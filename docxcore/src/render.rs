@@ -243,8 +243,6 @@ impl Default for RenderOptions {
     }
 }
 
-const PAGE_COLS: usize = 80;
-
 /// Where an embedded image's placeholder box was laid out, so the app can
 /// overlay real pixels onto it. Coordinates are in rendered cells: `row`/`col`
 /// are the box's top-left; `cols`/`rows` are the **interior** size (excludes the
@@ -283,19 +281,15 @@ pub fn render_with_images(
     opts: &RenderOptions,
 ) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>) {
     let content_width = if opts.page_view {
-        opts.width.min(PAGE_COLS).saturating_sub(4).max(8)
+        page_metrics(opts).content_cols
     } else {
         opts.width.max(8)
     };
     let mut images = Vec::new();
     let pairs = render_blocks(&doc.body, &[], content_width, opts, &mut images);
     let pairs = if opts.page_view {
-        // The page frame adds a top border row and a 2-col left margin.
-        for ib in &mut images {
-            ib.row += 1;
-            ib.col += 2;
-        }
-        frame_page(pairs, content_width)
+        // Print layout: paginate into real page boxes (margins, page numbers).
+        paginate(pairs, opts, &mut images)
     } else {
         pairs
     };
@@ -1300,31 +1294,134 @@ fn render_table(
 
 // ---- page framing ----
 
-fn frame_page(pairs: Vec<(Line, LineMap)>, inner: usize) -> Vec<(Line, LineMap)> {
-    let mut out = Vec::new();
-    out.push((
-        Line {
-            spans: vec![Line::dim_span(format!("┌{}┐", "─".repeat(inner + 2)))],
-        },
-        LineMap::default(),
-    ));
-    for (ln, mut map) in pairs {
-        let w = ln.width();
-        let pad = inner.saturating_sub(w);
-        let mut spans = vec![Line::dim_span("│ ".to_string())];
-        spans.extend(ln.spans);
-        spans.push(Line::dim_span(format!("{} │", " ".repeat(pad))));
-        for seg in &mut map.segs {
-            seg.col0 += 2;
-        }
-        out.push((Line { spans }, map));
+/// Geometry of one printed page, projected to terminal cells.
+struct PageMetrics {
+    /// Text wrap width (cells), inside the margins.
+    content_cols: usize,
+    /// Text rows per page, inside the margins.
+    content_rows: usize,
+    /// Left/right margin widths (cells), inside the page border.
+    ml: usize,
+    mr: usize,
+    /// Top/bottom margin heights (rows), inside the page border.
+    mt: usize,
+    mb: usize,
+    /// Left offset to center the page on the terminal.
+    center: usize,
+}
+
+fn page_metrics(opts: &RenderOptions) -> PageMetrics {
+    let pg = opts.page;
+    let pw = (pg.w.max(1)) as f32;
+    let ph = (pg.h.max(1)) as f32;
+    // Page width in cells (incl. borders), capped so the page stays readable and
+    // centered on wide terminals.
+    let total = opts.width.saturating_sub(2).clamp(20, 90);
+    let inner = total.saturating_sub(2).max(8); // page area inside the borders
+    let cpt = inner as f32 / pw; // cells per twip (horizontal)
+    let rpt = cpt / 2.0; // vertical: a terminal cell is ~2x taller than wide
+    let ml = (pg.ml.max(0) as f32 * cpt).round() as usize;
+    let mr = (pg.mr.max(0) as f32 * cpt).round() as usize;
+    let mt = (pg.mt.max(0) as f32 * rpt).round() as usize;
+    let mb = (pg.mb.max(0) as f32 * rpt).round() as usize;
+    let content_cols = inner.saturating_sub(ml + mr).max(4);
+    let page_rows = (ph * rpt).round() as usize;
+    let content_rows = page_rows.saturating_sub(mt + mb).clamp(1, 200);
+    PageMetrics {
+        content_cols,
+        content_rows,
+        ml,
+        mr,
+        mt,
+        mb,
+        center: opts.width.saturating_sub(inner + 2) / 2,
     }
-    out.push((
-        Line {
-            spans: vec![Line::dim_span(format!("└{}┘", "─".repeat(inner + 2)))],
-        },
-        LineMap::default(),
-    ));
+}
+
+/// Lay rendered lines out as discrete page boxes (Word "print layout"): each page
+/// is a bordered rectangle with real margins and a page number, centered on the
+/// terminal, with content flowing across pages.
+fn paginate(
+    pairs: Vec<(Line, LineMap)>,
+    opts: &RenderOptions,
+    images: &mut [ImageBox],
+) -> Vec<(Line, LineMap)> {
+    let m = page_metrics(opts);
+    let inner_w = m.content_cols + m.ml + m.mr;
+    let pad = |n: usize| " ".repeat(n);
+    let lead = pad(m.center);
+    let border = |l: char, r: char| -> (Line, LineMap) {
+        (
+            Line {
+                spans: vec![Line::dim_span(format!(
+                    "{lead}{l}{}{r}",
+                    "─".repeat(inner_w)
+                ))],
+            },
+            LineMap::default(),
+        )
+    };
+    let margin_row = |label: Option<&str>| -> (Line, LineMap) {
+        let inner = match label {
+            Some(s) => {
+                let s: String = s.chars().take(inner_w).collect();
+                let p = inner_w.saturating_sub(s.chars().count());
+                format!("{}{s}{}", pad(p / 2), pad(p - p / 2))
+            }
+            None => pad(inner_w),
+        };
+        (
+            Line {
+                spans: vec![Line::dim_span(format!("{lead}│{inner}│"))],
+            },
+            LineMap::default(),
+        )
+    };
+
+    let total_pages = pairs.len().div_ceil(m.content_rows).max(1);
+    let col_off = m.center + 1 + m.ml; // border + left margin + centering
+    let mut out: Vec<(Line, LineMap)> = Vec::new();
+    let mut new_row = vec![usize::MAX; pairs.len()];
+
+    let mut src = pairs.into_iter().enumerate();
+    for page in 0..total_pages {
+        out.push(border('┌', '┐'));
+        for _ in 0..m.mt {
+            out.push(margin_row(None));
+        }
+        for _ in 0..m.content_rows {
+            match src.next() {
+                Some((idx, (ln, mut map))) => {
+                    let rpad = m.content_cols.saturating_sub(ln.width());
+                    let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+                    spans.extend(ln.spans);
+                    spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+                    for seg in &mut map.segs {
+                        seg.col0 += col_off;
+                    }
+                    new_row[idx] = out.len();
+                    out.push((Line { spans }, map));
+                }
+                None => out.push(margin_row(None)), // pad the last page to full height
+            }
+        }
+        let pageno = format!("Page {} of {total_pages}", page + 1);
+        for r in 0..m.mb {
+            out.push(margin_row((r == m.mb / 2).then_some(pageno.as_str())));
+        }
+        out.push(border('└', '┘'));
+        out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
+    }
+
+    // Remap floating-image placements into the paginated layout.
+    for ib in images.iter_mut() {
+        if let Some(&nr) = new_row.get(ib.row) {
+            if nr != usize::MAX {
+                ib.row = nr;
+                ib.col += col_off;
+            }
+        }
+    }
     out
 }
 
@@ -1946,12 +2043,33 @@ mod tests {
     #[test]
     fn page_view_frames_content() {
         let d = doc(vec![para(vec![run("hi", RunProps::default())])]);
-        let mut o = opts(20);
+        let mut o = opts(40);
         o.page_view = true;
         let lines = render(&d, &o);
-        assert!(lines[0].plain().starts_with('┌'));
-        assert!(lines.last().unwrap().plain().starts_with('└'));
-        assert!(lines[1].plain().starts_with('│'));
+        let plain: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        // First line is the top page border, last is the bottom border.
+        assert!(plain[0].trim_start().starts_with('┌'), "{:?}", plain[0]);
+        assert!(plain.iter().any(|l| l.trim_start().starts_with('└')));
+        // The content "hi" appears inside the page, and a page number is printed.
+        assert!(plain.iter().any(|l| l.contains("hi")));
+        assert!(plain.iter().any(|l| l.contains("Page 1 of 1")));
+    }
+
+    #[test]
+    fn print_layout_paginates_long_documents() {
+        // Many short paragraphs must span more than one page box.
+        let body: Vec<Block> = (0..200)
+            .map(|i| para(vec![run(&format!("line {i}"), RunProps::default())]))
+            .collect();
+        let mut o = opts(60);
+        o.page_view = true;
+        let plain: Vec<String> = render(&doc(body), &o).iter().map(|l| l.plain()).collect();
+        let tops = plain
+            .iter()
+            .filter(|l| l.trim_start().starts_with('┌'))
+            .count();
+        assert!(tops >= 2, "expected multiple pages, got {tops}");
+        assert!(plain.iter().any(|l| l.contains("Page 2 of")));
     }
 
     // ---- caret map tests ----
