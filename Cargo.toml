@@ -5,7 +5,8 @@ members = ["docxcore", "docxy"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# MSRV is driven by dependencies (darling/image/instability need 1.88).
+rust-version = "1.88"
 license = "MIT"
 authors = ["yeroo"]
 repository = "https://github.com/yeroo/docxy"
