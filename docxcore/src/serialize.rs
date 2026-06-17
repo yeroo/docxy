@@ -1,0 +1,496 @@
+//! Serialize the [`crate::model`] document tree back to `word/document.xml`.
+//!
+//! This is a *semantic* serializer: it re-emits the structure and properties we
+//! model (paragraphs, runs + rPr, tables, lists, hyperlinks). It is designed so
+//! that `parse_document_xml(document_to_xml(&doc)) == doc` for everything we
+//! model — see the round-trip tests. Body content we do not model (e.g.
+//! `sectPr`, bookmarks) is preserved separately by the package layer, not here.
+
+use crate::model::*;
+
+const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+/// Serialize a document to the bytes of `word/document.xml`.
+pub fn document_to_xml(doc: &Document) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    s.push_str(&format!(
+        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:body>"
+    ));
+    for block in &doc.body {
+        write_block(&mut s, block);
+    }
+    s.push_str("</w:body></w:document>");
+    s
+}
+
+fn esc_text(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn esc_attr(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn write_block(s: &mut String, block: &Block) {
+    match block {
+        Block::Paragraph(p) => write_paragraph(s, p),
+        Block::Table(t) => write_table(s, t),
+        Block::Raw(raw) => s.push_str(raw),
+    }
+}
+
+fn write_paragraph(s: &mut String, p: &Paragraph) {
+    s.push_str("<w:p>");
+    write_ppr(s, &p.props);
+    for item in &p.content {
+        write_inline(s, item);
+    }
+    s.push_str("</w:p>");
+}
+
+fn write_ppr(s: &mut String, props: &ParProps) {
+    // Effective paragraph style: explicit style, else a synthesized heading style.
+    let style = props
+        .style_id
+        .clone()
+        .or_else(|| props.heading_level.map(|l| format!("Heading{l}")));
+    let has_any = style.is_some()
+        || props.num_id.is_some()
+        || props.align != Align::Left
+        || props.rtl
+        || props.frame.is_some();
+    if !has_any {
+        return;
+    }
+    s.push_str("<w:pPr>");
+    if let Some(st) = &style {
+        s.push_str("<w:pStyle w:val=\"");
+        esc_attr(st, s);
+        s.push_str("\"/>");
+    }
+    // framePr must precede numPr/jc in the schema order.
+    if let Some(f) = &props.frame {
+        s.push_str("<w:framePr");
+        if let Some(v) = f.w {
+            s.push_str(&format!(" w:w=\"{v}\""));
+        }
+        if let Some(v) = f.h {
+            s.push_str(&format!(" w:h=\"{v}\""));
+        }
+        if let Some(a) = &f.h_anchor {
+            s.push_str(" w:hAnchor=\"");
+            esc_attr(a, s);
+            s.push('"');
+        }
+        if let Some(a) = &f.v_anchor {
+            s.push_str(" w:vAnchor=\"");
+            esc_attr(a, s);
+            s.push('"');
+        }
+        if let Some(a) = &f.x_align {
+            s.push_str(" w:xAlign=\"");
+            esc_attr(a, s);
+            s.push('"');
+        }
+        if let Some(a) = &f.y_align {
+            s.push_str(" w:yAlign=\"");
+            esc_attr(a, s);
+            s.push('"');
+        }
+        if let Some(v) = f.x {
+            s.push_str(&format!(" w:x=\"{v}\""));
+        }
+        if let Some(v) = f.y {
+            s.push_str(&format!(" w:y=\"{v}\""));
+        }
+        s.push_str("/>");
+    }
+    if let Some(num) = props.num_id {
+        s.push_str(&format!(
+            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+            props.ilvl, num
+        ));
+    }
+    match props.align {
+        Align::Left => {}
+        Align::Center => s.push_str("<w:jc w:val=\"center\"/>"),
+        Align::Right => s.push_str("<w:jc w:val=\"right\"/>"),
+        Align::Justify => s.push_str("<w:jc w:val=\"both\"/>"),
+    }
+    if props.rtl {
+        s.push_str("<w:bidi/>");
+    }
+    s.push_str("</w:pPr>");
+}
+
+fn write_inline(s: &mut String, item: &Inline) {
+    match item {
+        Inline::Run(r) => write_run(s, r),
+        Inline::Tab => s.push_str("<w:r><w:tab/></w:r>"),
+        Inline::Break(kind) => match kind {
+            BreakKind::Line => s.push_str("<w:r><w:br/></w:r>"),
+            BreakKind::Page => s.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
+            BreakKind::Column => s.push_str("<w:r><w:br w:type=\"column\"/></w:r>"),
+        },
+        Inline::Hyperlink(h) => {
+            s.push_str("<w:hyperlink");
+            if let Some(id) = &h.rel_id {
+                s.push_str(" r:id=\"");
+                esc_attr(id, s);
+                s.push('"');
+            }
+            if let Some(a) = &h.anchor {
+                s.push_str(" w:anchor=\"");
+                esc_attr(a, s);
+                s.push('"');
+            }
+            s.push('>');
+            for r in &h.runs {
+                write_run(s, r);
+            }
+            s.push_str("</w:hyperlink>");
+        }
+        Inline::Raw(raw) => s.push_str(raw),
+    }
+}
+
+fn write_run(s: &mut String, r: &Run) {
+    s.push_str("<w:r>");
+    write_rpr(s, &r.props);
+    s.push_str("<w:t xml:space=\"preserve\">");
+    esc_text(&r.text, s);
+    s.push_str("</w:t></w:r>");
+}
+
+fn write_rpr(s: &mut String, p: &RunProps) {
+    let has_any = p.bold
+        || p.italic
+        || p.underline
+        || p.strike
+        || p.caps
+        || p.small_caps
+        || p.vanish
+        || p.vert_align != VertAlign::Baseline
+        || p.color.is_some()
+        || p.highlight.is_some()
+        || p.size_half_pts.is_some()
+        || p.font.is_some()
+        || p.style_id.is_some();
+    if !has_any {
+        return;
+    }
+    s.push_str("<w:rPr>");
+    if let Some(st) = &p.style_id {
+        s.push_str("<w:rStyle w:val=\"");
+        esc_attr(st, s);
+        s.push_str("\"/>");
+    }
+    if let Some(f) = &p.font {
+        s.push_str("<w:rFonts w:ascii=\"");
+        esc_attr(f, s);
+        s.push_str("\"/>");
+    }
+    if p.bold {
+        s.push_str("<w:b/>");
+    }
+    if p.italic {
+        s.push_str("<w:i/>");
+    }
+    if p.caps {
+        s.push_str("<w:caps/>");
+    }
+    if p.small_caps {
+        s.push_str("<w:smallCaps/>");
+    }
+    if p.strike {
+        s.push_str("<w:strike/>");
+    }
+    if p.vanish {
+        s.push_str("<w:vanish/>");
+    }
+    if let Some(c) = &p.color {
+        s.push_str("<w:color w:val=\"");
+        esc_attr(c, s);
+        s.push_str("\"/>");
+    }
+    if let Some(sz) = p.size_half_pts {
+        s.push_str(&format!("<w:sz w:val=\"{sz}\"/>"));
+    }
+    if let Some(h) = &p.highlight {
+        s.push_str("<w:highlight w:val=\"");
+        esc_attr(h, s);
+        s.push_str("\"/>");
+    }
+    if p.underline {
+        s.push_str("<w:u w:val=\"single\"/>");
+    }
+    match p.vert_align {
+        VertAlign::Baseline => {}
+        VertAlign::Superscript => s.push_str("<w:vertAlign w:val=\"superscript\"/>"),
+        VertAlign::Subscript => s.push_str("<w:vertAlign w:val=\"subscript\"/>"),
+    }
+    s.push_str("</w:rPr>");
+}
+
+fn write_table(s: &mut String, t: &Table) {
+    s.push_str("<w:tbl>");
+    if !t.grid.is_empty() {
+        s.push_str("<w:tblGrid>");
+        for w in &t.grid {
+            s.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
+        }
+        s.push_str("</w:tblGrid>");
+    }
+    for row in &t.rows {
+        s.push_str("<w:tr>");
+        for cell in &row.cells {
+            write_cell(s, cell);
+        }
+        s.push_str("</w:tr>");
+    }
+    s.push_str("</w:tbl>");
+}
+
+fn write_cell(s: &mut String, cell: &Cell) {
+    s.push_str("<w:tc>");
+    if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+        s.push_str("<w:tcPr>");
+        if cell.grid_span > 1 {
+            s.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", cell.grid_span));
+        }
+        match cell.v_merge {
+            VMerge::None => {}
+            VMerge::Restart => s.push_str("<w:vMerge w:val=\"restart\"/>"),
+            VMerge::Continue => s.push_str("<w:vMerge/>"),
+        }
+        s.push_str("</w:tcPr>");
+    }
+    if cell.blocks.is_empty() {
+        // A table cell must contain at least one block to be valid OOXML.
+        s.push_str("<w:p></w:p>");
+    } else {
+        for b in &cell.blocks {
+            write_block(s, b);
+        }
+    }
+    s.push_str("</w:tc>");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::load::{Relationships, parse_document_xml, parse_rels_xml};
+
+    fn roundtrip(doc: &Document, rels: &Relationships) -> Document {
+        let xml = document_to_xml(doc);
+        parse_document_xml(&xml, rels)
+    }
+
+    fn run(text: &str, props: RunProps) -> Inline {
+        Inline::Run(Run {
+            text: text.to_string(),
+            props,
+        })
+    }
+    fn para(props: ParProps, content: Vec<Inline>) -> Block {
+        Block::Paragraph(Paragraph { props, content })
+    }
+
+    #[test]
+    fn plain_paragraph_roundtrips() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![run("Hello world", RunProps::default())],
+            )],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn run_properties_roundtrip() {
+        let props = RunProps {
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            caps: true,
+            small_caps: true,
+            vanish: true,
+            vert_align: VertAlign::Superscript,
+            color: Some("FF0000".to_string()),
+            highlight: Some("yellow".to_string()),
+            size_half_pts: Some(28),
+            font: Some("Calibri".to_string()),
+            style_id: Some("Emphasis".to_string()),
+        };
+        let d = Document {
+            body: vec![para(ParProps::default(), vec![run("styled", props)])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn frame_pr_roundtrips() {
+        // Floating placement must survive a save so we never corrupt the layout.
+        let frame = FramePr {
+            x: Some(6481),
+            y: Some(2521),
+            w: None,
+            h: None,
+            h_anchor: Some("page".to_string()),
+            v_anchor: Some("page".to_string()),
+            x_align: None,
+            y_align: None,
+        };
+        let pp = ParProps {
+            frame: Some(frame),
+            ..Default::default()
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("x", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+
+        // The align-keyword variant too.
+        let frame2 = FramePr {
+            h_anchor: Some("margin".to_string()),
+            x_align: Some("right".to_string()),
+            y_align: Some("bottom".to_string()),
+            ..Default::default()
+        };
+        let pp2 = ParProps {
+            frame: Some(frame2),
+            ..Default::default()
+        };
+        let d2 = Document {
+            body: vec![para(pp2, vec![run("y", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d2, &Relationships::default()), d2);
+    }
+
+    #[test]
+    fn paragraph_properties_roundtrip() {
+        let pp = ParProps {
+            style_id: Some("Quote".to_string()),
+            align: Align::Center,
+            heading_level: None,
+            num_id: Some(3),
+            ilvl: 1,
+            rtl: true,
+            frame: None,
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("x", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn heading_roundtrips_via_style() {
+        let pp = ParProps {
+            style_id: Some("Heading2".to_string()),
+            heading_level: Some(2),
+            ..ParProps::default()
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("Title", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn breaks_and_tabs_roundtrip() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![
+                    run("a", RunProps::default()),
+                    Inline::Tab,
+                    run("b", RunProps::default()),
+                    Inline::Break(BreakKind::Line),
+                    Inline::Break(BreakKind::Page),
+                ],
+            )],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn special_characters_escape_roundtrip() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![run("a < b & c > d \"q\"", RunProps::default())],
+            )],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn hyperlink_roundtrips_with_rels() {
+        let rels = parse_rels_xml(
+            "<Relationships><Relationship Id=\"rId5\" Target=\"https://a.test/\" TargetMode=\"External\"/></Relationships>",
+        );
+        let h = Inline::Hyperlink(Hyperlink {
+            target: Some("https://a.test/".to_string()),
+            anchor: None,
+            rel_id: Some("rId5".to_string()),
+            runs: vec![Run {
+                text: "click".to_string(),
+                props: RunProps::default(),
+            }],
+        });
+        let d = Document {
+            body: vec![para(ParProps::default(), vec![h])],
+        };
+        assert_eq!(roundtrip(&d, &rels), d);
+    }
+
+    #[test]
+    fn table_roundtrips() {
+        let cell = |s: &str, span: u32| Cell {
+            grid_span: span,
+            v_merge: VMerge::None,
+            blocks: vec![para(ParProps::default(), vec![run(s, RunProps::default())])],
+        };
+        let t = Table {
+            grid: vec![100, 200],
+            rows: vec![
+                Row {
+                    cells: vec![cell("wide", 2)],
+                },
+                Row {
+                    cells: vec![
+                        Cell {
+                            v_merge: VMerge::Restart,
+                            ..cell("top", 1)
+                        },
+                        cell("b", 1),
+                    ],
+                },
+            ],
+        };
+        let d = Document {
+            body: vec![Block::Table(t)],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+}

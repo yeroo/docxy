@@ -1,0 +1,313 @@
+//! Open/save a whole `.docx` while preserving everything we don't model.
+//!
+//! The save strategy that keeps documents from being corrupted: keep **every**
+//! original ZIP part byte-for-byte, and on save rewrite only `word/document.xml`
+//! from the [`Document`] model. The trailing section properties (`w:sectPr`,
+//! which carry page size/margins/orientation) are captured verbatim and
+//! re-inserted, so page geometry survives a round-trip even though it isn't
+//! modeled.
+//!
+//! Known limitations (documented, not silent): body content other than
+//! paragraphs/tables and the final `sectPr` — e.g. bookmarks, mid-document
+//! section breaks, comments anchors — is not reconstructed by the serializer and
+//! is dropped on save. Full raw-node preservation is a later refinement.
+
+use crate::load::{LoadError, parse_document_xml, parse_rels_xml};
+use crate::model::Document;
+use crate::serialize::document_to_xml;
+use crate::zip::ZipArchive;
+use crate::zipwrite::write_zip;
+
+const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// A loaded `.docx`: the editable [`Document`] plus all original parts so save
+/// can preserve what isn't modeled.
+#[derive(Debug, Clone)]
+pub struct Package {
+    parts: Vec<(String, Vec<u8>)>,
+    doc_index: usize,
+    sect_pr: String,
+    /// The editable document. Mutate this, then [`save_package`].
+    pub document: Document,
+}
+
+impl Package {
+    /// Names of all parts in the container (for inspection/tests).
+    pub fn part_names(&self) -> Vec<&str> {
+        self.parts.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// The raw bytes of a part by name.
+    pub fn part(&self, name: &str) -> Option<&[u8]> {
+        self.parts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_slice())
+    }
+
+    /// Page size/margins from the captured `sectPr` (US Letter default).
+    pub fn page_geom(&self) -> crate::model::PageGeom {
+        use crate::model::PageGeom;
+        let d = PageGeom::default();
+        let g = |tag: &str, attr: &str, fallback: i32| -> i32 {
+            sect_attr(&self.sect_pr, tag, attr).unwrap_or(fallback)
+        };
+        PageGeom {
+            w: g("<w:pgSz", "w:w", d.w),
+            h: g("<w:pgSz", "w:h", d.h),
+            ml: g("<w:pgMar", "w:left", d.ml),
+            mr: g("<w:pgMar", "w:right", d.mr),
+            mt: g("<w:pgMar", "w:top", d.mt),
+            mb: g("<w:pgMar", "w:bottom", d.mb),
+        }
+    }
+}
+
+/// Read an integer attribute of a self-contained `sectPr` child element.
+fn sect_attr(sect: &str, tag: &str, attr: &str) -> Option<i32> {
+    let tstart = sect.find(tag)?;
+    let tend = sect[tstart..].find('>')? + tstart;
+    let el = &sect[tstart..tend];
+    let key = format!("{attr}=\"");
+    let kstart = el.find(&key)? + key.len();
+    let rest = &el[kstart..];
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
+/// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
+pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
+    let zip = match ZipArchive::open(data) {
+        Some(z) => z,
+        None => {
+            if data.len() >= 8 && data[..8] == OLE2 {
+                return Err(LoadError::Ole2);
+            }
+            return Err(LoadError::NotZip);
+        }
+    };
+
+    let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut doc_index = None;
+    for e in zip.entries() {
+        let bytes = zip.extract(e).ok_or(LoadError::CorruptPart)?;
+        if e.name == "word/document.xml" {
+            doc_index = Some(parts.len());
+        }
+        parts.push((e.name.clone(), bytes));
+    }
+    let doc_index = doc_index.ok_or(LoadError::MissingDocument)?;
+
+    let doc_xml = std::str::from_utf8(&parts[doc_index].1).map_err(|_| LoadError::NotUtf8)?;
+    let rels = parts
+        .iter()
+        .find(|(n, _)| n == "word/_rels/document.xml.rels")
+        .map(|(_, b)| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
+        .unwrap_or_default();
+    let document = parse_document_xml(doc_xml, &rels);
+    let sect_pr = extract_sectpr(doc_xml);
+
+    Ok(Package {
+        parts,
+        doc_index,
+        sect_pr,
+        document,
+    })
+}
+
+/// Build a new package around a document, with a minimal valid OPC part set.
+/// Used for "create new" and as a save target for an in-memory document.
+pub fn new_package(document: Document) -> Package {
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#;
+    let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>"#;
+
+    let parts = vec![
+        (
+            "[Content_Types].xml".to_string(),
+            content_types.as_bytes().to_vec(),
+        ),
+        ("_rels/.rels".to_string(), root_rels.as_bytes().to_vec()),
+        ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+        (
+            "word/_rels/document.xml.rels".to_string(),
+            doc_rels.as_bytes().to_vec(),
+        ),
+        ("word/styles.xml".to_string(), styles.as_bytes().to_vec()),
+    ];
+    let doc_index = 2;
+    Package {
+        parts,
+        doc_index,
+        sect_pr: String::new(),
+        document,
+    }
+}
+
+/// Serialize the package back to `.docx` bytes (STORED ZIP).
+pub fn save_package(pkg: &Package) -> Vec<u8> {
+    let mut xml = document_to_xml(&pkg.document);
+    if !pkg.sect_pr.is_empty() {
+        xml = xml.replacen("</w:body>", &format!("{}</w:body>", pkg.sect_pr), 1);
+    }
+    let mut parts = pkg.parts.clone();
+    parts[pkg.doc_index].1 = xml.into_bytes();
+    write_zip(&parts)
+}
+
+/// Capture the last (body-level) `w:sectPr` element verbatim, if any.
+fn extract_sectpr(xml: &str) -> String {
+    let Some(start) = xml.rfind("<w:sectPr") else {
+        return String::new();
+    };
+    let tail = &xml[start..];
+    if let Some(close) = tail.find("</w:sectPr>") {
+        return tail[..close + "</w:sectPr>".len()].to_string();
+    }
+    // self-closing <w:sectPr .../>
+    if let Some(gt) = tail.find('>') {
+        let seg = &tail[..gt + 1];
+        if seg.ends_with("/>") {
+            return seg.to_string();
+        }
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Block, Inline};
+    use crate::zipwrite::write_zip;
+
+    /// Build a tiny but valid .docx in memory.
+    fn make_docx(document_xml: &str) -> Vec<u8> {
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let styles = r#"<?xml version="1.0"?><w:styles/>"#;
+        write_zip(&[
+            ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+            (
+                "word/document.xml".to_string(),
+                document_xml.as_bytes().to_vec(),
+            ),
+            ("word/styles.xml".to_string(), styles.as_bytes().to_vec()),
+        ])
+    }
+
+    const BODY: &str = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+        <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Hello</w:t></w:r></w:p>\
+        <w:p><w:r><w:t>World</w:t></w:r></w:p>\
+        <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
+        </w:body></w:document>";
+
+    #[test]
+    fn roundtrip_preserves_model_parts_and_sectpr() {
+        let docx = make_docx(BODY);
+        let pkg1 = load_package(&docx).expect("load");
+        // model captured both paragraphs
+        assert_eq!(pkg1.document.body.len(), 2);
+
+        let saved = save_package(&pkg1);
+        let pkg2 = load_package(&saved).expect("reload saved");
+
+        // model is identical after a save round-trip
+        assert_eq!(pkg1.document, pkg2.document);
+        // all original parts are still present
+        let mut names = pkg2.part_names();
+        names.sort();
+        assert!(names.contains(&"word/styles.xml"));
+        assert!(names.contains(&"[Content_Types].xml"));
+        assert!(names.contains(&"word/document.xml"));
+        // sectPr (page size) survived into the saved document.xml
+        let doc_xml = pkg2
+            .part_names()
+            .iter()
+            .position(|n| *n == "word/document.xml")
+            .map(|i| String::from_utf8_lossy(&pkg2.parts[i].1).into_owned())
+            .unwrap();
+        assert!(doc_xml.contains("<w:sectPr"));
+        assert!(doc_xml.contains("w:w=\"11906\""));
+    }
+
+    #[test]
+    fn edit_text_then_save_persists() {
+        let docx = make_docx(BODY);
+        let mut pkg = load_package(&docx).expect("load");
+
+        // Edit: change the text of the first run of the first paragraph.
+        if let Block::Paragraph(p) = &mut pkg.document.body[0] {
+            if let Inline::Run(r) = &mut p.content[0] {
+                r.text = "Goodbye".to_string();
+            }
+        }
+        let saved = save_package(&pkg);
+        let reloaded = load_package(&saved).expect("reload");
+        assert_eq!(
+            reloaded.document.plain_text().lines().next().unwrap(),
+            "Goodbye"
+        );
+        // the second paragraph is untouched
+        assert!(reloaded.document.plain_text().contains("World"));
+    }
+
+    #[test]
+    fn rejects_non_docx() {
+        assert_eq!(load_package(b"nope").unwrap_err(), LoadError::NotZip);
+    }
+
+    #[test]
+    fn save_preserves_unmodeled_content() {
+        let body = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:bookmarkStart w:id=\"0\" w:name=\"bm\"/><w:r><w:t>hi</w:t></w:r><w:bookmarkEnd w:id=\"0\"/></w:p>\
+            <w:p><w:r><w:drawing><inline>IMG</inline></w:drawing></w:r></w:p>\
+            <w:sdt><w:sdtContent><w:p><w:r><w:t>ctrl</w:t></w:r></w:p></w:sdtContent></w:sdt>\
+            </w:body></w:document>";
+        let docx = make_docx(body);
+        let pkg1 = load_package(&docx).expect("load");
+
+        // The model has Raw placeholders for the unmodeled parts.
+        assert_eq!(pkg1.document.body.len(), 3);
+        assert!(matches!(pkg1.document.body[2], Block::Raw(_)));
+        if let Block::Paragraph(p) = &pkg1.document.body[1] {
+            assert!(matches!(p.content[0], Inline::Raw(_))); // the drawing run
+        } else {
+            panic!();
+        }
+
+        let saved = save_package(&pkg1);
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.contains("w:bookmarkStart"), "bookmark lost");
+        assert!(text.contains("<w:drawing>"), "drawing lost");
+        assert!(text.contains("<w:sdt>"), "content control lost");
+
+        // And a full round-trip is lossless.
+        let pkg2 = load_package(&saved).expect("reload");
+        assert_eq!(pkg1.document, pkg2.document);
+    }
+
+    #[test]
+    fn new_package_saves_and_reloads() {
+        use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
+        let document = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "Fresh document".to_string(),
+                    props: RunProps::default(),
+                })],
+            })],
+        };
+        let pkg = new_package(document.clone());
+        let bytes = save_package(&pkg);
+        let reloaded = load_package(&bytes).expect("reload new doc");
+        assert_eq!(reloaded.document, document);
+        assert!(reloaded.part_names().contains(&"word/styles.xml"));
+    }
+}

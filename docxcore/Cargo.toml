@@ -1,0 +1,18 @@
+[package]
+name = "docxcore"
+description = "Dependency-free DOCX (OOXML) I/O: ZIP, DEFLATE, XML, document model, and PDF export."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["docx", "ooxml", "word", "zip", "pdf"]
+categories = ["parser-implementations", "text-processing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — keep this crate pure and auditable.

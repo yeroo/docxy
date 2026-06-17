@@ -1,0 +1,6 @@
+# Normalize line endings: store LF in the repo on every platform.
+* text=auto eol=lf
+*.png binary
+*.docx binary
+*.pdf binary
+*.wmf binary

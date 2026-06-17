@@ -1,0 +1,35 @@
+[package]
+name = "docxy"
+description = "Docxy — a fast terminal (TUI) viewer and editor for Microsoft Word .docx documents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["docx", "word", "tui", "editor", "ooxml"]
+categories = ["command-line-utilities", "text-editors"]
+
+[[bin]]
+name = "docxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Path + version so `docxy` can be published once `docxcore` is on crates.io.
+docxcore = { version = "0.1.0", path = "../docxcore" }
+# ratatui re-exports crossterm, so we don't depend on crossterm separately.
+ratatui = "0.29"
+# OS clipboard bridge (copy/paste across applications).
+arboard = "3"
+# Inline images (kitty/iTerm2/Sixel, with a half-block fallback).
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+# Only the raster formats Word actually embeds; avoids heavy AVIF/AV1 codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
+
+# Rasterize legacy WMF/EMF vector images via the OS's GDI (Windows only).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange"] }

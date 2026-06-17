@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["docxcore", "docxy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["yeroo"]
+repository = "https://github.com/yeroo/docxy"
+
+# Accepted style choices (not bugs) so CI can run `clippy -D warnings`:
+#  - index loops over parallel grids/columns read clearer than iterator combinators
+#  - XmlParser::next is a pull-parser step returning Event, not an Iterator
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+explicit_counter_loop = "allow"
+should_implement_trait = "allow"
+field_reassign_with_default = "allow"
