@@ -19,3 +19,5 @@ needless_range_loop = "allow"
 explicit_counter_loop = "allow"
 should_implement_trait = "allow"
 field_reassign_with_default = "allow"
+# Nested `if let { if … }` reads clearer than edition-2024 let-chains here.
+collapsible_if = "allow"
