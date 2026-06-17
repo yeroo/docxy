@@ -1,5 +1,10 @@
 # Docxy
 
+[![CI](https://github.com/yeroo/docxy/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/docxy/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yeroo/docxy/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/docxy)
+[![crates.io](https://img.shields.io/crates/v/docxy.svg)](https://crates.io/crates/docxy)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A fast terminal (TUI) viewer and editor for Microsoft Word `.docx` documents.**
 
 Docxy opens real `.docx` files in your terminal — text, tables, lists, styles, and
