@@ -186,11 +186,17 @@ impl LineSeg {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LineMap {
     pub segs: Vec<LineSeg>,
+    /// In print layout, marks a hard page break: paginate starts a new page here
+    /// and does not render this (placeholder) line.
+    pub page_break: bool,
 }
 
 impl LineMap {
     fn one(seg: LineSeg) -> Self {
-        LineMap { segs: vec![seg] }
+        LineMap {
+            segs: vec![seg],
+            page_break: false,
+        }
     }
     /// The segment containing the caret (path + offset), if any.
     pub fn seg_for(&self, path: &[usize], offset: usize) -> Option<&LineSeg> {
@@ -727,10 +733,22 @@ fn render_paragraph(
     let mut line_idx = 0usize;
     for seg in &segs {
         if let Some(kind) = seg.sep {
-            out.push((
-                break_separator(kind, width, opts.show_invisibles),
-                LineMap::default(),
-            ));
+            if opts.page_view && kind == BreakKind::Page {
+                // Print layout: a hard page break ends the page; emit a marker
+                // (invisible) instead of a separator rule.
+                out.push((
+                    Line { spans: Vec::new() },
+                    LineMap {
+                        page_break: true,
+                        ..LineMap::default()
+                    },
+                ));
+            } else {
+                out.push((
+                    break_separator(kind, width, opts.show_invisibles),
+                    LineMap::default(),
+                ));
+            }
         }
         for gl in wrap_glyphs(&seg.glyphs, avail) {
             let prefix = if line_idx == 0 {
@@ -1378,32 +1396,55 @@ fn paginate(
         )
     };
 
-    let total_pages = pairs.len().div_ceil(m.content_rows).max(1);
     let col_off = m.center + 1 + m.ml; // border + left margin + centering
-    let mut out: Vec<(Line, LineMap)> = Vec::new();
-    let mut new_row = vec![usize::MAX; pairs.len()];
+    let total_in = pairs.len();
 
-    let mut src = pairs.into_iter().enumerate();
+    // Assign each content line to a page, honoring hard page breaks (the marker
+    // lines force the next line onto a new page and are themselves dropped).
+    let mut items: Vec<(usize, Line, LineMap, usize)> = Vec::new(); // (idx, line, map, page)
+    let mut row = 0usize;
+    let mut pg = 0usize;
+    for (idx, (ln, map)) in pairs.into_iter().enumerate() {
+        if map.page_break {
+            if row > 0 {
+                pg += 1;
+                row = 0;
+            }
+            continue;
+        }
+        if row == m.content_rows {
+            pg += 1;
+            row = 0;
+        }
+        items.push((idx, ln, map, pg));
+        row += 1;
+    }
+    let total_pages = pg + 1;
+
+    let mut out: Vec<(Line, LineMap)> = Vec::new();
+    let mut new_row = vec![usize::MAX; total_in];
+    let mut it = items.into_iter().peekable();
     for page in 0..total_pages {
         out.push(border('┌', '┐'));
         for _ in 0..m.mt {
             out.push(margin_row(None));
         }
-        for _ in 0..m.content_rows {
-            match src.next() {
-                Some((idx, (ln, mut map))) => {
-                    let rpad = m.content_cols.saturating_sub(ln.width());
-                    let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
-                    spans.extend(ln.spans);
-                    spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
-                    for seg in &mut map.segs {
-                        seg.col0 += col_off;
-                    }
-                    new_row[idx] = out.len();
-                    out.push((Line { spans }, map));
-                }
-                None => out.push(margin_row(None)), // pad the last page to full height
+        let mut placed = 0usize;
+        while it.peek().map(|t| t.3) == Some(page) {
+            let (idx, ln, mut map, _) = it.next().unwrap();
+            let rpad = m.content_cols.saturating_sub(ln.width());
+            let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+            spans.extend(ln.spans);
+            spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+            for seg in &mut map.segs {
+                seg.col0 += col_off;
             }
+            new_row[idx] = out.len();
+            out.push((Line { spans }, map));
+            placed += 1;
+        }
+        for _ in placed..m.content_rows {
+            out.push(margin_row(None)); // pad the page to full height
         }
         let pageno = format!("Page {} of {total_pages}", page + 1);
         for r in 0..m.mb {
@@ -2053,6 +2094,30 @@ mod tests {
         // The content "hi" appears inside the page, and a page number is printed.
         assert!(plain.iter().any(|l| l.contains("hi")));
         assert!(plain.iter().any(|l| l.contains("Page 1 of 1")));
+    }
+
+    #[test]
+    fn explicit_page_break_starts_new_page() {
+        // A hard page break must start a second page even with little content.
+        let p = para(vec![
+            run("before", RunProps::default()),
+            Inline::Break(BreakKind::Page),
+            run("after", RunProps::default()),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        let plain: Vec<String> = render(&doc(vec![p]), &o)
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let tops = plain
+            .iter()
+            .filter(|l| l.trim_start().starts_with('┌'))
+            .count();
+        assert_eq!(tops, 2, "page break should create a second page");
+        assert!(plain.iter().any(|l| l.contains("before")));
+        assert!(plain.iter().any(|l| l.contains("after")));
+        assert!(plain.iter().any(|l| l.contains("Page 2 of 2")));
     }
 
     #[test]
