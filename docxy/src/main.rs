@@ -497,12 +497,11 @@ impl App {
         }
     }
 
-    /// Overlay decoded image pixels onto their placeholder boxes, cropping (not
-    /// scaling) at the viewport edges as they scroll.
+    /// Paint each image: real pixels when we can decode and the terminal supports
+    /// graphics, otherwise a fallback box (border + caption) — the only time we
+    /// draw a border around a borderless picture. Cropped at the viewport edges.
     fn draw_images(&mut self, f: &mut Frame, content: Rect) {
-        if self.picker.is_none() {
-            return; // no terminal graphics support
-        }
+        let has_picker = self.picker.is_some();
         let (scroll, vh) = (self.scroll, self.viewport_h);
         for ib in self.images.clone() {
             // Visible window of the box, in box-relative cells.
@@ -518,24 +517,34 @@ impl App {
             }
             let x = content.x + ib.col as u16;
             let y = content.y + (ib.row + wtop - scroll) as u16;
-            // Crop the source band for this slice: absolute top within the full
-            // image is the slice's offset plus the scrolled-away rows.
-            let key = format!("{}#{}", ib.rid, ib.src_row);
-            self.refresh_image(
-                &key,
-                &ib.rid,
-                ib.cols,
-                ib.full_rows,
-                (ib.src_row + wtop, wh, w),
-            );
-            if let Some(Some(st)) = self.img_cache.get(&key) {
-                let rect = Rect {
-                    x,
-                    y,
-                    width: w as u16,
-                    height: wh as u16,
-                };
-                f.render_widget(Image::new(&st.proto), rect);
+            let rect = Rect {
+                x,
+                y,
+                width: w as u16,
+                height: wh as u16,
+            };
+            // Try real pixels first: crop the source band for this slice (absolute
+            // top within the full image = the slice's offset plus scrolled-away rows).
+            let mut drawn = false;
+            if has_picker && !ib.rid.is_empty() {
+                let key = format!("{}#{}", ib.rid, ib.src_row);
+                self.refresh_image(
+                    &key,
+                    &ib.rid,
+                    ib.cols,
+                    ib.full_rows,
+                    (ib.src_row + wtop, wh, w),
+                );
+                if let Some(Some(st)) = self.img_cache.get(&key) {
+                    f.render_widget(Image::new(&st.proto), rect);
+                    drawn = true;
+                }
+            }
+            // A borderless picture we couldn't render falls back to a box so the
+            // reader still sees something is there. A bordered picture already has
+            // its outline drawn into the text, so nothing extra is needed.
+            if !drawn && !ib.bordered {
+                draw_fallback_box(f, content, &ib, scroll, &ib.label);
             }
         }
     }
@@ -1721,6 +1730,74 @@ impl App {
 
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
+}
+
+/// Draw a dim bordered box with a centered caption for an image we can't render
+/// (no graphics support, missing bytes, or an undecodable format such as a
+/// formula preview). Each visible cell is placed from the box's absolute
+/// geometry, so it scrolls and clips correctly. This is the only case where a
+/// borderless picture gets a border.
+fn draw_fallback_box(f: &mut Frame, content: Rect, ib: &ImageBox, scroll: usize, label: &str) {
+    let (rows, cols) = (ib.rows, ib.cols);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let inner_w = cols.saturating_sub(2);
+    let lab: Vec<char> = label.chars().take(inner_w).collect();
+    let lab_start = 1 + inner_w.saturating_sub(lab.len()) / 2;
+    let label_row = rows / 2;
+    let x_end = (content.x + content.width) as usize;
+    let y_end = (content.y + content.height) as usize;
+    let buf = f.buffer_mut();
+    for r in 0..rows {
+        let sy = ib.row as isize + r as isize - scroll as isize;
+        if sy < 0 {
+            continue;
+        }
+        let sy = content.y as usize + sy as usize;
+        if sy >= y_end {
+            break;
+        }
+        for c in 0..cols {
+            let sx = content.x as usize + ib.col + c;
+            if sx >= x_end {
+                break;
+            }
+            let edge = if r == 0 {
+                if c == 0 {
+                    '┌'
+                } else if c == cols - 1 {
+                    '┐'
+                } else {
+                    '─'
+                }
+            } else if r == rows - 1 {
+                if c == 0 {
+                    '└'
+                } else if c == cols - 1 {
+                    '┘'
+                } else {
+                    '─'
+                }
+            } else if c == 0 || c == cols - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            let ch = if r == label_row && c >= lab_start && c < lab_start + lab.len() {
+                lab[c - lab_start]
+            } else {
+                edge
+            };
+            if let Some(cell) = buf.cell_mut(Position {
+                x: sx as u16,
+                y: sy as u16,
+            }) {
+                cell.set_char(ch).set_style(dim);
+            }
+        }
+    }
 }
 
 /// Only plain **internet links** (http/https) are ever opened. Everything else

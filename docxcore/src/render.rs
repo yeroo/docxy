@@ -293,6 +293,13 @@ pub struct ImageBox {
     /// The image's full height in cells across all slices (== `rows` when whole).
     /// The app scales the decoded source to this height before cropping.
     pub full_rows: usize,
+    /// The document defines a visible outline for this image. The app draws a
+    /// border around the picture; otherwise pictures are borderless and a box is
+    /// drawn only as the fallback when the pixels can't be rendered.
+    pub bordered: bool,
+    /// Fallback caption (e.g. `image 320×160`) drawn in the box when the picture
+    /// can't be rendered.
+    pub label: String,
 }
 
 /// The relationship id of an embedded image from its raw run XML — DrawingML
@@ -957,21 +964,36 @@ fn render_paragraph(
             if let Some((pw, ph)) = raw_image_extent(raw) {
                 let (pw, ph) = (pw as usize, ph as usize);
                 let (cols, rows) = image_box_cells(pw, ph, width);
-                if let Some(rid) = embed_rid(raw) {
-                    // Overlay fills the whole placeholder box (borders included) for
-                    // the largest legible area, exactly aligned so pixels never spill
-                    // past it onto the page frame.
-                    images.push(ImageBox {
-                        rid,
-                        row: out.len(),
-                        col: 0,
-                        cols: cols + 2,
-                        rows,
-                        src_row: 0,
-                        full_rows: rows,
-                    });
-                }
-                let mut boxed = image_box(cols, rows, &format!("image {pw}×{ph}"));
+                let bordered = raw_has_outline(raw);
+                let label = format!("image {pw}×{ph}");
+                // A bordered picture's pixels sit inside the document's outline; a
+                // borderless one fills the whole region. The box is always reported
+                // (even with no rid) so the app can draw a fallback for what it can't
+                // render. The overlay is aligned so pixels never spill onto the frame.
+                let (row, col, ocols, orows) = if bordered {
+                    (out.len() + 1, 1, cols, rows.saturating_sub(2).max(1))
+                } else {
+                    (out.len(), 0, cols + 2, rows)
+                };
+                images.push(ImageBox {
+                    rid: embed_rid(raw).unwrap_or_default(),
+                    row,
+                    col,
+                    cols: ocols,
+                    rows: orows,
+                    src_row: 0,
+                    full_rows: orows,
+                    bordered,
+                    label: label.clone(),
+                });
+                // The placeholder text carries a box only when the document defines
+                // one; otherwise it is blank and the app draws the pixels (or a
+                // fallback box if it can't render them).
+                let mut boxed = if bordered {
+                    image_box(cols, rows, &label)
+                } else {
+                    blank_box(rows)
+                };
                 for (_, map) in &mut boxed {
                     map.image = true;
                 }
@@ -1128,6 +1150,29 @@ fn image_box_cells(pw: usize, ph: usize, width: usize) -> (usize, usize) {
     (cols, rows)
 }
 
+/// Whether the document gives a picture a visible outline. Conservative: when in
+/// doubt, treat it as borderless (the default we want). VML shapes are bordered
+/// only with an explicit `stroked="t"`; DrawingML pictures only with an `<a:ln>`
+/// that has a real fill (not `<a:noFill/>`).
+fn raw_has_outline(raw: &str) -> bool {
+    if raw.contains("stroked=\"t\"") {
+        return true;
+    }
+    if let Some(i) = raw.find("<a:ln") {
+        let seg = &raw[i..(i + 400).min(raw.len())];
+        return seg.contains("solidFill") && !seg.contains("noFill");
+    }
+    false
+}
+
+/// A blank, borderless image placeholder of `rows` lines. It only reserves the
+/// vertical space; the app paints the picture (or a fallback box) over it.
+fn blank_box(rows: usize) -> Vec<(Line, LineMap)> {
+    (0..rows.max(1))
+        .map(|_| (Line { spans: Vec::new() }, LineMap::default()))
+        .collect()
+}
+
 fn image_box(cols: usize, rows: usize, label: &str) -> Vec<(Line, LineMap)> {
     let cols = cols.max(8);
     let rows = rows.max(3);
@@ -1172,6 +1217,7 @@ struct Place {
     w: i32,
     h: i32,
     label: String,
+    bordered: bool,
 }
 
 /// Project a run of frame-positioned image paragraphs onto a 2D canvas at their
@@ -1197,14 +1243,15 @@ fn render_floating_canvas(
         let Some((frame, (px_w, px_h))) = floating_image(b) else {
             continue;
         };
-        let rid = match b {
+        let raw = match b {
             Block::Paragraph(p) => p.content.iter().find_map(|it| match it {
-                Inline::Raw(r) => embed_rid(r),
+                Inline::Raw(r) => Some(r.as_str()),
                 _ => None,
             }),
             _ => None,
-        }
-        .unwrap_or_default();
+        };
+        let rid = raw.and_then(embed_rid).unwrap_or_default();
+        let bordered = raw.map(raw_has_outline).unwrap_or(false);
         // Image display size: px -> twips (15 per px at 96 dpi) -> cells.
         let bw = (px_w as f32 * 15.0 * cpt).round().max(3.0) as i32;
         let bh = (px_h as f32 * 15.0 * rpt).round().max(3.0) as i32;
@@ -1235,6 +1282,7 @@ fn render_floating_canvas(
             w: bw,
             h: bh,
             label: format!("image {px_w}×{px_h}"),
+            bordered,
         });
     }
     if places.is_empty() {
@@ -1276,18 +1324,30 @@ fn render_floating_canvas(
     let mut grid: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
     for p in &places {
         let top = p.r - min_r;
-        draw_box_into(&mut grid, top, p.c, p.w, p.h, &p.label);
-        // Interior rect (inside the border) for a real-pixel overlay.
-        if !p.rid.is_empty() {
-            let rows = (p.h - 1).max(1) as usize;
+        // Only stamp an outline into the canvas when the document defines one;
+        // otherwise the picture is borderless (the app paints it, or a fallback
+        // box if it can't).
+        if p.bordered {
+            draw_box_into(&mut grid, top, p.c, p.w, p.h, &p.label);
+        }
+        {
+            let (row, col, w, h) = if p.bordered {
+                // Inside the outline.
+                (top + 1, p.c + 1, (p.w - 1).max(1), (p.h - 1).max(1))
+            } else {
+                (top, p.c, p.w.max(1), p.h.max(1))
+            };
+            let rows = h.max(0) as usize;
             images.push(ImageBox {
                 rid: p.rid.clone(),
-                row: (top + 1).max(0) as usize,
-                col: (p.c + 1).max(0) as usize,
-                cols: (p.w - 1).max(1) as usize,
+                row: row.max(0) as usize,
+                col: col.max(0) as usize,
+                cols: w as usize,
                 rows,
                 src_row: 0,
                 full_rows: rows,
+                bordered: p.bordered,
+                label: p.label.clone(),
             });
         }
     }
@@ -1805,6 +1865,8 @@ fn paginate(
                         rows: seg_end - seg_start,
                         src_row: ib.src_row + (seg_start - ib.row),
                         full_rows: ib.full_rows,
+                        bordered: ib.bordered,
+                        label: ib.label.clone(),
                     });
                 }
             }
@@ -1976,30 +2038,47 @@ mod tests {
     fn drawing_renders_as_image_box() {
         let raw = "<w:r><w:drawing><wp:inline><wp:extent cx=\"3048000\" cy=\"1524000\"/></wp:inline></w:drawing></w:r>";
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let joined: String = render(&d, &opts(60))
+        // The picture is reported as an image region (with a fallback caption) but,
+        // having no document-defined outline, draws no border in the text itself.
+        let (lines, _m, imgs) = render_with_images(&d, &opts(60));
+        let joined: String = lines
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
+        assert_eq!(imgs.len(), 1, "expected one image region");
+        assert!(!imgs[0].bordered);
+        assert_eq!(imgs[0].label, "image 320×160");
         assert!(
-            joined.contains('┌') && joined.contains('┘'),
-            "no image box: {joined}"
-        );
-        assert!(
-            joined.contains("image 320×160"),
-            "missing size label: {joined}"
+            !joined.contains('┌'),
+            "borderless image should draw no box: {joined:?}"
         );
 
-        // A non-drawing raw (e.g. a bookmark) stays invisible.
+        // A non-drawing raw (e.g. a bookmark) is not an image at all.
         let d2 = doc(vec![para(vec![Inline::Raw(
             "<w:bookmarkStart/>".to_string(),
         )])]);
-        let joined2: String = render(&d2, &opts(60))
+        let (_l, _m, imgs2) = render_with_images(&d2, &opts(60));
+        assert!(imgs2.is_empty());
+    }
+
+    #[test]
+    fn drawing_with_outline_keeps_its_border() {
+        // A picture the document outlines (VML stroked) keeps a drawn border.
+        let raw = "<w:r><w:pict><v:shape style=\"width:240pt;height:120pt\" stroked=\"t\">\
+                   <v:imagedata r:id=\"r\"/></v:shape></w:pict></w:r>";
+        let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
+        let (lines, _m, imgs) = render_with_images(&d, &opts(60));
+        let joined: String = lines
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!joined2.contains('┌'));
+        assert!(imgs[0].bordered);
+        assert!(
+            joined.contains('┌') && joined.contains('┘'),
+            "outline not drawn: {joined:?}"
+        );
     }
 
     fn vml_img(w: u32, h: u32) -> String {
@@ -2032,17 +2111,12 @@ mod tests {
             framed_para(1081, 2521, vml_img(72, 72)), // ~9% across
             framed_para(8000, 2521, vml_img(72, 72)), // ~65% across, same y
         ]);
-        let lines = render(&d, &opts(100));
-        let joined: String = lines
-            .iter()
-            .map(|l| l.plain())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains('┌'), "no projected boxes:\n{joined}");
-        let row_with_two = lines.iter().any(|l| l.plain().matches('┌').count() == 2);
-        assert!(
-            row_with_two,
-            "images were not placed side by side:\n{joined}"
+        let (_l, _m, imgs) = render_with_images(&d, &opts(100));
+        assert_eq!(imgs.len(), 2, "expected two image regions: {imgs:?}");
+        assert_eq!(imgs[0].row, imgs[1].row, "same y should share a row");
+        assert_ne!(
+            imgs[0].col, imgs[1].col,
+            "far-apart x should differ in column"
         );
     }
 
@@ -2087,15 +2161,13 @@ mod tests {
             para(vec![run("Graphics", RunProps::default())]),
             framed_para(1081, 9361, vml_img(72, 72)), // a lower image
         ]);
-        let texts: Vec<String> = render(&d, &opts(100)).iter().map(|l| l.plain()).collect();
+        let (lines, _m, imgs) = render_with_images(&d, &opts(100));
+        let texts: Vec<String> = lines.iter().map(|l| l.plain()).collect();
         let heading = texts
             .iter()
             .position(|s| s.contains("Graphics"))
             .expect("heading line");
-        let last_box = texts
-            .iter()
-            .rposition(|s| s.contains('┌'))
-            .expect("a box line");
+        let last_box = imgs.iter().map(|i| i.row).max().expect("an image region");
         assert!(
             heading <= 1,
             "heading should be at the very top, got line {heading}"
@@ -2125,18 +2197,9 @@ mod tests {
             },
             content: vec![Inline::Raw(vml_img(72, 72))],
         });
-        let lines = render(&doc(vec![left, right]), &opts(100));
-        // The rightmost box corner (by column) should be far to the right.
-        let max_c = lines
-            .iter()
-            .flat_map(|l| {
-                let s = l.plain();
-                s.match_indices('┌')
-                    .map(|(i, _)| s[..i].chars().count())
-                    .collect::<Vec<_>>()
-            })
-            .max()
-            .unwrap_or(0);
+        let (_l, _m, imgs) = render_with_images(&doc(vec![left, right]), &opts(100));
+        // The right-aligned image should project to a far-right column.
+        let max_c = imgs.iter().map(|i| i.col).max().unwrap_or(0);
         assert!(
             max_c > 50,
             "right-aligned image should be far right, got col {max_c}"
@@ -2170,19 +2233,12 @@ mod tests {
         let raw = "<w:r><w:pict><v:shape id=\"i\" type=\"#t75\" style=\"width:192pt;height:2in\">\
             <v:imagedata r:id=\"rId7\" o:title=\"\"/></v:shape></w:pict></w:r>";
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let joined: String = render(&d, &opts(60))
-            .iter()
-            .map(|l| l.plain())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            joined.contains('┌') && joined.contains('┘'),
-            "no image box: {joined}"
-        );
-        assert!(
-            joined.contains("image 256×192"),
-            "missing size label: {joined}"
-        );
+        let (_l, _m, imgs) = render_with_images(&d, &opts(60));
+        // No explicit stroke → borderless, but reported with rid and caption.
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].rid, "rId7");
+        assert!(!imgs[0].bordered);
+        assert_eq!(imgs[0].label, "image 256×192");
     }
 
     #[test]
@@ -2831,6 +2887,8 @@ mod tests {
             rows: n,
             src_row: 0,
             full_rows: n,
+            bordered: false,
+            label: String::new(),
         }];
         paginate(image_pairs(n), &o, geom, &mut imgs, &pl);
 
@@ -2876,6 +2934,8 @@ mod tests {
             rows: img_h,
             src_row: 0,
             full_rows: img_h,
+            bordered: false,
+            label: String::new(),
         }];
         paginate(pairs, &o, geom, &mut imgs, &pl);
 
