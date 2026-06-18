@@ -526,17 +526,33 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
     let mut row = Row::default();
+    parse_cells_into(p, rels, &mut row.cells);
+    row
+}
+
+/// Collect the cells of a row (or a `<w:sdtContent>` within it), unwrapping
+/// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`).
+fn parse_cells_into(p: &mut XmlParser, rels: &Relationships, cells: &mut Vec<Cell>) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:tc" => row.cells.push(parse_cell(p, rels)),
+                "w:tc" => cells.push(parse_cell(p, rels)),
+                "w:sdt" => loop {
+                    match p.next() {
+                        Event::Start if p.name() == "w:sdtContent" => {
+                            parse_cells_into(p, rels, cells)
+                        }
+                        Event::Start => p.skip_element(),
+                        Event::End | Event::Eof => break,
+                        Event::Text => {}
+                    }
+                },
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
-    row
 }
 
 fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
