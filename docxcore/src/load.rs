@@ -274,6 +274,12 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:numPr" => parse_numpr(p, props),
+                "w:sectPr" => {
+                    // A mid-document section break — preserve it verbatim.
+                    let start = p.start_pos();
+                    p.skip_element();
+                    props.section_break = Some(p.raw_slice(start, p.pos()).to_string());
+                }
                 "w:framePr" => {
                     props.frame = Some(FramePr {
                         x: frame_int(p, "w:x"),

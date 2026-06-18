@@ -111,6 +111,10 @@ pub struct ParProps {
     /// Legacy text-frame positioning (`w:framePr`): floats the paragraph to an
     /// absolute page/margin position. Present only for "floating" content.
     pub frame: Option<FramePr>,
+    /// A section break: the verbatim `<w:sectPr>` XML carried in this paragraph's
+    /// `pPr`, describing the section that **ends** here (page size/orientation/
+    /// margins/headers). Preserved on save and used for per-section print layout.
+    pub section_break: Option<String>,
 }
 
 /// A `w:framePr` text frame: absolute placement in twips (1/1440 inch).

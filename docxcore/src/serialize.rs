@@ -85,7 +85,8 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.num_id.is_some()
         || props.align != Align::Left
         || props.rtl
-        || props.frame.is_some();
+        || props.frame.is_some()
+        || props.section_break.is_some();
     if !has_any {
         return;
     }
@@ -146,6 +147,10 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     }
     if props.rtl {
         s.push_str("<w:bidi/>");
+    }
+    // A section break (`<w:sectPr>`) is the last pPr child.
+    if let Some(sect) = &props.section_break {
+        s.push_str(sect);
     }
     s.push_str("</w:pPr>");
 }
@@ -406,6 +411,24 @@ mod tests {
             ilvl: 1,
             rtl: true,
             frame: None,
+            section_break: None,
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("x", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn section_break_roundtrips() {
+        // A mid-document section break (different page size/orientation) must
+        // survive a save instead of being dropped.
+        let pp = ParProps {
+            section_break: Some(
+                "<w:sectPr><w:pgSz w:w=\"15840\" w:h=\"12240\" w:orient=\"landscape\"/></w:sectPr>"
+                    .to_string(),
+            ),
+            ..ParProps::default()
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],
