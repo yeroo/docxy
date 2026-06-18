@@ -86,7 +86,8 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.align != Align::Left
         || props.rtl
         || props.frame.is_some()
-        || props.section_break.is_some();
+        || props.section_break.is_some()
+        || !props.tabs.is_empty();
     if !has_any {
         return;
     }
@@ -138,6 +139,28 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
             props.ilvl, num
         ));
+    }
+    if !props.tabs.is_empty() {
+        s.push_str("<w:tabs>");
+        for t in &props.tabs {
+            let val = match t.align {
+                TabAlign::Center => "center",
+                TabAlign::Right => "right",
+                TabAlign::Left => "left",
+            };
+            s.push_str(&format!("<w:tab w:val=\"{val}\""));
+            let leader = match t.leader {
+                TabLeader::Dot => Some("dot"),
+                TabLeader::Hyphen => Some("hyphen"),
+                TabLeader::Underscore => Some("underscore"),
+                TabLeader::None => None,
+            };
+            if let Some(l) = leader {
+                s.push_str(&format!(" w:leader=\"{l}\""));
+            }
+            s.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
+        }
+        s.push_str("</w:tabs>");
     }
     match props.align {
         Align::Left => {}
@@ -412,6 +435,32 @@ mod tests {
             rtl: true,
             frame: None,
             section_break: None,
+            tabs: Vec::new(),
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("x", RunProps::default())])],
+        };
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn direct_tab_stops_roundtrip() {
+        // A TOC-style paragraph with direct `w:tabs` (a left indent stop plus a
+        // right-aligned dot-leader stop for the page number) must survive a save.
+        let pp = ParProps {
+            tabs: vec![
+                TabStop {
+                    pos: 960,
+                    align: TabAlign::Left,
+                    leader: TabLeader::None,
+                },
+                TabStop {
+                    pos: 8630,
+                    align: TabAlign::Right,
+                    leader: TabLeader::Dot,
+                },
+            ],
+            ..ParProps::default()
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],

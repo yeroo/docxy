@@ -353,6 +353,7 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:numPr" => parse_numpr(p, props),
+                "w:tabs" => parse_tab_stops(p, &mut props.tabs),
                 "w:sectPr" => {
                     // A mid-document section break — preserve it verbatim.
                     let start = p.start_pos();
@@ -388,6 +389,39 @@ fn frame_int(p: &XmlParser, name: &str) -> Option<i32> {
 fn frame_str(p: &XmlParser, name: &str) -> Option<String> {
     let v = p.attr(name);
     (!v.is_empty()).then(|| decode_attr(v))
+}
+
+fn parse_tab_stops(p: &mut XmlParser, tabs: &mut Vec<TabStop>) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "w:tab" {
+                    let val = p.attr("w:val");
+                    if val != "clear" {
+                        let align = match val {
+                            "right" | "end" => TabAlign::Right,
+                            "center" => TabAlign::Center,
+                            _ => TabAlign::Left,
+                        };
+                        let leader = match p.attr("w:leader") {
+                            "dot" | "middleDot" => TabLeader::Dot,
+                            "hyphen" => TabLeader::Hyphen,
+                            "underscore" => TabLeader::Underscore,
+                            _ => TabLeader::None,
+                        };
+                        tabs.push(TabStop {
+                            pos: parse_int(p.attr("w:pos")).max(0),
+                            align,
+                            leader,
+                        });
+                    }
+                }
+                p.skip_element();
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
 }
 
 fn parse_numpr(p: &mut XmlParser, props: &mut ParProps) {

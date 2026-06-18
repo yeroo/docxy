@@ -115,6 +115,8 @@ pub struct ParProps {
     /// `pPr`, describing the section that **ends** here (page size/orientation/
     /// margins/headers). Preserved on save and used for per-section print layout.
     pub section_break: Option<String>,
+    /// Direct tab stops (`w:tabs`), which override the paragraph style's.
+    pub tabs: Vec<TabStop>,
 }
 
 /// A `w:framePr` text frame: absolute placement in twips (1/1440 inch).

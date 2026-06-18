@@ -544,10 +544,14 @@ fn flatten_para(
     avail: usize,
 ) -> Vec<Seg> {
     let inv = opts.show_invisibles;
-    // Tab stops (from the paragraph style) projected to columns. The page text
-    // width maps to `avail` cells, so a right tab near the margin lands near the
-    // right edge in either view.
-    let tab_stops = opts.styles.effective_tabs(para.props.style_id.as_deref());
+    // Tab stops (direct `w:tabs`, else the paragraph style's) projected to
+    // columns. The page text width maps to `avail` cells, so a right tab near the
+    // margin lands near the right edge in either view.
+    let tab_stops = if para.props.tabs.is_empty() {
+        opts.styles.effective_tabs(para.props.style_id.as_deref())
+    } else {
+        para.props.tabs.clone()
+    };
     let text_twips = (opts.page.w - opts.page.ml - opts.page.mr).max(1) as f32;
     let tab_col =
         |pos: i32| ((pos.max(0) as f32 * (avail as f32 / text_twips)).round() as usize).min(avail);
@@ -2077,6 +2081,43 @@ mod tests {
         });
         let line = render(&doc(vec![p]), &o)[0].plain();
         assert!(line.starts_with("Title"), "{line:?}");
+        assert!(line.contains("...."), "no dot leader: {line:?}");
+        assert!(
+            line.trim_end().ends_with('9'),
+            "page number not right-aligned: {line:?}"
+        );
+    }
+
+    #[test]
+    fn direct_ppr_tabs_render_dot_leader() {
+        // A deeper TOC entry (e.g. "1.1 Motivation") carries its tab stops on the
+        // paragraph's own `pPr`, not its style. The direct stops must drive the
+        // dot leader and right-aligned page number even with no style tabs.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                tabs: vec![
+                    TabStop {
+                        pos: 960,
+                        align: TabAlign::Left,
+                        leader: TabLeader::None,
+                    },
+                    TabStop {
+                        pos: 8630,
+                        align: TabAlign::Right,
+                        leader: TabLeader::Dot,
+                    },
+                ],
+                ..Default::default()
+            },
+            content: vec![
+                run("1.1", RunProps::default()),
+                Inline::Tab,
+                run("Motivation", RunProps::default()),
+                Inline::Tab,
+                run("9", RunProps::default()),
+            ],
+        });
+        let line = render(&doc(vec![p]), &opts(50))[0].plain();
         assert!(line.contains("...."), "no dot leader: {line:?}");
         assert!(
             line.trim_end().ends_with('9'),
