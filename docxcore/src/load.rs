@@ -547,6 +547,8 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
                 "w:tcPr" => parse_tcpr(p, &mut cell),
                 "w:p" => cell.blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => cell.blocks.push(Block::Table(parse_table(p, rels))),
+                // Unwrap content controls nested in a cell (cover-page titles etc.).
+                "w:sdt" => parse_sdt_block(p, rels, &mut cell.blocks),
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
