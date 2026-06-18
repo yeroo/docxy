@@ -509,6 +509,19 @@ struct Glyph {
     style: Style,
     link: Option<Rc<str>>,
     src: Option<usize>,
+    /// Set on the first cell of a small inline image (e.g. an equation) embedded
+    /// in the text flow. The remaining cells are blank fillers reserving its width.
+    img: Option<Rc<InlineImg>>,
+}
+
+/// A small inline picture placed within a line of text (its width is reserved by
+/// blank filler glyphs; the app paints the pixels over them).
+struct InlineImg {
+    rid: String,
+    cols: usize,
+    rows: usize,
+    bordered: bool,
+    label: String,
 }
 
 /// Style for invisible-character marks: a muted gray.
@@ -593,6 +606,7 @@ fn flatten_para(
                 style: st,
                 link,
                 src: Some(mc),
+                img: None,
             }
         } else {
             Glyph {
@@ -601,6 +615,7 @@ fn flatten_para(
                 style: style.clone(),
                 link,
                 src: Some(mc),
+                img: None,
             }
         };
         g.style.highlight = sel_at(mc);
@@ -697,6 +712,7 @@ fn flatten_para(
                         style,
                         link: None,
                         src: Some(mc),
+                        img: None,
                     });
                 }
                 mc += 1;
@@ -711,6 +727,7 @@ fn flatten_para(
                                 style: invis_style(),
                                 link: None,
                                 src: None,
+                                img: None,
                             });
                         }
                         segs.push(Seg {
@@ -729,9 +746,27 @@ fn flatten_para(
                 }
                 mc += 1;
             }
-            // SmartArt/diagram text is rendered as a box after the paragraph, not
-            // inline; both contribute no glyphs to the paragraph's text flow.
-            Inline::SmartArt { .. } | Inline::Raw(_) => {}
+            // A small inline picture (e.g. an equation) flows in the text: reserve
+            // its width with blank, non-breaking filler cells and tag the first so
+            // the line emitter can place the overlay. Larger images and SmartArt are
+            // drawn as blocks after the paragraph instead.
+            Inline::Raw(raw) => {
+                if let Some(img) = inline_image(raw) {
+                    let rc = Rc::new(img);
+                    let w = rc.cols;
+                    for i in 0..w.max(1) {
+                        segs.last_mut().unwrap().glyphs.push(Glyph {
+                            ch: '\u{00a0}', // non-breaking: keep the image on one line
+                            disp: Some(' '),
+                            style: Style::default(),
+                            link: None,
+                            src: None,
+                            img: (i == 0).then(|| rc.clone()),
+                        });
+                    }
+                }
+            }
+            Inline::SmartArt { .. } => {}
         }
     }
     if inv {
@@ -741,6 +776,7 @@ fn flatten_para(
             style: invis_style(),
             link: None,
             src: None,
+            img: None,
         });
     }
     segs
@@ -937,7 +973,30 @@ fn render_paragraph(
                 col0: prefix_cols,
                 cols,
             };
+            // Place any inline images sitting on this line and reserve the rows
+            // their pixels extend below the text baseline.
+            let row = out.len();
+            let mut reserve = 0usize;
+            for (i, g) in gl.iter().enumerate() {
+                if let Some(img) = &g.img {
+                    images.push(ImageBox {
+                        rid: img.rid.clone(),
+                        row,
+                        col: prefix_cols + i,
+                        cols: img.cols,
+                        rows: img.rows,
+                        src_row: 0,
+                        full_rows: img.rows,
+                        bordered: img.bordered,
+                        label: img.label.clone(),
+                    });
+                    reserve = reserve.max(img.rows.saturating_sub(1));
+                }
+            }
             out.push((line, LineMap::one(lseg)));
+            for _ in 0..reserve {
+                out.push((Line { spans: Vec::new() }, LineMap::default()));
+            }
             line_idx += 1;
         }
     }
@@ -960,6 +1019,11 @@ fn render_paragraph(
                     out.extend(text_box(&blocks, width, opts));
                     continue;
                 }
+            }
+            // Small inline pictures (equations) were already placed in the text
+            // flow above; only larger images get their own block box here.
+            if inline_image(raw).is_some() {
+                continue;
             }
             if let Some((pw, ph)) = raw_image_extent(raw) {
                 let (pw, ph) = (pw as usize, ph as usize);
@@ -1133,21 +1197,37 @@ fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, 
 }
 
 /// A dim bordered box standing in for an image (the graphics fallback).
-/// Size an image's placeholder box (interior `cols`×`rows`, in cells) from its
-/// pixel size and the available width. A terminal cell is ~8×16px (2:1
-/// tall:wide), so `pw/8` × `ph/16` preserves aspect ratio. Small images — inline
-/// equations are only a few rows tall and otherwise crush to an unreadable line —
-/// are magnified (aspect kept) up to a legible minimum height, bounded by width.
+/// Size a block image's placeholder box (interior `cols`×`rows`, in cells) from
+/// its pixel size and the available width. A terminal cell is ~8×16px (2:1
+/// tall:wide), so `pw/8` × `ph/16` preserves aspect ratio. Only larger pictures
+/// reach this path; small ones (e.g. equations) flow inline via [`inline_image`].
 fn image_box_cells(pw: usize, ph: usize, width: usize) -> (usize, usize) {
-    const MIN_ROWS: f32 = 4.0;
-    let max_cols = width.saturating_sub(2).max(10) as f32;
-    let base_c = (pw as f32 / 8.0).max(1.0);
-    let base_r = (ph as f32 / 16.0).max(1.0);
-    // Magnify so the box is at least MIN_ROWS tall, but never wider than the page.
-    let up = (MIN_ROWS / base_r).clamp(1.0, (max_cols / base_c).max(1.0));
-    let cols = (base_c * up).round().clamp(10.0, max_cols) as usize;
-    let rows = (base_r * up).round().clamp(3.0, 24.0) as usize;
+    let max_cols = width.saturating_sub(2).max(10);
+    let cols = (pw / 8).clamp(10, max_cols);
+    let rows = (ph / 16).clamp(3, 24);
     (cols, rows)
+}
+
+/// A small inline picture (e.g. an equation) that should flow within the text
+/// line, at its natural size (a cell is ~8×16px). Returns `None` for images too
+/// tall to sit inline, which are drawn as their own block instead.
+fn inline_image(raw: &str) -> Option<InlineImg> {
+    const INLINE_MAX_ROWS: usize = 3;
+    let (pw, ph) = raw_image_extent(raw)?;
+    let (pw, ph) = (pw as f32, ph as f32);
+    let rows = (ph / 16.0).round().max(1.0) as usize;
+    if rows > INLINE_MAX_ROWS {
+        return None;
+    }
+    // Width preserves aspect at that height (a cell is ~2× taller than wide).
+    let cols = ((pw / ph) * rows as f32 * 2.0).round().clamp(1.0, 40.0) as usize;
+    Some(InlineImg {
+        rid: embed_rid(raw).unwrap_or_default(),
+        cols,
+        rows,
+        bordered: raw_has_outline(raw),
+        label: format!("image {}×{}", pw as usize, ph as usize),
+    })
 }
 
 /// Whether the document gives a picture a visible outline. Conservative: when in
@@ -2081,6 +2161,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn small_inline_equation_flows_in_the_text() {
+        // A small inline object (an equation ~93×27px) sits within the line: text
+        // before it, a reserved gap for the picture, then text after it — not a
+        // detached block below the paragraph.
+        let eq = "<w:r><w:object><v:shape style=\"width:69.75pt;height:20.25pt\">\
+                  <v:imagedata r:id=\"rEq\"/></v:shape></w:object></w:r>";
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![
+                run("If ", RunProps::default()),
+                Inline::Raw(eq.to_string()),
+                run(", then x.", RunProps::default()),
+            ],
+        });
+        let (lines, _m, imgs) = render_with_images(&doc(vec![p]), &opts(60));
+        assert_eq!(imgs.len(), 1, "one inline image");
+        let ib = &imgs[0];
+        assert_eq!(ib.rid, "rEq");
+        assert!(ib.rows <= 3, "inline image should stay small: {ib:?}");
+        // It sits on the first line (with the text), not on a block after it.
+        let text_row = lines.iter().position(|l| l.plain().contains("If")).unwrap();
+        assert_eq!(ib.row, text_row, "image should share the text's line");
+        // The picture's column falls between "If " and the following ", then x.".
+        assert!(ib.col >= 3, "image should follow 'If ': {ib:?}");
+        assert!(
+            lines[text_row].plain().contains(", then x."),
+            "text continues on the same line after the picture"
+        );
+    }
+
     fn vml_img(w: u32, h: u32) -> String {
         format!(
             "<w:r><w:pict><v:shape style=\"width:{w}pt;height:{h}pt\"><v:imagedata r:id=\"r\"/></v:shape></w:pict></w:r>"
@@ -2841,20 +2952,27 @@ mod tests {
     }
 
     #[test]
-    fn small_image_is_magnified_keeping_aspect() {
-        // A wide, short inline equation (~114×24px) must not crush to a sliver:
-        // it is magnified to a legible height with its aspect ratio preserved.
-        let (c, r) = image_box_cells(114, 24, 90);
-        assert!(r >= 4, "equation too short to read: {c}×{r}");
-        assert!(c >= 30, "equation not magnified in proportion: {c}×{r}");
-        // Stays much wider than tall (a one-line formula), not stretched square.
-        assert!(c > r * 3, "aspect ratio not preserved: {c}×{r}");
+    fn small_image_flows_inline_not_as_block() {
+        // A short, wide equation (~114×24px) is handled inline, so the block-box
+        // sizer is never asked to magnify it.
+        let raw = "<w:r><w:pict><v:shape style=\"width:85.5pt;height:18pt\">\
+                   <v:imagedata r:id=\"r\"/></v:shape></w:pict></w:r>";
+        let img = inline_image(raw).expect("small image flows inline");
+        assert!(img.rows <= 3, "inline image too tall: {}", img.rows);
+        assert!(img.cols > img.rows, "one-line formula stays wide");
     }
 
     #[test]
     fn large_image_keeps_natural_cell_size() {
         // A comfortably-sized image (320×160px) is left at its natural projection.
         assert_eq!(image_box_cells(320, 160, 90), (40, 10));
+        assert!(
+            inline_image(
+                "<w:r><w:drawing><wp:inline><wp:extent cx=\"3048000\" cy=\"1524000\"/>\
+             </wp:inline></w:drawing></w:r>"
+            )
+            .is_none()
+        );
     }
 
     /// `n` blank lines, all tagged as image-placeholder lines.
