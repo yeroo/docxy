@@ -956,20 +956,19 @@ fn render_paragraph(
             }
             if let Some((pw, ph)) = raw_image_extent(raw) {
                 let (pw, ph) = (pw as usize, ph as usize);
-                let cols = (pw / 8).clamp(10, width.saturating_sub(2).max(10));
-                let rows = (ph / 16).clamp(2, 20);
-                let interior = rows.saturating_sub(2).max(1);
+                let (cols, rows) = image_box_cells(pw, ph, width);
                 if let Some(rid) = embed_rid(raw) {
-                    // Overlay covers the box interior only (between the borders), so
-                    // pixels never spill past the box's bottom edge.
+                    // Overlay fills the whole placeholder box (borders included) for
+                    // the largest legible area, exactly aligned so pixels never spill
+                    // past it onto the page frame.
                     images.push(ImageBox {
                         rid,
-                        row: out.len() + 1,
-                        col: 1,
-                        cols,
-                        rows: interior,
+                        row: out.len(),
+                        col: 0,
+                        cols: cols + 2,
+                        rows,
                         src_row: 0,
-                        full_rows: interior,
+                        full_rows: rows,
                     });
                 }
                 let mut boxed = image_box(cols, rows, &format!("image {pw}×{ph}"));
@@ -1112,6 +1111,23 @@ fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, 
 }
 
 /// A dim bordered box standing in for an image (the graphics fallback).
+/// Size an image's placeholder box (interior `cols`×`rows`, in cells) from its
+/// pixel size and the available width. A terminal cell is ~8×16px (2:1
+/// tall:wide), so `pw/8` × `ph/16` preserves aspect ratio. Small images — inline
+/// equations are only a few rows tall and otherwise crush to an unreadable line —
+/// are magnified (aspect kept) up to a legible minimum height, bounded by width.
+fn image_box_cells(pw: usize, ph: usize, width: usize) -> (usize, usize) {
+    const MIN_ROWS: f32 = 4.0;
+    let max_cols = width.saturating_sub(2).max(10) as f32;
+    let base_c = (pw as f32 / 8.0).max(1.0);
+    let base_r = (ph as f32 / 16.0).max(1.0);
+    // Magnify so the box is at least MIN_ROWS tall, but never wider than the page.
+    let up = (MIN_ROWS / base_r).clamp(1.0, (max_cols / base_c).max(1.0));
+    let cols = (base_c * up).round().clamp(10.0, max_cols) as usize;
+    let rows = (base_r * up).round().clamp(3.0, 24.0) as usize;
+    (cols, rows)
+}
+
 fn image_box(cols: usize, rows: usize, label: &str) -> Vec<(Line, LineMap)> {
     let cols = cols.max(8);
     let rows = rows.max(3);
@@ -2766,6 +2782,23 @@ mod tests {
         assert_eq!(row.segs[1].path, vec![0, 0, 1, 0]);
         // Cell B's segment starts to the right of cell A's.
         assert!(row.segs[1].col0 > row.segs[0].col0);
+    }
+
+    #[test]
+    fn small_image_is_magnified_keeping_aspect() {
+        // A wide, short inline equation (~114×24px) must not crush to a sliver:
+        // it is magnified to a legible height with its aspect ratio preserved.
+        let (c, r) = image_box_cells(114, 24, 90);
+        assert!(r >= 4, "equation too short to read: {c}×{r}");
+        assert!(c >= 30, "equation not magnified in proportion: {c}×{r}");
+        // Stays much wider than tall (a one-line formula), not stretched square.
+        assert!(c > r * 3, "aspect ratio not preserved: {c}×{r}");
+    }
+
+    #[test]
+    fn large_image_keeps_natural_cell_size() {
+        // A comfortably-sized image (320×160px) is left at its natural projection.
+        assert_eq!(image_box_cells(320, 160, 90), (40, 10));
     }
 
     /// `n` blank lines, all tagged as image-placeholder lines.
