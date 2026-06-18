@@ -51,6 +51,18 @@ impl Package {
             .map(|(_, b)| b.as_slice())
     }
 
+    /// Replace the bytes of an existing part (e.g. an edited header/footer).
+    /// Returns false if no such part exists.
+    pub fn set_part(&mut self, name: &str, bytes: Vec<u8>) -> bool {
+        match self.parts.iter_mut().find(|(n, _)| n == name) {
+            Some(e) => {
+                e.1 = bytes;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Page size/margins from the captured `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
         use crate::model::PageGeom;

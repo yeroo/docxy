@@ -17,13 +17,14 @@ use std::process::ExitCode;
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
-use docxcore::model::{Align, Block};
+use docxcore::model::{Align, Block, Document};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
     render_with_images,
 };
+use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use std::rc::Rc;
 
@@ -125,6 +126,7 @@ fn print_usage() {
            Ctrl-F find / replace (Tab toggles replace, Ctrl-A replaces all)\n  \
            Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q / Esc quit\n  \
            F2 page view   F3 show marks   F4 table borders\n  \
+           F6 edit header   F7 edit footer   (Esc returns)\n  \
            mouse: click to move · click a link to open it · wheel to scroll"
     );
 }
@@ -241,6 +243,15 @@ struct ImgState {
     proto: Protocol,
 }
 
+/// Active focus-edit of a header/footer: the body editor is parked here while the
+/// main editor temporarily operates on the header/footer document.
+struct HfEdit {
+    body: Editor,
+    is_header: bool,
+    part: String,
+    saved_page_view: bool,
+}
+
 struct App {
     pkg: Package,
     editor: Editor,
@@ -265,6 +276,11 @@ struct App {
     footers: PageParts,
     title_page: bool,
     even_odd: bool,
+    /// Part names of the default header/footer (for editing/saving), if present.
+    header_part: Option<String>,
+    footer_part: Option<String>,
+    /// Active header/footer focus-edit, if any.
+    hf_edit: Option<HfEdit>,
     vim: Option<VimState>,
     pending_link: Option<String>,
     /// (caret, visual row) hint to disambiguate wrap boundaries during j/k.
@@ -314,6 +330,8 @@ impl App {
             .part("word/settings.xml")
             .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
             .unwrap_or(false);
+        let header_part = hf_part_name(&pkg, &rels, "headerReference");
+        let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -337,6 +355,9 @@ impl App {
             footers,
             title_page,
             even_odd,
+            header_part,
+            footer_part,
+            hf_edit: None,
             vim: if vim { Some(VimState::new()) } else { None },
             pending_link: None,
             vrow_hint: None,
@@ -559,7 +580,82 @@ impl App {
         self.status = None;
     }
 
+    /// Enter focus-editing of the default header (or footer): park the body
+    /// editor and point the main editor at the header/footer document.
+    fn enter_hf_edit(&mut self, is_header: bool) {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let part = if is_header {
+            &self.header_part
+        } else {
+            &self.footer_part
+        };
+        let Some(part) = part.clone() else {
+            self.status = Some(format!(
+                "This document has no {}.",
+                if is_header { "header" } else { "footer" }
+            ));
+            self.dirty = true;
+            return;
+        };
+        let blocks = if is_header {
+            &self.headers.default
+        } else {
+            &self.footers.default
+        };
+        let new_editor = Editor::new(Document {
+            body: blocks.as_ref().clone(),
+        });
+        let body = std::mem::replace(&mut self.editor, new_editor);
+        let saved_page_view = self.page_view;
+        self.page_view = false;
+        self.editor.clear_selection();
+        self.hf_edit = Some(HfEdit {
+            body,
+            is_header,
+            part,
+            saved_page_view,
+        });
+        self.status = Some(format!(
+            "Editing {} — Esc/F6/F7 to return",
+            if is_header { "header" } else { "footer" }
+        ));
+        self.dirty = true;
+    }
+
+    /// Return from header/footer editing, committing the edits (splice back into
+    /// the part and update the print-layout source) when `commit`.
+    fn exit_hf_edit(&mut self, commit: bool) {
+        let Some(hf) = self.hf_edit.take() else {
+            return;
+        };
+        let edited = std::mem::replace(&mut self.editor, hf.body);
+        if commit {
+            let blocks = edited.doc.body;
+            let rc = Rc::new(blocks.clone());
+            if hf.is_header {
+                self.headers.default = rc;
+            } else {
+                self.footers.default = rc;
+            }
+            let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
+            if let Some(orig) = self.pkg.part(&hf.part) {
+                let orig = String::from_utf8_lossy(orig).into_owned();
+                let new_xml = splice_hf(&orig, &blocks, tag);
+                self.pkg.set_part(&hf.part, new_xml.into_bytes());
+            }
+            self.modified = true;
+        }
+        self.page_view = hf.saved_page_view;
+        self.dirty = true;
+    }
+
     fn save(&mut self) {
+        // Commit any in-progress header/footer edit first.
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
         self.pkg.document = self.editor.doc.clone();
         let bytes = save_package(&self.pkg);
         match std::fs::write(&self.path, &bytes) {
@@ -1259,6 +1355,13 @@ impl App {
             self.dirty = true;
             return false;
         }
+        // Header/footer focus-edit: Esc / F6 / F7 returns to the body (committing).
+        if self.hf_edit.is_some()
+            && matches!(key.code, KeyCode::Esc | KeyCode::F(6) | KeyCode::F(7))
+        {
+            self.exit_hf_edit(true);
+            return false;
+        }
         if self.find.is_some() {
             return self.on_find_key(key);
         }
@@ -1425,6 +1528,8 @@ impl App {
                 self.borderless = !self.borderless;
                 self.dirty = true;
             }
+            KeyCode::F(6) => self.enter_hf_edit(true),
+            KeyCode::F(7) => self.enter_hf_edit(false),
             _ => {}
         }
         false
@@ -1481,8 +1586,14 @@ impl App {
         let total_lines = self.lines.len().max(1);
         let (cr, cc) = caret.map(|(r, c)| (r + 1, c + 1)).unwrap_or((0, 0));
         let dirty_mark = if self.modified { "*" } else { " " };
+        let surface = match &self.hf_edit {
+            Some(hf) if hf.is_header => "[HEADER] ",
+            Some(_) => "[FOOTER] ",
+            None => "",
+        };
         let left = format!(
-            " {}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{} ",
+            " {}{}{}  │  ln {cr} col {cc}  │  {} lines  │  pg:{} marks:{} brd:{} ",
+            surface,
             dirty_mark,
             self.path,
             total_lines,
@@ -1704,6 +1815,37 @@ fn attr_value(el: &str, key: &str) -> Option<String> {
     Some(rest[..e].to_string())
 }
 
+/// The package part name of the default header/footer (for editing/saving).
+fn hf_part_name(pkg: &Package, rels: &Relationships, kind: &str) -> Option<String> {
+    let rid = ref_rid(pkg.sect_pr(), kind, "default")?;
+    let target = rels.target(&rid)?;
+    Some(match target.strip_prefix('/') {
+        Some(r) => r.to_string(),
+        None => format!("word/{}", target.trim_start_matches("./")),
+    })
+}
+
+/// Replace the inner content of a preserved header/footer part with serialized
+/// blocks, keeping the original `<w:hdr …>` wrapper (and its namespaces).
+fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let (Some(os), Some(ce)) = (original.find(&open), original.find(&close)) else {
+        return original.to_string();
+    };
+    let Some(inner_start) = original[os..].find('>').map(|e| os + e + 1) else {
+        return original.to_string();
+    };
+    if inner_start > ce {
+        return original.to_string();
+    }
+    let mut out = String::with_capacity(original.len() + 64);
+    out.push_str(&original[..inner_start]);
+    out.push_str(&blocks_to_xml(blocks));
+    out.push_str(&original[ce..]);
+    out
+}
+
 /// Dispatch one terminal event. Returns true if the app should quit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
@@ -1813,6 +1955,36 @@ mod tests {
     }
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn splice_hf_preserves_wrapper_and_replaces_content() {
+        // Editing a header must keep the original <w:hdr> wrapper (namespaces!)
+        // and re-parse cleanly.
+        let orig = "<?xml version=\"1.0\"?><w:hdr xmlns:w=\"x\" xmlns:v=\"y\">\
+            <w:p><w:r><w:t>old text</w:t></w:r></w:p></w:hdr>";
+        let blocks = vec![MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "new text".to_string(),
+                props: RunProps::default(),
+            })],
+        }]
+        .into_iter()
+        .map(Block::Paragraph)
+        .collect::<Vec<_>>();
+        let out = splice_hf(orig, &blocks, "w:hdr");
+        assert!(out.starts_with("<?xml"));
+        assert!(out.contains("xmlns:v=\"y\""), "namespaces lost: {out}");
+        assert!(
+            out.contains("new text") && !out.contains("old text"),
+            "{out}"
+        );
+        assert!(out.ends_with("</w:hdr>"));
+        // And it re-parses to the new content.
+        let parsed = parse_header_footer(&out, &Relationships::default());
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(&parsed[0], Block::Paragraph(p) if p.plain_text() == "new text"));
     }
 
     fn app_with(paras: &[&str]) -> App {
