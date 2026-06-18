@@ -189,6 +189,21 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     Vec::new()
 }
 
+/// Unwrap a block-level `<w:sdt>` (content control), appending the block content
+/// of its `<w:sdtContent>` to `out`. `sdtPr`/`sdtEndPr` are ignored.
+fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>) {
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:sdtContent" => out.extend(parse_blocks_until_end(p, rels)),
+                _ => p.skip_element(),
+            },
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
 /// Parse a sequence of block-level children up to the enclosing End event.
 fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block> {
     let mut blocks = Vec::new();
@@ -197,6 +212,10 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
             Event::Start => match p.name() {
                 "w:p" => blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => blocks.push(Block::Table(parse_table(p, rels))),
+                // A block-level structured-document-tag (content control: cover
+                // pages, TOC, …) — unwrap and parse its content so it's visible.
+                // The control wrapper itself is not reconstructed on save.
+                "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
                 // sectPr is preserved by the package layer; don't duplicate it.
                 "w:sectPr" => p.skip_element(),
                 _ => {

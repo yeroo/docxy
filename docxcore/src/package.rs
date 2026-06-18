@@ -410,9 +410,10 @@ mod tests {
         let docx = make_docx(body);
         let pkg1 = load_package(&docx).expect("load");
 
-        // The model has Raw placeholders for the unmodeled parts.
+        // Bookmarks/drawings stay Raw; the block-level sdt is unwrapped so its
+        // content (the "ctrl" paragraph) is visible.
         assert_eq!(pkg1.document.body.len(), 3);
-        assert!(matches!(pkg1.document.body[2], Block::Raw(_)));
+        assert_eq!(pkg1.document.body[2].plain_text(), "ctrl");
         if let Block::Paragraph(p) = &pkg1.document.body[1] {
             assert!(matches!(p.content[0], Inline::Raw(_))); // the drawing run
         } else {
@@ -423,9 +424,9 @@ mod tests {
         let text = String::from_utf8_lossy(&saved);
         assert!(text.contains("w:bookmarkStart"), "bookmark lost");
         assert!(text.contains("<w:drawing>"), "drawing lost");
-        assert!(text.contains("<w:sdt>"), "content control lost");
+        assert!(text.contains("ctrl"), "sdt content lost");
 
-        // And a full round-trip is lossless.
+        // And a full round-trip is stable (the unwrapped content stays unwrapped).
         let pkg2 = load_package(&saved).expect("reload");
         assert_eq!(pkg1.document, pkg2.document);
     }
