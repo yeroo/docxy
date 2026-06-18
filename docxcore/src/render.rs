@@ -530,7 +530,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
                 w += h.runs.iter().map(|r| r.text.chars().count()).sum::<usize>()
             }
             Inline::Tab | Inline::Break(_) => break,
-            Inline::Raw(_) => {}
+            Inline::SmartArt { .. } | Inline::Raw(_) => {}
         }
     }
     w
@@ -710,7 +710,9 @@ fn flatten_para(
                 }
                 mc += 1;
             }
-            Inline::Raw(_) => {} // zero-length, invisible (preserved for save only)
+            // SmartArt/diagram text is rendered as a box after the paragraph, not
+            // inline; both contribute no glyphs to the paragraph's text flow.
+            Inline::SmartArt { .. } | Inline::Raw(_) => {}
         }
     }
     if inv {
@@ -923,6 +925,13 @@ fn render_paragraph(
     // Drawings (images) inside the paragraph become a sized placeholder box,
     // emitted after the paragraph text. (Real pixels are overlaid by the app.)
     for item in &para.content {
+        // A SmartArt diagram: the shapes can't be drawn in a terminal, so show the
+        // diagram's node text in a labeled box.
+        if let Inline::SmartArt { text, .. } = item {
+            let blocks = smartart_blocks(text);
+            out.extend(text_box(&blocks, width, opts));
+            continue;
+        }
         if let Inline::Raw(raw) = item {
             // A text box (`<w:txbxContent>` inside a drawing/VML shape): render its
             // text in a box rather than treating the shape as opaque/an image.
@@ -1035,6 +1044,27 @@ fn css_len_px(s: &str, key: &str) -> Option<u32> {
 }
 
 /// Render a text box's block content inside a dim bordered frame (non-editable).
+/// Turn a SmartArt diagram's node text into renderable blocks: a "SmartArt"
+/// caption followed by one paragraph per node, so `text_box` can frame it.
+fn smartart_blocks(text: &[String]) -> Vec<Block> {
+    use crate::model::{Inline, Paragraph, Run, RunProps};
+    let para = |s: &str, bold: bool| {
+        Block::Paragraph(Paragraph {
+            props: Default::default(),
+            content: vec![Inline::Run(Run {
+                text: s.to_string(),
+                props: RunProps {
+                    bold,
+                    ..Default::default()
+                },
+            })],
+        })
+    };
+    let mut blocks = vec![para("SmartArt", true)];
+    blocks.extend(text.iter().map(|t| para(t, false)));
+    blocks
+}
+
 fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, LineMap)> {
     let inner = width.saturating_sub(4).max(8);
     let content = render_blocks(blocks, &[], inner, opts, &mut Vec::new());
@@ -2122,6 +2152,30 @@ mod tests {
         assert!(
             line.trim_end().ends_with('9'),
             "page number not right-aligned: {line:?}"
+        );
+    }
+
+    #[test]
+    fn smartart_renders_node_text_in_box() {
+        // A diagram's shapes can't be drawn in a terminal, so its node text shows
+        // in a labeled box.
+        let sa = Inline::SmartArt {
+            raw: "<w:r><w:drawing/></w:r>".to_string(),
+            text: vec!["Plan".to_string(), "Build".to_string(), "Ship".to_string()],
+        };
+        let joined: String = render(&doc(vec![para(vec![sa])]), &opts(40))
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("SmartArt"), "missing caption:\n{joined}");
+        assert!(
+            joined.contains("Plan") && joined.contains("Build") && joined.contains("Ship"),
+            "missing node text:\n{joined}"
+        );
+        assert!(
+            joined.contains('┌') && joined.contains('└'),
+            "not boxed:\n{joined}"
         );
     }
 

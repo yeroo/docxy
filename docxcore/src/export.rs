@@ -314,6 +314,19 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                 }
             }
             Inline::Break(_) => segs.push(Vec::new()),
+            // SmartArt: the terminal can't draw the diagram, so lay its node text
+            // out as plain lines ("SmartArt" caption first) in the PDF too.
+            Inline::SmartArt { text, .. } => {
+                for line in std::iter::once("SmartArt").chain(text.iter().map(|s| s.as_str())) {
+                    if !segs.last().map(|s| s.is_empty()).unwrap_or(true) {
+                        segs.push(Vec::new());
+                    }
+                    for ch in line.chars() {
+                        segs.last_mut().unwrap().push(plain_cell(ch));
+                    }
+                    segs.push(Vec::new());
+                }
+            }
             Inline::Raw(_) => {}
         }
     }

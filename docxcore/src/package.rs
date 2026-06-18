@@ -194,11 +194,27 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
     let doc_index = doc_index.ok_or(LoadError::MissingDocument)?;
 
     let doc_xml = std::str::from_utf8(&parts[doc_index].1).map_err(|_| LoadError::NotUtf8)?;
-    let rels = parts
+    let read_part = |name: &str| {
+        parts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+    };
+    let mut rels = parts
         .iter()
         .find(|(n, _)| n == "word/_rels/document.xml.rels")
         .map(|(_, b)| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
         .unwrap_or_default();
+    if let Some((_, b)) = parts
+        .iter()
+        .find(|(n, _)| n == "word/_rels/document.xml.rels")
+    {
+        let xml = std::str::from_utf8(b).unwrap_or("");
+        crate::load::set_diagram_texts(
+            &mut rels,
+            crate::load::collect_diagram_texts(xml, read_part),
+        );
+    }
     let document = parse_document_xml(doc_xml, &rels);
     let sect_pr = extract_sectpr(doc_xml);
 

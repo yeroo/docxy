@@ -205,6 +205,7 @@ fn write_inline(s: &mut String, item: &Inline) {
             }
             s.push_str("</w:hyperlink>");
         }
+        Inline::SmartArt { raw, .. } => s.push_str(raw),
         Inline::Raw(raw) => s.push_str(raw),
     }
 }
@@ -441,6 +442,26 @@ mod tests {
             body: vec![para(pp, vec![run("x", RunProps::default())])],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn smartart_serializes_raw_verbatim() {
+        // SmartArt carries the original run XML for lossless save; the extracted
+        // node text is render-only and must not leak into the saved document.
+        let raw = "<w:r><w:drawing><a:graphicData uri=\"x/diagram\">\
+                   <dgm:relIds r:dm=\"rId5\"/></a:graphicData></w:drawing></w:r>";
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![Inline::SmartArt {
+                    raw: raw.to_string(),
+                    text: vec!["Build".to_string(), "Ship".to_string()],
+                }],
+            )],
+        };
+        let xml = document_to_xml(&d);
+        assert!(xml.contains(raw), "raw drawing not preserved:\n{xml}");
+        assert!(!xml.contains("Build"), "render-only text leaked into save");
     }
 
     #[test]

@@ -79,6 +79,14 @@ pub enum Inline {
     Hyperlink(Hyperlink),
     Break(BreakKind),
     Tab,
+    /// A SmartArt / DrawingML diagram. `raw` is the original run XML, preserved
+    /// verbatim for lossless save; `text` is the diagram's node text, extracted
+    /// from the external diagram part at load time. The terminal can't draw the
+    /// diagram's shapes, so the renderer shows this text in a box instead.
+    SmartArt {
+        raw: String,
+        text: Vec<String>,
+    },
     /// Verbatim XML for inline content we don't model (images/fields/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
@@ -92,6 +100,7 @@ impl Inline {
             Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
             Inline::Tab => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
+            Inline::SmartArt { text, .. } => text.join("\n"),
             Inline::Raw(_) => String::new(),
         }
     }

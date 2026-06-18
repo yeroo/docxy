@@ -1001,7 +1001,8 @@ fn inline_len(i: &Inline) -> usize {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),
         Inline::Tab | Inline::Break(_) => 1,
-        Inline::Raw(_) => 0, // zero-length, invisible (preserved for save only)
+        // Zero-length, invisible in the editor (preserved for save only).
+        Inline::SmartArt { .. } | Inline::Raw(_) => 0,
     }
 }
 
@@ -1054,6 +1055,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             }
             Inline::Tab => out.push(Inline::Tab),
             Inline::Break(k) => out.push(Inline::Break(*k)),
+            Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
+                raw: raw.clone(),
+                text: text.clone(),
+            }),
             Inline::Raw(s) => out.push(Inline::Raw(s.clone())),
         }
     }
@@ -1131,7 +1136,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                     runs_insert(&mut h.runs, local, ch);
                     return;
                 }
-                Inline::Tab | Inline::Break(_) | Inline::Raw(_) => {
+                Inline::Tab | Inline::Break(_) | Inline::SmartArt { .. } | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
                             if let Inline::Run(r) = &mut content[i - 1] {
@@ -1199,7 +1204,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                         content.remove(i);
                     }
                 }
-                Inline::Tab | Inline::Break(_) | Inline::Raw(_) => {
+                Inline::Tab | Inline::Break(_) | Inline::SmartArt { .. } | Inline::Raw(_) => {
                     content.remove(i);
                 }
             }
@@ -1269,7 +1274,7 @@ fn range_all_have(
                 }
             }
             Inline::Tab | Inline::Break(_) => pos += 1,
-            Inline::Raw(_) => {} // zero-length
+            Inline::SmartArt { .. } | Inline::Raw(_) => {} // zero-length
         }
     }
     saw
@@ -1360,7 +1365,8 @@ fn set_prop_range(
                 out.push(Inline::Break(k));
                 pos += 1;
             }
-            Inline::Raw(s) => out.push(Inline::Raw(s)), // zero-length, unchanged
+            // zero-length, unchanged
+            inline @ (Inline::SmartArt { .. } | Inline::Raw(_)) => out.push(inline),
         }
     }
     *content = out;

@@ -43,10 +43,13 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// `rId` -> (target, is_external) from a `.rels` part.
+/// `rId` -> (target, is_external) from a `.rels` part, plus SmartArt node text
+/// keyed by the diagram-data relationship id (`<dgm:relIds r:dm>`), resolved from
+/// the external diagram parts at load time.
 #[derive(Debug, Default, Clone)]
 pub struct Relationships {
     map: HashMap<String, (String, bool)>,
+    diagrams: HashMap<String, Vec<String>>,
 }
 
 impl Relationships {
@@ -78,7 +81,12 @@ pub fn load(data: &[u8]) -> Result<Document, LoadError> {
         .ok_or(LoadError::MissingDocument)?;
     let doc_xml = std::str::from_utf8(&doc_bytes).map_err(|_| LoadError::NotUtf8)?;
     let rels = match zip.read("word/_rels/document.xml.rels") {
-        Some(b) => parse_rels_xml(std::str::from_utf8(&b).unwrap_or("")),
+        Some(b) => {
+            let xml = std::str::from_utf8(&b).unwrap_or("").to_string();
+            let mut r = parse_rels_xml(&xml);
+            r.diagrams = collect_diagram_texts(&xml, |n| zip.read(n));
+            r
+        }
         None => Relationships::default(),
     };
     Ok(parse_document_xml(doc_xml, &rels))
@@ -152,6 +160,114 @@ pub fn parse_rels_xml(xml: &str) -> Relationships {
         }
     }
     rels
+}
+
+/// Resolve every SmartArt diagram's node text, keyed by its `diagramData`
+/// relationship id. The drawing in `document.xml` only references the diagram via
+/// `<dgm:relIds r:dm="rIdN">`; the actual node text lives in the external
+/// `word/diagrams/dataN.xml` part, which we read and flatten here.
+pub(crate) fn collect_diagram_texts<F>(rels_xml: &str, read_part: F) -> HashMap<String, Vec<String>>
+where
+    F: Fn(&str) -> Option<Vec<u8>>,
+{
+    let mut out = HashMap::new();
+    let mut p = XmlParser::new(rels_xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "Relationship" {
+                    let ty = p.attr("Type");
+                    if ty.ends_with("/diagramData") {
+                        let id = decode_attr(p.attr("Id"));
+                        let target = decode_attr(p.attr("Target"));
+                        if !id.is_empty() && !target.is_empty() {
+                            let part = resolve_word_part(&target);
+                            if let Some(b) = read_part(&part) {
+                                let texts =
+                                    extract_diagram_text(std::str::from_utf8(&b).unwrap_or(""));
+                                if !texts.is_empty() {
+                                    out.insert(id, texts);
+                                }
+                            }
+                        }
+                    }
+                    p.skip_element();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Attach resolved SmartArt diagram text to a `Relationships`, keyed by the
+/// diagram-data relationship id. Public so the package loader can reuse it.
+pub(crate) fn set_diagram_texts(rels: &mut Relationships, diagrams: HashMap<String, Vec<String>>) {
+    rels.diagrams = diagrams;
+}
+
+/// Resolve a relationship `Target` (relative to `word/`) to a package part name,
+/// collapsing any leading `../` segments.
+fn resolve_word_part(target: &str) -> String {
+    let t = target.trim_start_matches('/');
+    let mut base = vec!["word"];
+    for seg in t.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                base.pop();
+            }
+            s => base.push(s),
+        }
+    }
+    base.join("/")
+}
+
+/// Pull the ordered node text out of a diagram data part (`<a:t>` runs inside the
+/// `<dgm:dataModel>` point list). Blank nodes (layout placeholders) are dropped.
+fn extract_diagram_text(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "a:t" => {
+                let t = read_text(&mut p);
+                let t = t.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+            }
+            Event::Start => {}
+            Event::End => {}
+            Event::Text => {}
+            Event::Eof => break,
+        }
+    }
+    out
+}
+
+/// Build a `SmartArt` inline if `raw` is a diagram drawing whose text we resolved,
+/// otherwise fall back to preserving the run verbatim as `Raw`.
+fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
+    if let Some(dm) = raw_attr(&raw, ":dm=\"") {
+        if let Some(text) = rels.diagrams.get(&dm) {
+            return Inline::SmartArt {
+                raw,
+                text: text.clone(),
+            };
+        }
+    }
+    Inline::Raw(raw)
+}
+
+/// The quoted value of the first attribute whose text ends with `key` (e.g.
+/// `:dm="`), used to read namespace-prefixed relationship ids out of raw XML.
+fn raw_attr(s: &str, key: &str) -> Option<String> {
+    let i = s.find(key)? + key.len();
+    let rest = &s[i..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 // ---- document ----
@@ -242,9 +358,10 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     let start = p.start_pos();
                     let mut tmp = Vec::new();
                     if parse_run(p, &mut tmp) {
-                        // Run held a drawing/field/etc. — preserve it verbatim.
-                        para.content
-                            .push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
+                        // Run held a drawing/field/etc. SmartArt becomes a text box;
+                        // anything else is preserved verbatim.
+                        let raw = p.raw_slice(start, p.pos()).to_string();
+                        para.content.push(drawing_inline(raw, rels));
                     } else {
                         para.content.extend(tmp);
                     }
@@ -297,7 +414,8 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     let start = p.start_pos();
                     let mut tmp = Vec::new();
                     if parse_run(p, &mut tmp) {
-                        out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
+                        let raw = p.raw_slice(start, p.pos()).to_string();
+                        out.push(drawing_inline(raw, rels));
                     } else {
                         out.extend(tmp);
                     }
@@ -724,6 +842,56 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    #[test]
+    fn extracts_diagram_node_text() {
+        // Node text from a diagram data part, with blank placeholder nodes dropped
+        // and multi-run nodes kept as separate entries (matching `<a:t>` order).
+        let xml = "<dgm:dataModel><dgm:ptLst>\
+            <dgm:pt><dgm:t><a:p><a:r><a:t>Build</a:t></a:r></a:p></dgm:t></dgm:pt>\
+            <dgm:pt><dgm:t><a:p><a:r><a:t>  </a:t></a:r></a:p></dgm:t></dgm:pt>\
+            <dgm:pt><dgm:t><a:p><a:r><a:t>Ship</a:t></a:r></a:p></dgm:t></dgm:pt>\
+            </dgm:ptLst></dgm:dataModel>";
+        assert_eq!(
+            extract_diagram_text(xml),
+            vec!["Build".to_string(), "Ship".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_diagram_part_name() {
+        assert_eq!(
+            resolve_word_part("diagrams/data1.xml"),
+            "word/diagrams/data1.xml"
+        );
+        assert_eq!(
+            resolve_word_part("../customXml/item1.xml"),
+            "customXml/item1.xml"
+        );
+    }
+
+    #[test]
+    fn diagram_run_becomes_smartart() {
+        let rels_xml = "<Relationships><Relationship Id=\"rId5\" \
+            Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData\" \
+            Target=\"diagrams/data1.xml\"/></Relationships>";
+        let data = b"<a:t>Hello</a:t>".to_vec();
+        let diagrams = collect_diagram_texts(rels_xml, |n| {
+            (n == "word/diagrams/data1.xml").then(|| data.clone())
+        });
+        assert_eq!(diagrams.get("rId5"), Some(&vec!["Hello".to_string()]));
+
+        let mut rels = parse_rels_xml(rels_xml);
+        set_diagram_texts(&mut rels, diagrams);
+        let xml = "<w:document><w:body><w:p><w:r><w:drawing>\
+            <a:graphicData uri=\"x/diagram\"><dgm:relIds r:dm=\"rId5\"/></a:graphicData>\
+            </w:drawing></w:r></w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &rels);
+        match &first_para(&d).content[0] {
+            Inline::SmartArt { text, .. } => assert_eq!(text, &vec!["Hello".to_string()]),
+            other => panic!("expected SmartArt, got {other:?}"),
+        }
     }
 
     fn first_para(d: &Document) -> &Paragraph {
