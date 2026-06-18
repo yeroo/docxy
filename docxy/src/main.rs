@@ -586,41 +586,58 @@ impl App {
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
-        let part = if is_header {
-            &self.header_part
+        let what = if is_header { "header" } else { "footer" };
+        // Resolve the part, creating one from scratch if the document has none.
+        let existing = if is_header {
+            self.header_part.clone()
         } else {
-            &self.footer_part
+            self.footer_part.clone()
         };
-        let Some(part) = part.clone() else {
-            self.status = Some(format!(
-                "This document has no {}.",
-                if is_header { "header" } else { "footer" }
-            ));
-            self.dirty = true;
-            return;
+        let part = match existing {
+            Some(p) => p,
+            None => match self.pkg.create_hf(is_header) {
+                Some(p) => {
+                    if is_header {
+                        self.header_part = Some(p.clone());
+                    } else {
+                        self.footer_part = Some(p.clone());
+                    }
+                    self.modified = true;
+                    self.status = Some(format!("Created a {what}."));
+                    p
+                }
+                None => {
+                    self.status = Some(format!("Couldn't create a {what}."));
+                    self.dirty = true;
+                    return;
+                }
+            },
         };
-        let blocks = if is_header {
+        // Start from the current content, or one empty paragraph if new/empty.
+        let src = if is_header {
             &self.headers.default
         } else {
             &self.footers.default
         };
-        let new_editor = Editor::new(Document {
-            body: blocks.as_ref().clone(),
-        });
-        let body = std::mem::replace(&mut self.editor, new_editor);
+        let body = if src.is_empty() {
+            vec![Block::Paragraph(docxcore::model::Paragraph::default())]
+        } else {
+            src.as_ref().clone()
+        };
+        let new_editor = Editor::new(Document { body });
+        let parked = std::mem::replace(&mut self.editor, new_editor);
         let saved_page_view = self.page_view;
         self.page_view = false;
         self.editor.clear_selection();
         self.hf_edit = Some(HfEdit {
-            body,
+            body: parked,
             is_header,
             part,
             saved_page_view,
         });
-        self.status = Some(format!(
-            "Editing {} — Esc/F6/F7 to return",
-            if is_header { "header" } else { "footer" }
-        ));
+        if self.status.is_none() {
+            self.status = Some(format!("Editing {what} — Esc/F6/F7 to return"));
+        }
         self.dirty = true;
     }
 

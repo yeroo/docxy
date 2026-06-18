@@ -63,6 +63,67 @@ impl Package {
         }
     }
 
+    /// Create a new, empty default header (`is_header`) or footer part and wire it
+    /// up: add the part, a `[Content_Types].xml` override, a relationship in
+    /// `document.xml.rels`, and a `<w:headerReference>`/`<w:footerReference>` in
+    /// the section properties. Returns the new part name.
+    pub fn create_hf(&mut self, is_header: bool) -> Option<String> {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let (kind, tag, ct, reltype) = if is_header {
+            (
+                "header",
+                "w:hdr",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+                "header",
+            )
+        } else {
+            (
+                "footer",
+                "w:ftr",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+                "footer",
+            )
+        };
+        // Unused part name word/{kind}{n}.xml.
+        let mut n = 1;
+        while self.part(&format!("word/{kind}{n}.xml")).is_some() {
+            n += 1;
+        }
+        let target = format!("{kind}{n}.xml");
+        let part_name = format!("word/{target}");
+
+        // A fresh relationship id from document.xml.rels.
+        let rels_name = "word/_rels/document.xml.rels";
+        let rels_xml = String::from_utf8_lossy(self.part(rels_name)?).into_owned();
+        let rid = next_rid(&rels_xml);
+
+        // The part itself (one empty paragraph).
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p/></{tag}>"
+        );
+        self.parts.push((part_name.clone(), body.into_bytes()));
+
+        // Relationship.
+        let rel =
+            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{reltype}\" Target=\"{target}\"/>");
+        let new_rels = rels_xml.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
+        self.set_part(rels_name, new_rels.into_bytes());
+
+        // Content-type override.
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct_xml = String::from_utf8_lossy(b).into_owned();
+            let ov = format!("<Override PartName=\"/{part_name}\" ContentType=\"{ct}\"/>");
+            let new_ct = ct_xml.replacen("</Types>", &format!("{ov}</Types>"), 1);
+            self.set_part("[Content_Types].xml", new_ct.into_bytes());
+        }
+
+        // Section reference (must be the first child of sectPr).
+        let reference = format!("<w:{kind}Reference w:type=\"default\" r:id=\"{rid}\"/>");
+        self.sect_pr = inject_sect_child(&self.sect_pr, &reference);
+        Some(part_name)
+    }
+
     /// Page size/margins from the captured `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
         use crate::model::PageGeom;
@@ -91,6 +152,41 @@ fn sect_attr(sect: &str, tag: &str, attr: &str) -> Option<i32> {
     let rest = &el[kstart..];
     let end = rest.find('"')?;
     rest[..end].parse().ok()
+}
+
+/// The next free relationship id (`rId{max+1}`) for a `.rels` part.
+fn next_rid(rels: &str) -> String {
+    let mut max = 0u32;
+    let mut i = 0;
+    while let Some(p) = rels[i..].find("Id=\"rId") {
+        let s = i + p + "Id=\"rId".len();
+        let num: String = rels[s..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = num.parse::<u32>() {
+            max = max.max(n);
+        }
+        i = s;
+    }
+    format!("rId{}", max + 1)
+}
+
+/// Insert a child element as the first child of `<w:sectPr>` (creating/expanding
+/// the element as needed). References must precede other section properties.
+fn inject_sect_child(sect: &str, child: &str) -> String {
+    if sect.is_empty() {
+        return format!("<w:sectPr>{child}</w:sectPr>");
+    }
+    let Some(gt) = sect.find('>') else {
+        return sect.to_string();
+    };
+    if sect[..gt].ends_with('/') {
+        // Self-closing <w:sectPr .../> — expand it.
+        return format!("{}>{child}</w:sectPr>", &sect[..gt - 1]);
+    }
+    let (head, tail) = sect.split_at(gt + 1);
+    format!("{head}{child}{tail}")
 }
 
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
@@ -224,6 +320,49 @@ mod tests {
         <w:p><w:r><w:t>World</w:t></w:r></w:p>\
         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
         </w:body></w:document>";
+
+    #[test]
+    fn create_header_from_scratch_wires_everything() {
+        use crate::model::{Block, Document, Paragraph};
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        let name = pkg.create_hf(true).expect("created header");
+        assert_eq!(name, "word/header1.xml");
+        assert!(pkg.part(&name).is_some(), "header part missing");
+        let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
+        assert!(
+            ct.contains("/word/header1.xml") && ct.contains("header+xml"),
+            "no content type: {ct}"
+        );
+        let rels =
+            String::from_utf8_lossy(pkg.part("word/_rels/document.xml.rels").unwrap()).into_owned();
+        assert!(
+            rels.contains("Target=\"header1.xml\""),
+            "no relationship: {rels}"
+        );
+        assert!(
+            pkg.sect_pr().contains("headerReference"),
+            "no sectPr ref: {}",
+            pkg.sect_pr()
+        );
+
+        // Survives a save + reload, and the reference lands in the saved document.
+        let bytes = save_package(&pkg);
+        let re = load_package(&bytes).expect("reload");
+        assert!(re.part("word/header1.xml").is_some());
+        let doc_xml = String::from_utf8_lossy(re.part("word/document.xml").unwrap()).into_owned();
+        assert!(
+            doc_xml.contains("w:headerReference"),
+            "ref not saved: {doc_xml}"
+        );
+
+        // A second create picks the next name and id.
+        let mut pkg2 = pkg;
+        let name2 = pkg2.create_hf(false).expect("created footer");
+        assert_eq!(name2, "word/footer1.xml");
+        assert!(pkg2.sect_pr().contains("footerReference"));
+    }
 
     #[test]
     fn roundtrip_preserves_model_parts_and_sectpr() {
