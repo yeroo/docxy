@@ -412,24 +412,29 @@ impl App {
         }
     }
 
-    /// Ensure `img_cache[rid]` holds a protocol encoding exactly the visible
-    /// window `(wtop, wh, w)` (box-relative cells) of the image scaled to its
-    /// full box. `None` is cached when the bytes are missing or undecodable
+    /// Ensure `img_cache[key]` holds a protocol encoding exactly the visible
+    /// window `(wtop, wh, w)` (cells, where `wtop` is absolute in the full image)
+    /// of the image `rid` scaled to its full height `br`. A split image uses a
+    /// distinct `key` per slice so simultaneously-visible slices don't thrash one
+    /// cache entry. `None` is cached when the bytes are missing or undecodable
     /// (e.g. WMF/EMF) so the placeholder box stays.
     fn refresh_image(
         &mut self,
+        key: &str,
         rid: &str,
         bc: usize,
         br: usize,
-        fw: usize,
-        fh: usize,
         win: (usize, usize, usize),
     ) {
         let Some(picker) = self.picker.as_ref() else {
             return;
         };
+        let (fw, fh) = {
+            let fs = picker.font_size();
+            (fs.0 as usize, fs.1 as usize)
+        };
         let (wtop, wh, w) = win;
-        let rebuild = match self.img_cache.get(rid) {
+        let rebuild = match self.img_cache.get(key) {
             Some(Some(st)) => st.box_cols != bc || st.box_rows != br,
             Some(None) => return,
             None => true,
@@ -468,7 +473,7 @@ impl App {
                     .or_else(|| metafile::render(b, pw, ph).map(image::DynamicImage::ImageRgba8))
             });
             let Some(src) = src else {
-                self.img_cache.insert(rid.to_string(), None);
+                self.img_cache.insert(key.to_string(), None);
                 return;
             };
             let resized = src.resize_exact(pw, ph, image::imageops::FilterType::Triangle);
@@ -479,10 +484,10 @@ impl App {
                 win,
                 proto,
             });
-            self.img_cache.insert(rid.to_string(), entry);
+            self.img_cache.insert(key.to_string(), entry);
             return;
         }
-        if let Some(Some(st)) = self.img_cache.get_mut(rid) {
+        if let Some(Some(st)) = self.img_cache.get_mut(key) {
             if st.win != win {
                 if let Some(proto) = encode(picker, &st.resized) {
                     st.proto = proto;
@@ -495,13 +500,9 @@ impl App {
     /// Overlay decoded image pixels onto their placeholder boxes, cropping (not
     /// scaling) at the viewport edges as they scroll.
     fn draw_images(&mut self, f: &mut Frame, content: Rect) {
-        let (fw, fh) = match &self.picker {
-            Some(p) => {
-                let fs = p.font_size();
-                (fs.0 as usize, fs.1 as usize)
-            }
-            None => return,
-        };
+        if self.picker.is_none() {
+            return; // no terminal graphics support
+        }
         let (scroll, vh) = (self.scroll, self.viewport_h);
         for ib in self.images.clone() {
             // Visible window of the box, in box-relative cells.
@@ -517,8 +518,17 @@ impl App {
             }
             let x = content.x + ib.col as u16;
             let y = content.y + (ib.row + wtop - scroll) as u16;
-            self.refresh_image(&ib.rid, ib.cols, ib.rows, fw, fh, (wtop, wh, w));
-            if let Some(Some(st)) = self.img_cache.get(&ib.rid) {
+            // Crop the source band for this slice: absolute top within the full
+            // image is the slice's offset plus the scrolled-away rows.
+            let key = format!("{}#{}", ib.rid, ib.src_row);
+            self.refresh_image(
+                &key,
+                &ib.rid,
+                ib.cols,
+                ib.full_rows,
+                (ib.src_row + wtop, wh, w),
+            );
+            if let Some(Some(st)) = self.img_cache.get(&key) {
                 let rect = Rect {
                     x,
                     y,

@@ -189,6 +189,9 @@ pub struct LineMap {
     /// In print layout, marks a hard page break: paginate starts a new page here
     /// and does not render this (placeholder) line.
     pub page_break: bool,
+    /// Marks an image placeholder line. Pagination keeps a contiguous run of these
+    /// together on one page when the image fits, rather than cutting it.
+    pub image: bool,
 }
 
 impl LineMap {
@@ -196,6 +199,7 @@ impl LineMap {
         LineMap {
             segs: vec![seg],
             page_break: false,
+            image: false,
         }
     }
     /// The segment containing the caret (path + offset), if any.
@@ -272,7 +276,8 @@ impl Default for RenderOptions {
 /// Where an embedded image's placeholder box was laid out, so the app can
 /// overlay real pixels onto it. Coordinates are in rendered cells: `row`/`col`
 /// are the box's top-left; `cols`/`rows` are the **interior** size (excludes the
-/// 1-cell border).
+/// 1-cell border). A tall image split across page boundaries yields one
+/// `ImageBox` per page, each a vertical slice of the same source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageBox {
     /// Relationship id (`r:embed` / `r:id`) used to resolve the media bytes.
@@ -280,7 +285,14 @@ pub struct ImageBox {
     pub row: usize,
     pub col: usize,
     pub cols: usize,
+    /// Height of *this* slice in cells (the whole image when not split).
     pub rows: usize,
+    /// Cell-rows of the image lying above this slice (0 for the first/only slice).
+    /// The app crops the source from here so each page shows its own band.
+    pub src_row: usize,
+    /// The image's full height in cells across all slices (== `rows` when whole).
+    /// The app scales the decoded source to this height before cropping.
+    pub full_rows: usize,
 }
 
 /// The relationship id of an embedded image from its raw run XML — DrawingML
@@ -946,17 +958,25 @@ fn render_paragraph(
                 let (pw, ph) = (pw as usize, ph as usize);
                 let cols = (pw / 8).clamp(10, width.saturating_sub(2).max(10));
                 let rows = (ph / 16).clamp(2, 20);
+                let interior = rows.saturating_sub(2).max(1);
                 if let Some(rid) = embed_rid(raw) {
-                    // Box top border is at the current row; interior starts at +1/+1.
+                    // Overlay covers the box interior only (between the borders), so
+                    // pixels never spill past the box's bottom edge.
                     images.push(ImageBox {
                         rid,
                         row: out.len() + 1,
                         col: 1,
                         cols,
-                        rows,
+                        rows: interior,
+                        src_row: 0,
+                        full_rows: interior,
                     });
                 }
-                out.extend(image_box(cols, rows, &format!("image {pw}×{ph}")));
+                let mut boxed = image_box(cols, rows, &format!("image {pw}×{ph}"));
+                for (_, map) in &mut boxed {
+                    map.image = true;
+                }
+                out.extend(boxed);
             }
         }
     }
@@ -1243,12 +1263,15 @@ fn render_floating_canvas(
         draw_box_into(&mut grid, top, p.c, p.w, p.h, &p.label);
         // Interior rect (inside the border) for a real-pixel overlay.
         if !p.rid.is_empty() {
+            let rows = (p.h - 1).max(1) as usize;
             images.push(ImageBox {
                 rid: p.rid.clone(),
                 row: (top + 1).max(0) as usize,
                 col: (p.c + 1).max(0) as usize,
                 cols: (p.w - 1).max(1) as usize,
-                rows: (p.h - 1).max(1) as usize,
+                rows,
+                src_row: 0,
+                full_rows: rows,
             });
         }
     }
@@ -1589,7 +1612,7 @@ fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
     geom: PageGeom,
-    images: &mut [ImageBox],
+    images: &mut Vec<ImageBox>,
     pl: &PageLines,
 ) -> Vec<(Line, LineMap)> {
     let m = page_metrics(opts.width, geom);
@@ -1636,9 +1659,26 @@ fn paginate(
     let col_off = m.center + 1 + m.ml; // border + left margin + centering
     let total_in = pairs.len();
 
+    // The height of the contiguous image run starting at each line (0 if the line
+    // is not the first of an image run), so a whole image that fits on a page can
+    // be kept together rather than cut at the boundary.
+    let img_flags: Vec<bool> = pairs.iter().map(|(_, m)| m.image).collect();
+    let run_height = |i: usize| -> usize {
+        if !img_flags[i] || (i > 0 && img_flags[i - 1]) {
+            return 0; // not the start of an image run
+        }
+        let mut h = 0;
+        while i + h < img_flags.len() && img_flags[i + h] {
+            h += 1;
+        }
+        h
+    };
+
     // Assign each content line to a page, honoring hard page breaks (the marker
-    // lines force the next line onto a new page and are themselves dropped).
+    // lines force the next line onto a new page and are themselves dropped) and
+    // keeping page-sized images intact.
     let mut items: Vec<(usize, Line, LineMap, usize)> = Vec::new(); // (idx, line, map, page)
+    let mut line_page = vec![usize::MAX; total_in];
     let mut row = 0usize;
     let mut pg = 0usize;
     for (idx, (ln, map)) in pairs.into_iter().enumerate() {
@@ -1649,10 +1689,19 @@ fn paginate(
             }
             continue;
         }
+        // An image that fits on a page but not in the space left starts the next
+        // page instead of being split. Taller-than-page images fall through and
+        // are cut across pages below.
+        let h = run_height(idx);
+        if h > 0 && h <= m.content_rows && row > 0 && row + h > m.content_rows {
+            pg += 1;
+            row = 0;
+        }
         if row == m.content_rows {
             pg += 1;
             row = 0;
         }
+        line_page[idx] = pg;
         items.push((idx, ln, map, pg));
         row += 1;
     }
@@ -1705,15 +1754,48 @@ fn paginate(
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
     }
 
-    // Remap floating-image placements into the paginated layout.
-    for ib in images.iter_mut() {
-        if let Some(&nr) = new_row.get(ib.row) {
-            if nr != usize::MAX {
-                ib.row = nr;
-                ib.col += col_off;
+    // Remap image placements into the paginated layout. An image whose interior
+    // lines landed on more than one page is emitted as one slice per page (each a
+    // vertical band of the same source) so it is cut cleanly at the boundary and
+    // never drawn over a page border.
+    let mut placed_imgs: Vec<ImageBox> = Vec::new();
+    for ib in images.iter() {
+        let mut seg_start = ib.row;
+        let end = ib.row + ib.rows;
+        while seg_start < end {
+            let Some(page) = line_page
+                .get(seg_start)
+                .copied()
+                .filter(|&p| p != usize::MAX)
+            else {
+                seg_start += 1;
+                continue;
+            };
+            // Extend the slice while lines stay on the same page and are placed.
+            let mut seg_end = seg_start + 1;
+            while seg_end < end
+                && line_page.get(seg_end).copied() == Some(page)
+                && new_row.get(seg_end).copied().unwrap_or(usize::MAX) != usize::MAX
+            {
+                seg_end += 1;
             }
+            if let Some(&nr) = new_row.get(seg_start) {
+                if nr != usize::MAX {
+                    placed_imgs.push(ImageBox {
+                        rid: ib.rid.clone(),
+                        row: nr,
+                        col: ib.col + col_off,
+                        cols: ib.cols,
+                        rows: seg_end - seg_start,
+                        src_row: ib.src_row + (seg_start - ib.row),
+                        full_rows: ib.full_rows,
+                    });
+                }
+            }
+            seg_start = seg_end;
         }
     }
+    *images = placed_imgs;
     out
 }
 
@@ -2684,5 +2766,89 @@ mod tests {
         assert_eq!(row.segs[1].path, vec![0, 0, 1, 0]);
         // Cell B's segment starts to the right of cell A's.
         assert!(row.segs[1].col0 > row.segs[0].col0);
+    }
+
+    /// `n` blank lines, all tagged as image-placeholder lines.
+    fn image_pairs(n: usize) -> Vec<(Line, LineMap)> {
+        (0..n)
+            .map(|_| {
+                (
+                    Line { spans: Vec::new() },
+                    LineMap {
+                        image: true,
+                        ..LineMap::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tall_image_is_split_into_tiling_slices() {
+        let o = opts(80);
+        let geom = o.page;
+        let cr = page_metrics(o.width, geom).content_rows;
+        let pl = page_lines(&o);
+        let n = cr + 3; // taller than a single page → must be cut
+        let mut imgs = vec![ImageBox {
+            rid: "r".to_string(),
+            row: 0,
+            col: 0,
+            cols: 5,
+            rows: n,
+            src_row: 0,
+            full_rows: n,
+        }];
+        paginate(image_pairs(n), &o, geom, &mut imgs, &pl);
+
+        assert!(imgs.len() >= 2, "tall image should be cut across pages");
+        assert!(imgs.iter().all(|i| i.rid == "r" && i.full_rows == n));
+        // Slices tile the image top-to-bottom with no gaps or overlap.
+        let mut acc = 0;
+        for s in &imgs {
+            assert_eq!(s.src_row, acc, "slice not contiguous: {imgs:?}");
+            acc += s.rows;
+        }
+        assert_eq!(acc, n, "slices must cover the whole image");
+    }
+
+    #[test]
+    fn page_sized_image_moves_to_next_page_intact() {
+        let o = opts(80);
+        let geom = o.page;
+        let cr = page_metrics(o.width, geom).content_rows;
+        assert!(cr >= 4, "test needs a few content rows (got {cr})");
+        let pl = page_lines(&o);
+        let img_h = cr - 1; // fits on a page, but not after the leading text
+        let mut pairs = vec![
+            (
+                Line {
+                    spans: vec![Line::dim_span("x".to_string())],
+                },
+                LineMap::default(),
+            ),
+            (
+                Line {
+                    spans: vec![Line::dim_span("y".to_string())],
+                },
+                LineMap::default(),
+            ),
+        ];
+        pairs.extend(image_pairs(img_h));
+        let mut imgs = vec![ImageBox {
+            rid: "r".to_string(),
+            row: 2,
+            col: 0,
+            cols: 5,
+            rows: img_h,
+            src_row: 0,
+            full_rows: img_h,
+        }];
+        paginate(pairs, &o, geom, &mut imgs, &pl);
+
+        // Kept whole (one slice) rather than cut at the page boundary.
+        assert_eq!(imgs.len(), 1, "image should not be split: {imgs:?}");
+        assert_eq!(imgs[0].rows, img_h);
+        assert_eq!(imgs[0].src_row, 0);
     }
 }
