@@ -249,10 +249,7 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                         para.content.extend(tmp);
                     }
                 }
-                "w:hyperlink" => {
-                    let h = parse_hyperlink(p, rels);
-                    para.content.push(Inline::Hyperlink(h));
-                }
+                "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
                 // Inline content control (content placeholder, etc.): unwrap it.
                 "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
                 _ => {
@@ -305,7 +302,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                         out.extend(tmp);
                     }
                 }
-                "w:hyperlink" => out.push(Inline::Hyperlink(parse_hyperlink(p, rels))),
+                "w:hyperlink" => parse_hyperlink_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
                 _ => {
                     let start = p.start_pos();
@@ -513,7 +510,11 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
     }
 }
 
-fn parse_hyperlink(p: &mut XmlParser, rels: &Relationships) -> Hyperlink {
+/// Parse a `<w:hyperlink>`, pushing into `out`. An **external** link (resolvable
+/// `r:id` target) is kept as a clickable [`Inline::Hyperlink`]; an internal
+/// anchor (TOC entries, cross-references) is **unwrapped** so its inline content
+/// — including tabs — renders normally (the link itself isn't actionable here).
+fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     let rid = decode_attr(p.attr("r:id"));
     let anchor_attr = decode_attr(p.attr("w:anchor"));
     let target = if rid.is_empty() {
@@ -521,12 +522,12 @@ fn parse_hyperlink(p: &mut XmlParser, rels: &Relationships) -> Hyperlink {
     } else {
         rels.target(&rid).map(|t| t.to_string())
     };
-    let rel_id = if rid.is_empty() { None } else { Some(rid) };
-    let anchor = if anchor_attr.is_empty() {
-        None
-    } else {
-        Some(anchor_attr)
-    };
+    if target.is_none() {
+        parse_inlines_into(p, rels, out);
+        return;
+    }
+    let rel_id = (!rid.is_empty()).then_some(rid);
+    let anchor = (!anchor_attr.is_empty()).then_some(anchor_attr);
 
     let mut runs = Vec::new();
     loop {
@@ -547,12 +548,12 @@ fn parse_hyperlink(p: &mut XmlParser, rels: &Relationships) -> Hyperlink {
             Event::Text => {}
         }
     }
-    Hyperlink {
+    out.push(Inline::Hyperlink(Hyperlink {
         target,
         anchor,
         rel_id,
         runs,
-    }
+    }));
 }
 
 fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {

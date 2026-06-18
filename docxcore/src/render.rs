@@ -519,13 +519,38 @@ struct Seg {
     sep: Option<BreakKind>,
 }
 
+/// Visible width (chars) of the inline content following index `from`, up to the
+/// next tab or break — used to right/center-align text at a tab stop.
+fn following_inline_width(content: &[Inline], from: usize) -> usize {
+    let mut w = 0;
+    for it in &content[(from + 1).min(content.len())..] {
+        match it {
+            Inline::Run(r) => w += r.text.chars().count(),
+            Inline::Hyperlink(h) => {
+                w += h.runs.iter().map(|r| r.text.chars().count()).sum::<usize>()
+            }
+            Inline::Tab | Inline::Break(_) => break,
+            Inline::Raw(_) => {}
+        }
+    }
+    w
+}
+
 fn flatten_para(
     para: &Paragraph,
     opts: &RenderOptions,
     heading: bool,
     sel: &[(usize, usize)],
+    avail: usize,
 ) -> Vec<Seg> {
     let inv = opts.show_invisibles;
+    // Tab stops (from the paragraph style) projected to columns. The page text
+    // width maps to `avail` cells, so a right tab near the margin lands near the
+    // right edge in either view.
+    let tab_stops = opts.styles.effective_tabs(para.props.style_id.as_deref());
+    let text_twips = (opts.page.w - opts.page.ml - opts.page.mr).max(1) as f32;
+    let tab_col =
+        |pos: i32| ((pos.max(0) as f32 * (avail as f32 / text_twips)).round() as usize).min(avail);
     let mut segs: Vec<Seg> = vec![Seg {
         glyphs: Vec::new(),
         sep: None,
@@ -559,7 +584,7 @@ fn flatten_para(
         g
     };
 
-    for item in &para.content {
+    for (idx, item) in para.content.iter().enumerate() {
         match item {
             Inline::Run(r) => {
                 let eff = opts.styles.effective_run(
@@ -609,40 +634,47 @@ fn flatten_para(
             }
             Inline::Tab => {
                 let hl = sel_at(mc);
-                let mut arrow = invis_style();
-                arrow.highlight = hl;
-                let plain = Style {
-                    highlight: hl,
-                    ..Style::default()
+                let cur = segs.last().unwrap().glyphs.len();
+                // Next tab stop strictly beyond the current column, else a default
+                // stop every 8 cells.
+                let stop = tab_stops
+                    .iter()
+                    .map(|t| (tab_col(t.pos), t.align, t.leader))
+                    .filter(|(col, _, _)| *col > cur)
+                    .min_by_key(|(col, _, _)| *col)
+                    .unwrap_or(((cur / 8 + 1) * 8, TabAlign::Left, TabLeader::None));
+                let (target, align, leader) = stop;
+                let fw = following_inline_width(&para.content, idx);
+                // Right/center tabs right-align the following text to the stop.
+                let fill_to = match align {
+                    TabAlign::Right => target.saturating_sub(fw),
+                    TabAlign::Center => target.saturating_sub(fw / 2),
+                    TabAlign::Left => target,
                 };
+                let fill_ch = match leader {
+                    TabLeader::Dot => '.',
+                    TabLeader::Hyphen => '-',
+                    TabLeader::Underscore => '_',
+                    TabLeader::None => ' ',
+                };
+                let end = fill_to.max(cur + 1).min(avail.max(cur + 1));
                 let seg = &mut segs.last_mut().unwrap().glyphs;
-                if inv {
+                for col in cur..end {
+                    let (ch, mut style) = if inv && col == cur {
+                        ('→', invis_style())
+                    } else if leader == TabLeader::None {
+                        (' ', Style::default())
+                    } else {
+                        (fill_ch, dim_style())
+                    };
+                    style.highlight = hl;
                     seg.push(Glyph {
-                        ch: '→',
+                        ch,
                         disp: None,
-                        style: arrow,
+                        style,
                         link: None,
                         src: Some(mc),
                     });
-                    for _ in 0..3 {
-                        seg.push(Glyph {
-                            ch: ' ',
-                            disp: None,
-                            style: plain.clone(),
-                            link: None,
-                            src: Some(mc),
-                        });
-                    }
-                } else {
-                    for _ in 0..4 {
-                        seg.push(Glyph {
-                            ch: ' ',
-                            disp: None,
-                            style: plain.clone(),
-                            link: None,
-                            src: Some(mc),
-                        });
-                    }
                 }
                 mc += 1;
             }
@@ -825,7 +857,7 @@ fn render_paragraph(
         .filter(|(p, _, _)| p == path)
         .map(|(_, s, e)| (*s, *e))
         .collect();
-    let segs = flatten_para(para, opts, heading.is_some(), &local_sel);
+    let segs = flatten_para(para, opts, heading.is_some(), &local_sel, avail);
 
     let mut out = Vec::new();
     let mut line_idx = 0usize;
@@ -2018,6 +2050,37 @@ mod tests {
         assert!(
             joined.contains("image 256×192"),
             "missing size label: {joined}"
+        );
+    }
+
+    #[test]
+    fn tab_stop_with_dot_leader_right_aligns() {
+        // A TOC-style paragraph: text + tab + page number, with a right tab and
+        // dot leader → dots fill and the number sits at the right.
+        let styles = crate::styles::parse_styles_xml(
+            "<w:styles><w:style w:styleId=\"TOC1\"><w:pPr>\
+             <w:tabs><w:tab w:val=\"right\" w:leader=\"dot\" w:pos=\"8630\"/></w:tabs>\
+             </w:pPr></w:style></w:styles>",
+        );
+        let mut o = opts(50);
+        o.styles = std::rc::Rc::new(styles);
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                style_id: Some("TOC1".to_string()),
+                ..Default::default()
+            },
+            content: vec![
+                run("Title", RunProps::default()),
+                Inline::Tab,
+                run("9", RunProps::default()),
+            ],
+        });
+        let line = render(&doc(vec![p]), &o)[0].plain();
+        assert!(line.starts_with("Title"), "{line:?}");
+        assert!(line.contains("...."), "no dot leader: {line:?}");
+        assert!(
+            line.trim_end().ends_with('9'),
+            "page number not right-aligned: {line:?}"
         );
     }
 

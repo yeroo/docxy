@@ -136,6 +136,33 @@ pub struct FramePr {
     pub y_align: Option<String>,
 }
 
+/// A tab stop alignment (`w:tab w:val`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// A tab stop leader fill (`w:tab w:leader`), e.g. the dots in a table of contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabLeader {
+    #[default]
+    None,
+    Dot,
+    Hyphen,
+    Underscore,
+}
+
+/// A paragraph tab stop (`w:tab`): position in twips, alignment, and leader fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStop {
+    pub pos: i32,
+    pub align: TabAlign,
+    pub leader: TabLeader,
+}
+
 /// Page geometry from `w:sectPr` (`pgSz`/`pgMar`), in twips. Used to project
 /// frame-positioned content onto the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

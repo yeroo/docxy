@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Align, RunProps};
+use crate::model::{Align, RunProps, TabAlign, TabLeader, TabStop};
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +56,7 @@ struct StyleDef {
     based_on: Option<String>,
     run: PartialRun,
     align: Option<Align>,
+    tabs: Vec<TabStop>,
 }
 
 /// A parsed `styles.xml`: document defaults plus named style definitions.
@@ -133,6 +134,31 @@ impl StyleSheet {
         let def = self.styles.get(id)?;
         let base = def.based_on.as_ref().and_then(|b| self.fold_align(b, seen));
         def.align.or(base)
+    }
+
+    /// Tab stops for a paragraph style (the most-derived style that defines any,
+    /// following `basedOn`). Empty if none.
+    pub fn effective_tabs(&self, para_style: Option<&str>) -> Vec<TabStop> {
+        let mut seen = HashSet::new();
+        para_style
+            .map(|s| self.fold_tabs(s, &mut seen))
+            .unwrap_or_default()
+    }
+
+    fn fold_tabs(&self, id: &str, seen: &mut HashSet<String>) -> Vec<TabStop> {
+        if !seen.insert(id.to_string()) {
+            return Vec::new();
+        }
+        let Some(def) = self.styles.get(id) else {
+            return Vec::new();
+        };
+        if !def.tabs.is_empty() {
+            return def.tabs.clone();
+        }
+        def.based_on
+            .as_ref()
+            .map(|b| self.fold_tabs(b, seen))
+            .unwrap_or_default()
     }
 }
 
@@ -270,9 +296,44 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
 fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
     loop {
         match p.next() {
-            Event::Start => {
-                if p.name() == "w:jc" {
+            Event::Start => match p.name() {
+                "w:jc" => {
                     def.align = map_align(p.attr("w:val"));
+                    p.skip_element();
+                }
+                "w:tabs" => parse_tabs(p, &mut def.tabs),
+                _ => p.skip_element(),
+            },
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+fn parse_tabs(p: &mut XmlParser, tabs: &mut Vec<TabStop>) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "w:tab" {
+                    let val = p.attr("w:val");
+                    if val != "clear" {
+                        let align = match val {
+                            "right" | "end" => TabAlign::Right,
+                            "center" => TabAlign::Center,
+                            _ => TabAlign::Left,
+                        };
+                        let leader = match p.attr("w:leader") {
+                            "dot" | "middleDot" => TabLeader::Dot,
+                            "hyphen" => TabLeader::Hyphen,
+                            "underscore" => TabLeader::Underscore,
+                            _ => TabLeader::None,
+                        };
+                        tabs.push(TabStop {
+                            pos: parse_uint(p.attr("w:pos")) as i32,
+                            align,
+                            leader,
+                        });
+                    }
                 }
                 p.skip_element();
             }
