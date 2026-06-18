@@ -306,44 +306,99 @@ pub fn render_with_images(
     doc: &Document,
     opts: &RenderOptions,
 ) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>) {
-    let content_width = if opts.page_view {
-        page_metrics(opts).content_cols
-    } else {
-        opts.width.max(8)
-    };
-    let mut images = Vec::new();
-    let pairs = render_blocks(&doc.body, &[], content_width, opts, &mut images);
-    let pairs = if opts.page_view {
-        // Render each header/footer variant to lines (non-editable) for the page
-        // margins. Images inside them aren't overlaid.
-        let mut hf_imgs = Vec::new();
-        let to_lines = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<Line> {
-            render_blocks(blocks, &[], content_width, opts, imgs)
-                .into_iter()
-                .map(|(l, _)| l)
-                .collect()
-        };
-        let pl = PageLines {
-            h: [
-                to_lines(&opts.headers.default, &mut hf_imgs),
-                to_lines(&opts.headers.first, &mut hf_imgs),
-                to_lines(&opts.headers.even, &mut hf_imgs),
-            ],
-            f: [
-                to_lines(&opts.footers.default, &mut hf_imgs),
-                to_lines(&opts.footers.first, &mut hf_imgs),
-                to_lines(&opts.footers.even, &mut hf_imgs),
-            ],
-            title_page: opts.title_page,
-            even_odd: opts.even_odd,
-        };
-        // Print layout: paginate into real page boxes (margins, page numbers).
-        paginate(pairs, opts, &mut images, &pl)
-    } else {
-        pairs
-    };
-    let (lines, maps) = pairs.into_iter().unzip();
+    if !opts.page_view {
+        let mut images = Vec::new();
+        let pairs = render_blocks(&doc.body, &[], opts.width.max(8), opts, &mut images);
+        let (lines, maps) = pairs.into_iter().unzip();
+        return (lines, maps, images);
+    }
+
+    // Print layout: split the body into sections (each `section_break` paragraph
+    // ends a section; the final body sectPr is the last section), then render and
+    // paginate each at its own page geometry so different paper sizes/orientations
+    // sit on different page boxes.
+    let pl = page_lines(opts);
+    let mut out: Vec<(Line, LineMap)> = Vec::new();
+    let mut images: Vec<ImageBox> = Vec::new();
+    for (start, end, geom) in sections(doc, opts.page) {
+        let content_width = page_metrics(opts.width, geom).content_cols;
+        let mut sec_imgs = Vec::new();
+        let mut pairs = render_blocks(
+            &doc.body[start..end],
+            &[],
+            content_width,
+            opts,
+            &mut sec_imgs,
+        );
+        // The slice rebased paragraph paths to 0; restore body-absolute paths.
+        for (_, map) in &mut pairs {
+            for seg in &mut map.segs {
+                if let Some(first) = seg.path.first_mut() {
+                    *first += start;
+                }
+            }
+        }
+        let pages = paginate(pairs, opts, geom, &mut sec_imgs, &pl);
+        let base = out.len();
+        for ib in &mut sec_imgs {
+            ib.row += base;
+        }
+        out.extend(pages);
+        images.extend(sec_imgs);
+    }
+    let (lines, maps) = out.into_iter().unzip();
     (lines, maps, images)
+}
+
+/// Body block ranges per section `(start, end_exclusive, geometry)`. A paragraph
+/// carrying a `section_break` ends a section (using that break's geometry); the
+/// remaining content forms the final section (using the trailing `sectPr`).
+fn sections(doc: &Document, last: PageGeom) -> Vec<(usize, usize, PageGeom)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in doc.body.iter().enumerate() {
+        if let Block::Paragraph(p) = b {
+            if let Some(sect) = &p.props.section_break {
+                out.push((start, i + 1, PageGeom::from_sect_pr(sect)));
+                start = i + 1;
+            }
+        }
+    }
+    if start < doc.body.len() || out.is_empty() {
+        out.push((start, doc.body.len(), last));
+    }
+    out
+}
+
+/// Render the header/footer variants to (non-editable) lines for the margins.
+fn page_lines(opts: &RenderOptions) -> PageLines {
+    let mut imgs = Vec::new();
+    let to_lines = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<Line> {
+        render_blocks(
+            blocks,
+            &[],
+            page_metrics(opts.width, opts.page).content_cols,
+            opts,
+            imgs,
+        )
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect()
+    };
+    PageLines {
+        h: [
+            to_lines(&opts.headers.default, &mut imgs),
+            to_lines(&opts.headers.first, &mut imgs),
+            to_lines(&opts.headers.even, &mut imgs),
+        ],
+        f: [
+            to_lines(&opts.footers.default, &mut imgs),
+            to_lines(&opts.footers.first, &mut imgs),
+            to_lines(&opts.footers.even, &mut imgs),
+        ],
+        title_page: opts.title_page,
+        even_odd: opts.even_odd,
+    }
 }
 
 fn render_blocks(
@@ -1371,13 +1426,12 @@ struct PageMetrics {
     center: usize,
 }
 
-fn page_metrics(opts: &RenderOptions) -> PageMetrics {
-    let pg = opts.page;
+fn page_metrics(width: usize, pg: PageGeom) -> PageMetrics {
     let pw = (pg.w.max(1)) as f32;
     let ph = (pg.h.max(1)) as f32;
     // Page width in cells (incl. borders), capped so the page stays readable and
     // centered on wide terminals.
-    let total = opts.width.saturating_sub(2).clamp(20, 90);
+    let total = width.saturating_sub(2).clamp(20, 90);
     let inner = total.saturating_sub(2).max(8); // page area inside the borders
     let cpt = inner as f32 / pw; // cells per twip (horizontal)
     let rpt = cpt / 2.0; // vertical: a terminal cell is ~2x taller than wide
@@ -1395,7 +1449,7 @@ fn page_metrics(opts: &RenderOptions) -> PageMetrics {
         mr,
         mt,
         mb,
-        center: opts.width.saturating_sub(inner + 2) / 2,
+        center: width.saturating_sub(inner + 2) / 2,
     }
 }
 
@@ -1432,10 +1486,11 @@ impl PageLines {
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
+    geom: PageGeom,
     images: &mut [ImageBox],
     pl: &PageLines,
 ) -> Vec<(Line, LineMap)> {
-    let m = page_metrics(opts);
+    let m = page_metrics(opts.width, geom);
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
     let lead = pad(m.center);
@@ -2239,6 +2294,51 @@ mod tests {
         assert!(
             h < b && b < f,
             "header/body/footer order wrong: h={h} b={b} f={f}"
+        );
+    }
+
+    #[test]
+    fn print_layout_switches_page_size_per_section() {
+        // Section 1 ends with a landscape section break (wider, so shorter page);
+        // section 2 uses the default trailing portrait geometry (taller page).
+        let break_para = Block::Paragraph(Paragraph {
+            props: ParProps {
+                section_break: Some(
+                    "<w:sectPr><w:pgSz w:w=\"15840\" w:h=\"12240\"/></w:sectPr>".to_string(),
+                ),
+                ..Default::default()
+            },
+            content: vec![run("end of section one", RunProps::default())],
+        });
+        let body = vec![
+            para(vec![run("section one body", RunProps::default())]),
+            break_para,
+            para(vec![run("section two body", RunProps::default())]),
+        ];
+        let mut o = opts(100);
+        o.page_view = true;
+        let plain: Vec<String> = render(&doc(body), &o).iter().map(|l| l.plain()).collect();
+        let tops: Vec<usize> = plain
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with('┌'))
+            .map(|(i, _)| i)
+            .collect();
+        let bots: Vec<usize> = plain
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with('└'))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            tops.len() >= 2 && bots.len() >= 2,
+            "expected ≥2 page boxes (2 sections)"
+        );
+        let h1 = bots[0] - tops[0]; // landscape (shorter)
+        let h2 = bots[1] - tops[1]; // portrait (taller)
+        assert!(
+            h1 < h2,
+            "landscape section page should be shorter than portrait: {h1} vs {h2}"
         );
     }
 

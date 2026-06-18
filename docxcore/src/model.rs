@@ -162,6 +162,36 @@ impl Default for PageGeom {
     }
 }
 
+impl PageGeom {
+    /// Parse page size/margins from a `<w:sectPr>` XML string (US Letter default
+    /// for anything absent). `pgSz w:w/w:h` already hold the physical dimensions,
+    /// so landscape sections need no special handling.
+    pub fn from_sect_pr(sect: &str) -> PageGeom {
+        let d = PageGeom::default();
+        let attr = |tag: &str, key: &str, fallback: i32| -> i32 {
+            (|| {
+                let ts = sect.find(tag)?;
+                let end = sect[ts..].find('>').map(|e| ts + e)?;
+                let el = &sect[ts..end];
+                let k = format!("{key}=\"");
+                let ks = el.find(&k)? + k.len();
+                let rest = &el[ks..];
+                let e = rest.find('"')?;
+                rest[..e].parse::<i32>().ok()
+            })()
+            .unwrap_or(fallback)
+        };
+        PageGeom {
+            w: attr("<w:pgSz", "w:w", d.w),
+            h: attr("<w:pgSz", "w:h", d.h),
+            ml: attr("<w:pgMar", "w:left", d.ml),
+            mr: attr("<w:pgMar", "w:right", d.mr),
+            mt: attr("<w:pgMar", "w:top", d.mt),
+            mb: attr("<w:pgMar", "w:bottom", d.mb),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Paragraph {
     pub props: ParProps,

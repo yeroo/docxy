@@ -124,34 +124,10 @@ impl Package {
         Some(part_name)
     }
 
-    /// Page size/margins from the captured `sectPr` (US Letter default).
+    /// Page size/margins from the captured (final) `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
-        use crate::model::PageGeom;
-        let d = PageGeom::default();
-        let g = |tag: &str, attr: &str, fallback: i32| -> i32 {
-            sect_attr(&self.sect_pr, tag, attr).unwrap_or(fallback)
-        };
-        PageGeom {
-            w: g("<w:pgSz", "w:w", d.w),
-            h: g("<w:pgSz", "w:h", d.h),
-            ml: g("<w:pgMar", "w:left", d.ml),
-            mr: g("<w:pgMar", "w:right", d.mr),
-            mt: g("<w:pgMar", "w:top", d.mt),
-            mb: g("<w:pgMar", "w:bottom", d.mb),
-        }
+        crate::model::PageGeom::from_sect_pr(&self.sect_pr)
     }
-}
-
-/// Read an integer attribute of a self-contained `sectPr` child element.
-fn sect_attr(sect: &str, tag: &str, attr: &str) -> Option<i32> {
-    let tstart = sect.find(tag)?;
-    let tend = sect[tstart..].find('>')? + tstart;
-    let el = &sect[tstart..tend];
-    let key = format!("{attr}=\"");
-    let kstart = el.find(&key)? + key.len();
-    let rest = &el[kstart..];
-    let end = rest.find('"')?;
-    rest[..end].parse().ok()
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
