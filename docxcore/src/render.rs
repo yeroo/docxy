@@ -232,10 +232,22 @@ pub struct RenderOptions {
     pub list_markers: Rc<HashMap<Vec<usize>, String>>,
     /// Page geometry, for projecting frame-positioned (floating) content.
     pub page: PageGeom,
-    /// Default header/footer block content, drawn in the page margins in print
-    /// layout (empty = none).
-    pub header: Rc<Vec<Block>>,
-    pub footer: Rc<Vec<Block>>,
+    /// Header/footer block content (default / first-page / even-page variants),
+    /// drawn in the page margins in print layout.
+    pub headers: PageParts,
+    pub footers: PageParts,
+    /// First page uses the `first` variant (`<w:titlePg/>`).
+    pub title_page: bool,
+    /// Even pages use the `even` variant (`<w:evenAndOddHeaders/>`).
+    pub even_odd: bool,
+}
+
+/// The three header (or footer) variants a section can define.
+#[derive(Debug, Clone, Default)]
+pub struct PageParts {
+    pub default: Rc<Vec<Block>>,
+    pub first: Rc<Vec<Block>>,
+    pub even: Rc<Vec<Block>>,
 }
 
 impl Default for RenderOptions {
@@ -249,8 +261,10 @@ impl Default for RenderOptions {
             styles: Rc::new(StyleSheet::default()),
             list_markers: Rc::new(HashMap::new()),
             page: PageGeom::default(),
-            header: Rc::new(Vec::new()),
-            footer: Rc::new(Vec::new()),
+            headers: PageParts::default(),
+            footers: PageParts::default(),
+            title_page: false,
+            even_odd: false,
         }
     }
 }
@@ -300,19 +314,31 @@ pub fn render_with_images(
     let mut images = Vec::new();
     let pairs = render_blocks(&doc.body, &[], content_width, opts, &mut images);
     let pairs = if opts.page_view {
-        // Render the header/footer block content to lines (non-editable), to be
-        // drawn in the page margins. Images inside them aren't overlaid.
+        // Render each header/footer variant to lines (non-editable) for the page
+        // margins. Images inside them aren't overlaid.
         let mut hf_imgs = Vec::new();
-        let header: Vec<Line> = render_blocks(&opts.header, &[], content_width, opts, &mut hf_imgs)
-            .into_iter()
-            .map(|(l, _)| l)
-            .collect();
-        let footer: Vec<Line> = render_blocks(&opts.footer, &[], content_width, opts, &mut hf_imgs)
-            .into_iter()
-            .map(|(l, _)| l)
-            .collect();
+        let to_lines = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<Line> {
+            render_blocks(blocks, &[], content_width, opts, imgs)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect()
+        };
+        let pl = PageLines {
+            h: [
+                to_lines(&opts.headers.default, &mut hf_imgs),
+                to_lines(&opts.headers.first, &mut hf_imgs),
+                to_lines(&opts.headers.even, &mut hf_imgs),
+            ],
+            f: [
+                to_lines(&opts.footers.default, &mut hf_imgs),
+                to_lines(&opts.footers.first, &mut hf_imgs),
+                to_lines(&opts.footers.even, &mut hf_imgs),
+            ],
+            title_page: opts.title_page,
+            even_odd: opts.even_odd,
+        };
         // Print layout: paginate into real page boxes (margins, page numbers).
-        paginate(pairs, opts, &mut images, &header, &footer)
+        paginate(pairs, opts, &mut images, &pl)
     } else {
         pairs
     };
@@ -1376,12 +1402,38 @@ fn page_metrics(opts: &RenderOptions) -> PageMetrics {
 /// Lay rendered lines out as discrete page boxes (Word "print layout"): each page
 /// is a bordered rectangle with real margins and a page number, centered on the
 /// terminal, with content flowing across pages.
+/// Rendered header/footer lines for the three variants, plus the section flags
+/// that select which one each page uses. Index 0=default, 1=first, 2=even.
+struct PageLines {
+    h: [Vec<Line>; 3],
+    f: [Vec<Line>; 3],
+    title_page: bool,
+    even_odd: bool,
+}
+
+impl PageLines {
+    fn variant(&self, page: usize) -> usize {
+        if page == 0 && self.title_page {
+            1 // first page
+        } else if self.even_odd && page % 2 == 1 {
+            2 // even page (page number 2, 4, … = 0-based 1, 3, …)
+        } else {
+            0 // default (odd pages, or no special variant)
+        }
+    }
+    fn header(&self, page: usize) -> &[Line] {
+        &self.h[self.variant(page)]
+    }
+    fn footer(&self, page: usize) -> &[Line] {
+        &self.f[self.variant(page)]
+    }
+}
+
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
     images: &mut [ImageBox],
-    header: &[Line],
-    footer: &[Line],
+    pl: &PageLines,
 ) -> Vec<(Line, LineMap)> {
     let m = page_metrics(opts);
     let inner_w = m.content_cols + m.ml + m.mr;
@@ -1454,7 +1506,8 @@ fn paginate(
     let mut it = items.into_iter().peekable();
     for page in 0..total_pages {
         out.push(border('┌', '┐'));
-        // Top margin, with the header drawn into it.
+        // Top margin, with this page's header drawn into it.
+        let header = pl.header(page);
         for r in 0..m.mt {
             match header.get(r) {
                 Some(hl) => out.push(frame_line(hl)),
@@ -1479,6 +1532,7 @@ fn paginate(
             out.push(margin_row(None)); // pad the page to full height
         }
         // Bottom margin: footer at the top of it, page number on the last row.
+        let footer = pl.footer(page);
         let pageno = format!("Page {} of {total_pages}", page + 1);
         let last = m.mb.saturating_sub(1);
         for r in 0..m.mb {
@@ -2164,8 +2218,10 @@ mod tests {
     fn print_layout_draws_header_and_footer() {
         let mut o = opts(70);
         o.page_view = true;
-        o.header = std::rc::Rc::new(vec![para(vec![run("THE HEADER", RunProps::default())])]);
-        o.footer = std::rc::Rc::new(vec![para(vec![run("THE FOOTER", RunProps::default())])]);
+        o.headers.default =
+            std::rc::Rc::new(vec![para(vec![run("THE HEADER", RunProps::default())])]);
+        o.footers.default =
+            std::rc::Rc::new(vec![para(vec![run("THE FOOTER", RunProps::default())])]);
         let d = doc(vec![para(vec![run("body text", RunProps::default())])]);
         let plain: Vec<String> = render(&d, &o).iter().map(|l| l.plain()).collect();
         let h = plain
@@ -2183,6 +2239,41 @@ mod tests {
         assert!(
             h < b && b < f,
             "header/body/footer order wrong: h={h} b={b} f={f}"
+        );
+    }
+
+    #[test]
+    fn print_layout_uses_first_and_even_header_variants() {
+        // With titlePg + evenAndOdd: page 1 = first, page 2 = even, page 3 = default.
+        let body: Vec<Block> = (0..120)
+            .map(|i| para(vec![run(&format!("line {i}"), RunProps::default())]))
+            .collect();
+        let mut o = opts(50);
+        o.page_view = true;
+        o.title_page = true;
+        o.even_odd = true;
+        o.headers.default =
+            std::rc::Rc::new(vec![para(vec![run("ODD-HEADER", RunProps::default())])]);
+        o.headers.first =
+            std::rc::Rc::new(vec![para(vec![run("FIRST-HEADER", RunProps::default())])]);
+        o.headers.even =
+            std::rc::Rc::new(vec![para(vec![run("EVEN-HEADER", RunProps::default())])]);
+        let plain: Vec<String> = render(&doc(body), &o).iter().map(|l| l.plain()).collect();
+        let first = plain
+            .iter()
+            .position(|l| l.contains("FIRST-HEADER"))
+            .expect("first header");
+        let even = plain
+            .iter()
+            .position(|l| l.contains("EVEN-HEADER"))
+            .expect("even header");
+        let odd = plain
+            .iter()
+            .position(|l| l.contains("ODD-HEADER"))
+            .expect("default header");
+        assert!(
+            first < even && even < odd,
+            "variant order: first={first} even={even} odd={odd}"
         );
     }
 

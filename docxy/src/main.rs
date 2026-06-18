@@ -21,7 +21,8 @@ use docxcore::model::{Align, Block};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{
-    Color as DocColor, ImageBox, Line as DocLine, LineMap, RenderOptions, render_with_images,
+    Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
+    render_with_images,
 };
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use std::rc::Rc;
@@ -258,9 +259,12 @@ struct App {
     clip_text: Option<String>,
     styles: Rc<StyleSheet>,
     numbering: Rc<Numbering>,
-    /// Default header/footer block content (for print layout margins).
-    header: Rc<Vec<Block>>,
-    footer: Rc<Vec<Block>>,
+    /// Header/footer block content (default/first/even variants) + section flags,
+    /// for print-layout margins.
+    headers: PageParts,
+    footers: PageParts,
+    title_page: bool,
+    even_odd: bool,
     vim: Option<VimState>,
     pending_link: Option<String>,
     /// (caret, visual row) hint to disambiguate wrap boundaries during j/k.
@@ -298,8 +302,18 @@ impl App {
             .part("word/_rels/document.xml.rels")
             .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
             .unwrap_or_default();
-        let header = Rc::new(load_hdr_ftr(&pkg, &rels, "headerReference"));
-        let footer = Rc::new(load_hdr_ftr(&pkg, &rels, "footerReference"));
+        let parts = |kind: &str| PageParts {
+            default: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "default")),
+            first: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "first")),
+            even: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "even")),
+        };
+        let headers = parts("headerReference");
+        let footers = parts("footerReference");
+        let title_page = flag_on(pkg.sect_pr(), "titlePg");
+        let even_odd = pkg
+            .part("word/settings.xml")
+            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
+            .unwrap_or(false);
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -319,8 +333,10 @@ impl App {
             clip_text: None,
             styles: Rc::new(styles),
             numbering: Rc::new(numbering),
-            header,
-            footer,
+            headers,
+            footers,
+            title_page,
+            even_odd,
             vim: if vim { Some(VimState::new()) } else { None },
             pending_link: None,
             vrow_hint: None,
@@ -356,8 +372,10 @@ impl App {
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
             page: self.pkg.page_geom(),
-            header: self.header.clone(),
-            footer: self.footer.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            title_page: self.title_page,
+            even_odd: self.even_odd,
         }
     }
 
@@ -1626,8 +1644,8 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
 
 /// Load the default header/footer block content referenced by the section's
 /// `<w:{kind}>` (kind = "headerReference" or "footerReference"). Empty if none.
-fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str) -> Vec<Block> {
-    let Some(rid) = ref_rid(pkg.sect_pr(), kind) else {
+fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str, wtype: &str) -> Vec<Block> {
+    let Some(rid) = ref_rid(pkg.sect_pr(), kind, wtype) else {
         return Vec::new();
     };
     let Some(target) = rels.target(&rid) else {
@@ -1643,11 +1661,11 @@ fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str) -> Vec<Block> {
     parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), rels)
 }
 
-/// The relationship id of a section header/footer reference, preferring the
-/// `default` type over `first`/`even`.
-fn ref_rid(sect: &str, kind: &str) -> Option<String> {
+/// The relationship id of a section header/footer reference of the given type
+/// (`default` / `first` / `even`).
+fn ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<String> {
     let needle = format!("<w:{kind}");
-    let (mut default, mut any) = (None, None);
+    let want = format!("w:type=\"{wtype}\"");
     let mut i = 0;
     while let Some(p) = sect[i..].find(&needle) {
         let start = i + p;
@@ -1656,15 +1674,26 @@ fn ref_rid(sect: &str, kind: &str) -> Option<String> {
             .map(|e| start + e)
             .unwrap_or(sect.len());
         let el = &sect[start..end];
-        if let Some(rid) = attr_value(el, "r:id") {
-            if el.contains("w:type=\"default\"") {
-                default = Some(rid.clone());
-            }
-            any.get_or_insert(rid);
+        if el.contains(&want) {
+            return attr_value(el, "r:id");
         }
         i = (end + 1).min(sect.len());
     }
-    default.or(any)
+    None
+}
+
+/// Whether an on/off OOXML element (`<w:tag/>` / `<w:tag w:val="…"/>`) is present
+/// and enabled.
+fn flag_on(xml: &str, tag: &str) -> bool {
+    let needle = format!("<w:{tag}");
+    let Some(p) = xml.find(&needle) else {
+        return false;
+    };
+    let end = xml[p..].find('>').map(|e| p + e).unwrap_or(xml.len());
+    !matches!(
+        attr_value(&xml[p..end], "w:val").as_deref(),
+        Some("false" | "0" | "off")
+    )
 }
 
 fn attr_value(el: &str, key: &str) -> Option<String> {
