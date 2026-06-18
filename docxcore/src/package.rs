@@ -37,6 +37,12 @@ impl Package {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()
     }
 
+    /// The captured trailing section properties (`w:sectPr`) XML, which carries
+    /// the header/footer references and page geometry.
+    pub fn sect_pr(&self) -> &str {
+        &self.sect_pr
+    }
+
     /// The raw bytes of a part by name.
     pub fn part(&self, name: &str) -> Option<&[u8]> {
         self.parts

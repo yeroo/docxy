@@ -16,8 +16,8 @@ use std::process::ExitCode;
 
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
-use docxcore::load::{Relationships, parse_rels_xml};
-use docxcore::model::Align;
+use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
+use docxcore::model::{Align, Block};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{
@@ -258,6 +258,9 @@ struct App {
     clip_text: Option<String>,
     styles: Rc<StyleSheet>,
     numbering: Rc<Numbering>,
+    /// Default header/footer block content (for print layout margins).
+    header: Rc<Vec<Block>>,
+    footer: Rc<Vec<Block>>,
     vim: Option<VimState>,
     pending_link: Option<String>,
     /// (caret, visual row) hint to disambiguate wrap boundaries during j/k.
@@ -295,6 +298,8 @@ impl App {
             .part("word/_rels/document.xml.rels")
             .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
             .unwrap_or_default();
+        let header = Rc::new(load_hdr_ftr(&pkg, &rels, "headerReference"));
+        let footer = Rc::new(load_hdr_ftr(&pkg, &rels, "footerReference"));
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -314,6 +319,8 @@ impl App {
             clip_text: None,
             styles: Rc::new(styles),
             numbering: Rc::new(numbering),
+            header,
+            footer,
             vim: if vim { Some(VimState::new()) } else { None },
             pending_link: None,
             vrow_hint: None,
@@ -349,6 +356,8 @@ impl App {
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
             page: self.pkg.page_geom(),
+            header: self.header.clone(),
+            footer: self.footer.clone(),
         }
     }
 
@@ -1613,6 +1622,57 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
         })
         .collect();
     RLine::from(spans)
+}
+
+/// Load the default header/footer block content referenced by the section's
+/// `<w:{kind}>` (kind = "headerReference" or "footerReference"). Empty if none.
+fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str) -> Vec<Block> {
+    let Some(rid) = ref_rid(pkg.sect_pr(), kind) else {
+        return Vec::new();
+    };
+    let Some(target) = rels.target(&rid) else {
+        return Vec::new();
+    };
+    let name = match target.strip_prefix('/') {
+        Some(r) => r.to_string(),
+        None => format!("word/{}", target.trim_start_matches("./")),
+    };
+    let Some(bytes) = pkg.part(&name) else {
+        return Vec::new();
+    };
+    parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), rels)
+}
+
+/// The relationship id of a section header/footer reference, preferring the
+/// `default` type over `first`/`even`.
+fn ref_rid(sect: &str, kind: &str) -> Option<String> {
+    let needle = format!("<w:{kind}");
+    let (mut default, mut any) = (None, None);
+    let mut i = 0;
+    while let Some(p) = sect[i..].find(&needle) {
+        let start = i + p;
+        let end = sect[start..]
+            .find('>')
+            .map(|e| start + e)
+            .unwrap_or(sect.len());
+        let el = &sect[start..end];
+        if let Some(rid) = attr_value(el, "r:id") {
+            if el.contains("w:type=\"default\"") {
+                default = Some(rid.clone());
+            }
+            any.get_or_insert(rid);
+        }
+        i = (end + 1).min(sect.len());
+    }
+    default.or(any)
+}
+
+fn attr_value(el: &str, key: &str) -> Option<String> {
+    let k = format!("{key}=\"");
+    let s = el.find(&k)? + k.len();
+    let rest = &el[s..];
+    let e = rest.find('"')?;
+    Some(rest[..e].to_string())
 }
 
 /// Dispatch one terminal event. Returns true if the app should quit.

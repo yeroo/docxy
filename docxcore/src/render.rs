@@ -232,6 +232,10 @@ pub struct RenderOptions {
     pub list_markers: Rc<HashMap<Vec<usize>, String>>,
     /// Page geometry, for projecting frame-positioned (floating) content.
     pub page: PageGeom,
+    /// Default header/footer block content, drawn in the page margins in print
+    /// layout (empty = none).
+    pub header: Rc<Vec<Block>>,
+    pub footer: Rc<Vec<Block>>,
 }
 
 impl Default for RenderOptions {
@@ -245,6 +249,8 @@ impl Default for RenderOptions {
             styles: Rc::new(StyleSheet::default()),
             list_markers: Rc::new(HashMap::new()),
             page: PageGeom::default(),
+            header: Rc::new(Vec::new()),
+            footer: Rc::new(Vec::new()),
         }
     }
 }
@@ -294,8 +300,19 @@ pub fn render_with_images(
     let mut images = Vec::new();
     let pairs = render_blocks(&doc.body, &[], content_width, opts, &mut images);
     let pairs = if opts.page_view {
+        // Render the header/footer block content to lines (non-editable), to be
+        // drawn in the page margins. Images inside them aren't overlaid.
+        let mut hf_imgs = Vec::new();
+        let header: Vec<Line> = render_blocks(&opts.header, &[], content_width, opts, &mut hf_imgs)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        let footer: Vec<Line> = render_blocks(&opts.footer, &[], content_width, opts, &mut hf_imgs)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
         // Print layout: paginate into real page boxes (margins, page numbers).
-        paginate(pairs, opts, &mut images)
+        paginate(pairs, opts, &mut images, &header, &footer)
     } else {
         pairs
     };
@@ -1363,11 +1380,22 @@ fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
     images: &mut [ImageBox],
+    header: &[Line],
+    footer: &[Line],
 ) -> Vec<(Line, LineMap)> {
     let m = page_metrics(opts);
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
     let lead = pad(m.center);
+    // Frame a header/footer/content line into a page row (left margin + content
+    // + right margin, between the borders). Non-editable (no caret map).
+    let frame_line = |ln: &Line| -> (Line, LineMap) {
+        let rpad = m.content_cols.saturating_sub(ln.width());
+        let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+        spans.extend(ln.spans.clone());
+        spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+        (Line { spans }, LineMap::default())
+    };
     let border = |l: char, r: char| -> (Line, LineMap) {
         (
             Line {
@@ -1426,8 +1454,12 @@ fn paginate(
     let mut it = items.into_iter().peekable();
     for page in 0..total_pages {
         out.push(border('┌', '┐'));
-        for _ in 0..m.mt {
-            out.push(margin_row(None));
+        // Top margin, with the header drawn into it.
+        for r in 0..m.mt {
+            match header.get(r) {
+                Some(hl) => out.push(frame_line(hl)),
+                None => out.push(margin_row(None)),
+            }
         }
         let mut placed = 0usize;
         while it.peek().map(|t| t.3) == Some(page) {
@@ -1446,9 +1478,17 @@ fn paginate(
         for _ in placed..m.content_rows {
             out.push(margin_row(None)); // pad the page to full height
         }
+        // Bottom margin: footer at the top of it, page number on the last row.
         let pageno = format!("Page {} of {total_pages}", page + 1);
+        let last = m.mb.saturating_sub(1);
         for r in 0..m.mb {
-            out.push(margin_row((r == m.mb / 2).then_some(pageno.as_str())));
+            if r == last {
+                out.push(margin_row(Some(pageno.as_str())));
+            } else if let Some(fl) = footer.get(r) {
+                out.push(frame_line(fl));
+            } else {
+                out.push(margin_row(None));
+            }
         }
         out.push(border('└', '┘'));
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
@@ -2118,6 +2158,32 @@ mod tests {
         assert!(plain.iter().any(|l| l.contains("before")));
         assert!(plain.iter().any(|l| l.contains("after")));
         assert!(plain.iter().any(|l| l.contains("Page 2 of 2")));
+    }
+
+    #[test]
+    fn print_layout_draws_header_and_footer() {
+        let mut o = opts(70);
+        o.page_view = true;
+        o.header = std::rc::Rc::new(vec![para(vec![run("THE HEADER", RunProps::default())])]);
+        o.footer = std::rc::Rc::new(vec![para(vec![run("THE FOOTER", RunProps::default())])]);
+        let d = doc(vec![para(vec![run("body text", RunProps::default())])]);
+        let plain: Vec<String> = render(&d, &o).iter().map(|l| l.plain()).collect();
+        let h = plain
+            .iter()
+            .position(|l| l.contains("THE HEADER"))
+            .expect("header drawn");
+        let b = plain
+            .iter()
+            .position(|l| l.contains("body text"))
+            .expect("body drawn");
+        let f = plain
+            .iter()
+            .position(|l| l.contains("THE FOOTER"))
+            .expect("footer drawn");
+        assert!(
+            h < b && b < f,
+            "header/body/footer order wrong: h={h} b={b} f={f}"
+        );
     }
 
     #[test]

@@ -173,6 +173,22 @@ pub fn parse_document_xml(xml: &str, rels: &Relationships) -> Document {
     Document { body }
 }
 
+/// Parse a header (`word/headerN.xml`) or footer (`word/footerN.xml`) part into
+/// its block content (the children of `<w:hdr>`/`<w:ftr>`).
+pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:hdr" || p.name() == "w:ftr" => {
+                return parse_blocks_until_end(&mut p, rels);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
 /// Parse a sequence of block-level children up to the enclosing End event.
 fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block> {
     let mut blocks = Vec::new();
