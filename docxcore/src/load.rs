@@ -253,8 +253,10 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     let h = parse_hyperlink(p, rels);
                     para.content.push(Inline::Hyperlink(h));
                 }
+                // Inline content control (content placeholder, etc.): unwrap it.
+                "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
                 _ => {
-                    // Unmodeled inline content (bookmarks, fields, sdt): preserve raw.
+                    // Unmodeled inline content (bookmarks, fields): preserve raw.
                     let start = p.start_pos();
                     p.skip_element();
                     para.content
@@ -271,6 +273,67 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
         }
     }
     para
+}
+
+/// Unwrap an inline `<w:sdt>` (content control inside a paragraph), parsing the
+/// inline content of its `<w:sdtContent>` into `out`.
+fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:sdtContent" => parse_inlines_into(p, rels, out),
+                _ => p.skip_element(),
+            },
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+/// Parse inline content (runs, hyperlinks, nested content controls) up to the
+/// enclosing End, pushing into `out`.
+fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:r" => {
+                    let start = p.start_pos();
+                    let mut tmp = Vec::new();
+                    if parse_run(p, &mut tmp) {
+                        out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
+                    } else {
+                        out.extend(tmp);
+                    }
+                }
+                "w:hyperlink" => out.push(Inline::Hyperlink(parse_hyperlink(p, rels))),
+                "w:sdt" => parse_inline_sdt(p, rels, out),
+                _ => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
+                }
+            },
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+/// Parse the block content of a text box (`<w:txbxContent>`) embedded in a
+/// drawing/VML-shape's raw XML, so its text can be shown.
+pub fn parse_textbox_blocks(raw: &str) -> Vec<Block> {
+    let rels = Relationships::default();
+    let mut p = XmlParser::new(raw);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:txbxContent" => {
+                return parse_blocks_until_end(&mut p, &rels);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Vec::new()
 }
 
 fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
@@ -798,6 +861,25 @@ mod tests {
         };
         assert_eq!(t.rows[0].cells[0].blocks.len(), 1);
         assert!(matches!(t.rows[0].cells[0].blocks[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn inline_sdt_is_unwrapped() {
+        // A content control wrapping runs inside a paragraph must show its text.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
+                   <w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>inner</w:t></w:r></w:sdtContent></w:sdt>\
+                   <w:r><w:t xml:space=\"preserve\"> b</w:t></w:r></w:p></w:body></w:document>";
+        assert_eq!(first_para(&doc(xml)).plain_text(), "a inner b");
+    }
+
+    #[test]
+    fn textbox_blocks_parsed() {
+        let raw = "<w:pict><v:shape><v:textbox><w:txbxContent>\
+                   <w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>";
+        let blocks = parse_textbox_blocks(raw);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].plain_text(), "boxed");
     }
 
     #[test]

@@ -888,6 +888,15 @@ fn render_paragraph(
     // emitted after the paragraph text. (Real pixels are overlaid by the app.)
     for item in &para.content {
         if let Inline::Raw(raw) = item {
+            // A text box (`<w:txbxContent>` inside a drawing/VML shape): render its
+            // text in a box rather than treating the shape as opaque/an image.
+            if raw.contains("txbxContent") {
+                let blocks = crate::load::parse_textbox_blocks(raw);
+                if !blocks.is_empty() {
+                    out.extend(text_box(&blocks, width, opts));
+                    continue;
+                }
+            }
             if let Some((pw, ph)) = raw_image_extent(raw) {
                 let (pw, ph) = (pw as usize, ph as usize);
                 let cols = (pw / 8).clamp(10, width.saturating_sub(2).max(10));
@@ -987,6 +996,33 @@ fn css_len_px(s: &str, key: &str) -> Option<u32> {
         val // px or unitless
     };
     Some(px.round() as u32)
+}
+
+/// Render a text box's block content inside a dim bordered frame (non-editable).
+fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, LineMap)> {
+    let inner = width.saturating_sub(4).max(8);
+    let content = render_blocks(blocks, &[], inner, opts, &mut Vec::new());
+    let mut out = Vec::new();
+    out.push((
+        Line {
+            spans: vec![Line::dim_span(format!("┌{}┐", "─".repeat(inner + 2)))],
+        },
+        LineMap::default(),
+    ));
+    for (ln, _) in content {
+        let pad = inner.saturating_sub(ln.width());
+        let mut spans = vec![Line::dim_span("│ ".to_string())];
+        spans.extend(ln.spans);
+        spans.push(Line::dim_span(format!("{} │", " ".repeat(pad))));
+        out.push((Line { spans }, LineMap::default()));
+    }
+    out.push((
+        Line {
+            spans: vec![Line::dim_span(format!("└{}┘", "─".repeat(inner + 2)))],
+        },
+        LineMap::default(),
+    ));
+    out
 }
 
 /// A dim bordered box standing in for an image (the graphics fallback).
@@ -1940,6 +1976,26 @@ mod tests {
         assert!(
             max_c > 50,
             "right-aligned image should be far right, got col {max_c}"
+        );
+    }
+
+    #[test]
+    fn text_box_content_renders() {
+        let raw = "<w:r><w:pict><v:shape><v:textbox><w:txbxContent>\
+                   <w:p><w:r><w:t>boxed text</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>";
+        let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
+        let joined: String = render(&d, &opts(40))
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("boxed text"),
+            "text box text missing:\n{joined}"
+        );
+        assert!(
+            joined.contains('┌') && joined.contains('└'),
+            "no box frame:\n{joined}"
         );
     }
 
