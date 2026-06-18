@@ -43,6 +43,11 @@ impl Package {
         &self.sect_pr
     }
 
+    /// Replace the trailing section properties (e.g. to change page orientation).
+    pub fn set_sect_pr(&mut self, xml: String) {
+        self.sect_pr = xml;
+    }
+
     /// The raw bytes of a part by name.
     pub fn part(&self, name: &str) -> Option<&[u8]> {
         self.parts

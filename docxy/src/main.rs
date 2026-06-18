@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
-use docxcore::model::{Align, Block, Document};
+use docxcore::model::{Align, Block, Document, PageGeom};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{
@@ -127,6 +127,7 @@ fn print_usage() {
            Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q / Esc quit\n  \
            F2 page view   F3 show marks   F4 table borders\n  \
            F6 edit header   F7 edit footer   (Esc returns)\n  \
+           F8/F9 insert landscape/portrait section at cursor\n  \
            mouse: click to move · click a link to open it · wheel to scroll"
     );
 }
@@ -666,6 +667,33 @@ impl App {
         }
         self.page_view = hf.saved_page_view;
         self.dirty = true;
+    }
+
+    /// Insert a section break at the caret: content up to here keeps the current
+    /// page geometry; the rest of the document becomes a new section with the
+    /// given orientation. (Works cleanly when the caret is in the final section.)
+    fn insert_section(&mut self, landscape: bool) {
+        if self.hf_edit.is_some() {
+            return;
+        }
+        let current = self.pkg.sect_pr().to_string();
+        let break_sect = if current.is_empty() {
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>".to_string()
+        } else {
+            current.clone()
+        };
+        if !self.editor.set_caret_section_break(Some(break_sect)) {
+            self.status = Some("Can't insert a section break here.".to_string());
+            self.dirty = true;
+            return;
+        }
+        self.pkg.set_sect_pr(orient_sectpr(&current, landscape));
+        self.modified = true;
+        self.dirty = true;
+        let o = if landscape { "landscape" } else { "portrait" };
+        self.status = Some(format!(
+            "Inserted a {o} section after the cursor (F2 to view)."
+        ));
     }
 
     fn save(&mut self) {
@@ -1547,6 +1575,8 @@ impl App {
             }
             KeyCode::F(6) => self.enter_hf_edit(true),
             KeyCode::F(7) => self.enter_hf_edit(false),
+            KeyCode::F(8) => self.insert_section(true),
+            KeyCode::F(9) => self.insert_section(false),
             _ => {}
         }
         false
@@ -1832,6 +1862,29 @@ fn attr_value(el: &str, key: &str) -> Option<String> {
     Some(rest[..e].to_string())
 }
 
+/// Rewrite a `<w:sectPr>` so its page size is landscape (w>h) or portrait (h>w),
+/// setting `w:orient`. Other section properties (margins, header refs) are kept.
+fn orient_sectpr(sect: &str, landscape: bool) -> String {
+    let g = PageGeom::from_sect_pr(sect);
+    let (w, h) = (g.w.max(1), g.h.max(1));
+    let (nw, nh) = if landscape {
+        (w.max(h), w.min(h))
+    } else {
+        (w.min(h), w.max(h))
+    };
+    let orient = if landscape { "landscape" } else { "portrait" };
+    let pgsz = format!("<w:pgSz w:w=\"{nw}\" w:h=\"{nh}\" w:orient=\"{orient}\"/>");
+    if sect.is_empty() {
+        return format!("<w:sectPr>{pgsz}</w:sectPr>");
+    }
+    if let Some(s) = sect.find("<w:pgSz") {
+        if let Some(e) = sect[s..].find("/>").map(|x| s + x + 2) {
+            return format!("{}{pgsz}{}", &sect[..s], &sect[e..]);
+        }
+    }
+    sect.replacen("</w:sectPr>", &format!("{pgsz}</w:sectPr>"), 1)
+}
+
 /// The package part name of the default header/footer (for editing/saving).
 fn hf_part_name(pkg: &Package, rels: &Relationships, kind: &str) -> Option<String> {
     let rid = ref_rid(pkg.sect_pr(), kind, "default")?;
@@ -1972,6 +2025,45 @@ mod tests {
     }
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn orient_sectpr_swaps_dimensions_and_keeps_other_props() {
+        let portrait =
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\"/></w:sectPr>";
+        let land = orient_sectpr(portrait, true);
+        assert!(
+            land.contains("w:w=\"15840\"") && land.contains("w:h=\"12240\""),
+            "{land}"
+        );
+        assert!(land.contains("w:orient=\"landscape\""));
+        assert!(land.contains("pgMar"), "other props dropped: {land}");
+        let port = orient_sectpr(&land, false);
+        assert!(
+            port.contains("w:w=\"12240\"") && port.contains("w:h=\"15840\""),
+            "{port}"
+        );
+        assert!(port.contains("w:orient=\"portrait\""));
+    }
+
+    #[test]
+    fn insert_landscape_section_persists() {
+        let mut app = app_with(&["first", "second"]);
+        app.insert_section(true); // caret is in the first paragraph
+        app.pkg.document = app.editor.doc.clone();
+        let bytes = save_package(&app.pkg);
+        let re = load_package(&bytes).expect("reload");
+        assert!(
+            re.sect_pr().contains("w:orient=\"landscape\""),
+            "trailing not landscape: {}",
+            re.sect_pr()
+        );
+        match &re.document.body[0] {
+            Block::Paragraph(p) => {
+                assert!(p.props.section_break.is_some(), "section break not saved")
+            }
+            _ => panic!("first block not a paragraph"),
+        }
     }
 
     #[test]

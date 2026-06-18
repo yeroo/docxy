@@ -900,6 +900,20 @@ impl Editor {
             }
         }
     }
+
+    /// Set (or clear) the section break carried by the caret's paragraph. A
+    /// section break ends a section here, so the following content becomes a new
+    /// section. Returns false if the caret isn't in a paragraph.
+    pub fn set_caret_section_break(&mut self, sect: Option<String>) -> bool {
+        self.checkpoint(EditKind::Structural);
+        match para_mut(&mut self.doc.body, &self.caret.path.clone()) {
+            Some(p) => {
+                p.props.section_break = sect;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 // ---- tree navigation ----

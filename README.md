@@ -62,6 +62,7 @@ docxy <file.docx> --pdf <out>   # export to PDF and exit
 | Ctrl-Q / Esc | quit |
 | F2 · F3 · F4 | page view · show marks · table borders |
 | F6 · F7 | edit header · edit footer (Esc returns) |
+| F8 · F9 | insert landscape · portrait section at cursor |
 | mouse | click to move · click a link to open · wheel/drag to scroll/select |
 
 ## Image support
