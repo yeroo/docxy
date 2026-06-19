@@ -40,7 +40,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -805,6 +805,21 @@ impl App {
         None
     }
 
+    /// If `col` is in the scrollbar gutter (just past the rendered content) and
+    /// the document overflows, jump the scroll to the indicated position and
+    /// return true. Used so clicking/dragging the bar scrolls instead of selecting.
+    fn scrollbar_jump(&mut self, row: usize, col: usize) -> bool {
+        if col < self.rendered_width as usize || self.lines.len() <= self.viewport_h {
+            return false;
+        }
+        let max = self.lines.len().saturating_sub(self.viewport_h);
+        let span = self.viewport_h.saturating_sub(1).max(1);
+        self.scroll = (row * max / span).min(max);
+        self.follow_caret = false;
+        self.drag_from = None; // this is a scrollbar drag, not a text selection
+        true
+    }
+
     /// The caret at a screen position, if it lands on editable text.
     fn click_caret(&self, row: usize, col: usize) -> Option<Caret> {
         let doc_line = self.scroll + row;
@@ -820,7 +835,13 @@ impl App {
                 if row >= self.viewport_h {
                     return; // status bar
                 }
-                self.follow_caret = true;
+                if self.scrollbar_jump(row, col) {
+                    return; // dragging the scrollbar, not selecting text
+                }
+                // Clicking places the caret at a visible spot, so never scroll to
+                // it — that would yank the view back to the old caret's page when
+                // the click lands on a non-editable cell (margin/border/gap).
+                self.follow_caret = false;
                 let doc_line = self.scroll + row;
                 // Position the caret at the click and remember it as the anchor
                 // for a possible drag-select.
@@ -844,6 +865,9 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self.drag_from.is_none() && self.scrollbar_jump(row, col) {
+                    return; // continuing a scrollbar drag
+                }
                 // Extend a selection from the press point to the dragged-to cell.
                 self.follow_caret = false;
                 let vh = self.viewport_h.max(1);
@@ -1603,8 +1627,16 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
-        let content = chunks[0];
+        let full = chunks[0];
         let status = chunks[1];
+
+        // Reserve a one-column gutter on the right for the vertical scrollbar, so
+        // the rendered width stays stable whether or not the bar is shown.
+        let gutter = if full.width > 2 { 1 } else { 0 };
+        let content = Rect {
+            width: full.width - gutter,
+            ..full
+        };
 
         self.viewport_h = content.height.max(1) as usize;
         self.ensure_rendered(content.width);
@@ -1639,6 +1671,26 @@ impl App {
         // encoded once per visible window and just re-emitted as it moves, so
         // this stays cheap while scrolling (the loop caps the redraw rate).
         self.draw_images(f, content);
+
+        // Vertical scrollbar in the reserved gutter, when the document overflows.
+        if gutter == 1 && self.lines.len() > self.viewport_h {
+            let mut sb = ScrollbarState::new(self.lines.len())
+                .position(self.scroll)
+                .viewport_content_length(self.viewport_h);
+            let area = Rect {
+                x: full.x + content.width,
+                y: full.y,
+                width: 1,
+                height: full.height,
+            };
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut sb,
+            );
+        }
 
         // Caret.
         if let Some((row, col)) = caret {
