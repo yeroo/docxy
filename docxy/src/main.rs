@@ -977,6 +977,7 @@ impl App {
         let title = format!(" {} ", bs.dir.display());
         let list_focus = bs.pane == backstage::Pane::Browser;
         let inner_h = panes[0].height.saturating_sub(2) as usize;
+        let inner_w = panes[0].width.saturating_sub(2) as usize;
         let start = self.bs_list_start;
         let mut lines = Vec::new();
         for (i, e) in bs.entries.iter().enumerate().skip(start).take(inner_h) {
@@ -984,7 +985,12 @@ impl App {
             let label = if e.is_dir {
                 format!(" {}/", e.name)
             } else {
-                format!(" {:<24}{:>10}", e.name, e.size_str())
+                // Right-align the size (with its unit) and fit the name to what's
+                // left, so the unit is never clipped at the pane's edge.
+                let size = e.size_str();
+                let name_w = inner_w.saturating_sub(size.len() + 2).max(1);
+                let name = fit_width(&e.name, name_w);
+                format!(" {:<name_w$} {}", name, size)
             };
             let style = if on && list_focus {
                 accent
@@ -2578,6 +2584,19 @@ impl App {
 
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
+}
+
+/// Truncate `s` to at most `w` columns, ending with `…` when clipped.
+fn fit_width(s: &str, w: usize) -> String {
+    if w == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= w {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(w - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Persisted view-mode toggles (print layout, invisibles, table borders), so
