@@ -105,6 +105,9 @@ pub struct Backstage {
     pub name_input: String,
     /// Caret position (char index) within `name_input`.
     pub name_cursor: usize,
+    /// In Save As: true when the file-name field is focused (accepting edits),
+    /// false when the folder browser is focused.
+    pub name_focus: bool,
 }
 
 impl Backstage {
@@ -124,6 +127,7 @@ impl Backstage {
             preview_scroll: 0,
             name_input: String::new(),
             name_cursor: 0,
+            name_focus: false,
         };
         b.refresh();
         b

@@ -287,6 +287,11 @@ struct App {
     bs_preview_h: usize,
     /// Index of the first file row shown (for mapping a click to an entry).
     bs_list_start: usize,
+    /// Save As name-box geometry (screen cells), set by draw() for hit-testing:
+    /// the editable text row, the first name char's x, and the box's top y.
+    bs_name_y: u16,
+    bs_name_x0: u16,
+    bs_name_top: u16,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -379,6 +384,9 @@ impl App {
             bs_preview_w: 36,
             bs_preview_h: 20,
             bs_list_start: 0,
+            bs_name_y: 0,
+            bs_name_x0: 0,
+            bs_name_top: 0,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -705,9 +713,23 @@ impl App {
             Some(b) => (b.item, b.pane),
             None => return,
         };
-        // The Save As dialog: clicking a folder steps in, clicking a file copies
-        // its name into the input (an overwrite target).
+        // The Save As dialog has two pieces; clicking one focuses it and
+        // deactivates the other.
         if pane == Pane::SaveAs {
+            // Click inside the name box (its 3 bottom rows): focus the field and
+            // drop the caret at the clicked character.
+            if y >= self.bs_name_top {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_focus = true;
+                    let off = x.saturating_sub(self.bs_name_x0) as usize;
+                    b.name_cursor = off.min(b.name_input.chars().count());
+                    self.dirty = true;
+                }
+                return;
+            }
+            // Click in the folder list: focus the browser (hiding the name caret)
+            // and select the row. A folder steps in on a second click; a file
+            // copies its name into the field as an overwrite target.
             if y < 2 {
                 return;
             }
@@ -715,6 +737,7 @@ impl App {
             if let Some(b) = self.backstage.as_mut() {
                 if idx < b.entries.len() {
                     let was_sel = idx == b.sel;
+                    b.name_focus = false;
                     b.sel = idx;
                     let is_dir = b.entries[idx].is_dir;
                     if is_dir && was_sel {
@@ -823,6 +846,7 @@ impl App {
                 if let Some(b) = self.backstage.as_mut() {
                     b.name_cursor = base.chars().count();
                     b.name_input = base;
+                    b.name_focus = true;
                     b.pane = Pane::SaveAs;
                 }
             }
@@ -843,48 +867,96 @@ impl App {
         self.quit_requested
     }
 
-    /// Keys for the Save As dialog. The arrows stay with the file-name field
-    /// (caret movement) — they never drive the folder list, which is changed by
-    /// the mouse. Enter writes the file, Esc (handled by the caller) cancels.
+    /// Keys for the Save As dialog. Tab moves focus between the file-name field
+    /// and the folder browser; each piece only reacts when it's focused. Enter
+    /// saves, Esc (handled by the caller) cancels.
     fn save_as_key(&mut self, key: KeyEvent) -> bool {
-        if key.code == KeyCode::Enter {
-            self.commit_save_as();
-            self.dirty = true;
-            return false;
-        }
-        if let Some(b) = self.backstage.as_mut() {
-            let len = b.name_input.chars().count();
-            match key.code {
-                KeyCode::Char(c) => {
-                    let at = byte_index(&b.name_input, b.name_cursor);
-                    b.name_input.insert(at, c);
-                    b.name_cursor += 1;
-                }
-                KeyCode::Backspace => {
-                    if b.name_cursor > 0 {
-                        let start = byte_index(&b.name_input, b.name_cursor - 1);
-                        let end = byte_index(&b.name_input, b.name_cursor);
-                        b.name_input.replace_range(start..end, "");
-                        b.name_cursor -= 1;
-                    }
-                }
-                KeyCode::Delete => {
-                    if b.name_cursor < len {
-                        let start = byte_index(&b.name_input, b.name_cursor);
-                        let end = byte_index(&b.name_input, b.name_cursor + 1);
-                        b.name_input.replace_range(start..end, "");
-                    }
-                }
-                KeyCode::Left => b.name_cursor = b.name_cursor.saturating_sub(1),
-                KeyCode::Right => b.name_cursor = (b.name_cursor + 1).min(len),
-                KeyCode::Home => b.name_cursor = 0,
-                KeyCode::End => b.name_cursor = len,
-                // Up/Down deliberately do nothing here.
-                _ => {}
+        let name_focus = self
+            .backstage
+            .as_ref()
+            .map(|b| b.name_focus)
+            .unwrap_or(true);
+        match key.code {
+            KeyCode::Enter => {
+                self.commit_save_as();
+                self.dirty = true;
+                return false;
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_focus = !b.name_focus;
+                }
+                self.dirty = true;
+                return false;
+            }
+            _ => {}
+        }
+        if name_focus {
+            self.save_as_name_key(key);
+        } else {
+            self.save_as_browser_key(key);
         }
         self.dirty = true;
         false
+    }
+
+    /// Editing keys while the file-name field is focused.
+    fn save_as_name_key(&mut self, key: KeyEvent) {
+        let Some(b) = self.backstage.as_mut() else {
+            return;
+        };
+        let len = b.name_input.chars().count();
+        match key.code {
+            KeyCode::Char(c) => {
+                let at = byte_index(&b.name_input, b.name_cursor);
+                b.name_input.insert(at, c);
+                b.name_cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if b.name_cursor > 0 {
+                    let start = byte_index(&b.name_input, b.name_cursor - 1);
+                    let end = byte_index(&b.name_input, b.name_cursor);
+                    b.name_input.replace_range(start..end, "");
+                    b.name_cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if b.name_cursor < len {
+                    let start = byte_index(&b.name_input, b.name_cursor);
+                    let end = byte_index(&b.name_input, b.name_cursor + 1);
+                    b.name_input.replace_range(start..end, "");
+                }
+            }
+            KeyCode::Left => b.name_cursor = b.name_cursor.saturating_sub(1),
+            KeyCode::Right => b.name_cursor = (b.name_cursor + 1).min(len),
+            KeyCode::Home => b.name_cursor = 0,
+            KeyCode::End => b.name_cursor = len,
+            _ => {}
+        }
+    }
+
+    /// Navigation keys while the folder browser is focused. Picking a file copies
+    /// its name into the field and returns focus there.
+    fn save_as_browser_key(&mut self, key: KeyEvent) {
+        let Some(b) = self.backstage.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => b.move_sel(false),
+            KeyCode::Down => b.move_sel(true),
+            KeyCode::Left => b.go_up(),
+            KeyCode::Right => {
+                if b.selected().map(|e| e.is_dir).unwrap_or(false) {
+                    let _ = b.enter();
+                } else if let Some(e) = b.selected() {
+                    let name = e.name.clone();
+                    b.name_cursor = name.chars().count();
+                    b.name_input = name;
+                    b.name_focus = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Write the document to `dir/name_input` (adding `.docx` if absent), make it
@@ -1195,6 +1267,14 @@ impl App {
     fn draw_bs_save_as(&self, f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let rev = Style::default().add_modifier(Modifier::REVERSED);
+        let focused = Style::default().fg(Color::Cyan);
+        // The focused piece gets a cyan border; the other is dimmed.
+        let (list_border, name_border) = if bs.name_focus {
+            (dim, focused)
+        } else {
+            (focused, dim)
+        };
         // Folder list on top, the typed file name in a box below it.
         let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
 
@@ -1213,8 +1293,11 @@ impl App {
                 let name_w = inner_w.saturating_sub(size.len() + 2).max(1);
                 format!(" {:<name_w$} {}", fit_width(&e.name, name_w), size)
             };
-            let style = if on {
+            // Highlight the selection strongly only when the browser is focused.
+            let style = if on && !bs.name_focus {
                 accent
+            } else if on {
+                rev
             } else if e.is_dir {
                 Style::default()
             } else {
@@ -1227,30 +1310,33 @@ impl App {
             Paragraph::new(lines).block(
                 RBlock::default()
                     .borders(Borders::ALL)
-                    .border_style(dim)
+                    .border_style(list_border)
                     .title(title),
             ),
             rows[0],
         );
 
         // file-name input — the text is plain; the caret is the real terminal
-        // cursor (same as the main editor), placed via set_cursor_position.
+        // cursor (same as the main editor), placed via set_cursor_position only
+        // while the field is focused.
         f.render_widget(
             Paragraph::new(RLine::raw(format!(" {}", bs.name_input))).block(
                 RBlock::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(" File name  (Enter to save · Esc cancel · click a folder to move) "),
+                    .border_style(name_border)
+                    .title(" File name  (Tab switches · Enter saves · Esc cancels) "),
             ),
             rows[1],
         );
-        // left border (1) + leading space (1) + caret column, clamped to the box
-        let inner_w = rows[1].width.saturating_sub(2);
-        let cx = (2 + bs.name_cursor as u16).min(inner_w);
-        f.set_cursor_position(Position {
-            x: rows[1].x + cx,
-            y: rows[1].y + 1,
-        });
+        if bs.name_focus {
+            // left border (1) + leading space (1) + caret column, clamped to the box
+            let inner_w = rows[1].width.saturating_sub(2);
+            let cx = (2 + bs.name_cursor as u16).min(inner_w);
+            f.set_cursor_position(Position {
+                x: rows[1].x + cx,
+                y: rows[1].y + 1,
+            });
+        }
     }
 
     fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
@@ -2598,6 +2684,11 @@ impl App {
             // − title(1) − borders(2) tall.
             self.bs_preview_w = (f.area().width as usize).saturating_sub(50).max(8);
             self.bs_preview_h = (f.area().height as usize).saturating_sub(3).max(1);
+            // Save As name box: bottom 3 rows of the content column (x starts at
+            // menu(14) + border(1) + space(1) = 16).
+            self.bs_name_top = f.area().height.saturating_sub(3);
+            self.bs_name_y = f.area().height.saturating_sub(2);
+            self.bs_name_x0 = 16;
             // Top file row shown, so a click can be mapped back to an entry.
             let list_h = (f.area().height as usize).saturating_sub(3).max(1);
             if let Some(b) = &self.backstage {
@@ -3417,6 +3508,38 @@ mod tests {
             .unwrap();
         app.bs_mouse(3, 1 + nrow as u16);
         assert!(app.backstage.is_some()); // still in the backstage, nothing reset
+    }
+
+    #[test]
+    fn save_as_clicks_switch_focus_and_place_caret() {
+        let tmp = std::env::temp_dir().join("docxy_saveas_focus");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let mut app = app_with(&["x"]);
+        app.path = tmp.join("report.docx").to_string_lossy().into_owned();
+        app.backstage = Some(backstage::Backstage::open(tmp.clone()));
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::SaveAs;
+        }
+        app.bs_menu_activate();
+        assert!(app.backstage.as_ref().unwrap().name_focus);
+        // simulate the geometry draw() would store for the name box
+        app.bs_name_top = 20;
+        app.bs_name_y = 21;
+        app.bs_name_x0 = 16;
+        // click inside the name box, 3 cells into the text -> caret at char 3
+        app.bs_mouse(app.bs_name_x0 + 3, 21);
+        let b = app.backstage.as_ref().unwrap();
+        assert!(b.name_focus);
+        assert_eq!(b.name_cursor, 3);
+        // click in the folder list -> focus the browser, deactivate the field
+        app.bs_mouse(20, 2);
+        assert!(!app.backstage.as_ref().unwrap().name_focus);
+        // with the browser focused, typing must NOT edit the file name
+        let before = app.backstage.as_ref().unwrap().name_input.clone();
+        app.on_key(key(KeyCode::Char('Z')));
+        assert_eq!(app.backstage.as_ref().unwrap().name_input, before);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
