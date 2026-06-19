@@ -2,7 +2,8 @@
 //! OS's own GDI, so `.wmf`/`.emf` media render as real images instead of
 //! placeholder boxes. Windows-only; elsewhere [`render`] returns `None`.
 
-/// Render a WMF or EMF metafile into a `w`×`h` RGBA bitmap (white background).
+/// Render a WMF or EMF metafile into a `w`×`h` RGBA bitmap with the white page
+/// keyed to transparent (see [`key_page`]), so equations blend with the terminal.
 /// Returns `None` if the bytes aren't a recognizable metafile or GDI fails.
 #[cfg(windows)]
 pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<image::RgbaImage> {
@@ -61,7 +62,11 @@ pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<image::RgbaImage> {
         let src = std::slice::from_raw_parts(bits as *const u8, n);
         let mut rgba = Vec::with_capacity(n);
         for px in src.chunks_exact(4) {
-            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]); // BGRX -> RGBA, opaque
+            // BGRX from GDI. These metafiles are mostly equations: black line-art on
+            // the white page we filled. Drop the page to transparent so it blends
+            // with the terminal instead of showing as a white sticker.
+            let (r, g, b) = (px[2], px[1], px[0]);
+            rgba.extend_from_slice(&key_page(r, g, b));
         }
 
         SelectObject(hdc, old);
@@ -71,6 +76,29 @@ pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<image::RgbaImage> {
         DeleteEnhMetaFile(hemf);
 
         image::RgbaImage::from_raw(w, h, rgba)
+    }
+}
+
+/// Map one rendered pixel (over a white page) to RGBA with the page keyed out.
+///
+/// Grayscale ink (the usual equation case) becomes a light glyph whose opacity is
+/// its darkness, so it reads on a dark terminal and the page turns transparent.
+/// Coloured art keeps its colour and only the near-white page is dropped. The
+/// light branch is premultiplied against black, so it still looks right on the
+/// few terminals that ignore alpha (the page stays dark rather than light).
+#[cfg(windows)]
+fn key_page(r: u8, g: u8, b: u8) -> [u8; 4] {
+    let lum = (r as u32 * 30 + g as u32 * 59 + b as u32 * 11) / 100; // 0..=255
+    let sat = r.max(g).max(b) - r.min(g).min(b);
+    if sat < 24 {
+        // Line art: ink coverage is how dark the pixel is; recolour to light.
+        let cov = 255 - lum as u8;
+        let v = (220 * cov as u32 / 255) as u8;
+        [v, v, v, cov]
+    } else {
+        // Coloured: keep the colour, drop only the white page.
+        let a = if r.min(g).min(b) > 230 { 0 } else { 255 };
+        [r, g, b, a]
     }
 }
 
@@ -113,4 +141,23 @@ unsafe fn to_emf(bytes: &[u8]) -> Option<windows_sys::Win32::Graphics::Gdi::HENH
 #[cfg(not(windows))]
 pub fn render(_bytes: &[u8], _w: u32, _h: u32) -> Option<image::RgbaImage> {
     None
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::key_page;
+
+    #[test]
+    fn keys_page_to_transparent_and_inverts_ink() {
+        // The white page becomes fully transparent.
+        assert_eq!(key_page(255, 255, 255)[3], 0);
+        // Black ink becomes opaque and light (visible on a dark terminal).
+        let ink = key_page(0, 0, 0);
+        assert_eq!(ink[3], 255);
+        assert!(ink[0] > 128, "ink should be light: {ink:?}");
+        // A coloured pixel keeps its colour and stays opaque.
+        let red = key_page(200, 10, 10);
+        assert_eq!([red[0], red[1], red[2]], [200, 10, 10]);
+        assert_eq!(red[3], 255);
+    }
 }
