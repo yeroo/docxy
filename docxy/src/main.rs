@@ -8,6 +8,7 @@
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
 //! line-map, and routes keys into a `docxcore::editor::Editor`.
 
+mod backstage;
 mod metafile;
 mod ribbon;
 
@@ -20,7 +21,7 @@ use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
 use docxcore::model::{Align, Block, Document, PageGeom};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
-use docxcore::package::{Package, load_package, save_package};
+use docxcore::package::{Package, load_package, new_package, save_package};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
     render_with_images,
@@ -41,7 +42,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan, Text};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block as RBlock, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -275,6 +278,8 @@ struct App {
     ribbon_open: bool,
     ribbon_focus: ribbon::Focus,
     ribbon_h: usize,
+    /// The full-screen File backstage, when open.
+    backstage: Option<backstage::Backstage>,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -362,6 +367,7 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             // Set each frame by draw(); 0 until then so mouse rows map directly.
             ribbon_h: 0,
+            backstage: None,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -454,6 +460,9 @@ impl App {
             KeyCode::Down => self.ribbon_move(Dir::Down),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 match self.ribbon_focus {
+                    ribbon::Focus::Tab(i) if self.ribbon.tab_label(i) == Some("File") => {
+                        self.open_backstage();
+                    }
                     ribbon::Focus::Tab(_) => self.ribbon_focus = self.ribbon.enter_body(),
                     ribbon::Focus::Button(_) => {
                         if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
@@ -541,6 +550,392 @@ impl App {
             );
         }
         f.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+
+    // ---- File backstage ----
+
+    /// Open the full-screen File menu, starting in the current file's folder.
+    fn open_backstage(&mut self) {
+        let dir = std::path::Path::new(&self.path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.backstage = Some(backstage::Backstage::open(dir));
+        self.ribbon_focus = ribbon::Focus::None;
+        self.ribbon_open = false;
+        self.bs_update_preview();
+        self.dirty = true;
+    }
+
+    fn backstage_key(&mut self, key: KeyEvent) -> bool {
+        use backstage::Pane;
+        let pane = match &self.backstage {
+            Some(b) => b.pane,
+            None => return false,
+        };
+        if key.code == KeyCode::Esc {
+            self.backstage = None;
+            self.dirty = true;
+            return false;
+        }
+        if pane == Pane::Menu {
+            match key.code {
+                KeyCode::Up => self.bs_menu_move(false),
+                KeyCode::Down => self.bs_menu_move(true),
+                KeyCode::Enter | KeyCode::Right => return self.bs_menu_activate(),
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(b) = self.backstage.as_mut() {
+                        b.move_sel(false);
+                    }
+                    self.bs_update_preview();
+                }
+                KeyCode::Down => {
+                    if let Some(b) = self.backstage.as_mut() {
+                        b.move_sel(true);
+                    }
+                    self.bs_update_preview();
+                }
+                KeyCode::Enter => {
+                    let path = self.backstage.as_mut().and_then(|b| b.enter());
+                    if let Some(p) = path {
+                        self.open_path(&p);
+                        self.backstage = None;
+                    } else {
+                        self.bs_update_preview();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(b) = self.backstage.as_mut() {
+                        b.go_up();
+                    }
+                    self.bs_update_preview();
+                }
+                KeyCode::Left => {
+                    if let Some(b) = self.backstage.as_mut() {
+                        b.pane = Pane::Menu;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn bs_menu_move(&mut self, down: bool) {
+        if let Some(b) = self.backstage.as_mut() {
+            let n = backstage::ITEMS.len();
+            let i = backstage::ITEMS
+                .iter()
+                .position(|x| *x == b.item)
+                .unwrap_or(0);
+            let ni = if down {
+                (i + 1).min(n - 1)
+            } else {
+                i.saturating_sub(1)
+            };
+            b.item = backstage::ITEMS[ni];
+        }
+    }
+
+    /// Activate the selected menu item. Returns true only if the app should quit.
+    fn bs_menu_activate(&mut self) -> bool {
+        use backstage::{Item, Pane};
+        let item = match &self.backstage {
+            Some(b) => b.item,
+            None => return false,
+        };
+        match item {
+            Item::Open => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.pane = Pane::Browser;
+                }
+                self.bs_update_preview();
+            }
+            Item::Info => {} // the Info pane is shown on the right; nothing to do
+            Item::Save => {
+                self.save();
+                self.backstage = None;
+            }
+            Item::SaveAs => self.status = Some("Save As — not implemented yet".to_string()),
+            Item::New | Item::Close => {
+                self.new_document();
+                self.backstage = None;
+            }
+            Item::Print | Item::Export => {
+                self.export_pdf();
+                self.backstage = None;
+            }
+        }
+        self.dirty = true;
+        false
+    }
+
+    /// Render a quick preview of the highlighted `.docx` into the backstage.
+    fn bs_update_preview(&mut self) {
+        let sel = self.backstage.as_ref().and_then(|b| b.selected_docx());
+        let Some(b) = self.backstage.as_mut() else {
+            return;
+        };
+        if sel == b.preview_path {
+            return;
+        }
+        b.preview_path = sel.clone();
+        b.preview.clear();
+        let Some(path) = sel else { return };
+        match std::fs::read(&path)
+            .ok()
+            .and_then(|d| load_package(&d).ok())
+        {
+            Some(pkg) => {
+                let styles = pkg
+                    .part("word/styles.xml")
+                    .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
+                    .unwrap_or_default();
+                let opts = RenderOptions {
+                    width: 36,
+                    styles: Rc::new(styles),
+                    ..RenderOptions::default()
+                };
+                b.preview = docxcore::render::render(&pkg.document, &opts)
+                    .iter()
+                    .take(60)
+                    .map(|l| l.plain())
+                    .collect();
+            }
+            None => b.preview = vec!["(cannot read this file)".to_string()],
+        }
+    }
+
+    /// Replace the open document with one loaded from `path`.
+    fn open_path(&mut self, path: &std::path::Path) {
+        match std::fs::read(path).ok().and_then(|d| load_package(&d).ok()) {
+            Some(pkg) => {
+                self.load_package_state(pkg, path.display().to_string());
+                self.status = Some(format!("opened {}", path.display()));
+            }
+            None => self.status = Some(format!("cannot open {}", path.display())),
+        }
+    }
+
+    fn new_document(&mut self) {
+        let pkg = new_package(Document {
+            body: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
+        });
+        self.load_package_state(pkg, "untitled.docx".to_string());
+        self.status = Some("new document".to_string());
+    }
+
+    fn export_pdf(&mut self) {
+        let mut out = std::path::PathBuf::from(&self.path);
+        out.set_extension("pdf");
+        let pdf = to_pdf(
+            &self.editor.doc,
+            &PdfOptions {
+                styles: self.styles.clone(),
+                ..PdfOptions::default()
+            },
+        );
+        self.status = match std::fs::write(&out, &pdf) {
+            Ok(()) => Some(format!("exported {}", out.display())),
+            Err(e) => Some(format!("export failed: {e}")),
+        };
+    }
+
+    /// Rebuild all per-document state from a freshly loaded package.
+    fn load_package_state(&mut self, mut pkg: Package, path: String) {
+        let styles = pkg
+            .part("word/styles.xml")
+            .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let numbering = pkg
+            .part("word/numbering.xml")
+            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let rels = pkg
+            .part("word/_rels/document.xml.rels")
+            .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let parts = |kind: &str| PageParts {
+            default: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "default")),
+            first: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "first")),
+            even: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "even")),
+        };
+        self.headers = parts("headerReference");
+        self.footers = parts("footerReference");
+        self.title_page = flag_on(pkg.sect_pr(), "titlePg");
+        self.even_odd = pkg
+            .part("word/settings.xml")
+            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
+            .unwrap_or(false);
+        self.header_part = hf_part_name(&pkg, &rels, "headerReference");
+        self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
+        let doc = std::mem::take(&mut pkg.document);
+        self.pkg = pkg;
+        self.editor = Editor::new(doc);
+        self.styles = Rc::new(styles);
+        self.numbering = Rc::new(numbering);
+        self.rels = rels;
+        self.path = path;
+        self.modified = false;
+        self.scroll = 0;
+        self.find = None;
+        self.img_cache.clear();
+        self.dirty = true;
+    }
+
+    fn draw_backstage(&self, f: &mut Frame, area: Rect) {
+        use backstage::{Item, Pane};
+        let Some(bs) = &self.backstage else { return };
+        f.render_widget(Clear, area);
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let rev = Style::default().add_modifier(Modifier::REVERSED);
+
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+        f.render_widget(
+            Paragraph::new(RLine::styled("  File      (Esc to close)", rev)),
+            rows[0],
+        );
+        let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).split(rows[1]);
+
+        // left menu
+        let menu_focus = bs.pane == Pane::Menu;
+        let menu_lines: Vec<RLine> = backstage::ITEMS
+            .iter()
+            .map(|it| {
+                let on = *it == bs.item;
+                let style = if on && menu_focus {
+                    accent
+                } else if on {
+                    rev
+                } else {
+                    Style::default()
+                };
+                RLine::styled(format!(" {:<12}", it.label()), style)
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(menu_lines)
+                .block(RBlock::default().borders(Borders::RIGHT).border_style(dim)),
+            cols[0],
+        );
+
+        // right content pane
+        match bs.item {
+            Item::Open => self.draw_bs_open(f, cols[1], bs),
+            Item::Info => self.draw_bs_info(f, cols[1]),
+            other => {
+                let msg = match other {
+                    Item::Save => "Save (Ctrl+S) — write changes to the current file.",
+                    Item::SaveAs => "Save As — not implemented yet.",
+                    Item::Print | Item::Export => "Export — write a PDF next to the document.",
+                    Item::New => "New — start a blank document.",
+                    Item::Close => "Close — discard and start a blank document.",
+                    _ => "",
+                };
+                f.render_widget(
+                    Paragraph::new(format!("\n  {msg}\n\n  Enter to run · Esc to close")),
+                    cols[1],
+                );
+            }
+        }
+    }
+
+    fn draw_bs_open(&self, f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let rev = Style::default().add_modifier(Modifier::REVERSED);
+        let panes = Layout::horizontal([Constraint::Min(24), Constraint::Length(40)]).split(area);
+
+        // file list (dir path as the box title)
+        let title = format!(" {} ", bs.dir.display());
+        let list_focus = bs.pane == backstage::Pane::Browser;
+        let inner_h = panes[0].height.saturating_sub(2) as usize;
+        let start = bs
+            .sel
+            .saturating_sub(inner_h / 2)
+            .min(bs.entries.len().saturating_sub(inner_h));
+        let mut lines = Vec::new();
+        for (i, e) in bs.entries.iter().enumerate().skip(start).take(inner_h) {
+            let on = i == bs.sel;
+            let label = if e.is_dir {
+                format!(" {}/", e.name)
+            } else {
+                format!(" {:<24}{:>10}", e.name, e.size_str())
+            };
+            let style = if on && list_focus {
+                accent
+            } else if on {
+                rev
+            } else if e.locked {
+                dim
+            } else {
+                Style::default()
+            };
+            lines.push(RLine::styled(label, style));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(title),
+            ),
+            panes[0],
+        );
+
+        // preview
+        let prev: Vec<RLine> = bs.preview.iter().map(|s| RLine::raw(s.clone())).collect();
+        f.render_widget(
+            Paragraph::new(prev).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(" Preview "),
+            ),
+            panes[1],
+        );
+    }
+
+    fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let text = self.editor.doc.plain_text();
+        let words = text.split_whitespace().count();
+        let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+        let paras = self
+            .editor
+            .doc
+            .body
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(_)))
+            .count();
+        let lines = vec![
+            RLine::raw(format!("  File        {}", self.path)),
+            RLine::raw(format!(
+                "  Modified    {}",
+                if self.modified { "yes" } else { "no" }
+            )),
+            RLine::raw(String::new()),
+            RLine::raw(format!("  Paragraphs  {paras}")),
+            RLine::raw(format!("  Words       {words}")),
+            RLine::raw(format!("  Characters  {chars}")),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(" Info "),
+            ),
+            area,
+        );
     }
 
     fn ensure_rendered(&mut self, width: u16) {
@@ -972,9 +1367,13 @@ impl App {
     fn ribbon_click(&mut self, x: u16, y: u16) {
         match self.ribbon.hit(x, y, self.ribbon_open) {
             ribbon::Hit::Tab(i) => {
-                self.ribbon_open = true;
-                self.ribbon_focus = ribbon::Focus::Tab(i);
-                self.dirty = true;
+                if self.ribbon.tab_label(i) == Some("File") {
+                    self.open_backstage();
+                } else {
+                    self.ribbon_open = true;
+                    self.ribbon_focus = ribbon::Focus::Tab(i);
+                    self.dirty = true;
+                }
             }
             ribbon::Hit::Button(act) => {
                 self.run_act(act);
@@ -985,6 +1384,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.backstage.is_some() {
+            return; // backstage is keyboard-driven for now
+        }
         let mrow = m.row as usize;
         let col = m.column as usize;
         // A left-click in the ribbon area drives the ribbon; other events (wheel,
@@ -1604,6 +2006,10 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // Keyboard actions should keep the caret on screen; wheel/drag don't.
         self.follow_caret = true;
+        // The File backstage is modal: it owns all keys while open.
+        if self.backstage.is_some() {
+            return self.backstage_key(key);
+        }
         // A link-open confirmation is modal: only an explicit `y` proceeds.
         if let Some(url) = self.pending_link.take() {
             match key.code {
@@ -1649,6 +2055,7 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let is_quit = ctrl && key.code == KeyCode::Char('q');
         if !is_quit {
             self.quit_armed = false;
@@ -1661,6 +2068,7 @@ impl App {
                     self.dirty = true;
                 }
             }
+            KeyCode::Char('f') if alt => self.open_backstage(),
             KeyCode::Char('q') if ctrl => return self.try_quit(),
             KeyCode::Char('s') if ctrl => self.save(),
             KeyCode::Char('f') if ctrl => self.enter_find(),
@@ -1823,6 +2231,11 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // The File backstage takes over the whole screen.
+        if self.backstage.is_some() {
+            self.draw_backstage(f, f.area());
+            return;
+        }
         // The ribbon sits above the document; its height is the collapsed tab
         // strip or the expanded body. Stored so mouse rows can be routed.
         self.ribbon_h = self.ribbon_height();
@@ -2542,6 +2955,25 @@ mod tests {
         let mut app = App::new(new_package(Document { body }), "test.docx", false);
         app.os_clip = None; // don't touch the real OS clipboard in tests
         app
+    }
+
+    #[test]
+    fn backstage_opens_runs_new_and_closes() {
+        let mut app = app_with(&["hello world"]);
+        // File backstage opens and is modal.
+        app.open_backstage();
+        assert!(app.backstage.is_some());
+        // Selecting "New" replaces the document and closes the backstage.
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::New;
+        }
+        app.bs_menu_activate();
+        assert!(app.backstage.is_none());
+        assert_eq!(app.path, "untitled.docx");
+        // Esc closes the backstage without quitting the app.
+        app.open_backstage();
+        assert!(!app.on_key(key(KeyCode::Esc)));
+        assert!(app.backstage.is_none());
     }
 
     #[test]

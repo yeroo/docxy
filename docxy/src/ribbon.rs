@@ -259,9 +259,9 @@ impl Ribbon {
             },
         ];
         let mut r = Ribbon {
-            // Only Home exists for now; other tabs aren't drawn until implemented.
-            tabs: vec!["Home"],
-            active: 0,
+            // File opens the full-screen backstage; Home is the only ribbon tab.
+            tabs: vec!["File", "Home"],
+            active: 1,
             groups,
             placed: Vec::new(),
             tab_cols: Vec::new(),
@@ -310,6 +310,9 @@ impl Ribbon {
 
     pub fn active_tab(&self) -> usize {
         self.active
+    }
+    pub fn tab_label(&self, i: usize) -> Option<&'static str> {
+        self.tabs.get(i).copied()
     }
     pub fn width(&self) -> u16 {
         self.width
@@ -597,14 +600,16 @@ mod tests {
     #[test]
     fn clicking_the_home_tab_is_detected() {
         let r = Ribbon::home();
-        let (a, b) = r.tab_cols[0];
-        assert!(matches!(r.hit((a + b) / 2, 0, false), Hit::Tab(0)));
+        // tab 0 = File, tab 1 = Home
+        assert_eq!(r.tab_label(0), Some("File"));
+        let (a, b) = r.tab_cols[1];
+        assert!(matches!(r.hit((a + b) / 2, 0, false), Hit::Tab(1)));
     }
 
     #[test]
     fn down_from_tabs_enters_first_button_then_up_returns() {
         let r = Ribbon::home();
-        let f = r.nav(Focus::Tab(0), Dir::Down);
+        let f = r.nav(Focus::Tab(1), Dir::Down);
         assert!(matches!(f, Focus::Button(_)));
         // the first button is on the top row, so Up goes back to the tabs
         assert!(matches!(r.nav(f, Dir::Up), Focus::Tab(_)));
