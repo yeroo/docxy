@@ -283,6 +283,8 @@ struct App {
     /// Preview pane size (cells), set by draw() so the preview fills/scrolls it.
     bs_preview_w: usize,
     bs_preview_h: usize,
+    /// Index of the first file row shown (for mapping a click to an entry).
+    bs_list_start: usize,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -373,6 +375,7 @@ impl App {
             backstage: None,
             bs_preview_w: 36,
             bs_preview_h: 20,
+            bs_list_start: 0,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -657,6 +660,77 @@ impl App {
         false
     }
 
+    /// Route a left-click inside the File backstage. The layout is fixed:
+    /// menu column x<14, then (for Open) the file list x 14..48, then the
+    /// preview. Clicking a row selects it; clicking the already-selected row
+    /// activates it (open the file / step into the folder).
+    fn bs_mouse(&mut self, x: u16, y: u16) {
+        use backstage::{ITEMS, Item, Pane};
+        // Left menu column: select an item, or activate it on a second click.
+        if x < 14 {
+            if y >= 1 {
+                let idx = (y - 1) as usize;
+                if idx < ITEMS.len() {
+                    let cur = self.backstage.as_ref().map(|b| b.item);
+                    if cur == Some(ITEMS[idx]) {
+                        let _ = self.bs_menu_activate();
+                    } else if let Some(b) = self.backstage.as_mut() {
+                        b.item = ITEMS[idx];
+                        b.pane = Pane::Menu;
+                    }
+                    self.bs_update_preview();
+                    self.dirty = true;
+                }
+            }
+            return;
+        }
+        // The list/preview only exist for the Open item.
+        let is_open = self
+            .backstage
+            .as_ref()
+            .map(|b| b.item == Item::Open)
+            .unwrap_or(false);
+        if !is_open {
+            return;
+        }
+        if x < 48 {
+            // File list: rows start below the box's top border (body y=1, +1).
+            if y < 2 {
+                return;
+            }
+            let row = (y - 2) as usize;
+            let idx = self.bs_list_start + row;
+            let (n, sel) = match &self.backstage {
+                Some(b) => (b.entries.len(), b.sel),
+                None => return,
+            };
+            if idx >= n {
+                return;
+            }
+            if idx == sel {
+                // Second click on the highlighted row activates it.
+                let path = self.backstage.as_mut().and_then(|b| b.enter());
+                if let Some(p) = path {
+                    self.open_path(&p);
+                    self.backstage = None;
+                } else {
+                    self.bs_update_preview();
+                }
+            } else if let Some(b) = self.backstage.as_mut() {
+                b.sel = idx;
+                b.pane = Pane::Browser;
+                self.bs_update_preview();
+            }
+            self.dirty = true;
+        } else {
+            // Click in the preview gives it focus so the wheel/keys scroll it.
+            if let Some(b) = self.backstage.as_mut() {
+                b.pane = Pane::Preview;
+            }
+            self.dirty = true;
+        }
+    }
+
     fn bs_scroll_preview(&mut self, delta: isize) {
         let h = self.bs_preview_h.max(1);
         if let Some(b) = self.backstage.as_mut() {
@@ -903,10 +977,7 @@ impl App {
         let title = format!(" {} ", bs.dir.display());
         let list_focus = bs.pane == backstage::Pane::Browser;
         let inner_h = panes[0].height.saturating_sub(2) as usize;
-        let start = bs
-            .sel
-            .saturating_sub(inner_h / 2)
-            .min(bs.entries.len().saturating_sub(inner_h));
+        let start = self.bs_list_start;
         let mut lines = Vec::new();
         for (i, e) in bs.entries.iter().enumerate().skip(start).take(inner_h) {
             let on = i == bs.sel;
@@ -1467,6 +1538,7 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         if self.backstage.is_some() {
             match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => self.bs_mouse(m.column, m.row),
                 MouseEventKind::ScrollDown => {
                     self.bs_scroll_preview(3);
                     self.dirty = true;
@@ -1477,7 +1549,7 @@ impl App {
                 }
                 _ => {}
             }
-            return; // backstage is otherwise keyboard-driven
+            return; // backstage handles its own mouse
         }
         let mrow = m.row as usize;
         let col = m.column as usize;
@@ -2329,6 +2401,14 @@ impl App {
             // − title(1) − borders(2) tall.
             self.bs_preview_w = (f.area().width as usize).saturating_sub(50).max(8);
             self.bs_preview_h = (f.area().height as usize).saturating_sub(3).max(1);
+            // Top file row shown, so a click can be mapped back to an entry.
+            let list_h = (f.area().height as usize).saturating_sub(3).max(1);
+            if let Some(b) = &self.backstage {
+                self.bs_list_start = b
+                    .sel
+                    .saturating_sub(list_h / 2)
+                    .min(b.entries.len().saturating_sub(list_h));
+            }
             self.bs_update_preview();
             self.draw_backstage(f, f.area());
             return;
@@ -3086,6 +3166,43 @@ mod tests {
         // and at the top
         app.bs_scroll_preview(-1000);
         assert_eq!(app.backstage.as_ref().unwrap().preview_scroll, 0);
+    }
+
+    #[test]
+    fn clicking_a_file_row_selects_then_opens_it() {
+        let tmp = std::env::temp_dir().join("docxy_click_pick");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // a real, openable doc so the second click can open it
+        let pkg = new_package(Document {
+            body: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
+        });
+        std::fs::write(tmp.join("hello.docx"), save_package(&pkg)).unwrap();
+        let mut app = app_with(&["start"]);
+        app.backstage = Some(backstage::Backstage::open(tmp.clone()));
+        app.bs_list_start = 0;
+        // find the row of hello.docx (entries are folders-first, no "..")
+        let row = app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.name == "hello.docx")
+            .unwrap();
+        let y = 2 + row as u16; // first entry is at screen y=2
+        // first click selects it
+        app.bs_mouse(20, y);
+        assert_eq!(app.backstage.as_ref().unwrap().sel, row);
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Browser
+        );
+        // second click on the same row opens it and closes the backstage
+        app.bs_mouse(20, y);
+        assert!(app.backstage.is_none());
+        assert!(app.path.ends_with("hello.docx"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
