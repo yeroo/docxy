@@ -39,11 +39,12 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::{
     Block as RBlock, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
 };
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
@@ -257,6 +258,20 @@ struct HfEdit {
     saved_page_view: bool,
 }
 
+/// What a confirmed (Yes) modal should do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    Exit,
+}
+
+/// A modal Yes/No dialog.
+struct Confirm {
+    prompt: String,
+    /// The selected button: true = Yes, false = No.
+    yes: bool,
+    action: ConfirmAction,
+}
+
 struct App {
     pkg: Package,
     editor: Editor,
@@ -292,6 +307,12 @@ struct App {
     bs_name_y: u16,
     bs_name_x0: u16,
     bs_name_top: u16,
+    /// The Save As "Save" button rect (set by draw() for mouse hit-testing).
+    bs_save_btn: Rect,
+    /// A modal Yes/No confirmation (e.g. Exit). The two button rects are stored
+    /// each frame by draw() for mouse hit-testing.
+    confirm: Option<Confirm>,
+    confirm_btns: [Rect; 2],
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -387,6 +408,9 @@ impl App {
             bs_name_y: 0,
             bs_name_x0: 0,
             bs_name_top: 0,
+            bs_save_btn: Rect::default(),
+            confirm: None,
+            confirm_btns: [Rect::default(); 2],
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -716,6 +740,12 @@ impl App {
         // The Save As dialog has two pieces; clicking one focuses it and
         // deactivates the other.
         if pane == Pane::SaveAs {
+            // The Save button (a clickable Enter).
+            if self.bs_save_btn.contains(Position { x, y }) {
+                self.commit_save_as();
+                self.dirty = true;
+                return;
+            }
             // Click inside the name box (its 3 bottom rows): focus the field and
             // drop the caret at the clicked character.
             if y >= self.bs_name_top {
@@ -860,7 +890,15 @@ impl App {
             }
             Item::Exit => {
                 self.backstage = None;
-                self.quit_requested = true;
+                self.confirm = Some(Confirm {
+                    prompt: if self.modified {
+                        "Exit docxy? Unsaved changes will be lost.".to_string()
+                    } else {
+                        "Exit docxy?".to_string()
+                    },
+                    yes: false,
+                    action: ConfirmAction::Exit,
+                });
             }
         }
         self.dirty = true;
@@ -957,6 +995,63 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Apply the modal's choice. Returns true if the app should quit.
+    fn apply_confirm(&mut self) -> bool {
+        self.dirty = true;
+        if let Some(c) = self.confirm.take() {
+            if c.yes {
+                match c.action {
+                    ConfirmAction::Exit => {
+                        self.quit_requested = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Keys for a Yes/No modal: ←/→/Tab move, y/n choose, Enter confirms,
+    /// Esc cancels.
+    fn confirm_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(c) = self.confirm.as_mut() {
+                    c.yes = !c.yes;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(c) = self.confirm.as_mut() {
+                    c.yes = true;
+                }
+                return self.apply_confirm();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm = None;
+            }
+            KeyCode::Enter => return self.apply_confirm(),
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    /// Click on a modal's Yes/No button. Returns true if the app should quit.
+    fn confirm_mouse(&mut self, x: u16, y: u16) -> bool {
+        let p = Position { x, y };
+        if self.confirm_btns[0].contains(p) {
+            if let Some(c) = self.confirm.as_mut() {
+                c.yes = true;
+            }
+            return self.apply_confirm();
+        }
+        if self.confirm_btns[1].contains(p) {
+            self.confirm = None;
+            self.dirty = true;
+        }
+        false
     }
 
     /// Write the document to `dir/name_input` (adding `.docx` if absent), make it
@@ -1316,6 +1411,12 @@ impl App {
             rows[0],
         );
 
+        // The name band is the file-name input plus a Save button on the right.
+        let btn = self.bs_save_btn;
+        let name_box = Rect {
+            width: rows[1].width.saturating_sub(btn.width),
+            ..rows[1]
+        };
         // file-name input — the text is plain; the caret is the real terminal
         // cursor (same as the main editor), placed via set_cursor_position only
         // while the field is focused.
@@ -1324,19 +1425,91 @@ impl App {
                 RBlock::default()
                     .borders(Borders::ALL)
                     .border_style(name_border)
-                    .title(" File name  (Tab switches · Enter saves · Esc cancels) "),
+                    .title(" File name  (Tab · Enter · Esc) "),
             ),
-            rows[1],
+            name_box,
+        );
+        // Save button — clickable duplicate of Enter.
+        f.render_widget(
+            Paragraph::new("Save")
+                .alignment(Alignment::Center)
+                .block(RBlock::default().borders(Borders::ALL).border_style(accent))
+                .style(accent),
+            btn,
         );
         if bs.name_focus {
             // left border (1) + leading space (1) + caret column, clamped to the box
-            let inner_w = rows[1].width.saturating_sub(2);
+            let inner_w = name_box.width.saturating_sub(2);
             let cx = (2 + bs.name_cursor as u16).min(inner_w);
             f.set_cursor_position(Position {
-                x: rows[1].x + cx,
-                y: rows[1].y + 1,
+                x: name_box.x + cx,
+                y: name_box.y + 1,
             });
         }
+    }
+
+    /// A centered modal Yes/No box. Stores the button rects for hit-testing.
+    fn draw_confirm(&mut self, f: &mut Frame, area: Rect, prompt: &str, yes: bool) {
+        let w = ((prompt.chars().count() as u16) + 6)
+            .clamp(28, area.width.saturating_sub(4).max(28))
+            .min(area.width);
+        let h = 7u16.min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Confirm ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        // prompt, centered above the buttons
+        let prompt_area = Rect {
+            height: inner.height.saturating_sub(2),
+            ..inner
+        };
+        f.render_widget(
+            Paragraph::new(prompt)
+                .wrap(Wrap { trim: true })
+                .alignment(Alignment::Center),
+            prompt_area,
+        );
+
+        // [ Yes ] [ No ] buttons, centered on the bottom row
+        let yes_lbl = "  Yes  ";
+        let no_lbl = "  No  ";
+        let (yw, nw) = (yes_lbl.len() as u16, no_lbl.len() as u16);
+        let total = yw + 2 + nw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let yes_rect = Rect {
+            x: bx,
+            y: by,
+            width: yw,
+            height: 1,
+        };
+        let no_rect = Rect {
+            x: bx + yw + 2,
+            y: by,
+            width: nw,
+            height: 1,
+        };
+        let sel = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(
+            Paragraph::new(yes_lbl).style(if yes { sel } else { unsel }),
+            yes_rect,
+        );
+        f.render_widget(
+            Paragraph::new(no_lbl).style(if yes { unsel } else { sel }),
+            no_rect,
+        );
+        self.confirm_btns = [yes_rect, no_rect];
     }
 
     fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
@@ -1819,6 +1992,13 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.confirm.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                // quit (if any) propagates via quit_requested in handle_event
+                self.confirm_mouse(m.column, m.row);
+            }
+            return;
+        }
         if self.backstage.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.bs_mouse(m.column, m.row),
@@ -2453,6 +2633,10 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // Keyboard actions should keep the caret on screen; wheel/drag don't.
         self.follow_caret = true;
+        // A modal confirmation owns all keys while open.
+        if self.confirm.is_some() {
+            return self.confirm_key(key);
+        }
         // The File backstage is modal: it owns all keys while open.
         if self.backstage.is_some() {
             return self.backstage_key(key);
@@ -2689,6 +2873,13 @@ impl App {
             self.bs_name_top = f.area().height.saturating_sub(3);
             self.bs_name_y = f.area().height.saturating_sub(2);
             self.bs_name_x0 = 16;
+            // Save button: the rightmost 10 cells of the name band.
+            self.bs_save_btn = Rect {
+                x: f.area().width.saturating_sub(10),
+                y: self.bs_name_top,
+                width: 10,
+                height: 3,
+            };
             // Top file row shown, so a click can be mapped back to an entry.
             let list_h = (f.area().height as usize).saturating_sub(3).max(1);
             if let Some(b) = &self.backstage {
@@ -2861,6 +3052,12 @@ impl App {
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
+
+        // A modal confirmation sits on top of everything.
+        if let Some(c) = &self.confirm {
+            let (prompt, yes) = (c.prompt.clone(), c.yes);
+            self.draw_confirm(f, full, &prompt, yes);
+        }
     }
 }
 
@@ -3511,6 +3708,35 @@ mod tests {
     }
 
     #[test]
+    fn save_as_save_button_click_writes_the_file() {
+        let tmp = std::env::temp_dir().join("docxy_save_btn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut app = app_with(&["body"]);
+        app.path = tmp.join("orig.docx").to_string_lossy().into_owned();
+        app.backstage = Some(backstage::Backstage::open(tmp.clone()));
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::SaveAs;
+        }
+        app.bs_menu_activate();
+        if let Some(b) = app.backstage.as_mut() {
+            b.name_input = "clicked".to_string();
+        }
+        // simulate the Save button geometry draw() would store, then click it
+        app.bs_save_btn = Rect {
+            x: 40,
+            y: 20,
+            width: 10,
+            height: 3,
+        };
+        app.bs_mouse(44, 21);
+        assert!(tmp.join("clicked.docx").exists());
+        assert!(app.backstage.is_none());
+        assert!(app.path.ends_with("clicked.docx"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn save_as_clicks_switch_focus_and_place_caret() {
         let tmp = std::env::temp_dir().join("docxy_saveas_focus");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3572,18 +3798,32 @@ mod tests {
     }
 
     #[test]
-    fn file_menu_exit_quits_the_program() {
+    fn file_menu_exit_asks_to_confirm_then_quits() {
         let mut app = app_with(&["doc"]);
         app.open_backstage();
         if let Some(b) = app.backstage.as_mut() {
             b.item = backstage::Item::Exit;
             b.pane = backstage::Pane::Menu;
         }
-        // Enter on the Exit item signals quit to the event loop.
+        // Activating Exit opens a Yes/No modal instead of quitting outright.
         let quit = app.bs_menu_activate();
+        assert!(!quit);
+        assert!(!app.quit_requested);
+        assert!(app.backstage.is_none());
+        assert!(app.confirm.is_some());
+        // No is selected by default; Esc dismisses without quitting.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+        assert!(!app.quit_requested);
+        // Reopen and confirm with 'y'.
+        app.open_backstage();
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::Exit;
+        }
+        app.bs_menu_activate();
+        let quit = app.on_key(key(KeyCode::Char('y')));
         assert!(quit);
         assert!(app.quit_requested);
-        assert!(app.backstage.is_none());
     }
 
     #[test]
