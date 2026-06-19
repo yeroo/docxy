@@ -1225,24 +1225,10 @@ impl App {
             rows[0],
         );
 
-        // file-name input — a Far-style block cursor sits *on* a cell (the char
-        // at the caret, or a trailing space at end-of-line), without inserting a
-        // gap that would shift the text.
-        let cursor = Style::default().fg(Color::Black).bg(Color::Cyan);
-        let mut spans = vec![RSpan::raw(" ")];
-        for (i, ch) in bs.name_input.chars().enumerate() {
-            let st = if i == bs.name_cursor {
-                cursor
-            } else {
-                Style::default()
-            };
-            spans.push(RSpan::styled(ch.to_string(), st));
-        }
-        if bs.name_cursor >= bs.name_input.chars().count() {
-            spans.push(RSpan::styled(" ", cursor));
-        }
+        // file-name input — the text is plain; the caret is the real terminal
+        // cursor (same as the main editor), placed via set_cursor_position.
         f.render_widget(
-            Paragraph::new(RLine::from(spans)).block(
+            Paragraph::new(RLine::raw(format!(" {}", bs.name_input))).block(
                 RBlock::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
@@ -1250,6 +1236,13 @@ impl App {
             ),
             rows[1],
         );
+        // left border (1) + leading space (1) + caret column, clamped to the box
+        let inner_w = rows[1].width.saturating_sub(2);
+        let cx = (2 + bs.name_cursor as u16).min(inner_w);
+        f.set_cursor_position(Position {
+            x: rows[1].x + cx,
+            y: rows[1].y + 1,
+        });
     }
 
     fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
