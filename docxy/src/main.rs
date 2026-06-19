@@ -852,7 +852,8 @@ impl App {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
         let rev = Style::default().add_modifier(Modifier::REVERSED);
-        let panes = Layout::horizontal([Constraint::Min(24), Constraint::Length(40)]).split(area);
+        // The preview gets most of the width; the file list is a compact column.
+        let panes = Layout::horizontal([Constraint::Length(34), Constraint::Min(20)]).split(area);
 
         // file list (dir path as the box title)
         let title = format!(" {} ", bs.dir.display());
@@ -2955,6 +2956,21 @@ mod tests {
         let mut app = App::new(new_package(Document { body }), "test.docx", false);
         app.os_clip = None; // don't touch the real OS clipboard in tests
         app
+    }
+
+    #[test]
+    fn browsing_the_backstage_never_touches_the_document() {
+        let mut app = app_with(&["original text"]);
+        app.open_backstage();
+        // Navigate the file list (which updates the preview) and back out.
+        for _ in 0..6 {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.backstage.is_none());
+        // The open document is untouched — preview must not replace it.
+        assert_eq!(first_line(&app), "original text");
     }
 
     #[test]

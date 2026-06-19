@@ -99,7 +99,10 @@ impl Backstage {
     pub fn open(dir: PathBuf) -> Backstage {
         let mut b = Backstage {
             item: Item::Open,
-            pane: Pane::Menu,
+            // Land in the file browser so the arrow keys navigate files (not the
+            // menu) — that avoids accidentally activating New/Close. Left returns
+            // to the menu for the other actions.
+            pane: Pane::Browser,
             dir,
             entries: Vec::new(),
             sel: 0,
