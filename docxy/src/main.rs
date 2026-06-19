@@ -591,6 +591,10 @@ impl App {
             self.dirty = true;
             return false;
         }
+        // The Save As dialog has its own typed-filename handling.
+        if pane == Pane::SaveAs {
+            return self.save_as_key(key);
+        }
         match pane {
             Pane::Menu => match key.code {
                 KeyCode::Up => self.bs_menu_move(false),
@@ -658,6 +662,8 @@ impl App {
                     _ => {}
                 }
             }
+            // Handled above by save_as_key; here only to keep the match total.
+            Pane::SaveAs => {}
         }
         self.dirty = true;
         false
@@ -687,13 +693,34 @@ impl App {
             }
             return;
         }
+        let (item, pane) = match &self.backstage {
+            Some(b) => (b.item, b.pane),
+            None => return,
+        };
+        // The Save As dialog: clicking a folder steps in, clicking a file copies
+        // its name into the input (an overwrite target).
+        if pane == Pane::SaveAs {
+            if y < 2 {
+                return;
+            }
+            let idx = self.bs_list_start + (y - 2) as usize;
+            if let Some(b) = self.backstage.as_mut() {
+                if idx < b.entries.len() {
+                    let was_sel = idx == b.sel;
+                    b.sel = idx;
+                    let is_dir = b.entries[idx].is_dir;
+                    if is_dir && was_sel {
+                        let _ = b.enter();
+                    } else if !is_dir {
+                        b.name_input = b.entries[idx].name.clone();
+                    }
+                    self.dirty = true;
+                }
+            }
+            return;
+        }
         // The list/preview only exist for the Open item.
-        let is_open = self
-            .backstage
-            .as_ref()
-            .map(|b| b.item == Item::Open)
-            .unwrap_or(false);
-        if !is_open {
+        if item != Item::Open {
             return;
         }
         if x < 48 {
@@ -778,7 +805,17 @@ impl App {
                 self.save();
                 self.backstage = None;
             }
-            Item::SaveAs => self.status = Some("Save As — not implemented yet".to_string()),
+            Item::SaveAs => {
+                // Prefill the current file's name and focus the folder browser.
+                let base = std::path::Path::new(&self.path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled.docx".to_string());
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_input = base;
+                    b.pane = Pane::SaveAs;
+                }
+            }
             Item::New => {
                 self.new_document();
                 self.backstage = None;
@@ -794,6 +831,82 @@ impl App {
         }
         self.dirty = true;
         self.quit_requested
+    }
+
+    /// Keys for the Save As dialog: type the file name, arrow through folders,
+    /// Left/Right to go up/into a folder, Enter to write the file.
+    fn save_as_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter => self.commit_save_as(),
+            KeyCode::Char(c) => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_input.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_input.pop();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.move_sel(false);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.move_sel(true);
+                }
+            }
+            // Step into the highlighted folder (files are chosen by clicking).
+            KeyCode::Right => {
+                if let Some(b) = self.backstage.as_mut() {
+                    if b.selected().map(|e| e.is_dir).unwrap_or(false) {
+                        let _ = b.enter();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.go_up();
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    /// Write the document to `dir/name_input` (adding `.docx` if absent), make it
+    /// the current file, and close the backstage.
+    fn commit_save_as(&mut self) {
+        let (dir, name) = match &self.backstage {
+            Some(b) => (b.dir.clone(), b.name_input.trim().to_string()),
+            None => return,
+        };
+        if name.is_empty() {
+            self.status = Some("Save As — type a file name first.".to_string());
+            return;
+        }
+        let mut fname = name;
+        if !fname.to_ascii_lowercase().ends_with(".docx") {
+            fname.push_str(".docx");
+        }
+        let path = dir.join(&fname);
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        self.pkg.document = self.editor.doc.clone();
+        let bytes = save_package(&self.pkg);
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                self.path = path.to_string_lossy().into_owned();
+                self.modified = false;
+                self.backstage = None;
+                self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
+            }
+            Err(e) => self.status = Some(format!("save failed: {e}")),
+        }
     }
 
     /// Render a quick preview of the highlighted `.docx` into the backstage.
@@ -955,11 +1068,11 @@ impl App {
         // right content pane
         match bs.item {
             Item::Open => self.draw_bs_open(f, cols[1], bs),
+            Item::SaveAs => self.draw_bs_save_as(f, cols[1], bs),
             Item::Info => self.draw_bs_info(f, cols[1]),
             other => {
                 let msg = match other {
                     Item::Save => "Save (Ctrl+S) — write changes to the current file.",
-                    Item::SaveAs => "Save As — not implemented yet.",
                     Item::Print | Item::Export => "Export — write a PDF next to the document.",
                     Item::New => "New — start a blank document.",
                     Item::Exit => "Exit — quit docxy.",
@@ -1067,6 +1180,62 @@ impl App {
                 &mut sb,
             );
         }
+    }
+
+    fn draw_bs_save_as(&self, f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let rev = Style::default().add_modifier(Modifier::REVERSED);
+        // Folder list on top, the typed file name in a box below it.
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+
+        // folder list (only subfolders matter for choosing a destination)
+        let title = format!(" {} ", bs.dir.display());
+        let inner_h = rows[0].height.saturating_sub(2) as usize;
+        let inner_w = rows[0].width.saturating_sub(2) as usize;
+        let start = self.bs_list_start;
+        let mut lines = Vec::new();
+        for (i, e) in bs.entries.iter().enumerate().skip(start).take(inner_h) {
+            let on = i == bs.sel;
+            let label = if e.is_dir {
+                format!(" {}/", e.name)
+            } else {
+                let size = e.size_str();
+                let name_w = inner_w.saturating_sub(size.len() + 2).max(1);
+                format!(" {:<name_w$} {}", fit_width(&e.name, name_w), size)
+            };
+            let style = if on {
+                accent
+            } else if e.is_dir {
+                Style::default()
+            } else {
+                // existing files are dimmed — they're overwrite targets, not folders
+                dim
+            };
+            lines.push(RLine::styled(label, style));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(title),
+            ),
+            rows[0],
+        );
+
+        // file-name input
+        let mut shown = bs.name_input.clone();
+        shown.push('▏'); // caret
+        f.render_widget(
+            Paragraph::new(RLine::styled(format!(" {shown}"), rev)).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" File name  (Enter to save · ←/→ folders · Esc cancel) "),
+            ),
+            rows[1],
+        );
     }
 
     fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
@@ -3173,6 +3342,39 @@ mod tests {
         assert!(app.backstage.is_none());
         // The open document is untouched — preview must not replace it.
         assert_eq!(first_line(&app), "original text");
+    }
+
+    #[test]
+    fn save_as_writes_to_typed_name_and_retargets() {
+        let tmp = std::env::temp_dir().join("docxy_save_as");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut app = app_with(&["hello world"]);
+        app.path = tmp.join("orig.docx").to_string_lossy().into_owned();
+        app.open_backstage();
+        // pick Save As from the menu and activate it
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::SaveAs;
+        }
+        app.bs_menu_activate();
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::SaveAs
+        );
+        // it prefilled the current basename
+        assert_eq!(app.backstage.as_ref().unwrap().name_input, "orig.docx");
+        // retype a new name and save (drop the extension to check it's added)
+        if let Some(b) = app.backstage.as_mut() {
+            b.name_input = "copy".to_string();
+        }
+        app.on_key(key(KeyCode::Enter));
+        let out = tmp.join("copy.docx");
+        assert!(out.exists(), "save-as did not write the file");
+        // the app is now editing the new file and the dialog closed
+        assert!(app.backstage.is_none());
+        assert!(app.path.ends_with("copy.docx"));
+        assert!(!app.modified);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

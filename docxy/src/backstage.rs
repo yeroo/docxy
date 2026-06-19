@@ -84,6 +84,8 @@ pub enum Pane {
     Browser,
     /// The read-only document preview (scrollable).
     Preview,
+    /// The Save As dialog (folder browser + typed file name).
+    SaveAs,
 }
 
 pub struct Backstage {
@@ -99,6 +101,8 @@ pub struct Backstage {
     pub preview_w: usize,
     /// Top line of the preview scroll window.
     pub preview_scroll: usize,
+    /// The filename being typed in the Save As dialog.
+    pub name_input: String,
 }
 
 impl Backstage {
@@ -116,6 +120,7 @@ impl Backstage {
             preview_path: None,
             preview_w: 0,
             preview_scroll: 0,
+            name_input: String::new(),
         };
         b.refresh();
         b
