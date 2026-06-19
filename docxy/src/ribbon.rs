@@ -133,7 +133,14 @@ impl Ribbon {
                         btn("⧉", 1, Copy, "Copy (Ctrl+C)"),
                     ],
                     vec![
-                        Seg::Gap(" ▾   "),
+                        Seg::Gap(" "),
+                        btn(
+                            "▾",
+                            1,
+                            Todo("Paste options"),
+                            "Paste options (paste special)",
+                        ),
+                        Seg::Gap("   "),
                         btn(
                             "▥",
                             1,
@@ -639,6 +646,21 @@ mod tests {
             assert_eq!(width(l), width(&lines[0]), "line {i} has a different width");
             assert_eq!(bar_cols(l), top, "border columns drift on line {i}");
         }
+    }
+
+    #[test]
+    fn paste_split_dropdown_is_keyboard_reachable() {
+        let r = Ribbon::home();
+        // Entering the body lands on Paste (first button, top-left).
+        let paste = r.enter_body();
+        assert!(matches!(r.focus_act(paste), Some((Act::Paste, _))));
+        // Down from Paste reaches its dropdown caret directly below it.
+        let down = r.nav(paste, Dir::Down);
+        let hint = r.focus_hint(down).unwrap_or("");
+        assert!(
+            hint.contains("Paste options"),
+            "Down from Paste should reach the paste dropdown, got: {hint}"
+        );
     }
 
     #[test]
