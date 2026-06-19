@@ -277,7 +277,6 @@ struct App {
     editor: Editor,
     path: String,
     modified: bool,
-    quit_armed: bool,
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
@@ -387,7 +386,6 @@ impl App {
             editor: Editor::new(doc),
             path: path.to_string(),
             modified: false,
-            quit_armed: false,
             quit_requested: false,
             status: None,
             scroll: 0,
@@ -888,18 +886,7 @@ impl App {
                 self.export_pdf();
                 self.backstage = None;
             }
-            Item::Exit => {
-                self.backstage = None;
-                self.confirm = Some(Confirm {
-                    prompt: if self.modified {
-                        "Exit docxy? Unsaved changes will be lost.".to_string()
-                    } else {
-                        "Exit docxy?".to_string()
-                    },
-                    yes: false,
-                    action: ConfirmAction::Exit,
-                });
-            }
+            Item::Exit => self.request_exit(),
         }
         self.dirty = true;
         self.quit_requested
@@ -1876,16 +1863,19 @@ impl App {
         }
     }
 
-    fn try_quit(&mut self) -> bool {
-        if self.modified && !self.quit_armed {
-            self.quit_armed = true;
-            self.status = Some(
-                "Unsaved changes — Ctrl-S to save, or press quit again to discard".to_string(),
-            );
-            false
-        } else {
-            true
-        }
+    /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
+    fn request_exit(&mut self) {
+        self.backstage = None;
+        self.confirm = Some(Confirm {
+            prompt: if self.modified {
+                "Exit docxy? Unsaved changes will be lost.".to_string()
+            } else {
+                "Exit docxy?".to_string()
+            },
+            yes: false,
+            action: ConfirmAction::Exit,
+        });
+        self.dirty = true;
     }
 
     /// Put text on the OS clipboard and remember it (so a later paste of our own
@@ -2687,10 +2677,6 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let is_quit = ctrl && key.code == KeyCode::Char('q');
-        if !is_quit {
-            self.quit_armed = false;
-        }
         match key.code {
             // Esc clears a selection but never quits — use Ctrl+Q to quit.
             KeyCode::Esc => {
@@ -2700,7 +2686,7 @@ impl App {
                 }
             }
             KeyCode::Char('f') if alt => self.open_backstage(),
-            KeyCode::Char('q') if ctrl => return self.try_quit(),
+            KeyCode::Char('q') if ctrl => self.request_exit(),
             KeyCode::Char('s') if ctrl => self.save(),
             KeyCode::Char('f') if ctrl => self.enter_find(),
             KeyCode::Char('a') if ctrl => {
@@ -2862,6 +2848,13 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // A confirmation modal owns the whole screen — no content behind it.
+        if let Some(c) = &self.confirm {
+            let (prompt, yes) = (c.prompt.clone(), c.yes);
+            f.render_widget(Clear, f.area());
+            self.draw_confirm(f, f.area(), &prompt, yes);
+            return;
+        }
         // The File backstage takes over the whole screen.
         if self.backstage.is_some() {
             // Preview pane size = total − menu(14) − list(34) − borders(2) wide,
@@ -3052,12 +3045,6 @@ impl App {
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
-
-        // A modal confirmation sits on top of everything.
-        if let Some(c) = &self.confirm {
-            let (prompt, yes) = (c.prompt.clone(), c.yes);
-            self.draw_confirm(f, full, &prompt, yes);
-        }
     }
 }
 
@@ -3798,6 +3785,28 @@ mod tests {
     }
 
     #[test]
+    fn backstage_opens_on_the_menu_and_down_reaches_exit() {
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        // lands on the vertical menu, not the file list
+        assert_eq!(app.backstage.as_ref().unwrap().pane, backstage::Pane::Menu);
+        // Down walks the menu straight to Exit
+        for _ in 0..backstage::ITEMS.len() {
+            if app.backstage.as_ref().unwrap().item == backstage::Item::Exit {
+                break;
+            }
+            app.on_key(key(KeyCode::Down));
+            // focus stays on the menu the whole way down
+            assert_eq!(app.backstage.as_ref().unwrap().pane, backstage::Pane::Menu);
+        }
+        assert_eq!(app.backstage.as_ref().unwrap().item, backstage::Item::Exit);
+        // Enter on Exit shows the confirm modal (and closes the backstage)
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.confirm.is_some());
+        assert!(app.backstage.is_none());
+    }
+
+    #[test]
     fn file_menu_exit_asks_to_confirm_then_quits() {
         let mut app = app_with(&["doc"]);
         app.open_backstage();
@@ -4096,22 +4105,31 @@ mod tests {
     }
 
     #[test]
-    fn quit_guard_requires_confirmation_when_modified() {
+    fn ctrl_q_opens_the_exit_confirmation() {
         let mut app = app_with(&["a"]);
         app.editor.move_end();
         app.on_key(key(KeyCode::Char('x')));
         assert!(app.modified);
-        // first quit is blocked
+        // Ctrl+Q does not quit outright — it opens the Yes/No modal.
         assert!(!app.on_key(ctrl(KeyCode::Char('q'))));
-        assert!(app.quit_armed);
-        // second quit goes through
-        assert!(app.on_key(ctrl(KeyCode::Char('q'))));
+        assert!(app.confirm.is_some());
+        // the prompt warns about unsaved changes
+        assert!(app.confirm.as_ref().unwrap().prompt.contains("Unsaved"));
+        // confirming with 'y' quits
+        assert!(app.on_key(key(KeyCode::Char('y'))));
+        assert!(app.quit_requested);
     }
 
     #[test]
-    fn clean_quit_is_immediate() {
+    fn ctrl_q_confirmation_can_be_cancelled() {
         let mut app = app_with(&["a"]);
-        assert!(app.on_key(ctrl(KeyCode::Char('q'))));
+        // even with no changes, Ctrl+Q asks first
+        assert!(!app.on_key(ctrl(KeyCode::Char('q'))));
+        assert!(app.confirm.is_some());
+        // No / Esc dismisses without quitting
+        assert!(!app.on_key(key(KeyCode::Esc)));
+        assert!(app.confirm.is_none());
+        assert!(!app.quit_requested);
     }
 
     #[test]
