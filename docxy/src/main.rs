@@ -334,6 +334,7 @@ impl App {
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let doc = std::mem::take(&mut pkg.document);
+        let prefs = ViewPrefs::load();
         App {
             pkg,
             editor: Editor::new(doc),
@@ -343,9 +344,9 @@ impl App {
             status: None,
             scroll: 0,
             viewport_h: 1,
-            page_view: false,
-            invisibles: false,
-            borderless: false,
+            page_view: prefs.page_view,
+            invisibles: prefs.invisibles,
+            borderless: prefs.borderless,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -399,6 +400,15 @@ impl App {
             title_page: self.title_page,
             even_odd: self.even_odd,
         }
+    }
+
+    fn save_view_prefs(&self) {
+        ViewPrefs {
+            page_view: self.page_view,
+            invisibles: self.invisibles,
+            borderless: self.borderless,
+        }
+        .save();
     }
 
     fn ensure_rendered(&mut self, width: u16) {
@@ -1606,14 +1616,17 @@ impl App {
             }
             KeyCode::F(2) => {
                 self.page_view = !self.page_view;
+                self.save_view_prefs();
                 self.dirty = true;
             }
             KeyCode::F(3) => {
                 self.invisibles = !self.invisibles;
+                self.save_view_prefs();
                 self.dirty = true;
             }
             KeyCode::F(4) => {
                 self.borderless = !self.borderless;
+                self.save_view_prefs();
                 self.dirty = true;
             }
             KeyCode::F(6) => self.enter_hf_edit(true),
@@ -1782,6 +1795,69 @@ impl App {
 
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
+}
+
+/// Persisted view-mode toggles (print layout, invisibles, table borders), so
+/// they survive across sessions. Stored as a tiny `key=1/0` file in the user's
+/// config directory.
+#[derive(Clone, Copy, Default)]
+struct ViewPrefs {
+    page_view: bool,
+    invisibles: bool,
+    borderless: bool,
+}
+
+impl ViewPrefs {
+    fn path() -> Option<std::path::PathBuf> {
+        let dir = if cfg!(windows) {
+            std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+                })
+        }?;
+        Some(dir.join("docxy").join("view.conf"))
+    }
+
+    fn parse(text: &str) -> ViewPrefs {
+        let mut p = ViewPrefs::default();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let on = v.trim() == "1";
+                match k.trim() {
+                    "page_view" => p.page_view = on,
+                    "invisibles" => p.invisibles = on,
+                    "borderless" => p.borderless = on,
+                    _ => {}
+                }
+            }
+        }
+        p
+    }
+
+    fn to_conf(self) -> String {
+        format!(
+            "page_view={}\ninvisibles={}\nborderless={}\n",
+            self.page_view as u8, self.invisibles as u8, self.borderless as u8,
+        )
+    }
+
+    fn load() -> ViewPrefs {
+        Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| Self::parse(&t))
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, self.to_conf());
+    }
 }
 
 /// Draw a dim bordered box with a centered caption for an image we can't render
@@ -2158,6 +2234,22 @@ mod tests {
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
     use docxcore::package::new_package;
+
+    #[test]
+    fn view_prefs_round_trip() {
+        let p = ViewPrefs {
+            page_view: true,
+            invisibles: false,
+            borderless: true,
+        };
+        let back = ViewPrefs::parse(&p.to_conf());
+        assert_eq!(back.page_view, p.page_view);
+        assert_eq!(back.invisibles, p.invisibles);
+        assert_eq!(back.borderless, p.borderless);
+        // Unknown/blank lines are ignored; missing keys default off.
+        let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
+        assert!(partial.invisibles && !partial.page_view && !partial.borderless);
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
