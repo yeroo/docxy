@@ -437,20 +437,24 @@ impl Ribbon {
 
     // ---- rendering ----
 
-    /// Render the collapsed ribbon: just the tab strip (one line).
+    /// Render the collapsed ribbon: just the tab strip (one line). The active tab
+    /// is only highlighted (inverted) while the ribbon is engaged; when it's idle
+    /// the tabs are drawn plain.
     pub fn render_tabs(&self, focus: Focus) -> Line<'static> {
-        let mut spans = vec![Span::raw("  ")];
+        let engaged = focus != Focus::None;
         let focused_tab = if let Focus::Tab(t) = focus {
             Some(t)
         } else {
             None
         };
+        let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
-            let style = if i == self.active {
-                // active tab: inverted (white bg / black fg)
-                Style::default().fg(Color::Black).bg(Color::White)
+            let style = if !engaged {
+                Style::default() // idle: plain, nothing inverted
+            } else if i == self.active {
+                Style::default().fg(Color::Black).bg(Color::White) // active tab
             } else if Some(i) == focused_tab {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::default().add_modifier(Modifier::REVERSED) // keyboard cursor
             } else {
                 Style::default().add_modifier(Modifier::DIM)
             };
