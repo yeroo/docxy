@@ -103,6 +103,8 @@ pub struct Backstage {
     pub preview_scroll: usize,
     /// The filename being typed in the Save As dialog.
     pub name_input: String,
+    /// Caret position (char index) within `name_input`.
+    pub name_cursor: usize,
 }
 
 impl Backstage {
@@ -121,6 +123,7 @@ impl Backstage {
             preview_w: 0,
             preview_scroll: 0,
             name_input: String::new(),
+            name_cursor: 0,
         };
         b.refresh();
         b

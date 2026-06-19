@@ -713,6 +713,7 @@ impl App {
                         let _ = b.enter();
                     } else if !is_dir {
                         b.name_input = b.entries[idx].name.clone();
+                        b.name_cursor = b.name_input.chars().count();
                     }
                     self.dirty = true;
                 }
@@ -806,12 +807,13 @@ impl App {
                 self.backstage = None;
             }
             Item::SaveAs => {
-                // Prefill the current file's name and focus the folder browser.
+                // Prefill the current file's name with the caret at its end.
                 let base = std::path::Path::new(&self.path)
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "untitled.docx".to_string());
                 if let Some(b) = self.backstage.as_mut() {
+                    b.name_cursor = base.chars().count();
                     b.name_input = base;
                     b.pane = Pane::SaveAs;
                 }
@@ -833,45 +835,45 @@ impl App {
         self.quit_requested
     }
 
-    /// Keys for the Save As dialog: type the file name, arrow through folders,
-    /// Left/Right to go up/into a folder, Enter to write the file.
+    /// Keys for the Save As dialog. The arrows stay with the file-name field
+    /// (caret movement) — they never drive the folder list, which is changed by
+    /// the mouse. Enter writes the file, Esc (handled by the caller) cancels.
     fn save_as_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Enter => self.commit_save_as(),
-            KeyCode::Char(c) => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.name_input.push(c);
+        if key.code == KeyCode::Enter {
+            self.commit_save_as();
+            self.dirty = true;
+            return false;
+        }
+        if let Some(b) = self.backstage.as_mut() {
+            let len = b.name_input.chars().count();
+            match key.code {
+                KeyCode::Char(c) => {
+                    let at = byte_index(&b.name_input, b.name_cursor);
+                    b.name_input.insert(at, c);
+                    b.name_cursor += 1;
                 }
-            }
-            KeyCode::Backspace => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.name_input.pop();
-                }
-            }
-            KeyCode::Up => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.move_sel(false);
-                }
-            }
-            KeyCode::Down => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.move_sel(true);
-                }
-            }
-            // Step into the highlighted folder (files are chosen by clicking).
-            KeyCode::Right => {
-                if let Some(b) = self.backstage.as_mut() {
-                    if b.selected().map(|e| e.is_dir).unwrap_or(false) {
-                        let _ = b.enter();
+                KeyCode::Backspace => {
+                    if b.name_cursor > 0 {
+                        let start = byte_index(&b.name_input, b.name_cursor - 1);
+                        let end = byte_index(&b.name_input, b.name_cursor);
+                        b.name_input.replace_range(start..end, "");
+                        b.name_cursor -= 1;
                     }
                 }
-            }
-            KeyCode::Left => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.go_up();
+                KeyCode::Delete => {
+                    if b.name_cursor < len {
+                        let start = byte_index(&b.name_input, b.name_cursor);
+                        let end = byte_index(&b.name_input, b.name_cursor + 1);
+                        b.name_input.replace_range(start..end, "");
+                    }
                 }
+                KeyCode::Left => b.name_cursor = b.name_cursor.saturating_sub(1),
+                KeyCode::Right => b.name_cursor = (b.name_cursor + 1).min(len),
+                KeyCode::Home => b.name_cursor = 0,
+                KeyCode::End => b.name_cursor = len,
+                // Up/Down deliberately do nothing here.
+                _ => {}
             }
-            _ => {}
         }
         self.dirty = true;
         false
@@ -1224,15 +1226,18 @@ impl App {
             rows[0],
         );
 
-        // file-name input
-        let mut shown = bs.name_input.clone();
-        shown.push('▏'); // caret
+        // file-name input, with the caret drawn at the cursor position
+        let cut = byte_index(&bs.name_input, bs.name_cursor);
+        let mut shown = String::from(" ");
+        shown.push_str(&bs.name_input[..cut]);
+        shown.push('▏');
+        shown.push_str(&bs.name_input[cut..]);
         f.render_widget(
-            Paragraph::new(RLine::styled(format!(" {shown}"), rev)).block(
+            Paragraph::new(RLine::styled(shown, rev)).block(
                 RBlock::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" File name  (Enter to save · ←/→ folders · Esc cancel) "),
+                    .title(" File name  (Enter to save · Esc cancel · click a folder to move) "),
             ),
             rows[1],
         );
@@ -2762,6 +2767,11 @@ fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
+/// Byte offset of char index `i` in `s` (its length if `i` is past the end).
+fn byte_index(s: &str, i: usize) -> usize {
+    s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
+}
+
 /// Truncate `s` to at most `w` columns, ending with `…` when clipped.
 fn fit_width(s: &str, w: usize) -> String {
     if w == 0 {
@@ -3375,6 +3385,35 @@ mod tests {
         assert!(app.path.ends_with("copy.docx"));
         assert!(!app.modified);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn save_as_arrows_edit_the_name_not_the_file_list() {
+        let mut app = app_with(&["x"]);
+        app.path = "report.docx".to_string();
+        app.open_backstage();
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::SaveAs;
+        }
+        app.bs_menu_activate();
+        let sel_before = app.backstage.as_ref().unwrap().sel;
+        // caret starts at end; Left then type inserts mid-string
+        app.on_key(key(KeyCode::Left)); // before the 'x' of ".docx"
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left)); // now before ".docx" -> after "report"
+        app.on_key(key(KeyCode::Char('-')));
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('2')));
+        let b = app.backstage.as_ref().unwrap();
+        assert_eq!(b.name_input, "report-v2.docx");
+        // the file list selection never moved
+        assert_eq!(b.sel, sel_before);
+        // Up/Down are inert in the dialog
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.backstage.as_ref().unwrap().sel, sel_before);
     }
 
     #[test]
