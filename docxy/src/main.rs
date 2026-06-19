@@ -9,6 +9,7 @@
 //! line-map, and routes keys into a `docxcore::editor::Editor`.
 
 mod metafile;
+mod ribbon;
 
 use std::collections::HashMap;
 use std::io;
@@ -121,14 +122,14 @@ fn print_usage() {
            arrows / Home / End / PgUp / PgDn     move   (Ctrl-←/→ by word)\n  \
            Shift + move                          select   (Esc clears)\n  \
            Ctrl-B bold  Ctrl-I italic  Ctrl-U underline   (over selection)\n  \
-           Ctrl-L/E/R   align left / center / right\n  \
+           Ctrl-L/E/R/J align left / center / right / justify\n  \
            Ctrl-A select all   Ctrl-C copy   Ctrl-X cut   Ctrl-V paste\n  \
-           Ctrl-F find / replace (Tab toggles replace, Ctrl-A replaces all)\n  \
+           Ctrl-F find   Ctrl-H replace   Ctrl-Shift-8 show marks\n  \
            Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q / Esc quit\n  \
+           F9 ribbon (←→ tabs · ↓ enter · arrows move · Enter apply · Esc leave)\n  \
            F2 page view   F3 show marks   F4 table borders\n  \
-           F6 edit header   F7 edit footer   (Esc returns)\n  \
-           F8/F9 insert landscape/portrait section at cursor\n  \
-           mouse: click to move · click a link to open it · wheel to scroll"
+           F6 edit header   F7 edit footer   (Esc returns)   F8 section break\n  \
+           mouse: click to move · click ribbon buttons · click a link · wheel to scroll"
     );
 }
 
@@ -268,6 +269,12 @@ struct App {
     /// Whether to write view-mode toggles to the user config (only the real TUI;
     /// off in tests so the suite never reads or writes the shared config file).
     persist_prefs: bool,
+    /// The Home ribbon, its expanded/collapsed state, keyboard focus, and the
+    /// number of rows it currently occupies (for routing mouse coordinates).
+    ribbon: ribbon::Ribbon,
+    ribbon_open: bool,
+    ribbon_focus: ribbon::Focus,
+    ribbon_h: usize,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -350,6 +357,11 @@ impl App {
             invisibles: false,
             borderless: false,
             persist_prefs: false,
+            ribbon: ribbon::Ribbon::home(),
+            ribbon_open: false,
+            ribbon_focus: ribbon::Focus::None,
+            // Set each frame by draw(); 0 until then so mouse rows map directly.
+            ribbon_h: 0,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -415,6 +427,120 @@ impl App {
             borderless: self.borderless,
         }
         .save();
+    }
+
+    // ---- ribbon ----
+
+    /// Rows the ribbon currently occupies: 1 for the collapsed tab strip, or the
+    /// strip + body + yellow hint bar when expanded.
+    fn ribbon_height(&self) -> usize {
+        if self.ribbon_open { 1 + 5 + 1 } else { 1 }
+    }
+
+    /// Handle a key while the ribbon has focus. Returns `Some(quit)` if consumed,
+    /// `None` to let it fall through to normal editing (e.g. Ctrl shortcuts).
+    fn ribbon_key(&mut self, key: KeyEvent) -> Option<bool> {
+        use ribbon::Dir;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(9) => {
+                self.ribbon_focus = ribbon::Focus::None;
+                self.ribbon_open = false;
+                self.dirty = true;
+                Some(false)
+            }
+            KeyCode::Left => self.ribbon_move(Dir::Left),
+            KeyCode::Right => self.ribbon_move(Dir::Right),
+            KeyCode::Up => self.ribbon_move(Dir::Up),
+            KeyCode::Down => self.ribbon_move(Dir::Down),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                match self.ribbon_focus {
+                    ribbon::Focus::Tab(_) => self.ribbon_focus = self.ribbon.enter_body(),
+                    ribbon::Focus::Button(_) => {
+                        if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
+                            self.run_act(act);
+                        }
+                    }
+                    ribbon::Focus::None => {}
+                }
+                self.dirty = true;
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    fn ribbon_move(&mut self, dir: ribbon::Dir) -> Option<bool> {
+        self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, dir);
+        self.dirty = true;
+        Some(false)
+    }
+
+    /// Run a ribbon command, mapping it to the matching editor operation.
+    fn run_act(&mut self, act: ribbon::Act) {
+        use ribbon::Act::*;
+        match act {
+            Cut => self.do_cut(),
+            Copy => self.do_copy(),
+            Paste => self.do_paste(),
+            Bold => {
+                self.editor.toggle_bold();
+                self.after_edit();
+            }
+            Italic => {
+                self.editor.toggle_italic();
+                self.after_edit();
+            }
+            Underline => {
+                self.editor.toggle_underline();
+                self.after_edit();
+            }
+            Strike => {
+                self.editor.toggle_strike();
+                self.after_edit();
+            }
+            AlignLeft => {
+                self.editor.set_align(Align::Left);
+                self.after_edit();
+            }
+            AlignCenter => {
+                self.editor.set_align(Align::Center);
+                self.after_edit();
+            }
+            AlignRight => {
+                self.editor.set_align(Align::Right);
+                self.after_edit();
+            }
+            Justify => {
+                self.editor.set_align(Align::Justify);
+                self.after_edit();
+            }
+            ShowHide => {
+                self.invisibles = !self.invisibles;
+                self.save_view_prefs();
+                self.dirty = true;
+            }
+            Find | Replace => self.enter_find(),
+            SelectAll => {
+                self.editor.select_all();
+                self.dirty = true;
+            }
+            Todo(name) => {
+                self.status = Some(format!("{name} — not implemented yet"));
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn draw_ribbon(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![self.ribbon.render_tabs(self.ribbon_focus)];
+        if self.ribbon_open {
+            lines.extend(self.ribbon.render_body(self.ribbon_focus));
+            lines.push(
+                self.ribbon
+                    .render_hint(self.ribbon_focus, self.ribbon.width()),
+            );
+        }
+        f.render_widget(Paragraph::new(Text::from(lines)), area);
     }
 
     fn ensure_rendered(&mut self, width: u16) {
@@ -843,11 +969,42 @@ impl App {
         Some(Caret::at(seg.path.clone(), seg.offset_for_col(col)))
     }
 
+    fn ribbon_click(&mut self, x: u16, y: u16) {
+        match self.ribbon.hit(x, y, self.ribbon_open) {
+            ribbon::Hit::Tab(i) => {
+                self.ribbon_open = true;
+                self.ribbon_focus = ribbon::Focus::Tab(i);
+                self.dirty = true;
+            }
+            ribbon::Hit::Button(act) => {
+                self.run_act(act);
+                self.dirty = true;
+            }
+            ribbon::Hit::Outside => {}
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
-        let row = m.row as usize;
+        let mrow = m.row as usize;
         let col = m.column as usize;
+        // A left-click in the ribbon area drives the ribbon; other events (wheel,
+        // drag) fall through to the document so scrolling works anywhere.
+        if mrow < self.ribbon_h {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                self.ribbon_click(m.column, m.row);
+                return;
+            }
+        }
+        let row = mrow.saturating_sub(self.ribbon_h); // row within the document viewport
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Returning to the document collapses the on-demand ribbon and
+                // hands keyboard control back to the editor.
+                if self.ribbon_open {
+                    self.ribbon_open = false;
+                    self.ribbon_focus = ribbon::Focus::None;
+                    self.dirty = true;
+                }
                 if row >= self.viewport_h {
                     return; // status bar
                 }
@@ -1483,6 +1640,13 @@ impl App {
                 return false;
             }
         }
+        // While the ribbon has keyboard focus, navigation keys drive it; other
+        // keys (Ctrl shortcuts, typing) fall through to normal handling.
+        if self.ribbon_focus != ribbon::Focus::None {
+            if let Some(quit) = self.ribbon_key(key) {
+                return quit;
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let is_quit = key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('q'));
@@ -1531,6 +1695,16 @@ impl App {
             KeyCode::Char('r') if ctrl => {
                 self.editor.set_align(Align::Right);
                 self.after_edit();
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.editor.set_align(Align::Justify);
+                self.after_edit();
+            }
+            KeyCode::Char('h') if ctrl => self.enter_find(),
+            KeyCode::Char('8') if ctrl && shift => {
+                self.invisibles = !self.invisibles;
+                self.save_view_prefs();
+                self.dirty = true;
             }
             KeyCode::Char('z') if ctrl => {
                 if self.editor.undo() {
@@ -1638,16 +1812,30 @@ impl App {
             KeyCode::F(6) => self.enter_hf_edit(true),
             KeyCode::F(7) => self.enter_hf_edit(false),
             KeyCode::F(8) => self.insert_section(true),
-            KeyCode::F(9) => self.insert_section(false),
+            KeyCode::F(9) => {
+                // Focus the ribbon (expanding it); F9 again or Esc leaves.
+                self.ribbon_open = true;
+                self.ribbon_focus = ribbon::Focus::Tab(self.ribbon.active_tab());
+                self.dirty = true;
+            }
             _ => {}
         }
         false
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
-        let full = chunks[0];
-        let status = chunks[1];
+        // The ribbon sits above the document; its height is the collapsed tab
+        // strip or the expanded body. Stored so mouse rows can be routed.
+        self.ribbon_h = self.ribbon_height();
+        let chunks = Layout::vertical([
+            Constraint::Length(self.ribbon_h as u16),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+        self.draw_ribbon(f, chunks[0]);
+        let full = chunks[1];
+        let status = chunks[2];
 
         // Reserve a one-column gutter on the right for the vertical scrollbar, so
         // the rendered width stays stable whether or not the bar is shown.
@@ -2355,6 +2543,34 @@ mod tests {
         let mut app = App::new(new_package(Document { body }), "test.docx", false);
         app.os_clip = None; // don't touch the real OS clipboard in tests
         app
+    }
+
+    #[test]
+    fn ribbon_focus_navigation_and_actions() {
+        let mut app = app_with(&["hello world"]);
+        // F9 expands and focuses the tabs.
+        app.on_key(key(KeyCode::F(9)));
+        assert!(app.ribbon_open);
+        assert!(matches!(app.ribbon_focus, ribbon::Focus::Tab(_)));
+        // Down drops into the button body.
+        app.on_key(key(KeyCode::Down));
+        assert!(matches!(app.ribbon_focus, ribbon::Focus::Button(_)));
+        // A dimmed action reports "not implemented".
+        app.run_act(ribbon::Act::Todo("Bullets"));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("not implemented")
+        );
+        // A live action applies to the document.
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bold);
+        assert!(app.modified, "Bold should mark the document modified");
+        // Esc leaves the ribbon (must not quit the app) and collapses it.
+        assert!(!app.on_key(key(KeyCode::Esc)));
+        assert!(!app.ribbon_open);
+        assert_eq!(app.ribbon_focus, ribbon::Focus::None);
     }
 
     fn vim_app(paras: &[&str]) -> App {
