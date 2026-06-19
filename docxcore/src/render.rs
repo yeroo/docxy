@@ -620,8 +620,13 @@ fn flatten_para(
         para.props.tabs.clone()
     };
     let text_twips = (opts.page.w - opts.page.ml - opts.page.mr).max(1) as f32;
-    let tab_col =
-        |pos: i32| ((pos.max(0) as f32 * (avail as f32 / text_twips)).round() as usize).min(avail);
+    // With invisibles on, a trailing `¶` (and `↵` at line breaks) takes a cell, so
+    // a right tab must stop one column short of the edge or its right-aligned text
+    // (e.g. a TOC page number) overflows and wraps to the next row.
+    let tab_limit = avail.saturating_sub(if inv { 1 } else { 0 });
+    let tab_col = |pos: i32| {
+        ((pos.max(0) as f32 * (avail as f32 / text_twips)).round() as usize).min(tab_limit)
+    };
     let mut segs: Vec<Seg> = vec![Seg {
         glyphs: Vec::new(),
         sep: None,
@@ -2499,6 +2504,34 @@ mod tests {
             line.trim_end().ends_with('9'),
             "page number not right-aligned: {line:?}"
         );
+    }
+
+    #[test]
+    fn toc_page_number_stays_on_one_line_with_invisibles() {
+        // The trailing ¶ must not push a right-aligned page number onto the next
+        // row when invisibles are shown.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                tabs: vec![TabStop {
+                    pos: 8630,
+                    align: TabAlign::Right,
+                    leader: TabLeader::Dot,
+                }],
+                ..Default::default()
+            },
+            content: vec![
+                run("1 Introduction", RunProps::default()),
+                Inline::Tab,
+                run("9", RunProps::default()),
+            ],
+        });
+        let mut o = opts(60);
+        o.show_invisibles = true;
+        let lines = render(&doc(vec![p]), &o);
+        assert_eq!(lines.len(), 1, "page number wrapped to a second line");
+        let plain = lines[0].plain();
+        // Both the number and the pilcrow sit on the one line.
+        assert!(plain.contains('9') && plain.contains('¶'), "{plain:?}");
     }
 
     #[test]
