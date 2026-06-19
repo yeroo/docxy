@@ -1838,6 +1838,35 @@ impl PageLines {
     }
 }
 
+/// Truncate a line's spans to at most `max` display columns, returning the
+/// clipped spans and their width. Keeps the page frame rigid: content that
+/// overruns the text width (e.g. an invisibles `¶`/`¤` marker spilling out of a
+/// table cell or text box) is cut at the margin instead of pushing the border.
+fn clip_to_cols(spans: Vec<Span>, max: usize) -> (Vec<Span>, usize) {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for sp in spans {
+        if used >= max {
+            break;
+        }
+        let n = sp.text.chars().count();
+        if used + n <= max {
+            used += n;
+            out.push(sp);
+        } else {
+            let text: String = sp.text.chars().take(max - used).collect();
+            out.push(Span {
+                text,
+                style: sp.style,
+                link: sp.link,
+            });
+            used = max;
+            break;
+        }
+    }
+    (out, used)
+}
+
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
@@ -1852,9 +1881,10 @@ fn paginate(
     // Frame a header/footer/content line into a page row (left margin + content
     // + right margin, between the borders). Non-editable (no caret map).
     let frame_line = |ln: &Line| -> (Line, LineMap) {
-        let rpad = m.content_cols.saturating_sub(ln.width());
+        let (clipped, w) = clip_to_cols(ln.spans.clone(), m.content_cols);
+        let rpad = m.content_cols - w;
         let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
-        spans.extend(ln.spans.clone());
+        spans.extend(clipped);
         spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
         (Line { spans }, LineMap::default())
     };
@@ -1953,9 +1983,10 @@ fn paginate(
         let mut placed = 0usize;
         while it.peek().map(|t| t.3) == Some(page) {
             let (idx, ln, mut map, _) = it.next().unwrap();
-            let rpad = m.content_cols.saturating_sub(ln.width());
+            let (clipped, w) = clip_to_cols(ln.spans, m.content_cols);
+            let rpad = m.content_cols - w;
             let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
-            spans.extend(ln.spans);
+            spans.extend(clipped);
             spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
             for seg in &mut map.segs {
                 seg.col0 += col_off;
@@ -2668,6 +2699,42 @@ mod tests {
         assert!(
             hit.spans.iter().any(|s| s.style.highlight),
             "selection should highlight across the section break"
+        );
+    }
+
+    #[test]
+    fn invisibles_keep_the_page_border_rigid() {
+        // A table's row-end `¤` (and paragraph `¶`) must not spill past the text
+        // width and push the page border out when invisibles are shown.
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(vec![run(s, RunProps::default())])],
+        };
+        let t = Table {
+            grid: vec![100, 100],
+            rows: vec![Row {
+                cells: vec![cell("Apple"), cell("Banana")],
+            }],
+        };
+        let d = doc(vec![
+            Block::Table(t),
+            para(vec![run("body text", RunProps::default())]),
+        ]);
+        let mut o = opts(60);
+        o.page_view = true;
+        o.show_invisibles = true;
+        let right_borders: Vec<usize> = render(&d, &o)
+            .iter()
+            .filter_map(|l| {
+                let s = l.plain();
+                s.rfind('│').map(|b| s[..b].chars().count())
+            })
+            .collect();
+        let first = right_borders[0];
+        assert!(
+            right_borders.iter().all(|&c| c == first),
+            "page border not rigid: {right_borders:?}"
         );
     }
 
