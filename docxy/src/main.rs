@@ -265,6 +265,9 @@ struct App {
     page_view: bool,
     invisibles: bool,
     borderless: bool,
+    /// Whether to write view-mode toggles to the user config (only the real TUI;
+    /// off in tests so the suite never reads or writes the shared config file).
+    persist_prefs: bool,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -334,7 +337,6 @@ impl App {
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let doc = std::mem::take(&mut pkg.document);
-        let prefs = ViewPrefs::load();
         App {
             pkg,
             editor: Editor::new(doc),
@@ -344,9 +346,10 @@ impl App {
             status: None,
             scroll: 0,
             viewport_h: 1,
-            page_view: prefs.page_view,
-            invisibles: prefs.invisibles,
-            borderless: prefs.borderless,
+            page_view: false,
+            invisibles: false,
+            borderless: false,
+            persist_prefs: false,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -403,6 +406,9 @@ impl App {
     }
 
     fn save_view_prefs(&self) {
+        if !self.persist_prefs {
+            return;
+        }
         ViewPrefs {
             page_view: self.page_view,
             invisibles: self.invisibles,
@@ -2162,6 +2168,12 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path, vim);
+    // Restore persisted view-mode toggles and enable saving them going forward.
+    let prefs = ViewPrefs::load();
+    app.page_view = prefs.page_view;
+    app.invisibles = prefs.invisibles;
+    app.borderless = prefs.borderless;
+    app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
     app.picker =
