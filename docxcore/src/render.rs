@@ -342,11 +342,15 @@ pub fn render_with_images(
     for (start, end, geom) in sections(doc, opts.page) {
         let content_width = page_metrics(opts.width, geom).content_cols;
         let mut sec_imgs = Vec::new();
+        // The slice rebases paragraph paths to 0, so the path-keyed selection and
+        // list markers must be rebased to match (else they silently miss every
+        // paragraph after the first section break).
+        let sec_opts = section_opts(opts, start, end);
         let mut pairs = render_blocks(
             &doc.body[start..end],
             &[],
             content_width,
-            opts,
+            &sec_opts,
             &mut sec_imgs,
         );
         // The slice rebased paragraph paths to 0; restore body-absolute paths.
@@ -367,6 +371,36 @@ pub fn render_with_images(
     }
     let (lines, maps) = out.into_iter().unzip();
     (lines, maps, images)
+}
+
+/// A copy of `opts` with path-keyed inputs (selection, list markers) rebased to a
+/// section slice `[start, end)`: the top-level path index is shifted down by
+/// `start` and entries outside the section are dropped, so they line up with the
+/// slice's local (0-based) paragraph paths.
+fn section_opts(opts: &RenderOptions, start: usize, end: usize) -> RenderOptions {
+    let rebase = |p: &[usize]| -> Option<Vec<usize>> {
+        let first = *p.first()?;
+        (start..end).contains(&first).then(|| {
+            let mut lp = p.to_vec();
+            lp[0] = first - start;
+            lp
+        })
+    };
+    let selection = opts
+        .selection
+        .iter()
+        .filter_map(|(p, s, e)| rebase(p).map(|lp| (lp, *s, *e)))
+        .collect();
+    let mut markers = HashMap::new();
+    for (p, m) in opts.list_markers.iter() {
+        if let Some(lp) = rebase(p) {
+            markers.insert(lp, m.clone());
+        }
+    }
+    let mut so = opts.clone();
+    so.selection = selection;
+    so.list_markers = Rc::new(markers);
+    so
 }
 
 /// Body block ranges per section `(start, end_exclusive, geometry)`. A paragraph
@@ -2544,6 +2578,32 @@ mod tests {
         );
         // content before and after the break is present
         assert!(joined.contains('a') && joined.contains('b'));
+    }
+
+    #[test]
+    fn selection_highlights_after_a_section_break() {
+        // In print layout each section is rendered from a 0-based slice, so a
+        // selection keyed by an absolute paragraph path must still highlight a
+        // paragraph that sits after a section break.
+        let mut sect = ParProps::default();
+        sect.section_break = Some("<w:sectPr/>".to_string());
+        let first = Block::Paragraph(Paragraph {
+            props: sect,
+            content: vec![run("first section", RunProps::default())],
+        });
+        let second = para(vec![run("pick me", RunProps::default())]);
+        let mut o = opts(50);
+        o.page_view = true;
+        o.selection = vec![(vec![1], 0, 7)]; // all of paragraph index 1
+        let (lines, _maps, _imgs) = render_with_images(&doc(vec![first, second]), &o);
+        let hit = lines
+            .iter()
+            .find(|l| l.plain().contains("pick me"))
+            .expect("second section line");
+        assert!(
+            hit.spans.iter().any(|s| s.style.highlight),
+            "selection should highlight across the section break"
+        );
     }
 
     #[test]
