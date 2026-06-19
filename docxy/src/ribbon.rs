@@ -30,6 +30,8 @@ pub enum Act {
     Find,
     Replace,
     SelectAll,
+    /// Toggle the comments review side panel.
+    ToggleComments,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -102,7 +104,9 @@ pub enum Hit {
 pub struct Ribbon {
     tabs: Vec<&'static str>,
     active: usize,
-    groups: Vec<Group>,
+    /// Groups per tab (aligned with `tabs`); the File tab has none — it opens
+    /// the backstage instead of an in-ribbon body.
+    tab_groups: Vec<Vec<Group>>,
     placed: Vec<Placed>,
     /// Column ranges of each tab header on the (collapsed or expanded) top row.
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive)
@@ -114,155 +118,11 @@ const ROW1: usize = 2; // y of second button row
 
 impl Ribbon {
     pub fn home() -> Ribbon {
-        use Act::*;
-        let groups = vec![
-            Group {
-                title: "Clipboard",
-                width: 9,
-                rows: [
-                    vec![
-                        btn(
-                            "Paste",
-                            5,
-                            Paste,
-                            "Paste (Ctrl+V) — insert clipboard contents",
-                        ),
-                        Seg::Gap(" "),
-                        btn("✂", 1, Cut, "Cut (Ctrl+X)"),
-                        Seg::Gap(" "),
-                        btn("⧉", 1, Copy, "Copy (Ctrl+C)"),
-                    ],
-                    vec![
-                        Seg::Gap(" "),
-                        btn(
-                            "▾",
-                            1,
-                            Todo("Paste options"),
-                            "Paste options (paste special)",
-                        ),
-                        Seg::Gap("   "),
-                        btn(
-                            "▥",
-                            1,
-                            Todo("Format Painter"),
-                            "Format Painter — copy formatting",
-                        ),
-                    ],
-                ],
-            },
-            Group {
-                title: "Font",
-                width: 27,
-                rows: [
-                    vec![
-                        btn("[Calibri ▾]", 11, Todo("Font"), "Font — choose a typeface"),
-                        btn("[11▾]", 5, Todo("Font size"), "Font size"),
-                        Seg::Gap(" "),
-                        btn("A↑", 2, Todo("Grow font"), "Grow font (Ctrl+])"),
-                        Seg::Gap(" "),
-                        btn("A↓", 2, Todo("Shrink font"), "Shrink font (Ctrl+[)"),
-                        Seg::Gap(" "),
-                        btn("Aa", 2, Todo("Change case"), "Change case (Shift+F3)"),
-                        Seg::Gap(" "),
-                        btn(
-                            "⌧",
-                            1,
-                            Todo("Clear formatting"),
-                            "Clear formatting (Ctrl+Space)",
-                        ),
-                    ],
-                    vec![
-                        btn("B", 1, Bold, "Bold (Ctrl+B) — make the selection bold"),
-                        Seg::Gap("  "),
-                        btn("I", 1, Italic, "Italic (Ctrl+I)"),
-                        Seg::Gap("  "),
-                        btn("U", 1, Underline, "Underline (Ctrl+U)"),
-                        Seg::Gap("  "),
-                        btn("S", 1, Strike, "Strikethrough"),
-                        Seg::Gap("  "),
-                        btn("x₂", 2, Todo("Subscript"), "Subscript (Ctrl+=)"),
-                        Seg::Gap(" "),
-                        btn("x²", 2, Todo("Superscript"), "Superscript (Ctrl+Shift+=)"),
-                        Seg::Gap("  "),
-                        btn("ab▾", 3, Todo("Highlight"), "Text highlight colour"),
-                        Seg::Gap("  "),
-                        btn("A▾", 2, Todo("Font colour"), "Font colour"),
-                    ],
-                ],
-            },
-            Group {
-                title: "Paragraph",
-                width: 27,
-                rows: [
-                    vec![
-                        btn("•──", 3, Todo("Bullets"), "Bullets — bulleted list"),
-                        Seg::Gap(" "),
-                        btn("1──", 3, Todo("Numbering"), "Numbering — numbered list"),
-                        Seg::Gap(" "),
-                        btn("•◦─", 3, Todo("Multilevel list"), "Multilevel list"),
-                        Seg::Gap(" "),
-                        btn(
-                            "ind-",
-                            4,
-                            Todo("Decrease indent"),
-                            "Decrease indent (Ctrl+Shift+M)",
-                        ),
-                        Seg::Gap(" "),
-                        btn(
-                            "ind+",
-                            4,
-                            Todo("Increase indent"),
-                            "Increase indent (Ctrl+M)",
-                        ),
-                        Seg::Gap(" "),
-                        btn("A↓Z", 3, Todo("Sort"), "Sort"),
-                        Seg::Gap(" "),
-                        btn(
-                            "¶",
-                            1,
-                            ShowHide,
-                            "Show/hide formatting marks (Ctrl+Shift+8)",
-                        ),
-                    ],
-                    vec![
-                        btn("⡿⠍", 2, AlignLeft, "Align left (Ctrl+L)"),
-                        Seg::Gap(" "),
-                        btn("⢽⡯", 2, AlignCenter, "Align center (Ctrl+E)"),
-                        Seg::Gap(" "),
-                        btn("⠩⢿", 2, AlignRight, "Align right (Ctrl+R)"),
-                        Seg::Gap(" "),
-                        btn("⣿⣿", 2, Justify, "Justify (Ctrl+J)"),
-                        Seg::Gap("  "),
-                        btn("↕≡", 2, Todo("Line spacing"), "Line and paragraph spacing"),
-                        Seg::Gap("  "),
-                        btn("▩▾", 2, Todo("Shading"), "Shading"),
-                        Seg::Gap("  "),
-                        btn("⊞▾", 2, Todo("Borders"), "Borders"),
-                    ],
-                ],
-            },
-            Group {
-                title: "Editing",
-                width: 7,
-                rows: [
-                    vec![
-                        Seg::Gap("  "),
-                        btn("⌕", 1, Find, "Find (Ctrl+F)"),
-                        Seg::Gap(" "),
-                        btn("⇄", 1, Replace, "Replace (Ctrl+H)"),
-                    ],
-                    vec![
-                        Seg::Gap("   "),
-                        btn("▭", 1, SelectAll, "Select all (Ctrl+A)"),
-                    ],
-                ],
-            },
-        ];
         let mut r = Ribbon {
-            // File opens the full-screen backstage; Home is the only ribbon tab.
-            tabs: vec!["File", "Home"],
+            // File opens the full-screen backstage; Home and Review are ribbons.
+            tabs: vec!["File", "Home", "Review"],
             active: 1,
-            groups,
+            tab_groups: vec![Vec::new(), home_groups(), review_groups()],
             placed: Vec::new(),
             tab_cols: Vec::new(),
             width: 0,
@@ -271,12 +131,220 @@ impl Ribbon {
         r
     }
 
+    /// The groups of the currently active tab (empty for tabs without a body).
+    fn groups(&self) -> &[Group] {
+        &self.tab_groups[self.active]
+    }
+
+    /// Switch the active ribbon to tab `i` if it has a body, re-laying it out.
+    /// Tabs without a body (File) are ignored, so the current ribbon stays put.
+    pub fn set_active(&mut self, i: usize) {
+        if i < self.tabs.len() && !self.tab_groups[i].is_empty() {
+            self.active = i;
+            self.layout();
+        }
+    }
+}
+
+/// The Home tab's groups (Clipboard / Font / Paragraph / Editing).
+fn home_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Clipboard",
+            width: 9,
+            rows: [
+                vec![
+                    btn(
+                        "Paste",
+                        5,
+                        Paste,
+                        "Paste (Ctrl+V) — insert clipboard contents",
+                    ),
+                    Seg::Gap(" "),
+                    btn("✂", 1, Cut, "Cut (Ctrl+X)"),
+                    Seg::Gap(" "),
+                    btn("⧉", 1, Copy, "Copy (Ctrl+C)"),
+                ],
+                vec![
+                    Seg::Gap(" "),
+                    btn(
+                        "▾",
+                        1,
+                        Todo("Paste options"),
+                        "Paste options (paste special)",
+                    ),
+                    Seg::Gap("   "),
+                    btn(
+                        "▥",
+                        1,
+                        Todo("Format Painter"),
+                        "Format Painter — copy formatting",
+                    ),
+                ],
+            ],
+        },
+        Group {
+            title: "Font",
+            width: 27,
+            rows: [
+                vec![
+                    btn("[Calibri ▾]", 11, Todo("Font"), "Font — choose a typeface"),
+                    btn("[11▾]", 5, Todo("Font size"), "Font size"),
+                    Seg::Gap(" "),
+                    btn("A↑", 2, Todo("Grow font"), "Grow font (Ctrl+])"),
+                    Seg::Gap(" "),
+                    btn("A↓", 2, Todo("Shrink font"), "Shrink font (Ctrl+[)"),
+                    Seg::Gap(" "),
+                    btn("Aa", 2, Todo("Change case"), "Change case (Shift+F3)"),
+                    Seg::Gap(" "),
+                    btn(
+                        "⌧",
+                        1,
+                        Todo("Clear formatting"),
+                        "Clear formatting (Ctrl+Space)",
+                    ),
+                ],
+                vec![
+                    btn("B", 1, Bold, "Bold (Ctrl+B) — make the selection bold"),
+                    Seg::Gap("  "),
+                    btn("I", 1, Italic, "Italic (Ctrl+I)"),
+                    Seg::Gap("  "),
+                    btn("U", 1, Underline, "Underline (Ctrl+U)"),
+                    Seg::Gap("  "),
+                    btn("S", 1, Strike, "Strikethrough"),
+                    Seg::Gap("  "),
+                    btn("x₂", 2, Todo("Subscript"), "Subscript (Ctrl+=)"),
+                    Seg::Gap(" "),
+                    btn("x²", 2, Todo("Superscript"), "Superscript (Ctrl+Shift+=)"),
+                    Seg::Gap("  "),
+                    btn("ab▾", 3, Todo("Highlight"), "Text highlight colour"),
+                    Seg::Gap("  "),
+                    btn("A▾", 2, Todo("Font colour"), "Font colour"),
+                ],
+            ],
+        },
+        Group {
+            title: "Paragraph",
+            width: 27,
+            rows: [
+                vec![
+                    btn("•──", 3, Todo("Bullets"), "Bullets — bulleted list"),
+                    Seg::Gap(" "),
+                    btn("1──", 3, Todo("Numbering"), "Numbering — numbered list"),
+                    Seg::Gap(" "),
+                    btn("•◦─", 3, Todo("Multilevel list"), "Multilevel list"),
+                    Seg::Gap(" "),
+                    btn(
+                        "ind-",
+                        4,
+                        Todo("Decrease indent"),
+                        "Decrease indent (Ctrl+Shift+M)",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "ind+",
+                        4,
+                        Todo("Increase indent"),
+                        "Increase indent (Ctrl+M)",
+                    ),
+                    Seg::Gap(" "),
+                    btn("A↓Z", 3, Todo("Sort"), "Sort"),
+                    Seg::Gap(" "),
+                    btn(
+                        "¶",
+                        1,
+                        ShowHide,
+                        "Show/hide formatting marks (Ctrl+Shift+8)",
+                    ),
+                ],
+                vec![
+                    btn("⡿⠍", 2, AlignLeft, "Align left (Ctrl+L)"),
+                    Seg::Gap(" "),
+                    btn("⢽⡯", 2, AlignCenter, "Align center (Ctrl+E)"),
+                    Seg::Gap(" "),
+                    btn("⠩⢿", 2, AlignRight, "Align right (Ctrl+R)"),
+                    Seg::Gap(" "),
+                    btn("⣿⣿", 2, Justify, "Justify (Ctrl+J)"),
+                    Seg::Gap("  "),
+                    btn("↕≡", 2, Todo("Line spacing"), "Line and paragraph spacing"),
+                    Seg::Gap("  "),
+                    btn("▩▾", 2, Todo("Shading"), "Shading"),
+                    Seg::Gap("  "),
+                    btn("⊞▾", 2, Todo("Borders"), "Borders"),
+                ],
+            ],
+        },
+        Group {
+            title: "Editing",
+            width: 7,
+            rows: [
+                vec![
+                    Seg::Gap("  "),
+                    btn("⌕", 1, Find, "Find (Ctrl+F)"),
+                    Seg::Gap(" "),
+                    btn("⇄", 1, Replace, "Replace (Ctrl+H)"),
+                ],
+                vec![
+                    Seg::Gap("   "),
+                    btn("▭", 1, SelectAll, "Select all (Ctrl+A)"),
+                ],
+            ],
+        },
+    ]
+}
+
+/// The Review tab's groups (Comments / Tracking).
+fn review_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Comments",
+            width: 21,
+            rows: [
+                vec![
+                    btn("✎ New", 5, Todo("New comment"), "New comment"),
+                    Seg::Gap("  "),
+                    btn("✗ Delete", 8, Todo("Delete comment"), "Delete comment"),
+                ],
+                vec![
+                    btn("‹ Prev", 6, Todo("Previous comment"), "Previous comment"),
+                    Seg::Gap(" "),
+                    btn("Next ›", 6, Todo("Next comment"), "Next comment"),
+                    Seg::Gap("  "),
+                    btn("▤ Show", 6, ToggleComments, "Show/hide the comments panel"),
+                ],
+            ],
+        },
+        Group {
+            title: "Tracking",
+            width: 8,
+            rows: [
+                vec![btn(
+                    "Track ▾",
+                    7,
+                    Todo("Track Changes"),
+                    "Track Changes (Ctrl+Shift+E)",
+                )],
+                vec![btn(
+                    "Markup ▾",
+                    8,
+                    Todo("Display for Review"),
+                    "Display for review",
+                )],
+            ],
+        },
+    ]
+}
+
+impl Ribbon {
     /// Compute placed-button rects and total width from the group definitions.
     fn layout(&mut self) {
         self.placed.clear();
         // Each group cell is " " + content(width) + " " between │ borders.
         let mut gx = 1u16; // after the left "│"
-        for g in &self.groups {
+        let active = self.active;
+        for g in &self.tab_groups[active] {
             for (ri, row) in g.rows.iter().enumerate() {
                 let mut x = gx + 1; // group cell has a leading pad space
                 for seg in row {
@@ -468,7 +536,7 @@ impl Ribbon {
     /// include the tab strip (line 0) or the hint bar.
     pub fn render_body(&self, focus: Focus) -> Vec<Line<'static>> {
         let dim = Style::default().add_modifier(Modifier::DIM);
-        let widths: Vec<usize> = self.groups.iter().map(|g| g.width).collect();
+        let widths: Vec<usize> = self.groups().iter().map(|g| g.width).collect();
         let bar = |l: &str, m: &str, r: &str| -> Line<'static> {
             let mut s = String::from(l);
             for (i, w) in widths.iter().enumerate() {
@@ -496,7 +564,7 @@ impl Ribbon {
         let mut out = vec![bar("┌", "┬", "┐")];
         for ri in 0..2 {
             let mut spans = vec![Span::styled("│", dim)];
-            for g in &self.groups {
+            for g in self.groups() {
                 spans.push(Span::raw(" "));
                 self.row_spans(&g.rows[ri], ri as u8, focused, &mut spans);
                 // Pad the row to the group width so the right border lines up with
@@ -510,7 +578,7 @@ impl Ribbon {
         out.push(bar("├", "┼", "┤"));
         // group titles
         let mut spans = vec![Span::styled("│", dim)];
-        for g in &self.groups {
+        for g in self.groups() {
             let pad = g.width.saturating_sub(g.title.chars().count());
             let l = pad / 2;
             spans.push(Span::raw(format!(

@@ -16,6 +16,7 @@
 //!
 //! Save and PDF export are added in later phases per `ARCHITECTURE.md`.
 
+pub mod comments;
 pub mod editor;
 pub mod equation;
 pub mod export;

@@ -294,6 +294,14 @@ struct App {
     ribbon_open: bool,
     ribbon_focus: ribbon::Focus,
     ribbon_h: usize,
+    /// Review comments parsed from the document, and whether the side panel that
+    /// lists them is shown.
+    comments: Vec<docxcore::comments::Comment>,
+    show_comments: bool,
+    /// First comment row shown in the panel (scroll offset).
+    comments_scroll: usize,
+    /// The comments panel rect (set by draw() for wheel hit-testing).
+    comments_rect: Rect,
     /// The full-screen File backstage, when open.
     backstage: Option<backstage::Backstage>,
     /// Preview pane size (cells), set by draw() so the preview fills/scrolls it.
@@ -380,6 +388,7 @@ impl App {
             .unwrap_or(false);
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
+        let comments = docxcore::comments::parse_comments(&pkg);
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -397,6 +406,10 @@ impl App {
             ribbon: ribbon::Ribbon::home(),
             ribbon_open: false,
             ribbon_focus: ribbon::Focus::None,
+            comments,
+            show_comments: false,
+            comments_scroll: 0,
+            comments_rect: Rect::default(),
             // Set each frame by draw(); 0 until then so mouse rows map directly.
             ribbon_h: 0,
             backstage: None,
@@ -521,8 +534,26 @@ impl App {
 
     fn ribbon_move(&mut self, dir: ribbon::Dir) -> Option<bool> {
         self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, dir);
+        // Moving across tabs switches the active ribbon so its body updates live.
+        if let ribbon::Focus::Tab(i) = self.ribbon_focus {
+            self.ribbon.set_active(i);
+        }
         self.dirty = true;
         Some(false)
+    }
+
+    /// Toggle the comments review side panel.
+    fn toggle_comments(&mut self) {
+        self.show_comments = !self.show_comments;
+        self.comments_scroll = 0;
+        self.status = Some(if self.comments.is_empty() {
+            "No comments in this document.".to_string()
+        } else if self.show_comments {
+            format!("Showing {} comment(s).", self.comments.len())
+        } else {
+            "Comments panel hidden.".to_string()
+        });
+        self.dirty = true;
     }
 
     /// Run a ribbon command, mapping it to the matching editor operation.
@@ -574,6 +605,7 @@ impl App {
                 self.editor.select_all();
                 self.dirty = true;
             }
+            ToggleComments => self.toggle_comments(),
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
@@ -1178,6 +1210,8 @@ impl App {
             .unwrap_or(false);
         self.header_part = hf_part_name(&pkg, &rels, "headerReference");
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
+        self.comments = docxcore::comments::parse_comments(&pkg);
+        self.comments_scroll = 0;
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
         self.editor = Editor::new(doc);
@@ -1432,6 +1466,70 @@ impl App {
                 x: name_box.x + cx,
                 y: name_box.y + 1,
             });
+        }
+    }
+
+    /// The comments review side panel: each comment's author/date, the quoted
+    /// span it anchors to, and its text, scrollable with the wheel.
+    fn draw_comments_panel(&self, f: &mut Frame, area: Rect) {
+        let head = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let quote = Style::default().fg(Color::Yellow);
+        let inner_w = area.width.saturating_sub(2).max(4) as usize;
+        let inner_h = area.height.saturating_sub(2).max(1) as usize;
+
+        let mut lines: Vec<RLine> = Vec::new();
+        for (i, c) in self.comments.iter().enumerate() {
+            if i > 0 {
+                lines.push(RLine::raw(""));
+            }
+            let who = if c.author.is_empty() {
+                "Unknown".to_string()
+            } else {
+                c.author.clone()
+            };
+            let date = c.date.split('T').next().unwrap_or("").to_string();
+            lines.push(RLine::styled(format!("▣ {who}  {date}"), head));
+            if !c.quoted.is_empty() {
+                for w in wrap_str(&format!("“{}”", c.quoted), inner_w) {
+                    lines.push(RLine::styled(w, quote));
+                }
+            }
+            for para in c.text.split('\n') {
+                for w in wrap_str(para, inner_w) {
+                    lines.push(RLine::raw(w));
+                }
+            }
+        }
+
+        let total = lines.len();
+        let scroll = self.comments_scroll.min(total.saturating_sub(inner_h));
+        let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
+        let title = format!(" Comments ({}) ", self.comments.len());
+        f.render_widget(
+            Paragraph::new(shown).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            ),
+            area,
+        );
+        if total > inner_h {
+            let mut sb = ScrollbarState::new(total)
+                .position(scroll)
+                .viewport_content_length(inner_h);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area.inner(ratatui::layout::Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut sb,
+            );
         }
     }
 
@@ -1968,6 +2066,7 @@ impl App {
                 if self.ribbon.tab_label(i) == Some("File") {
                     self.open_backstage();
                 } else {
+                    self.ribbon.set_active(i);
                     self.ribbon_open = true;
                     self.ribbon_focus = ribbon::Focus::Tab(i);
                     self.dirty = true;
@@ -2081,6 +2180,17 @@ impl App {
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
+                // The wheel over the comments panel scrolls the comments.
+                if self.comments_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    // a loose cap (draw clamps to the exact content height)
+                    let cap = self.comments.len() * 12;
+                    self.comments_scroll = (self.comments_scroll + 3).min(cap);
+                    self.dirty = true;
+                    return;
+                }
                 // Scrolling changes only the visible slice, not the document, so
                 // don't mark dirty (that would re-render the whole doc per tick).
                 self.follow_caret = false;
@@ -2088,6 +2198,14 @@ impl App {
                 self.scroll = (self.scroll + 3).min(max);
             }
             MouseEventKind::ScrollUp => {
+                if self.comments_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    self.comments_scroll = self.comments_scroll.saturating_sub(3);
+                    self.dirty = true;
+                    return;
+                }
                 self.follow_caret = false;
                 self.scroll = self.scroll.saturating_sub(3);
             }
@@ -2895,8 +3013,19 @@ impl App {
         ])
         .split(f.area());
         self.draw_ribbon(f, chunks[0]);
-        let full = chunks[1];
+        let mut full = chunks[1];
         let status = chunks[2];
+
+        // The comments review panel takes a column on the right (Word-style).
+        self.comments_rect = Rect::default();
+        if self.show_comments && !self.comments.is_empty() && full.width > 50 {
+            let pw = 40.min(full.width / 2);
+            let cols =
+                Layout::horizontal([Constraint::Min(10), Constraint::Length(pw)]).split(full);
+            full = cols[0];
+            self.comments_rect = cols[1];
+            self.draw_comments_panel(f, cols[1]);
+        }
 
         // Reserve a one-column gutter on the right for the vertical scrollbar, so
         // the rendered width stays stable whether or not the bar is shown.
@@ -3055,6 +3184,50 @@ fn on_off(b: bool) -> &'static str {
 /// Byte offset of char index `i` in `s` (its length if `i` is past the end).
 fn byte_index(s: &str, i: usize) -> usize {
     s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Word-wrap `s` to lines of at most `w` columns (by char count). Long words are
+/// hard-broken. An empty input yields a single empty line.
+fn wrap_str(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut len = 0usize;
+    for word in s.split_whitespace() {
+        let wl = word.chars().count();
+        if wl > w {
+            // hard-break an over-long word
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+                len = 0;
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                chunk.push(ch);
+                if chunk.chars().count() == w {
+                    out.push(std::mem::take(&mut chunk));
+                }
+            }
+            if !chunk.is_empty() {
+                line = chunk;
+                len = line.chars().count();
+            }
+            continue;
+        }
+        let extra = if len == 0 { wl } else { wl + 1 };
+        if len + extra > w {
+            out.push(std::mem::take(&mut line));
+            len = 0;
+        }
+        if len > 0 {
+            line.push(' ');
+            len += 1;
+        }
+        line.push_str(word);
+        len += wl;
+    }
+    out.push(line);
+    out
 }
 
 /// Truncate `s` to at most `w` columns, ending with `…` when clipped.
@@ -3692,6 +3865,29 @@ mod tests {
             .unwrap();
         app.bs_mouse(3, 1 + nrow as u16);
         assert!(app.backstage.is_some()); // still in the backstage, nothing reset
+    }
+
+    #[test]
+    fn review_tab_present_and_toggle_flips_the_panel() {
+        let mut app = app_with(&["body text"]);
+        // The ribbon has a Review tab after File and Home.
+        assert_eq!(app.ribbon.tab_label(2), Some("Review"));
+        // Switching to it activates the Review ribbon.
+        app.ribbon.set_active(2);
+        assert_eq!(app.ribbon.active_tab(), 2);
+        // The Comments toggle flips the side-panel flag.
+        assert!(!app.show_comments);
+        app.run_act(ribbon::Act::ToggleComments);
+        assert!(app.show_comments);
+        app.run_act(ribbon::Act::ToggleComments);
+        assert!(!app.show_comments);
+    }
+
+    #[test]
+    fn wrap_str_wraps_words_and_hard_breaks() {
+        assert_eq!(wrap_str("hello world foo", 11), vec!["hello world", "foo"]);
+        assert_eq!(wrap_str("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_str("", 5), vec![String::new()]);
     }
 
     #[test]
