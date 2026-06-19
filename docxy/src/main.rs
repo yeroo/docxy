@@ -1187,7 +1187,6 @@ impl App {
     fn draw_bs_save_as(&self, f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
-        let rev = Style::default().add_modifier(Modifier::REVERSED);
         // Folder list on top, the typed file name in a box below it.
         let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
 
@@ -1226,14 +1225,24 @@ impl App {
             rows[0],
         );
 
-        // file-name input, with the caret drawn at the cursor position
-        let cut = byte_index(&bs.name_input, bs.name_cursor);
-        let mut shown = String::from(" ");
-        shown.push_str(&bs.name_input[..cut]);
-        shown.push('▏');
-        shown.push_str(&bs.name_input[cut..]);
+        // file-name input — a Far-style block cursor sits *on* a cell (the char
+        // at the caret, or a trailing space at end-of-line), without inserting a
+        // gap that would shift the text.
+        let cursor = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let mut spans = vec![RSpan::raw(" ")];
+        for (i, ch) in bs.name_input.chars().enumerate() {
+            let st = if i == bs.name_cursor {
+                cursor
+            } else {
+                Style::default()
+            };
+            spans.push(RSpan::styled(ch.to_string(), st));
+        }
+        if bs.name_cursor >= bs.name_input.chars().count() {
+            spans.push(RSpan::styled(" ", cursor));
+        }
         f.render_widget(
-            Paragraph::new(RLine::styled(shown, rev)).block(
+            Paragraph::new(RLine::from(spans)).block(
                 RBlock::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
