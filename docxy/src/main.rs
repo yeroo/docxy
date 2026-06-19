@@ -675,16 +675,24 @@ impl App {
     /// activates it (open the file / step into the folder).
     fn bs_mouse(&mut self, x: u16, y: u16) {
         use backstage::{ITEMS, Item, Pane};
-        // Left menu column: select an item, or activate it on a second click.
+        // Left menu column. The navigational items (Open / Save As / Info) just
+        // switch the right pane, so a single click engages them right away —
+        // Save As prefills the name and lets you type immediately. The acting
+        // items (New / Save / Print / Export / Exit) need a second click on the
+        // already-selected row, so a stray click can't discard or quit.
         if x < 14 {
             if y >= 1 {
                 let idx = (y - 1) as usize;
                 if idx < ITEMS.len() {
+                    let it = ITEMS[idx];
                     let cur = self.backstage.as_ref().map(|b| b.item);
-                    if cur == Some(ITEMS[idx]) {
+                    let navigational = matches!(it, Item::Open | Item::SaveAs | Item::Info);
+                    if let Some(b) = self.backstage.as_mut() {
+                        b.item = it;
+                    }
+                    if navigational || cur == Some(it) {
                         let _ = self.bs_menu_activate();
                     } else if let Some(b) = self.backstage.as_mut() {
-                        b.item = ITEMS[idx];
                         b.pane = Pane::Menu;
                     }
                     self.bs_update_preview();
@@ -3387,6 +3395,28 @@ mod tests {
         assert!(app.path.ends_with("copy.docx"));
         assert!(!app.modified);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn one_click_on_save_as_engages_and_prefills_the_name() {
+        let mut app = app_with(&["x"]);
+        app.path = "report.docx".to_string();
+        app.open_backstage();
+        let row = backstage::ITEMS
+            .iter()
+            .position(|i| *i == backstage::Item::SaveAs)
+            .unwrap();
+        app.bs_mouse(3, 1 + row as u16); // a single click in the menu column
+        let b = app.backstage.as_ref().unwrap();
+        assert_eq!(b.pane, backstage::Pane::SaveAs); // editable right away
+        assert_eq!(b.name_input, "report.docx"); // name shown immediately
+        // a stray single click on New must NOT discard the document
+        let nrow = backstage::ITEMS
+            .iter()
+            .position(|i| *i == backstage::Item::New)
+            .unwrap();
+        app.bs_mouse(3, 1 + nrow as u16);
+        assert!(app.backstage.is_some()); // still in the backstage, nothing reset
     }
 
     #[test]
