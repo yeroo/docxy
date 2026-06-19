@@ -562,6 +562,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
                 w += h.runs.iter().map(|r| r.text.chars().count()).sum::<usize>()
             }
             Inline::Tab | Inline::Break(_) => break,
+            Inline::Equation { text, .. } => w += text.chars().count(),
             Inline::SmartArt { .. } | Inline::Raw(_) => {}
         }
     }
@@ -764,6 +765,20 @@ fn flatten_para(
                             img: (i == 0).then(|| rc.clone()),
                         });
                     }
+                }
+            }
+            // A decoded equation flows as ordinary (non-editable) text at body size.
+            Inline::Equation { text, .. } => {
+                let st = Style::default();
+                for ch in text.chars() {
+                    segs.last_mut().unwrap().glyphs.push(Glyph {
+                        ch,
+                        disp: None,
+                        style: st.clone(),
+                        link: None,
+                        src: None,
+                        img: None,
+                    });
                 }
             }
             Inline::SmartArt { .. } => {}

@@ -50,6 +50,9 @@ impl std::error::Error for LoadError {}
 pub struct Relationships {
     map: HashMap<String, (String, bool)>,
     diagrams: HashMap<String, Vec<String>>,
+    /// Decoded equation text keyed by the OLE object relationship id
+    /// (`<o:OLEObject r:id>`), resolved from the embedded `Equation.3` objects.
+    equations: HashMap<String, String>,
 }
 
 impl Relationships {
@@ -85,6 +88,7 @@ pub fn load(data: &[u8]) -> Result<Document, LoadError> {
             let xml = std::str::from_utf8(&b).unwrap_or("").to_string();
             let mut r = parse_rels_xml(&xml);
             r.diagrams = collect_diagram_texts(&xml, |n| zip.read(n));
+            r.equations = collect_equation_texts(&xml, |n| zip.read(n));
             r
         }
         None => Relationships::default(),
@@ -207,6 +211,46 @@ pub(crate) fn set_diagram_texts(rels: &mut Relationships, diagrams: HashMap<Stri
     rels.diagrams = diagrams;
 }
 
+/// Decode every embedded legacy equation (`Equation.3` OLE object) to Unicode
+/// text, keyed by its relationship id, so `<o:OLEObject r:id>` runs can render as
+/// inline text instead of the raster preview.
+pub(crate) fn collect_equation_texts<F>(rels_xml: &str, read_part: F) -> HashMap<String, String>
+where
+    F: Fn(&str) -> Option<Vec<u8>>,
+{
+    let mut out = HashMap::new();
+    let mut p = XmlParser::new(rels_xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "Relationship" {
+                    if p.attr("Type").ends_with("/oleObject") {
+                        let id = decode_attr(p.attr("Id"));
+                        let target = decode_attr(p.attr("Target"));
+                        if !id.is_empty() && !target.is_empty() {
+                            let part = resolve_word_part(&target);
+                            if let Some(b) = read_part(&part) {
+                                if let Some(t) = crate::equation::decode(&b) {
+                                    out.insert(id, t);
+                                }
+                            }
+                        }
+                    }
+                    p.skip_element();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Attach decoded equation text to a `Relationships`, keyed by OLE relationship id.
+pub(crate) fn set_equation_texts(rels: &mut Relationships, equations: HashMap<String, String>) {
+    rels.equations = equations;
+}
+
 /// Resolve a relationship `Target` (relative to `word/`) to a package part name,
 /// collapsing any leading `../` segments.
 fn resolve_word_part(target: &str) -> String {
@@ -247,9 +291,21 @@ fn extract_diagram_text(xml: &str) -> Vec<String> {
     out
 }
 
-/// Build a `SmartArt` inline if `raw` is a diagram drawing whose text we resolved,
-/// otherwise fall back to preserving the run verbatim as `Raw`.
+/// Resolve a run holding a drawing/object: a decoded equation becomes inline
+/// text, a SmartArt diagram becomes a `SmartArt` box, otherwise the run is
+/// preserved verbatim as `Raw`.
 fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
+    // Legacy equation: the OLE object's r:id points at an `Equation.3` we decoded.
+    if let Some(i) = raw.find("OLEObject") {
+        if let Some(id) = raw_attr(&raw[i..], ":id=\"") {
+            if let Some(text) = rels.equations.get(&id) {
+                return Inline::Equation {
+                    raw,
+                    text: text.clone(),
+                };
+            }
+        }
+    }
     if let Some(dm) = raw_attr(&raw, ":dm=\"") {
         if let Some(text) = rels.diagrams.get(&dm) {
             return Inline::SmartArt {
@@ -891,6 +947,24 @@ mod tests {
         match &first_para(&d).content[0] {
             Inline::SmartArt { text, .. } => assert_eq!(text, &vec!["Hello".to_string()]),
             other => panic!("expected SmartArt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equation_object_run_becomes_inline_text() {
+        let mut rels = Relationships::default();
+        let mut eqs = HashMap::new();
+        eqs.insert("rId7".to_string(), "x²+1".to_string());
+        set_equation_texts(&mut rels, eqs);
+        // A run holding the OLE equation object plus its image preview.
+        let xml = "<w:document><w:body><w:p><w:r><w:object>\
+            <o:OLEObject Type=\"Embed\" ProgID=\"Equation.3\" r:id=\"rId7\"/>\
+            <v:shape><v:imagedata r:id=\"rId8\"/></v:shape>\
+            </w:object></w:r></w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &rels);
+        match &first_para(&d).content[0] {
+            Inline::Equation { text, .. } => assert_eq!(text, "x²+1"),
+            other => panic!("expected Equation, got {other:?}"),
         }
     }
 

@@ -87,6 +87,13 @@ pub enum Inline {
         raw: String,
         text: Vec<String>,
     },
+    /// A legacy Equation Editor (`Equation.3`) object decoded to Unicode math
+    /// text. `raw` is the original run XML (preserved verbatim for lossless save);
+    /// `text` is the decoded equation, rendered as inline text at body size.
+    Equation {
+        raw: String,
+        text: String,
+    },
     /// Verbatim XML for inline content we don't model (images/fields/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
@@ -101,6 +108,7 @@ impl Inline {
             Inline::Tab => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
             Inline::SmartArt { text, .. } => text.join("\n"),
+            Inline::Equation { text, .. } => text.clone(),
             Inline::Raw(_) => String::new(),
         }
     }

@@ -206,6 +206,7 @@ fn write_inline(s: &mut String, item: &Inline) {
             s.push_str("</w:hyperlink>");
         }
         Inline::SmartArt { raw, .. } => s.push_str(raw),
+        Inline::Equation { raw, .. } => s.push_str(raw),
         Inline::Raw(raw) => s.push_str(raw),
     }
 }

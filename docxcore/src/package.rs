@@ -214,6 +214,10 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
             &mut rels,
             crate::load::collect_diagram_texts(xml, read_part),
         );
+        crate::load::set_equation_texts(
+            &mut rels,
+            crate::load::collect_equation_texts(xml, read_part),
+        );
     }
     let document = parse_document_xml(doc_xml, &rels);
     let sect_pr = extract_sectpr(doc_xml);

@@ -1002,7 +1002,7 @@ fn inline_len(i: &Inline) -> usize {
         Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),
         Inline::Tab | Inline::Break(_) => 1,
         // Zero-length, invisible in the editor (preserved for save only).
-        Inline::SmartArt { .. } | Inline::Raw(_) => 0,
+        Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_) => 0,
     }
 }
 
@@ -1056,6 +1056,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             Inline::Tab => out.push(Inline::Tab),
             Inline::Break(k) => out.push(Inline::Break(*k)),
             Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
+                raw: raw.clone(),
+                text: text.clone(),
+            }),
+            Inline::Equation { raw, text } => out.push(Inline::Equation {
                 raw: raw.clone(),
                 text: text.clone(),
             }),
@@ -1136,7 +1140,11 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                     runs_insert(&mut h.runs, local, ch);
                     return;
                 }
-                Inline::Tab | Inline::Break(_) | Inline::SmartArt { .. } | Inline::Raw(_) => {
+                Inline::Tab
+                | Inline::Break(_)
+                | Inline::SmartArt { .. }
+                | Inline::Equation { .. }
+                | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
                             if let Inline::Run(r) = &mut content[i - 1] {
@@ -1204,7 +1212,11 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                         content.remove(i);
                     }
                 }
-                Inline::Tab | Inline::Break(_) | Inline::SmartArt { .. } | Inline::Raw(_) => {
+                Inline::Tab
+                | Inline::Break(_)
+                | Inline::SmartArt { .. }
+                | Inline::Equation { .. }
+                | Inline::Raw(_) => {
                     content.remove(i);
                 }
             }
@@ -1274,7 +1286,7 @@ fn range_all_have(
                 }
             }
             Inline::Tab | Inline::Break(_) => pos += 1,
-            Inline::SmartArt { .. } | Inline::Raw(_) => {} // zero-length
+            Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_) => {} // zero-length
         }
     }
     saw
@@ -1366,7 +1378,9 @@ fn set_prop_range(
                 pos += 1;
             }
             // zero-length, unchanged
-            inline @ (Inline::SmartArt { .. } | Inline::Raw(_)) => out.push(inline),
+            inline @ (Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_)) => {
+                out.push(inline)
+            }
         }
     }
     *content = out;
