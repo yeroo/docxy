@@ -252,8 +252,9 @@ impl Ribbon {
             },
         ];
         let mut r = Ribbon {
-            tabs: vec!["File", "Home", "Insert", "Layout", "Review", "View"],
-            active: 1,
+            // Only Home exists for now; other tabs aren't drawn until implemented.
+            tabs: vec!["Home"],
+            active: 0,
             groups,
             placed: Vec::new(),
             tab_cols: Vec::new(),
@@ -470,13 +471,24 @@ impl Ribbon {
         } else {
             None
         };
+        let row_w = |row: &[Seg]| -> usize {
+            row.iter()
+                .map(|s| match s {
+                    Seg::Gap(g) => g.chars().count(),
+                    Seg::Btn(b) => b.width,
+                })
+                .sum()
+        };
         let mut out = vec![bar("┌", "┬", "┐")];
         for ri in 0..2 {
             let mut spans = vec![Span::styled("│", dim)];
             for g in &self.groups {
                 spans.push(Span::raw(" "));
                 self.row_spans(&g.rows[ri], ri as u8, focused, &mut spans);
-                spans.push(Span::raw(" "));
+                // Pad the row to the group width so the right border lines up with
+                // the ┬/┼ in the borders above and below.
+                let pad = g.width.saturating_sub(row_w(&g.rows[ri]));
+                spans.push(Span::raw(" ".repeat(pad + 1)));
                 spans.push(Span::styled("│", dim));
             }
             out.push(Line::from(spans));
@@ -576,23 +588,16 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_tab_header_is_detected() {
+    fn clicking_the_home_tab_is_detected() {
         let r = Ribbon::home();
-        // "Home" is the second tab; click within its column.
-        let (a, b) = r.tab_cols[1];
-        match r.hit((a + b) / 2, 0, false) {
-            Hit::Tab(1) => {}
-            other => panic!(
-                "expected Tab(1), got it elsewhere ({:?})",
-                matches!(other, Hit::Tab(_))
-            ),
-        }
+        let (a, b) = r.tab_cols[0];
+        assert!(matches!(r.hit((a + b) / 2, 0, false), Hit::Tab(0)));
     }
 
     #[test]
     fn down_from_tabs_enters_first_button_then_up_returns() {
         let r = Ribbon::home();
-        let f = r.nav(Focus::Tab(1), Dir::Down);
+        let f = r.nav(Focus::Tab(0), Dir::Down);
         assert!(matches!(f, Focus::Button(_)));
         // the first button is on the top row, so Up goes back to the tabs
         assert!(matches!(r.nav(f, Dir::Up), Focus::Tab(_)));
@@ -608,6 +613,31 @@ mod tests {
         if let (Focus::Button(_), Focus::Button(_)) = (start, right) {
         } else {
             panic!("expected button focus");
+        }
+    }
+
+    #[test]
+    fn body_border_columns_line_up_on_every_row() {
+        let r = Ribbon::home();
+        let lines = r.render_body(Focus::None);
+        let width = |l: &Line| -> usize { l.spans.iter().map(|s| s.content.chars().count()).sum() };
+        let bar_cols = |l: &Line| -> Vec<usize> {
+            let mut cols = Vec::new();
+            let mut c = 0usize;
+            for sp in &l.spans {
+                for ch in sp.content.chars() {
+                    if "┌┐└┘├┤┬┴┼│".contains(ch) {
+                        cols.push(c);
+                    }
+                    c += 1;
+                }
+            }
+            cols
+        };
+        let top = bar_cols(&lines[0]);
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(width(l), width(&lines[0]), "line {i} has a different width");
+            assert_eq!(bar_cols(l), top, "border columns drift on line {i}");
         }
     }
 
