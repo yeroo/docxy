@@ -125,7 +125,7 @@ fn print_usage() {
            Ctrl-L/E/R/J align left / center / right / justify\n  \
            Ctrl-A select all   Ctrl-C copy   Ctrl-X cut   Ctrl-V paste\n  \
            Ctrl-F find   Ctrl-H replace   Ctrl-Shift-8 show marks\n  \
-           Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q / Esc quit\n  \
+           Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q quit\n  \
            F9 ribbon (←→ tabs · ↓ enter · arrows move · Enter apply · Esc leave)\n  \
            F2 page view   F3 show marks   F4 table borders\n  \
            F6 edit header   F7 edit footer   (Esc returns)   F8 section break\n  \
@@ -1649,18 +1649,17 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let is_quit = key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('q'));
+        let is_quit = ctrl && key.code == KeyCode::Char('q');
         if !is_quit {
             self.quit_armed = false;
         }
         match key.code {
+            // Esc clears a selection but never quits — use Ctrl+Q to quit.
             KeyCode::Esc => {
                 if self.editor.has_selection() {
                     self.editor.clear_selection();
                     self.dirty = true;
-                    return false;
                 }
-                return self.try_quit();
             }
             KeyCode::Char('q') if ctrl => return self.try_quit(),
             KeyCode::Char('s') if ctrl => self.save(),
@@ -2726,16 +2725,24 @@ mod tests {
         app.on_key(key(KeyCode::Char('x')));
         assert!(app.modified);
         // first quit is blocked
-        assert!(!app.on_key(KeyCode::Esc.into_key()));
+        assert!(!app.on_key(ctrl(KeyCode::Char('q'))));
         assert!(app.quit_armed);
         // second quit goes through
-        assert!(app.on_key(KeyCode::Esc.into_key()));
+        assert!(app.on_key(ctrl(KeyCode::Char('q'))));
     }
 
     #[test]
     fn clean_quit_is_immediate() {
         let mut app = app_with(&["a"]);
-        assert!(app.on_key(KeyCode::Esc.into_key()));
+        assert!(app.on_key(ctrl(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn esc_does_not_quit() {
+        let mut app = app_with(&["a"]);
+        // Esc on a clean doc must not quit.
+        assert!(!app.on_key(KeyCode::Esc.into_key()));
+        assert!(!app.on_key(KeyCode::Esc.into_key()));
     }
 
     #[test]
@@ -2770,14 +2777,14 @@ mod tests {
     }
 
     #[test]
-    fn esc_clears_selection_then_quits() {
+    fn esc_clears_selection_but_never_quits() {
         let mut app = app_with(&["ab"]);
         app.editor.move_home();
         app.on_key(shift(KeyCode::Right));
         assert!(app.editor.has_selection());
-        assert!(!app.on_key(KeyCode::Esc.into_key())); // clears selection, does not quit
+        assert!(!app.on_key(KeyCode::Esc.into_key())); // clears selection
         assert!(!app.editor.has_selection());
-        assert!(app.on_key(KeyCode::Esc.into_key())); // now quits
+        assert!(!app.on_key(KeyCode::Esc.into_key())); // and still does not quit
     }
 
     #[test]
