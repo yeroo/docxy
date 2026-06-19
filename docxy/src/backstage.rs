@@ -82,6 +82,8 @@ pub enum Pane {
     Menu,
     /// The Open folder browser.
     Browser,
+    /// The read-only document preview (scrollable).
+    Preview,
 }
 
 pub struct Backstage {
@@ -93,6 +95,10 @@ pub struct Backstage {
     /// Rendered preview lines for the highlighted `.docx` (filled by the app).
     pub preview: Vec<String>,
     pub preview_path: Option<PathBuf>,
+    /// Cell width the current preview was rendered at (re-render when it changes).
+    pub preview_w: usize,
+    /// Top line of the preview scroll window.
+    pub preview_scroll: usize,
 }
 
 impl Backstage {
@@ -108,6 +114,8 @@ impl Backstage {
             sel: 0,
             preview: Vec::new(),
             preview_path: None,
+            preview_w: 0,
+            preview_scroll: 0,
         };
         b.refresh();
         b

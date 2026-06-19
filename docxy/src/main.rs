@@ -280,6 +280,9 @@ struct App {
     ribbon_h: usize,
     /// The full-screen File backstage, when open.
     backstage: Option<backstage::Backstage>,
+    /// Preview pane size (cells), set by draw() so the preview fills/scrolls it.
+    bs_preview_w: usize,
+    bs_preview_h: usize,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -368,6 +371,8 @@ impl App {
             // Set each frame by draw(); 0 until then so mouse rows map directly.
             ribbon_h: 0,
             backstage: None,
+            bs_preview_w: 36,
+            bs_preview_h: 20,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -580,15 +585,14 @@ impl App {
             self.dirty = true;
             return false;
         }
-        if pane == Pane::Menu {
-            match key.code {
+        match pane {
+            Pane::Menu => match key.code {
                 KeyCode::Up => self.bs_menu_move(false),
                 KeyCode::Down => self.bs_menu_move(true),
                 KeyCode::Enter | KeyCode::Right => return self.bs_menu_activate(),
                 _ => {}
-            }
-        } else {
-            match key.code {
+            },
+            Pane::Browser => match key.code {
                 KeyCode::Up => {
                     if let Some(b) = self.backstage.as_mut() {
                         b.move_sel(false);
@@ -621,11 +625,45 @@ impl App {
                         b.pane = Pane::Menu;
                     }
                 }
+                // Step right into the read-only preview to scroll it.
+                KeyCode::Right | KeyCode::Tab => {
+                    if let Some(b) = self.backstage.as_mut() {
+                        if !b.preview.is_empty() {
+                            b.pane = Pane::Preview;
+                        }
+                    }
+                }
                 _ => {}
+            },
+            Pane::Preview => {
+                let page = self.bs_preview_h.saturating_sub(1).max(1) as isize;
+                match key.code {
+                    KeyCode::Up => self.bs_scroll_preview(-1),
+                    KeyCode::Down => self.bs_scroll_preview(1),
+                    KeyCode::PageUp => self.bs_scroll_preview(-page),
+                    KeyCode::PageDown => self.bs_scroll_preview(page),
+                    KeyCode::Home => self.bs_scroll_preview(isize::MIN / 2),
+                    KeyCode::End => self.bs_scroll_preview(isize::MAX / 2),
+                    KeyCode::Left | KeyCode::Tab => {
+                        if let Some(b) = self.backstage.as_mut() {
+                            b.pane = Pane::Browser;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         self.dirty = true;
         false
+    }
+
+    fn bs_scroll_preview(&mut self, delta: isize) {
+        let h = self.bs_preview_h.max(1);
+        if let Some(b) = self.backstage.as_mut() {
+            let max = b.preview.len().saturating_sub(h) as isize;
+            let new = (b.preview_scroll as isize + delta).clamp(0, max.max(0));
+            b.preview_scroll = new as usize;
+        }
     }
 
     fn bs_menu_move(&mut self, down: bool) {
@@ -679,14 +717,20 @@ impl App {
 
     /// Render a quick preview of the highlighted `.docx` into the backstage.
     fn bs_update_preview(&mut self) {
+        let w = self.bs_preview_w.max(8);
         let sel = self.backstage.as_ref().and_then(|b| b.selected_docx());
         let Some(b) = self.backstage.as_mut() else {
             return;
         };
-        if sel == b.preview_path {
+        // Re-render when the highlighted file or the pane width changes.
+        if sel == b.preview_path && w == b.preview_w {
             return;
         }
+        if sel != b.preview_path {
+            b.preview_scroll = 0; // a new file starts at the top
+        }
         b.preview_path = sel.clone();
+        b.preview_w = w;
         b.preview.clear();
         let Some(path) = sel else { return };
         match std::fs::read(&path)
@@ -699,13 +743,13 @@ impl App {
                     .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
                     .unwrap_or_default();
                 let opts = RenderOptions {
-                    width: 36,
+                    width: w,
                     styles: Rc::new(styles),
                     ..RenderOptions::default()
                 };
                 b.preview = docxcore::render::render(&pkg.document, &opts)
                     .iter()
-                    .take(60)
+                    .take(120)
                     .map(|l| l.plain())
                     .collect();
             }
@@ -892,17 +936,53 @@ impl App {
             panes[0],
         );
 
-        // preview
-        let prev: Vec<RLine> = bs.preview.iter().map(|s| RLine::raw(s.clone())).collect();
+        // preview — a scrollable, read-only render of the highlighted document
+        let prev_focus = bs.pane == backstage::Pane::Preview;
+        let inner_ph = panes[1].height.saturating_sub(2) as usize;
+        let scroll = bs
+            .preview_scroll
+            .min(bs.preview.len().saturating_sub(inner_ph));
+        let prev: Vec<RLine> = bs
+            .preview
+            .iter()
+            .skip(scroll)
+            .take(inner_ph)
+            .map(|s| RLine::raw(s.clone()))
+            .collect();
+        let pstyle = if prev_focus {
+            Style::default().fg(Color::Cyan)
+        } else {
+            dim
+        };
         f.render_widget(
             Paragraph::new(prev).block(
                 RBlock::default()
                     .borders(Borders::ALL)
-                    .border_style(dim)
-                    .title(" Preview "),
+                    .border_style(pstyle)
+                    .title(if prev_focus {
+                        " Preview  (↑↓ PgUp/Dn scroll · ← list) "
+                    } else {
+                        " Preview "
+                    }),
             ),
             panes[1],
         );
+        // scrollbar on the preview's right edge
+        if bs.preview.len() > inner_ph {
+            let mut sb = ScrollbarState::new(bs.preview.len())
+                .position(scroll)
+                .viewport_content_length(inner_ph);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                panes[1].inner(ratatui::layout::Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut sb,
+            );
+        }
     }
 
     fn draw_bs_info(&self, f: &mut Frame, area: Rect) {
@@ -1386,7 +1466,18 @@ impl App {
 
     fn on_mouse(&mut self, m: MouseEvent) {
         if self.backstage.is_some() {
-            return; // backstage is keyboard-driven for now
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.bs_scroll_preview(3);
+                    self.dirty = true;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.bs_scroll_preview(-3);
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return; // backstage is otherwise keyboard-driven
         }
         let mrow = m.row as usize;
         let col = m.column as usize;
@@ -2234,6 +2325,11 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         // The File backstage takes over the whole screen.
         if self.backstage.is_some() {
+            // Preview pane size = total − menu(14) − list(34) − borders(2) wide,
+            // − title(1) − borders(2) tall.
+            self.bs_preview_w = (f.area().width as usize).saturating_sub(50).max(8);
+            self.bs_preview_h = (f.area().height as usize).saturating_sub(3).max(1);
+            self.bs_update_preview();
             self.draw_backstage(f, f.area());
             return;
         }
@@ -2971,6 +3067,45 @@ mod tests {
         assert!(app.backstage.is_none());
         // The open document is untouched — preview must not replace it.
         assert_eq!(first_line(&app), "original text");
+    }
+
+    #[test]
+    fn preview_pane_scrolls_and_clamps() {
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        app.bs_preview_h = 5;
+        if let Some(b) = app.backstage.as_mut() {
+            b.preview = (0..20).map(|i| format!("line {i}")).collect();
+            b.pane = backstage::Pane::Preview;
+        }
+        app.bs_scroll_preview(3);
+        assert_eq!(app.backstage.as_ref().unwrap().preview_scroll, 3);
+        // clamps at the bottom: max = len(20) - height(5) = 15
+        app.bs_scroll_preview(1000);
+        assert_eq!(app.backstage.as_ref().unwrap().preview_scroll, 15);
+        // and at the top
+        app.bs_scroll_preview(-1000);
+        assert_eq!(app.backstage.as_ref().unwrap().preview_scroll, 0);
+    }
+
+    #[test]
+    fn right_steps_into_preview_then_left_returns() {
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        if let Some(b) = app.backstage.as_mut() {
+            b.preview = vec!["x".to_string()];
+            b.pane = backstage::Pane::Browser;
+        }
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Preview
+        );
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Browser
+        );
     }
 
     #[test]
