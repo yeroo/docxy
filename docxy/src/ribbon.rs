@@ -111,6 +111,8 @@ pub struct Ribbon {
     /// Column ranges of each tab header on the (collapsed or expanded) top row.
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive)
     width: u16,
+    /// Whether the comments panel is on (drives the Review ▸ Show checkbox).
+    comments_on: bool,
 }
 
 const ROW0: usize = 1; // y of first button row inside the expanded ribbon
@@ -126,9 +128,15 @@ impl Ribbon {
             placed: Vec::new(),
             tab_cols: Vec::new(),
             width: 0,
+            comments_on: false,
         };
         r.layout();
         r
+    }
+
+    /// Reflect the comments-panel state in the Review ▸ Show checkbox.
+    pub fn set_comments_on(&mut self, on: bool) {
+        self.comments_on = on;
     }
 
     /// The groups of the currently active tab (empty for tabs without a body).
@@ -300,7 +308,7 @@ fn review_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Comments",
-            width: 21,
+            width: 23,
             rows: [
                 vec![
                     btn("✎ New", 5, Todo("New comment"), "New comment"),
@@ -312,7 +320,13 @@ fn review_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Next ›", 6, Todo("Next comment"), "Next comment"),
                     Seg::Gap("  "),
-                    btn("▤ Show", 6, ToggleComments, "Show/hide the comments panel"),
+                    // glyph is swapped to "[x] Show" while the panel is on
+                    btn(
+                        "[ ] Show",
+                        8,
+                        ToggleComments,
+                        "Show/hide the comments panel",
+                    ),
                 ],
             ],
         },
@@ -614,7 +628,17 @@ impl Ribbon {
                     } else {
                         Style::default().add_modifier(Modifier::DIM)
                     };
-                    out.push(Span::styled(b.glyph.to_string(), style));
+                    // Toggle buttons render as a checkbox reflecting their state.
+                    let glyph = if b.act == Act::ToggleComments {
+                        if self.comments_on {
+                            "[x] Show"
+                        } else {
+                            "[ ] Show"
+                        }
+                    } else {
+                        b.glyph
+                    };
+                    out.push(Span::styled(glyph.to_string(), style));
                 }
             }
         }

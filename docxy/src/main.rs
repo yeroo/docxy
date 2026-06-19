@@ -1970,7 +1970,7 @@ impl App {
             } else {
                 "Exit docxy?".to_string()
             },
-            yes: false,
+            yes: true,
             action: ConfirmAction::Exit,
         });
         self.dirty = true;
@@ -3006,6 +3006,7 @@ impl App {
         // The ribbon sits above the document; its height is the collapsed tab
         // strip or the expanded body. Stored so mouse rows can be routed.
         self.ribbon_h = self.ribbon_height();
+        self.ribbon.set_comments_on(self.show_comments);
         let chunks = Layout::vertical([
             Constraint::Length(self.ribbon_h as u16),
             Constraint::Min(1),
@@ -4016,7 +4017,8 @@ mod tests {
         assert!(!app.quit_requested);
         assert!(app.backstage.is_none());
         assert!(app.confirm.is_some());
-        // No is selected by default; Esc dismisses without quitting.
+        assert!(app.confirm.as_ref().unwrap().yes, "Yes is the default");
+        // Esc dismisses without quitting regardless of the selection.
         app.on_key(key(KeyCode::Esc));
         assert!(app.confirm.is_none());
         assert!(!app.quit_requested);
