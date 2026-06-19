@@ -263,6 +263,8 @@ struct App {
     path: String,
     modified: bool,
     quit_armed: bool,
+    /// Set when the File ▸ Exit item is chosen, so the event loop quits.
+    quit_requested: bool,
     status: Option<String>,
     scroll: usize,
     viewport_h: usize,
@@ -360,6 +362,7 @@ impl App {
             path: path.to_string(),
             modified: false,
             quit_armed: false,
+            quit_requested: false,
             status: None,
             scroll: 0,
             viewport_h: 1,
@@ -784,9 +787,13 @@ impl App {
                 self.export_pdf();
                 self.backstage = None;
             }
+            Item::Exit => {
+                self.backstage = None;
+                self.quit_requested = true;
+            }
         }
         self.dirty = true;
-        false
+        self.quit_requested
     }
 
     /// Render a quick preview of the highlighted `.docx` into the backstage.
@@ -2939,7 +2946,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
         Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
         Event::Mouse(m) => {
             app.on_mouse(m);
-            false
+            app.quit_requested // a clicked File ▸ Exit quits
         }
         Event::Resize(_, _) => {
             app.dirty = true;
@@ -3166,6 +3173,21 @@ mod tests {
         assert!(app.backstage.is_none());
         // The open document is untouched — preview must not replace it.
         assert_eq!(first_line(&app), "original text");
+    }
+
+    #[test]
+    fn file_menu_exit_quits_the_program() {
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        if let Some(b) = app.backstage.as_mut() {
+            b.item = backstage::Item::Exit;
+            b.pane = backstage::Pane::Menu;
+        }
+        // Enter on the Exit item signals quit to the event loop.
+        let quit = app.bs_menu_activate();
+        assert!(quit);
+        assert!(app.quit_requested);
+        assert!(app.backstage.is_none());
     }
 
     #[test]
