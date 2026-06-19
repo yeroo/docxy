@@ -779,7 +779,7 @@ impl App {
                 self.backstage = None;
             }
             Item::SaveAs => self.status = Some("Save As — not implemented yet".to_string()),
-            Item::New | Item::Close => {
+            Item::New => {
                 self.new_document();
                 self.backstage = None;
             }
@@ -962,7 +962,7 @@ impl App {
                     Item::SaveAs => "Save As — not implemented yet.",
                     Item::Print | Item::Export => "Export — write a PDF next to the document.",
                     Item::New => "New — start a blank document.",
-                    Item::Close => "Close — discard and start a blank document.",
+                    Item::Exit => "Exit — quit docxy.",
                     _ => "",
                 };
                 f.render_widget(

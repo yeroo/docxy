@@ -18,11 +18,10 @@ pub enum Item {
     SaveAs,
     Print,
     Export,
-    Close,
     Exit,
 }
 
-pub const ITEMS: [Item; 9] = [
+pub const ITEMS: [Item; 8] = [
     Item::New,
     Item::Open,
     Item::Info,
@@ -30,7 +29,6 @@ pub const ITEMS: [Item; 9] = [
     Item::SaveAs,
     Item::Print,
     Item::Export,
-    Item::Close,
     Item::Exit,
 ];
 
@@ -44,7 +42,6 @@ impl Item {
             Item::SaveAs => "Save As",
             Item::Print => "Print",
             Item::Export => "Export",
-            Item::Close => "Close",
             Item::Exit => "Exit",
         }
     }
@@ -224,7 +221,7 @@ mod tests {
 
     #[test]
     fn item_order_and_labels() {
-        assert_eq!(ITEMS.len(), 9);
+        assert_eq!(ITEMS.len(), 8);
         assert_eq!(Item::Open.label(), "Open");
         assert_eq!(Item::SaveAs.label(), "Save As");
         // Exit is the last item.
