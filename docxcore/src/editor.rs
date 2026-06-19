@@ -926,6 +926,15 @@ fn resolve_para<'a>(body: &'a [Block], path: &[usize]) -> Option<&'a Paragraph> 
     let (i, rest) = path.split_first()?;
     match body.get(*i)? {
         Block::Paragraph(p) if rest.is_empty() => Some(p),
+        // A deeper path descends into a text box embedded in this paragraph:
+        // rest[0] is the text box's inline index, rest[1..] the path inside it.
+        Block::Paragraph(p) => {
+            let (k, inner) = rest.split_first()?;
+            match p.content.get(*k)? {
+                Inline::TextBox { blocks, .. } => resolve_para(blocks, inner),
+                _ => None,
+            }
+        }
         Block::Table(t) if rest.len() >= 2 => {
             let cell = t.rows.get(rest[0])?.cells.get(rest[1])?;
             resolve_para(&cell.blocks, &rest[2..])
@@ -948,6 +957,11 @@ fn container_mut<'a>(
             let cell = t.rows.get_mut(path[1])?.cells.get_mut(path[2])?;
             container_mut(&mut cell.blocks, &path[3..])
         }
+        // Descend into a text box (inline index `path[1]`) within this paragraph.
+        Block::Paragraph(p) => match p.content.get_mut(path[1])? {
+            Inline::TextBox { blocks, .. } => container_mut(blocks, &path[2..]),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -976,7 +990,17 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
     for (i, b) in body.iter().enumerate() {
         prefix.push(i);
         match b {
-            Block::Paragraph(_) => out.push(prefix.clone()),
+            Block::Paragraph(p) => {
+                out.push(prefix.clone());
+                // Text-box paragraphs are addressable just after their host.
+                for (k, inl) in p.content.iter().enumerate() {
+                    if let Inline::TextBox { blocks, .. } = inl {
+                        prefix.push(k);
+                        collect_paths(blocks, prefix, out);
+                        prefix.pop();
+                    }
+                }
+            }
             Block::Table(t) => {
                 for (ri, row) in t.rows.iter().enumerate() {
                     for (ci, cell) in row.cells.iter().enumerate() {
@@ -1002,7 +1026,10 @@ fn inline_len(i: &Inline) -> usize {
         Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),
         Inline::Tab | Inline::Break(_) => 1,
         // Zero-length, invisible in the editor (preserved for save only).
-        Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_) => 0,
+        Inline::SmartArt { .. }
+        | Inline::Equation { .. }
+        | Inline::TextBox { .. }
+        | Inline::Raw(_) => 0,
     }
 }
 
@@ -1062,6 +1089,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             Inline::Equation { raw, text } => out.push(Inline::Equation {
                 raw: raw.clone(),
                 text: text.clone(),
+            }),
+            Inline::TextBox { raw, blocks } => out.push(Inline::TextBox {
+                raw: raw.clone(),
+                blocks: blocks.clone(),
             }),
             Inline::Raw(s) => out.push(Inline::Raw(s.clone())),
         }
@@ -1144,6 +1175,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
                 | Inline::Equation { .. }
+                | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
@@ -1216,6 +1248,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
                 | Inline::Equation { .. }
+                | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
                 }
@@ -1286,7 +1319,10 @@ fn range_all_have(
                 }
             }
             Inline::Tab | Inline::Break(_) => pos += 1,
-            Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_) => {} // zero-length
+            Inline::SmartArt { .. }
+            | Inline::Equation { .. }
+            | Inline::TextBox { .. }
+            | Inline::Raw(_) => {} // zero-length
         }
     }
     saw
@@ -1378,9 +1414,10 @@ fn set_prop_range(
                 pos += 1;
             }
             // zero-length, unchanged
-            inline @ (Inline::SmartArt { .. } | Inline::Equation { .. } | Inline::Raw(_)) => {
-                out.push(inline)
-            }
+            inline @ (Inline::SmartArt { .. }
+            | Inline::Equation { .. }
+            | Inline::TextBox { .. }
+            | Inline::Raw(_)) => out.push(inline),
         }
     }
     *content = out;
@@ -1413,6 +1450,38 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn caret_enters_and_edits_a_text_box() {
+        // A host paragraph carrying a text box whose content is "hi".
+        let host = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![Inline::TextBox {
+                raw: "<w:r><w:pict><w:txbxContent><w:p/></w:txbxContent></w:pict></w:r>"
+                    .to_string(),
+                blocks: vec![para("hi")],
+            }],
+        });
+        let mut ed = Editor::new(Document { body: vec![host] });
+        // Navigation reaches the text box paragraph (path [0, 0, 0]).
+        let paths = all_paragraph_paths(&ed.doc.body);
+        assert!(
+            paths.contains(&vec![0, 0, 0]),
+            "text box not navigable: {paths:?}"
+        );
+        // Place the caret inside the box and type.
+        ed.caret = Caret::at(vec![0, 0, 0], 2);
+        ed.insert_char('!');
+        // The edit lands in the text box's content, not the host paragraph.
+        if let Block::Paragraph(p) = &ed.doc.body[0] {
+            match &p.content[0] {
+                Inline::TextBox { blocks, .. } => {
+                    assert_eq!(blocks[0].plain_text(), "hi!");
+                }
+                other => panic!("expected TextBox, got {other:?}"),
+            }
+        }
     }
 
     #[test]

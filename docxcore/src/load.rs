@@ -295,6 +295,13 @@ fn extract_diagram_text(xml: &str) -> Vec<String> {
 /// text, a SmartArt diagram becomes a `SmartArt` box, otherwise the run is
 /// preserved verbatim as `Raw`.
 fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
+    // A text box / shape with text: model its content so the caret can enter it.
+    if raw.contains("txbxContent") {
+        let blocks = parse_textbox_blocks(&raw);
+        if !blocks.is_empty() {
+            return Inline::TextBox { raw, blocks };
+        }
+    }
     // Legacy equation: the OLE object's r:id points at an `Equation.3` we decoded.
     if let Some(i) = raw.find("OLEObject") {
         if let Some(id) = raw_attr(&raw[i..], ":id=\"") {

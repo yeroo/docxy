@@ -333,6 +333,23 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.last_mut().unwrap().push(plain_cell(ch));
                 }
             }
+            // A text box: lay its text out on its own lines.
+            Inline::TextBox { blocks, .. } => {
+                for line in blocks.iter().flat_map(|b| {
+                    b.plain_text()
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                }) {
+                    if !segs.last().map(|s| s.is_empty()).unwrap_or(true) {
+                        segs.push(Vec::new());
+                    }
+                    for ch in line.chars() {
+                        segs.last_mut().unwrap().push(plain_cell(ch));
+                    }
+                    segs.push(Vec::new());
+                }
+            }
             Inline::Raw(_) => {}
         }
     }

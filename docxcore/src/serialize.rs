@@ -207,6 +207,19 @@ fn write_inline(s: &mut String, item: &Inline) {
         }
         Inline::SmartArt { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
+        Inline::TextBox { raw, blocks } => {
+            // Splice the (possibly edited) content back into the shape's
+            // `txbxContent`, preserving the surrounding VML/drawing markup.
+            const OPEN: &str = "<w:txbxContent>";
+            match (raw.find(OPEN), raw.find("</w:txbxContent>")) {
+                (Some(a), Some(b)) if a + OPEN.len() <= b => {
+                    s.push_str(&raw[..a + OPEN.len()]);
+                    s.push_str(&blocks_to_xml(blocks));
+                    s.push_str(&raw[b..]);
+                }
+                _ => s.push_str(raw),
+            }
+        }
         Inline::Raw(raw) => s.push_str(raw),
     }
 }
@@ -443,6 +456,43 @@ mod tests {
             body: vec![para(pp, vec![run("x", RunProps::default())])],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn text_box_splices_edited_content_into_shape() {
+        // Edited box content replaces the original txbxContent while the
+        // surrounding shape XML is preserved verbatim.
+        let raw = "<w:r><w:pict><v:shape><v:textbox><w:txbxContent>\
+                   <w:p><w:r><w:t>old</w:t></w:r></w:p>\
+                   </w:txbxContent></v:textbox></v:shape></w:pict></w:r>";
+        let tb = Inline::TextBox {
+            raw: raw.to_string(),
+            blocks: vec![para(
+                ParProps::default(),
+                vec![run("new text", RunProps::default())],
+            )],
+        };
+        let d = Document {
+            body: vec![para(ParProps::default(), vec![tb])],
+        };
+        let xml = document_to_xml(&d);
+        assert!(xml.contains("new text"), "edited content missing:\n{xml}");
+        assert!(!xml.contains(">old<"), "stale content kept:\n{xml}");
+        assert!(
+            xml.contains("<v:shape><v:textbox>") && xml.contains("</v:shape>"),
+            "shape markup not preserved:\n{xml}"
+        );
+        // And it reloads as a text box again.
+        let back = roundtrip(&d, &Relationships::default());
+        match &back.body[0] {
+            Block::Paragraph(p) => match &p.content[0] {
+                Inline::TextBox { blocks, .. } => {
+                    assert_eq!(blocks[0].plain_text(), "new text")
+                }
+                other => panic!("expected TextBox, got {other:?}"),
+            },
+            _ => panic!("expected paragraph"),
+        }
     }
 
     #[test]

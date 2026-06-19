@@ -94,6 +94,14 @@ pub enum Inline {
         raw: String,
         text: String,
     },
+    /// A text box / shape with text (`<w:txbxContent>`). `blocks` is its editable
+    /// content (addressable by path, so the caret can enter it); `raw` is the
+    /// original run XML, whose `txbxContent` is replaced with the serialized
+    /// `blocks` on save so the surrounding shape is preserved.
+    TextBox {
+        raw: String,
+        blocks: Vec<Block>,
+    },
     /// Verbatim XML for inline content we don't model (images/fields/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
@@ -109,6 +117,11 @@ impl Inline {
             Inline::Break(_) => "\n".to_string(),
             Inline::SmartArt { text, .. } => text.join("\n"),
             Inline::Equation { text, .. } => text.clone(),
+            Inline::TextBox { blocks, .. } => blocks
+                .iter()
+                .map(|b| b.plain_text())
+                .collect::<Vec<_>>()
+                .join("\n"),
             Inline::Raw(_) => String::new(),
         }
     }

@@ -597,7 +597,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             }
             Inline::Tab | Inline::Break(_) => break,
             Inline::Equation { text, .. } => w += text.chars().count(),
-            Inline::SmartArt { .. } | Inline::Raw(_) => {}
+            Inline::SmartArt { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
         }
     }
     w
@@ -815,7 +815,8 @@ fn flatten_para(
                     });
                 }
             }
-            Inline::SmartArt { .. } => {}
+            // Rendered as a box after the paragraph, not in the inline flow.
+            Inline::SmartArt { .. } | Inline::TextBox { .. } => {}
         }
     }
     if inv {
@@ -1051,24 +1052,23 @@ fn render_paragraph(
     }
     // Drawings (images) inside the paragraph become a sized placeholder box,
     // emitted after the paragraph text. (Real pixels are overlaid by the app.)
-    for item in &para.content {
+    for (idx, item) in para.content.iter().enumerate() {
         // A SmartArt diagram: the shapes can't be drawn in a terminal, so show the
-        // diagram's node text in a labeled box.
+        // diagram's node text in a labeled (non-editable) box.
         if let Inline::SmartArt { text, .. } = item {
             let blocks = smartart_blocks(text);
-            out.extend(text_box(&blocks, width, opts));
+            out.extend(text_box(&blocks, None, width, opts, images));
+            continue;
+        }
+        // A text box: its content is editable, addressed by the host paragraph's
+        // path plus this inline index, so the box's text is selectable.
+        if let Inline::TextBox { blocks, .. } = item {
+            let mut base = path.to_vec();
+            base.push(idx);
+            out.extend(text_box(blocks, Some(&base), width, opts, images));
             continue;
         }
         if let Inline::Raw(raw) = item {
-            // A text box (`<w:txbxContent>` inside a drawing/VML shape): render its
-            // text in a box rather than treating the shape as opaque/an image.
-            if raw.contains("txbxContent") {
-                let blocks = crate::load::parse_textbox_blocks(raw);
-                if !blocks.is_empty() {
-                    out.extend(text_box(&blocks, width, opts));
-                    continue;
-                }
-            }
             // Small inline pictures (equations) were already placed in the text
             // flow above; only larger images get their own block box here.
             if inline_image(raw).is_some() {
@@ -1219,9 +1219,20 @@ fn smartart_blocks(text: &[String]) -> Vec<Block> {
     blocks
 }
 
-fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, LineMap)> {
+/// Render `blocks` inside a dim border. When `base` is `Some`, the content keeps
+/// its caret map (rebased to that path prefix and shifted right past the `│ `
+/// frame) so the box's text is editable/selectable; `None` makes it display-only
+/// (e.g. a SmartArt caption, whose paragraphs aren't part of the model).
+fn text_box(
+    blocks: &[Block],
+    base: Option<&[usize]>,
+    width: usize,
+    opts: &RenderOptions,
+    images: &mut Vec<ImageBox>,
+) -> Vec<(Line, LineMap)> {
+    const FRAME: usize = 2; // the leading "│ "
     let inner = width.saturating_sub(4).max(8);
-    let content = render_blocks(blocks, &[], inner, opts, &mut Vec::new());
+    let content = render_blocks(blocks, base.unwrap_or(&[]), inner, opts, images);
     let mut out = Vec::new();
     out.push((
         Line {
@@ -1229,12 +1240,21 @@ fn text_box(blocks: &[Block], width: usize, opts: &RenderOptions) -> Vec<(Line, 
         },
         LineMap::default(),
     ));
-    for (ln, _) in content {
+    for (ln, mut map) in content {
         let pad = inner.saturating_sub(ln.width());
         let mut spans = vec![Line::dim_span("│ ".to_string())];
         spans.extend(ln.spans);
         spans.push(Line::dim_span(format!("{} │", " ".repeat(pad))));
-        out.push((Line { spans }, LineMap::default()));
+        // Keep the content editable only for a real (modeled) text box.
+        let map = if base.is_some() {
+            for seg in &mut map.segs {
+                seg.col0 += FRAME;
+            }
+            map
+        } else {
+            LineMap::default()
+        };
+        out.push((Line { spans }, map));
     }
     out.push((
         Line {
@@ -2367,23 +2387,35 @@ mod tests {
     }
 
     #[test]
-    fn text_box_content_renders() {
+    fn text_box_content_renders_and_is_editable() {
         let raw = "<w:r><w:pict><v:shape><v:textbox><w:txbxContent>\
-                   <w:p><w:r><w:t>boxed text</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>";
-        let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let joined: String = render(&d, &opts(40))
+                   <w:p><w:r><w:t>boxed text</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
+            .to_string();
+        let tb = Inline::TextBox {
+            raw,
+            blocks: vec![para(vec![run("boxed text", RunProps::default())])],
+        };
+        let d = doc(vec![para(vec![tb])]);
+        let (lines, maps, _i) = render_with_images(&d, &opts(40));
+        let joined: String = lines
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            joined.contains("boxed text"),
-            "text box text missing:\n{joined}"
-        );
+        assert!(joined.contains("boxed text"), "text missing:\n{joined}");
         assert!(
             joined.contains('┌') && joined.contains('└'),
-            "no box frame:\n{joined}"
+            "no frame:\n{joined}"
         );
+        // The box's text line carries an editable segment whose path descends into
+        // the text box: [host paragraph 0, inline 0, inner paragraph 0].
+        let seg = lines
+            .iter()
+            .zip(maps.iter())
+            .find(|(l, _)| l.plain().contains("boxed text"))
+            .and_then(|(_, m)| m.segs.first())
+            .expect("an editable segment for the box text");
+        assert_eq!(seg.path, vec![0, 0, 0]);
     }
 
     #[test]
