@@ -1,0 +1,3141 @@
+{
+  "root": "files",
+  "count": 248,
+  "categories": {
+    "Empty": 1,
+    "MiscNode": 1,
+    "Normalize": 16,
+    "ParaPr": 5,
+    "SDT": 19,
+    "TextRun": 3,
+    "Toc": 1,
+    "bookmark": 4,
+    "bullet": 5,
+    "chart": 12,
+    "columns": 2,
+    "comment": 6,
+    "complexDocx": 6,
+    "content control": 3,
+    "cover page": 4,
+    "equation": 2,
+    "field": 5,
+    "footer & header": 11,
+    "footnote & endnote": 6,
+    "format": 3,
+    "hyperlink": 13,
+    "hyperlink for splitPara": 5,
+    "misc": 2,
+    "mixed features": 3,
+    "mixed languages": 1,
+    "numbering": 4,
+    "object": 1,
+    "ole": 1,
+    "page layout": 26,
+    "paragraph": 10,
+    "picture": 4,
+    "protected": 4,
+    "revision": 1,
+    "run": 3,
+    "runstyle": 1,
+    "section break": 2,
+    "smart art": 2,
+    "smart tag": 1,
+    "smart tag for splitPara": 4,
+    "style": 6,
+    "table": 18,
+    "template": 1,
+    "textbox": 2,
+    "track change": 1,
+    "unable to normalized": 2,
+    "watermark": 15
+  },
+  "tags": {
+    "custom-xml": {
+      "count": 47,
+      "doc": "Custom XML data parts"
+    },
+    "tables": {
+      "count": 47,
+      "doc": "Tables"
+    },
+    "headers-footers": {
+      "count": 46,
+      "doc": "Headers and/or footers"
+    },
+    "images": {
+      "count": 42,
+      "doc": "Embedded raster images"
+    },
+    "numbering-part": {
+      "count": 35,
+      "doc": "numbering.xml present"
+    },
+    "drawing": {
+      "count": 32,
+      "doc": "DrawingML graphics (w:drawing)"
+    },
+    "vml": {
+      "count": 32,
+      "doc": "Legacy VML shapes (v:shape)"
+    },
+    "bookmarks": {
+      "count": 30,
+      "doc": "Bookmarks"
+    },
+    "lists": {
+      "count": 30,
+      "doc": "Numbered/bulleted lists (numPr)"
+    },
+    "hyperlinks": {
+      "count": 28,
+      "doc": "Hyperlinks"
+    },
+    "sdt": {
+      "count": 27,
+      "doc": "Content controls / structured document tags"
+    },
+    "section-breaks": {
+      "count": 26,
+      "doc": "Multiple section properties"
+    },
+    "ole": {
+      "count": 24,
+      "doc": "Embedded OLE objects"
+    },
+    "tracked-changes": {
+      "count": 22,
+      "doc": "Tracked insertions/deletions (w:ins / w:del)"
+    },
+    "shading": {
+      "count": 21,
+      "doc": "Paragraph/cell shading"
+    },
+    "smarttag": {
+      "count": 18,
+      "doc": "Smart tags (w:smartTag)"
+    },
+    "normalize-edge": {
+      "count": 16,
+      "doc": "Normalization edge case"
+    },
+    "fields": {
+      "count": 15,
+      "doc": "Field codes (fldChar / fldSimple)"
+    },
+    "comments": {
+      "count": 14,
+      "doc": "Review comments (commentReference / comments.xml)"
+    },
+    "chart": {
+      "count": 12,
+      "doc": "Charts"
+    },
+    "merged-cells": {
+      "count": 12,
+      "doc": "Tables with merged cells (gridSpan / vMerge)"
+    },
+    "title-page": {
+      "count": 12,
+      "doc": "Different first-page header/footer"
+    },
+    "multi-column": {
+      "count": 11,
+      "doc": "Multi-column section layout"
+    },
+    "partial": {
+      "count": 11,
+      "doc": "Partial / split content edge case"
+    },
+    "symbols": {
+      "count": 11,
+      "doc": "Symbol runs (w:sym)"
+    },
+    "wmf-emf": {
+      "count": 11,
+      "doc": "WMF/EMF vector images"
+    },
+    "footnotes": {
+      "count": 9,
+      "doc": "Footnotes"
+    },
+    "landscape": {
+      "count": 8,
+      "doc": "Landscape orientation"
+    },
+    "textbox": {
+      "count": 8,
+      "doc": "Text boxes (txbxContent)"
+    },
+    "watermark": {
+      "count": 8,
+      "doc": "Page watermark / background"
+    },
+    "toc": {
+      "count": 7,
+      "doc": "Table of contents field"
+    },
+    "rtl": {
+      "count": 6,
+      "doc": "Right-to-left / bidi text"
+    },
+    "endnotes": {
+      "count": 5,
+      "doc": "Endnotes"
+    },
+    "even-odd": {
+      "count": 5,
+      "doc": "Different odd/even headers/footers"
+    },
+    "page-borders": {
+      "count": 3,
+      "doc": "Page borders"
+    },
+    "bug-cannot-normalize": {
+      "count": 2,
+      "doc": "Known not-normalizable"
+    },
+    "bug-missing-id": {
+      "count": 2,
+      "doc": "Missing IDs (e.g. table row id)"
+    },
+    "encrypted": {
+      "count": 2,
+      "doc": "Password-encrypted (cannot open)"
+    },
+    "smartart": {
+      "count": 2,
+      "doc": "SmartArt diagrams"
+    },
+    "bug-conflicting-id": {
+      "count": 1,
+      "doc": "Conflicting IDs"
+    },
+    "empty": {
+      "count": 1,
+      "doc": "Essentially empty document"
+    },
+    "math": {
+      "count": 1,
+      "doc": "Equations / OMML math (m:oMath)"
+    },
+    "protected": {
+      "count": 1,
+      "doc": "Editing-protected document"
+    },
+    "write-protected": {
+      "count": 1,
+      "doc": "Write-protected document"
+    }
+  },
+  "files": [
+    {
+      "name": "empty.docx",
+      "path": "files/Empty/empty.docx",
+      "folder": "Empty",
+      "category": "Empty",
+      "tags": [
+        "empty"
+      ],
+      "size": 9668
+    },
+    {
+      "name": "WithMiscNodes.docx",
+      "path": "files/MiscNode/WithMiscNodes.docx",
+      "folder": "MiscNode",
+      "category": "MiscNode",
+      "tags": [
+        "merged-cells",
+        "smarttag",
+        "tables"
+      ],
+      "size": 11937
+    },
+    {
+      "name": "bookmark between two paragraphs.docx",
+      "path": "files/Normalize/bookmark between two paragraphs.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bookmarks",
+        "normalize-edge"
+      ],
+      "size": 10216
+    },
+    {
+      "name": "comment.docx",
+      "path": "files/Normalize/comment.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "comments",
+        "custom-xml",
+        "normalize-edge"
+      ],
+      "size": 12392
+    },
+    {
+      "name": "complex0.docx",
+      "path": "files/Normalize/complex0.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bookmarks",
+        "comments",
+        "drawing",
+        "fields",
+        "headers-footers",
+        "images",
+        "merged-cells",
+        "multi-column",
+        "normalize-edge",
+        "ole",
+        "section-breaks",
+        "shading",
+        "symbols",
+        "tables",
+        "title-page",
+        "toc",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 220153
+    },
+    {
+      "name": "conflicting IDs.docx",
+      "path": "files/Normalize/conflicting IDs.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bug-conflicting-id",
+        "normalize-edge",
+        "tables"
+      ],
+      "size": 8748
+    },
+    {
+      "name": "header&footer.docx",
+      "path": "files/Normalize/header&footer.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "headers-footers",
+        "normalize-edge"
+      ],
+      "size": 12491
+    },
+    {
+      "name": "lastRenderedPageBreak+run.docx",
+      "path": "files/Normalize/lastRenderedPageBreak+run.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "normalize-edge"
+      ],
+      "size": 10663
+    },
+    {
+      "name": "miss table-row_id.docx",
+      "path": "files/Normalize/miss table-row_id.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bug-missing-id",
+        "normalize-edge",
+        "tables"
+      ],
+      "size": 8868
+    },
+    {
+      "name": "normalized.docx",
+      "path": "files/Normalize/normalized.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bookmarks",
+        "custom-xml",
+        "fields",
+        "hyperlinks",
+        "normalize-edge",
+        "toc",
+        "tracked-changes"
+      ],
+      "size": 13196
+    },
+    {
+      "name": "object+text+pict.docx",
+      "path": "files/Normalize/object+text+pict.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "images",
+        "normalize-edge",
+        "ole",
+        "vml"
+      ],
+      "size": 13355
+    },
+    {
+      "name": "p in sdt.docx",
+      "path": "files/Normalize/p in sdt.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "custom-xml",
+        "fields",
+        "normalize-edge",
+        "rtl",
+        "sdt",
+        "tracked-changes"
+      ],
+      "size": 13159
+    },
+    {
+      "name": "partially miss table row ID.docx",
+      "path": "files/Normalize/partially miss table row ID.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "bug-missing-id",
+        "normalize-edge",
+        "partial",
+        "tables"
+      ],
+      "size": 10543
+    },
+    {
+      "name": "pict+pict.docx",
+      "path": "files/Normalize/pict+pict.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "normalize-edge",
+        "vml"
+      ],
+      "size": 8731
+    },
+    {
+      "name": "sdsd.docx",
+      "path": "files/Normalize/sdsd.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "normalize-edge",
+        "symbols"
+      ],
+      "size": 8370
+    },
+    {
+      "name": "sym+sym.docx",
+      "path": "files/Normalize/sym+sym.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "normalize-edge",
+        "symbols"
+      ],
+      "size": 8467
+    },
+    {
+      "name": "t+t.docx",
+      "path": "files/Normalize/t+t.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "custom-xml",
+        "normalize-edge"
+      ],
+      "size": 9663
+    },
+    {
+      "name": "text+sym.docx",
+      "path": "files/Normalize/text+sym.docx",
+      "folder": "Normalize",
+      "category": "Normalize",
+      "tags": [
+        "normalize-edge",
+        "symbols"
+      ],
+      "size": 8480
+    },
+    {
+      "name": "outlineLvl.docx",
+      "path": "files/ParaPr/outlineLvl.docx",
+      "folder": "ParaPr",
+      "category": "ParaPr",
+      "tags": [],
+      "size": 11724
+    },
+    {
+      "name": "parabidi.docx",
+      "path": "files/ParaPr/parabidi.docx",
+      "folder": "ParaPr",
+      "category": "ParaPr",
+      "tags": [
+        "rtl"
+      ],
+      "size": 8799
+    },
+    {
+      "name": "paraind.docx",
+      "path": "files/ParaPr/paraind.docx",
+      "folder": "ParaPr",
+      "category": "ParaPr",
+      "tags": [],
+      "size": 8901
+    },
+    {
+      "name": "parashading.docx",
+      "path": "files/ParaPr/parashading.docx",
+      "folder": "ParaPr",
+      "category": "ParaPr",
+      "tags": [
+        "shading"
+      ],
+      "size": 8874
+    },
+    {
+      "name": "paraspace.docx",
+      "path": "files/ParaPr/paraspace.docx",
+      "folder": "ParaPr",
+      "category": "ParaPr",
+      "tags": [],
+      "size": 8973
+    },
+    {
+      "name": "SDT.docx",
+      "path": "files/SDT/SDT.docx",
+      "folder": "SDT",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13576
+    },
+    {
+      "name": "sdtContent.docx",
+      "path": "files/SDT/sdtContent.docx",
+      "folder": "SDT",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 16516
+    },
+    {
+      "name": "SDT Block.docx",
+      "path": "files/SDT/Sdt/SDT Block.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 16516
+    },
+    {
+      "name": "SDT Run.docx",
+      "path": "files/SDT/Sdt/SDT Run.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13576
+    },
+    {
+      "name": "sdtBlock.docx",
+      "path": "files/SDT/Sdt/sdtBlock.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 15342
+    },
+    {
+      "name": "sdtCell.docx",
+      "path": "files/SDT/Sdt/sdtCell.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "tables"
+      ],
+      "size": 15020
+    },
+    {
+      "name": "sdtContent.docx",
+      "path": "files/SDT/Sdt/sdtContent.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "drawing",
+        "images",
+        "sdt",
+        "tables"
+      ],
+      "size": 126317
+    },
+    {
+      "name": "sdtDataBinding.docx",
+      "path": "files/SDT/Sdt/sdtDataBinding.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13601
+    },
+    {
+      "name": "sdtRow.docx",
+      "path": "files/SDT/Sdt/sdtRow.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt",
+        "tables"
+      ],
+      "size": 13994
+    },
+    {
+      "name": "sdtRun.docx",
+      "path": "files/SDT/Sdt/sdtRun.docx",
+      "folder": "SDT/Sdt",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13592
+    },
+    {
+      "name": "SDT Block.docx",
+      "path": "files/SDT/SdtBlock/SDT Block.docx",
+      "folder": "SDT/SdtBlock",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 16516
+    },
+    {
+      "name": "sdtBlock.docx",
+      "path": "files/SDT/SdtBlock/sdtBlock.docx",
+      "folder": "SDT/SdtBlock",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 15342
+    },
+    {
+      "name": "sdtContent.docx",
+      "path": "files/SDT/SdtBlock/sdtContent.docx",
+      "folder": "SDT/SdtBlock",
+      "category": "SDT",
+      "tags": [
+        "drawing",
+        "images",
+        "sdt",
+        "tables"
+      ],
+      "size": 126317
+    },
+    {
+      "name": "sdtDataBinding.docx",
+      "path": "files/SDT/SdtBlock/sdtDataBinding.docx",
+      "folder": "SDT/SdtBlock",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13601
+    },
+    {
+      "name": "sdtCell.docx",
+      "path": "files/SDT/SdtCell/sdtCell.docx",
+      "folder": "SDT/SdtCell",
+      "category": "SDT",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "tables"
+      ],
+      "size": 15020
+    },
+    {
+      "name": "sdtContent.docx",
+      "path": "files/SDT/SdtCell/sdtContent.docx",
+      "folder": "SDT/SdtCell",
+      "category": "SDT",
+      "tags": [
+        "drawing",
+        "images",
+        "sdt",
+        "tables"
+      ],
+      "size": 126317
+    },
+    {
+      "name": "SDT Run.docx",
+      "path": "files/SDT/SdtRun/SDT Run.docx",
+      "folder": "SDT/SdtRun",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13576
+    },
+    {
+      "name": "sdtContent.docx",
+      "path": "files/SDT/SdtRun/sdtContent.docx",
+      "folder": "SDT/SdtRun",
+      "category": "SDT",
+      "tags": [
+        "drawing",
+        "images",
+        "sdt",
+        "tables"
+      ],
+      "size": 126317
+    },
+    {
+      "name": "sdtRun.docx",
+      "path": "files/SDT/SdtRun/sdtRun.docx",
+      "folder": "SDT/SdtRun",
+      "category": "SDT",
+      "tags": [
+        "sdt"
+      ],
+      "size": 13592
+    },
+    {
+      "name": "lastRenderedPageBreak.docx",
+      "path": "files/TextRun/lastRenderedPageBreak.docx",
+      "folder": "TextRun",
+      "category": "TextRun",
+      "tags": [],
+      "size": 10663
+    },
+    {
+      "name": "mixed-run.docx",
+      "path": "files/TextRun/mixed-run.docx",
+      "folder": "TextRun",
+      "category": "TextRun",
+      "tags": [
+        "images",
+        "ole",
+        "vml"
+      ],
+      "size": 13355
+    },
+    {
+      "name": "test.docx",
+      "path": "files/TextRun/test.docx",
+      "folder": "TextRun",
+      "category": "TextRun",
+      "tags": [
+        "shading"
+      ],
+      "size": 11228
+    },
+    {
+      "name": "TOC2.docx",
+      "path": "files/Toc/TOC2.docx",
+      "folder": "Toc",
+      "category": "Toc",
+      "tags": [
+        "bookmarks",
+        "custom-xml",
+        "fields",
+        "hyperlinks",
+        "toc",
+        "tracked-changes"
+      ],
+      "size": 13425
+    },
+    {
+      "name": "bookmark-p12.docx",
+      "path": "files/bookmark/bookmark-p12.docx",
+      "folder": "bookmark",
+      "category": "bookmark",
+      "tags": [
+        "bookmarks",
+        "custom-xml"
+      ],
+      "size": 12258
+    },
+    {
+      "name": "bookmark-pic.docx",
+      "path": "files/bookmark/bookmark-pic.docx",
+      "folder": "bookmark",
+      "category": "bookmark",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "images"
+      ],
+      "size": 16015
+    },
+    {
+      "name": "bookmark-whole text.docx",
+      "path": "files/bookmark/bookmark-whole text.docx",
+      "folder": "bookmark",
+      "category": "bookmark",
+      "tags": [
+        "bookmarks",
+        "custom-xml"
+      ],
+      "size": 12131
+    },
+    {
+      "name": "bookmark.docx",
+      "path": "files/bookmark/bookmark.docx",
+      "folder": "bookmark",
+      "category": "bookmark",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "even-odd",
+        "fields",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "numbering-part",
+        "section-breaks",
+        "smarttag",
+        "toc",
+        "tracked-changes"
+      ],
+      "size": 129880
+    },
+    {
+      "name": "bullet-complex.docx",
+      "path": "files/bullet/bullet-complex.docx",
+      "folder": "bullet",
+      "category": "bullet",
+      "tags": [
+        "custom-xml",
+        "headers-footers",
+        "images",
+        "lists",
+        "numbering-part",
+        "section-breaks"
+      ],
+      "size": 28831
+    },
+    {
+      "name": "bullet-picture.docx",
+      "path": "files/bullet/bullet-picture.docx",
+      "folder": "bullet",
+      "category": "bullet",
+      "tags": [
+        "images",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 17146
+    },
+    {
+      "name": "bullet-simple.docx",
+      "path": "files/bullet/bullet-simple.docx",
+      "folder": "bullet",
+      "category": "bullet",
+      "tags": [
+        "custom-xml",
+        "headers-footers",
+        "images",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 24535
+    },
+    {
+      "name": "bullet-simple1.docx",
+      "path": "files/bullet/bullet-simple1.docx",
+      "folder": "bullet",
+      "category": "bullet",
+      "tags": [
+        "images",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 19739
+    },
+    {
+      "name": "bullet-symbol.docx",
+      "path": "files/bullet/bullet-symbol.docx",
+      "folder": "bullet",
+      "category": "bullet",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 11890
+    },
+    {
+      "name": "chart-Area.docx",
+      "path": "files/chart/chart-Area.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18312
+    },
+    {
+      "name": "chart-Bubble.docx",
+      "path": "files/chart/chart-Bubble.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18439
+    },
+    {
+      "name": "chart-Column.docx",
+      "path": "files/chart/chart-Column.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18619
+    },
+    {
+      "name": "chart-Line.docx",
+      "path": "files/chart/chart-Line.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18299
+    },
+    {
+      "name": "chart-Pie.docx",
+      "path": "files/chart/chart-Pie.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18022
+    },
+    {
+      "name": "chart-Radar.docx",
+      "path": "files/chart/chart-Radar.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18330
+    },
+    {
+      "name": "chart-X-y.docx",
+      "path": "files/chart/chart-X-y.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 18115
+    },
+    {
+      "name": "chart.docx",
+      "path": "files/chart/chart.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 64810
+    },
+    {
+      "name": "chart1.docx",
+      "path": "files/chart/chart1.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "ole"
+      ],
+      "size": 64810
+    },
+    {
+      "name": "chart2.docx",
+      "path": "files/chart/chart2.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "multi-column",
+        "ole"
+      ],
+      "size": 65496
+    },
+    {
+      "name": "chart3.docx",
+      "path": "files/chart/chart3.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "drawing",
+        "multi-column",
+        "ole"
+      ],
+      "size": 66384
+    },
+    {
+      "name": "chart4.docx",
+      "path": "files/chart/chart4.docx",
+      "folder": "chart",
+      "category": "chart",
+      "tags": [
+        "chart",
+        "custom-xml",
+        "drawing",
+        "ole"
+      ],
+      "size": 66980
+    },
+    {
+      "name": "columns1.docx",
+      "path": "files/columns/columns1.docx",
+      "folder": "columns",
+      "category": "columns",
+      "tags": [
+        "multi-column",
+        "section-breaks"
+      ],
+      "size": 57733
+    },
+    {
+      "name": "columns2.docx",
+      "path": "files/columns/columns2.docx",
+      "folder": "columns",
+      "category": "columns",
+      "tags": [
+        "multi-column",
+        "smarttag"
+      ],
+      "size": 52053
+    },
+    {
+      "name": "1 Comment.docx",
+      "path": "files/comment/1 Comment.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments"
+      ],
+      "size": 11199
+    },
+    {
+      "name": "2 Comments.docx",
+      "path": "files/comment/2 Comments.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments",
+        "headers-footers"
+      ],
+      "size": 15372
+    },
+    {
+      "name": "Comment for comment.docx",
+      "path": "files/comment/Comment for comment.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments"
+      ],
+      "size": 11425
+    },
+    {
+      "name": "Comments with paragraph.docx",
+      "path": "files/comment/Comments with paragraph.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments"
+      ],
+      "size": 11404
+    },
+    {
+      "name": "Comments with table.docx",
+      "path": "files/comment/Comments with table.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments"
+      ],
+      "size": 11915
+    },
+    {
+      "name": "comments by another person.docx",
+      "path": "files/comment/comments by another person.docx",
+      "folder": "comment",
+      "category": "comment",
+      "tags": [
+        "comments",
+        "symbols"
+      ],
+      "size": 11709
+    },
+    {
+      "name": "complex table3.docx",
+      "path": "files/complexDocx/complex table3.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "fields",
+        "merged-cells",
+        "shading",
+        "tables",
+        "tracked-changes"
+      ],
+      "size": 12806
+    },
+    {
+      "name": "complex tables.docx",
+      "path": "files/complexDocx/complex tables.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "landscape",
+        "merged-cells",
+        "shading",
+        "tables",
+        "tracked-changes"
+      ],
+      "size": 13533
+    },
+    {
+      "name": "complex0.docx",
+      "path": "files/complexDocx/complex0.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "bookmarks",
+        "comments",
+        "drawing",
+        "fields",
+        "headers-footers",
+        "images",
+        "merged-cells",
+        "multi-column",
+        "ole",
+        "section-breaks",
+        "shading",
+        "symbols",
+        "tables",
+        "title-page",
+        "toc",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 215531
+    },
+    {
+      "name": "complexity - part 1.docx",
+      "path": "files/complexDocx/complexity - part 1.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "headers-footers",
+        "images",
+        "lists",
+        "numbering-part",
+        "tables",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 30487
+    },
+    {
+      "name": "complexity - part 2.docx",
+      "path": "files/complexDocx/complexity - part 2.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "headers-footers",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 25816
+    },
+    {
+      "name": "complexity.docx",
+      "path": "files/complexDocx/complexity.docx",
+      "folder": "complexDocx",
+      "category": "complexDocx",
+      "tags": [
+        "headers-footers",
+        "images",
+        "lists",
+        "numbering-part",
+        "tables",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 43336
+    },
+    {
+      "name": "SDT - Copy.docx",
+      "path": "files/content control/SDT - Copy.docx",
+      "folder": "content control",
+      "category": "content control",
+      "tags": [
+        "sdt"
+      ],
+      "size": 17802
+    },
+    {
+      "name": "SDT.docx",
+      "path": "files/content control/SDT.docx",
+      "folder": "content control",
+      "category": "content control",
+      "tags": [
+        "sdt"
+      ],
+      "size": 17763
+    },
+    {
+      "name": "sdtcontents.docx",
+      "path": "files/content control/sdtcontents.docx",
+      "folder": "content control",
+      "category": "content control",
+      "tags": [
+        "custom-xml",
+        "sdt"
+      ],
+      "size": 18693
+    },
+    {
+      "name": "coverpage1.docx",
+      "path": "files/cover page/coverpage1.docx",
+      "folder": "cover page",
+      "category": "cover page",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "shading",
+        "tables",
+        "title-page"
+      ],
+      "size": 20943
+    },
+    {
+      "name": "coverpage2.docx",
+      "path": "files/cover page/coverpage2.docx",
+      "folder": "cover page",
+      "category": "cover page",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "shading",
+        "tables",
+        "title-page"
+      ],
+      "size": 20851
+    },
+    {
+      "name": "coverpage3.docx",
+      "path": "files/cover page/coverpage3.docx",
+      "folder": "cover page",
+      "category": "cover page",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "shading",
+        "tables",
+        "textbox",
+        "title-page",
+        "vml"
+      ],
+      "size": 19917
+    },
+    {
+      "name": "covwepage4.docx",
+      "path": "files/cover page/covwepage4.docx",
+      "folder": "cover page",
+      "category": "cover page",
+      "tags": [
+        "custom-xml",
+        "sdt",
+        "section-breaks",
+        "textbox",
+        "title-page",
+        "vml"
+      ],
+      "size": 22467
+    },
+    {
+      "name": "equation-1.docx",
+      "path": "files/equation/equation-1.docx",
+      "folder": "equation",
+      "category": "equation",
+      "tags": [
+        "headers-footers",
+        "images",
+        "numbering-part",
+        "ole",
+        "symbols",
+        "tables",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 195799
+    },
+    {
+      "name": "equation.docx",
+      "path": "files/equation/equation.docx",
+      "folder": "equation",
+      "category": "equation",
+      "tags": [
+        "math",
+        "shading"
+      ],
+      "size": 12548
+    },
+    {
+      "name": "Field-Create date.docx",
+      "path": "files/field/Field-Create date.docx",
+      "folder": "field",
+      "category": "field",
+      "tags": [
+        "fields"
+      ],
+      "size": 10572
+    },
+    {
+      "name": "Field-more field.docx",
+      "path": "files/field/Field-more field.docx",
+      "folder": "field",
+      "category": "field",
+      "tags": [
+        "fields",
+        "tracked-changes"
+      ],
+      "size": 11243
+    },
+    {
+      "name": "Field-more field2.docx",
+      "path": "files/field/Field-more field2.docx",
+      "folder": "field",
+      "category": "field",
+      "tags": [
+        "fields",
+        "tracked-changes"
+      ],
+      "size": 11243
+    },
+    {
+      "name": "field.docx",
+      "path": "files/field/field.docx",
+      "folder": "field",
+      "category": "field",
+      "tags": [
+        "custom-xml",
+        "fields",
+        "tracked-changes"
+      ],
+      "size": 13386
+    },
+    {
+      "name": "simple-field.docx",
+      "path": "files/field/simple-field.docx",
+      "folder": "field",
+      "category": "field",
+      "tags": [
+        "fields"
+      ],
+      "size": 10610
+    },
+    {
+      "name": "40101 2004.Rules and Regulations of the Board of Regents.docx",
+      "path": "files/footer & header/40101 2004.Rules and Regulations of the Board of Regents.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "headers-footers",
+        "hyperlinks",
+        "lists",
+        "numbering-part",
+        "smarttag"
+      ],
+      "size": 19289
+    },
+    {
+      "name": "BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+      "path": "files/footer & header/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "bookmarks",
+        "even-odd",
+        "footnotes",
+        "headers-footers",
+        "hyperlinks",
+        "lists",
+        "numbering-part",
+        "section-breaks",
+        "shading",
+        "symbols",
+        "tables",
+        "title-page",
+        "tracked-changes"
+      ],
+      "size": 204742
+    },
+    {
+      "name": "Business Plan for a Startup Business_July.docx",
+      "path": "files/footer & header/Business Plan for a Startup Business_July.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "bookmarks",
+        "fields",
+        "headers-footers",
+        "hyperlinks",
+        "merged-cells",
+        "numbering-part",
+        "smarttag",
+        "tables",
+        "toc",
+        "tracked-changes"
+      ],
+      "size": 51215
+    },
+    {
+      "name": "Outreach_Toolkit_2007_After_the_Flood_Fact_Sheet[1].docx",
+      "path": "files/footer & header/Outreach_Toolkit_2007_After_the_Flood_Fact_Sheet[1].docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "multi-column",
+        "numbering-part",
+        "textbox",
+        "vml"
+      ],
+      "size": 143995
+    },
+    {
+      "name": "footer header - plaintext.docx",
+      "path": "files/footer & header/footer header - plaintext.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 14201
+    },
+    {
+      "name": "footer header empty.docx",
+      "path": "files/footer & header/footer header empty.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [],
+      "size": 11620
+    },
+    {
+      "name": "footer header even.docx",
+      "path": "files/footer & header/footer header even.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "custom-xml",
+        "even-odd",
+        "headers-footers"
+      ],
+      "size": 20151
+    },
+    {
+      "name": "footer header-fisrt.docx",
+      "path": "files/footer & header/footer header-fisrt.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "headers-footers",
+        "title-page"
+      ],
+      "size": 20176
+    },
+    {
+      "name": "footer header-odd.docx",
+      "path": "files/footer & header/footer header-odd.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [
+        "custom-xml",
+        "even-odd",
+        "headers-footers",
+        "textbox",
+        "vml"
+      ],
+      "size": 25128
+    },
+    {
+      "name": "footer header.docx",
+      "path": "files/footer & header/footer header.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [],
+      "size": 10081
+    },
+    {
+      "name": "no footer header.docx",
+      "path": "files/footer & header/no footer header.docx",
+      "folder": "footer & header",
+      "category": "footer & header",
+      "tags": [],
+      "size": 10097
+    },
+    {
+      "name": "endnote at end of section and restart for each section.docx",
+      "path": "files/footnote & endnote/endnote at end of section and restart for each section.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "endnotes"
+      ],
+      "size": 13847
+    },
+    {
+      "name": "endnote.docx",
+      "path": "files/footnote & endnote/endnote.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "endnotes"
+      ],
+      "size": 13942
+    },
+    {
+      "name": "footnote at bottom of paget and resart for each page.docx",
+      "path": "files/footnote & endnote/footnote at bottom of paget and resart for each page.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "footnotes"
+      ],
+      "size": 13781
+    },
+    {
+      "name": "footnote below text and resart for each section.docx",
+      "path": "files/footnote & endnote/footnote below text and resart for each section.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "footnotes"
+      ],
+      "size": 13769
+    },
+    {
+      "name": "footnote.docx",
+      "path": "files/footnote & endnote/footnote.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "footnotes"
+      ],
+      "size": 13768
+    },
+    {
+      "name": "ftEdNote.docx",
+      "path": "files/footnote & endnote/ftEdNote.docx",
+      "folder": "footnote & endnote",
+      "category": "footnote & endnote",
+      "tags": [
+        "custom-xml",
+        "endnotes",
+        "footnotes"
+      ],
+      "size": 13322
+    },
+    {
+      "name": "format-font1.docx",
+      "path": "files/format/format-font1.docx",
+      "folder": "format",
+      "category": "format",
+      "tags": [
+        "shading"
+      ],
+      "size": 11228
+    },
+    {
+      "name": "format-font2.docx",
+      "path": "files/format/format-font2.docx",
+      "folder": "format",
+      "category": "format",
+      "tags": [],
+      "size": 11503
+    },
+    {
+      "name": "format-paragrapsimple.docx",
+      "path": "files/format/format-paragrapsimple.docx",
+      "folder": "format",
+      "category": "format",
+      "tags": [
+        "shading"
+      ],
+      "size": 11392
+    },
+    {
+      "name": "632399205748969391 Moon Tregillus.docx",
+      "path": "files/hyperlink/632399205748969391 Moon Tregillus.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "hyperlinks",
+        "images",
+        "lists",
+        "numbering-part",
+        "smarttag",
+        "vml",
+        "watermark"
+      ],
+      "size": 46112
+    },
+    {
+      "name": "632399964516872542 1.docx",
+      "path": "files/hyperlink/632399964516872542 1.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "landscape",
+        "lists",
+        "merged-cells",
+        "numbering-part",
+        "section-breaks",
+        "smarttag",
+        "tables",
+        "title-page",
+        "tracked-changes",
+        "wmf-emf"
+      ],
+      "size": 154031
+    },
+    {
+      "name": "632404333468899776 PFVI_Nutrition.docx",
+      "path": "files/hyperlink/632404333468899776 PFVI_Nutrition.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "ole",
+        "tables",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 74146
+    },
+    {
+      "name": "Hyperlink - external.docx",
+      "path": "files/hyperlink/Hyperlink - external.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 10755
+    },
+    {
+      "name": "Hyperlink - internal.docx",
+      "path": "files/hyperlink/Hyperlink - internal.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "lists",
+        "numbering-part",
+        "shading",
+        "vml"
+      ],
+      "size": 38113
+    },
+    {
+      "name": "Hyperlink - relative.docx",
+      "path": "files/hyperlink/Hyperlink - relative.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 10410
+    },
+    {
+      "name": "doclocation.docx",
+      "path": "files/hyperlink/doclocation.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "hyperlinks",
+        "rtl"
+      ],
+      "size": 10866
+    },
+    {
+      "name": "hyperlink-complex.docx",
+      "path": "files/hyperlink/hyperlink-complex.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "hyperlinks",
+        "rtl"
+      ],
+      "size": 9075
+    },
+    {
+      "name": "hyperlink-in shapes.docx",
+      "path": "files/hyperlink/hyperlink-in shapes.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "bookmarks",
+        "hyperlinks",
+        "textbox"
+      ],
+      "size": 10681
+    },
+    {
+      "name": "hyperlink-in table.docx",
+      "path": "files/hyperlink/hyperlink-in table.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks",
+        "tables"
+      ],
+      "size": 10792
+    },
+    {
+      "name": "hyperlink.docx",
+      "path": "files/hyperlink/hyperlink.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 11941
+    },
+    {
+      "name": "simple-hyper.docx",
+      "path": "files/hyperlink/simple-hyper.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 11655
+    },
+    {
+      "name": "test10.docx",
+      "path": "files/hyperlink/test10.docx",
+      "folder": "hyperlink",
+      "category": "hyperlink",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 10437
+    },
+    {
+      "name": "632404333468899776 PFVI_Nutrition.docx",
+      "path": "files/hyperlink for splitPara/632404333468899776 PFVI_Nutrition.docx",
+      "folder": "hyperlink for splitPara",
+      "category": "hyperlink for splitPara",
+      "tags": [
+        "bookmarks",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "ole",
+        "partial",
+        "tables",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 74146
+    },
+    {
+      "name": "Hyperlink - internal.docx",
+      "path": "files/hyperlink for splitPara/Hyperlink - internal.docx",
+      "folder": "hyperlink for splitPara",
+      "category": "hyperlink for splitPara",
+      "tags": [
+        "bookmarks",
+        "drawing",
+        "headers-footers",
+        "hyperlinks",
+        "images",
+        "lists",
+        "numbering-part",
+        "partial",
+        "shading",
+        "vml"
+      ],
+      "size": 38113
+    },
+    {
+      "name": "doclocation.docx",
+      "path": "files/hyperlink for splitPara/doclocation.docx",
+      "folder": "hyperlink for splitPara",
+      "category": "hyperlink for splitPara",
+      "tags": [
+        "bookmarks",
+        "hyperlinks",
+        "partial",
+        "rtl"
+      ],
+      "size": 10866
+    },
+    {
+      "name": "hyperlink.docx",
+      "path": "files/hyperlink for splitPara/hyperlink.docx",
+      "folder": "hyperlink for splitPara",
+      "category": "hyperlink for splitPara",
+      "tags": [
+        "hyperlinks",
+        "partial"
+      ],
+      "size": 11941
+    },
+    {
+      "name": "test10.docx",
+      "path": "files/hyperlink for splitPara/test10.docx",
+      "folder": "hyperlink for splitPara",
+      "category": "hyperlink for splitPara",
+      "tags": [
+        "hyperlinks",
+        "partial"
+      ],
+      "size": 10437
+    },
+    {
+      "name": "complex0.docx",
+      "path": "files/complex0.docx",
+      "folder": "",
+      "category": "misc",
+      "tags": [
+        "bookmarks",
+        "comments",
+        "drawing",
+        "fields",
+        "headers-footers",
+        "images",
+        "merged-cells",
+        "multi-column",
+        "ole",
+        "section-breaks",
+        "shading",
+        "symbols",
+        "tables",
+        "title-page",
+        "toc",
+        "tracked-changes",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 220153
+    },
+    {
+      "name": "test.docx",
+      "path": "files/test.docx",
+      "folder": "",
+      "category": "misc",
+      "tags": [],
+      "size": 11547
+    },
+    {
+      "name": "BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+      "path": "files/mixed features/BackgroundReport - THE WORKING GROUP ON INTERNET GOVERNANCE.docx",
+      "folder": "mixed features",
+      "category": "mixed features",
+      "tags": [
+        "bookmarks",
+        "even-odd",
+        "footnotes",
+        "headers-footers",
+        "hyperlinks",
+        "lists",
+        "numbering-part",
+        "section-breaks",
+        "shading",
+        "symbols",
+        "tables",
+        "title-page",
+        "tracked-changes"
+      ],
+      "size": 204742
+    },
+    {
+      "name": "MSDN - EULA.docx",
+      "path": "files/mixed features/MSDN - EULA.docx",
+      "folder": "mixed features",
+      "category": "mixed features",
+      "tags": [
+        "lists",
+        "numbering-part",
+        "smarttag"
+      ],
+      "size": 29141
+    },
+    {
+      "name": "webappdis.docx",
+      "path": "files/mixed features/webappdis.docx",
+      "folder": "mixed features",
+      "category": "mixed features",
+      "tags": [
+        "hyperlinks"
+      ],
+      "size": 18666
+    },
+    {
+      "name": "Unit1Translation.docx",
+      "path": "files/mixed languages/Unit1Translation.docx",
+      "folder": "mixed languages",
+      "category": "mixed languages",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 15107
+    },
+    {
+      "name": "numbering-list.docx",
+      "path": "files/numbering/numbering-list.docx",
+      "folder": "numbering",
+      "category": "numbering",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 12078
+    },
+    {
+      "name": "numbering-newformat.docx",
+      "path": "files/numbering/numbering-newformat.docx",
+      "folder": "numbering",
+      "category": "numbering",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 12135
+    },
+    {
+      "name": "numbering-simple.docx",
+      "path": "files/numbering/numbering-simple.docx",
+      "folder": "numbering",
+      "category": "numbering",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 11722
+    },
+    {
+      "name": "numbering-startValue.docx",
+      "path": "files/numbering/numbering-startValue.docx",
+      "folder": "numbering",
+      "category": "numbering",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 11825
+    },
+    {
+      "name": "object-chart.docx",
+      "path": "files/object/object-chart.docx",
+      "folder": "object",
+      "category": "object",
+      "tags": [
+        "images",
+        "ole",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 17514
+    },
+    {
+      "name": "ole.docx",
+      "path": "files/ole/ole.docx",
+      "folder": "ole",
+      "category": "ole",
+      "tags": [
+        "custom-xml",
+        "images",
+        "ole",
+        "vml",
+        "wmf-emf"
+      ],
+      "size": 20746
+    },
+    {
+      "name": "A4.docx",
+      "path": "files/page layout/page layout(big file)/A4.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [
+        "headers-footers",
+        "shading",
+        "smarttag"
+      ],
+      "size": 49495
+    },
+    {
+      "name": "A5.docx",
+      "path": "files/page layout/page layout(big file)/A5.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [],
+      "size": 11436
+    },
+    {
+      "name": "Indent_Spacing.Template.docx",
+      "path": "files/page layout/page layout(big file)/Indent_Spacing.Template.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [],
+      "size": 10316
+    },
+    {
+      "name": "Indent_Spacing.docx",
+      "path": "files/page layout/page layout(big file)/Indent_Spacing.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 20318
+    },
+    {
+      "name": "column2.docx",
+      "path": "files/page layout/page layout(big file)/column2.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [
+        "multi-column",
+        "smarttag"
+      ],
+      "size": 80512
+    },
+    {
+      "name": "landScape.docx",
+      "path": "files/page layout/page layout(big file)/landScape.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [
+        "images",
+        "landscape",
+        "numbering-part"
+      ],
+      "size": 14741
+    },
+    {
+      "name": "margin.docx",
+      "path": "files/page layout/page layout(big file)/margin.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [],
+      "size": 12119
+    },
+    {
+      "name": "pageBorders.docx",
+      "path": "files/page layout/page layout(big file)/pageBorders.docx",
+      "folder": "page layout/page layout(big file)",
+      "category": "page layout",
+      "tags": [
+        "page-borders",
+        "smarttag"
+      ],
+      "size": 15748
+    },
+    {
+      "name": "Columns-Right.docx",
+      "path": "files/page layout/pagelayout simple/Columns-Right.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [
+        "multi-column"
+      ],
+      "size": 10869
+    },
+    {
+      "name": "Line numbers-Continuous.docx",
+      "path": "files/page layout/pagelayout simple/Line numbers-Continuous.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [],
+      "size": 10923
+    },
+    {
+      "name": "Orientation-landscape.docx",
+      "path": "files/page layout/pagelayout simple/Orientation-landscape.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [
+        "landscape"
+      ],
+      "size": 10913
+    },
+    {
+      "name": "PageBorder-3D.docx",
+      "path": "files/page layout/pagelayout simple/PageBorder-3D.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [
+        "page-borders"
+      ],
+      "size": 10931
+    },
+    {
+      "name": "PageColor-lightgreen.docx",
+      "path": "files/page layout/pagelayout simple/PageColor-lightgreen.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [
+        "watermark"
+      ],
+      "size": 10914
+    },
+    {
+      "name": "Size-Tabloid.docx",
+      "path": "files/page layout/pagelayout simple/Size-Tabloid.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [],
+      "size": 10838
+    },
+    {
+      "name": "Themes-verve.docx",
+      "path": "files/page layout/pagelayout simple/Themes-verve.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [
+        "images"
+      ],
+      "size": 20228
+    },
+    {
+      "name": "margin-narrow.docx",
+      "path": "files/page layout/pagelayout simple/margin-narrow.docx",
+      "folder": "page layout/pagelayout simple",
+      "category": "page layout",
+      "tags": [],
+      "size": 10781
+    },
+    {
+      "name": "Columns-Right.docx",
+      "path": "files/page layout/pagelayout with break in the end/Columns-Right.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "custom-xml",
+        "multi-column",
+        "section-breaks"
+      ],
+      "size": 12269
+    },
+    {
+      "name": "Line numbers-Continuous.docx",
+      "path": "files/page layout/pagelayout with break in the end/Line numbers-Continuous.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "section-breaks"
+      ],
+      "size": 10983
+    },
+    {
+      "name": "Orientation-landscape.docx",
+      "path": "files/page layout/pagelayout with break in the end/Orientation-landscape.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "landscape",
+        "section-breaks"
+      ],
+      "size": 10994
+    },
+    {
+      "name": "PageBorder-3D.docx",
+      "path": "files/page layout/pagelayout with break in the end/PageBorder-3D.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "custom-xml",
+        "page-borders",
+        "section-breaks"
+      ],
+      "size": 12325
+    },
+    {
+      "name": "PageColor-lightgreen.docx",
+      "path": "files/page layout/pagelayout with break in the end/PageColor-lightgreen.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "section-breaks",
+        "watermark"
+      ],
+      "size": 10962
+    },
+    {
+      "name": "Size-Tabloid.docx",
+      "path": "files/page layout/pagelayout with break in the end/Size-Tabloid.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "section-breaks"
+      ],
+      "size": 10910
+    },
+    {
+      "name": "Themes-verve.docx",
+      "path": "files/page layout/pagelayout with break in the end/Themes-verve.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "images",
+        "section-breaks"
+      ],
+      "size": 20297
+    },
+    {
+      "name": "margin-narrow.docx",
+      "path": "files/page layout/pagelayout with break in the end/margin-narrow.docx",
+      "folder": "page layout/pagelayout with break in the end",
+      "category": "page layout",
+      "tags": [
+        "section-breaks"
+      ],
+      "size": 10869
+    },
+    {
+      "name": "text direction-2.docx",
+      "path": "files/page layout/text direction/text direction-2.docx",
+      "folder": "page layout/text direction",
+      "category": "page layout",
+      "tags": [
+        "custom-xml",
+        "landscape",
+        "section-breaks"
+      ],
+      "size": 12985
+    },
+    {
+      "name": "textdirection-1.docx",
+      "path": "files/page layout/text direction/textdirection-1.docx",
+      "folder": "page layout/text direction",
+      "category": "page layout",
+      "tags": [
+        "landscape",
+        "section-breaks"
+      ],
+      "size": 10892
+    },
+    {
+      "name": "AdjustRightInd.docx",
+      "path": "files/paragraph/AdjustRightInd.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 10624
+    },
+    {
+      "name": "AutoSpaceDE.docx",
+      "path": "files/paragraph/AutoSpaceDE.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [
+        "custom-xml"
+      ],
+      "size": 13005
+    },
+    {
+      "name": "Para.docx",
+      "path": "files/paragraph/Para.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 11760
+    },
+    {
+      "name": "Paragraph.docx",
+      "path": "files/paragraph/Paragraph.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [
+        "custom-xml",
+        "lists",
+        "numbering-part",
+        "section-breaks"
+      ],
+      "size": 12890
+    },
+    {
+      "name": "empty.docx",
+      "path": "files/paragraph/empty.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 10389
+    },
+    {
+      "name": "paragraph-alignment.docx",
+      "path": "files/paragraph/paragraph-alignment.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 11095
+    },
+    {
+      "name": "paragraph-line space.docx",
+      "path": "files/paragraph/paragraph-line space.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 11174
+    },
+    {
+      "name": "paragraph-space in ps.docx",
+      "path": "files/paragraph/paragraph-space in ps.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [],
+      "size": 10828
+    },
+    {
+      "name": "sectionBreak.docx",
+      "path": "files/paragraph/sectionBreak.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [
+        "bookmarks",
+        "custom-xml",
+        "section-breaks"
+      ],
+      "size": 14272
+    },
+    {
+      "name": "temp.docx",
+      "path": "files/paragraph/temp.docx",
+      "folder": "paragraph",
+      "category": "paragraph",
+      "tags": [
+        "bookmarks",
+        "custom-xml",
+        "rtl"
+      ],
+      "size": 11745
+    },
+    {
+      "name": "pic-1.docx",
+      "path": "files/picture/pic-1.docx",
+      "folder": "picture",
+      "category": "picture",
+      "tags": [
+        "drawing",
+        "images",
+        "landscape"
+      ],
+      "size": 207513
+    },
+    {
+      "name": "pic-3.docx",
+      "path": "files/picture/pic-3.docx",
+      "folder": "picture",
+      "category": "picture",
+      "tags": [
+        "drawing",
+        "images"
+      ],
+      "size": 31635
+    },
+    {
+      "name": "pic-4.docx",
+      "path": "files/picture/pic-4.docx",
+      "folder": "picture",
+      "category": "picture",
+      "tags": [
+        "drawing",
+        "images"
+      ],
+      "size": 28858
+    },
+    {
+      "name": "pic-5.docx",
+      "path": "files/picture/pic-5.docx",
+      "folder": "picture",
+      "category": "picture",
+      "tags": [
+        "drawing",
+        "images"
+      ],
+      "size": 31635
+    },
+    {
+      "name": "ReadOnly.docx",
+      "path": "files/protected/ReadOnly.docx",
+      "folder": "protected",
+      "category": "protected",
+      "tags": [],
+      "size": 10237
+    },
+    {
+      "name": "document with password.docx",
+      "path": "files/protected/document with password.docx",
+      "folder": "protected",
+      "category": "protected",
+      "tags": [
+        "encrypted"
+      ],
+      "size": 19968
+    },
+    {
+      "name": "partial protected.docx",
+      "path": "files/protected/partial protected.docx",
+      "folder": "protected",
+      "category": "protected",
+      "tags": [
+        "partial",
+        "protected"
+      ],
+      "size": 10571
+    },
+    {
+      "name": "write protected.docx",
+      "path": "files/protected/write protected.docx",
+      "folder": "protected",
+      "category": "protected",
+      "tags": [
+        "custom-xml",
+        "write-protected"
+      ],
+      "size": 11141
+    },
+    {
+      "name": "revision.docx",
+      "path": "files/revision/revision.docx",
+      "folder": "revision",
+      "category": "revision",
+      "tags": [
+        "lists",
+        "numbering-part"
+      ],
+      "size": 12192
+    },
+    {
+      "name": "lastRenderedPageBreak.docx",
+      "path": "files/run/lastRenderedPageBreak.docx",
+      "folder": "run",
+      "category": "run",
+      "tags": [],
+      "size": 10663
+    },
+    {
+      "name": "mixed-run.docx",
+      "path": "files/run/mixed-run.docx",
+      "folder": "run",
+      "category": "run",
+      "tags": [
+        "images",
+        "ole",
+        "vml"
+      ],
+      "size": 13355
+    },
+    {
+      "name": "test.docx",
+      "path": "files/run/test.docx",
+      "folder": "run",
+      "category": "run",
+      "tags": [
+        "shading"
+      ],
+      "size": 11228
+    },
+    {
+      "name": "mixed-run.docx",
+      "path": "files/runstyle/mixed-run.docx",
+      "folder": "runstyle",
+      "category": "runstyle",
+      "tags": [
+        "images",
+        "ole",
+        "vml"
+      ],
+      "size": 15327
+    },
+    {
+      "name": "paraWithSect.docx",
+      "path": "files/section break/paraWithSect.docx",
+      "folder": "section break",
+      "category": "section break",
+      "tags": [
+        "section-breaks"
+      ],
+      "size": 11517
+    },
+    {
+      "name": "sectionBreak.docx",
+      "path": "files/section break/sectionBreak.docx",
+      "folder": "section break",
+      "category": "section break",
+      "tags": [
+        "bookmarks",
+        "custom-xml",
+        "section-breaks"
+      ],
+      "size": 14272
+    },
+    {
+      "name": "SmartArt.docx",
+      "path": "files/smart art/SmartArt.docx",
+      "folder": "smart art",
+      "category": "smart art",
+      "tags": [
+        "custom-xml",
+        "drawing",
+        "smartart"
+      ],
+      "size": 43310
+    },
+    {
+      "name": "SmartArt1.docx",
+      "path": "files/smart art/SmartArt1.docx",
+      "folder": "smart art",
+      "category": "smart art",
+      "tags": [
+        "custom-xml",
+        "drawing",
+        "images",
+        "lists",
+        "numbering-part",
+        "smartart"
+      ],
+      "size": 165221
+    },
+    {
+      "name": "smartTag.docx",
+      "path": "files/smart tag/smartTag.docx",
+      "folder": "smart tag",
+      "category": "smart tag",
+      "tags": [
+        "custom-xml",
+        "smarttag"
+      ],
+      "size": 13171
+    },
+    {
+      "name": "smartTag 1run.docx",
+      "path": "files/smart tag for splitPara/smartTag 1run.docx",
+      "folder": "smart tag for splitPara",
+      "category": "smart tag for splitPara",
+      "tags": [
+        "custom-xml",
+        "partial",
+        "smarttag"
+      ],
+      "size": 11009
+    },
+    {
+      "name": "smartTag 3run.docx",
+      "path": "files/smart tag for splitPara/smartTag 3run.docx",
+      "folder": "smart tag for splitPara",
+      "category": "smart tag for splitPara",
+      "tags": [
+        "custom-xml",
+        "partial",
+        "smarttag"
+      ],
+      "size": 11036
+    },
+    {
+      "name": "smartTag Nesting 2 run.docx",
+      "path": "files/smart tag for splitPara/smartTag Nesting 2 run.docx",
+      "folder": "smart tag for splitPara",
+      "category": "smart tag for splitPara",
+      "tags": [
+        "custom-xml",
+        "partial",
+        "smarttag"
+      ],
+      "size": 11085
+    },
+    {
+      "name": "smartTag Nesting.docx",
+      "path": "files/smart tag for splitPara/smartTag Nesting.docx",
+      "folder": "smart tag for splitPara",
+      "category": "smart tag for splitPara",
+      "tags": [
+        "custom-xml",
+        "partial",
+        "smarttag"
+      ],
+      "size": 13171
+    },
+    {
+      "name": "1.docx",
+      "path": "files/style/1.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [
+        "bookmarks",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 17734
+    },
+    {
+      "name": "2.docx",
+      "path": "files/style/2.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [
+        "bookmarks",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 14355
+    },
+    {
+      "name": "style.docx",
+      "path": "files/style/style.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [],
+      "size": 21679
+    },
+    {
+      "name": "style1.docx",
+      "path": "files/style/style1.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [],
+      "size": 12929
+    },
+    {
+      "name": "style2.docx",
+      "path": "files/style/style2.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [
+        "bookmarks",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 17734
+    },
+    {
+      "name": "style3.docx",
+      "path": "files/style/style3.docx",
+      "folder": "style",
+      "category": "style",
+      "tags": [
+        "bookmarks",
+        "lists",
+        "numbering-part"
+      ],
+      "size": 14355
+    },
+    {
+      "name": "1.docx",
+      "path": "files/table/1.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "tables"
+      ],
+      "size": 10555
+    },
+    {
+      "name": "2003 Consumer Confidence Report.docx",
+      "path": "files/table/2003 Consumer Confidence Report.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "headers-footers",
+        "lists",
+        "merged-cells",
+        "numbering-part",
+        "section-breaks",
+        "shading",
+        "smarttag",
+        "tables",
+        "title-page",
+        "tracked-changes"
+      ],
+      "size": 34910
+    },
+    {
+      "name": "2006.docx",
+      "path": "files/table/2006.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "headers-footers",
+        "merged-cells",
+        "tables",
+        "textbox",
+        "tracked-changes",
+        "vml"
+      ],
+      "size": 18204
+    },
+    {
+      "name": "2007.docx",
+      "path": "files/table/2007.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "headers-footers",
+        "hyperlinks",
+        "merged-cells",
+        "section-breaks",
+        "shading",
+        "smarttag",
+        "tables",
+        "tracked-changes",
+        "vml"
+      ],
+      "size": 39106
+    },
+    {
+      "name": "Table with style.docx",
+      "path": "files/table/Table with style.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "tables"
+      ],
+      "size": 10850
+    },
+    {
+      "name": "complex table.docx",
+      "path": "files/table/complex table.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "tables"
+      ],
+      "size": 10880
+    },
+    {
+      "name": "table-One table cell .docx",
+      "path": "files/table/table-One table cell .docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "tables"
+      ],
+      "size": 10328
+    },
+    {
+      "name": "table-complex.docx",
+      "path": "files/table/table-complex.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "merged-cells",
+        "tables"
+      ],
+      "size": 10633
+    },
+    {
+      "name": "table.docx",
+      "path": "files/table/table.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "drawing",
+        "fields",
+        "images",
+        "lists",
+        "numbering-part",
+        "tables"
+      ],
+      "size": 118885
+    },
+    {
+      "name": "tableCell.docx",
+      "path": "files/table/tableCell.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "tables"
+      ],
+      "size": 11694
+    },
+    {
+      "name": "tableCell2Para.docx",
+      "path": "files/table/tableCell2Para.docx",
+      "folder": "table",
+      "category": "table",
+      "tags": [
+        "custom-xml",
+        "tables"
+      ],
+      "size": 14371
+    },
+    {
+      "name": "cellWithComment.docx",
+      "path": "files/table/TableComments/cellWithComment.docx",
+      "folder": "table/TableComments",
+      "category": "table",
+      "tags": [
+        "comments",
+        "tables"
+      ],
+      "size": 11678
+    },
+    {
+      "name": "column with comments.docx",
+      "path": "files/table/TableComments/column with comments.docx",
+      "folder": "table/TableComments",
+      "category": "table",
+      "tags": [
+        "comments",
+        "tables"
+      ],
+      "size": 11771
+    },
+    {
+      "name": "crossTableComment.docx",
+      "path": "files/table/TableComments/crossTableComment.docx",
+      "folder": "table/TableComments",
+      "category": "table",
+      "tags": [
+        "comments",
+        "tables"
+      ],
+      "size": 11732
+    },
+    {
+      "name": "rowWithComment.docx",
+      "path": "files/table/TableComments/rowWithComment.docx",
+      "folder": "table/TableComments",
+      "category": "table",
+      "tags": [
+        "comments",
+        "tables"
+      ],
+      "size": 11685
+    },
+    {
+      "name": "TableEdn.docx",
+      "path": "files/table/TableFntEdnt/TableEdn.docx",
+      "folder": "table/TableFntEdnt",
+      "category": "table",
+      "tags": [
+        "custom-xml",
+        "endnotes",
+        "footnotes",
+        "tables"
+      ],
+      "size": 13622
+    },
+    {
+      "name": "TableFnt.docx",
+      "path": "files/table/TableFntEdnt/TableFnt.docx",
+      "folder": "table/TableFntEdnt",
+      "category": "table",
+      "tags": [
+        "custom-xml",
+        "footnotes",
+        "tables"
+      ],
+      "size": 13335
+    },
+    {
+      "name": "TableFntEdnt.docx",
+      "path": "files/table/TableFntEdnt/TableFntEdnt.docx",
+      "folder": "table/TableFntEdnt",
+      "category": "table",
+      "tags": [
+        "custom-xml",
+        "endnotes",
+        "footnotes",
+        "tables"
+      ],
+      "size": 13698
+    },
+    {
+      "name": "Simple.docx",
+      "path": "files/template/Simple.docx",
+      "folder": "template",
+      "category": "template",
+      "tags": [],
+      "size": 10014
+    },
+    {
+      "name": "textBox-2.docx",
+      "path": "files/textbox/textBox-2.docx",
+      "folder": "textbox",
+      "category": "textbox",
+      "tags": [
+        "textbox",
+        "vml"
+      ],
+      "size": 11849
+    },
+    {
+      "name": "txtBox.docx",
+      "path": "files/textbox/txtBox.docx",
+      "folder": "textbox",
+      "category": "textbox",
+      "tags": [
+        "textbox",
+        "vml"
+      ],
+      "size": 11744
+    },
+    {
+      "name": "trackChange.docx",
+      "path": "files/track change/trackChange.docx",
+      "folder": "track change",
+      "category": "track change",
+      "tags": [],
+      "size": 10496
+    },
+    {
+      "name": "ReadOnly.docx",
+      "path": "files/unable to normalized/ReadOnly.docx",
+      "folder": "unable to normalized",
+      "category": "unable to normalized",
+      "tags": [
+        "bug-cannot-normalize"
+      ],
+      "size": 10237
+    },
+    {
+      "name": "document with password.docx",
+      "path": "files/unable to normalized/document with password.docx",
+      "folder": "unable to normalized",
+      "category": "unable to normalized",
+      "tags": [
+        "bug-cannot-normalize",
+        "encrypted"
+      ],
+      "size": 19968
+    },
+    {
+      "name": "background - Copy (6).docx",
+      "path": "files/watermark/background - Copy (6).docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 14505
+    },
+    {
+      "name": "background - Copy (7).docx",
+      "path": "files/watermark/background - Copy (7).docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 14505
+    },
+    {
+      "name": "background - Copy (8).docx",
+      "path": "files/watermark/background - Copy (8).docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 14505
+    },
+    {
+      "name": "background - aqua diagonal.docx",
+      "path": "files/watermark/background - aqua diagonal.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "watermark"
+      ],
+      "size": 14667
+    },
+    {
+      "name": "background - orange.docx",
+      "path": "files/watermark/background - orange.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "watermark"
+      ],
+      "size": 14590
+    },
+    {
+      "name": "background - preset color.docx",
+      "path": "files/watermark/background - preset color.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "watermark"
+      ],
+      "size": 14724
+    },
+    {
+      "name": "background - texture.docx",
+      "path": "files/watermark/background - texture.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "images",
+        "symbols",
+        "watermark"
+      ],
+      "size": 17835
+    },
+    {
+      "name": "background - yellow 2 green.docx",
+      "path": "files/watermark/background - yellow 2 green.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "watermark"
+      ],
+      "size": 14677
+    },
+    {
+      "name": "background.docx",
+      "path": "files/watermark/background.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers"
+      ],
+      "size": 14505
+    },
+    {
+      "name": "chinese watermark with font size color specified.docx",
+      "path": "files/watermark/chinese watermark with font size color specified.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "vml"
+      ],
+      "size": 15109
+    },
+    {
+      "name": "confidential - upper.docx",
+      "path": "files/watermark/confidential - upper.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "vml"
+      ],
+      "size": 15014
+    },
+    {
+      "name": "draft - horizotal.docx",
+      "path": "files/watermark/draft - horizotal.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "vml"
+      ],
+      "size": 15194
+    },
+    {
+      "name": "picture watermark with auto scale and washout.docx",
+      "path": "files/watermark/picture watermark with auto scale and washout.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "images",
+        "vml"
+      ],
+      "size": 279375
+    },
+    {
+      "name": "picture watermark with scale 150% and washout effect.docx",
+      "path": "files/watermark/picture watermark with scale 150% and washout effect.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "images",
+        "vml"
+      ],
+      "size": 125140
+    },
+    {
+      "name": "picture watermark with scale 50% and not washout.docx",
+      "path": "files/watermark/picture watermark with scale 50% and not washout.docx",
+      "folder": "watermark",
+      "category": "watermark",
+      "tags": [
+        "headers-footers",
+        "images",
+        "vml"
+      ],
+      "size": 245784
+    }
+  ]
+}
