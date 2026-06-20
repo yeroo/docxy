@@ -181,7 +181,12 @@ public partial class MainWindow : Window
         TreeViewItem Ensure(string key, string header)
         {
             if (nodes.TryGetValue(key, out var n)) return n;
-            n = new TreeViewItem { Header = header, FontWeight = System.Windows.FontWeights.SemiBold };
+            n = new TreeViewItem
+            {
+                Header = header,
+                FontWeight = System.Windows.FontWeights.SemiBold,
+                Foreground = System.Windows.Media.Brushes.White,
+            };
             nodes[key] = n;
             return n;
         }

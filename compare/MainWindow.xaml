@@ -7,6 +7,15 @@
         Background="#1B1D23" Foreground="#E6E6E6"
         UseLayoutRounding="True" FontFamily="Segoe UI" FontSize="12">
 
+  <Window.Resources>
+    <!-- TreeViewItem's default template doesn't inherit Foreground, so set it
+         here for every node (otherwise folder/leaf text renders black). -->
+    <Style TargetType="TreeViewItem">
+      <Setter Property="Foreground" Value="#E6E6E6"/>
+      <Setter Property="Padding" Value="2,1"/>
+    </Style>
+  </Window.Resources>
+
   <Grid>
     <!-- Full browser, shown while expanded -->
     <DockPanel x:Name="ContentPanel" Margin="0">
