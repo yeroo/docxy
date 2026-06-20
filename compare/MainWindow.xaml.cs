@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private IntPtr _hwnd;
     private bool _docOpen;
     private bool _collapsed;
+    private FileEntry? _selected;
 
     private Process? _docxy;
     private dynamic? _wordApp;
@@ -217,7 +218,46 @@ public partial class MainWindow : Window
     private void Tree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {
         if (e.NewValue is TreeViewItem { Tag: FileEntry fe })
+        {
+            _selected = fe;
             OpenSideBySide(fe);
+        }
+    }
+
+    /// Absolute path of a corpus file on disk.
+    private string FullPath(FileEntry fe) =>
+        Path.GetFullPath(Path.Combine(_repoRoot, "corpus",
+            fe.Path.Replace('/', Path.DirectorySeparatorChar)));
+
+    private void Tree_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.C &&
+            (System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Control) != 0)
+        {
+            CopySelectedPath();
+            e.Handled = true;
+        }
+    }
+
+    private void CopyPath_Click(object sender, RoutedEventArgs e) => CopySelectedPath();
+
+    private void CopySelectedPath()
+    {
+        if (_selected is null)
+        {
+            StatusText.Text = "no file selected";
+            return;
+        }
+        var p = FullPath(_selected);
+        try
+        {
+            Clipboard.SetText(p);
+            StatusText.Text = "copied path: " + _selected.Name;
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "copy failed: " + ex.Message;
+        }
     }
 
     // ---- launching Word + docxy ----
@@ -229,7 +269,7 @@ public partial class MainWindow : Window
             MessageBox.Show("docxy.exe not found. Build it first: cargo build", "docxy compare");
             return;
         }
-        var full = Path.GetFullPath(Path.Combine(_repoRoot, "corpus", fe.Path.Replace('/', Path.DirectorySeparatorChar)));
+        var full = FullPath(fe);
         if (!File.Exists(full))
         {
             MessageBox.Show("Missing file:\n" + full, "docxy compare");

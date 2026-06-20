@@ -55,7 +55,14 @@
 
       <TreeView x:Name="Tree" Background="Transparent" BorderThickness="0" Foreground="#E6E6E6"
                 Margin="4,4,4,4"
-                SelectedItemChanged="Tree_SelectedItemChanged"/>
+                SelectedItemChanged="Tree_SelectedItemChanged"
+                KeyDown="Tree_KeyDown">
+        <TreeView.ContextMenu>
+          <ContextMenu>
+            <MenuItem Header="Copy file path  (Ctrl+C)" Click="CopyPath_Click"/>
+          </ContextMenu>
+        </TreeView.ContextMenu>
+      </TreeView>
     </DockPanel>
 
     <!-- Thin strip, shown while collapsed; hovering the window expands it -->
