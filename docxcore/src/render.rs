@@ -597,7 +597,10 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             }
             Inline::Tab | Inline::Break(_) => break,
             Inline::Equation { text, .. } => w += text.chars().count(),
-            Inline::SmartArt { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
+            Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::TextBox { .. }
+            | Inline::Raw(_) => {}
         }
     }
     w
@@ -821,7 +824,7 @@ fn flatten_para(
                 }
             }
             // Rendered as a box after the paragraph, not in the inline flow.
-            Inline::SmartArt { .. } | Inline::TextBox { .. } => {}
+            Inline::SmartArt { .. } | Inline::Chart { .. } | Inline::TextBox { .. } => {}
         }
     }
     if inv {
@@ -1065,6 +1068,13 @@ fn render_paragraph(
             out.extend(text_box(&blocks, None, width, opts, images));
             continue;
         }
+        // A chart: drawn as a text bar/pie view in a (non-editable) box.
+        if let Inline::Chart { chart, .. } = item {
+            let lines = crate::chart::render_chart(chart, width.saturating_sub(6).max(16));
+            let blocks = chart_blocks(&lines);
+            out.extend(text_box(&blocks, None, width, opts, images));
+            continue;
+        }
         // A text box: its content is editable, addressed by the host paragraph's
         // path plus this inline index, so the box's text is selectable.
         if let Inline::TextBox { blocks, .. } = item {
@@ -1222,6 +1232,28 @@ fn smartart_blocks(text: &[String]) -> Vec<Block> {
     let mut blocks = vec![para("SmartArt", true)];
     blocks.extend(text.iter().map(|t| para(t, false)));
     blocks
+}
+
+/// Build the box content for a chart: the heading line bold, the bars below it
+/// as monospace rows (a leading run keeps spacing intact).
+fn chart_blocks(lines: &[String]) -> Vec<Block> {
+    use crate::model::{Inline, Paragraph, Run, RunProps};
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            Block::Paragraph(Paragraph {
+                props: Default::default(),
+                content: vec![Inline::Run(Run {
+                    text: s.clone(),
+                    props: RunProps {
+                        bold: i == 0,
+                        ..Default::default()
+                    },
+                })],
+            })
+        })
+        .collect()
 }
 
 /// Render `blocks` inside a dim border. When `base` is `Some`, the content keeps

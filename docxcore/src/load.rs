@@ -53,6 +53,8 @@ pub struct Relationships {
     /// Decoded equation text keyed by the OLE object relationship id
     /// (`<o:OLEObject r:id>`), resolved from the embedded `Equation.3` objects.
     equations: HashMap<String, String>,
+    /// Parsed charts keyed by the `<c:chart r:id>` relationship id.
+    charts: HashMap<String, crate::chart::Chart>,
 }
 
 impl Relationships {
@@ -89,6 +91,7 @@ pub fn load(data: &[u8]) -> Result<Document, LoadError> {
             let mut r = parse_rels_xml(&xml);
             r.diagrams = collect_diagram_texts(&xml, |n| zip.read(n));
             r.equations = collect_equation_texts(&xml, |n| zip.read(n));
+            r.charts = collect_chart_data(&xml, |n| zip.read(n));
             r
         }
         None => Relationships::default(),
@@ -251,6 +254,51 @@ pub(crate) fn set_equation_texts(rels: &mut Relationships, equations: HashMap<St
     rels.equations = equations;
 }
 
+/// Parse every chart part referenced from the document rels, keyed by its
+/// relationship id (the `<c:chart r:id>` in the drawing points at it).
+pub(crate) fn collect_chart_data<F>(
+    rels_xml: &str,
+    read_part: F,
+) -> HashMap<String, crate::chart::Chart>
+where
+    F: Fn(&str) -> Option<Vec<u8>>,
+{
+    let mut out = HashMap::new();
+    let mut p = XmlParser::new(rels_xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "Relationship" && p.attr("Type").ends_with("/chart") {
+                    let id = decode_attr(p.attr("Id"));
+                    let target = decode_attr(p.attr("Target"));
+                    if !id.is_empty() && !target.is_empty() {
+                        if let Some(b) = read_part(&resolve_word_part(&target)) {
+                            if let Some(c) = std::str::from_utf8(&b)
+                                .ok()
+                                .and_then(crate::chart::parse_chart_xml)
+                            {
+                                out.insert(id, c);
+                            }
+                        }
+                    }
+                    p.skip_element();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Attach parsed charts to a `Relationships`, keyed by chart relationship id.
+pub(crate) fn set_chart_data(
+    rels: &mut Relationships,
+    charts: HashMap<String, crate::chart::Chart>,
+) {
+    rels.charts = charts;
+}
+
 /// Resolve a relationship `Target` (relative to `word/`) to a package part name,
 /// collapsing any leading `../` segments.
 fn resolve_word_part(target: &str) -> String {
@@ -319,6 +367,17 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
                 raw,
                 text: text.clone(),
             };
+        }
+    }
+    // A DrawingML chart: `<c:chart r:id="rIdN"/>` points at a parsed chart part.
+    if raw.contains("c:chart") {
+        if let Some(id) = raw_attr(&raw, ":id=\"") {
+            if let Some(chart) = rels.charts.get(&id) {
+                return Inline::Chart {
+                    raw,
+                    chart: chart.clone(),
+                };
+            }
         }
     }
     Inline::Raw(raw)

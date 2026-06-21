@@ -327,6 +327,18 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.push(Vec::new());
                 }
             }
+            // A chart: lay its text bar/pie view out on its own lines.
+            Inline::Chart { chart, .. } => {
+                for line in crate::chart::render_chart(chart, 80) {
+                    if !segs.last().map(|s| s.is_empty()).unwrap_or(true) {
+                        segs.push(Vec::new());
+                    }
+                    for ch in line.chars() {
+                        segs.last_mut().unwrap().push(plain_cell(ch));
+                    }
+                    segs.push(Vec::new());
+                }
+            }
             // A decoded equation flows inline as plain text.
             Inline::Equation { text, .. } => {
                 for ch in text.chars() {

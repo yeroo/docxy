@@ -87,6 +87,13 @@ pub enum Inline {
         raw: String,
         text: Vec<String>,
     },
+    /// A DrawingML chart. `raw` is the original run XML (preserved verbatim for
+    /// lossless save); `chart` is the parsed plot data, rendered as a text
+    /// bar/pie view in a box since a terminal can't draw chart graphics.
+    Chart {
+        raw: String,
+        chart: crate::chart::Chart,
+    },
     /// A legacy Equation Editor (`Equation.3`) object decoded to Unicode math
     /// text. `raw` is the original run XML (preserved verbatim for lossless save);
     /// `text` is the decoded equation, rendered as inline text at body size.
@@ -116,6 +123,7 @@ impl Inline {
             Inline::Tab => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
             Inline::SmartArt { text, .. } => text.join("\n"),
+            Inline::Chart { chart, .. } => chart.title.clone().unwrap_or_default(),
             Inline::Equation { text, .. } => text.clone(),
             Inline::TextBox { blocks, .. } => blocks
                 .iter()

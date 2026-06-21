@@ -1027,6 +1027,7 @@ fn inline_len(i: &Inline) -> usize {
         Inline::Tab | Inline::Break(_) => 1,
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
+        | Inline::Chart { .. }
         | Inline::Equation { .. }
         | Inline::TextBox { .. }
         | Inline::Raw(_) => 0,
@@ -1085,6 +1086,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
                 raw: raw.clone(),
                 text: text.clone(),
+            }),
+            Inline::Chart { raw, chart } => out.push(Inline::Chart {
+                raw: raw.clone(),
+                chart: chart.clone(),
             }),
             Inline::Equation { raw, text } => out.push(Inline::Equation {
                 raw: raw.clone(),
@@ -1174,6 +1179,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 Inline::Tab
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
+                | Inline::Chart { .. }
                 | Inline::Equation { .. }
                 | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
@@ -1247,6 +1253,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 Inline::Tab
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
+                | Inline::Chart { .. }
                 | Inline::Equation { .. }
                 | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
@@ -1320,6 +1327,7 @@ fn range_all_have(
             }
             Inline::Tab | Inline::Break(_) => pos += 1,
             Inline::SmartArt { .. }
+            | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Raw(_) => {} // zero-length
@@ -1415,6 +1423,7 @@ fn set_prop_range(
             }
             // zero-length, unchanged
             inline @ (Inline::SmartArt { .. }
+            | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::TextBox { .. }
             | Inline::Raw(_)) => out.push(inline),
