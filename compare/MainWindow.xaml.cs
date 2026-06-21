@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private FileEntry? _selected;
 
     private Process? _docxy;
+    private IntPtr _docxyHwnd;
     private dynamic? _wordApp;
     private dynamic? _wordDoc;
     private DispatcherTimer? _placer;
@@ -284,15 +285,18 @@ public partial class MainWindow : Window
         var docxyRect = (x: wa.Left + CollapsedW, y: wa.Top, w: half, h: wa.Height);
         var wordRect = (x: wa.Left + CollapsedW + half, y: wa.Top, w: wa.Width - CollapsedW - half, h: wa.Height);
 
-        // docxy in its own console window
+        // docxy in a fresh Windows Terminal window — unlike a classic console it
+        // resizes/reflows freely, so SetWindowPos gives the exact size we want.
+        // A unique tab title lets us find (and later close) just this window.
+        var stem = Path.GetFileNameWithoutExtension(full);
+        var wtTitle = "docxy: " + stem;
         try
         {
-            _docxy = Process.Start(new ProcessStartInfo
-            {
-                FileName = _docxyExe,
-                Arguments = $"\"{full}\"",
-                UseShellExecute = true,
-            });
+            var psi = new ProcessStartInfo { FileName = "wt.exe", UseShellExecute = true };
+            foreach (var a in new[] { "-w", "new", "nt", "--title", wtTitle, "--suppressApplicationTitle",
+                                      _docxyExe, full })
+                psi.ArgumentList.Add(a);
+            _docxy = Process.Start(psi);
         }
         catch (Exception ex) { StatusText.Text = "docxy failed: " + ex.Message; }
 
@@ -300,7 +304,6 @@ public partial class MainWindow : Window
         StartWord(full);
 
         // both windows take a moment to appear — poll and position them
-        var stem = Path.GetFileNameWithoutExtension(full);
         bool placedDocxy = false, placedWord = false;
         int ticks = 0;
         _placer?.Stop();
@@ -308,11 +311,15 @@ public partial class MainWindow : Window
         _placer.Tick += (_, _) =>
         {
             ticks++;
-            if (!placedDocxy && _docxy is { HasExited: false })
+            if (!placedDocxy)
             {
-                _docxy.Refresh();
-                var h = _docxy.MainWindowHandle;
-                if (h != IntPtr.Zero) { Win32.Place(h, docxyRect.x, docxyRect.y, docxyRect.w, docxyRect.h); placedDocxy = true; }
+                var h = Win32.FindWindowByClassAndTitle("CASCADIA_HOSTING_WINDOW_CLASS", wtTitle);
+                if (h != IntPtr.Zero)
+                {
+                    _docxyHwnd = h;
+                    Win32.Place(h, docxyRect.x, docxyRect.y, docxyRect.w, docxyRect.h);
+                    placedDocxy = true;
+                }
             }
             if (!placedWord)
             {
@@ -322,7 +329,9 @@ public partial class MainWindow : Window
             if ((placedDocxy && placedWord) || ticks > 50)
             {
                 _placer!.Stop();
-                StatusText.Text = fe.Name + (placedWord ? "" : "  (Word window not found)");
+                StatusText.Text = fe.Name
+                    + (placedDocxy ? "" : "  (terminal not found)")
+                    + (placedWord ? "" : "  (Word not found)");
             }
         };
         _placer.Start();
@@ -356,6 +365,13 @@ public partial class MainWindow : Window
         try { if (_wordApp is not null) _wordApp.Quit(); } catch { }
         _wordDoc = null;
         _wordApp = null;
+        // close the Windows Terminal window we opened (the wt.exe launcher process
+        // has already handed off and exited, so close by window handle)
+        if (_docxyHwnd != IntPtr.Zero)
+        {
+            try { Win32.PostMessageW(_docxyHwnd, Win32.WM_CLOSE, IntPtr.Zero, IntPtr.Zero); } catch { }
+            _docxyHwnd = IntPtr.Zero;
+        }
         try { if (_docxy is { HasExited: false }) _docxy.Kill(true); } catch { }
         _docxy = null;
     }

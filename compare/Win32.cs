@@ -16,7 +16,12 @@ internal static partial class Win32
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;
     public const int SW_RESTORE = 9;
+    public const uint WM_CLOSE = 0x0010;
     private const uint SPI_GETWORKAREA = 0x0030;
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
