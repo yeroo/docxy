@@ -642,10 +642,15 @@ fn style_from_run(p: &RunProps) -> Style {
 }
 
 /// A run of glyphs between hard breaks, plus the page/column break (if any) that
-/// precedes it (so a separator line can be drawn before it).
+/// precedes it (so a separator line can be drawn before it). A `block` seg carries
+/// no glyphs: it marks where a block-level inline (a multi-line equation, chart,
+/// SmartArt, text box, or block image) sits in the source order, so it renders in
+/// place between the inline runs rather than all blocks being dumped after the
+/// paragraph text.
 struct Seg {
     glyphs: Vec<Glyph>,
     sep: Option<BreakKind>,
+    block: Option<usize>,
 }
 
 /// Visible width (chars) of the inline content following index `from`, up to the
@@ -695,6 +700,7 @@ fn flatten_para(
     let mut segs: Vec<Seg> = vec![Seg {
         glyphs: Vec::new(),
         sep: None,
+        block: None,
     }];
     let mut mc = 0usize;
 
@@ -728,6 +734,21 @@ fn flatten_para(
     };
 
     for (idx, item) in para.content.iter().enumerate() {
+        // Inline content that lands right after a block marker starts a fresh text
+        // seg, so it renders below the block (not appended to the block's marker).
+        let produces_inline = match item {
+            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab => true,
+            Inline::Equation { text, .. } => !text.contains('\n'),
+            Inline::Raw(raw) => inline_image(raw).is_some(),
+            _ => false,
+        };
+        if produces_inline && segs.last().is_some_and(|s| s.block.is_some()) {
+            segs.push(Seg {
+                glyphs: Vec::new(),
+                sep: None,
+                block: None,
+            });
+        }
         match item {
             Inline::Run(r) => {
                 let eff = opts.styles.effective_run(
@@ -838,15 +859,18 @@ fn flatten_para(
                         segs.push(Seg {
                             glyphs: Vec::new(),
                             sep: None,
+                            block: None,
                         });
                     }
                     BreakKind::Page => segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: Some(BreakKind::Page),
+                        block: None,
                     }),
                     BreakKind::Column => segs.push(Seg {
                         glyphs: Vec::new(),
                         sep: Some(BreakKind::Column),
+                        block: None,
                     }),
                 }
                 mc += 1;
@@ -869,6 +893,13 @@ fn flatten_para(
                             img: (i == 0).then(|| rc.clone()),
                         });
                     }
+                } else if raw_image_extent(raw).is_some() {
+                    // A larger (block) image renders as a sized box in source order.
+                    segs.push(Seg {
+                        glyphs: Vec::new(),
+                        sep: None,
+                        block: Some(idx),
+                    });
                 }
             }
             // A decoded equation flows as ordinary (non-editable) text at body
@@ -886,15 +917,28 @@ fn flatten_para(
                     });
                 }
             }
-            // Rendered as a box/block after the paragraph, not in the inline flow
+            // Rendered as a box/block in source order, not in the inline flow
             // (multi-line equations fall here; single-line ones match above).
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
-            | Inline::Equation { .. } => {}
+            | Inline::Equation { .. } => {
+                segs.push(Seg {
+                    glyphs: Vec::new(),
+                    sep: None,
+                    block: Some(idx),
+                });
+            }
         }
     }
     if inv {
+        if segs.last().is_some_and(|s| s.block.is_some()) {
+            segs.push(Seg {
+                glyphs: Vec::new(),
+                sep: None,
+                block: None,
+            });
+        }
         segs.last_mut().unwrap().glyphs.push(Glyph {
             ch: '¶',
             disp: None,
@@ -1056,6 +1100,18 @@ fn render_paragraph(
     let mut out = Vec::new();
     let mut line_idx = 0usize;
     for seg in &segs {
+        if let Some(bidx) = seg.block {
+            emit_block_item(
+                &para.content[bidx],
+                bidx,
+                path,
+                width,
+                opts,
+                images,
+                &mut out,
+            );
+            continue;
+        }
         if let Some(kind) = seg.sep {
             if opts.page_view && kind == BreakKind::Page {
                 // Print layout: a hard page break ends the page; emit a marker
@@ -1133,52 +1189,65 @@ fn render_paragraph(
             line_idx += 1;
         }
     }
-    // Drawings (images) inside the paragraph become a sized placeholder box,
-    // emitted after the paragraph text. (Real pixels are overlaid by the app.)
-    for (idx, item) in para.content.iter().enumerate() {
+    if let Some(lvl) = heading {
+        if lvl <= 2 {
+            out.push((
+                Line {
+                    spans: vec![Line::dim_span("─".repeat(width))],
+                },
+                LineMap::default(),
+            ));
+        }
+    }
+    out
+}
+
+/// Render a block-level inline (multi-line equation, chart, SmartArt, text box, or
+/// block image) at its place in the paragraph flow, appending to `out`. `idx` is the
+/// item's index in the host paragraph's content.
+fn emit_block_item(
+    item: &Inline,
+    idx: usize,
+    path: &[usize],
+    width: usize,
+    opts: &RenderOptions,
+    images: &mut Vec<ImageBox>,
+    out: &mut Vec<(Line, LineMap)>,
+) {
+    match item {
         // A SmartArt diagram: the shapes can't be drawn in a terminal, so show the
         // diagram's node text in a labeled (non-editable) box.
-        if let Inline::SmartArt { text, .. } = item {
+        Inline::SmartArt { text, .. } => {
             let blocks = smartart_blocks(text);
             out.extend(text_box(&blocks, None, width, opts, images));
-            continue;
         }
-        // A multi-line equation (a matrix laid out as rows) is emitted on its own
-        // lines below the paragraph text.
-        if let Inline::Equation { text, .. } = item {
-            if text.contains('\n') {
-                for ln in text.split('\n') {
-                    out.push((
-                        Line {
-                            spans: vec![Line::text_span(ln.to_string())],
-                        },
-                        LineMap::default(),
-                    ));
-                }
+        // A multi-line equation (a matrix laid out as rows) on its own lines.
+        Inline::Equation { text, .. } if text.contains('\n') => {
+            for ln in text.split('\n') {
+                out.push((
+                    Line {
+                        spans: vec![Line::text_span(ln.to_string())],
+                    },
+                    LineMap::default(),
+                ));
             }
-            continue;
         }
         // A chart: drawn as a text bar/pie view in a (non-editable) box.
-        if let Inline::Chart { chart, .. } = item {
+        Inline::Chart { chart, .. } => {
             let lines = crate::chart::render_chart(chart, width.saturating_sub(6).max(16));
             let blocks = chart_blocks(&lines);
             out.extend(text_box(&blocks, None, width, opts, images));
-            continue;
         }
         // A text box: its content is editable, addressed by the host paragraph's
         // path plus this inline index, so the box's text is selectable.
-        if let Inline::TextBox { blocks, .. } = item {
+        Inline::TextBox { blocks, .. } => {
             let mut base = path.to_vec();
             base.push(idx);
             out.extend(text_box(blocks, Some(&base), width, opts, images));
-            continue;
         }
-        if let Inline::Raw(raw) = item {
-            // Small inline pictures (equations) were already placed in the text
-            // flow above; only larger images get their own block box here.
-            if inline_image(raw).is_some() {
-                continue;
-            }
+        // A larger (block) image: a sized placeholder box; real pixels are overlaid
+        // by the app.
+        Inline::Raw(raw) => {
             if let Some((pw, ph)) = raw_image_extent(raw) {
                 let (pw, ph) = (pw as usize, ph as usize);
                 let (cols, rows) = image_box_cells(pw, ph, width);
@@ -1218,18 +1287,8 @@ fn render_paragraph(
                 out.extend(boxed);
             }
         }
+        _ => {}
     }
-    if let Some(lvl) = heading {
-        if lvl <= 2 {
-            out.push((
-                Line {
-                    spans: vec![Line::dim_span("─".repeat(width))],
-                },
-                LineMap::default(),
-            ));
-        }
-    }
-    out
 }
 
 /// Parse an embedded image's display size in pixels (96 dpi) from raw run XML.
