@@ -1817,6 +1817,44 @@ fn junction(u: bool, d: bool, l: bool, r: bool) -> char {
     }
 }
 
+/// Split `total` content cells across `ncols` columns, proportional to the table's
+/// grid widths (`w:tblGrid`, in twips) when they line up with the column count, else
+/// evenly. Every column gets at least one cell and the parts sum to exactly `total`
+/// (largest-remainder apportionment), so a wide content column and a narrow notes
+/// column keep their relative sizes instead of being forced equal.
+fn distribute_cols(total: usize, grid: &[u32], ncols: usize) -> Vec<usize> {
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let weights: Vec<u64> = if grid.len() == ncols && grid.iter().any(|&w| w > 0) {
+        grid.iter().map(|&w| w.max(1) as u64).collect()
+    } else {
+        vec![1; ncols]
+    };
+    let wsum: u64 = weights.iter().sum::<u64>().max(1);
+    // One cell to every column, then hand out the rest in proportion.
+    let mut cols = vec![1usize; ncols];
+    let assignable = total.saturating_sub(ncols);
+    let mut rema: Vec<(usize, u64)> = Vec::with_capacity(ncols);
+    let mut used = 0usize;
+    for (i, &w) in weights.iter().enumerate() {
+        let exact = assignable as u64 * w;
+        let q = (exact / wsum) as usize;
+        cols[i] += q;
+        used += q;
+        rema.push((i, exact % wsum));
+    }
+    rema.sort_by_key(|&(_, r)| std::cmp::Reverse(r));
+    let mut leftover = assignable - used;
+    let mut k = 0;
+    while leftover > 0 {
+        cols[rema[k % ncols].0] += 1;
+        leftover -= 1;
+        k += 1;
+    }
+    cols
+}
+
 fn render_table(
     t: &Table,
     table_path: &[usize],
@@ -1860,11 +1898,7 @@ fn render_table(
     };
     let overflow = eff_width > width;
     let content_total = eff_width.saturating_sub(overhead).max(ncols);
-    let base = content_total / ncols;
-    let rem = content_total - base * ncols;
-    let cols: Vec<usize> = (0..ncols)
-        .map(|i| (base + if i < rem { 1 } else { 0 }).max(1))
-        .collect();
+    let cols = distribute_cols(content_total, &t.grid, ncols);
 
     // Occupancy grid: which origin cell covers each (row, col). gridSpan covers
     // columns; vMerge::Continue inherits the owner from the row above.
@@ -3481,6 +3515,25 @@ mod tests {
             h < b && b < f,
             "header/body/footer order wrong: h={h} b={b} f={f}"
         );
+    }
+
+    #[test]
+    fn columns_follow_grid_proportions() {
+        // A wide content column + narrow notes column (≈82% / 18%) keeps its ratio
+        // and the parts sum to the available width.
+        let cols = distribute_cols(100, &[6588, 1453], 2);
+        assert_eq!(cols.iter().sum::<usize>(), 100);
+        assert!(
+            cols[0] > cols[1] * 3,
+            "wide column should dominate: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn columns_fall_back_to_even_without_grid() {
+        let cols = distribute_cols(100, &[], 4);
+        assert_eq!(cols.iter().sum::<usize>(), 100);
+        assert!(cols.iter().all(|&c| c == 25), "even split: {cols:?}");
     }
 
     #[test]
