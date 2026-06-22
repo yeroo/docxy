@@ -68,7 +68,11 @@ internal static partial class Win32
     {
         if (hWnd == IntPtr.Zero) return;
         ShowWindow(hWnd, SW_RESTORE);
-        SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Pass HWND_TOP (IntPtr.Zero) and *omit* SWP_NOZORDER so the window is
+        // raised to the front — otherwise Word/the terminal stay wherever they
+        // spawned (often behind other windows). NOACTIVATE keeps the three tiled
+        // windows from fighting over keyboard focus as each is placed.
+        SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
     /// <summary>Find a top-level window of <paramref name="className"/> whose title
