@@ -334,19 +334,50 @@ impl Mtef<'_> {
         if rows == 0 || cols == 0 || rows * cols > 256 {
             return MBox::empty();
         }
+        // The element lists are END-terminated and omit empty cells, so read
+        // elements until the terminating END (capped at rows*cols) rather than a
+        // fixed count — otherwise we run past the terminator and desync.
+        // The cells are an END-terminated list of LINE records. Typesize/ruler/
+        // size/font records can sit *between* cells (setting the size of the next
+        // one); skip those so they don't get mistaken for empty cells and shift
+        // the whole grid. Empty cells are NULL LINEs and are kept.
+        // Read exactly rows*cols cells. Each cell is a LINE record; between cells
+        // there can be bare END separators and typesize/ruler/size/font records.
+        // Skip those (they're not cells) so the grid doesn't shift. Empty cells are
+        // NULL LINEs (handled by read_line), not bare ENDs.
         self.depth += 1;
-        let mut cells: Vec<Vec<MBox>> = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            let mut row = Vec::with_capacity(cols);
-            for _ in 0..cols {
-                if self.eof() || self.depth > 40 {
-                    break;
+        let mut flat: Vec<MBox> = Vec::new();
+        while !self.eof() && self.depth <= 40 && flat.len() < rows * cols {
+            let tag = self.b[self.pos];
+            match tag & 0x0f {
+                0 => self.pos += 1,               // bare END: an inter-cell separator
+                1 => flat.push(self.read_line()), // a cell (LINE / NULL LINE)
+                7 => {
+                    self.pos += 1;
+                    self.ruler();
                 }
-                row.push(self.read_line());
+                8 => {
+                    self.pos += 1;
+                    self.u8();
+                    self.u8();
+                    while !self.eof() && self.u8() != 0 {}
+                }
+                9 => {
+                    self.pos += 1;
+                    self.skip_size();
+                }
+                10..=14 => self.pos += 1, // typesize shorthand between cells
+                _ => flat.push(self.read_line()),
             }
-            cells.push(row);
         }
         self.depth -= 1;
+        let cells: Vec<Vec<MBox>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| flat.get(r * cols + c).cloned().unwrap_or_else(MBox::empty))
+                    .collect()
+            })
+            .collect();
         grid(&cells)
     }
 
@@ -371,13 +402,20 @@ impl Mtef<'_> {
 fn format_template(selector: u8, slots: &[MBox]) -> MBox {
     let b = |i: usize| slots.get(i).cloned().unwrap_or_else(MBox::empty);
     let s = |i: usize| slots.get(i).map(MBox::flat).unwrap_or_default();
+    // Fences (selectors 0..=5) around an empty slot are MathType placeholders;
+    // drop them so we don't emit stray "()"/"[]" after a real construct.
+    if selector <= 5 && b(0).is_blank() {
+        return MBox::empty();
+    }
     match selector {
-        // ParBoxClass fences: angle / paren / brace / square brackets. The bracket
-        // grows tall around a multi-row child (e.g. a matrix).
+        // Fences that grow tall around a multi-row child (e.g. a matrix):
+        // angle / paren / brace / bracket / determinant bar / double bar.
         0 => bracket(b(0), '⟨', '⟩'),
         1 => bracket(b(0), '(', ')'),
         2 => bracket(b(0), '{', '}'),
         3 => bracket(b(0), '[', ']'),
+        4 => bracket(b(0), '|', '|'),
+        5 => bracket(b(0), '‖', '‖'),
         // Radicals: square root (and nth root) — selectors vary; treat 9..=11 as roots.
         9..=11 => {
             if s(1).is_empty() {
