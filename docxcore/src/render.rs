@@ -1840,12 +1840,20 @@ fn render_table(
                     _ => None,
                 };
                 if let Some((cline, cmap)) = content {
-                    let used = cline.width();
-                    line.spans.extend(cline.spans.clone());
+                    // Clip the cell content to the cell width so nothing — e.g. a
+                    // nested table too wide to fit — can push the outer grid out
+                    // of alignment.
+                    let (clipped, used) = clip_to_cols(cline.spans.clone(), cw);
+                    line.spans.extend(clipped);
                     if cw > used {
                         line.spans.push(Line::text_span(" ".repeat(cw - used)));
                     }
                     for seg in &cmap.segs {
+                        // Drop segments that fall entirely past the clip (their text
+                        // isn't shown), and keep the rest aligned to the cell.
+                        if seg.col0 >= cw {
+                            continue;
+                        }
                         let mut seg = seg.clone();
                         seg.col0 += content_start;
                         map.segs.push(seg);
@@ -3073,6 +3081,40 @@ mod tests {
         let joined = lines.iter().map(|l| l.plain()).collect::<String>();
         for i in 0..10 {
             assert!(joined.contains(&format!("c{i}")), "missing c{i}");
+        }
+    }
+
+    #[test]
+    fn nested_table_too_wide_does_not_break_the_outer_grid() {
+        // A bordered nested table needs more cells than the narrow outer cell can
+        // give; it must be clipped to the cell, not overflow and shift the grid.
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(vec![run(s, RunProps::default())])],
+        };
+        let nested = Table {
+            grid: vec![100, 100],
+            rows: vec![Row {
+                cells: vec![cell("a"), cell("b")],
+            }],
+        };
+        let nested_cell = Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![Block::Table(nested)],
+        };
+        let t = Table {
+            grid: vec![100, 100, 100],
+            rows: vec![Row {
+                cells: vec![cell("X"), nested_cell, cell("Y")],
+            }],
+        };
+        let d = doc(vec![Block::Table(t)]);
+        let lines = render(&d, &opts(40));
+        let first = lines[0].width();
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(l.width(), first, "row {i} width differs: {:?}", l.plain());
         }
     }
 
