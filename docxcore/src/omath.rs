@@ -115,7 +115,8 @@ fn render_node(p: &mut XmlParser, name: &str) -> String {
         "m:d" => {
             let beg = first_nonempty(&all("m:begChr")).unwrap_or_else(|| "(".to_string());
             let end = first_nonempty(&all("m:endChr")).unwrap_or_else(|| ")".to_string());
-            let sep = first_nonempty(&all("m:sepChr")).unwrap_or_else(|| ",".to_string());
+            // OMML's default separator is a vertical bar, not a comma.
+            let sep = first_nonempty(&all("m:sepChr")).unwrap_or_else(|| "|".to_string());
             let inner = all("m:e").join(&sep);
             format!("{beg}{inner}{end}")
         }
@@ -279,6 +280,14 @@ mod tests {
         let x = "<m:oMath><m:d><m:dPr><m:begChr m:val=\"[\"/><m:endChr m:val=\"]\"/></m:dPr>\
                  <m:e><m:r><m:t>x</m:t></m:r></m:e></m:d></m:oMath>";
         assert_eq!(r(x), "[x]");
+    }
+
+    #[test]
+    fn delimiter_with_two_elements_uses_a_bar_separator() {
+        let x = "<m:oMath><m:d><m:dPr><m:begChr m:val=\"⟨\"/><m:endChr m:val=\"⟩\"/></m:dPr>\
+                 <m:e><m:r><m:t>12</m:t></m:r></m:e>\
+                 <m:e><m:r><m:t>13</m:t></m:r></m:e></m:d></m:oMath>";
+        assert_eq!(r(x), "⟨12|13⟩");
     }
 
     #[test]
