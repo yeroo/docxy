@@ -11,6 +11,9 @@
     <RootNamespace>DocxyCompare</RootNamespace>
     <!-- LibraryImport source-generated P/Invoke needs unsafe blocks enabled -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- `dotnet run` otherwise skips MSBuild (and so the cargo step below) when
+         the C# is unchanged; force the build chain so docxy is always rebuilt. -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
 
   <!-- Build the docxy release binary first, so `dotnet run` always launches the
