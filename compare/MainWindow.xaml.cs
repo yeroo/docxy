@@ -69,10 +69,38 @@ public partial class MainWindow : Window
         {
             MessageBox.Show("Failed to read manifest:\n" + ex.Message, "docxy compare");
         }
+        // Always rebuild docxy here so the launcher uses the current binary,
+        // independent of whether `dotnet run` re-ran the MSBuild step.
+        BuildDocxy(_repoRoot);
         _docxyExe = FindDocxyExe(_repoRoot);
         SubTitle.Text = _docxyExe.Length > 0
             ? $"{_manifest.Count} files · docxy + Word side by side"
             : "docxy.exe not found — build it (cargo build)";
+    }
+
+    /// Run `cargo build --release -p docxy` synchronously so the launched docxy
+    /// is always current. A no-op (~0.1s) when nothing changed.
+    private static void BuildDocxy(string repo)
+    {
+        var cargoHome = Environment.GetEnvironmentVariable("CARGO_HOME")
+            ?? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cargo");
+        var cargo = Path.Combine(cargoHome, "bin", "cargo.exe");
+        if (!File.Exists(cargo)) return; // no toolchain — use whatever exists
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = cargo,
+                WorkingDirectory = repo,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            foreach (var a in new[] { "build", "--release", "-p", "docxy" })
+                psi.ArgumentList.Add(a);
+            Process.Start(psi)?.WaitForExit(180_000);
+        }
+        catch { /* best effort */ }
     }
 
     private static string LocateRepo()
