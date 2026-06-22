@@ -156,6 +156,7 @@ impl Mtef<'_> {
                     self.depth -= 1;
                     out.push_str(&slots.join(" "));
                 }
+                5 => out.push_str(&self.matrix(flags)), // MATRIX
                 6 => {
                     // EMBELL (standalone): an accent; skip its type byte.
                     if flags & XF_LMOVE != 0 {
@@ -226,6 +227,40 @@ impl Mtef<'_> {
         slots
     }
 
+    /// Read exactly one element: a LINE record's content (or a single object if
+    /// the next record isn't a LINE). Used for matrix cells, where the element
+    /// count is fixed and the cells are not terminated by a shared END.
+    fn read_line(&mut self) -> String {
+        if self.eof() {
+            return String::new();
+        }
+        let tag = self.u8();
+        let typ = tag & 0x0f;
+        let flags = tag & 0xf0;
+        match typ {
+            1 => {
+                if flags & XF_NULL != 0 {
+                    return String::new();
+                }
+                if flags & XF_LMOVE != 0 {
+                    self.skip_nudge();
+                }
+                if flags & XF_LSPACE != 0 {
+                    self.u8();
+                }
+                if flags & XF_RULER != 0 {
+                    self.ruler();
+                }
+                self.list()
+            }
+            0 => String::new(), // unexpected early END
+            _ => {
+                self.pos -= 1;
+                self.one_object()
+            }
+        }
+    }
+
     /// Parse exactly one object (used when a template slot isn't wrapped in LINE).
     fn one_object(&mut self) -> String {
         // Reuse `list` semantics for a single record by faking a one-record list:
@@ -263,6 +298,7 @@ impl Mtef<'_> {
                 self.depth -= 1;
                 format_template(selector, &slots)
             }
+            5 => self.matrix(flags),
             _ => String::new(),
         }
     }
@@ -273,6 +309,51 @@ impl Mtef<'_> {
             self.u8(); // stop type
             self.u16(); // offset
         }
+    }
+
+    /// MATRIX record: a `rows`×`cols` grid of element object-lists. Rendered as
+    /// rows of space-separated cells, rows joined by ` / ` (any surrounding fence
+    /// is supplied by the enclosing template).
+    fn matrix(&mut self, flags: u8) -> String {
+        if flags & XF_LMOVE != 0 {
+            self.skip_nudge();
+        }
+        let _valign = self.u8();
+        let _h_just = self.u8();
+        let _v_just = self.u8();
+        let rows = self.u8() as usize;
+        let cols = self.u8() as usize;
+        // Row/column line-partition arrays: 2 bits per entry, each array
+        // byte-aligned. (rows+1) row entries, (cols+1) col entries.
+        let skip_parts = |s: &mut Self, n: usize| {
+            for _ in 0..(2 * n).div_ceil(8) {
+                s.u8();
+            }
+        };
+        skip_parts(self, rows + 1);
+        skip_parts(self, cols + 1);
+        if rows == 0 || cols == 0 || rows * cols > 256 {
+            return String::new();
+        }
+        self.depth += 1;
+        let mut cells = Vec::with_capacity(rows * cols);
+        for _ in 0..rows * cols {
+            if self.eof() || self.depth > 40 {
+                break;
+            }
+            cells.push(self.read_line());
+        }
+        self.depth -= 1;
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .filter_map(|c| cells.get(r * cols + c))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
     }
 
     /// SIZE record (type 9), whose length depends on the first following byte.
