@@ -1,6 +1,7 @@
 //! `docxy` — terminal viewer/**editor** for `.docx`.
 //!
 //! Usage:
+//!   docxy                          open the editor with a new blank document
 //!   docxy <file.docx>              open in the editor
 //!   docxy <file.docx> --pdf <out>  headless: export to PDF and exit
 //!
@@ -65,23 +66,34 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
-    let Some(input) = parsed.input else {
-        print_usage();
-        return ExitCode::from(2);
-    };
-
-    let data = match std::fs::read(&input) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: cannot read {input}: {e}");
-            return ExitCode::FAILURE;
+    // With a file argument we load it; with none, start a fresh blank document.
+    let (pkg, input) = match parsed.input {
+        Some(input) => {
+            let data = match std::fs::read(&input) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: cannot read {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let pkg = match load_package(&data) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            (pkg, input)
         }
-    };
-    let pkg = match load_package(&data) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+        None => {
+            if parsed.pdf_out.is_some() {
+                eprintln!("error: --pdf requires an input file");
+                return ExitCode::from(2);
+            }
+            let pkg = new_package(Document {
+                body: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
+            });
+            (pkg, "untitled.docx".to_string())
         }
     };
 
@@ -118,6 +130,7 @@ fn print_usage() {
     eprintln!(
         "Docxy — terminal .docx viewer & editor\n\n\
          USAGE:\n  \
+           docxy                           new blank document in the editor\n  \
            docxy <file.docx>               open in the editor\n  \
            docxy <file.docx> --vim         open with vim keybindings\n  \
            docxy <file.docx> --pdf <out>   export to PDF and exit\n\n\
