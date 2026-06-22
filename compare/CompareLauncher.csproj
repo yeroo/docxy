@@ -13,4 +13,17 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <!-- Build the docxy release binary first, so `dotnet run` always launches the
+       current docxy (the launcher prefers target/release/docxy.exe). cargo is
+       incremental, so this is a no-op when docxy is unchanged. cargo isn't on
+       MSBuild's PATH, so resolve it from CARGO_HOME / the default rustup path. -->
+  <PropertyGroup>
+    <CargoExe Condition="'$(CARGO_HOME)' != ''">$(CARGO_HOME)\bin\cargo.exe</CargoExe>
+    <CargoExe Condition="'$(CargoExe)' == ''">$(USERPROFILE)\.cargo\bin\cargo.exe</CargoExe>
+  </PropertyGroup>
+  <Target Name="BuildDocxy" BeforeTargets="Build">
+    <Exec Command="&quot;$(CargoExe)&quot; build --release -p docxy"
+          WorkingDirectory="$(MSBuildProjectDirectory)\.." />
+  </Target>
+
 </Project>

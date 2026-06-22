@@ -19,9 +19,8 @@ side, so you can compare renderings at a glance.
 ## Requirements
 
 - .NET 9 SDK (`dotnet`)
+- Rust toolchain (`cargo`) — the build rebuilds docxy automatically
 - Microsoft Word (automated via COM)
-- `docxy.exe` built in the repo — `cargo build --release` (the launcher prefers
-  `target/release/docxy.exe`, falling back to `target/debug/docxy.exe`)
 - `corpus/classification.json` generated — `python corpus/tools/classify.py`
 
 ## Run
@@ -30,6 +29,11 @@ side, so you can compare renderings at a glance.
 cd compare
 dotnet run -c Release
 ```
+
+Building the launcher first runs `cargo build --release -p docxy` (a pre-build
+MSBuild step), so `dotnet run` always launches the current docxy — the launcher
+uses `target/release/docxy.exe`. cargo is incremental, so it's a no-op when
+docxy is unchanged.
 
 ## Notes
 
