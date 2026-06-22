@@ -3453,8 +3453,12 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
             if st.highlight {
                 style = style.add_modifier(Modifier::REVERSED);
             }
+            // Black/"automatic" text uses the terminal's default foreground — a
+            // document's black text is invisible on a dark terminal otherwise.
             if let Some(c) = st.color {
-                style = style.fg(map_color(c));
+                if c != DocColor::Black {
+                    style = style.fg(map_color(c));
+                }
             }
             RSpan::styled(s.text.clone(), style)
         })
@@ -3882,6 +3886,36 @@ mod tests {
         assert!(app.show_comments);
         app.run_act(ribbon::Act::ToggleComments);
         assert!(!app.show_comments);
+    }
+
+    #[test]
+    fn black_text_uses_terminal_default_foreground() {
+        use docxcore::render::{Color as DC, Line as DL, Span as DS, Style as DST};
+        let line = DL {
+            spans: vec![
+                DS {
+                    text: "blk".into(),
+                    style: DST {
+                        color: Some(DC::Black),
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+                DS {
+                    text: "red".into(),
+                    style: DST {
+                        color: Some(DC::Red),
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+            ],
+        };
+        let rl = doc_line_to_ratatui(&line);
+        // black → no fg (terminal default, so it's visible on a dark background)
+        assert_eq!(rl.spans[0].style.fg, None);
+        // other colors still map
+        assert_eq!(rl.spans[1].style.fg, Some(Color::Red));
     }
 
     #[test]
