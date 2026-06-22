@@ -315,6 +315,12 @@ struct App {
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
     comments_rect: Rect,
+    /// In page view, how far the canvas is scrolled right to reveal the comments
+    /// that sit beside the (un-shrunk) page. 0 = comments off-screen.
+    comments_hscroll: usize,
+    /// The horizontal scroll applied to the document this frame (= comments_hscroll
+    /// when comments sit aside, else 0). Used to map the caret and mouse columns.
+    doc_hscroll: u16,
     /// The full-screen File backstage, when open.
     backstage: Option<backstage::Backstage>,
     /// Preview pane size (cells), set by draw() so the preview fills/scrolls it.
@@ -430,6 +436,8 @@ impl App {
             show_comments: false,
             comments_scroll: 0,
             comments_rect: Rect::default(),
+            comments_hscroll: 0,
+            doc_hscroll: 0,
             // Set each frame by draw(); 0 until then so mouse rows map directly.
             ribbon_h: 0,
             backstage: None,
@@ -508,6 +516,7 @@ impl App {
             light_page: self.light_page,
             show_ruler: self.show_ruler,
             show_nav: self.show_nav,
+            show_comments: self.show_comments,
         }
         .save();
     }
@@ -569,6 +578,7 @@ impl App {
     fn toggle_comments(&mut self) {
         self.show_comments = !self.show_comments;
         self.comments_scroll = 0;
+        self.save_view_prefs();
         self.status = Some(if self.comments.is_empty() {
             "No comments in this document.".to_string()
         } else if self.show_comments {
@@ -2244,7 +2254,8 @@ impl App {
             return;
         }
         let mrow = m.row as usize;
-        let col = (m.column as usize).saturating_sub(self.doc_x0 as usize);
+        let col =
+            (m.column as usize).saturating_sub(self.doc_x0 as usize) + self.doc_hscroll as usize;
         // A left-click in the ribbon area drives the ribbon; other events (wheel,
         // drag) fall through to the document so scrolling works anywhere.
         if mrow < self.ribbon_h {
@@ -2323,6 +2334,28 @@ impl App {
                     let max = self.lines.len().saturating_sub(vh);
                     self.scroll = (self.scroll + 1).min(max);
                 }
+                self.dirty = true;
+            }
+            // Shift+wheel scrolls the canvas horizontally (to reach comments
+            // that sit beside the page in print layout). Horizontal wheels too.
+            MouseEventKind::ScrollRight => {
+                self.comments_hscroll += 4;
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollLeft => {
+                self.comments_hscroll = self.comments_hscroll.saturating_sub(4);
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown
+                if m.modifiers.contains(KeyModifiers::SHIFT) && self.show_comments =>
+            {
+                self.comments_hscroll += 4;
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollUp
+                if m.modifiers.contains(KeyModifiers::SHIFT) && self.show_comments =>
+            {
+                self.comments_hscroll = self.comments_hscroll.saturating_sub(4);
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
@@ -3183,9 +3216,14 @@ impl App {
         let mut full = chunks[1];
         let status = chunks[2];
 
-        // The comments review panel takes a column on the right (Word-style).
+        // The comments review panel. In read view it docks on the right (the
+        // text reflows to fit). In page view the page must NOT shrink, so the
+        // panel sits beside the page off-screen and is reached by scrolling the
+        // canvas right (Word-style) — handled after the content rect is known.
         self.comments_rect = Rect::default();
-        if self.show_comments && !self.comments.is_empty() && full.width > 50 {
+        let comments_on = self.show_comments && !self.comments.is_empty();
+        let comments_aside = comments_on && self.page_view;
+        if comments_on && !comments_aside && full.width > 50 {
             let pw = 40.min(full.width / 2);
             let cols =
                 Layout::horizontal([Constraint::Min(10), Constraint::Length(pw)]).split(full);
@@ -3214,8 +3252,11 @@ impl App {
         // Reserve a one-column gutter on the right for the vertical scrollbar, so
         // the rendered width stays stable whether or not the bar is shown.
         let gutter = if full.width > 2 { 1 } else { 0 };
+        // In aside mode reserve a bottom row for the horizontal scrollbar.
+        let hbar = comments_aside && full.height > 3;
         let content = Rect {
             width: full.width - gutter,
+            height: full.height - u16::from(hbar),
             ..full
         };
         self.doc_x0 = content.x;
@@ -3250,15 +3291,64 @@ impl App {
         } else {
             &[]
         };
+        // Comments aside: the page keeps its full width; the panel sits beside it
+        // at canvas-x = content.width, revealed by scrolling the canvas right.
+        let panel_w = if comments_aside {
+            40.min(content.width.saturating_sub(20)).max(8)
+        } else {
+            0
+        };
+        if comments_aside {
+            self.comments_hscroll = self.comments_hscroll.min(panel_w as usize);
+        } else {
+            self.comments_hscroll = 0;
+        }
+        self.doc_hscroll = self.comments_hscroll as u16;
+
         let text = Text::from(visible.iter().map(doc_line_to_ratatui).collect::<Vec<_>>());
         // Light page: black on white (fills the whole content rect). Black/auto
         // text inherits this base, coloured text keeps its colour.
-        let para = if self.light_page {
+        let mut para = if self.light_page {
             Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::White))
         } else {
             Paragraph::new(text)
         };
+        if self.doc_hscroll > 0 {
+            para = para.scroll((0, self.doc_hscroll));
+        }
         f.render_widget(para, content);
+
+        // The comments panel, slid in from the right as the canvas scrolls.
+        if comments_aside {
+            let h = self.comments_hscroll as u16;
+            let panel = Rect {
+                x: content.x + content.width.saturating_sub(h),
+                y: content.y,
+                width: panel_w,
+                height: content.height,
+            };
+            self.comments_rect = panel;
+            self.draw_comments_panel(f, panel);
+            // Horizontal scrollbar on the reserved bottom row.
+            if hbar {
+                let canvas = content.width as usize + panel_w as usize;
+                let mut sb = ScrollbarState::new(canvas)
+                    .position(self.comments_hscroll)
+                    .viewport_content_length(content.width as usize);
+                f.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                        .begin_symbol(None)
+                        .end_symbol(None),
+                    Rect {
+                        x: content.x,
+                        y: content.y + content.height,
+                        width: content.width,
+                        height: 1,
+                    },
+                    &mut sb,
+                );
+            }
+        }
 
         // Overlay real image pixels onto the placeholder boxes. Each image is
         // encoded once per visible window and just re-emitted as it moves, so
@@ -3285,10 +3375,15 @@ impl App {
             );
         }
 
-        // Caret.
+        // Caret (shifted by the horizontal scroll; hidden if scrolled off-screen).
         if let Some((row, col)) = caret {
-            if row >= self.scroll && row < self.scroll + self.viewport_h {
-                let x = content.x + (col.min(content.width.saturating_sub(1) as usize)) as u16;
+            let hs = self.doc_hscroll as usize;
+            if row >= self.scroll
+                && row < self.scroll + self.viewport_h
+                && col >= hs
+                && (col - hs) < content.width as usize
+            {
+                let x = content.x + (col - hs) as u16;
                 let y = content.y + (row - self.scroll) as u16;
                 f.set_cursor_position(Position { x, y });
             }
@@ -3450,6 +3545,7 @@ struct ViewPrefs {
     light_page: bool,
     show_ruler: bool,
     show_nav: bool,
+    show_comments: bool,
 }
 
 impl ViewPrefs {
@@ -3478,6 +3574,7 @@ impl ViewPrefs {
                     "light_page" => p.light_page = on,
                     "show_ruler" => p.show_ruler = on,
                     "show_nav" => p.show_nav = on,
+                    "show_comments" => p.show_comments = on,
                     _ => {}
                 }
             }
@@ -3487,13 +3584,14 @@ impl ViewPrefs {
 
     fn to_conf(self) -> String {
         format!(
-            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\n",
+            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\n",
             self.page_view as u8,
             self.invisibles as u8,
             self.borderless as u8,
             self.light_page as u8,
             self.show_ruler as u8,
             self.show_nav as u8,
+            self.show_comments as u8,
         )
     }
 
@@ -3827,6 +3925,7 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     app.light_page = prefs.light_page;
     app.show_ruler = prefs.show_ruler;
     app.show_nav = prefs.show_nav;
+    app.show_comments = prefs.show_comments;
     app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
@@ -3910,6 +4009,7 @@ mod tests {
             light_page: true,
             show_ruler: false,
             show_nav: true,
+            show_comments: true,
         };
         let back = ViewPrefs::parse(&p.to_conf());
         assert_eq!(back.page_view, p.page_view);
@@ -3918,6 +4018,7 @@ mod tests {
         assert_eq!(back.light_page, p.light_page);
         assert_eq!(back.show_ruler, p.show_ruler);
         assert_eq!(back.show_nav, p.show_nav);
+        assert_eq!(back.show_comments, p.show_comments);
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
         assert!(partial.invisibles && !partial.page_view && !partial.borderless);

@@ -327,7 +327,7 @@ fn review_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Comments",
-            width: 23,
+            width: 25,
             rows: [
                 vec![
                     btn("✎ New", 5, Todo("New comment"), "New comment"),
@@ -339,10 +339,10 @@ fn review_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Next ›", 6, Todo("Next comment"), "Next comment"),
                     Seg::Gap("  "),
-                    // glyph is swapped to "[x] Show" while the panel is on
+                    // a plain toggle — inverts when the panel is on
                     btn(
-                        "[ ] Show",
-                        8,
+                        "▤ Comments",
+                        10,
                         ToggleComments,
                         "Show/hide the comments panel",
                     ),
