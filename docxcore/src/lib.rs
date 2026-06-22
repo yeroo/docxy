@@ -25,6 +25,7 @@ pub mod inflate;
 pub mod load;
 pub mod model;
 pub mod numbering;
+pub mod omath;
 pub mod package;
 pub mod render;
 pub mod serialize;

@@ -456,6 +456,17 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
                 // sectPr is preserved by the package layer; don't duplicate it.
                 "w:sectPr" => p.skip_element(),
+                // Block-level OMML math: a paragraph holding the text equation.
+                "m:oMathPara" | "m:oMath" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let raw = p.raw_slice(start, p.pos()).to_string();
+                    let text = crate::omath::render_omath(&raw);
+                    blocks.push(Block::Paragraph(Paragraph {
+                        props: Default::default(),
+                        content: vec![Inline::Equation { raw, text }],
+                    }));
+                }
                 _ => {
                     // Unmodeled block content (content controls, etc.): preserve raw.
                     let start = p.start_pos();
@@ -491,6 +502,14 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                 "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
                 // Inline content control (content placeholder, etc.): unwrap it.
                 "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
+                // OMML math: render it to a text equation (lossless raw kept).
+                "m:oMath" | "m:oMathPara" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let raw = p.raw_slice(start, p.pos()).to_string();
+                    let text = crate::omath::render_omath(&raw);
+                    para.content.push(Inline::Equation { raw, text });
+                }
                 _ => {
                     // Unmodeled inline content (bookmarks, fields): preserve raw.
                     let start = p.start_pos();
