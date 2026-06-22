@@ -3318,13 +3318,21 @@ impl App {
         }
         self.doc_hscroll = self.comments_hscroll as u16;
 
-        let text = Text::from(visible.iter().map(doc_line_to_ratatui).collect::<Vec<_>>());
-        // Light page: black on white (fills the whole content rect). Black/auto
-        // text inherits this base, coloured text keeps its colour.
+        let rlines: Vec<_> = visible.iter().map(doc_line_to_ratatui).collect();
+        // Light page: black on white. In page view the page sits on a black
+        // "desktop" (Word-style) — each line's page region is painted white and the
+        // centering margins / inter-page gaps stay black. In continuous view there
+        // is no page frame, so the whole content area is white.
         let mut para = if self.light_page {
-            Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::White))
+            if self.page_view {
+                let painted: Vec<_> = rlines.into_iter().map(paint_page_on_black).collect();
+                Paragraph::new(Text::from(painted)).style(Style::default().bg(Color::Black))
+            } else {
+                Paragraph::new(Text::from(rlines))
+                    .style(Style::default().fg(Color::Black).bg(Color::White))
+            }
         } else {
-            Paragraph::new(text)
+            Paragraph::new(Text::from(rlines))
         };
         if self.doc_hscroll > 0 {
             para = para.scroll((0, self.doc_hscroll));
@@ -3745,6 +3753,44 @@ fn map_color(c: DocColor) -> Color {
     }
 }
 
+/// Style one page-view line as a white page on a black desktop: the cells before
+/// the first non-blank one (the centering margin) are painted black, and the page
+/// itself — from the left border to the end of the line — is painted white with
+/// black default text (coloured text keeps its colour). Fully-blank lines (the gaps
+/// between pages) become all black.
+fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
+    let white = |sp: RSpan<'static>| -> RSpan<'static> {
+        let mut st = sp.style.bg(Color::White);
+        if st.fg.is_none() {
+            st = st.fg(Color::Black);
+        }
+        RSpan::styled(sp.content, st)
+    };
+    let mut in_page = false;
+    let mut out: Vec<RSpan<'static>> = Vec::new();
+    for span in line.spans {
+        if in_page {
+            out.push(white(span));
+            continue;
+        }
+        let text = span.content.into_owned();
+        match text.find(|c: char| !c.is_whitespace()) {
+            None => out.push(RSpan::styled(text, span.style.bg(Color::Black))),
+            Some(i) => {
+                if i > 0 {
+                    out.push(RSpan::styled(
+                        text[..i].to_string(),
+                        span.style.bg(Color::Black),
+                    ));
+                }
+                out.push(white(RSpan::styled(text[i..].to_string(), span.style)));
+                in_page = true;
+            }
+        }
+    }
+    RLine::from(out)
+}
+
 fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
     let spans: Vec<RSpan<'static>> = line
         .spans
@@ -4012,6 +4058,30 @@ mod tests {
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
     use docxcore::package::new_package;
+
+    #[test]
+    fn page_on_black_paints_margin_black_and_page_white() {
+        // "   │ hi │" → centering margin black, page region white.
+        let line = RLine::from(vec![RSpan::raw("   "), RSpan::raw("│ hi │")]);
+        let out = paint_page_on_black(line);
+        assert_eq!(
+            out.spans[0].style.bg,
+            Some(Color::Black),
+            "margin not black"
+        );
+        assert_eq!(
+            out.spans.last().unwrap().style.bg,
+            Some(Color::White),
+            "page not white"
+        );
+    }
+
+    #[test]
+    fn page_on_black_blank_line_is_all_black() {
+        // The gap between pages (all whitespace) is fully black.
+        let out = paint_page_on_black(RLine::from(vec![RSpan::raw("        ")]));
+        assert!(out.spans.iter().all(|s| s.style.bg == Some(Color::Black)));
+    }
 
     #[test]
     fn view_prefs_round_trip() {
