@@ -5,6 +5,7 @@
 //! their brackets, and matrices render as a multi-row grid with growing
 //! brackets (so a 2×2 stacks onto two lines).
 
+use crate::mathbox::{MBox, flatten, hcat, matrix_grid};
 use crate::xml::{Event, XmlParser};
 
 /// Render an `<m:oMath>` / `<m:oMathPara>` element (given as raw XML) to text.
@@ -15,132 +16,11 @@ pub fn render_omath(xml: &str) -> String {
         match p.next() {
             Event::Start if p.name() == "m:oMath" || p.name() == "m:oMathPara" => {
                 let name = p.name().to_string();
-                let b = render_node(&mut p, &name);
-                if b.lines.len() == 1 {
-                    return b.lines[0].trim().to_string();
-                }
-                // multi-line: trim each row's trailing pad, drop blank edge rows
-                let mut rows: Vec<String> =
-                    b.lines.iter().map(|l| l.trim_end().to_string()).collect();
-                while rows.first().is_some_and(|l| l.is_empty()) {
-                    rows.remove(0);
-                }
-                while rows.last().is_some_and(|l| l.is_empty()) {
-                    rows.pop();
-                }
-                return rows.join("\n");
+                return flatten(&render_node(&mut p, &name));
             }
             Event::Eof => return String::new(),
             _ => {}
         }
-    }
-}
-
-/// A laid-out fragment of math: `lines` stacked top-to-bottom, with `base` the
-/// row index that sits on the surrounding text's baseline (so a tall matrix
-/// aligns its middle with neighbouring `A =` text).
-#[derive(Clone)]
-struct MBox {
-    lines: Vec<String>,
-    base: usize,
-}
-
-impl MBox {
-    fn line(s: String) -> MBox {
-        MBox {
-            lines: vec![s],
-            base: 0,
-        }
-    }
-    fn width(&self) -> usize {
-        self.lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(0)
-    }
-    fn is_blank(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-    /// Flatten to one inline string (used when a construct can't stack).
-    fn flat(&self) -> String {
-        self.lines.join("")
-    }
-}
-
-/// Place boxes side by side, aligning their baselines.
-fn hcat(boxes: &[MBox]) -> MBox {
-    let boxes: Vec<&MBox> = boxes.iter().filter(|b| !b.is_blank()).collect();
-    match boxes.len() {
-        0 => return MBox::line(String::new()),
-        1 => return boxes[0].clone(),
-        _ => {}
-    }
-    let above = boxes.iter().map(|b| b.base).max().unwrap();
-    let below = boxes
-        .iter()
-        .map(|b| b.lines.len() - 1 - b.base)
-        .max()
-        .unwrap();
-    let h = above + below + 1;
-    let mut out = vec![String::new(); h];
-    for b in &boxes {
-        let bw = b.width();
-        let top = above - b.base;
-        for (r, row) in out.iter_mut().enumerate() {
-            if r >= top && r - top < b.lines.len() {
-                let l = &b.lines[r - top];
-                row.push_str(l);
-                row.push_str(&" ".repeat(bw - l.chars().count()));
-            } else {
-                row.push_str(&" ".repeat(bw));
-            }
-        }
-    }
-    MBox {
-        lines: out,
-        base: above,
-    }
-}
-
-/// Wrap a box in growing brackets (`l`/`r`), tall when it spans many rows.
-fn bracket(b: MBox, l: char, r: char) -> MBox {
-    let h = b.lines.len();
-    if h <= 1 {
-        return MBox::line(format!(
-            "{l}{}{r}",
-            b.lines.first().cloned().unwrap_or_default()
-        ));
-    }
-    let (lt, lm, lb, rt, rm, rb) = bracket_pieces(l, r);
-    let lines = b
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let (lc, rc) = if i == 0 {
-                (lt, rt)
-            } else if i == h - 1 {
-                (lb, rb)
-            } else {
-                (lm, rm)
-            };
-            format!("{lc} {c} {rc}")
-        })
-        .collect();
-    MBox {
-        lines,
-        base: b.base,
-    }
-}
-
-/// Top/middle/bottom glyphs for a growing left/right bracket pair.
-fn bracket_pieces(l: char, r: char) -> (char, char, char, char, char, char) {
-    match (l, r) {
-        ('[', ']') => ('⎡', '⎢', '⎣', '⎤', '⎥', '⎦'),
-        ('(', ')') => ('⎛', '⎜', '⎝', '⎞', '⎟', '⎠'),
-        ('{', '}') => ('⎧', '⎪', '⎩', '⎫', '⎪', '⎭'),
-        _ => (l, '│', l, r, '│', r),
     }
 }
 
@@ -166,45 +46,7 @@ fn read_matrix(p: &mut XmlParser) -> MBox {
             Event::Text => {}
         }
     }
-    matrix_box(&rows)
-}
-
-/// Lay a grid of cells out as a bracketed text table (columns aligned).
-fn matrix_box(rows: &[Vec<MBox>]) -> MBox {
-    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    if rows.is_empty() || ncols == 0 {
-        return MBox::line("[]".to_string());
-    }
-    let cell =
-        |r: usize, c: usize| -> String { rows[r].get(c).map(MBox::flat).unwrap_or_default() };
-    let colw: Vec<usize> = (0..ncols)
-        .map(|c| {
-            (0..rows.len())
-                .map(|r| cell(r, c).chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let lines: Vec<String> = (0..rows.len())
-        .map(|r| {
-            (0..ncols)
-                .map(|c| {
-                    let s = cell(r, c);
-                    format!("{s}{}", " ".repeat(colw[c] - s.chars().count()))
-                })
-                .collect::<Vec<_>>()
-                .join("  ")
-        })
-        .collect();
-    let n = lines.len();
-    bracket(
-        MBox {
-            base: (n - 1) / 2,
-            lines,
-        },
-        '[',
-        ']',
-    )
+    matrix_grid(&rows, '[', ']')
 }
 
 fn is_prop(name: &str) -> bool {

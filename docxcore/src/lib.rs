@@ -23,6 +23,7 @@ pub mod equation;
 pub mod export;
 pub mod inflate;
 pub mod load;
+pub mod mathbox;
 pub mod model;
 pub mod numbering;
 pub mod omath;

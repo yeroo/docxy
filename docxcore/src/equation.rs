@@ -11,6 +11,8 @@
 //! Coverage is the common case; anything we can't make sense of returns `None`
 //! and the caller falls back to the rendered preview image.
 
+use crate::mathbox::{MBox, bracket, grid, hcat, vstack};
+
 /// Decode an `Equation.3` OLE object (`oleObjectN.bin` bytes) to Unicode text.
 pub fn decode(ole_bin: &[u8]) -> Option<String> {
     let stream = cfb_read_stream(ole_bin, "Equation Native")?;
@@ -36,8 +38,8 @@ pub fn decode_mtef(mtef: &[u8]) -> Option<String> {
         pos: 5,
         depth: 0,
     };
-    let s = p.list();
-    (!s.trim().is_empty()).then_some(s)
+    let s = crate::mathbox::flatten(&p.list());
+    (!s.is_empty()).then_some(s)
 }
 
 struct Mtef<'a> {
@@ -82,12 +84,12 @@ impl Mtef<'_> {
         }
     }
 
-    /// Parse an object list (records up to an END), returning its text.
-    fn list(&mut self) -> String {
-        let mut out = String::new();
+    /// Parse an object list (records up to an END), laying its pieces out in a row.
+    fn list(&mut self) -> MBox {
+        let mut items: Vec<MBox> = Vec::new();
         // Guard against malformed input causing runaway recursion.
         if self.depth > 40 {
-            return out;
+            return MBox::empty();
         }
         loop {
             if self.eof() {
@@ -112,7 +114,7 @@ impl Mtef<'_> {
                     if flags & XF_RULER != 0 {
                         self.ruler();
                     }
-                    out.push_str(&self.list());
+                    items.push(self.list());
                 }
                 2 => {
                     // CHAR
@@ -122,7 +124,7 @@ impl Mtef<'_> {
                     let _typeface = self.u8();
                     let ch = self.u16();
                     if let Some(c) = char::from_u32(ch as u32) {
-                        out.push(c);
+                        items.push(MBox::line(c.to_string()));
                     }
                     if flags & XF_EMBELL != 0 {
                         self.list(); // embellishment list, terminated by END
@@ -139,7 +141,7 @@ impl Mtef<'_> {
                     self.depth += 1;
                     let slots = self.slots();
                     self.depth -= 1;
-                    out.push_str(&format_template(selector, &slots));
+                    items.push(format_template(selector, &slots));
                 }
                 4 => {
                     // PILE: a vertical stack of lines
@@ -154,9 +156,10 @@ impl Mtef<'_> {
                     self.depth += 1;
                     let slots = self.slots();
                     self.depth -= 1;
-                    out.push_str(&slots.join(" "));
+                    let mid = slots.len() / 2;
+                    items.push(vstack(&slots, mid));
                 }
-                5 => out.push_str(&self.matrix(flags)), // MATRIX
+                5 => items.push(self.matrix(flags)), // MATRIX
                 6 => {
                     // EMBELL (standalone): an accent; skip its type byte.
                     if flags & XF_LMOVE != 0 {
@@ -176,11 +179,11 @@ impl Mtef<'_> {
                 _ => break,   // unknown — stop rather than desync
             }
         }
-        out
+        hcat(&items)
     }
 
     /// A template/pile sub-object list: each LINE is one slot.
-    fn slots(&mut self) -> Vec<String> {
+    fn slots(&mut self) -> Vec<MBox> {
         let mut slots = Vec::new();
         if self.depth > 40 {
             return slots;
@@ -197,7 +200,7 @@ impl Mtef<'_> {
                 1 => {
                     // LINE = one slot
                     if flags & XF_NULL != 0 {
-                        slots.push(String::new());
+                        slots.push(MBox::empty());
                         continue;
                     }
                     if flags & XF_LMOVE != 0 {
@@ -218,7 +221,7 @@ impl Mtef<'_> {
                 _ => {
                     self.pos -= 1;
                     let one = self.one_object();
-                    if !one.is_empty() {
+                    if !one.is_blank() {
                         slots.push(one);
                     }
                 }
@@ -230,9 +233,9 @@ impl Mtef<'_> {
     /// Read exactly one element: a LINE record's content (or a single object if
     /// the next record isn't a LINE). Used for matrix cells, where the element
     /// count is fixed and the cells are not terminated by a shared END.
-    fn read_line(&mut self) -> String {
+    fn read_line(&mut self) -> MBox {
         if self.eof() {
-            return String::new();
+            return MBox::empty();
         }
         let tag = self.u8();
         let typ = tag & 0x0f;
@@ -240,7 +243,7 @@ impl Mtef<'_> {
         match typ {
             1 => {
                 if flags & XF_NULL != 0 {
-                    return String::new();
+                    return MBox::empty();
                 }
                 if flags & XF_LMOVE != 0 {
                     self.skip_nudge();
@@ -253,7 +256,7 @@ impl Mtef<'_> {
                 }
                 self.list()
             }
-            0 => String::new(), // unexpected early END
+            0 => MBox::empty(), // unexpected early END
             _ => {
                 self.pos -= 1;
                 self.one_object()
@@ -262,12 +265,9 @@ impl Mtef<'_> {
     }
 
     /// Parse exactly one object (used when a template slot isn't wrapped in LINE).
-    fn one_object(&mut self) -> String {
-        // Reuse `list` semantics for a single record by faking a one-record list:
-        // read one record's worth via `list` is awkward, so handle the common
-        // CHAR/TMPL inline.
+    fn one_object(&mut self) -> MBox {
         if self.eof() {
-            return String::new();
+            return MBox::empty();
         }
         let tag = self.u8();
         let typ = tag & 0x0f;
@@ -283,8 +283,8 @@ impl Mtef<'_> {
                     self.list();
                 }
                 char::from_u32(ch as u32)
-                    .map(String::from)
-                    .unwrap_or_default()
+                    .map(|c| MBox::line(c.to_string()))
+                    .unwrap_or_else(MBox::empty)
             }
             3 => {
                 if flags & XF_LMOVE != 0 {
@@ -299,7 +299,7 @@ impl Mtef<'_> {
                 format_template(selector, &slots)
             }
             5 => self.matrix(flags),
-            _ => String::new(),
+            _ => MBox::empty(),
         }
     }
 
@@ -311,10 +311,9 @@ impl Mtef<'_> {
         }
     }
 
-    /// MATRIX record: a `rows`×`cols` grid of element object-lists. Rendered as
-    /// rows of space-separated cells, rows joined by ` / ` (any surrounding fence
-    /// is supplied by the enclosing template).
-    fn matrix(&mut self, flags: u8) -> String {
+    /// MATRIX record: a `rows`×`cols` grid of element object-lists, laid out as a
+    /// column-aligned grid (any surrounding bracket is supplied by the fence).
+    fn matrix(&mut self, flags: u8) -> MBox {
         if flags & XF_LMOVE != 0 {
             self.skip_nudge();
         }
@@ -333,27 +332,22 @@ impl Mtef<'_> {
         skip_parts(self, rows + 1);
         skip_parts(self, cols + 1);
         if rows == 0 || cols == 0 || rows * cols > 256 {
-            return String::new();
+            return MBox::empty();
         }
         self.depth += 1;
-        let mut cells = Vec::with_capacity(rows * cols);
-        for _ in 0..rows * cols {
-            if self.eof() || self.depth > 40 {
-                break;
+        let mut cells: Vec<Vec<MBox>> = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row = Vec::with_capacity(cols);
+            for _ in 0..cols {
+                if self.eof() || self.depth > 40 {
+                    break;
+                }
+                row.push(self.read_line());
             }
-            cells.push(self.read_line());
+            cells.push(row);
         }
         self.depth -= 1;
-        (0..rows)
-            .map(|r| {
-                (0..cols)
-                    .filter_map(|c| cells.get(r * cols + c))
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect::<Vec<_>>()
-            .join(" / ")
+        grid(&cells)
     }
 
     /// SIZE record (type 9), whose length depends on the first following byte.
@@ -374,28 +368,30 @@ impl Mtef<'_> {
 }
 
 /// Render a template from its selector and slot texts.
-fn format_template(selector: u8, slots: &[String]) -> String {
-    let s = |i: usize| slots.get(i).map(String::as_str).unwrap_or("");
+fn format_template(selector: u8, slots: &[MBox]) -> MBox {
+    let b = |i: usize| slots.get(i).cloned().unwrap_or_else(MBox::empty);
+    let s = |i: usize| slots.get(i).map(MBox::flat).unwrap_or_default();
     match selector {
-        // ParBoxClass fences: angle / paren / brace / square brackets.
-        0 => format!("⟨{}⟩", s(0)),
-        1 => format!("({})", s(0)),
-        2 => format!("{{{}}}", s(0)),
-        3 => format!("[{}]", s(0)),
+        // ParBoxClass fences: angle / paren / brace / square brackets. The bracket
+        // grows tall around a multi-row child (e.g. a matrix).
+        0 => bracket(b(0), '⟨', '⟩'),
+        1 => bracket(b(0), '(', ')'),
+        2 => bracket(b(0), '{', '}'),
+        3 => bracket(b(0), '[', ']'),
         // Radicals: square root (and nth root) — selectors vary; treat 9..=11 as roots.
         9..=11 => {
             if s(1).is_empty() {
-                format!("√({})", s(0))
+                MBox::line(format!("√({})", s(0)))
             } else {
-                format!("{}√({})", superscript(s(1)), s(0))
+                MBox::line(format!("{}√({})", superscript(&s(1)), s(0)))
             }
         }
         // Fraction.
-        14 => format!("({})/({})", s(0), s(1)),
+        14 => MBox::line(format!("({})/({})", s(0), s(1))),
         // Subscript/superscript: slots are [subscript, superscript].
-        15 => format!("{}{}", subscript(s(0)), superscript(s(1))),
-        // Unknown structure: keep the content so nothing is lost.
-        _ => slots.join(""),
+        15 => MBox::line(format!("{}{}", subscript(&s(0)), superscript(&s(1)))),
+        // Unknown structure: keep the content (laid out in a row).
+        _ => hcat(slots),
     }
 }
 
