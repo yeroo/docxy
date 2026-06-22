@@ -657,10 +657,11 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             Inline::Run(r) => w += str_width(&r.text),
             Inline::Hyperlink(h) => w += h.runs.iter().map(|r| str_width(&r.text)).sum::<usize>(),
             Inline::Tab | Inline::Break(_) => break,
-            Inline::Equation { text, .. } => w += str_width(text),
+            Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
+            | Inline::Equation { .. }
             | Inline::Raw(_) => {}
         }
     }
@@ -870,8 +871,9 @@ fn flatten_para(
                     }
                 }
             }
-            // A decoded equation flows as ordinary (non-editable) text at body size.
-            Inline::Equation { text, .. } => {
+            // A decoded equation flows as ordinary (non-editable) text at body
+            // size. A multi-line one (a matrix) is emitted as a block below.
+            Inline::Equation { text, .. } if !text.contains('\n') => {
                 let st = Style::default();
                 for ch in text.chars() {
                     segs.last_mut().unwrap().glyphs.push(Glyph {
@@ -884,8 +886,12 @@ fn flatten_para(
                     });
                 }
             }
-            // Rendered as a box after the paragraph, not in the inline flow.
-            Inline::SmartArt { .. } | Inline::Chart { .. } | Inline::TextBox { .. } => {}
+            // Rendered as a box/block after the paragraph, not in the inline flow
+            // (multi-line equations fall here; single-line ones match above).
+            Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::TextBox { .. }
+            | Inline::Equation { .. } => {}
         }
     }
     if inv {
@@ -1135,6 +1141,21 @@ fn render_paragraph(
         if let Inline::SmartArt { text, .. } = item {
             let blocks = smartart_blocks(text);
             out.extend(text_box(&blocks, None, width, opts, images));
+            continue;
+        }
+        // A multi-line equation (a matrix laid out as rows) is emitted on its own
+        // lines below the paragraph text.
+        if let Inline::Equation { text, .. } = item {
+            if text.contains('\n') {
+                for ln in text.split('\n') {
+                    out.push((
+                        Line {
+                            spans: vec![Line::text_span(ln.to_string())],
+                        },
+                        LineMap::default(),
+                    ));
+                }
+            }
             continue;
         }
         // A chart: drawn as a text bar/pie view in a (non-editable) box.

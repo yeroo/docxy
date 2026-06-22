@@ -2,23 +2,209 @@
 //! line, so equations show as readable text in a terminal that can't typeset
 //! real math. Fractions become `a/b`, sub/superscripts use Unicode where they
 //! exist (else `_`/`^`), n-ary operators keep their limits, delimiters keep
-//! their brackets, and matrices render as `[a, b; c, d]`.
+//! their brackets, and matrices render as a multi-row grid with growing
+//! brackets (so a 2×2 stacks onto two lines).
 
 use crate::xml::{Event, XmlParser};
 
 /// Render an `<m:oMath>` / `<m:oMathPara>` element (given as raw XML) to text.
+/// A matrix becomes a multi-line grid; the result may contain `\n`.
 pub fn render_omath(xml: &str) -> String {
     let mut p = XmlParser::new(xml);
     loop {
         match p.next() {
             Event::Start if p.name() == "m:oMath" || p.name() == "m:oMathPara" => {
                 let name = p.name().to_string();
-                return render_node(&mut p, &name).trim().to_string();
+                let b = render_node(&mut p, &name);
+                if b.lines.len() == 1 {
+                    return b.lines[0].trim().to_string();
+                }
+                // multi-line: trim each row's trailing pad, drop blank edge rows
+                let mut rows: Vec<String> =
+                    b.lines.iter().map(|l| l.trim_end().to_string()).collect();
+                while rows.first().is_some_and(|l| l.is_empty()) {
+                    rows.remove(0);
+                }
+                while rows.last().is_some_and(|l| l.is_empty()) {
+                    rows.pop();
+                }
+                return rows.join("\n");
             }
             Event::Eof => return String::new(),
             _ => {}
         }
     }
+}
+
+/// A laid-out fragment of math: `lines` stacked top-to-bottom, with `base` the
+/// row index that sits on the surrounding text's baseline (so a tall matrix
+/// aligns its middle with neighbouring `A =` text).
+#[derive(Clone)]
+struct MBox {
+    lines: Vec<String>,
+    base: usize,
+}
+
+impl MBox {
+    fn line(s: String) -> MBox {
+        MBox {
+            lines: vec![s],
+            base: 0,
+        }
+    }
+    fn width(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+    fn is_blank(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+    /// Flatten to one inline string (used when a construct can't stack).
+    fn flat(&self) -> String {
+        self.lines.join("")
+    }
+}
+
+/// Place boxes side by side, aligning their baselines.
+fn hcat(boxes: &[MBox]) -> MBox {
+    let boxes: Vec<&MBox> = boxes.iter().filter(|b| !b.is_blank()).collect();
+    match boxes.len() {
+        0 => return MBox::line(String::new()),
+        1 => return boxes[0].clone(),
+        _ => {}
+    }
+    let above = boxes.iter().map(|b| b.base).max().unwrap();
+    let below = boxes
+        .iter()
+        .map(|b| b.lines.len() - 1 - b.base)
+        .max()
+        .unwrap();
+    let h = above + below + 1;
+    let mut out = vec![String::new(); h];
+    for b in &boxes {
+        let bw = b.width();
+        let top = above - b.base;
+        for (r, row) in out.iter_mut().enumerate() {
+            if r >= top && r - top < b.lines.len() {
+                let l = &b.lines[r - top];
+                row.push_str(l);
+                row.push_str(&" ".repeat(bw - l.chars().count()));
+            } else {
+                row.push_str(&" ".repeat(bw));
+            }
+        }
+    }
+    MBox {
+        lines: out,
+        base: above,
+    }
+}
+
+/// Wrap a box in growing brackets (`l`/`r`), tall when it spans many rows.
+fn bracket(b: MBox, l: char, r: char) -> MBox {
+    let h = b.lines.len();
+    if h <= 1 {
+        return MBox::line(format!(
+            "{l}{}{r}",
+            b.lines.first().cloned().unwrap_or_default()
+        ));
+    }
+    let (lt, lm, lb, rt, rm, rb) = bracket_pieces(l, r);
+    let lines = b
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let (lc, rc) = if i == 0 {
+                (lt, rt)
+            } else if i == h - 1 {
+                (lb, rb)
+            } else {
+                (lm, rm)
+            };
+            format!("{lc} {c} {rc}")
+        })
+        .collect();
+    MBox {
+        lines,
+        base: b.base,
+    }
+}
+
+/// Top/middle/bottom glyphs for a growing left/right bracket pair.
+fn bracket_pieces(l: char, r: char) -> (char, char, char, char, char, char) {
+    match (l, r) {
+        ('[', ']') => ('⎡', '⎢', '⎣', '⎤', '⎥', '⎦'),
+        ('(', ')') => ('⎛', '⎜', '⎝', '⎞', '⎟', '⎠'),
+        ('{', '}') => ('⎧', '⎪', '⎩', '⎫', '⎪', '⎭'),
+        _ => (l, '│', l, r, '│', r),
+    }
+}
+
+/// Read an `<m:m>` matrix into a grid of cell boxes and lay it out.
+fn read_matrix(p: &mut XmlParser) -> MBox {
+    let mut rows: Vec<Vec<MBox>> = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "m:mr" => {
+                let mut cells = Vec::new();
+                loop {
+                    match p.next() {
+                        Event::Start if p.name() == "m:e" => cells.push(render_node(p, "m:e")),
+                        Event::Start => p.skip_element(),
+                        Event::End | Event::Eof => break,
+                        Event::Text => {}
+                    }
+                }
+                rows.push(cells);
+            }
+            Event::Start => p.skip_element(),
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    matrix_box(&rows)
+}
+
+/// Lay a grid of cells out as a bracketed text table (columns aligned).
+fn matrix_box(rows: &[Vec<MBox>]) -> MBox {
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if rows.is_empty() || ncols == 0 {
+        return MBox::line("[]".to_string());
+    }
+    let cell =
+        |r: usize, c: usize| -> String { rows[r].get(c).map(MBox::flat).unwrap_or_default() };
+    let colw: Vec<usize> = (0..ncols)
+        .map(|c| {
+            (0..rows.len())
+                .map(|r| cell(r, c).chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let lines: Vec<String> = (0..rows.len())
+        .map(|r| {
+            (0..ncols)
+                .map(|c| {
+                    let s = cell(r, c);
+                    format!("{s}{}", " ".repeat(colw[c] - s.chars().count()))
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect();
+    let n = lines.len();
+    bracket(
+        MBox {
+            base: (n - 1) / 2,
+            lines,
+        },
+        '[',
+        ']',
+    )
 }
 
 fn is_prop(name: &str) -> bool {
@@ -51,9 +237,9 @@ fn take_text(p: &mut XmlParser) -> String {
         .collect()
 }
 
-/// The (tag, rendered-text) of each child element of the current element,
+/// The (tag, rendered box) of each child element of the current element,
 /// consuming through its end tag.
-fn parts(p: &mut XmlParser) -> Vec<(String, String)> {
+fn parts(p: &mut XmlParser) -> Vec<(String, MBox)> {
     let mut out = Vec::new();
     loop {
         match p.next() {
@@ -62,7 +248,7 @@ fn parts(p: &mut XmlParser) -> Vec<(String, String)> {
                 if is_char_prop(&n) {
                     let v = decode(p.attr("m:val"));
                     p.skip_element();
-                    out.push((n, v));
+                    out.push((n, MBox::line(v)));
                 } else if is_prop(&n) {
                     // Properties are ignored, except the bracket/operator chars
                     // (m:chr / m:begChr / m:endChr) nested inside them.
@@ -72,7 +258,7 @@ fn parts(p: &mut XmlParser) -> Vec<(String, String)> {
                         }
                     }
                 } else if n == "m:t" {
-                    out.push((n, take_text(p)));
+                    out.push((n, MBox::line(take_text(p))));
                 } else {
                     let r = render_node(p, &n);
                     out.push((n, r));
@@ -84,55 +270,63 @@ fn parts(p: &mut XmlParser) -> Vec<(String, String)> {
     }
 }
 
-/// Render one element (its Start already consumed) by combining its children.
-fn render_node(p: &mut XmlParser, name: &str) -> String {
+/// Render one element (its Start already consumed) into a math box.
+fn render_node(p: &mut XmlParser, name: &str) -> MBox {
+    if name == "m:m" {
+        return read_matrix(p);
+    }
     let ps = parts(p);
-    let one = |tag: &str| -> String {
+    // flattened-string view of the first child with a tag
+    let s1 = |tag: &str| -> String {
         ps.iter()
             .find(|(t, _)| t == tag)
-            .map(|(_, v)| v.clone())
+            .map(|(_, b)| b.flat())
             .unwrap_or_default()
     };
-    let all = |tag: &str| -> Vec<String> {
+    let strs = |tag: &str| -> Vec<String> {
         ps.iter()
             .filter(|(t, _)| t == tag)
-            .map(|(_, v)| v.clone())
-            .collect()
-    };
-    let concat = || -> String {
-        ps.iter()
-            .filter(|(t, _)| !is_prop(t))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, b)| b.flat())
             .collect()
     };
 
     match name {
-        "m:f" => format!(
+        "m:f" => MBox::line(format!(
             "{}/{}",
-            paren_if_op(&one("m:num")),
-            paren_if_op(&one("m:den"))
-        ),
+            paren_if_op(&s1("m:num")),
+            paren_if_op(&s1("m:den"))
+        )),
         "m:d" => {
-            let beg = first_nonempty(&all("m:begChr")).unwrap_or_else(|| "(".to_string());
-            let end = first_nonempty(&all("m:endChr")).unwrap_or_else(|| ")".to_string());
-            // OMML's default separator is a vertical bar, not a comma.
-            let sep = first_nonempty(&all("m:sepChr")).unwrap_or_else(|| "|".to_string());
-            let inner = all("m:e").join(&sep);
-            format!("{beg}{inner}{end}")
+            let beg = first_nonempty(&strs("m:begChr")).unwrap_or_else(|| "(".to_string());
+            let end = first_nonempty(&strs("m:endChr")).unwrap_or_else(|| ")".to_string());
+            let elems: Vec<MBox> = ps
+                .iter()
+                .filter(|(t, _)| t == "m:e")
+                .map(|(_, b)| b.clone())
+                .collect();
+            // A single matrix-like child keeps its own (tall) brackets; otherwise
+            // wrap the inline content in the requested delimiter chars.
+            if elems.len() == 1 && elems[0].lines.len() > 1 {
+                elems.into_iter().next().unwrap()
+            } else {
+                let sep = first_nonempty(&strs("m:sepChr")).unwrap_or_else(|| "|".to_string());
+                let inner = elems.iter().map(MBox::flat).collect::<Vec<_>>().join(&sep);
+                MBox::line(format!("{beg}{inner}{end}"))
+            }
         }
-        "m:sSub" => format!("{}{}", one("m:e"), to_script(&one("m:sub"), false)),
-        "m:sSup" => format!("{}{}", one("m:e"), to_script(&one("m:sup"), true)),
-        "m:sSubSup" => format!(
+        "m:sSub" => MBox::line(format!("{}{}", s1("m:e"), to_script(&s1("m:sub"), false))),
+        "m:sSup" => MBox::line(format!("{}{}", s1("m:e"), to_script(&s1("m:sup"), true))),
+        "m:sSubSup" => MBox::line(format!(
             "{}{}{}",
-            one("m:e"),
-            to_script(&one("m:sub"), false),
-            to_script(&one("m:sup"), true)
-        ),
+            s1("m:e"),
+            to_script(&s1("m:sub"), false),
+            to_script(&s1("m:sup"), true)
+        )),
         "m:nary" => {
-            let op = first_nonempty(&all("m:chr")).unwrap_or_else(|| "∫".to_string());
+            let op = first_nonempty(&strs("m:chr")).unwrap_or_else(|| "∫".to_string());
             let mut s = op;
-            let sub = one("m:sub");
-            let sup = one("m:sup");
+            let sub = s1("m:sub");
+            let sup = s1("m:sup");
             if !sub.is_empty() {
                 s.push('_');
                 s.push_str(&paren_if_op(&sub));
@@ -142,23 +336,27 @@ fn render_node(p: &mut XmlParser, name: &str) -> String {
                 s.push_str(&paren_if_op(&sup));
             }
             s.push(' ');
-            s.push_str(&one("m:e"));
-            s
+            s.push_str(&s1("m:e"));
+            MBox::line(s)
         }
-        "m:func" => format!("{}({})", one("m:fName"), one("m:e")),
+        "m:func" => MBox::line(format!("{}({})", s1("m:fName"), s1("m:e"))),
         "m:rad" => {
-            let deg = one("m:deg");
+            let deg = s1("m:deg");
             if deg.is_empty() {
-                format!("√({})", one("m:e"))
+                MBox::line(format!("√({})", s1("m:e")))
             } else {
-                format!("{deg}√({})", one("m:e"))
+                MBox::line(format!("{deg}√({})", s1("m:e")))
             }
         }
-        "m:m" => format!("[{}]", all("m:mr").join("; ")),
-        "m:mr" => all("m:e").join(", "),
-        // generic containers: m:e, m:num, m:den, m:sub, m:sup, m:fName, m:r,
-        // m:oMath, m:oMathPara …
-        _ => concat(),
+        // generic containers (m:e, m:num, m:r, m:oMath, …): place children in a row
+        _ => {
+            let boxes: Vec<MBox> = ps
+                .into_iter()
+                .filter(|(t, _)| !is_prop(t))
+                .map(|(_, b)| b)
+                .collect();
+            hcat(&boxes)
+        }
     }
 }
 
@@ -323,15 +521,16 @@ mod tests {
             "missing equation:\n{}",
             &text[..text.len().min(300)]
         );
-        assert!(text.contains("[1, 0; 0, 1]"), "matrix not text-rendered");
+        assert!(text.contains("⎡ 1  0 ⎤"), "matrix not rendered as a grid");
     }
 
     #[test]
-    fn matrix_renders_as_text_grid() {
+    fn matrix_renders_as_a_multi_row_grid() {
         let x = "<m:oMath><m:m><m:mr><m:e><m:r><m:t>a</m:t></m:r></m:e>\
                  <m:e><m:r><m:t>b</m:t></m:r></m:e></m:mr>\
                  <m:mr><m:e><m:r><m:t>c</m:t></m:r></m:e>\
                  <m:e><m:r><m:t>d</m:t></m:r></m:e></m:mr></m:m></m:oMath>";
-        assert_eq!(r(x), "[a, b; c, d]");
+        // two rows, columns aligned, with growing square brackets
+        assert_eq!(r(x), "⎡ a  b ⎤\n⎣ c  d ⎦");
     }
 }
