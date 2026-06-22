@@ -285,6 +285,19 @@ struct App {
     page_view: bool,
     invisibles: bool,
     borderless: bool,
+    /// Light document page (black on white) instead of the terminal default.
+    light_page: bool,
+    /// Show the column ruler above the document.
+    show_ruler: bool,
+    /// Show the navigation (heading outline) pane on the left.
+    show_nav: bool,
+    /// Navigation pane geometry + entries (set by draw() for clicks).
+    nav_rect: Rect,
+    nav_items: Vec<(String, usize)>, // (heading text, doc line)
+    /// Top-left of the document content area on screen (set by draw() so mouse
+    /// coordinates map to document rows/cols across the nav pane and ruler).
+    doc_x0: u16,
+    doc_y0: u16,
     /// Whether to write view-mode toggles to the user config (only the real TUI;
     /// off in tests so the suite never reads or writes the shared config file).
     persist_prefs: bool,
@@ -402,6 +415,13 @@ impl App {
             page_view: false,
             invisibles: false,
             borderless: false,
+            light_page: false,
+            show_ruler: false,
+            show_nav: false,
+            nav_rect: Rect::default(),
+            nav_items: Vec::new(),
+            doc_x0: 0,
+            doc_y0: 0,
             persist_prefs: false,
             ribbon: ribbon::Ribbon::home(),
             ribbon_open: false,
@@ -485,6 +505,9 @@ impl App {
             page_view: self.page_view,
             invisibles: self.invisibles,
             borderless: self.borderless,
+            light_page: self.light_page,
+            show_ruler: self.show_ruler,
+            show_nav: self.show_nav,
         }
         .save();
     }
@@ -606,10 +629,44 @@ impl App {
                 self.dirty = true;
             }
             ToggleComments => self.toggle_comments(),
+            ReadMode => self.set_page_view(false),
+            PrintLayout => self.set_page_view(true),
+            DarkMode => {
+                self.light_page = !self.light_page;
+                self.save_view_prefs();
+                self.status = Some(
+                    if self.light_page {
+                        "Light page"
+                    } else {
+                        "Dark page"
+                    }
+                    .to_string(),
+                );
+                self.dirty = true;
+            }
+            ToggleRuler => {
+                self.show_ruler = !self.show_ruler;
+                self.save_view_prefs();
+                self.dirty = true;
+            }
+            ToggleNav => {
+                self.show_nav = !self.show_nav;
+                self.save_view_prefs();
+                self.dirty = true;
+            }
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Set print-layout (page) view on/off and persist it.
+    fn set_page_view(&mut self, on: bool) {
+        if self.page_view != on {
+            self.page_view = on;
+            self.save_view_prefs();
+            self.dirty = true;
         }
     }
 
@@ -1533,6 +1590,73 @@ impl App {
         }
     }
 
+    /// A column ruler row aligned with the document's left edge.
+    fn draw_ruler(&self, f: &mut Frame, area: Rect) {
+        let mut s = String::with_capacity(area.width as usize);
+        for c in 0..area.width as usize {
+            if c % 10 == 0 {
+                s.push(char::from_digit(((c / 10) % 10) as u32, 10).unwrap_or('|'));
+            } else if c % 5 == 0 {
+                s.push('+');
+            } else {
+                s.push('·');
+            }
+        }
+        f.render_widget(
+            Paragraph::new(RLine::styled(
+                s,
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            area,
+        );
+    }
+
+    /// The navigation (outline) pane: the document's headings, click to jump.
+    fn draw_nav_pane(&mut self, f: &mut Frame) {
+        let area = self.nav_rect;
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let mut items: Vec<(String, usize)> = Vec::new();
+        for (bi, block) in self.editor.doc.body.iter().enumerate() {
+            if let Block::Paragraph(p) = block {
+                if let Some(lvl) = p.props.heading_level {
+                    let text = p.plain_text().trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let line = self
+                        .maps
+                        .iter()
+                        .position(|m| m.segs.iter().any(|s| s.path.first() == Some(&bi)))
+                        .unwrap_or(0);
+                    let indent = "  ".repeat(lvl.saturating_sub(1) as usize);
+                    items.push((format!("{indent}{text}"), line));
+                }
+            }
+        }
+        self.nav_items = items;
+
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let inner_h = area.height.saturating_sub(2) as usize;
+        let body: Vec<RLine> = if self.nav_items.is_empty() {
+            vec![RLine::styled("(no headings)", dim)]
+        } else {
+            self.nav_items
+                .iter()
+                .take(inner_h)
+                .map(|(t, _)| RLine::raw(fit_width(t, inner_w)))
+                .collect()
+        };
+        f.render_widget(
+            Paragraph::new(body).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Navigation "),
+            ),
+            area,
+        );
+    }
+
     /// A centered modal Yes/No box. Stores the button rects for hit-testing.
     fn draw_confirm(&mut self, f: &mut Frame, area: Rect, prompt: &str, yes: bool) {
         let w = ((prompt.chars().count() as u16) + 6)
@@ -2103,8 +2227,24 @@ impl App {
             }
             return; // backstage handles its own mouse
         }
+        // Navigation pane: click a heading to jump to it.
+        if self.show_nav
+            && m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.nav_rect.contains(Position {
+                x: m.column,
+                y: m.row,
+            })
+        {
+            let row = m.row.saturating_sub(self.nav_rect.y + 1) as usize; // inside the box border
+            if let Some((_, line)) = self.nav_items.get(row) {
+                self.scroll = (*line).min(self.lines.len().saturating_sub(1));
+                self.follow_caret = false;
+                self.dirty = true;
+            }
+            return;
+        }
         let mrow = m.row as usize;
-        let col = m.column as usize;
+        let col = (m.column as usize).saturating_sub(self.doc_x0 as usize);
         // A left-click in the ribbon area drives the ribbon; other events (wheel,
         // drag) fall through to the document so scrolling works anywhere.
         if mrow < self.ribbon_h {
@@ -2113,7 +2253,13 @@ impl App {
                 return;
             }
         }
-        let row = mrow.saturating_sub(self.ribbon_h); // row within the document viewport
+        // Ignore left-clicks on the ruler row (between the ribbon and the document).
+        if mrow < self.doc_y0 as usize {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                return;
+            }
+        }
+        let row = mrow.saturating_sub(self.doc_y0 as usize); // row within the document viewport
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Returning to the document collapses the on-demand ribbon and
@@ -3006,7 +3152,27 @@ impl App {
         // The ribbon sits above the document; its height is the collapsed tab
         // strip or the expanded body. Stored so mouse rows can be routed.
         self.ribbon_h = self.ribbon_height();
-        self.ribbon.set_comments_on(self.show_comments);
+        // Tell the ribbon which toggles are on (drawn inverted) + the page mode.
+        let mut toggles = Vec::new();
+        if self.invisibles {
+            toggles.push(ribbon::Act::ShowHide);
+        }
+        if self.show_comments {
+            toggles.push(ribbon::Act::ToggleComments);
+        }
+        toggles.push(if self.page_view {
+            ribbon::Act::PrintLayout
+        } else {
+            ribbon::Act::ReadMode
+        });
+        if self.show_ruler {
+            toggles.push(ribbon::Act::ToggleRuler);
+        }
+        if self.show_nav {
+            toggles.push(ribbon::Act::ToggleNav);
+        }
+        self.ribbon.set_toggles(toggles);
+        self.ribbon.set_light_page(self.light_page);
         let chunks = Layout::vertical([
             Constraint::Length(self.ribbon_h as u16),
             Constraint::Min(1),
@@ -3028,6 +3194,23 @@ impl App {
             self.draw_comments_panel(f, cols[1]);
         }
 
+        // Navigation (outline) pane on the left.
+        self.nav_rect = Rect::default();
+        if self.show_nav && full.width > 40 {
+            let nw = 26.min(full.width / 3);
+            let cols =
+                Layout::horizontal([Constraint::Length(nw), Constraint::Min(10)]).split(full);
+            self.nav_rect = cols[0];
+            full = cols[1];
+        }
+
+        // Column ruler at the top of the document area.
+        if self.show_ruler && full.height > 2 {
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(full);
+            self.draw_ruler(f, rows[0]);
+            full = rows[1];
+        }
+
         // Reserve a one-column gutter on the right for the vertical scrollbar, so
         // the rendered width stays stable whether or not the bar is shown.
         let gutter = if full.width > 2 { 1 } else { 0 };
@@ -3035,9 +3218,14 @@ impl App {
             width: full.width - gutter,
             ..full
         };
+        self.doc_x0 = content.x;
+        self.doc_y0 = content.y;
 
         self.viewport_h = content.height.max(1) as usize;
         self.ensure_rendered(content.width);
+        if self.show_nav {
+            self.draw_nav_pane(f);
+        }
 
         // Keep the caret in view after keyboard moves, but never fight the user
         // when they're scrolling/dragging the viewport themselves.
@@ -3063,7 +3251,14 @@ impl App {
             &[]
         };
         let text = Text::from(visible.iter().map(doc_line_to_ratatui).collect::<Vec<_>>());
-        f.render_widget(Paragraph::new(text), content);
+        // Light page: black on white (fills the whole content rect). Black/auto
+        // text inherits this base, coloured text keeps its colour.
+        let para = if self.light_page {
+            Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::White))
+        } else {
+            Paragraph::new(text)
+        };
+        f.render_widget(para, content);
 
         // Overlay real image pixels onto the placeholder boxes. Each image is
         // encoded once per visible window and just re-emitted as it moves, so
@@ -3252,6 +3447,9 @@ struct ViewPrefs {
     page_view: bool,
     invisibles: bool,
     borderless: bool,
+    light_page: bool,
+    show_ruler: bool,
+    show_nav: bool,
 }
 
 impl ViewPrefs {
@@ -3277,6 +3475,9 @@ impl ViewPrefs {
                     "page_view" => p.page_view = on,
                     "invisibles" => p.invisibles = on,
                     "borderless" => p.borderless = on,
+                    "light_page" => p.light_page = on,
+                    "show_ruler" => p.show_ruler = on,
+                    "show_nav" => p.show_nav = on,
                     _ => {}
                 }
             }
@@ -3286,8 +3487,13 @@ impl ViewPrefs {
 
     fn to_conf(self) -> String {
         format!(
-            "page_view={}\ninvisibles={}\nborderless={}\n",
-            self.page_view as u8, self.invisibles as u8, self.borderless as u8,
+            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\n",
+            self.page_view as u8,
+            self.invisibles as u8,
+            self.borderless as u8,
+            self.light_page as u8,
+            self.show_ruler as u8,
+            self.show_nav as u8,
         )
     }
 
@@ -3618,6 +3824,9 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     app.page_view = prefs.page_view;
     app.invisibles = prefs.invisibles;
     app.borderless = prefs.borderless;
+    app.light_page = prefs.light_page;
+    app.show_ruler = prefs.show_ruler;
+    app.show_nav = prefs.show_nav;
     app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
@@ -3698,11 +3907,17 @@ mod tests {
             page_view: true,
             invisibles: false,
             borderless: true,
+            light_page: true,
+            show_ruler: false,
+            show_nav: true,
         };
         let back = ViewPrefs::parse(&p.to_conf());
         assert_eq!(back.page_view, p.page_view);
         assert_eq!(back.invisibles, p.invisibles);
         assert_eq!(back.borderless, p.borderless);
+        assert_eq!(back.light_page, p.light_page);
+        assert_eq!(back.show_ruler, p.show_ruler);
+        assert_eq!(back.show_nav, p.show_nav);
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
         assert!(partial.invisibles && !partial.page_view && !partial.borderless);
@@ -3916,6 +4131,23 @@ mod tests {
         assert_eq!(rl.spans[0].style.fg, None);
         // other colors still map
         assert_eq!(rl.spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn view_ribbon_actions_toggle_their_state() {
+        let mut app = app_with(&["heading"]);
+        assert_eq!(app.ribbon.tab_label(3), Some("View"));
+        app.run_act(ribbon::Act::PrintLayout);
+        assert!(app.page_view);
+        app.run_act(ribbon::Act::ReadMode);
+        assert!(!app.page_view);
+        assert!(!app.light_page);
+        app.run_act(ribbon::Act::DarkMode);
+        assert!(app.light_page);
+        app.run_act(ribbon::Act::ToggleRuler);
+        assert!(app.show_ruler);
+        app.run_act(ribbon::Act::ToggleNav);
+        assert!(app.show_nav);
     }
 
     #[test]

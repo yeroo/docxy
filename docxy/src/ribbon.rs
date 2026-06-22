@@ -32,6 +32,17 @@ pub enum Act {
     SelectAll,
     /// Toggle the comments review side panel.
     ToggleComments,
+    // View tab
+    /// Reflowed reading view (page layout off).
+    ReadMode,
+    /// Print layout (pages with margins/headers).
+    PrintLayout,
+    /// Switch the document page between dark and light.
+    DarkMode,
+    /// Toggle the column ruler.
+    ToggleRuler,
+    /// Toggle the navigation (outline) pane.
+    ToggleNav,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -111,8 +122,10 @@ pub struct Ribbon {
     /// Column ranges of each tab header on the (collapsed or expanded) top row.
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive)
     width: u16,
-    /// Whether the comments panel is on (drives the Review ▸ Show checkbox).
-    comments_on: bool,
+    /// Toggle buttons that are currently "on" — drawn with inverted fg/bg.
+    active_toggles: Vec<Act>,
+    /// Whether the document page is light (drives the View ▸ Dark Mode icon).
+    light_page: bool,
 }
 
 const ROW0: usize = 1; // y of first button row inside the expanded ribbon
@@ -121,22 +134,28 @@ const ROW1: usize = 2; // y of second button row
 impl Ribbon {
     pub fn home() -> Ribbon {
         let mut r = Ribbon {
-            // File opens the full-screen backstage; Home and Review are ribbons.
-            tabs: vec!["File", "Home", "Review"],
+            // File opens the backstage; Home/Review/View are ribbons.
+            tabs: vec!["File", "Home", "Review", "View"],
             active: 1,
-            tab_groups: vec![Vec::new(), home_groups(), review_groups()],
+            tab_groups: vec![Vec::new(), home_groups(), review_groups(), view_groups()],
             placed: Vec::new(),
             tab_cols: Vec::new(),
             width: 0,
-            comments_on: false,
+            active_toggles: Vec::new(),
+            light_page: false,
         };
         r.layout();
         r
     }
 
-    /// Reflect the comments-panel state in the Review ▸ Show checkbox.
-    pub fn set_comments_on(&mut self, on: bool) {
-        self.comments_on = on;
+    /// Set which toggle buttons are "on" (drawn inverted).
+    pub fn set_toggles(&mut self, acts: Vec<Act>) {
+        self.active_toggles = acts;
+    }
+
+    /// Set whether the page is light (flips the Dark Mode sun/moon icon).
+    pub fn set_light_page(&mut self, on: bool) {
+        self.light_page = on;
     }
 
     /// The groups of the currently active tab (empty for tabs without a body).
@@ -345,6 +364,57 @@ fn review_groups() -> Vec<Group> {
                     8,
                     Todo("Display for Review"),
                     "Display for review",
+                )],
+            ],
+        },
+    ]
+}
+
+/// The View tab's groups (Views / Page / Show).
+fn view_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Views",
+            width: 5,
+            rows: [
+                vec![btn(
+                    "Read",
+                    4,
+                    ReadMode,
+                    "Read Mode — reflowed reading view",
+                )],
+                vec![btn(
+                    "Print",
+                    5,
+                    PrintLayout,
+                    "Print Layout — pages with margins & headers",
+                )],
+            ],
+        },
+        Group {
+            title: "Page",
+            width: 6,
+            rows: [
+                vec![btn(
+                    "☀ Mode",
+                    6,
+                    DarkMode,
+                    "Dark Mode — switch the page between dark and light",
+                )],
+                vec![],
+            ],
+        },
+        Group {
+            title: "Show",
+            width: 8,
+            rows: [
+                vec![btn("Ruler", 5, ToggleRuler, "Show the column ruler")],
+                vec![btn(
+                    "Nav Pane",
+                    8,
+                    ToggleNav,
+                    "Navigation pane — jump to a heading",
                 )],
             ],
         },
@@ -621,19 +691,23 @@ impl Ribbon {
                     let is_focus = focused
                         .map(|p| p.row == rr && p.act == b.act && p.hint == b.hint)
                         .unwrap_or(false);
+                    let is_on = self.active_toggles.contains(&b.act);
                     let style = if is_focus {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else if is_on {
+                        // a toggle that's on: invert fg/bg so it's obviously active
+                        Style::default().add_modifier(Modifier::REVERSED)
                     } else if b.act.enabled() {
                         Style::default()
                     } else {
                         Style::default().add_modifier(Modifier::DIM)
                     };
-                    // Toggle buttons render as a checkbox reflecting their state.
-                    let glyph = if b.act == Act::ToggleComments {
-                        if self.comments_on {
-                            "[x] Show"
+                    // Dark Mode shows the sun on a dark page, the moon on a light one.
+                    let glyph = if b.act == Act::DarkMode {
+                        if self.light_page {
+                            "☾ Mode"
                         } else {
-                            "[ ] Show"
+                            "☀ Mode"
                         }
                     } else {
                         b.glyph
@@ -691,6 +765,46 @@ mod tests {
         assert!(Act::AlignLeft.enabled());
         assert!(!Act::Todo("Bullets").enabled());
         assert!(r.button_count() > 20);
+    }
+
+    #[test]
+    fn an_on_toggle_button_is_drawn_inverted() {
+        let mut r = Ribbon::home();
+        r.set_active(3); // View tab has Read/Print toggles
+        assert_eq!(r.tab_label(3), Some("View"));
+        // nothing inverted yet
+        let plain = r.render_body(Focus::None);
+        let any_rev = |ls: &[Line]| {
+            ls.iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+        };
+        assert!(!any_rev(&plain));
+        // mark Read Mode on → its button inverts
+        r.set_toggles(vec![Act::ReadMode]);
+        assert!(any_rev(&r.render_body(Focus::None)));
+    }
+
+    #[test]
+    fn dark_mode_icon_flips_with_the_page() {
+        let mut r = Ribbon::home();
+        r.set_active(3);
+        let body = |r: &Ribbon| {
+            r.render_body(Focus::None)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.clone())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        r.set_light_page(false);
+        assert!(body(&r).contains('☀')); // dark page → sun
+        r.set_light_page(true);
+        assert!(body(&r).contains('☾')); // light page → moon
     }
 
     #[test]
