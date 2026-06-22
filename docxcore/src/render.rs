@@ -192,6 +192,9 @@ pub struct LineMap {
     /// Marks an image placeholder line. Pagination keeps a contiguous run of these
     /// together on one page when the image fits, rather than cutting it.
     pub image: bool,
+    /// A wide-table line that is allowed to extend past the page's right border
+    /// (instead of being clipped) when the table doesn't fit the page width.
+    pub overflow: bool,
 }
 
 impl LineMap {
@@ -200,6 +203,7 @@ impl LineMap {
             segs: vec![seg],
             page_break: false,
             image: false,
+            overflow: false,
         }
     }
     /// The segment containing the caret (path + offset), if any.
@@ -1705,7 +1709,19 @@ fn render_table(
     } else {
         3 * ncols + 1
     };
-    let content_total = width.saturating_sub(overhead).max(ncols);
+    // In page layout, a top-level table that can't give each column a readable
+    // width is rendered wider than the page and allowed to extend past the right
+    // border (capped at the terminal), rather than crammed into 1-2 cell columns.
+    const MIN_COL: usize = 8;
+    let top_level = table_path.len() <= 1;
+    let eff_width = if opts.page_view && top_level {
+        let desired = ncols * MIN_COL + overhead;
+        desired.clamp(width, opts.width.saturating_sub(2).max(width))
+    } else {
+        width
+    };
+    let overflow = eff_width > width;
+    let content_total = eff_width.saturating_sub(overhead).max(ncols);
     let base = content_total / ncols;
     let rem = content_total - base * ncols;
     let cols: Vec<usize> = (0..ncols)
@@ -1855,6 +1871,12 @@ fn render_table(
                 });
             }
             out.push((line, map));
+        }
+    }
+    // Wide table: let pagination know these lines may extend past the page border.
+    if overflow {
+        for (_, m) in &mut out {
+            m.overflow = true;
         }
     }
     out
@@ -2148,11 +2170,17 @@ fn paginate(
         let mut placed = 0usize;
         while it.peek().map(|t| t.3) == Some(page) {
             let (idx, ln, mut map, _) = it.next().unwrap();
-            let (clipped, w) = clip_to_cols(ln.spans, m.content_cols);
-            let rpad = m.content_cols - w;
             let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
-            spans.extend(clipped);
-            spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+            if map.overflow {
+                // A wide table line: keep it whole and let it run past the right
+                // border (no clip, no right frame) — the page extends rightward.
+                spans.extend(ln.spans);
+            } else {
+                let (clipped, w) = clip_to_cols(ln.spans, m.content_cols);
+                let rpad = m.content_cols - w;
+                spans.extend(clipped);
+                spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+            }
             for seg in &mut map.segs {
                 seg.col0 += col_off;
             }
@@ -3012,6 +3040,43 @@ mod tests {
     }
 
     #[test]
+    fn wide_table_overflows_the_page_instead_of_cramming() {
+        // A 10-column table can't fit a small page width; in page-view it should
+        // widen and extend past the right border rather than cram to 1-cell cells.
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(vec![run(s, RunProps::default())])],
+        };
+        let mkrow = || Row {
+            cells: (0..10).map(|i| cell(&format!("c{i}"))).collect(),
+        };
+        let t = Table {
+            grid: vec![100; 10],
+            rows: vec![mkrow(), mkrow()],
+        };
+        let d = doc(vec![Block::Table(t)]);
+        let o = RenderOptions {
+            width: 100,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+        let (lines, _) = render_mapped(&d, &o);
+        let content_cols = page_metrics(o.width, o.page).content_cols;
+        // some table row must be wider than the page content area (it overflows)
+        let widest = lines.iter().map(|l| l.width()).max().unwrap();
+        assert!(
+            widest > content_cols + 2,
+            "table did not overflow: widest {widest}, content {content_cols}"
+        );
+        // and every column label still shows in full (not crammed/clipped away)
+        let joined = lines.iter().map(|l| l.plain()).collect::<String>();
+        for i in 0..10 {
+            assert!(joined.contains(&format!("c{i}")), "missing c{i}");
+        }
+    }
+
+    #[test]
     fn narrow_table_keeps_borders_aligned() {
         // At a small width the columns are < 4 cells; cell text must wrap to the
         // column instead of overflowing it (which used to break the borders).
@@ -3024,10 +3089,20 @@ mod tests {
             grid: vec![100, 100, 100, 100],
             rows: vec![
                 Row {
-                    cells: vec![cell("Release"), cell("Disk"), cell("Media"), cell("Product")],
+                    cells: vec![
+                        cell("Release"),
+                        cell("Disk"),
+                        cell("Media"),
+                        cell("Product"),
+                    ],
                 },
                 Row {
-                    cells: vec![cell("09/29/95"), cell("Disk1"), cell("1.44mb"), cell("Office")],
+                    cells: vec![
+                        cell("09/29/95"),
+                        cell("Disk1"),
+                        cell("1.44mb"),
+                        cell("Office"),
+                    ],
                 },
             ],
         };
