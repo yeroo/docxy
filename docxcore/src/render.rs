@@ -390,47 +390,66 @@ pub fn render_with_images(
     let pl = page_lines(opts);
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut images: Vec<ImageBox> = Vec::new();
-    for (start, end, geom) in sections(doc, opts.page) {
+    for (start, end, geom, col_tw) in sections(doc, opts.page) {
         let m = page_metrics(opts.width, geom);
         let content_width = m.content_cols;
-        // Newspaper columns: render the section at the narrower column width, then
-        // flow the resulting lines into N side-by-side columns per page.
         let ncols = geom.cols.max(1) as usize;
-        let col_layout = (ncols > 1).then(|| {
-            let text_tw = (geom.w - geom.ml - geom.mr).max(1) as f32;
-            let gap = ((geom.col_space as f32) * content_width as f32 / text_tw).round() as usize;
-            let gap = gap.clamp(1, content_width / 4);
-            let col_w = (content_width.saturating_sub((ncols - 1) * gap) / ncols).max(6);
-            (ncols, gap, col_w, m.content_rows)
-        });
-        let render_w = col_layout.map(|(_, _, w, _)| w).unwrap_or(content_width);
-
-        let mut sec_imgs = Vec::new();
         // The slice rebases paragraph paths to 0, so the path-keyed selection and
         // list markers must be rebased to match (else they silently miss every
         // paragraph after the first section break).
         let sec_opts = section_opts(opts, start, end);
-        let mut pairs = render_blocks(
-            &doc.body[start..end],
-            &[],
-            render_w,
-            &sec_opts,
-            &mut sec_imgs,
-        );
         // The slice rebased paragraph paths to 0; restore body-absolute paths.
-        for (_, map) in &mut pairs {
-            for seg in &mut map.segs {
-                if let Some(first) = seg.path.first_mut() {
-                    *first += start;
+        let rebase = |pairs: &mut Vec<(Line, LineMap)>| {
+            for (_, map) in pairs.iter_mut() {
+                for seg in &mut map.segs {
+                    if let Some(first) = seg.path.first_mut() {
+                        *first += start;
+                    }
                 }
             }
-        }
-        if let Some((n, gap, col_w, rows)) = col_layout {
-            // Pixel-image overlays can't follow the column reflow; drop them (the
-            // placeholder space remains). Text/charts flow as normal content.
-            sec_imgs.clear();
-            pairs = columnize(pairs, n, gap, col_w, rows);
-        }
+        };
+
+        let mut sec_imgs = Vec::new();
+        let pairs = if ncols > 1 {
+            // Newspaper columns: render the section once per distinct column width,
+            // then flow the lines into the (possibly unequal) columns. Pixel-image
+            // overlays can't follow the reflow, so they're dropped (space remains).
+            let text_tw = (geom.w - geom.ml - geom.mr).max(1) as f32;
+            let gap = (((geom.col_space as f32) * content_width as f32 / text_tw).round() as usize)
+                .clamp(1, content_width / 4);
+            let avail = content_width.saturating_sub((ncols - 1) * gap);
+            let col_cells = distribute_cols(avail.max(ncols), &col_tw, ncols);
+            // Render each distinct column width once and share it across columns.
+            let mut distinct: Vec<(usize, Vec<(Line, LineMap)>)> = Vec::new();
+            for &w in &col_cells {
+                if !distinct.iter().any(|(dw, _)| *dw == w) {
+                    let mut p = render_blocks(
+                        &doc.body[start..end],
+                        &[],
+                        w.max(1),
+                        &sec_opts,
+                        &mut Vec::new(),
+                    );
+                    rebase(&mut p);
+                    distinct.push((w, p));
+                }
+            }
+            let renders: Vec<&Vec<(Line, LineMap)>> = col_cells
+                .iter()
+                .map(|&w| &distinct.iter().find(|(dw, _)| *dw == w).unwrap().1)
+                .collect();
+            flow_columns(&renders, &col_cells, gap, m.content_rows)
+        } else {
+            let mut p = render_blocks(
+                &doc.body[start..end],
+                &[],
+                content_width,
+                &sec_opts,
+                &mut sec_imgs,
+            );
+            rebase(&mut p);
+            p
+        };
         let pages = paginate(pairs, opts, geom, &mut sec_imgs, &pl);
         let base = out.len();
         for ib in &mut sec_imgs {
@@ -476,19 +495,62 @@ fn section_opts(opts: &RenderOptions, start: usize, end: usize) -> RenderOptions
 /// Body block ranges per section `(start, end_exclusive, geometry)`. A paragraph
 /// carrying a `section_break` ends a section (using that break's geometry); the
 /// remaining content forms the final section (using the trailing `sectPr`).
-fn sections(doc: &Document, last: PageGeom) -> Vec<(usize, usize, PageGeom)> {
+fn sections(doc: &Document, last: PageGeom) -> Vec<(usize, usize, PageGeom, Vec<u32>)> {
     let mut out = Vec::new();
     let mut start = 0;
     for (i, b) in doc.body.iter().enumerate() {
         if let Block::Paragraph(p) = b {
             if let Some(sect) = &p.props.section_break {
-                out.push((start, i + 1, PageGeom::from_sect_pr(sect)));
+                out.push((
+                    start,
+                    i + 1,
+                    PageGeom::from_sect_pr(sect),
+                    column_widths(sect),
+                ));
                 start = i + 1;
             }
         }
     }
     if start < doc.body.len() || out.is_empty() {
-        out.push((start, doc.body.len(), last));
+        // The final section's raw sectPr isn't threaded here, so it falls back to
+        // even columns (the common case for a trailing single-column section).
+        out.push((start, doc.body.len(), last, Vec::new()));
+    }
+    out
+}
+
+/// Per-column widths (twips) of an unequal-width section (`<w:cols w:equalWidth="0">`
+/// with explicit `<w:col w:w="…"/>` children). Empty for equal/auto columns, so the
+/// caller falls back to an even split.
+fn column_widths(sect: &str) -> Vec<u32> {
+    let Some(cs) = sect.find("<w:cols") else {
+        return Vec::new();
+    };
+    let block_end = sect[cs..]
+        .find("</w:cols>")
+        .map(|e| cs + e)
+        .or_else(|| sect[cs..].find('>').map(|e| cs + e + 1))
+        .unwrap_or(sect.len());
+    let block = &sect[cs..block_end.min(sect.len())];
+    if !block.contains("w:equalWidth=\"0\"") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(p) = block[i..].find("<w:col ") {
+        let s = i + p;
+        let e = block[s..].find('>').map(|x| s + x).unwrap_or(block.len());
+        let el = &block[s..e];
+        let w = (|| {
+            let k = "w:w=\"";
+            let ks = el.find(k)? + k.len();
+            let rest = &el[ks..];
+            rest[..rest.find('"')?].parse::<u32>().ok()
+        })();
+        if let Some(w) = w {
+            out.push(w);
+        }
+        i = e + 1;
     }
     out
 }
@@ -2181,42 +2243,143 @@ fn clip_to_cols(spans: Vec<Span>, max: usize) -> (Vec<Span>, usize) {
 /// then left-to-right, advancing to a new page after `n` full columns. Each
 /// output line is one merged screen row (its map carries every column's
 /// segments, shifted to their column's x), so the caret still maps correctly.
-fn columnize(
-    pairs: Vec<(Line, LineMap)>,
-    n: usize,
+/// Flow a section's rendered lines into newspaper columns of (possibly unequal)
+/// `widths` cells, filling each column top-to-bottom to `rows` lines, left to
+/// right, page by page. `renders[k]` is the whole section rendered at `widths[k]`
+/// (columns of equal width share one rendering). Continuity across columns of
+/// different widths is kept by a source-character cursor; for equal widths the cut
+/// points land exactly on line boundaries, matching a plain column chop.
+fn flow_columns(
+    renders: &[&Vec<(Line, LineMap)>],
+    widths: &[usize],
     gap: usize,
-    col_w: usize,
     rows: usize,
 ) -> Vec<(Line, LineMap)> {
-    if n <= 1 || rows == 0 || pairs.is_empty() {
-        return pairs;
+    let n = widths.len();
+    if n == 0 || rows == 0 {
+        return renders.first().map(|r| (*r).clone()).unwrap_or_default();
     }
-    let total = pairs.len();
-    let per_page = rows * n;
-    let pages = total.div_ceil(per_page);
+    // Prefix counts of non-space source characters per render (whitespace is
+    // dropped at wrap points, so counting it would drift between widths).
+    let nonspace = |l: &Line| {
+        l.spans
+            .iter()
+            .flat_map(|s| s.text.chars())
+            .filter(|c| !c.is_whitespace())
+            .count()
+    };
+    let pc: Vec<Vec<usize>> = renders
+        .iter()
+        .map(|r| {
+            let mut v = Vec::with_capacity(r.len() + 1);
+            let mut acc = 0usize;
+            v.push(0);
+            for (l, _) in r.iter() {
+                acc += nonspace(l);
+                v.push(acc);
+            }
+            v
+        })
+        .collect();
+    let total = pc
+        .iter()
+        .map(|v| *v.last().unwrap_or(&0))
+        .max()
+        .unwrap_or(0);
+
+    // How many characters n columns of height `h` cover, threading the cursor.
+    let covered = |h: usize| -> usize {
+        if h == 0 {
+            return 0;
+        }
+        let mut cur = 0usize;
+        for p in pc.iter() {
+            let s = match p.binary_search(&cur) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            cur = p.get(s + h).copied().unwrap_or(total);
+        }
+        cur
+    };
+    // Balance the columns when the whole section fits on one page: use the
+    // smallest height that still covers everything, so content spreads across the
+    // columns instead of filling the first one and leaving the rest blank (which
+    // is what Word does for a short multi-column section). Taller sections page
+    // normally at the full page height.
+    let fill = if covered(rows) >= total {
+        let (mut lo, mut hi) = (1usize, rows);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if covered(mid) >= total {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    } else {
+        rows
+    };
+
+    // Screen x offset where each column position starts.
+    let mut xs = vec![0usize; n];
+    for k in 1..n {
+        xs[k] = xs[k - 1] + widths[k - 1] + gap;
+    }
+
+    // Walk columns left-to-right, top-to-bottom, threading a character cursor so a
+    // column resumes where the previous one stopped. Each slice is (render, first
+    // line, end line).
+    let mut slices: Vec<(usize, usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    let mut guard = 0usize;
+    while cursor < total && guard < 100_000 {
+        guard += 1;
+        let k = slices.len() % n;
+        let (r, p) = (renders[k], &pc[k]);
+        let s = match p.binary_search(&cursor) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+        .min(r.len());
+        let e = (s + fill).min(r.len());
+        let next = p.get(e).copied().unwrap_or(total);
+        slices.push((k, s, e));
+        if next <= cursor {
+            break; // no forward progress — avoid looping on empty tails
+        }
+        cursor = next;
+    }
+    while slices.is_empty() || !slices.len().is_multiple_of(n) {
+        let k = slices.len() % n;
+        let len = renders[k].len();
+        slices.push((k, len, len)); // empty filler column to complete the page
+    }
+
     let mut out: Vec<(Line, LineMap)> = Vec::new();
-    for page in 0..pages {
-        let base = page * per_page;
-        for r in 0..rows {
+    for page in 0..slices.len() / n {
+        for row in 0..rows {
             let mut spans: Vec<Span> = Vec::new();
             let mut segs: Vec<LineSeg> = Vec::new();
             for k in 0..n {
-                let x_off = k * (col_w + gap);
-                let li = base + k * rows + r;
-                if li < total {
-                    let (line, map) = &pairs[li];
-                    let (clipped, w) = clip_to_cols(line.spans.clone(), col_w);
+                let (r, s, e) = slices[page * n + k];
+                let w = widths[k];
+                let li = s + row;
+                if li < e {
+                    let (line, map) = &renders[r][li];
+                    let (clipped, cw) = clip_to_cols(line.spans.clone(), w);
                     spans.extend(clipped);
-                    if w < col_w {
-                        spans.push(Line::text_span(" ".repeat(col_w - w)));
+                    if cw < w {
+                        spans.push(Line::text_span(" ".repeat(w - cw)));
                     }
                     for seg in &map.segs {
-                        let mut s = seg.clone();
-                        s.col0 += x_off;
-                        segs.push(s);
+                        let mut sg = seg.clone();
+                        sg.col0 += xs[k];
+                        segs.push(sg);
                     }
                 } else {
-                    spans.push(Line::text_span(" ".repeat(col_w)));
+                    spans.push(Line::text_span(" ".repeat(w)));
                 }
                 if k + 1 < n {
                     spans.push(Line::text_span(" ".repeat(gap)));
@@ -2452,7 +2615,7 @@ mod tests {
     }
 
     #[test]
-    fn columnize_lays_lines_into_columns_with_shifted_maps() {
+    fn flow_columns_lays_lines_into_columns_with_shifted_maps() {
         // six single-char lines, each an editable segment
         let mk = |c: char| {
             let line = Line {
@@ -2467,8 +2630,8 @@ mod tests {
             (line, map)
         };
         let pairs: Vec<_> = "abcdef".chars().map(mk).collect();
-        // 2 columns, gap 1, col width 3, 3 rows per page → one page, a/b/c | d/e/f
-        let out = columnize(pairs, 2, 1, 3, 3);
+        // 2 equal columns (width 3, gap 1), 3 rows per page → a/b/c | d/e/f
+        let out = flow_columns(&[&pairs, &pairs], &[3, 3], 1, 3);
         assert_eq!(out.len(), 3);
         let r0 = out[0].0.plain();
         assert!(r0.starts_with('a') && r0.contains('d'), "row0: {r0:?}");
@@ -2478,6 +2641,32 @@ mod tests {
         assert_eq!(out[0].1.segs[1].col0, 4);
         assert!(out[1].0.plain().contains('b') && out[1].0.plain().contains('e'));
         assert!(out[2].0.plain().contains('c') && out[2].0.plain().contains('f'));
+    }
+
+    #[test]
+    fn flow_columns_respects_unequal_widths() {
+        // A wide left column and a narrow right column: the screen offset of the
+        // second column equals the first column's width plus the gap.
+        let mk = |c: char| {
+            (
+                Line {
+                    spans: vec![Line::text_span(c.to_string())],
+                },
+                LineMap::one(LineSeg {
+                    path: vec![0],
+                    start: 0,
+                    col0: 0,
+                    cols: vec![0, 1],
+                }),
+            )
+        };
+        let wide: Vec<_> = "abcd".chars().map(mk).collect();
+        let narrow: Vec<_> = "abcd".chars().map(mk).collect();
+        // widths 8 (wide) + 3 (narrow), gap 1, 2 rows per page
+        let out = flow_columns(&[&wide, &narrow], &[8, 3], 1, 2);
+        assert_eq!(out[0].1.segs.len(), 2);
+        assert_eq!(out[0].1.segs[0].col0, 0);
+        assert_eq!(out[0].1.segs[1].col0, 9); // 8 + gap(1)
     }
 
     #[test]
