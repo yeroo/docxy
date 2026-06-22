@@ -790,6 +790,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             Inline::Hyperlink(h) => w += h.runs.iter().map(|r| str_width(&r.text)).sum::<usize>(),
             Inline::Tab | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
+            Inline::Field { text, .. } => w += str_width(text),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
@@ -864,7 +865,7 @@ fn flatten_para(
         // Inline content that lands right after a block marker starts a fresh text
         // seg, so it renders below the block (not appended to the block's marker).
         let produces_inline = match item {
-            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab => true,
+            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab | Inline::Field { .. } => true,
             Inline::Equation { text, .. } => !text.contains('\n'),
             Inline::Raw(raw) => inline_image(raw).is_some(),
             _ => false,
@@ -1032,6 +1033,20 @@ fn flatten_para(
             // A decoded equation flows as ordinary (non-editable) text at body
             // size. A multi-line one (a matrix) is emitted as a block below.
             Inline::Equation { text, .. } if !text.contains('\n') => {
+                let st = Style::default();
+                for ch in text.chars() {
+                    segs.last_mut().unwrap().glyphs.push(Glyph {
+                        ch,
+                        disp: None,
+                        style: st.clone(),
+                        link: None,
+                        src: None,
+                        img: None,
+                    });
+                }
+            }
+            // A field's cached result flows as ordinary (non-editable) body text.
+            Inline::Field { text, .. } => {
                 let st = Style::default();
                 for ch in text.chars() {
                     segs.last_mut().unwrap().glyphs.push(Glyph {

@@ -109,7 +109,15 @@ pub enum Inline {
         raw: String,
         blocks: Vec<Block>,
     },
-    /// Verbatim XML for inline content we don't model (images/fields/bookmarks),
+    /// A field (`<w:fldSimple>`, e.g. CREATEDATE/PAGE/REF). `raw` is the original
+    /// XML (preserved verbatim for lossless save); `text` is the field's cached
+    /// result, rendered as inline body text so the value (a date, a number, …) is
+    /// visible instead of vanishing.
+    Field {
+        raw: String,
+        text: String,
+    },
+    /// Verbatim XML for inline content we don't model (images/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
 }
@@ -125,6 +133,7 @@ impl Inline {
             Inline::SmartArt { text, .. } => text.join("\n"),
             Inline::Chart { chart, .. } => chart.title.clone().unwrap_or_default(),
             Inline::Equation { text, .. } => text.clone(),
+            Inline::Field { text, .. } => text.clone(),
             Inline::TextBox { blocks, .. } => blocks
                 .iter()
                 .map(|b| b.plain_text())

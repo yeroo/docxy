@@ -500,6 +500,9 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
+                // A simple field: keep its XML verbatim (lossless save) but surface
+                // its cached result text so the value is visible.
+                "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
                 // Inline content control (content placeholder, etc.): unwrap it.
                 "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
                 // OMML math: render it to a text equation (lossless raw kept).
@@ -528,6 +531,18 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
         }
     }
     para
+}
+
+/// Parse a `<w:fldSimple>` field. Its inner runs hold the field's last-computed
+/// result; keep the whole element verbatim for a lossless save, but expose the
+/// result text so the value renders (a date, page number, cross-reference, …).
+fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let start = p.start_pos();
+    let mut inner = Vec::new();
+    parse_inlines_into(p, rels, &mut inner);
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    let text: String = inner.iter().map(Inline::text).collect();
+    out.push(Inline::Field { raw, text });
 }
 
 /// Unwrap an inline `<w:sdt>` (content control inside a paragraph), parsing the
@@ -562,6 +577,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, out),
+                "w:fldSimple" => parse_fld_simple(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
                 _ => {
                     let start = p.start_pos();
@@ -1058,6 +1074,26 @@ mod tests {
             Block::Paragraph(p) => p,
             _ => panic!("expected paragraph"),
         }
+    }
+
+    #[test]
+    fn fld_simple_surfaces_result_and_stays_lossless() {
+        let xml = "<w:document><w:body><w:p>\
+                   <w:fldSimple w:instr=\" CREATEDATE \\@ &quot;M/d/yyyy&quot; \">\
+                   <w:r><w:t>11/5/2007</w:t></w:r></w:fldSimple>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        match &first_para(&d).content[0] {
+            Inline::Field { text, raw } => {
+                assert_eq!(text, "11/5/2007");
+                assert!(raw.contains("CREATEDATE") && raw.contains("</w:fldSimple>"));
+            }
+            other => panic!("expected Field, got {other:?}"),
+        }
+        // the field's value is visible text
+        assert_eq!(first_para(&d).plain_text(), "11/5/2007");
+        // and it serializes back verbatim
+        assert!(crate::serialize::document_to_xml(&d).contains("<w:fldSimple w:instr="));
     }
 
     #[test]

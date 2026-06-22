@@ -208,6 +208,7 @@ fn write_inline(s: &mut String, item: &Inline) {
         Inline::SmartArt { raw, .. } => s.push_str(raw),
         Inline::Chart { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
+        Inline::Field { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
             // Splice the (possibly edited) content back into the shape's
             // `txbxContent`, preserving the surrounding VML/drawing markup.

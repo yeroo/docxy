@@ -1029,6 +1029,7 @@ fn inline_len(i: &Inline) -> usize {
         Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
+        | Inline::Field { .. }
         | Inline::TextBox { .. }
         | Inline::Raw(_) => 0,
     }
@@ -1092,6 +1093,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 chart: chart.clone(),
             }),
             Inline::Equation { raw, text } => out.push(Inline::Equation {
+                raw: raw.clone(),
+                text: text.clone(),
+            }),
+            Inline::Field { raw, text } => out.push(Inline::Field {
                 raw: raw.clone(),
                 text: text.clone(),
             }),
@@ -1181,6 +1186,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
                 | Inline::Equation { .. }
+                | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
@@ -1255,6 +1261,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
                 | Inline::Equation { .. }
+                | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
@@ -1329,6 +1336,7 @@ fn range_all_have(
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
+            | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Raw(_) => {} // zero-length
         }
@@ -1425,6 +1433,7 @@ fn set_prop_range(
             inline @ (Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
+            | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Raw(_)) => out.push(inline),
         }

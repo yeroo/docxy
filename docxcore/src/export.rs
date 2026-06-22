@@ -339,8 +339,8 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.push(Vec::new());
                 }
             }
-            // A decoded equation flows inline as plain text.
-            Inline::Equation { text, .. } => {
+            // A decoded equation (or a field's result) flows inline as plain text.
+            Inline::Equation { text, .. } | Inline::Field { text, .. } => {
                 for ch in text.chars() {
                     segs.last_mut().unwrap().push(plain_cell(ch));
                 }
