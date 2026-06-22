@@ -340,7 +340,20 @@ pub fn render_with_images(
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut images: Vec<ImageBox> = Vec::new();
     for (start, end, geom) in sections(doc, opts.page) {
-        let content_width = page_metrics(opts.width, geom).content_cols;
+        let m = page_metrics(opts.width, geom);
+        let content_width = m.content_cols;
+        // Newspaper columns: render the section at the narrower column width, then
+        // flow the resulting lines into N side-by-side columns per page.
+        let ncols = geom.cols.max(1) as usize;
+        let col_layout = (ncols > 1).then(|| {
+            let text_tw = (geom.w - geom.ml - geom.mr).max(1) as f32;
+            let gap = ((geom.col_space as f32) * content_width as f32 / text_tw).round() as usize;
+            let gap = gap.clamp(1, content_width / 4);
+            let col_w = (content_width.saturating_sub((ncols - 1) * gap) / ncols).max(6);
+            (ncols, gap, col_w, m.content_rows)
+        });
+        let render_w = col_layout.map(|(_, _, w, _)| w).unwrap_or(content_width);
+
         let mut sec_imgs = Vec::new();
         // The slice rebases paragraph paths to 0, so the path-keyed selection and
         // list markers must be rebased to match (else they silently miss every
@@ -349,7 +362,7 @@ pub fn render_with_images(
         let mut pairs = render_blocks(
             &doc.body[start..end],
             &[],
-            content_width,
+            render_w,
             &sec_opts,
             &mut sec_imgs,
         );
@@ -360,6 +373,12 @@ pub fn render_with_images(
                     *first += start;
                 }
             }
+        }
+        if let Some((n, gap, col_w, rows)) = col_layout {
+            // Pixel-image overlays can't follow the column reflow; drop them (the
+            // placeholder space remains). Text/charts flow as normal content.
+            sec_imgs.clear();
+            pairs = columnize(pairs, n, gap, col_w, rows);
         }
         let pages = paginate(pairs, opts, geom, &mut sec_imgs, &pl);
         let base = out.len();
@@ -1899,6 +1918,65 @@ fn clip_to_cols(spans: Vec<Span>, max: usize) -> (Vec<Span>, usize) {
     (out, used)
 }
 
+/// Flow a section's single tall column of lines into `n` newspaper columns of
+/// `col_w` cells each, `gap` cells apart, `rows` lines tall per column. Column
+/// `k` of a page sits at x-offset `k*(col_w+gap)`; columns fill top-to-bottom
+/// then left-to-right, advancing to a new page after `n` full columns. Each
+/// output line is one merged screen row (its map carries every column's
+/// segments, shifted to their column's x), so the caret still maps correctly.
+fn columnize(
+    pairs: Vec<(Line, LineMap)>,
+    n: usize,
+    gap: usize,
+    col_w: usize,
+    rows: usize,
+) -> Vec<(Line, LineMap)> {
+    if n <= 1 || rows == 0 || pairs.is_empty() {
+        return pairs;
+    }
+    let total = pairs.len();
+    let per_page = rows * n;
+    let pages = total.div_ceil(per_page);
+    let mut out: Vec<(Line, LineMap)> = Vec::new();
+    for page in 0..pages {
+        let base = page * per_page;
+        for r in 0..rows {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut segs: Vec<LineSeg> = Vec::new();
+            for k in 0..n {
+                let x_off = k * (col_w + gap);
+                let li = base + k * rows + r;
+                if li < total {
+                    let (line, map) = &pairs[li];
+                    let (clipped, w) = clip_to_cols(line.spans.clone(), col_w);
+                    spans.extend(clipped);
+                    if w < col_w {
+                        spans.push(Line::text_span(" ".repeat(col_w - w)));
+                    }
+                    for seg in &map.segs {
+                        let mut s = seg.clone();
+                        s.col0 += x_off;
+                        segs.push(s);
+                    }
+                } else {
+                    spans.push(Line::text_span(" ".repeat(col_w)));
+                }
+                if k + 1 < n {
+                    spans.push(Line::text_span(" ".repeat(gap)));
+                }
+            }
+            out.push((
+                Line { spans },
+                LineMap {
+                    segs,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    out
+}
+
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
@@ -2097,6 +2175,46 @@ fn paginate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columnize_lays_lines_into_columns_with_shifted_maps() {
+        // six single-char lines, each an editable segment
+        let mk = |c: char| {
+            let line = Line {
+                spans: vec![Line::text_span(c.to_string())],
+            };
+            let map = LineMap::one(LineSeg {
+                path: vec![0],
+                start: 0,
+                col0: 0,
+                cols: vec![0, 1],
+            });
+            (line, map)
+        };
+        let pairs: Vec<_> = "abcdef".chars().map(mk).collect();
+        // 2 columns, gap 1, col width 3, 3 rows per page → one page, a/b/c | d/e/f
+        let out = columnize(pairs, 2, 1, 3, 3);
+        assert_eq!(out.len(), 3);
+        let r0 = out[0].0.plain();
+        assert!(r0.starts_with('a') && r0.contains('d'), "row0: {r0:?}");
+        // the two columns map to different screen x (0 and col_w+gap = 4)
+        assert_eq!(out[0].1.segs.len(), 2);
+        assert_eq!(out[0].1.segs[0].col0, 0);
+        assert_eq!(out[0].1.segs[1].col0, 4);
+        assert!(out[1].0.plain().contains('b') && out[1].0.plain().contains('e'));
+        assert!(out[2].0.plain().contains('c') && out[2].0.plain().contains('f'));
+    }
+
+    #[test]
+    fn page_geom_parses_column_count() {
+        let g = crate::model::PageGeom::from_sect_pr(
+            "<w:sectPr><w:cols w:num=\"3\" w:space=\"425\"/></w:sectPr>",
+        );
+        assert_eq!(g.cols, 3);
+        assert_eq!(g.col_space, 425);
+        // absent → single column
+        assert_eq!(crate::model::PageGeom::from_sect_pr("<w:sectPr/>").cols, 1);
+    }
 
     fn run(text: &str, props: RunProps) -> Inline {
         Inline::Run(Run {

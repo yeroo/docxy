@@ -213,6 +213,10 @@ pub struct PageGeom {
     pub mr: i32,
     pub mt: i32,
     pub mb: i32,
+    /// Number of newspaper columns in the section (`w:cols w:num`); 1 = single.
+    pub cols: i32,
+    /// Space between columns, in twips (`w:cols w:space`).
+    pub col_space: i32,
 }
 
 impl Default for PageGeom {
@@ -225,6 +229,8 @@ impl Default for PageGeom {
             mr: 1440,
             mt: 1440,
             mb: 1440,
+            cols: 1,
+            col_space: 720,
         }
     }
 }
@@ -255,6 +261,8 @@ impl PageGeom {
             mr: attr("<w:pgMar", "w:right", d.mr),
             mt: attr("<w:pgMar", "w:top", d.mt),
             mb: attr("<w:pgMar", "w:bottom", d.mb),
+            cols: attr("<w:cols", "w:num", d.cols).max(1),
+            col_space: attr("<w:cols", "w:space", d.col_space).max(0),
         }
     }
 }
