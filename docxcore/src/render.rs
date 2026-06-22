@@ -330,9 +330,56 @@ pub fn render_with_images(
     opts: &RenderOptions,
 ) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>) {
     if !opts.page_view {
+        let w = opts.width.max(8);
         let mut images = Vec::new();
-        let pairs = render_blocks(&doc.body, &[], opts.width.max(8), opts, &mut images);
-        let (lines, maps) = pairs.into_iter().unzip();
+        let mut out: Vec<(Line, LineMap)> = Vec::new();
+        // Continuous view has no page margins, so the header/footer would otherwise
+        // be invisible. Show them once as a non-editable banner (header on top,
+        // footer at the bottom) so their content isn't lost. Their caret maps are
+        // dropped so clicks don't collide with the body's paragraph paths.
+        let banner = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<(Line, LineMap)> {
+            render_blocks(blocks, &[], w, opts, imgs)
+                .into_iter()
+                .map(|(l, _)| (l, LineMap::default()))
+                .collect()
+        };
+        let head = banner_blocks(&opts.headers);
+        if !head.is_empty() {
+            out.extend(banner(head, &mut images));
+            out.push((
+                Line {
+                    spans: vec![Line::dim_span("─".repeat(w))],
+                },
+                LineMap::default(),
+            ));
+        }
+        let body_off = out.len();
+        let mut body_imgs = Vec::new();
+        let body = render_blocks(&doc.body, &[], w, opts, &mut body_imgs);
+        for ib in &mut body_imgs {
+            ib.row += body_off;
+        }
+        images.append(&mut body_imgs);
+        out.extend(body);
+        let foot = banner_blocks(&opts.footers);
+        if !foot.is_empty() {
+            out.push((
+                Line {
+                    spans: vec![Line::dim_span("─".repeat(w))],
+                },
+                LineMap::default(),
+            ));
+            let off = out.len();
+            let mut foot_imgs = Vec::new();
+            for (l, _) in render_blocks(foot, &[], w, opts, &mut foot_imgs) {
+                out.push((l, LineMap::default()));
+            }
+            for ib in &mut foot_imgs {
+                ib.row += off;
+            }
+            images.append(&mut foot_imgs);
+        }
+        let (lines, maps) = out.into_iter().unzip();
         return (lines, maps, images);
     }
 
@@ -444,6 +491,17 @@ fn sections(doc: &Document, last: PageGeom) -> Vec<(usize, usize, PageGeom)> {
         out.push((start, doc.body.len(), last));
     }
     out
+}
+
+/// The first non-empty header/footer variant (default → first → even), used for
+/// the continuous-view banner where there is no page concept to pick a variant.
+fn banner_blocks(parts: &PageParts) -> &[Block] {
+    for v in [&parts.default, &parts.first, &parts.even] {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    &[]
 }
 
 /// Render the header/footer variants to (non-editable) lines for the margins.
@@ -3422,6 +3480,27 @@ mod tests {
         assert!(
             h < b && b < f,
             "header/body/footer order wrong: h={h} b={b} f={f}"
+        );
+    }
+
+    #[test]
+    fn continuous_view_shows_header_and_footer_as_banner() {
+        // Continuous view has no page margins, so the header/footer render as a
+        // banner (header on top, footer at the bottom) instead of vanishing.
+        let mut o = opts(70);
+        o.page_view = false;
+        o.headers.default =
+            std::rc::Rc::new(vec![para(vec![run("THE HEADER", RunProps::default())])]);
+        o.footers.default =
+            std::rc::Rc::new(vec![para(vec![run("THE FOOTER", RunProps::default())])]);
+        let d = doc(vec![para(vec![run("body text", RunProps::default())])]);
+        let plain: Vec<String> = render(&d, &o).iter().map(|l| l.plain()).collect();
+        let h = plain.iter().position(|l| l.contains("THE HEADER"));
+        let b = plain.iter().position(|l| l.contains("body text"));
+        let f = plain.iter().position(|l| l.contains("THE FOOTER"));
+        assert!(
+            matches!((h, b, f), (Some(h), Some(b), Some(f)) if h < b && b < f),
+            "expected header < body < footer, got h={h:?} b={b:?} f={f:?}"
         );
     }
 
