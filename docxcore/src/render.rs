@@ -195,6 +195,12 @@ pub struct LineMap {
     /// A wide-table line that is allowed to extend past the page's right border
     /// (instead of being clipped) when the table doesn't fit the page width.
     pub overflow: bool,
+    /// For a line belonging to a (bordered) table, the table's top and bottom
+    /// border strings, shared across all its lines. When pagination splits the
+    /// table across a page boundary, it closes the table with the bottom border at
+    /// the page's edge and reopens it with the top border on the next page (as
+    /// Word does). `None` for non-table or borderless lines.
+    pub table_edge: Option<Rc<(String, String)>>,
 }
 
 impl LineMap {
@@ -204,6 +210,7 @@ impl LineMap {
             page_break: false,
             image: false,
             overflow: false,
+            table_edge: None,
         }
     }
     /// The segment containing the caret (path + offset), if any.
@@ -2121,6 +2128,18 @@ fn render_table(
             m.overflow = true;
         }
     }
+    // Tag every line with the table's top and bottom border so that, if pagination
+    // splits the table across a page boundary, it can close and reopen the grid at
+    // the page edges (matching Word). Only for bordered tables, which begin and end
+    // with a full-width border line.
+    if !borderless && out.len() >= 2 {
+        let top = out.first().unwrap().0.plain();
+        let bottom = out.last().unwrap().0.plain();
+        let edge = Rc::new((top, bottom));
+        for (_, m) in &mut out {
+            m.table_edge = Some(edge.clone());
+        }
+    }
     out
 }
 
@@ -2497,9 +2516,20 @@ fn paginate(
     }
     let total_pages = pg + 1;
 
+    // A bare content string (e.g. a synthesized table border) framed into a page
+    // row like ordinary content.
+    let frame_str = |text: &str| -> (Line, LineMap) {
+        frame_line(&Line {
+            spans: vec![Line::dim_span(text.to_string())],
+        })
+    };
+
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut new_row = vec![usize::MAX; total_in];
     let mut it = items.into_iter().peekable();
+    // A table border carried over from the previous page (the table was split):
+    // reopen the grid at the top of this page's content.
+    let mut pending_top: Option<Rc<(String, String)>> = None;
     for page in 0..total_pages {
         out.push(border('┌', '┐'));
         // Top margin, with this page's header drawn into it.
@@ -2510,9 +2540,14 @@ fn paginate(
                 None => out.push(margin_row(None)),
             }
         }
+        if let Some(edge) = pending_top.take() {
+            out.push(frame_str(&edge.0)); // table top border (continued table)
+        }
         let mut placed = 0usize;
+        let mut last_edge: Option<Rc<(String, String)>> = None;
         while it.peek().map(|t| t.3) == Some(page) {
             let (idx, ln, mut map, _) = it.next().unwrap();
+            last_edge = map.table_edge.clone();
             let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
             if map.overflow {
                 // A wide table line: keep it whole and let it run past the right
@@ -2530,6 +2565,19 @@ fn paginate(
             new_row[idx] = out.len();
             out.push((Line { spans }, map));
             placed += 1;
+        }
+        // If the last row of this page and the first of the next belong to the same
+        // table, the table is split here: close it with its bottom border and carry
+        // its top border to reopen on the next page.
+        if let Some(edge) = &last_edge {
+            let continues = it
+                .peek()
+                .and_then(|t| t.2.table_edge.as_ref())
+                .is_some_and(|e| Rc::ptr_eq(e, edge));
+            if continues {
+                out.push(frame_str(&edge.1)); // table bottom border
+                pending_top = Some(edge.clone());
+            }
         }
         for _ in placed..m.content_rows {
             out.push(margin_row(None)); // pad the page to full height
@@ -3443,6 +3491,43 @@ mod tests {
         for i in 0..10 {
             assert!(joined.contains(&format!("c{i}")), "missing c{i}");
         }
+    }
+
+    #[test]
+    fn table_split_across_pages_redraws_top_and_bottom_borders() {
+        // A two-column table tall enough to span several pages must be closed
+        // (└┴┘) at each page break and reopened (┌┬┐) on the next page, not just
+        // bordered once at its true top and bottom.
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(vec![run(s, RunProps::default())])],
+        };
+        let rows: Vec<Row> = (0..400)
+            .map(|i| Row {
+                cells: vec![cell(&format!("a{i}")), cell(&format!("b{i}"))],
+            })
+            .collect();
+        let t = Table {
+            grid: vec![3000, 3000],
+            rows,
+        };
+        let d = doc(vec![Block::Table(t)]);
+        let o = RenderOptions {
+            width: 60,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+        let plain: Vec<String> = render(&d, &o).iter().map(|l| l.plain()).collect();
+        // Table borders carry column junctions (┬ on top, ┴ on bottom); the page
+        // frame does not. More than one of each means the grid was reopened/closed
+        // at the page boundaries.
+        let tops = plain.iter().filter(|l| l.contains('┬')).count();
+        let bottoms = plain.iter().filter(|l| l.contains('┴')).count();
+        assert!(
+            tops >= 2 && bottoms >= 2,
+            "table not reclosed per page: tops={tops} bottoms={bottoms}"
+        );
     }
 
     #[test]
