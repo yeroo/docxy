@@ -111,7 +111,7 @@ pub struct Line {
 
 impl Line {
     pub fn width(&self) -> usize {
-        self.spans.iter().map(|s| s.text.chars().count()).sum()
+        self.spans.iter().map(|s| str_width(&s.text)).sum()
     }
     pub fn plain(&self) -> String {
         self.spans.iter().map(|s| s.text.as_str()).collect()
@@ -577,6 +577,46 @@ struct InlineImg {
     label: String,
 }
 
+/// Display width of a character in terminal cells: 2 for East Asian wide /
+/// fullwidth glyphs (CJK, Hangul, kana, fullwidth forms, most emoji), 0 for
+/// combining marks, 1 otherwise. A compact approximation of `unicode-width`.
+fn char_width(c: char) -> usize {
+    let u = c as u32;
+    if u == 0 {
+        return 0;
+    }
+    if (0x0300..=0x036F).contains(&u) || (0x200B..=0x200F).contains(&u) {
+        return 0; // combining marks / zero-width
+    }
+    let wide = matches!(u,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK radicals, Kangxi, CJK punctuation
+        | 0x3041..=0x33FF // kana, CJK symbols
+        | 0x3400..=0x4DBF // CJK ext A
+        | 0x4E00..=0x9FFF // CJK unified
+        | 0xA000..=0xA4CF // Yi
+        | 0xAC00..=0xD7A3 // Hangul syllables
+        | 0xF900..=0xFAFF // CJK compatibility
+        | 0xFE10..=0xFE19 // vertical forms
+        | 0xFE30..=0xFE6F // CJK compatibility / small forms
+        | 0xFF00..=0xFF60 // fullwidth forms
+        | 0xFFE0..=0xFFE6 // fullwidth signs
+        | 0x1F300..=0x1FAFF // emoji & pictographs
+        | 0x20000..=0x3FFFD // CJK ext B and beyond
+    );
+    if wide { 2 } else { 1 }
+}
+
+/// Display width of a string in terminal cells.
+fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// Display width of a glyph (its shown char), in terminal cells.
+fn glyph_w(g: &Glyph) -> usize {
+    char_width(g.disp.unwrap_or(g.ch))
+}
+
 /// Style for invisible-character marks: a muted gray.
 fn invis_style() -> Style {
     Style {
@@ -610,12 +650,10 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
     let mut w = 0;
     for it in &content[(from + 1).min(content.len())..] {
         match it {
-            Inline::Run(r) => w += r.text.chars().count(),
-            Inline::Hyperlink(h) => {
-                w += h.runs.iter().map(|r| r.text.chars().count()).sum::<usize>()
-            }
+            Inline::Run(r) => w += str_width(&r.text),
+            Inline::Hyperlink(h) => w += h.runs.iter().map(|r| str_width(&r.text)).sum::<usize>(),
             Inline::Tab | Inline::Break(_) => break,
-            Inline::Equation { text, .. } => w += text.chars().count(),
+            Inline::Equation { text, .. } => w += str_width(text),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
@@ -888,13 +926,16 @@ fn wrap_glyphs(glyphs: &[Glyph], width: usize) -> Vec<Vec<Glyph>> {
     let width = width.max(1);
     let mut lines: Vec<Vec<Glyph>> = Vec::new();
     let mut cur: Vec<Glyph> = Vec::new();
+    let mut cur_w = 0usize; // display width of `cur`
     let mut last_space: Option<usize> = None;
+    let row_w = |gs: &[Glyph]| gs.iter().map(glyph_w).sum::<usize>();
     for g in glyphs {
         cur.push(g.clone());
+        cur_w += glyph_w(g);
         if g.ch == ' ' {
             last_space = Some(cur.len() - 1);
         }
-        if cur.len() > width {
+        if cur_w > width {
             if let Some(sp) = last_space {
                 let rest = cur.split_off(sp + 1);
                 while cur.last().map(|g| g.ch == ' ').unwrap_or(false) {
@@ -902,10 +943,12 @@ fn wrap_glyphs(glyphs: &[Glyph], width: usize) -> Vec<Vec<Glyph>> {
                 }
                 lines.push(std::mem::take(&mut cur));
                 cur = rest;
+                cur_w = row_w(&cur);
                 last_space = cur.iter().rposition(|g| g.ch == ' ');
             } else {
                 let last = cur.pop().unwrap();
                 lines.push(std::mem::take(&mut cur));
+                cur_w = glyph_w(&last);
                 cur.push(last);
                 last_space = None;
             }
@@ -948,6 +991,7 @@ fn glyph_extent(glyphs: &[Glyph]) -> (usize, Vec<usize>) {
     let mut col = 0usize;
     let mut last_end = 0usize;
     for g in glyphs {
+        let w = glyph_w(g);
         if let Some(s) = g.src {
             if last_src != Some(s) {
                 if start.is_none() {
@@ -956,9 +1000,9 @@ fn glyph_extent(glyphs: &[Glyph]) -> (usize, Vec<usize>) {
                 cols.push(col);
                 last_src = Some(s);
             }
-            last_end = col + 1;
+            last_end = col + w;
         }
-        col += 1;
+        col += w;
     }
     cols.push(last_end);
     (start.unwrap_or(0), cols)
@@ -1024,7 +1068,7 @@ fn render_paragraph(
             } else {
                 &cont_prefix
             };
-            let body_w = gl.len();
+            let body_w = gl.iter().map(glyph_w).sum::<usize>();
             let total = prefix.chars().count() + body_w;
             let align = opts
                 .styles
@@ -1900,18 +1944,27 @@ fn clip_to_cols(spans: Vec<Span>, max: usize) -> (Vec<Span>, usize) {
         if used >= max {
             break;
         }
-        let n = sp.text.chars().count();
-        if used + n <= max {
-            used += n;
+        let w = str_width(&sp.text);
+        if used + w <= max {
+            used += w;
             out.push(sp);
         } else {
-            let text: String = sp.text.chars().take(max - used).collect();
+            // Partial span: keep whole chars while they fit (never split a
+            // double-width glyph across the boundary).
+            let mut text = String::new();
+            for ch in sp.text.chars() {
+                let cw = char_width(ch);
+                if used + cw > max {
+                    break;
+                }
+                text.push(ch);
+                used += cw;
+            }
             out.push(Span {
                 text,
                 style: sp.style,
                 link: sp.link,
             });
-            used = max;
             break;
         }
     }
@@ -2175,6 +2228,18 @@ fn paginate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cjk_chars_are_double_width_and_clip_safely() {
+        assert_eq!(char_width('A'), 1);
+        assert_eq!(char_width('哈'), 2);
+        assert_eq!(str_width("a哈b"), 4);
+        // clip by display width, never splitting a wide glyph
+        let spans = vec![Line::text_span("哈巴谷".to_string())];
+        let (out, w) = clip_to_cols(spans, 3);
+        assert_eq!(w, 2); // one wide char fits; the next needs 2 more cells
+        assert_eq!(out[0].text, "哈");
+    }
 
     #[test]
     fn columnize_lays_lines_into_columns_with_shifted_maps() {
