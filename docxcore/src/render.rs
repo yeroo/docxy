@@ -1031,7 +1031,9 @@ fn render_paragraph(
         (String::new(), String::new())
     };
     let prefix_w = first_prefix.chars().count();
-    let avail = width.saturating_sub(prefix_w).max(4);
+    // Honor the requested width down to a single cell — narrow table columns rely
+    // on wrapping to their exact width, else cells overflow and break the borders.
+    let avail = width.saturating_sub(prefix_w).max(1);
 
     let local_sel: Vec<(usize, usize)> = opts
         .selection
@@ -3007,6 +3009,34 @@ mod tests {
         assert!(joined.contains('│'));
         assert!(joined.contains('└') && joined.contains('┘'));
         assert!(joined.contains('A') && joined.contains('d'));
+    }
+
+    #[test]
+    fn narrow_table_keeps_borders_aligned() {
+        // At a small width the columns are < 4 cells; cell text must wrap to the
+        // column instead of overflowing it (which used to break the borders).
+        let cell = |s: &str| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![para(vec![run(s, RunProps::default())])],
+        };
+        let t = Table {
+            grid: vec![100, 100, 100, 100],
+            rows: vec![
+                Row {
+                    cells: vec![cell("Release"), cell("Disk"), cell("Media"), cell("Product")],
+                },
+                Row {
+                    cells: vec![cell("09/29/95"), cell("Disk1"), cell("1.44mb"), cell("Office")],
+                },
+            ],
+        };
+        let d = doc(vec![Block::Table(t)]);
+        let lines = render(&d, &opts(24));
+        let first = lines[0].width();
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(l.width(), first, "row {i} width differs: {:?}", l.plain());
+        }
     }
 
     #[test]
