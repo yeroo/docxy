@@ -496,7 +496,7 @@ fn view_groups() -> Vec<Group> {
         },
         Group {
             title: "Edit",
-            width: 10,
+            width: 16,
             rows: [
                 vec![
                     btn("Document", 8, EditDocument, "Edit the document body"),
@@ -845,6 +845,38 @@ pub enum Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_group_is_wide_enough_for_its_content() {
+        // A group whose declared `width` is narrower than its widest row overflows
+        // the next "│" border (this once broke the View ▸ Edit group's right edge).
+        let mut r = Ribbon::home();
+        for tab in 0..r.tabs.len() {
+            r.set_active(tab);
+            for g in r.groups() {
+                let widest = g
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|seg| match seg {
+                                Seg::Gap(s) => s.chars().count(),
+                                Seg::Btn(b) => b.width,
+                            })
+                            .sum::<usize>()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    g.width >= widest,
+                    "group {:?} width {} < content {}",
+                    g.title,
+                    g.width,
+                    widest
+                );
+            }
+        }
+    }
 
     #[test]
     fn live_and_dimmed_buttons_are_classified() {

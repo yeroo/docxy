@@ -25,7 +25,7 @@ use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, new_package, save_package};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
-    render_with_images,
+    Span as DocSpan, Style as DocStyle, render_with_images,
 };
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
@@ -777,8 +777,18 @@ impl App {
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
             page: self.pkg.page_geom(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
+            // While editing a header/footer the editor *is* that surface, so the
+            // banner/margin copy is suppressed (no duplicate header).
+            headers: if self.hf_edit.is_some() {
+                PageParts::default()
+            } else {
+                self.headers.clone()
+            },
+            footers: if self.hf_edit.is_some() {
+                PageParts::default()
+            } else {
+                self.footers.clone()
+            },
             title_page: self.title_page,
             even_odd: self.even_odd,
         }
@@ -2287,7 +2297,56 @@ impl App {
 
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
-            let (lines, maps, images) = render_with_images(&self.editor.doc, &self.options(width));
+            let opts = self.options(width);
+            let (mut lines, mut maps, mut images) =
+                render_with_images(&self.editor.doc, &opts);
+            // While editing a header/footer, show the rest of the page (the parked
+            // document body) dimmed and read-only below/above the editable surface,
+            // the way Word greys out the body. The body's caret maps are dropped so
+            // the caret stays in the header/footer being edited.
+            if let Some(hf) = &self.hf_edit {
+                let (mut body, _bm, _bi) = render_with_images(&hf.body.doc, &opts);
+                for l in &mut body {
+                    for s in &mut l.spans {
+                        s.style.dim = true;
+                        s.style.highlight = false;
+                        s.style.color = None;
+                    }
+                }
+                let body_maps: Vec<LineMap> = body.iter().map(|_| LineMap::default()).collect();
+                let sep = DocLine {
+                    spans: vec![DocSpan {
+                        text: "─".repeat(width.max(1) as usize),
+                        style: DocStyle {
+                            dim: true,
+                            ..DocStyle::default()
+                        },
+                        link: None,
+                    }],
+                };
+                if hf.is_header {
+                    // Header (editable) on top, greyed body beneath.
+                    lines.push(sep);
+                    maps.push(LineMap::default());
+                    lines.extend(body);
+                    maps.extend(body_maps);
+                } else {
+                    // Greyed body on top, footer (editable) at the bottom. The
+                    // editable surface (and its images) shift down past the body.
+                    let shift = body.len() + 1;
+                    for ib in &mut images {
+                        ib.row += shift;
+                    }
+                    let mut nl = body;
+                    let mut nm = body_maps;
+                    nl.push(sep);
+                    nm.push(LineMap::default());
+                    nl.append(&mut lines);
+                    nm.append(&mut maps);
+                    lines = nl;
+                    maps = nm;
+                }
+            }
             self.lines = lines;
             self.maps = maps;
             self.images = images;
