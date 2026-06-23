@@ -21,6 +21,7 @@ pub mod comments;
 pub mod editor;
 pub mod equation;
 pub mod export;
+pub mod field;
 pub mod inflate;
 pub mod load;
 pub mod mathbox;

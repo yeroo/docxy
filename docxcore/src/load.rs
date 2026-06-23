@@ -537,11 +537,16 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
 /// result; keep the whole element verbatim for a lossless save, but expose the
 /// result text so the value renders (a date, page number, cross-reference, …).
 fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    // Capture the instruction (e.g. `= 2+2 \# "0.00"`) before advancing.
+    let instr = decode_attr(p.attr("w:instr"));
     let start = p.start_pos();
     let mut inner = Vec::new();
     parse_inlines_into(p, rels, &mut inner);
     let raw = p.raw_slice(start, p.pos()).to_string();
-    let text: String = inner.iter().map(Inline::text).collect();
+    let cached: String = inner.iter().map(Inline::text).collect();
+    // Recompute the value where we can (formula fields); otherwise show what Word
+    // last cached. The original XML is kept verbatim for a lossless save.
+    let text = crate::field::eval_field(&instr).unwrap_or(cached);
     out.push(Inline::Field { raw, text });
 }
 
@@ -1094,6 +1099,27 @@ mod tests {
         assert_eq!(first_para(&d).plain_text(), "11/5/2007");
         // and it serializes back verbatim
         assert!(crate::serialize::document_to_xml(&d).contains("<w:fldSimple w:instr="));
+    }
+
+    #[test]
+    fn formula_field_is_recomputed_from_cache() {
+        // The cached result is a stale "0"; docxy recomputes the formula to 14.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:fldSimple w:instr=\" = 2*(3+4) \"><w:r><w:t>0</w:t></w:r></w:fldSimple>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(first_para(&d).plain_text(), "14");
+    }
+
+    #[test]
+    fn non_formula_simple_field_keeps_cached_value() {
+        // A DATE field isn't recomputed (no clock context); the cache stands.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:fldSimple w:instr=\" DATE \\@ &quot;M/d/yyyy&quot; \">\
+                   <w:r><w:t>2/15/2008</w:t></w:r></w:fldSimple>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(first_para(&d).plain_text(), "2/15/2008");
     }
 
     #[test]
