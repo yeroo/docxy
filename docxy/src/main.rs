@@ -322,6 +322,69 @@ impl PasteOpt {
     }
 }
 
+/// A field type offered by the Insert Field dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldKind {
+    Date,
+    Time,
+    Page,
+    NumPages,
+    Author,
+    Title,
+    Subject,
+    FileName,
+}
+
+impl FieldKind {
+    const ALL: [FieldKind; 8] = [
+        FieldKind::Date,
+        FieldKind::Time,
+        FieldKind::Page,
+        FieldKind::NumPages,
+        FieldKind::Author,
+        FieldKind::Title,
+        FieldKind::Subject,
+        FieldKind::FileName,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            FieldKind::Date => "Date",
+            FieldKind::Time => "Time",
+            FieldKind::Page => "Page Number",
+            FieldKind::NumPages => "Number of Pages",
+            FieldKind::Author => "Author",
+            FieldKind::Title => "Title",
+            FieldKind::Subject => "Subject",
+            FieldKind::FileName => "File Name",
+        }
+    }
+    /// The field instruction (entity-decoded), e.g. `DATE \@ "M/d/yyyy"`.
+    fn instr(self) -> &'static str {
+        match self {
+            FieldKind::Date => "DATE \\@ \"M/d/yyyy\"",
+            FieldKind::Time => "TIME \\@ \"h:mm AM/PM\"",
+            FieldKind::Page => "PAGE",
+            FieldKind::NumPages => "NUMPAGES",
+            FieldKind::Author => "AUTHOR",
+            FieldKind::Title => "TITLE",
+            FieldKind::Subject => "SUBJECT",
+            FieldKind::FileName => "FILENAME",
+        }
+    }
+    /// Value used when the field can't be computed here (no clock/metadata/pages).
+    fn fallback(self) -> &'static str {
+        match self {
+            FieldKind::Page | FieldKind::NumPages => "1",
+            _ => "",
+        }
+    }
+}
+
+/// The modal Insert Field dialog: pick a field to insert at the caret.
+struct InsertFieldDialog {
+    sel: usize,
+}
+
 /// The modal Paste Special dialog: pick how the clipboard is pasted.
 struct PasteSpecial {
     /// A short description of what is on the clipboard.
@@ -407,6 +470,13 @@ struct App {
     paste_special: Option<PasteSpecial>,
     ps_rows: Vec<Rect>,
     ps_btns: [Rect; 2],
+    /// The modal Insert Field dialog, plus its option-row and button rects.
+    insert_field: Option<InsertFieldDialog>,
+    if_rows: Vec<Rect>,
+    if_btns: [Rect; 2],
+    /// Field-evaluation context (clock + document properties + filename), kept so
+    /// newly inserted fields can be computed.
+    field_ctx: docxcore::field::FieldContext,
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -536,6 +606,10 @@ impl App {
             paste_special: None,
             ps_rows: Vec::new(),
             ps_btns: [Rect::default(); 2],
+            insert_field: None,
+            if_rows: Vec::new(),
+            if_btns: [Rect::default(); 2],
+            field_ctx,
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -686,6 +760,10 @@ impl App {
                 self.editor.insert_hrule();
                 self.after_edit();
                 self.status = Some("Inserted horizontal line".to_string());
+            }
+            InsertField => {
+                self.insert_field = Some(InsertFieldDialog { sel: 0 });
+                self.dirty = true;
             }
             Paste => self.do_paste(),
             Bold => {
@@ -2371,6 +2449,72 @@ impl App {
         self.dirty = true;
     }
 
+    /// The computed value of `kind`, with a fresh clock for date/time fields.
+    fn field_value(&self, kind: FieldKind) -> String {
+        let mut ctx = self.field_ctx.clone();
+        ctx.now = local_now();
+        docxcore::field::eval_field_ctx(kind.instr(), &ctx)
+            .unwrap_or_else(|| kind.fallback().to_string())
+    }
+
+    /// Build a simple field (`<w:fldSimple>`) inline with its computed value.
+    fn build_field(&self, kind: FieldKind) -> Inline {
+        let text = self.field_value(kind);
+        let raw = format!(
+            "<w:fldSimple w:instr=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:fldSimple>",
+            xml_esc_attr(kind.instr()),
+            xml_esc_text(&text),
+        );
+        Inline::Field { raw, text }
+    }
+
+    fn apply_insert_field(&mut self) {
+        let Some(d) = self.insert_field.take() else {
+            return;
+        };
+        let Some(&kind) = FieldKind::ALL.get(d.sel) else {
+            return;
+        };
+        let inl = self.build_field(kind);
+        self.editor.paste(&Clip {
+            paras: vec![vec![inl]],
+        });
+        self.after_edit();
+        self.status = Some(format!("Inserted field: {}", kind.label()));
+    }
+
+    fn insert_field_key(&mut self, key: KeyEvent) -> bool {
+        let Some(d) = self.insert_field.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(FieldKind::ALL.len() - 1),
+            KeyCode::Enter => self.apply_insert_field(),
+            KeyCode::Esc => self.insert_field = None,
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn insert_field_mouse(&mut self, x: u16, y: u16) {
+        let p = Position { x, y };
+        if let Some(i) = self.if_rows.iter().position(|r| r.contains(p)) {
+            if let Some(d) = self.insert_field.as_mut() {
+                d.sel = i;
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.if_btns[0].contains(p) {
+            self.apply_insert_field();
+        } else if self.if_btns[1].contains(p) {
+            self.insert_field = None;
+        }
+        self.dirty = true;
+    }
+
     /// The hyperlink target at a given document line and column, if any.
     fn link_at(&self, doc_line: usize, col: usize) -> Option<String> {
         let line = self.lines.get(doc_line)?;
@@ -2438,6 +2582,12 @@ impl App {
         if self.paste_special.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.paste_special_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.insert_field.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.insert_field_mouse(m.column, m.row);
             }
             return;
         }
@@ -3147,6 +3297,9 @@ impl App {
         if self.paste_special.is_some() {
             return self.paste_special_key(key);
         }
+        if self.insert_field.is_some() {
+            return self.insert_field_key(key);
+        }
         // The File backstage is modal: it owns all keys while open.
         if self.backstage.is_some() {
             return self.backstage_key(key);
@@ -3708,6 +3861,91 @@ impl App {
         if self.paste_special.is_some() {
             self.draw_paste_special(f, f.area());
         }
+        if self.insert_field.is_some() {
+            self.draw_insert_field(f, f.area());
+        }
+    }
+
+    fn draw_insert_field(&mut self, f: &mut Frame, area: Rect) {
+        let Some(d) = &self.insert_field else {
+            return;
+        };
+        let sel = d.sel;
+        let n = FieldKind::ALL.len() as u16;
+        // "Field:"(1) + options(n) + blank(1) + preview(1) + blank(1) + buttons(1).
+        let inner_h = 1 + n + 1 + 1 + 1 + 1;
+        let w = 46u16.clamp(28, area.width.saturating_sub(2).max(28));
+        let h = (inner_h + 2).min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Insert Field ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let line = |row: u16| Rect {
+            x: inner.x + 1,
+            y: inner.y + row,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(Paragraph::new("Field:"), line(0));
+        let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        self.if_rows.clear();
+        for (i, k) in FieldKind::ALL.iter().enumerate() {
+            let r = line(1 + i as u16);
+            let on = i == sel;
+            let label = format!(" {} {}", if on { "▶" } else { " " }, k.label());
+            f.render_widget(
+                Paragraph::new(label).style(if on { on_style } else { Style::default() }),
+                r,
+            );
+            self.if_rows.push(r);
+        }
+        // Live preview of the selected field's value.
+        let preview = FieldKind::ALL
+            .get(sel)
+            .map(|k| self.field_value(*k))
+            .unwrap_or_default();
+        let pv = if preview.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            preview
+        };
+        f.render_widget(
+            Paragraph::new(format!("Preview:  {pv}"))
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            line(1 + n + 1),
+        );
+
+        let (il, cl) = (" Insert ", " Cancel ");
+        let (iw, cw) = (il.len() as u16, cl.len() as u16);
+        let total = iw + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let insert_rect = Rect {
+            x: bx,
+            y: by,
+            width: iw,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + iw + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(il).style(on_style), insert_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.if_btns = [insert_rect, cancel_rect];
     }
 
     fn draw_paste_special(&mut self, f: &mut Frame, area: Rect) {
@@ -4019,6 +4257,16 @@ fn safe_url(url: &str) -> bool {
     }
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn xml_esc_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_esc_attr(s: &str) -> String {
+    xml_esc_text(s).replace('"', "&quot;")
 }
 
 /// Whether the clipboard text looks like a single URL (so Paste Special can offer
@@ -4975,6 +5223,30 @@ mod tests {
             _ => panic!(),
         }
         assert!(app.modified);
+    }
+
+    #[test]
+    fn insert_field_dialog_inserts_a_field_inline() {
+        let mut app = app_with(&["x"]);
+        app.run_act(ribbon::Act::InsertField);
+        assert!(app.insert_field.is_some(), "dialog opened");
+        app.on_key(key(KeyCode::Enter)); // insert the first field (Date)
+        assert!(app.insert_field.is_none(), "dialog closes after insert");
+        assert!(app.modified);
+        let has_field = match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => p.content.iter().any(|i| matches!(i, Inline::Field { .. })),
+            _ => false,
+        };
+        assert!(has_field, "a field inline was inserted");
+    }
+
+    #[test]
+    fn insert_field_esc_cancels() {
+        let mut app = app_with(&["x"]);
+        app.run_act(ribbon::Act::InsertField);
+        assert!(!app.on_key(key(KeyCode::Esc)));
+        assert!(app.insert_field.is_none());
+        assert!(!app.modified);
     }
 
     #[test]

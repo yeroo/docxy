@@ -22,6 +22,8 @@ pub enum Act {
     PasteSpecial,
     /// Insert a horizontal line (paragraph bottom border) at the caret.
     HorizontalLine,
+    /// Open the Insert Field dialog (date, page, author, …).
+    InsertField,
     Bold,
     Italic,
     Underline,
@@ -352,6 +354,19 @@ fn insert_groups() -> Vec<Group> {
                     Todo("Blank Page"),
                     "Insert a blank page",
                 )],
+            ],
+        },
+        Group {
+            title: "Text",
+            width: 13,
+            rows: [
+                vec![btn(
+                    "⎀ Field",
+                    7,
+                    InsertField,
+                    "Insert a field — date, page, author, …",
+                )],
+                vec![btn("⧉ Quick Parts", 13, Todo("Quick Parts"), "Quick parts")],
             ],
         },
         Group {
