@@ -4952,6 +4952,27 @@ mod tests {
     }
 
     #[test]
+    fn typing_three_dashes_then_enter_inserts_a_horizontal_line() {
+        let mut app = app_with(&[""]);
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Char('-')));
+        }
+        app.on_key(key(KeyCode::Enter));
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => {
+                assert!(p.content.is_empty(), "the rule paragraph is emptied");
+                assert_eq!(
+                    p.props.borders.bottom,
+                    Some(docxcore::model::BorderKind::Single),
+                    "--- + Enter should set a bottom border"
+                );
+            }
+            _ => panic!("expected a paragraph"),
+        }
+        assert!(app.modified);
+    }
+
+    #[test]
     fn paste_special_offers_options_and_pastes_unformatted() {
         let mut app = app_with(&["dest"]);
         app.ensure_rendered(40);
