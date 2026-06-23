@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
-use docxcore::model::{Align, Block, Document, PageGeom};
+use docxcore::model::{Align, Block, Document, Hyperlink, Inline, PageGeom, Run, RunProps};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, new_package, save_package};
 use docxcore::render::{
@@ -285,6 +285,56 @@ struct Confirm {
     action: ConfirmAction,
 }
 
+/// One way to paste the clipboard, offered by the Paste Special dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PasteOpt {
+    /// Paste docxy's own copied content with its original formatting.
+    KeepSource,
+    /// Paste the text, adopting the formatting where it is dropped.
+    Merge,
+    /// Paste plain text with no formatting at all.
+    Unformatted,
+    /// Paste the text as a hyperlink to its own address (URLs only).
+    Hyperlink,
+}
+
+impl PasteOpt {
+    fn label(self) -> &'static str {
+        match self {
+            PasteOpt::KeepSource => "Keep Source Formatting",
+            PasteOpt::Merge => "Merge Formatting",
+            PasteOpt::Unformatted => "Unformatted Text",
+            PasteOpt::Hyperlink => "Paste as Hyperlink",
+        }
+    }
+    /// The "Result" description, like Word's box.
+    fn result(self) -> &'static str {
+        match self {
+            PasteOpt::KeepSource => {
+                "Inserts the clipboard contents keeping their original formatting."
+            }
+            PasteOpt::Merge => "Inserts the text and adopts the formatting of where it is pasted.",
+            PasteOpt::Unformatted => {
+                "Inserts the clipboard contents as text without any formatting."
+            }
+            PasteOpt::Hyperlink => "Inserts the text as a hyperlink to its address.",
+        }
+    }
+}
+
+/// The modal Paste Special dialog: pick how the clipboard is pasted.
+struct PasteSpecial {
+    /// A short description of what is on the clipboard.
+    source: String,
+    /// The plain-text payload of the clipboard.
+    text: String,
+    /// docxy's own richly-formatted clip, when our content is still on the board.
+    rich: Option<Clip>,
+    /// The offered options and the highlighted one.
+    opts: Vec<PasteOpt>,
+    sel: usize,
+}
+
 struct App {
     pkg: Package,
     editor: Editor,
@@ -352,6 +402,11 @@ struct App {
     /// each frame by draw() for mouse hit-testing.
     confirm: Option<Confirm>,
     confirm_btns: [Rect; 2],
+    /// The modal Paste Special dialog, plus the option-row and button rects that
+    /// draw() records each frame for mouse hit-testing.
+    paste_special: Option<PasteSpecial>,
+    ps_rows: Vec<Rect>,
+    ps_btns: [Rect; 2],
     find: Option<FindState>,
     clipboard: Option<Clip>,
     os_clip: Option<arboard::Clipboard>,
@@ -478,6 +533,9 @@ impl App {
             bs_save_btn: Rect::default(),
             confirm: None,
             confirm_btns: [Rect::default(); 2],
+            paste_special: None,
+            ps_rows: Vec::new(),
+            ps_btns: [Rect::default(); 2],
             find: None,
             clipboard: None,
             os_clip: arboard::Clipboard::new().ok(),
@@ -623,6 +681,7 @@ impl App {
         match act {
             Cut => self.do_cut(),
             Copy => self.do_copy(),
+            PasteSpecial => self.open_paste_special(),
             Paste => self.do_paste(),
             Bold => {
                 self.editor.toggle_bold();
@@ -2186,6 +2245,127 @@ impl App {
         }
     }
 
+    /// Open the Paste Special dialog, offering the paste formats that make sense
+    /// for what is currently on the clipboard.
+    fn open_paste_special(&mut self) {
+        let os_text = self.os_get();
+        let (text, rich) = match os_text {
+            // Our own content is still on the board: a richly-formatted clip.
+            Some(t) if Some(&t) == self.clip_text.as_ref() => (t, self.clipboard.clone()),
+            Some(t) => (t, None),
+            None => match &self.clipboard {
+                Some(c) => (c.to_text(), Some(c.clone())),
+                None => {
+                    self.status = Some("Clipboard is empty".to_string());
+                    self.dirty = true;
+                    return;
+                }
+            },
+        };
+        if text.is_empty() && rich.is_none() {
+            self.status = Some("Clipboard is empty".to_string());
+            self.dirty = true;
+            return;
+        }
+        let mut opts = Vec::new();
+        if rich.is_some() {
+            opts.push(PasteOpt::KeepSource);
+        }
+        opts.push(PasteOpt::Merge);
+        opts.push(PasteOpt::Unformatted);
+        if looks_like_url(&text) {
+            opts.push(PasteOpt::Hyperlink);
+        }
+        let source = if rich.is_some() {
+            "Formatted text (docxy selection)"
+        } else {
+            "Text"
+        }
+        .to_string();
+        self.paste_special = Some(PasteSpecial {
+            source,
+            text,
+            rich,
+            opts,
+            sel: 0,
+        });
+        self.dirty = true;
+    }
+
+    /// Carry out the highlighted Paste Special option and close the dialog.
+    fn apply_paste_special(&mut self) {
+        let Some(ps) = self.paste_special.take() else {
+            return;
+        };
+        let Some(&opt) = ps.opts.get(ps.sel) else {
+            return;
+        };
+        match opt {
+            PasteOpt::KeepSource => {
+                if let Some(c) = &ps.rich {
+                    self.editor.paste(c);
+                }
+            }
+            // insert_str inserts as if typed, so the text adopts the caret's run.
+            PasteOpt::Merge => self.editor.insert_str(&ps.text),
+            PasteOpt::Unformatted => self.editor.paste(&Clip::from_text(&ps.text)),
+            PasteOpt::Hyperlink => {
+                let url = ps.text.trim().to_string();
+                let link = Inline::Hyperlink(Hyperlink {
+                    target: Some(url.clone()),
+                    anchor: None,
+                    rel_id: None,
+                    runs: vec![Run {
+                        text: url,
+                        props: RunProps::default(),
+                    }],
+                });
+                self.editor.paste(&Clip {
+                    paras: vec![vec![link]],
+                });
+            }
+        }
+        self.after_edit();
+        self.status = Some(format!("Pasted ({})", opt.label()));
+    }
+
+    fn paste_special_key(&mut self, key: KeyEvent) -> bool {
+        let Some(ps) = self.paste_special.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                ps.sel = ps.sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                ps.sel = (ps.sel + 1).min(ps.opts.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.apply_paste_special(),
+            KeyCode::Esc => self.paste_special = None,
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn paste_special_mouse(&mut self, x: u16, y: u16) {
+        let p = Position { x, y };
+        // Click an option row to highlight it.
+        if let Some(i) = self.ps_rows.iter().position(|r| r.contains(p)) {
+            if let Some(ps) = self.paste_special.as_mut() {
+                ps.sel = i;
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.ps_btns[0].contains(p) {
+            self.apply_paste_special();
+        } else if self.ps_btns[1].contains(p) {
+            self.paste_special = None;
+        }
+        self.dirty = true;
+    }
+
     /// The hyperlink target at a given document line and column, if any.
     fn link_at(&self, doc_line: usize, col: usize) -> Option<String> {
         let line = self.lines.get(doc_line)?;
@@ -2247,6 +2427,12 @@ impl App {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 // quit (if any) propagates via quit_requested in handle_event
                 self.confirm_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.paste_special.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.paste_special_mouse(m.column, m.row);
             }
             return;
         }
@@ -2952,6 +3138,10 @@ impl App {
         if self.confirm.is_some() {
             return self.confirm_key(key);
         }
+        // The Paste Special dialog is modal too.
+        if self.paste_special.is_some() {
+            return self.paste_special_key(key);
+        }
         // The File backstage is modal: it owns all keys while open.
         if self.backstage.is_some() {
             return self.backstage_key(key);
@@ -3020,6 +3210,7 @@ impl App {
             }
             KeyCode::Char('c') if ctrl => self.do_copy(),
             KeyCode::Char('x') if ctrl => self.do_cut(),
+            KeyCode::Char('v') if ctrl && alt => self.open_paste_special(),
             KeyCode::Char('v') if ctrl => self.do_paste(),
             KeyCode::Char('b') if ctrl => {
                 self.editor.toggle_bold();
@@ -3501,6 +3692,96 @@ impl App {
         let status_widget =
             Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(status_widget, status);
+
+        // The Paste Special dialog floats on top of the document (so the paste
+        // target stays visible behind it).
+        if self.paste_special.is_some() {
+            self.draw_paste_special(f, f.area());
+        }
+    }
+
+    fn draw_paste_special(&mut self, f: &mut Frame, area: Rect) {
+        let Some(ps) = &self.paste_special else {
+            return;
+        };
+        let n = ps.opts.len() as u16;
+        // source(1) + blank(1) + "As:"(1) + options(n) + blank(1) + result(2) +
+        // blank(1) + buttons(1), inside a border.
+        let inner_h = 1 + 1 + 1 + n + 1 + 2 + 1 + 1;
+        let w = 52u16.clamp(28, area.width.saturating_sub(2).max(28));
+        let h = (inner_h + 2).min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Paste Special ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let line = |row: u16, height: u16| Rect {
+            x: inner.x + 1,
+            y: inner.y + row,
+            width: inner.width.saturating_sub(2),
+            height,
+        };
+        // Source line.
+        f.render_widget(
+            Paragraph::new(format!("Source:  {}", ps.source))
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            line(0, 1),
+        );
+        f.render_widget(Paragraph::new("As:"), line(2, 1));
+
+        // Option rows.
+        let sel = Style::default().fg(Color::Black).bg(Color::Cyan);
+        self.ps_rows.clear();
+        for (i, opt) in ps.opts.iter().enumerate() {
+            let r = line(3 + i as u16, 1);
+            let on = i == ps.sel;
+            let label = format!(" {} {}", if on { "▶" } else { " " }, opt.label());
+            let style = if on { sel } else { Style::default() };
+            f.render_widget(Paragraph::new(label).style(style), r);
+            self.ps_rows.push(r);
+        }
+
+        // Result description for the highlighted option.
+        let res_y = 3 + n + 1;
+        let result = ps.opts.get(ps.sel).map(|o| o.result()).unwrap_or("");
+        f.render_widget(
+            Paragraph::new(result)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            line(res_y, 2),
+        );
+
+        // [ Paste ] [ Cancel ] buttons on the bottom row.
+        let (pl, cl) = (" Paste ", " Cancel ");
+        let (pw, cw) = (pl.len() as u16, cl.len() as u16);
+        let total = pw + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let paste_rect = Rect {
+            x: bx,
+            y: by,
+            width: pw,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + pw + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(pl).style(sel), paste_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.ps_btns = [paste_rect, cancel_rect];
     }
 }
 
@@ -3728,6 +4009,18 @@ fn safe_url(url: &str) -> bool {
     }
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Whether the clipboard text looks like a single URL (so Paste Special can offer
+/// "Paste as Hyperlink"). A single token with a web/mail scheme or a `www.` host.
+fn looks_like_url(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && !t.contains(char::is_whitespace)
+        && (t.starts_with("http://")
+            || t.starts_with("https://")
+            || t.starts_with("mailto:")
+            || t.starts_with("www."))
 }
 
 /// Open a URL with the OS default handler — **without a shell** (the URL is
@@ -4644,6 +4937,61 @@ mod tests {
         assert!(!app.on_key(key(KeyCode::Esc)));
         assert!(!app.ribbon_open);
         assert_eq!(app.ribbon_focus, ribbon::Focus::None);
+    }
+
+    fn para_text(app: &App, i: usize) -> String {
+        match &app.editor.doc.body[i] {
+            Block::Paragraph(p) => p.plain_text(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn paste_special_offers_options_and_pastes_unformatted() {
+        let mut app = app_with(&["dest"]);
+        app.ensure_rendered(40);
+        // Internal rich clip, with no OS clipboard available in the test.
+        app.os_clip = None;
+        app.clipboard = Some(Clip::from_text("hi"));
+        app.clip_text = Some("hi".to_string());
+
+        app.run_act(ribbon::Act::PasteSpecial);
+        {
+            let ps = app.paste_special.as_ref().expect("dialog opened");
+            assert_eq!(ps.opts[0], PasteOpt::KeepSource);
+            assert!(ps.opts.contains(&PasteOpt::Unformatted));
+        }
+        // Down twice highlights "Unformatted Text", Enter pastes and closes.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.paste_special.is_none(), "dialog closes after pasting");
+        assert!(app.modified);
+        assert!(para_text(&app, 0).starts_with("hi"), "text was inserted");
+    }
+
+    #[test]
+    fn paste_special_esc_cancels_without_editing() {
+        let mut app = app_with(&["dest"]);
+        app.os_clip = None;
+        app.clipboard = Some(Clip::from_text("hi"));
+        app.clip_text = Some("hi".to_string());
+        app.run_act(ribbon::Act::PasteSpecial);
+        assert!(app.paste_special.is_some());
+        assert!(!app.on_key(key(KeyCode::Esc)));
+        assert!(app.paste_special.is_none(), "Esc closes the dialog");
+        assert!(!app.modified, "cancel must not modify the document");
+    }
+
+    #[test]
+    fn paste_special_offers_hyperlink_for_a_url() {
+        let mut app = app_with(&["dest"]);
+        app.os_clip = None;
+        app.clipboard = Some(Clip::from_text("https://example.com"));
+        app.clip_text = Some("https://example.com".to_string());
+        app.run_act(ribbon::Act::PasteSpecial);
+        let ps = app.paste_special.as_ref().expect("dialog opened");
+        assert!(ps.opts.contains(&PasteOpt::Hyperlink));
     }
 
     fn vim_app(paras: &[&str]) -> App {

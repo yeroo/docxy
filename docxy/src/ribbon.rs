@@ -18,6 +18,8 @@ pub enum Act {
     Cut,
     Copy,
     Paste,
+    /// Open the Paste Special dialog (choose how clipboard content is pasted).
+    PasteSpecial,
     Bold,
     Italic,
     Underline,
@@ -198,8 +200,8 @@ fn home_groups() -> Vec<Group> {
                     btn(
                         "▾",
                         1,
-                        Todo("Paste options"),
-                        "Paste options (paste special)",
+                        PasteSpecial,
+                        "Paste Special (Ctrl+Alt+V) — choose paste format",
                     ),
                     Seg::Gap("   "),
                     btn(
@@ -871,10 +873,11 @@ mod tests {
         assert!(matches!(r.focus_act(paste), Some((Act::Paste, _))));
         // Down from Paste reaches its dropdown caret directly below it.
         let down = r.nav(paste, Dir::Down);
+        assert!(matches!(r.focus_act(down), Some((Act::PasteSpecial, _))));
         let hint = r.focus_hint(down).unwrap_or("");
         assert!(
-            hint.contains("Paste options"),
-            "Down from Paste should reach the paste dropdown, got: {hint}"
+            hint.contains("Paste Special"),
+            "Down from Paste should reach the Paste Special dropdown, got: {hint}"
         );
     }
 
