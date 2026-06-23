@@ -32,4 +32,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 # Rasterize legacy WMF/EMF vector images via the OS's GDI (Windows only).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_SystemInformation"] }

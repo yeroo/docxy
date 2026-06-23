@@ -421,6 +421,21 @@ impl App {
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
+        // Recompute fields that depend on the clock / document properties (DATE,
+        // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
+        // rather than the value last cached in the file.
+        let field_ctx = docxcore::field::FieldContext {
+            now: local_now(),
+            props: pkg
+                .part("docProps/core.xml")
+                .map(|b| docxcore::field::parse_core_props(std::str::from_utf8(b).unwrap_or("")))
+                .unwrap_or_default(),
+            filename: std::path::Path::new(path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        docxcore::field::recompute(&mut pkg.document, &field_ctx);
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -3730,6 +3745,31 @@ fn open_url(url: &str) {
     let _ = Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
+/// The current local date-time for field evaluation (DATE/TIME). On Windows this
+/// is the OS local clock; elsewhere it falls back to UTC.
+#[cfg(windows)]
+fn local_now() -> Option<docxcore::field::DateTime> {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    let mut st = unsafe { std::mem::zeroed::<windows_sys::Win32::Foundation::SYSTEMTIME>() };
+    unsafe { GetLocalTime(&mut st) };
+    Some(docxcore::field::DateTime {
+        year: st.wYear as i32,
+        month: st.wMonth as u32,
+        day: st.wDay as u32,
+        hour: st.wHour as u32,
+        min: st.wMinute as u32,
+        sec: st.wSecond as u32,
+        weekday: st.wDayOfWeek as u32,
+    })
+}
+
+#[cfg(not(windows))]
+fn local_now() -> Option<docxcore::field::DateTime> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(docxcore::field::civil_from_unix(secs))
 }
 
 fn map_color(c: DocColor) -> Color {

@@ -554,6 +554,355 @@ fn first_cap(s: &str) -> String {
     }
 }
 
+// ---- context-dependent fields (date/time, document properties) ----
+
+/// A civil date-time, the unit DATE/CREATEDATE/… fields format.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DateTime {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub min: u32,
+    pub sec: u32,
+    /// 0 = Sunday … 6 = Saturday.
+    pub weekday: u32,
+}
+
+/// Document properties from `docProps/core.xml`, the source for AUTHOR/TITLE/… and
+/// CREATEDATE/SAVEDATE fields.
+#[derive(Clone, Debug, Default)]
+pub struct DocProps {
+    pub author: String,
+    pub title: String,
+    pub subject: String,
+    pub keywords: String,
+    pub comments: String,
+    pub last_saved_by: String,
+    pub revision: String,
+    pub created: Option<DateTime>,
+    pub modified: Option<DateTime>,
+}
+
+/// What a field needs beyond its own instruction: the current clock (for DATE/
+/// TIME), the document properties, and the file name.
+#[derive(Clone, Debug, Default)]
+pub struct FieldContext {
+    pub now: Option<DateTime>,
+    pub props: DocProps,
+    pub filename: String,
+}
+
+/// Like [`eval_field`], but also resolves fields that need outside context — the
+/// clock (DATE, TIME), the document properties (AUTHOR, TITLE, CREATEDATE, …), and
+/// the file name (FILENAME). Returns `None` when the field still can't be resolved
+/// (e.g. DATE with no clock, or an empty property), so the cached result stands.
+pub fn eval_field_ctx(instr: &str, ctx: &FieldContext) -> Option<String> {
+    if let Some(v) = eval_field(instr) {
+        return Some(v); // self-contained: = (Formula), IF
+    }
+    let s = instr.trim();
+    let name_end = s.find(char::is_whitespace).unwrap_or(s.len());
+    let name = s[..name_end].to_ascii_uppercase();
+    let rest = &s[name_end..];
+    let (_, switches) = split_switches(rest);
+    let pic = switches
+        .iter()
+        .find(|(c, _)| *c == '@')
+        .map(|(_, a)| a.as_str());
+    let nonempty = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+
+    let mut out = match name.as_str() {
+        // The current clock — already local — so DATE/TIME need no timezone math.
+        "DATE" => format_date(ctx.now.as_ref()?, pic.unwrap_or("M/d/yyyy")),
+        "TIME" => format_date(ctx.now.as_ref()?, pic.unwrap_or("h:mm AM/PM")),
+        // CREATEDATE/SAVEDATE/PRINTDATE are deliberately NOT recomputed: core.xml
+        // stores them in UTC, but Word shows them in the viewer's local time, so the
+        // value Word already cached is the correct local representation. Recomputing
+        // from UTC (we have no original timezone) would shift the time. Keep cached.
+        "AUTHOR" => nonempty(&ctx.props.author)?,
+        "TITLE" => nonempty(&ctx.props.title)?,
+        "SUBJECT" => nonempty(&ctx.props.subject)?,
+        "KEYWORDS" => nonempty(&ctx.props.keywords)?,
+        "COMMENTS" => nonempty(&ctx.props.comments)?,
+        "LASTSAVEDBY" => nonempty(&ctx.props.last_saved_by)?,
+        "REVNUM" => nonempty(&ctx.props.revision)?,
+        "FILENAME" => nonempty(&ctx.filename)?,
+        _ => return None,
+    };
+    if let Some((_, fmt)) = switches.iter().find(|(c, _)| *c == '*') {
+        out = apply_star(&out, out.parse().unwrap_or(0.0), fmt);
+    }
+    Some(out)
+}
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const WEEKDAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// Format a date-time against a Word `\@` picture (case-sensitive: `M`=month,
+/// `m`=minute). Supports yyyy/yy, MMMM/MMM/MM/M, dddd/ddd/dd/d, HH/H, hh/h, mm/m,
+/// ss/s, AM/PM (and am/pm), `'literal'` text, and other characters as literals.
+fn format_date(dt: &DateTime, pic: &str) -> String {
+    let chars: Vec<char> = pic.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let h12 = {
+        let h = dt.hour % 12;
+        if h == 0 { 12 } else { h }
+    };
+    let starts = |i: usize, pat: &str| chars[i..].starts_with(&pat.chars().collect::<Vec<_>>());
+    while i < chars.len() {
+        // Quoted literal.
+        if chars[i] == '\'' {
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let (tok, val): (&str, String) = if starts(i, "yyyy") {
+            ("yyyy", format!("{:04}", dt.year))
+        } else if starts(i, "yy") {
+            ("yy", format!("{:02}", dt.year.rem_euclid(100)))
+        } else if starts(i, "MMMM") {
+            (
+                "MMMM",
+                MONTHS
+                    .get((dt.month.max(1) - 1) as usize)
+                    .unwrap_or(&"")
+                    .to_string(),
+            )
+        } else if starts(i, "MMM") {
+            (
+                "MMM",
+                MONTHS
+                    .get((dt.month.max(1) - 1) as usize)
+                    .map(|m| m[..3].to_string())
+                    .unwrap_or_default(),
+            )
+        } else if starts(i, "MM") {
+            ("MM", format!("{:02}", dt.month))
+        } else if starts(i, "M") {
+            ("M", dt.month.to_string())
+        } else if starts(i, "dddd") {
+            (
+                "dddd",
+                WEEKDAYS.get(dt.weekday as usize).unwrap_or(&"").to_string(),
+            )
+        } else if starts(i, "ddd") {
+            (
+                "ddd",
+                WEEKDAYS
+                    .get(dt.weekday as usize)
+                    .map(|w| w[..3].to_string())
+                    .unwrap_or_default(),
+            )
+        } else if starts(i, "dd") {
+            ("dd", format!("{:02}", dt.day))
+        } else if starts(i, "d") {
+            ("d", dt.day.to_string())
+        } else if starts(i, "HH") {
+            ("HH", format!("{:02}", dt.hour))
+        } else if starts(i, "H") {
+            ("H", dt.hour.to_string())
+        } else if starts(i, "hh") {
+            ("hh", format!("{h12:02}"))
+        } else if starts(i, "h") {
+            ("h", h12.to_string())
+        } else if starts(i, "mm") {
+            ("mm", format!("{:02}", dt.min))
+        } else if starts(i, "m") {
+            ("m", dt.min.to_string())
+        } else if starts(i, "ss") {
+            ("ss", format!("{:02}", dt.sec))
+        } else if starts(i, "s") {
+            ("s", dt.sec.to_string())
+        } else if starts(i, "AM/PM") {
+            ("AM/PM", if dt.hour < 12 { "AM" } else { "PM" }.to_string())
+        } else if starts(i, "am/pm") {
+            ("am/pm", if dt.hour < 12 { "am" } else { "pm" }.to_string())
+        } else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        out.push_str(&val);
+        i += tok.chars().count();
+    }
+    out
+}
+
+/// Day of week (0=Sunday) for a civil date, via days-from-civil.
+fn weekday_of(y: i32, m: u32, d: u32) -> u32 {
+    // days since 1970-01-01 (a Thursday).
+    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as i64;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146097 + doe - 719468;
+    (((days % 7) + 4 + 7) % 7) as u32 // 1970-01-01 = Thursday(4)
+}
+
+/// Convert Unix seconds (UTC) to a civil date-time (used as the non-Windows
+/// fallback clock; Word shows local time, but this is close enough for DATE).
+pub fn civil_from_unix(secs: i64) -> DateTime {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let weekday = (((days % 7) + 4 + 7) % 7) as u32; // 1970-01-01 = Thursday
+    // days-from-civil inverse (Howard Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + if month <= 2 { 1 } else { 0 }) as i32;
+    DateTime {
+        year,
+        month,
+        day,
+        hour: (rem / 3600) as u32,
+        min: (rem % 3600 / 60) as u32,
+        sec: (rem % 60) as u32,
+        weekday,
+    }
+}
+
+/// Parse `docProps/core.xml` into [`DocProps`].
+pub fn parse_core_props(xml: &str) -> DocProps {
+    let tag = |name: &str| -> String {
+        let open = format!("<{name}");
+        let Some(s) = xml.find(&open) else {
+            return String::new();
+        };
+        let Some(gt) = xml[s..].find('>').map(|e| s + e + 1) else {
+            return String::new();
+        };
+        let close = format!("</{name}>");
+        let Some(e) = xml[gt..].find(&close).map(|e| gt + e) else {
+            return String::new();
+        };
+        xml_unescape(&xml[gt..e])
+    };
+    DocProps {
+        author: tag("dc:creator"),
+        title: tag("dc:title"),
+        subject: tag("dc:subject"),
+        keywords: tag("cp:keywords"),
+        comments: tag("dc:description"),
+        last_saved_by: tag("cp:lastModifiedBy"),
+        revision: tag("cp:revision"),
+        created: parse_iso(&tag("dcterms:created")),
+        modified: parse_iso(&tag("dcterms:modified")),
+    }
+}
+
+/// Parse an ISO-8601 timestamp like `2007-11-05T14:54:00Z` (the value is in UTC;
+/// we format the stored components directly).
+pub fn parse_iso(s: &str) -> Option<DateTime> {
+    let s = s.trim();
+    let num = |a: usize, b: usize| s.get(a..b)?.parse::<u32>().ok();
+    if s.len() < 10 {
+        return None;
+    }
+    let year = s.get(0..4)?.parse::<i32>().ok()?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let (hour, min, sec) = if s.len() >= 19 {
+        (num(11, 13)?, num(14, 16)?, num(17, 19)?)
+    } else {
+        (0, 0, 0)
+    };
+    Some(DateTime {
+        year,
+        month,
+        day,
+        hour,
+        min,
+        sec,
+        weekday: weekday_of(year, month, day),
+    })
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extract the `w:instr` value (entity-decoded) from a `<w:fldSimple>`'s raw XML.
+fn instr_of(raw: &str) -> Option<String> {
+    let k = "w:instr=\"";
+    let s = raw.find(k)? + k.len();
+    let e = raw[s..].find('"')? + s;
+    Some(xml_unescape(&raw[s..e]))
+}
+
+/// Recompute every simple field in the document against `ctx`, replacing its
+/// rendered text where a fresh value is available (the cache stands otherwise).
+pub fn recompute(doc: &mut crate::model::Document, ctx: &FieldContext) {
+    fn walk_blocks(blocks: &mut [crate::model::Block], ctx: &FieldContext) {
+        use crate::model::{Block, Inline};
+        for b in blocks {
+            match b {
+                Block::Paragraph(p) => {
+                    for inl in &mut p.content {
+                        match inl {
+                            Inline::Field { raw, text } => {
+                                if let Some(v) = instr_of(raw).and_then(|i| eval_field_ctx(&i, ctx))
+                                {
+                                    *text = v;
+                                }
+                            }
+                            Inline::TextBox { blocks, .. } => walk_blocks(blocks, ctx),
+                            _ => {}
+                        }
+                    }
+                }
+                Block::Table(t) => {
+                    for row in &mut t.rows {
+                        for cell in &mut row.cells {
+                            walk_blocks(&mut cell.blocks, ctx);
+                        }
+                    }
+                }
+                Block::Raw(_) => {}
+            }
+        }
+    }
+    walk_blocks(&mut doc.body, ctx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +969,87 @@ mod tests {
             ev("IF \"x\" <> \"y\" \"different\" \"equal\"").as_deref(),
             Some("different")
         );
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime {
+        DateTime {
+            year: y,
+            month: mo,
+            day: d,
+            hour: h,
+            min: mi,
+            sec: s,
+            weekday: weekday_of(y, mo, d),
+        }
+    }
+
+    #[test]
+    fn date_and_time_fields_use_the_clock() {
+        let ctx = FieldContext {
+            now: Some(at(2026, 6, 23, 14, 5, 9)),
+            ..Default::default()
+        };
+        // simple-field.docx: DATE with only \* MERGEFORMAT → default M/d/yyyy
+        assert_eq!(
+            eval_field_ctx(" DATE \\* MERGEFORMAT ", &ctx).as_deref(),
+            Some("6/23/2026")
+        );
+        assert_eq!(
+            eval_field_ctx(" DATE \\@ \"yyyy-MM-dd\" ", &ctx).as_deref(),
+            Some("2026-06-23")
+        );
+        assert_eq!(
+            eval_field_ctx(" TIME \\@ \"h:mm AM/PM\" ", &ctx).as_deref(),
+            Some("2:05 PM")
+        );
+        // no clock → the cached value stands
+        assert_eq!(eval_field_ctx(" DATE ", &FieldContext::default()), None);
+    }
+
+    #[test]
+    fn date_picture_names_and_weekday() {
+        let dt = at(2026, 6, 23, 0, 0, 0);
+        assert_eq!(WEEKDAYS[dt.weekday as usize], "Tuesday");
+        assert_eq!(
+            format_date(&dt, "dddd, MMMM d, yyyy"),
+            "Tuesday, June 23, 2026"
+        );
+        assert_eq!(format_date(&dt, "ddd MMM dd"), "Tue Jun 23");
+    }
+
+    #[test]
+    fn document_property_fields() {
+        let ctx = FieldContext {
+            props: DocProps {
+                author: "Zhe".into(),
+                title: "My Doc".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(eval_field_ctx(" AUTHOR ", &ctx).as_deref(), Some("Zhe"));
+        assert_eq!(
+            eval_field_ctx(" TITLE \\* Upper ", &ctx).as_deref(),
+            Some("MY DOC")
+        );
+        // an empty property is not substituted (the cache stands)
+        assert_eq!(eval_field_ctx(" SUBJECT ", &ctx), None);
+    }
+
+    #[test]
+    fn core_props_parse_and_stored_dates_keep_cache() {
+        let props = parse_core_props(
+            "<x><dc:creator>Zhe</dc:creator>\
+             <dcterms:created>2007-11-05T14:54:00Z</dcterms:created></x>",
+        );
+        assert_eq!(props.author, "Zhe");
+        assert_eq!(props.created, Some(at(2007, 11, 5, 14, 54, 0)));
+        // CREATEDATE is not recomputed (UTC→local would shift it); cache stands.
+        let ctx = FieldContext {
+            props,
+            ..Default::default()
+        };
+        assert_eq!(eval_field_ctx(" CREATEDATE \\@ \"M/d/yyyy\" ", &ctx), None);
     }
 
     #[test]
