@@ -785,7 +785,9 @@ fn style_from_run(p: &RunProps) -> Style {
         underline: p.underline,
         strike: p.strike,
         dim: p.vanish,
-        highlight: false,
+        // The terminal has no per-run background, so a text highlight shows as
+        // reversed video (same as a selection).
+        highlight: p.highlight.is_some(),
         color: p.color.as_deref().and_then(parse_hex).map(quantize),
     }
 }
@@ -879,7 +881,9 @@ fn flatten_para(
                 img: None,
             }
         };
-        g.style.highlight = sel_at(mc);
+        // Selection highlight ORs with the run's own highlight (so highlighted
+        // text stays marked when not selected).
+        g.style.highlight |= sel_at(mc);
         g
     };
 

@@ -779,6 +779,107 @@ impl Editor {
         self.toggle_run_prop(|p| p.strike, |p, v| p.strike = v);
     }
 
+    /// Run properties at the caret (used for toggles and the ribbon's on-states).
+    pub fn caret_props(&self) -> RunProps {
+        resolve_para(&self.doc.body, &self.caret.path)
+            .map(|p| run_props_at(&p.content, self.caret.offset))
+            .unwrap_or_default()
+    }
+
+    /// Apply `f` to the run properties over the selection (or the run at the caret
+    /// when there is no selection, so the next typed text takes the change).
+    fn map_props(&mut self, f: impl Fn(&mut RunProps)) {
+        let spans = self.selection_spans();
+        if spans.is_empty() {
+            return;
+        }
+        self.checkpoint(EditKind::Structural);
+        for (path, s, e) in &spans {
+            if let Some(p) = para_mut(&mut self.doc.body, path) {
+                map_prop_range(&mut p.content, *s, *e, &f);
+            }
+        }
+    }
+
+    /// Grow (or shrink) the font size of the selection by `delta` half-points,
+    /// defaulting from 11pt when unset.
+    pub fn resize_font(&mut self, delta: i32) {
+        self.map_props(|p| {
+            let cur = p.size_half_pts.unwrap_or(22) as i32;
+            p.size_half_pts = Some((cur + delta).clamp(2, 264) as u32);
+        });
+    }
+    pub fn set_font_size(&mut self, half_pts: u32) {
+        self.map_props(move |p| p.size_half_pts = Some(half_pts));
+    }
+    pub fn set_font(&mut self, name: &str) {
+        let name = name.to_string();
+        self.map_props(move |p| p.font = Some(name.clone()));
+    }
+    pub fn set_color(&mut self, hex: Option<String>) {
+        self.map_props(move |p| p.color = hex.clone());
+    }
+    pub fn set_highlight(&mut self, name: Option<String>) {
+        self.map_props(move |p| p.highlight = name.clone());
+    }
+
+    /// Toggle subscript/superscript: turn it off if already on, else set it.
+    pub fn toggle_vert_align(&mut self, target: VertAlign) {
+        let new = if self.caret_props().vert_align == target {
+            VertAlign::Baseline
+        } else {
+            target
+        };
+        self.map_props(move |p| p.vert_align = new);
+    }
+
+    /// Reset character formatting (Ctrl+Space) over the selection.
+    pub fn clear_run_formatting(&mut self) {
+        self.map_props(|p| *p = RunProps::default());
+    }
+
+    /// Cycle the case of the selected text (Word's Shift+F3): all-caps →
+    /// lowercase → Capitalize Each Word → all-caps …
+    pub fn cycle_case(&mut self) {
+        let text = self.selected_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        let has_upper = text.chars().any(|c| c.is_uppercase());
+        let has_lower = text.chars().any(|c| c.is_lowercase());
+        let spans = self.selection_spans();
+        self.checkpoint(EditKind::Structural);
+        let f: Box<dyn Fn(&str) -> String> = if has_upper && !has_lower {
+            Box::new(|s: &str| s.to_lowercase()) // ALL CAPS → lower
+        } else if !has_upper {
+            Box::new(|s: &str| title_case(s)) // lower → Capitalize
+        } else {
+            Box::new(|s: &str| s.to_uppercase()) // mixed → ALL CAPS
+        };
+        for (path, s, e) in &spans {
+            if let Some(p) = para_mut(&mut self.doc.body, path) {
+                map_text_range(&mut p.content, *s, *e, &*f);
+            }
+        }
+    }
+
+    /// The plain text currently selected (empty if no selection).
+    fn selected_text(&self) -> String {
+        self.selection_spans()
+            .iter()
+            .filter_map(|(path, s, e)| {
+                resolve_para(&self.doc.body, path).map(|p| {
+                    p.plain_text()
+                        .chars()
+                        .skip(*s)
+                        .take(e.saturating_sub(*s))
+                        .collect::<String>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Toggle a run property over the selection. The new value is "off" only if
     /// every selected character already has it (so it works like Word).
     fn toggle_run_prop(&mut self, get: fn(&RunProps) -> bool, set: fn(&mut RunProps, bool)) {
@@ -1401,15 +1502,15 @@ fn range_all_have(
     saw
 }
 
-/// Split a run so that `[start, end)` (absolute char positions, with the run
-/// starting at `pos`) becomes its own run with `set(value)` applied.
-fn split_run(
+/// Split a run at `[start, end)` (absolute char positions, run starting at `pos`)
+/// and rebuild it, applying `mid` to the in-range slice's run. `mid` may change the
+/// properties and/or the text of that slice.
+fn split_run_with(
     r: Run,
     pos: usize,
     start: usize,
     end: usize,
-    set: fn(&mut RunProps, bool),
-    value: bool,
+    mid_fn: &dyn Fn(&str, &RunProps) -> Run,
 ) -> Vec<Run> {
     let len = r.text.chars().count();
     let (a, b) = (pos, pos + len);
@@ -1420,38 +1521,30 @@ fn split_run(
     }
     let b1 = char_byte(&r.text, os);
     let b2 = char_byte(&r.text, oe);
-    let left = r.text[..b1].to_string();
-    let mid = r.text[b1..b2].to_string();
-    let right = r.text[b2..].to_string();
+    let (left, mid, right) = (&r.text[..b1], &r.text[b1..b2], &r.text[b2..]);
     let mut out = Vec::new();
     if !left.is_empty() {
         out.push(Run {
-            text: left,
+            text: left.to_string(),
             props: r.props.clone(),
         });
     }
-    let mut mp = r.props.clone();
-    set(&mut mp, value);
-    out.push(Run {
-        text: mid,
-        props: mp,
-    });
+    out.push(mid_fn(mid, &r.props));
     if !right.is_empty() {
         out.push(Run {
-            text: right,
+            text: right.to_string(),
             props: r.props.clone(),
         });
     }
     out
 }
 
-/// Apply `set(value)` to every run-character in `[start, end)`, splitting runs.
-fn set_prop_range(
+/// Rebuild `content`, applying `mid_fn` to the run slice in `[start, end)`.
+fn edit_run_range(
     content: &mut Vec<Inline>,
     start: usize,
     end: usize,
-    set: fn(&mut RunProps, bool),
-    value: bool,
+    mid_fn: &dyn Fn(&str, &RunProps) -> Run,
 ) {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -1459,7 +1552,7 @@ fn set_prop_range(
         match inline {
             Inline::Run(r) => {
                 let len = r.text.chars().count();
-                for nr in split_run(r, pos, start, end, set, value) {
+                for nr in split_run_with(r, pos, start, end, mid_fn) {
                     out.push(Inline::Run(nr));
                 }
                 pos += len;
@@ -1469,7 +1562,7 @@ fn set_prop_range(
                 let mut p = pos;
                 for run in h.runs.drain(..) {
                     let len = run.text.chars().count();
-                    for nr in split_run(run, p, start, end, set, value) {
+                    for nr in split_run_with(run, p, start, end, mid_fn) {
                         new_runs.push(nr);
                     }
                     p += len;
@@ -1487,15 +1580,96 @@ fn set_prop_range(
                 pos += 1;
             }
             // zero-length, unchanged
-            inline @ (Inline::SmartArt { .. }
-            | Inline::Chart { .. }
-            | Inline::Equation { .. }
-            | Inline::Field { .. }
-            | Inline::TextBox { .. }
-            | Inline::Raw(_)) => out.push(inline),
+            other => out.push(other),
         }
     }
     *content = out;
+}
+
+/// Apply `set(value)` to every run-character in `[start, end)`, splitting runs.
+fn set_prop_range(
+    content: &mut Vec<Inline>,
+    start: usize,
+    end: usize,
+    set: fn(&mut RunProps, bool),
+    value: bool,
+) {
+    edit_run_range(content, start, end, &|text, props| {
+        let mut p = props.clone();
+        set(&mut p, value);
+        Run {
+            text: text.to_string(),
+            props: p,
+        }
+    });
+}
+
+/// Apply `f` to the run properties of every character in `[start, end)`.
+fn map_prop_range(content: &mut Vec<Inline>, start: usize, end: usize, f: &dyn Fn(&mut RunProps)) {
+    edit_run_range(content, start, end, &|text, props| {
+        let mut p = props.clone();
+        f(&mut p);
+        Run {
+            text: text.to_string(),
+            props: p,
+        }
+    });
+}
+
+/// Apply a text transform `f` to every character in `[start, end)` (formatting
+/// preserved).
+fn map_text_range(content: &mut Vec<Inline>, start: usize, end: usize, f: &dyn Fn(&str) -> String) {
+    edit_run_range(content, start, end, &|text, props| Run {
+        text: f(text),
+        props: props.clone(),
+    });
+}
+
+/// Capitalize the first letter of each whitespace-separated word.
+fn title_case(s: &str) -> String {
+    let mut out = String::new();
+    let mut start_of_word = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            start_of_word = true;
+            out.push(c);
+        } else if start_of_word {
+            out.extend(c.to_uppercase());
+            start_of_word = false;
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// The run properties at char `offset` in `content` (the run covering the
+/// character before the offset, else the one at it).
+fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
+    let mut pos = 0;
+    let mut last = RunProps::default();
+    for inline in content {
+        let runs: &[Run] = match inline {
+            Inline::Run(r) => std::slice::from_ref(r),
+            Inline::Hyperlink(h) => &h.runs,
+            Inline::Tab | Inline::Break(_) => {
+                pos += 1;
+                continue;
+            }
+            _ => continue,
+        };
+        for r in runs {
+            let len = r.text.chars().count();
+            if offset > pos && offset <= pos + len {
+                return r.props.clone();
+            }
+            if len > 0 {
+                last = r.props.clone();
+            }
+            pos += len;
+        }
+    }
+    last
 }
 
 #[cfg(test)]
@@ -1556,6 +1730,42 @@ mod tests {
                 }
                 other => panic!("expected TextBox, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn font_formatting_applies_over_the_selection() {
+        let mut ed = Editor::new(doc(&["hello"]));
+        ed.select_all();
+        ed.resize_font(2); // 11pt default (22) → 12pt (24)
+        ed.set_color(Some("FF0000".to_string()));
+        ed.set_font("Arial");
+        ed.toggle_vert_align(VertAlign::Superscript);
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => match &p.content[0] {
+                Inline::Run(r) => {
+                    assert_eq!(r.props.size_half_pts, Some(24));
+                    assert_eq!(r.props.color.as_deref(), Some("FF0000"));
+                    assert_eq!(r.props.font.as_deref(), Some("Arial"));
+                    assert_eq!(r.props.vert_align, VertAlign::Superscript);
+                }
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+        // cycle case: all-lower → Capitalize
+        ed.select_all();
+        ed.cycle_case();
+        assert_eq!(top_text(&ed), vec!["Hello"]);
+        // clear formatting resets the run props
+        ed.select_all();
+        ed.clear_run_formatting();
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => match &p.content[0] {
+                Inline::Run(r) => assert_eq!(r.props, RunProps::default()),
+                _ => panic!(),
+            },
+            _ => panic!(),
         }
     }
 

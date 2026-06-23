@@ -385,6 +385,110 @@ struct InsertFieldDialog {
     sel: usize,
 }
 
+/// What a [`Picker`] sets on the selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickerKind {
+    FontName,
+    FontSize,
+    FontColor,
+    Highlight,
+}
+
+impl PickerKind {
+    fn title(self) -> &'static str {
+        match self {
+            PickerKind::FontName => " Font ",
+            PickerKind::FontSize => " Font Size ",
+            PickerKind::FontColor => " Font Colour ",
+            PickerKind::Highlight => " Highlight ",
+        }
+    }
+    fn items(self) -> &'static [&'static str] {
+        match self {
+            PickerKind::FontName => &[
+                "Calibri",
+                "Arial",
+                "Times New Roman",
+                "Courier New",
+                "Cambria",
+                "Georgia",
+                "Verdana",
+                "Consolas",
+                "Tahoma",
+            ],
+            PickerKind::FontSize => &[
+                "8", "9", "10", "11", "12", "14", "16", "18", "20", "24", "28", "36", "48", "72",
+            ],
+            PickerKind::FontColor => &[
+                "Automatic",
+                "Black",
+                "Red",
+                "Orange",
+                "Yellow",
+                "Green",
+                "Blue",
+                "Purple",
+                "Gray",
+                "White",
+            ],
+            PickerKind::Highlight => &[
+                "None",
+                "Yellow",
+                "Green",
+                "Cyan",
+                "Magenta",
+                "Red",
+                "Blue",
+                "Gray",
+                "Dark Yellow",
+            ],
+        }
+    }
+}
+
+/// A hex RRGGBB for a font-colour name (`None` = automatic).
+fn color_hex(name: &str) -> Option<String> {
+    Some(
+        match name {
+            "Black" => "000000",
+            "Red" => "FF0000",
+            "Orange" => "FFA500",
+            "Yellow" => "FFFF00",
+            "Green" => "008000",
+            "Blue" => "0000FF",
+            "Purple" => "800080",
+            "Gray" => "808080",
+            "White" => "FFFFFF",
+            _ => return None, // "Automatic"
+        }
+        .to_string(),
+    )
+}
+
+/// The OOXML highlight name for a label (`None` clears the highlight).
+fn highlight_name(name: &str) -> Option<String> {
+    Some(
+        match name {
+            "Yellow" => "yellow",
+            "Green" => "green",
+            "Cyan" => "cyan",
+            "Magenta" => "magenta",
+            "Red" => "red",
+            "Blue" => "blue",
+            "Gray" => "lightGray",
+            "Dark Yellow" => "darkYellow",
+            _ => return None, // "None"
+        }
+        .to_string(),
+    )
+}
+
+/// A modal list picker for a font/size/colour/highlight choice.
+struct FontPicker {
+    kind: PickerKind,
+    sel: usize,
+}
+
 /// The modal Paste Special dialog: pick how the clipboard is pasted.
 struct PasteSpecial {
     /// A short description of what is on the clipboard.
@@ -474,6 +578,10 @@ struct App {
     insert_field: Option<InsertFieldDialog>,
     if_rows: Vec<Rect>,
     if_btns: [Rect; 2],
+    /// The modal font/size/colour/highlight picker, plus its row/button rects.
+    font_picker: Option<FontPicker>,
+    fp_rows: Vec<Rect>,
+    fp_btns: [Rect; 2],
     /// Field-evaluation context (clock + document properties + filename), kept so
     /// newly inserted fields can be computed.
     field_ctx: docxcore::field::FieldContext,
@@ -609,6 +717,9 @@ impl App {
             insert_field: None,
             if_rows: Vec::new(),
             if_btns: [Rect::default(); 2],
+            font_picker: None,
+            fp_rows: Vec::new(),
+            fp_btns: [Rect::default(); 2],
             field_ctx,
             find: None,
             clipboard: None,
@@ -782,6 +893,36 @@ impl App {
                 self.editor.toggle_strike();
                 self.after_edit();
             }
+            Subscript => {
+                self.editor
+                    .toggle_vert_align(docxcore::model::VertAlign::Subscript);
+                self.after_edit();
+            }
+            Superscript => {
+                self.editor
+                    .toggle_vert_align(docxcore::model::VertAlign::Superscript);
+                self.after_edit();
+            }
+            GrowFont => {
+                self.editor.resize_font(2);
+                self.after_edit();
+            }
+            ShrinkFont => {
+                self.editor.resize_font(-2);
+                self.after_edit();
+            }
+            ChangeCase => {
+                self.editor.cycle_case();
+                self.after_edit();
+            }
+            ClearFormatting => {
+                self.editor.clear_run_formatting();
+                self.after_edit();
+            }
+            FontName => self.open_picker(PickerKind::FontName),
+            FontSize => self.open_picker(PickerKind::FontSize),
+            FontColor => self.open_picker(PickerKind::FontColor),
+            Highlight => self.open_picker(PickerKind::Highlight),
             AlignLeft => {
                 self.editor.set_align(Align::Left);
                 self.after_edit();
@@ -2515,6 +2656,70 @@ impl App {
         self.dirty = true;
     }
 
+    fn open_picker(&mut self, kind: PickerKind) {
+        if !self.editor.has_selection() {
+            self.status = Some(format!("Select text first, then {}", kind.title().trim()));
+            self.dirty = true;
+            return;
+        }
+        self.font_picker = Some(FontPicker { kind, sel: 0 });
+        self.dirty = true;
+    }
+
+    fn apply_picker(&mut self) {
+        let Some(p) = self.font_picker.take() else {
+            return;
+        };
+        let Some(item) = p.kind.items().get(p.sel).copied() else {
+            return;
+        };
+        match p.kind {
+            PickerKind::FontName => self.editor.set_font(item),
+            PickerKind::FontSize => {
+                if let Ok(pt) = item.parse::<u32>() {
+                    self.editor.set_font_size(pt * 2);
+                }
+            }
+            PickerKind::FontColor => self.editor.set_color(color_hex(item)),
+            PickerKind::Highlight => self.editor.set_highlight(highlight_name(item)),
+        }
+        self.after_edit();
+        self.status = Some(format!("{}: {item}", p.kind.title().trim()));
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) -> bool {
+        let Some(p) = self.font_picker.as_mut() else {
+            return false;
+        };
+        let n = p.kind.items().len();
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Enter => self.apply_picker(),
+            KeyCode::Esc => self.font_picker = None,
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn picker_mouse(&mut self, x: u16, y: u16) {
+        let pos = Position { x, y };
+        if let Some(i) = self.fp_rows.iter().position(|r| r.contains(pos)) {
+            if let Some(p) = self.font_picker.as_mut() {
+                p.sel = i;
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.fp_btns[0].contains(pos) {
+            self.apply_picker();
+        } else if self.fp_btns[1].contains(pos) {
+            self.font_picker = None;
+        }
+        self.dirty = true;
+    }
+
     /// The hyperlink target at a given document line and column, if any.
     fn link_at(&self, doc_line: usize, col: usize) -> Option<String> {
         let line = self.lines.get(doc_line)?;
@@ -2588,6 +2793,12 @@ impl App {
         if self.insert_field.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.insert_field_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.font_picker.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.picker_mouse(m.column, m.row);
             }
             return;
         }
@@ -3300,6 +3511,9 @@ impl App {
         if self.insert_field.is_some() {
             return self.insert_field_key(key);
         }
+        if self.font_picker.is_some() {
+            return self.picker_key(key);
+        }
         // The File backstage is modal: it owns all keys while open.
         if self.backstage.is_some() {
             return self.backstage_key(key);
@@ -3380,6 +3594,32 @@ impl App {
             }
             KeyCode::Char('u') if ctrl => {
                 self.editor.toggle_underline();
+                self.after_edit();
+            }
+            // Font shortcuts (Word): grow/shrink, sub/superscript, case, clear.
+            KeyCode::Char(']') if ctrl => {
+                self.editor.resize_font(2);
+                self.after_edit();
+            }
+            KeyCode::Char('[') if ctrl => {
+                self.editor.resize_font(-2);
+                self.after_edit();
+            }
+            KeyCode::Char('=') | KeyCode::Char('+') if ctrl => {
+                let tgt = if shift || matches!(key.code, KeyCode::Char('+')) {
+                    docxcore::model::VertAlign::Superscript
+                } else {
+                    docxcore::model::VertAlign::Subscript
+                };
+                self.editor.toggle_vert_align(tgt);
+                self.after_edit();
+            }
+            KeyCode::F(3) if shift => {
+                self.editor.cycle_case();
+                self.after_edit();
+            }
+            KeyCode::Char(' ') if ctrl => {
+                self.editor.clear_run_formatting();
                 self.after_edit();
             }
             KeyCode::Char('l') if ctrl => {
@@ -3585,6 +3825,23 @@ impl App {
         }
         if self.show_nav {
             toggles.push(ribbon::Act::ToggleNav);
+        }
+        // Font toggles reflect the run formatting at the caret.
+        let rp = self.editor.caret_props();
+        for (on, act) in [
+            (rp.bold, ribbon::Act::Bold),
+            (rp.italic, ribbon::Act::Italic),
+            (rp.underline, ribbon::Act::Underline),
+            (rp.strike, ribbon::Act::Strike),
+        ] {
+            if on {
+                toggles.push(act);
+            }
+        }
+        match rp.vert_align {
+            docxcore::model::VertAlign::Subscript => toggles.push(ribbon::Act::Subscript),
+            docxcore::model::VertAlign::Superscript => toggles.push(ribbon::Act::Superscript),
+            docxcore::model::VertAlign::Baseline => {}
         }
         self.ribbon.set_toggles(toggles);
         self.ribbon.set_light_page(self.light_page);
@@ -3864,6 +4121,82 @@ impl App {
         if self.insert_field.is_some() {
             self.draw_insert_field(f, f.area());
         }
+        if self.font_picker.is_some() {
+            self.draw_picker(f, f.area());
+        }
+    }
+
+    fn draw_picker(&mut self, f: &mut Frame, area: Rect) {
+        let Some(pk) = &self.font_picker else {
+            return;
+        };
+        let items = pk.kind.items();
+        let title = pk.kind.title();
+        let sel = pk.sel;
+        let n = items.len() as u16;
+        // Scroll the list so the selection stays visible in a capped window.
+        let max_rows = (area.height.saturating_sub(6)).clamp(3, 14);
+        let view = n.min(max_rows);
+        let top = (sel as u16)
+            .saturating_sub(view.saturating_sub(1))
+            .min(n - view);
+        let inner_h = view + 2; // list + blank + buttons
+        let w = 30u16.clamp(20, area.width.saturating_sub(2).max(20));
+        let h = (inner_h + 2).min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        self.fp_rows.clear();
+        for row in 0..view {
+            let i = (top + row) as usize;
+            let r = Rect {
+                x: inner.x + 1,
+                y: inner.y + row,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            let on = i == sel;
+            let label = format!(" {} {}", if on { "▶" } else { " " }, items[i]);
+            f.render_widget(
+                Paragraph::new(label).style(if on { on_style } else { Style::default() }),
+                r,
+            );
+            self.fp_rows.push(r);
+        }
+
+        let (ok, cl) = (" OK ", " Cancel ");
+        let (ow, cw) = (ok.len() as u16, cl.len() as u16);
+        let total = ow + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let ok_rect = Rect {
+            x: bx,
+            y: by,
+            width: ow,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + ow + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(ok).style(on_style), ok_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.fp_btns = [ok_rect, cancel_rect];
     }
 
     fn draw_insert_field(&mut self, f: &mut Frame, area: Rect) {
@@ -5222,6 +5555,49 @@ mod tests {
             Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
             _ => panic!(),
         }
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn font_color_picker_sets_the_run_colour() {
+        let mut app = app_with(&["hello"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::FontColor);
+        assert!(app.font_picker.is_some(), "picker opened");
+        // items: Automatic(0), Black(1), Red(2)
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.font_picker.is_none(), "picker closes after OK");
+        let red = match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => p
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Run(r) if r.props.color.as_deref() == Some("FF0000"))),
+            _ => false,
+        };
+        assert!(red, "the selection turned red");
+    }
+
+    #[test]
+    fn font_picker_needs_a_selection() {
+        let mut app = app_with(&["hello"]);
+        app.run_act(ribbon::Act::FontColor); // no selection
+        assert!(app.font_picker.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("Select text"));
+    }
+
+    #[test]
+    fn grow_font_and_change_case_act_on_selection() {
+        let mut app = app_with(&["abc"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::GrowFont);
+        app.run_act(ribbon::Act::ChangeCase);
+        let txt = match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => p.plain_text(),
+            _ => String::new(),
+        };
+        assert_eq!(txt, "Abc", "lowercase → Capitalize");
         assert!(app.modified);
     }
 
