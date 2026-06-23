@@ -1097,6 +1097,24 @@ mod tests {
     }
 
     #[test]
+    fn complex_field_hides_code_and_shows_result() {
+        // A fldChar field: begin / instruction / separate / result / end. The
+        // instruction (PAGE) is hidden; only the cached result (7) renders.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                   <w:r><w:instrText> PAGE </w:instrText></w:r>\
+                   <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                   <w:r><w:t>7</w:t></w:r>\
+                   <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(first_para(&d).plain_text(), "7");
+        // the field markers survive verbatim for a lossless save
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("PAGE") && out.contains("fldCharType=\"begin\""));
+    }
+
+    #[test]
     fn plain_paragraph_text() {
         let d = doc(
             "<w:document><w:body><w:p><w:r><w:t>Hello world</w:t></w:r></w:p></w:body></w:document>",
