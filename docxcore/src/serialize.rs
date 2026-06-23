@@ -89,6 +89,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.section_break.is_some()
         || props.borders.top.is_some()
         || props.borders.bottom.is_some()
+        || props.indent != 0
         || !props.tabs.is_empty();
     if !has_any {
         return;
@@ -179,6 +180,10 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             s.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
         }
         s.push_str("</w:tabs>");
+    }
+    // w:ind precedes w:jc in the schema order.
+    if props.indent != 0 {
+        s.push_str(&format!("<w:ind w:left=\"{}\"/>", props.indent));
     }
     match props.align {
         Align::Left => {}
@@ -475,6 +480,7 @@ mod tests {
                 bottom: Some(BorderKind::Single),
                 top: None,
             },
+            indent: 720,
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],

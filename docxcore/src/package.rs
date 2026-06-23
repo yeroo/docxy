@@ -133,6 +133,82 @@ impl Package {
     pub fn page_geom(&self) -> crate::model::PageGeom {
         crate::model::PageGeom::from_sect_pr(&self.sect_pr)
     }
+
+    /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
+    /// its `numId`, creating the part + relationship + content-type if absent. Used
+    /// by the Bullets/Numbering ribbon commands so applied lists render and save.
+    pub fn ensure_list(&mut self, bullet: bool) -> i32 {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        // Reserved high ids, unlikely to collide with a document's own lists.
+        let (num_id, abs_id, fmt, text) = if bullet {
+            (9990, 9990, "bullet", "•")
+        } else {
+            (9991, 9991, "decimal", "%1.")
+        };
+        let abstract_xml = format!(
+            "<w:abstractNum w:abstractNumId=\"{abs_id}\"><w:lvl w:ilvl=\"0\">\
+             <w:start w:val=\"1\"/><w:numFmt w:val=\"{fmt}\"/><w:lvlText w:val=\"{text}\"/>\
+             <w:lvlJc w:val=\"left\"/></w:lvl></w:abstractNum>"
+        );
+        let num_xml =
+            format!("<w:num w:numId=\"{num_id}\"><w:abstractNumId w:val=\"{abs_id}\"/></w:num>");
+        let name = "word/numbering.xml";
+        let marker = format!("w:numId=\"{num_id}\"");
+
+        if let Some(b) = self.part(name) {
+            let xml = String::from_utf8_lossy(b).into_owned();
+            if xml.contains(&marker) {
+                return num_id; // already defined
+            }
+            // abstractNum first (after the opening tag), num last (before the close).
+            let xml = match xml.find("<w:numbering").and_then(|s| xml[s..].find('>')) {
+                Some(_) => {
+                    let open_end = xml.find("<w:numbering").unwrap();
+                    let gt = xml[open_end..].find('>').unwrap() + open_end + 1;
+                    format!("{}{abstract_xml}{}", &xml[..gt], &xml[gt..])
+                }
+                None => xml,
+            };
+            let xml = xml.replacen("</w:numbering>", &format!("{num_xml}</w:numbering>"), 1);
+            self.set_part(name, xml.into_bytes());
+            return num_id;
+        }
+
+        // Create numbering.xml from scratch + wire content-type and relationship.
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:numbering xmlns:w=\"{W_NS}\">{abstract_xml}{num_xml}</w:numbering>"
+        );
+        self.parts.push((name.to_string(), body.into_bytes()));
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            if !ct.contains("numbering+xml") {
+                let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
+                self.set_part(
+                    "[Content_Types].xml",
+                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            if !rels.contains("numbering.xml") {
+                let rid = next_rid(&rels);
+                let rel = format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{R_NS}/numbering\" Target=\"numbering.xml\"/>"
+                );
+                self.set_part(
+                    rels_name,
+                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+        num_id
+    }
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.

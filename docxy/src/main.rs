@@ -923,6 +923,22 @@ impl App {
             FontSize => self.open_picker(PickerKind::FontSize),
             FontColor => self.open_picker(PickerKind::FontColor),
             Highlight => self.open_picker(PickerKind::Highlight),
+            Bullets => self.apply_list(true),
+            Numbering => self.apply_list(false),
+            IncreaseIndent => {
+                self.editor.change_indent(720);
+                self.after_edit();
+            }
+            DecreaseIndent => {
+                self.editor.change_indent(-720);
+                self.after_edit();
+            }
+            Sort => {
+                self.editor.sort_paragraphs();
+                self.after_edit();
+                self.status = Some("Sorted paragraphs".to_string());
+            }
+            ParaBorders => self.toggle_para_border(),
             AlignLeft => {
                 self.editor.set_align(Align::Left);
                 self.after_edit();
@@ -2656,6 +2672,61 @@ impl App {
         self.dirty = true;
     }
 
+    /// Re-read numbering.xml from the package (after a list is created/changed).
+    fn reparse_numbering(&mut self) {
+        let n = self
+            .pkg
+            .part("word/numbering.xml")
+            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        self.numbering = Rc::new(n);
+    }
+
+    /// Toggle a bullet/numbered list on the selected paragraphs.
+    fn apply_list(&mut self, bullet: bool) {
+        let num_id = self.pkg.ensure_list(bullet);
+        if self.editor.all_in_list(num_id) {
+            self.editor.set_list(None);
+            self.status = Some("List removed".to_string());
+        } else {
+            self.editor.set_list(Some(num_id));
+            self.status = Some(
+                if bullet {
+                    "Bulleted list"
+                } else {
+                    "Numbered list"
+                }
+                .to_string(),
+            );
+        }
+        self.reparse_numbering();
+        self.after_edit();
+    }
+
+    /// Toggle a bottom paragraph border on the selected paragraphs.
+    fn toggle_para_border(&mut self) {
+        use docxcore::model::{BorderKind, ParBorders};
+        let has = self.editor.caret_para_props().borders.bottom.is_some();
+        let new = if has {
+            ParBorders::default()
+        } else {
+            ParBorders {
+                top: None,
+                bottom: Some(BorderKind::Single),
+            }
+        };
+        self.editor.set_para_border(new);
+        self.after_edit();
+        self.status = Some(
+            if has {
+                "Border removed"
+            } else {
+                "Bottom border"
+            }
+            .to_string(),
+        );
+    }
+
     fn open_picker(&mut self, kind: PickerKind) {
         if !self.editor.has_selection() {
             self.status = Some(format!("Select text first, then {}", kind.title().trim()));
@@ -3620,6 +3691,10 @@ impl App {
             }
             KeyCode::Char(' ') if ctrl => {
                 self.editor.clear_run_formatting();
+                self.after_edit();
+            }
+            KeyCode::Char('m') if ctrl => {
+                self.editor.change_indent(if shift { -720 } else { 720 });
                 self.after_edit();
             }
             KeyCode::Char('l') if ctrl => {
@@ -5553,6 +5628,43 @@ mod tests {
         // a fresh, border-free paragraph follows for the caret
         match &app.editor.doc.body[1] {
             Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
+            _ => panic!(),
+        }
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn bullets_button_applies_a_list_and_renders_a_marker() {
+        let mut app = app_with(&["item one", "item two"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bullets);
+        for i in 0..2 {
+            match &app.editor.doc.body[i] {
+                Block::Paragraph(p) => assert!(p.props.num_id.is_some(), "para {i} is a list item"),
+                _ => panic!(),
+            }
+        }
+        app.ensure_rendered(40);
+        let plain: Vec<String> = app.lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            plain.iter().any(|l| l.contains('•')),
+            "a bullet marker should render: {plain:?}"
+        );
+        // toggling again removes the list
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bullets);
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => assert!(p.props.num_id.is_none()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn increase_indent_shifts_the_paragraph() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::IncreaseIndent);
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.indent, 720),
             _ => panic!(),
         }
         assert!(app.modified);

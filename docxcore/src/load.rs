@@ -635,6 +635,12 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                 "w:numPr" => parse_numpr(p, props),
                 "w:tabs" => parse_tab_stops(p, &mut props.tabs),
                 "w:pBdr" => props.borders = crate::styles::parse_pbdr(p),
+                "w:ind" => {
+                    if let Some(v) = frame_int(p, "w:left").or_else(|| frame_int(p, "w:start")) {
+                        props.indent = v;
+                    }
+                    p.skip_element();
+                }
                 "w:sectPr" => {
                     // A mid-document section break — preserve it verbatim.
                     let start = p.start_pos();

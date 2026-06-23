@@ -786,6 +786,13 @@ impl Editor {
             .unwrap_or_default()
     }
 
+    /// Paragraph properties of the paragraph at the caret.
+    pub fn caret_para_props(&self) -> ParProps {
+        resolve_para(&self.doc.body, &self.caret.path)
+            .map(|p| p.props.clone())
+            .unwrap_or_default()
+    }
+
     /// Apply `f` to the run properties over the selection (or the run at the caret
     /// when there is no selection, so the next typed text takes the change).
     fn map_props(&mut self, f: impl Fn(&mut RunProps)) {
@@ -860,6 +867,86 @@ impl Editor {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
                 map_text_range(&mut p.content, *s, *e, &*f);
             }
+        }
+    }
+
+    /// Paths of the paragraphs touched by the selection (or the caret's paragraph).
+    fn selected_para_paths(&self) -> Vec<Vec<usize>> {
+        let spans = self.selection_spans();
+        if spans.is_empty() {
+            return vec![self.caret.path.clone()];
+        }
+        let mut paths: Vec<Vec<usize>> = Vec::new();
+        for (path, _, _) in spans {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// Apply `f` to each paragraph touched by the selection (one undo step).
+    fn for_each_para(&mut self, f: impl Fn(&mut ParProps)) {
+        self.checkpoint(EditKind::Structural);
+        for path in self.selected_para_paths() {
+            if let Some(p) = para_mut(&mut self.doc.body, &path) {
+                f(&mut p.props);
+            }
+        }
+    }
+
+    /// Increase/decrease the left indent of the selected paragraphs by `delta`
+    /// twips (clamped at 0).
+    pub fn change_indent(&mut self, delta: i32) {
+        self.for_each_para(|pr| pr.indent = (pr.indent + delta).max(0));
+    }
+
+    /// Set (or clear) the list membership of the selected paragraphs.
+    pub fn set_list(&mut self, num_id: Option<i32>) {
+        self.for_each_para(move |pr| {
+            pr.num_id = num_id;
+            if num_id.is_none() {
+                pr.ilvl = 0;
+            }
+        });
+    }
+
+    /// Whether every selected paragraph is already in list `num_id` (for toggling).
+    pub fn all_in_list(&self, num_id: i32) -> bool {
+        let paths = self.selected_para_paths();
+        !paths.is_empty()
+            && paths.iter().all(|path| {
+                resolve_para(&self.doc.body, path).map(|p| p.props.num_id) == Some(Some(num_id))
+            })
+    }
+
+    /// Set the bottom border of the selected paragraphs (Word's Borders ▸ Bottom).
+    pub fn set_para_border(&mut self, borders: ParBorders) {
+        self.for_each_para(move |pr| pr.borders = borders);
+    }
+
+    /// Sort the selected top-level paragraphs alphabetically (Word's A→Z Sort).
+    pub fn sort_paragraphs(&mut self) {
+        let mut idxs: Vec<usize> = self
+            .selected_para_paths()
+            .iter()
+            .filter(|p| p.len() == 1)
+            .map(|p| p[0])
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        if idxs.len() < 2 {
+            return;
+        }
+        let (lo, hi) = (idxs[0], *idxs.last().unwrap());
+        self.checkpoint(EditKind::Structural);
+        let mut slice: Vec<Block> = self.doc.body[lo..=hi].to_vec();
+        slice.sort_by_key(|b| match b {
+            Block::Paragraph(p) => p.plain_text().to_lowercase(),
+            _ => String::new(),
+        });
+        for (k, b) in slice.into_iter().enumerate() {
+            self.doc.body[lo + k] = b;
         }
     }
 
@@ -1731,6 +1818,32 @@ mod tests {
                 other => panic!("expected TextBox, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn paragraph_indent_list_and_sort() {
+        let mut ed = Editor::new(doc(&["banana", "apple", "cherry"]));
+        ed.select_all();
+        ed.change_indent(720);
+        ed.sort_paragraphs();
+        assert_eq!(top_text(&ed), vec!["apple", "banana", "cherry"]);
+        for b in &ed.doc.body {
+            if let Block::Paragraph(p) = b {
+                assert_eq!(p.props.indent, 720);
+            }
+        }
+        // decrease clamps at 0
+        ed.select_all();
+        ed.change_indent(-9999);
+        if let Block::Paragraph(p) = &ed.doc.body[0] {
+            assert_eq!(p.props.indent, 0);
+        }
+        // list toggle
+        ed.select_all();
+        ed.set_list(Some(42));
+        assert!(ed.all_in_list(42));
+        ed.set_list(None);
+        assert!(!ed.all_in_list(42));
     }
 
     #[test]

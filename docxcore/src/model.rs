@@ -167,6 +167,8 @@ pub struct ParProps {
     /// Direct paragraph borders (`w:pBdr`). A bottom (or top) border renders as a
     /// horizontal rule — Word's "horizontal line".
     pub borders: ParBorders,
+    /// Left indent in twips (`w:ind w:left`/`w:start`). Rendered as leading space.
+    pub indent: i32,
 }
 
 /// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since

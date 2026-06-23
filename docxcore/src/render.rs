@@ -1244,18 +1244,20 @@ fn render_paragraph(
 ) -> Vec<(Line, LineMap)> {
     let heading = para.props.heading_level;
     let is_list = para.props.num_id.is_some();
+    // Left indent (`w:ind`) drawn as leading spaces: ~6 cells per half-inch.
+    let indent = " ".repeat((para.props.indent.max(0) / 120) as usize);
     let (first_prefix, cont_prefix) = if is_list {
-        let ind = " ".repeat(para.props.ilvl.max(0) as usize * 2);
+        let lvl = " ".repeat(para.props.ilvl.max(0) as usize * 2);
         let marker = opts
             .list_markers
             .get(path)
             .map(|s| s.as_str())
             .unwrap_or("•");
-        let first = format!("{ind}{marker} ");
+        let first = format!("{indent}{lvl}{marker} ");
         let cont = " ".repeat(first.chars().count());
         (first, cont)
     } else {
-        (String::new(), String::new())
+        (indent.clone(), indent)
     };
     let prefix_w = first_prefix.chars().count();
     // Honor the requested width down to a single cell — narrow table columns rely
