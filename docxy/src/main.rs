@@ -3265,7 +3265,12 @@ impl App {
                 self.after_edit();
             }
             KeyCode::Enter => {
-                self.editor.insert_newline();
+                // "---" / "===" / "___" … on a line becomes a horizontal rule.
+                if self.editor.hrule_autoformat() {
+                    self.status = Some("Inserted horizontal line".to_string());
+                } else {
+                    self.editor.insert_newline();
+                }
                 self.after_edit();
             }
             KeyCode::Backspace => {

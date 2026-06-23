@@ -164,6 +164,65 @@ pub struct ParProps {
     pub section_break: Option<String>,
     /// Direct tab stops (`w:tabs`), which override the paragraph style's.
     pub tabs: Vec<TabStop>,
+    /// Direct paragraph borders (`w:pBdr`). A bottom (or top) border renders as a
+    /// horizontal rule — Word's "horizontal line".
+    pub borders: ParBorders,
+}
+
+/// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
+/// that's what reads as a rule in a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParBorders {
+    pub top: Option<BorderKind>,
+    pub bottom: Option<BorderKind>,
+}
+
+/// A border line style (`w:val` on a `w:pBdr` side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderKind {
+    Single,
+    Double,
+    Thick,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+impl BorderKind {
+    /// Map a `w:val` to a kind; `None` for an absent/`nil`/`none` border.
+    pub fn from_val(val: &str) -> Option<BorderKind> {
+        match val {
+            "single" => Some(BorderKind::Single),
+            "double" => Some(BorderKind::Double),
+            "thick" | "triple" => Some(BorderKind::Thick),
+            "dotted" | "dotDash" | "dotDotDash" => Some(BorderKind::Dotted),
+            "dashed" | "dashSmallGap" | "dashDotStroked" => Some(BorderKind::Dashed),
+            "wave" | "doubleWave" => Some(BorderKind::Wavy),
+            _ => None,
+        }
+    }
+    /// The `w:val` written back on save.
+    pub fn to_val(self) -> &'static str {
+        match self {
+            BorderKind::Single => "single",
+            BorderKind::Double => "double",
+            BorderKind::Thick => "thick",
+            BorderKind::Dotted => "dotted",
+            BorderKind::Dashed => "dashed",
+            BorderKind::Wavy => "wave",
+        }
+    }
+    /// The glyph used to draw the rule.
+    pub fn glyph(self) -> char {
+        match self {
+            BorderKind::Single => '─',
+            BorderKind::Double => '═',
+            BorderKind::Thick => '━',
+            BorderKind::Dotted => '┈',
+            BorderKind::Dashed => '╌',
+            BorderKind::Wavy => '∿',
+        }
+    }
 }
 
 /// A `w:framePr` text frame: absolute placement in twips (1/1440 inch).

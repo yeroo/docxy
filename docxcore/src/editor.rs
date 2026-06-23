@@ -229,6 +229,41 @@ impl Editor {
         self.caret.offset = 0;
     }
 
+    /// Word-style autoformat: if the current paragraph's whole text is three or
+    /// more of the same border character (`-` `_` `=` `*` `~` `#`), turn it into a
+    /// horizontal rule (a bottom paragraph border) and move to a fresh paragraph
+    /// below. Returns true if it fired (so the caller skips the normal newline).
+    pub fn hrule_autoformat(&mut self) -> bool {
+        let kind = match para_mut(&mut self.doc.body, &self.caret.path) {
+            Some(p) => match hrule_kind(&p.plain_text()) {
+                Some(k) => k,
+                None => return false,
+            },
+            None => return false,
+        };
+        self.checkpoint(EditKind::Structural);
+        if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+            p.content.clear();
+            p.props.borders.bottom = Some(kind);
+        }
+        self.caret.offset = 0;
+        // A fresh paragraph below for the caret, without inheriting the rule.
+        self.insert_newline();
+        if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+            p.props.borders = ParBorders::default();
+        }
+        true
+    }
+
+    /// Set (or clear) the bottom border of the paragraph at the caret — used by a
+    /// menu/command to insert a horizontal line directly.
+    pub fn set_hrule(&mut self, kind: Option<BorderKind>) {
+        self.checkpoint(EditKind::Structural);
+        if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+            p.props.borders.bottom = kind;
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.has_selection() {
             self.delete_selection();
@@ -966,6 +1001,23 @@ fn container_mut<'a>(
     }
 }
 
+/// The border kind for an autoformat trigger: a string of three or more of the
+/// same border character. `None` otherwise.
+fn hrule_kind(text: &str) -> Option<BorderKind> {
+    let t = text.trim();
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let kind = match first {
+        '-' => BorderKind::Single,
+        '_' | '#' => BorderKind::Thick,
+        '=' => BorderKind::Double,
+        '*' => BorderKind::Dotted,
+        '~' => BorderKind::Wavy,
+        _ => return None,
+    };
+    (t.chars().count() >= 3 && t.chars().all(|c| c == first)).then_some(kind)
+}
+
 fn para_mut<'a>(body: &'a mut Vec<Block>, path: &[usize]) -> Option<&'a mut Paragraph> {
     let (cont, idx) = container_mut(body, path)?;
     match cont.get_mut(idx)? {
@@ -1500,6 +1552,30 @@ mod tests {
                 other => panic!("expected TextBox, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn hrule_autoformat_makes_a_horizontal_line() {
+        let mut ed = Editor::new(doc(&["---", "next"]));
+        ed.caret.offset = 3; // end of "---"
+        assert!(ed.hrule_autoformat());
+        // The "---" paragraph is now an empty rule (bottom border).
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => {
+                assert!(p.content.is_empty());
+                assert_eq!(p.props.borders.bottom, Some(BorderKind::Single));
+            }
+            _ => panic!(),
+        }
+        // A fresh paragraph below holds the caret and carries no border.
+        match &ed.doc.body[1] {
+            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
+            _ => panic!(),
+        }
+        // Plain text is not a trigger.
+        let mut ed2 = Editor::new(doc(&["hello"]));
+        ed2.caret.offset = 5;
+        assert!(!ed2.hrule_autoformat());
     }
 
     #[test]

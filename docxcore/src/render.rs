@@ -651,8 +651,30 @@ fn render_blocks(
         path.push(bi);
         match b {
             Block::Paragraph(p) => {
+                // Collapse a run of paragraphs that share a border into one rule.
+                let eff = |blk: Option<&Block>| -> crate::model::ParBorders {
+                    match blk {
+                        Some(Block::Paragraph(q)) => opts
+                            .styles
+                            .effective_borders(q.props.style_id.as_deref(), q.props.borders),
+                        _ => crate::model::ParBorders::default(),
+                    }
+                };
+                let me = eff(Some(b));
+                let suppress_top =
+                    me.top.is_some() && eff(blocks.get(bi.wrapping_sub(1))).top == me.top && bi > 0;
+                let suppress_bottom =
+                    me.bottom.is_some() && eff(blocks.get(bi + 1)).bottom == me.bottom;
                 let mut sub_imgs = Vec::new();
-                let sub = render_paragraph(p, &path, width, opts, &mut sub_imgs);
+                let sub = render_paragraph(
+                    p,
+                    &path,
+                    width,
+                    opts,
+                    &mut sub_imgs,
+                    suppress_top,
+                    suppress_bottom,
+                );
                 absorb(&mut out, sub, sub_imgs, images);
             }
             Block::Table(t) => out.extend(render_table(t, &path, width, opts)),
@@ -1210,6 +1232,11 @@ fn render_paragraph(
     width: usize,
     opts: &RenderOptions,
     images: &mut Vec<ImageBox>,
+    // Adjacent paragraphs sharing a border draw one rule for the run (Word's
+    // behavior): drop the top rule when the paragraph above already carries it,
+    // and the bottom rule when the one below does.
+    suppress_top: bool,
+    suppress_bottom: bool,
 ) -> Vec<(Line, LineMap)> {
     let heading = para.props.heading_level;
     let is_list = para.props.num_id.is_some();
@@ -1239,7 +1266,28 @@ fn render_paragraph(
         .collect();
     let segs = flatten_para(para, opts, heading.is_some(), &local_sel, avail);
 
+    // Paragraph borders (`w:pBdr`, direct or from the style) draw as a horizontal
+    // rule above (top) and/or below (bottom) the paragraph — Word's horizontal line.
+    let borders = opts
+        .styles
+        .effective_borders(para.props.style_id.as_deref(), para.props.borders);
+    let rule = |kind: crate::model::BorderKind| -> (Line, LineMap) {
+        (
+            Line {
+                spans: vec![Line::text_span(
+                    kind.glyph().to_string().repeat(width.max(1)),
+                )],
+            },
+            LineMap::default(),
+        )
+    };
+
     let mut out = Vec::new();
+    if let Some(k) = borders.top {
+        if !suppress_top {
+            out.push(rule(k));
+        }
+    }
     let mut line_idx = 0usize;
     for seg in &segs {
         if let Some(bidx) = seg.block {
@@ -1329,6 +1377,11 @@ fn render_paragraph(
                 out.push((Line { spans: Vec::new() }, LineMap::default()));
             }
             line_idx += 1;
+        }
+    }
+    if let Some(k) = borders.bottom {
+        if !suppress_bottom {
+            out.push(rule(k));
         }
     }
     if let Some(lvl) = heading {
@@ -1777,7 +1830,8 @@ fn render_floating_canvas(
             continue;
         }
         if let Block::Paragraph(p) = b {
-            for (line, _) in render_paragraph(p, &[0], text_w, opts, &mut Vec::new()) {
+            for (line, _) in render_paragraph(p, &[0], text_w, opts, &mut Vec::new(), false, false)
+            {
                 let s = line.plain();
                 // Skip leading blank lines so the heading hugs the top.
                 if !s.trim().is_empty() || !text_lines.is_empty() {
@@ -2763,6 +2817,30 @@ mod tests {
             width,
             ..RenderOptions::default()
         }
+    }
+
+    #[test]
+    fn paragraph_bottom_border_renders_a_rule() {
+        let o = opts(20);
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                borders: ParBorders {
+                    top: None,
+                    bottom: Some(BorderKind::Single),
+                },
+                ..Default::default()
+            },
+            content: vec![run("hi", RunProps::default())],
+        });
+        let plain: Vec<String> = render(&doc(vec![p]), &o)
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(plain.iter().any(|l| l.contains("hi")));
+        assert!(
+            plain.iter().any(|l| l.starts_with('─')),
+            "expected a rule line, got {plain:?}"
+        );
     }
 
     #[test]

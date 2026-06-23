@@ -87,6 +87,8 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.rtl
         || props.frame.is_some()
         || props.section_break.is_some()
+        || props.borders.top.is_some()
+        || props.borders.bottom.is_some()
         || !props.tabs.is_empty();
     if !has_any {
         return;
@@ -139,6 +141,22 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
             props.ilvl, num
         ));
+    }
+    // pBdr precedes tabs in the schema order.
+    if props.borders.top.is_some() || props.borders.bottom.is_some() {
+        s.push_str("<w:pBdr>");
+        for (tag, side) in [
+            ("w:top", props.borders.top),
+            ("w:bottom", props.borders.bottom),
+        ] {
+            if let Some(k) = side {
+                s.push_str(&format!(
+                    "<{tag} w:val=\"{}\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/>",
+                    k.to_val()
+                ));
+            }
+        }
+        s.push_str("</w:pBdr>");
     }
     if !props.tabs.is_empty() {
         s.push_str("<w:tabs>");
@@ -453,6 +471,10 @@ mod tests {
             frame: None,
             section_break: None,
             tabs: Vec::new(),
+            borders: ParBorders {
+                bottom: Some(BorderKind::Single),
+                top: None,
+            },
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],

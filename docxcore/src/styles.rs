@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Align, RunProps, TabAlign, TabLeader, TabStop};
+use crate::model::{Align, BorderKind, ParBorders, RunProps, TabAlign, TabLeader, TabStop};
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +57,7 @@ struct StyleDef {
     run: PartialRun,
     align: Option<Align>,
     tabs: Vec<TabStop>,
+    borders: ParBorders,
 }
 
 /// A parsed `styles.xml`: document defaults plus named style definitions.
@@ -159,6 +160,36 @@ impl StyleSheet {
             .as_ref()
             .map(|b| self.fold_tabs(b, seen))
             .unwrap_or_default()
+    }
+
+    /// Effective paragraph borders: a direct side wins; otherwise inherit the
+    /// most-derived side from the style chain.
+    pub fn effective_borders(&self, para_style: Option<&str>, direct: ParBorders) -> ParBorders {
+        let style_b = para_style
+            .map(|s| self.fold_borders(s, &mut HashSet::new()))
+            .unwrap_or_default();
+        ParBorders {
+            top: direct.top.or(style_b.top),
+            bottom: direct.bottom.or(style_b.bottom),
+        }
+    }
+
+    fn fold_borders(&self, id: &str, seen: &mut HashSet<String>) -> ParBorders {
+        if !seen.insert(id.to_string()) {
+            return ParBorders::default();
+        }
+        let Some(def) = self.styles.get(id) else {
+            return ParBorders::default();
+        };
+        let base = def
+            .based_on
+            .as_ref()
+            .map(|b| self.fold_borders(b, seen))
+            .unwrap_or_default();
+        ParBorders {
+            top: def.borders.top.or(base.top),
+            bottom: def.borders.bottom.or(base.bottom),
+        }
     }
 }
 
@@ -302,12 +333,35 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
                     p.skip_element();
                 }
                 "w:tabs" => parse_tabs(p, &mut def.tabs),
+                "w:pBdr" => def.borders = parse_pbdr(p),
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// Parse a `<w:pBdr>` element's top/bottom sides into [`ParBorders`].
+pub fn parse_pbdr(p: &mut XmlParser) -> ParBorders {
+    let mut b = ParBorders::default();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let side = p.name();
+                let kind = BorderKind::from_val(p.attr("w:val"));
+                match side {
+                    "w:top" => b.top = kind,
+                    "w:bottom" => b.bottom = kind,
+                    _ => {}
+                }
+                p.skip_element();
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    b
 }
 
 fn parse_tabs(p: &mut XmlParser, tabs: &mut Vec<TabStop>) {
@@ -423,6 +477,25 @@ mod tests {
             ss.effective_align(Some("Centered"), Align::Right),
             Align::Right
         ); // direct wins
+    }
+
+    #[test]
+    fn paragraph_border_resolved_from_style() {
+        let xml = r#"<w:styles><w:style w:styleId="Rule"><w:pPr>
+            <w:pBdr><w:bottom w:val="single" w:sz="6"/></w:pBdr></w:pPr></w:style></w:styles>"#;
+        let ss = parse_styles_xml(xml);
+        let b = ss.effective_borders(Some("Rule"), ParBorders::default());
+        assert_eq!(b.bottom, Some(BorderKind::Single));
+        assert_eq!(b.top, None);
+        // a direct border wins over the style's
+        let direct = ParBorders {
+            bottom: Some(BorderKind::Double),
+            top: None,
+        };
+        assert_eq!(
+            ss.effective_borders(Some("Rule"), direct).bottom,
+            Some(BorderKind::Double)
+        );
     }
 
     #[test]

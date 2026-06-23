@@ -634,6 +634,7 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                 }
                 "w:numPr" => parse_numpr(p, props),
                 "w:tabs" => parse_tab_stops(p, &mut props.tabs),
+                "w:pBdr" => props.borders = crate::styles::parse_pbdr(p),
                 "w:sectPr" => {
                     // A mid-document section break — preserve it verbatim.
                     let start = p.start_pos();
