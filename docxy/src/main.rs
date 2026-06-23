@@ -544,6 +544,8 @@ struct App {
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
     comment_sel: usize,
     comment_active: bool,
+    /// While entering a new comment's text (the draft body).
+    comment_input: Option<String>,
     /// First comment row shown in the panel (scroll offset).
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
@@ -700,6 +702,7 @@ impl App {
             show_comments: false,
             comment_sel: 0,
             comment_active: false,
+            comment_input: None,
             comments_scroll: 0,
             comments_rect: Rect::default(),
             comments_hscroll: 0,
@@ -973,6 +976,8 @@ impl App {
             ToggleComments => self.toggle_comments(),
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
+            NewComment => self.start_comment(),
+            DeleteComment => self.delete_comment(),
             ReadMode => self.set_page_view(false),
             PrintLayout => self.set_page_view(true),
             DarkMode => {
@@ -1874,6 +1879,121 @@ impl App {
 
     /// The comments review side panel: each comment's author/date, the quoted
     /// span it anchors to, and its text, scrollable with the wheel.
+    /// The next free comment id (max existing + 1).
+    fn next_comment_id(&self) -> i32 {
+        self.comments
+            .iter()
+            .filter_map(|c| c.id.parse::<i32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Begin a new comment on the selection (prompts for the body in the status bar).
+    fn start_comment(&mut self) {
+        if !self.editor.has_selection() {
+            self.status = Some("Select text to comment on first".to_string());
+            self.dirty = true;
+            return;
+        }
+        self.comment_input = Some(String::new());
+        self.dirty = true;
+    }
+
+    /// Commit the new comment: wrap the selection in markers, add it to comments.xml
+    /// and the live panel.
+    fn commit_comment(&mut self) {
+        let text = self.comment_input.take().unwrap_or_default();
+        if text.trim().is_empty() {
+            self.status = Some("Comment cancelled (empty)".to_string());
+            self.dirty = true;
+            return;
+        }
+        let quoted = self.editor.selection_text();
+        let id = self.next_comment_id();
+        if !self.editor.add_comment(&id.to_string()) {
+            self.status = Some("No selection to comment on".to_string());
+            self.dirty = true;
+            return;
+        }
+        let author = if self.field_ctx.props.author.trim().is_empty() {
+            "docxy".to_string()
+        } else {
+            self.field_ctx.props.author.clone()
+        };
+        let initials: String = author
+            .split_whitespace()
+            .filter_map(|w| w.chars().next())
+            .collect();
+        let date = self
+            .field_ctx
+            .now
+            .as_ref()
+            .map(|d| {
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                    d.year, d.month, d.day, d.hour, d.min, d.sec
+                )
+            })
+            .unwrap_or_default();
+        self.pkg.add_comment(id, &author, &initials, &date, &text);
+        self.comments.push(docxcore::comments::Comment {
+            id: id.to_string(),
+            author,
+            initials,
+            date,
+            text,
+            quoted,
+        });
+        self.comment_active = true;
+        self.comment_sel = self.comments.len() - 1;
+        self.show_comments = true;
+        self.after_edit();
+        self.status = Some("Comment added".to_string());
+    }
+
+    /// Delete the navigation-selected comment (markers + comments.xml + panel).
+    fn delete_comment(&mut self) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments to delete".to_string());
+            self.dirty = true;
+            return;
+        }
+        let idx = self.comment_sel.min(self.comments.len() - 1);
+        let c = self.comments.remove(idx);
+        self.editor.remove_comment_markers(&c.id);
+        if let Ok(id) = c.id.parse::<i32>() {
+            self.pkg.remove_comment(id);
+        }
+        self.comment_sel = idx.min(self.comments.len().saturating_sub(1));
+        self.comment_active = !self.comments.is_empty();
+        self.after_edit();
+        self.status = Some(format!("Deleted comment by {}", c.author));
+    }
+
+    fn comment_input_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.comment_input = None;
+                self.status = Some("Comment cancelled".to_string());
+            }
+            KeyCode::Enter => self.commit_comment(),
+            KeyCode::Backspace => {
+                if let Some(s) = self.comment_input.as_mut() {
+                    s.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = self.comment_input.as_mut() {
+                    s.push(c);
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
     /// Move the comment selection by `delta`, reveal it in the panel, and jump the
     /// caret to the comment's anchored text (Review ▸ Previous/Next).
     fn nav_comment(&mut self, delta: i32) {
@@ -3651,6 +3771,9 @@ impl App {
         if self.font_picker.is_some() {
             return self.picker_key(key);
         }
+        if self.comment_input.is_some() {
+            return self.comment_input_key(key);
+        }
         // The File backstage is modal: it owns all keys while open.
         if self.backstage.is_some() {
             return self.backstage_key(key);
@@ -4195,7 +4318,9 @@ impl App {
             on_off(self.invisibles),
             on_off(!self.borderless),
         );
-        let status_text = if let Some(url) = &self.pending_link {
+        let status_text = if let Some(draft) = &self.comment_input {
+            format!(" New comment: {draft}▏   ( Enter = add · Esc = cancel )")
+        } else if let Some(url) = &self.pending_link {
             format!(" Open this link?  {url}   ( y = open in browser · any other key = cancel )")
         } else if let Some(f) = &self.find {
             let n = f.matches.len();
@@ -5727,6 +5852,44 @@ mod tests {
         // Prev wraps to the last.
         app.run_act(ribbon::Act::PrevComment);
         assert_eq!(app.comment_sel, 1);
+    }
+
+    #[test]
+    fn new_then_delete_comment() {
+        let mut app = app_with(&["hello world"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::NewComment);
+        assert!(app.comment_input.is_some(), "entered comment-text mode");
+        for c in "a note".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.comment_input.is_none());
+        assert_eq!(app.comments.len(), 1);
+        assert_eq!(app.comments[0].text, "a note");
+        // markers wrap the selection in the model
+        let marked = |app: &App, needle: &str| match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => p
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Raw(r) if r.contains(needle))),
+            _ => false,
+        };
+        assert!(marked(&app, "commentRangeStart"));
+        assert!(marked(&app, "commentReference"));
+        // delete removes the comment and its markers
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty());
+        assert!(!marked(&app, "commentRange"));
+        assert!(!marked(&app, "commentReference"));
+    }
+
+    #[test]
+    fn new_comment_needs_a_selection() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::NewComment);
+        assert!(app.comment_input.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("Select text"));
     }
 
     #[test]

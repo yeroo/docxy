@@ -63,6 +63,9 @@ pub enum Act {
     /// Jump to the previous / next review comment.
     PrevComment,
     NextComment,
+    /// Add a comment on the selection / delete the selected comment.
+    NewComment,
+    DeleteComment,
     // View tab
     /// Reflowed reading view (page layout off).
     ReadMode,
@@ -399,9 +402,9 @@ fn review_groups() -> Vec<Group> {
             width: 25,
             rows: [
                 vec![
-                    btn("✎ New", 5, Todo("New comment"), "New comment"),
+                    btn("✎ New", 5, NewComment, "New comment on the selection"),
                     Seg::Gap("  "),
-                    btn("✗ Delete", 8, Todo("Delete comment"), "Delete comment"),
+                    btn("✗ Delete", 8, DeleteComment, "Delete the selected comment"),
                 ],
                 vec![
                     btn("‹ Prev", 6, PrevComment, "Previous comment"),

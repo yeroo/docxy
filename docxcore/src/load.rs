@@ -762,7 +762,8 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     out.push(Inline::Tab);
                     p.skip_element();
                 }
-                "w:drawing" | "w:pict" | "w:object" | "w:fldChar" | "w:instrText" | "w:sym" => {
+                "w:drawing" | "w:pict" | "w:object" | "w:fldChar" | "w:instrText" | "w:sym"
+                | "w:commentReference" => {
                     had_raw = true;
                     p.skip_element();
                 }
@@ -1127,6 +1128,22 @@ mod tests {
                    </w:p></w:body></w:document>";
         let d = doc(xml);
         assert_eq!(first_para(&d).plain_text(), "2/15/2008");
+    }
+
+    #[test]
+    fn comment_markers_round_trip() {
+        // range start/end and the reference run must all survive load → save.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:commentRangeStart w:id=\"1\"/><w:r><w:t>hi</w:t></w:r>\
+                   <w:commentRangeEnd w:id=\"1\"/>\
+                   <w:r><w:commentReference w:id=\"1\"/></w:r>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("commentRangeStart w:id=\"1\""));
+        assert!(out.contains("commentReference w:id=\"1\""));
+        assert!(out.contains("commentRangeEnd w:id=\"1\""));
+        assert_eq!(first_para(&d).plain_text(), "hi");
     }
 
     #[test]

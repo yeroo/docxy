@@ -848,7 +848,7 @@ impl Editor {
     /// Cycle the case of the selected text (Word's Shift+F3): all-caps →
     /// lowercase → Capitalize Each Word → all-caps …
     pub fn cycle_case(&mut self) {
-        let text = self.selected_text();
+        let text = self.selection_text();
         if text.trim().is_empty() {
             return;
         }
@@ -925,6 +925,69 @@ impl Editor {
         self.for_each_para(move |pr| pr.borders = borders);
     }
 
+    /// Wrap the current selection in comment markers for comment `id` (the
+    /// reference run + range start/end go around the selected text). Returns false
+    /// if there is no selection.
+    pub fn add_comment(&mut self, id: &str) -> bool {
+        let spans = self.selection_spans();
+        let (Some((spath, soff, _)), Some((epath, _, eoff))) = (spans.first(), spans.last()) else {
+            return false;
+        };
+        let (spath, soff, epath, eoff) = (spath.clone(), *soff, epath.clone(), *eoff);
+        self.checkpoint(EditKind::Structural);
+        self.anchor = None;
+        // End marker first, so the start offset stays valid within one paragraph.
+        self.caret = Caret {
+            path: epath,
+            offset: eoff,
+        };
+        self.paste(&Clip {
+            paras: vec![vec![
+                Inline::Raw(format!("<w:commentRangeEnd w:id=\"{id}\"/>")),
+                Inline::Raw(format!("<w:r><w:commentReference w:id=\"{id}\"/></w:r>")),
+            ]],
+        });
+        self.caret = Caret {
+            path: spath,
+            offset: soff,
+        };
+        self.paste(&Clip {
+            paras: vec![vec![Inline::Raw(format!(
+                "<w:commentRangeStart w:id=\"{id}\"/>"
+            ))]],
+        });
+        true
+    }
+
+    /// Remove every comment marker (range start/end + reference) for comment `id`.
+    pub fn remove_comment_markers(&mut self, id: &str) {
+        self.checkpoint(EditKind::Structural);
+        let needles = [
+            format!("commentRangeStart w:id=\"{id}\""),
+            format!("commentRangeEnd w:id=\"{id}\""),
+            format!("commentReference w:id=\"{id}\""),
+        ];
+        fn walk(blocks: &mut [Block], needles: &[String]) {
+            for b in blocks {
+                match b {
+                    Block::Paragraph(p) => p.content.retain(|inl| match inl {
+                        Inline::Raw(raw) => !needles.iter().any(|n| raw.contains(n.as_str())),
+                        _ => true,
+                    }),
+                    Block::Table(t) => {
+                        for row in &mut t.rows {
+                            for cell in &mut row.cells {
+                                walk(&mut cell.blocks, needles);
+                            }
+                        }
+                    }
+                    Block::Raw(_) => {}
+                }
+            }
+        }
+        walk(&mut self.doc.body, &needles);
+    }
+
     /// Sort the selected top-level paragraphs alphabetically (Word's A→Z Sort).
     pub fn sort_paragraphs(&mut self) {
         let mut idxs: Vec<usize> = self
@@ -951,7 +1014,7 @@ impl Editor {
     }
 
     /// The plain text currently selected (empty if no selection).
-    fn selected_text(&self) -> String {
+    pub fn selection_text(&self) -> String {
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {

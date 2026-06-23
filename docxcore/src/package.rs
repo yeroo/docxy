@@ -134,6 +134,86 @@ impl Package {
         crate::model::PageGeom::from_sect_pr(&self.sect_pr)
     }
 
+    /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
+    /// content-type if absent. `text` is the comment body (XML-escaped here).
+    pub fn add_comment(&mut self, id: i32, author: &str, initials: &str, date: &str, text: &str) {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let esc = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        };
+        let comment = format!(
+            "<w:comment w:id=\"{id}\" w:author=\"{}\" w:initials=\"{}\" w:date=\"{}\">\
+             <w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p></w:comment>",
+            esc(author),
+            esc(initials),
+            esc(date),
+            esc(text),
+        );
+        let name = "word/comments.xml";
+        if let Some(b) = self.part(name) {
+            let xml = String::from_utf8_lossy(b).into_owned();
+            self.set_part(
+                name,
+                xml.replacen("</w:comments>", &format!("{comment}</w:comments>"), 1)
+                    .into_bytes(),
+            );
+            return;
+        }
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:comments xmlns:w=\"{W_NS}\">{comment}</w:comments>"
+        );
+        self.parts.push((name.to_string(), body.into_bytes()));
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            if !ct.contains("comments+xml") {
+                let ov = "<Override PartName=\"/word/comments.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/>";
+                self.set_part(
+                    "[Content_Types].xml",
+                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            if !rels.contains("comments.xml") {
+                let rid = next_rid(&rels);
+                let rel = format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{R_NS}/comments\" Target=\"comments.xml\"/>"
+                );
+                self.set_part(
+                    rels_name,
+                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                        .into_bytes(),
+                );
+            }
+        }
+    }
+
+    /// Remove the `<w:comment w:id="id">…</w:comment>` from `comments.xml`.
+    pub fn remove_comment(&mut self, id: i32) {
+        let name = "word/comments.xml";
+        let Some(b) = self.part(name) else {
+            return;
+        };
+        let xml = String::from_utf8_lossy(b).into_owned();
+        let open = format!("<w:comment w:id=\"{id}\"");
+        if let Some(start) = xml.find(&open) {
+            if let Some(rel_end) = xml[start..].find("</w:comment>") {
+                let end = start + rel_end + "</w:comment>".len();
+                let mut out = xml.clone();
+                out.replace_range(start..end, "");
+                self.set_part(name, out.into_bytes());
+            }
+        }
+    }
+
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
     /// its `numId`, creating the part + relationship + content-type if absent. Used
     /// by the Bullets/Numbering ribbon commands so applied lists render and save.
