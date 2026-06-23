@@ -60,6 +60,9 @@ pub enum Act {
     SelectAll,
     /// Toggle the comments review side panel.
     ToggleComments,
+    /// Jump to the previous / next review comment.
+    PrevComment,
+    NextComment,
     // View tab
     /// Reflowed reading view (page layout off).
     ReadMode,
@@ -401,9 +404,9 @@ fn review_groups() -> Vec<Group> {
                     btn("✗ Delete", 8, Todo("Delete comment"), "Delete comment"),
                 ],
                 vec![
-                    btn("‹ Prev", 6, Todo("Previous comment"), "Previous comment"),
+                    btn("‹ Prev", 6, PrevComment, "Previous comment"),
                     Seg::Gap(" "),
-                    btn("Next ›", 6, Todo("Next comment"), "Next comment"),
+                    btn("Next ›", 6, NextComment, "Next comment"),
                     Seg::Gap("  "),
                     // a plain toggle — inverts when the panel is on
                     btn(

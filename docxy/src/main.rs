@@ -541,6 +541,9 @@ struct App {
     /// lists them is shown.
     comments: Vec<docxcore::comments::Comment>,
     show_comments: bool,
+    /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
+    comment_sel: usize,
+    comment_active: bool,
     /// First comment row shown in the panel (scroll offset).
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
@@ -695,6 +698,8 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             comments,
             show_comments: false,
+            comment_sel: 0,
+            comment_active: false,
             comments_scroll: 0,
             comments_rect: Rect::default(),
             comments_hscroll: 0,
@@ -966,6 +971,8 @@ impl App {
                 self.dirty = true;
             }
             ToggleComments => self.toggle_comments(),
+            PrevComment => self.nav_comment(-1),
+            NextComment => self.nav_comment(1),
             ReadMode => self.set_page_view(false),
             PrintLayout => self.set_page_view(true),
             DarkMode => {
@@ -1606,6 +1613,8 @@ impl App {
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
         self.comments_scroll = 0;
+        self.comment_sel = 0;
+        self.comment_active = false;
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
         self.editor = Editor::new(doc);
@@ -1865,26 +1874,77 @@ impl App {
 
     /// The comments review side panel: each comment's author/date, the quoted
     /// span it anchors to, and its text, scrollable with the wheel.
-    fn draw_comments_panel(&self, f: &mut Frame, area: Rect) {
+    /// Move the comment selection by `delta`, reveal it in the panel, and jump the
+    /// caret to the comment's anchored text (Review ▸ Previous/Next).
+    fn nav_comment(&mut self, delta: i32) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments".to_string());
+            self.dirty = true;
+            return;
+        }
+        self.show_comments = true;
+        let n = self.comments.len() as i32;
+        // The first Prev/Next lands on the first (or last) comment rather than
+        // stepping past it.
+        if !self.comment_active {
+            self.comment_active = true;
+            self.comment_sel = if delta >= 0 { 0 } else { (n - 1) as usize };
+        } else {
+            self.comment_sel = (self.comment_sel as i32 + delta).rem_euclid(n) as usize;
+        }
+        // Jump the caret to the first occurrence of the comment's anchored text.
+        let quoted = self.comments[self.comment_sel].quoted.clone();
+        if !quoted.is_empty() {
+            let ms = self.editor.find_all(&quoted, false);
+            if let Some(m) = ms.first() {
+                self.editor.select_match(m);
+                self.follow_caret = true;
+            }
+        }
+        // Scroll the panel so the selected comment's header is visible.
+        let inner_w = (self.comments_rect.width as usize).saturating_sub(2).max(4);
+        let (_, headers) = self.comment_panel_lines(inner_w);
+        if let Some(&h) = headers.get(self.comment_sel) {
+            self.comments_scroll = h;
+        }
+        let who = {
+            let a = &self.comments[self.comment_sel].author;
+            if a.is_empty() { "Unknown" } else { a.as_str() }
+        };
+        self.status = Some(format!("Comment {}/{} — {who}", self.comment_sel + 1, n));
+        self.dirty = true;
+    }
+
+    /// Build the comments-panel lines (wrapped to `inner_w`) plus the line index of
+    /// each comment's header, highlighting the Prev/Next-selected comment.
+    fn comment_panel_lines(&self, inner_w: usize) -> (Vec<RLine<'static>>, Vec<usize>) {
         let head = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
+        let sel_head = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         let quote = Style::default().fg(Color::Yellow);
-        let inner_w = area.width.saturating_sub(2).max(4) as usize;
-        let inner_h = area.height.saturating_sub(2).max(1) as usize;
-
         let mut lines: Vec<RLine> = Vec::new();
+        let mut headers: Vec<usize> = Vec::new();
         for (i, c) in self.comments.iter().enumerate() {
             if i > 0 {
                 lines.push(RLine::raw(""));
             }
+            headers.push(lines.len());
             let who = if c.author.is_empty() {
                 "Unknown".to_string()
             } else {
                 c.author.clone()
             };
             let date = c.date.split('T').next().unwrap_or("").to_string();
-            lines.push(RLine::styled(format!("▣ {who}  {date}"), head));
+            let hstyle = if self.comment_active && i == self.comment_sel {
+                sel_head
+            } else {
+                head
+            };
+            lines.push(RLine::styled(format!("▣ {who}  {date}"), hstyle));
             if !c.quoted.is_empty() {
                 for w in wrap_str(&format!("“{}”", c.quoted), inner_w) {
                     lines.push(RLine::styled(w, quote));
@@ -1896,7 +1956,13 @@ impl App {
                 }
             }
         }
+        (lines, headers)
+    }
 
+    fn draw_comments_panel(&self, f: &mut Frame, area: Rect) {
+        let inner_w = area.width.saturating_sub(2).max(4) as usize;
+        let inner_h = area.height.saturating_sub(2).max(1) as usize;
+        let (lines, _) = self.comment_panel_lines(inner_w);
         let total = lines.len();
         let scroll = self.comments_scroll.min(total.saturating_sub(inner_h));
         let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
@@ -5631,6 +5697,44 @@ mod tests {
             _ => panic!(),
         }
         assert!(app.modified);
+    }
+
+    #[test]
+    fn comment_navigation_selects_jumps_and_wraps() {
+        let mk = |id: &str, author: &str, quoted: &str| docxcore::comments::Comment {
+            id: id.to_string(),
+            author: author.to_string(),
+            quoted: quoted.to_string(),
+            text: "a note".to_string(),
+            ..Default::default()
+        };
+        let mut app = app_with(&["alpha beta gamma delta"]);
+        app.comments = vec![mk("1", "Ann", "beta"), mk("2", "Bob", "delta")];
+        // First Next lands on the first comment, shows the panel, jumps the caret.
+        app.run_act(ribbon::Act::NextComment);
+        assert!(app.show_comments);
+        assert!(app.comment_active);
+        assert_eq!(app.comment_sel, 0);
+        assert!(
+            app.editor.has_selection(),
+            "caret jumped to the anchored text"
+        );
+        // Next advances, then wraps.
+        app.run_act(ribbon::Act::NextComment);
+        assert_eq!(app.comment_sel, 1);
+        app.run_act(ribbon::Act::NextComment);
+        assert_eq!(app.comment_sel, 0);
+        // Prev wraps to the last.
+        app.run_act(ribbon::Act::PrevComment);
+        assert_eq!(app.comment_sel, 1);
+    }
+
+    #[test]
+    fn comment_navigation_with_no_comments_reports() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::NextComment);
+        assert!(app.comments.is_empty());
+        assert!(app.status.as_deref().unwrap_or("").contains("No comments"));
     }
 
     #[test]
