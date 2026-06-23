@@ -503,6 +503,9 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                 // A simple field: keep its XML verbatim (lossless save) but surface
                 // its cached result text so the value is visible.
                 "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
+                // A smart tag wraps runs in (deprecated) metadata; unwrap to its
+                // inner content so the text isn't lost.
+                "w:smartTag" => parse_inlines_into(p, rels, &mut para.content),
                 // Inline content control (content placeholder, etc.): unwrap it.
                 "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
                 // OMML math: render it to a text equation (lossless raw kept).
@@ -583,6 +586,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, out),
                 "w:fldSimple" => parse_fld_simple(p, rels, out),
+                "w:smartTag" => parse_inlines_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
                 _ => {
                     let start = p.start_pos();
@@ -1128,6 +1132,25 @@ mod tests {
                    </w:p></w:body></w:document>";
         let d = doc(xml);
         assert_eq!(first_para(&d).plain_text(), "2/15/2008");
+    }
+
+    #[test]
+    fn smart_tag_runs_are_unwrapped() {
+        // <w:smartTag> wrappers (deprecated MS metadata) must not hide their runs.
+        let xml = "<w:document><w:body><w:p>\
+                   <w:r><w:t xml:space=\"preserve\">The </w:t></w:r>\
+                   <w:smartTag w:element=\"place\">\
+                   <w:smartTag w:element=\"PlaceType\"><w:r><w:t>University</w:t></w:r></w:smartTag>\
+                   <w:r><w:t xml:space=\"preserve\"> of </w:t></w:r>\
+                   <w:smartTag w:element=\"PlaceName\"><w:r><w:t>Texas</w:t></w:r></w:smartTag>\
+                   </w:smartTag>\
+                   <w:r><w:t xml:space=\"preserve\"> System</w:t></w:r>\
+                   </w:p></w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(
+            first_para(&d).plain_text(),
+            "The University of Texas System"
+        );
     }
 
     #[test]
