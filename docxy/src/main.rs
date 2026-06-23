@@ -682,6 +682,11 @@ impl App {
             Cut => self.do_cut(),
             Copy => self.do_copy(),
             PasteSpecial => self.open_paste_special(),
+            HorizontalLine => {
+                self.editor.insert_hrule();
+                self.after_edit();
+                self.status = Some("Inserted horizontal line".to_string());
+            }
             Paste => self.do_paste(),
             Bold => {
                 self.editor.toggle_bold();
@@ -4612,11 +4617,11 @@ mod tests {
     #[test]
     fn review_tab_present_and_toggle_flips_the_panel() {
         let mut app = app_with(&["body text"]);
-        // The ribbon has a Review tab after File and Home.
-        assert_eq!(app.ribbon.tab_label(2), Some("Review"));
+        // The ribbon has a Review tab after File, Home and Insert.
+        assert_eq!(app.ribbon.tab_label(3), Some("Review"));
         // Switching to it activates the Review ribbon.
-        app.ribbon.set_active(2);
-        assert_eq!(app.ribbon.active_tab(), 2);
+        app.ribbon.set_active(3);
+        assert_eq!(app.ribbon.active_tab(), 3);
         // The Comments toggle flips the side-panel flag.
         assert!(!app.show_comments);
         app.run_act(ribbon::Act::ToggleComments);
@@ -4658,7 +4663,7 @@ mod tests {
     #[test]
     fn view_ribbon_actions_toggle_their_state() {
         let mut app = app_with(&["heading"]);
-        assert_eq!(app.ribbon.tab_label(3), Some("View"));
+        assert_eq!(app.ribbon.tab_label(4), Some("View"));
         app.run_act(ribbon::Act::PrintLayout);
         assert!(app.page_view);
         app.run_act(ribbon::Act::ReadMode);
@@ -4949,6 +4954,27 @@ mod tests {
             Block::Paragraph(p) => p.plain_text(),
             _ => String::new(),
         }
+    }
+
+    #[test]
+    fn insert_tab_button_inserts_a_horizontal_line() {
+        let mut app = app_with(&["hello"]);
+        // The ribbon has an Insert tab between Home and Review.
+        assert_eq!(app.ribbon.tab_label(2), Some("Insert"));
+        app.run_act(ribbon::Act::HorizontalLine);
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(
+                p.props.borders.bottom,
+                Some(docxcore::model::BorderKind::Single)
+            ),
+            _ => panic!("expected a paragraph"),
+        }
+        // a fresh, border-free paragraph follows for the caret
+        match &app.editor.doc.body[1] {
+            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, None),
+            _ => panic!(),
+        }
+        assert!(app.modified);
     }
 
     #[test]

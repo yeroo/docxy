@@ -255,12 +255,17 @@ impl Editor {
         true
     }
 
-    /// Set (or clear) the bottom border of the paragraph at the caret — used by a
-    /// menu/command to insert a horizontal line directly.
-    pub fn set_hrule(&mut self, kind: Option<BorderKind>) {
+    /// Insert a horizontal line at the caret (Insert ▸ Horizontal Line): give the
+    /// current paragraph a bottom border, then drop to a fresh paragraph below.
+    pub fn insert_hrule(&mut self) {
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-            p.props.borders.bottom = kind;
+            p.props.borders.bottom = Some(BorderKind::Single);
+        }
+        self.move_end();
+        self.insert_newline();
+        if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+            p.props.borders = ParBorders::default();
         }
     }
 

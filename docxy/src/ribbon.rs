@@ -20,6 +20,8 @@ pub enum Act {
     Paste,
     /// Open the Paste Special dialog (choose how clipboard content is pasted).
     PasteSpecial,
+    /// Insert a horizontal line (paragraph bottom border) at the caret.
+    HorizontalLine,
     Bold,
     Italic,
     Underline,
@@ -137,9 +139,15 @@ impl Ribbon {
     pub fn home() -> Ribbon {
         let mut r = Ribbon {
             // File opens the backstage; Home/Review/View are ribbons.
-            tabs: vec!["File", "Home", "Review", "View"],
+            tabs: vec!["File", "Home", "Insert", "Review", "View"],
             active: 1,
-            tab_groups: vec![Vec::new(), home_groups(), review_groups(), view_groups()],
+            tab_groups: vec![
+                Vec::new(),
+                home_groups(),
+                insert_groups(),
+                review_groups(),
+                view_groups(),
+            ],
             placed: Vec::new(),
             tab_cols: Vec::new(),
             width: 0,
@@ -324,6 +332,44 @@ fn home_groups() -> Vec<Group> {
 }
 
 /// The Review tab's groups (Comments / Tracking).
+/// The Insert tab's groups (Pages / Symbols).
+fn insert_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
+        Group {
+            title: "Pages",
+            width: 10,
+            rows: [
+                vec![btn(
+                    "Page Break",
+                    10,
+                    Todo("Page Break"),
+                    "Insert a page break",
+                )],
+                vec![btn(
+                    "Blank Page",
+                    10,
+                    Todo("Blank Page"),
+                    "Insert a blank page",
+                )],
+            ],
+        },
+        Group {
+            title: "Symbols",
+            width: 13,
+            rows: [
+                vec![btn(
+                    "─ Horiz. Line",
+                    13,
+                    HorizontalLine,
+                    "Insert a horizontal line (or type --- then Enter)",
+                )],
+                vec![btn("Ω Symbol", 8, Todo("Symbol"), "Insert a symbol")],
+            ],
+        },
+    ]
+}
+
 fn review_groups() -> Vec<Group> {
     use Act::*;
     vec![
@@ -772,8 +818,8 @@ mod tests {
     #[test]
     fn an_on_toggle_button_is_drawn_inverted() {
         let mut r = Ribbon::home();
-        r.set_active(3); // View tab has Read/Print toggles
-        assert_eq!(r.tab_label(3), Some("View"));
+        r.set_active(4); // View tab has Read/Print toggles
+        assert_eq!(r.tab_label(4), Some("View"));
         // nothing inverted yet
         let plain = r.render_body(Focus::None);
         let any_rev = |ls: &[Line]| {
@@ -790,7 +836,7 @@ mod tests {
     #[test]
     fn dark_mode_icon_flips_with_the_page() {
         let mut r = Ribbon::home();
-        r.set_active(3);
+        r.set_active(4);
         let body = |r: &Ribbon| {
             r.render_body(Focus::None)
                 .iter()
