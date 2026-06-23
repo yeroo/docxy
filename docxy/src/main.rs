@@ -1003,6 +1003,13 @@ impl App {
                 self.save_view_prefs();
                 self.dirty = true;
             }
+            EditDocument => {
+                if self.hf_edit.is_some() {
+                    self.exit_hf_edit(true);
+                }
+            }
+            EditHeader => self.enter_hf_edit(true),
+            EditFooter => self.enter_hf_edit(false),
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
@@ -4090,6 +4097,12 @@ impl App {
         if self.show_nav {
             toggles.push(ribbon::Act::ToggleNav);
         }
+        // The edit-surface switch shows which of body/header/footer is active.
+        toggles.push(match &self.hf_edit {
+            None => ribbon::Act::EditDocument,
+            Some(hf) if hf.is_header => ribbon::Act::EditHeader,
+            Some(_) => ribbon::Act::EditFooter,
+        });
         // Font toggles reflect the run formatting at the caret.
         let rp = self.editor.caret_props();
         for (on, act) in [
@@ -5890,6 +5903,22 @@ mod tests {
         app.run_act(ribbon::Act::NewComment);
         assert!(app.comment_input.is_none());
         assert!(app.status.as_deref().unwrap_or("").contains("Select text"));
+    }
+
+    #[test]
+    fn view_edit_surface_switch() {
+        let mut app = app_with(&["body text"]);
+        assert!(app.hf_edit.is_none());
+        app.run_act(ribbon::Act::EditHeader);
+        assert_eq!(
+            app.hf_edit.as_ref().map(|h| h.is_header),
+            Some(true),
+            "switched to header editing"
+        );
+        app.run_act(ribbon::Act::EditFooter);
+        assert_eq!(app.hf_edit.as_ref().map(|h| h.is_header), Some(false));
+        app.run_act(ribbon::Act::EditDocument);
+        assert!(app.hf_edit.is_none(), "returned to the body");
     }
 
     #[test]

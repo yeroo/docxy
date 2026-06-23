@@ -77,6 +77,10 @@ pub enum Act {
     ToggleRuler,
     /// Toggle the navigation (outline) pane.
     ToggleNav,
+    /// Edit the body / the header / the footer (a 3-way surface switch).
+    EditDocument,
+    EditHeader,
+    EditFooter,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -488,6 +492,18 @@ fn view_groups() -> Vec<Group> {
                     ToggleNav,
                     "Navigation pane — jump to a heading",
                 )],
+            ],
+        },
+        Group {
+            title: "Edit",
+            width: 10,
+            rows: [
+                vec![
+                    btn("Document", 8, EditDocument, "Edit the document body"),
+                    Seg::Gap("  "),
+                    btn("Header", 6, EditHeader, "Edit the page header (F6)"),
+                ],
+                vec![btn("Footer", 6, EditFooter, "Edit the page footer (F7)")],
             ],
         },
     ]
