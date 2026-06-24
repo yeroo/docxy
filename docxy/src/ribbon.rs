@@ -77,6 +77,8 @@ pub enum Act {
     ToggleRuler,
     /// Toggle the navigation (outline) pane.
     ToggleNav,
+    /// Auto-hide the ribbon: collapse it to the tab strip after each use.
+    AutoHideRibbon,
     /// Edit the body / the header / the footer (a 3-way surface switch).
     EditDocument,
     EditHeader,
@@ -492,6 +494,19 @@ fn view_groups() -> Vec<Group> {
                     ToggleNav,
                     "Navigation pane — jump to a heading",
                 )],
+            ],
+        },
+        Group {
+            title: "Ribbon",
+            width: 9,
+            rows: [
+                vec![btn(
+                    "Auto Hide",
+                    9,
+                    AutoHideRibbon,
+                    "Auto-hide the ribbon — collapse to tabs after each use",
+                )],
+                vec![],
             ],
         },
         Group {

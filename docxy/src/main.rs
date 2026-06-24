@@ -537,6 +537,9 @@ struct App {
     ribbon_open: bool,
     ribbon_focus: ribbon::Focus,
     ribbon_h: usize,
+    /// When set, the ribbon collapses back to its tab strip after each use (and
+    /// when clicking into the document); when clear, it stays expanded once open.
+    auto_hide_ribbon: bool,
     /// Review comments parsed from the document, and whether the side panel that
     /// lists them is shown.
     comments: Vec<docxcore::comments::Comment>,
@@ -698,6 +701,7 @@ impl App {
             ribbon: ribbon::Ribbon::home(),
             ribbon_open: false,
             ribbon_focus: ribbon::Focus::None,
+            auto_hide_ribbon: false,
             comments,
             show_comments: false,
             comment_sel: 0,
@@ -806,6 +810,7 @@ impl App {
             show_ruler: self.show_ruler,
             show_nav: self.show_nav,
             show_comments: self.show_comments,
+            auto_hide_ribbon: self.auto_hide_ribbon,
         }
         .save();
     }
@@ -1010,6 +1015,17 @@ impl App {
             }
             ToggleNav => {
                 self.show_nav = !self.show_nav;
+                self.save_view_prefs();
+                self.dirty = true;
+            }
+            AutoHideRibbon => {
+                self.auto_hide_ribbon = !self.auto_hide_ribbon;
+                // Enabling auto-hide collapses the ribbon right away, the way
+                // Word's "Collapse the Ribbon" hides it on the spot.
+                if self.auto_hide_ribbon {
+                    self.ribbon_open = false;
+                    self.ribbon_focus = ribbon::Focus::None;
+                }
                 self.save_view_prefs();
                 self.dirty = true;
             }
@@ -2298,8 +2314,7 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let (mut lines, mut maps, mut images) =
-                render_with_images(&self.editor.doc, &opts);
+            let (mut lines, mut maps, mut images) = render_with_images(&self.editor.doc, &opts);
             // While editing a header/footer, show the rest of the page (the parked
             // document body) dimmed and read-only below/above the editable surface,
             // the way Word greys out the body. The body's caret maps are dropped so
@@ -3176,11 +3191,14 @@ impl App {
         let row = mrow.saturating_sub(self.doc_y0 as usize); // row within the document viewport
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Returning to the document collapses the on-demand ribbon and
-                // hands keyboard control back to the editor.
+                // Returning to the document hands keyboard control back to the
+                // editor. With auto-hide on, it also collapses the on-demand
+                // ribbon; otherwise the ribbon stays pinned open.
                 if self.ribbon_open {
-                    self.ribbon_open = false;
                     self.ribbon_focus = ribbon::Focus::None;
+                    if self.auto_hide_ribbon {
+                        self.ribbon_open = false;
+                    }
                     self.dirty = true;
                 }
                 if row >= self.viewport_h {
@@ -4156,6 +4174,9 @@ impl App {
         if self.show_nav {
             toggles.push(ribbon::Act::ToggleNav);
         }
+        if self.auto_hide_ribbon {
+            toggles.push(ribbon::Act::AutoHideRibbon);
+        }
         // The edit-surface switch shows which of body/header/footer is active.
         toggles.push(match &self.hf_edit {
             None => ribbon::Act::EditDocument,
@@ -4782,6 +4803,7 @@ struct ViewPrefs {
     show_ruler: bool,
     show_nav: bool,
     show_comments: bool,
+    auto_hide_ribbon: bool,
 }
 
 impl ViewPrefs {
@@ -4811,6 +4833,7 @@ impl ViewPrefs {
                     "show_ruler" => p.show_ruler = on,
                     "show_nav" => p.show_nav = on,
                     "show_comments" => p.show_comments = on,
+                    "auto_hide_ribbon" => p.auto_hide_ribbon = on,
                     _ => {}
                 }
             }
@@ -4820,7 +4843,7 @@ impl ViewPrefs {
 
     fn to_conf(self) -> String {
         format!(
-            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\n",
+            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\nauto_hide_ribbon={}\n",
             self.page_view as u8,
             self.invisibles as u8,
             self.borderless as u8,
@@ -4828,6 +4851,7 @@ impl ViewPrefs {
             self.show_ruler as u8,
             self.show_nav as u8,
             self.show_comments as u8,
+            self.auto_hide_ribbon as u8,
         )
     }
 
@@ -5247,6 +5271,7 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     app.show_ruler = prefs.show_ruler;
     app.show_nav = prefs.show_nav;
     app.show_comments = prefs.show_comments;
+    app.auto_hide_ribbon = prefs.auto_hide_ribbon;
     app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
@@ -5355,6 +5380,7 @@ mod tests {
             show_ruler: false,
             show_nav: true,
             show_comments: true,
+            auto_hide_ribbon: true,
         };
         let back = ViewPrefs::parse(&p.to_conf());
         assert_eq!(back.page_view, p.page_view);
@@ -5364,6 +5390,7 @@ mod tests {
         assert_eq!(back.show_ruler, p.show_ruler);
         assert_eq!(back.show_nav, p.show_nav);
         assert_eq!(back.show_comments, p.show_comments);
+        assert_eq!(back.auto_hide_ribbon, p.auto_hide_ribbon);
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
         assert!(partial.invisibles && !partial.page_view && !partial.borderless);
@@ -5594,6 +5621,39 @@ mod tests {
         assert!(app.show_ruler);
         app.run_act(ribbon::Act::ToggleNav);
         assert!(app.show_nav);
+    }
+
+    #[test]
+    fn auto_hide_ribbon_pins_and_collapses() {
+        let mut app = app_with(&["heading"]);
+        // Default: ribbon stays pinned open once expanded — a document click
+        // moves focus out but leaves it open.
+        app.ribbon_open = true;
+        assert!(!app.auto_hide_ribbon);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: app.doc_y0 + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.ribbon_open,
+            "ribbon should stay pinned when auto-hide off"
+        );
+        // Enabling auto-hide collapses it immediately, and a later document
+        // click keeps it collapsed.
+        app.ribbon_open = true;
+        app.run_act(ribbon::Act::AutoHideRibbon);
+        assert!(app.auto_hide_ribbon);
+        assert!(!app.ribbon_open, "enabling auto-hide collapses on the spot");
+        app.ribbon_open = true;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: app.doc_y0 + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.ribbon_open, "auto-hide collapses on document click");
     }
 
     #[test]
