@@ -39,6 +39,10 @@ on a small, dependency-free OOXML engine (`docxcore`) with a thin
 cargo install docxy
 ```
 
+Or grab a prebuilt binary (Linux / Windows / macOS) from the
+[latest release](https://github.com/yeroo/docxy/releases/latest) — each is
+checksummed, cosign-signed, and carries a build-provenance attestation.
+
 ## Usage
 
 ```sh
