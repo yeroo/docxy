@@ -24,6 +24,7 @@ public partial class MainWindow : Window
 
     private Process? _docxy;
     private IntPtr _docxyHwnd;
+    private IntPtr _wordHwnd;
     private dynamic? _wordApp;
     private dynamic? _wordDoc;
     private DispatcherTimer? _placer;
@@ -347,15 +348,27 @@ public partial class MainWindow : Window
                     _docxyHwnd = h;
                     Win32.Place(h, docxyRect.x, docxyRect.y, docxyRect.w, docxyRect.h);
                     placedDocxy = true;
+                    // Placing the terminal just raised it to the top; if Word is
+                    // already down, lift it back above so the terminal's cell-snap
+                    // spill stays hidden behind Word.
+                    if (placedWord) Win32.Raise(_wordHwnd);
                 }
             }
             if (!placedWord)
             {
                 var h = Win32.FindWindowByClassAndTitle("OpusApp", stem);
-                if (h != IntPtr.Zero) { Win32.Place(h, wordRect.x, wordRect.y, wordRect.w, wordRect.h); placedWord = true; }
+                if (h != IntPtr.Zero)
+                {
+                    _wordHwnd = h;
+                    Win32.Place(h, wordRect.x, wordRect.y, wordRect.w, wordRect.h);
+                    placedWord = true;
+                }
             }
             if ((placedDocxy && placedWord) || ticks > 50)
             {
+                // Final z-order: Word sits above the terminal so the two tile
+                // cleanly with no terminal overlap on Word's edge.
+                if (placedWord) Win32.Raise(_wordHwnd);
                 _placer!.Stop();
                 StatusText.Text = fe.Name
                     + (placedDocxy ? "" : "  (terminal not found)")
@@ -393,6 +406,7 @@ public partial class MainWindow : Window
         try { if (_wordApp is not null) _wordApp.Quit(); } catch { }
         _wordDoc = null;
         _wordApp = null;
+        _wordHwnd = IntPtr.Zero;
         // close the Windows Terminal window we opened (the wt.exe launcher process
         // has already handed off and exited, so close by window handle)
         if (_docxyHwnd != IntPtr.Zero)

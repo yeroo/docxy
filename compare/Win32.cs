@@ -12,6 +12,8 @@ internal static partial class Win32
 
     public readonly record struct Area(int Left, int Top, int Width, int Height);
 
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;
@@ -73,6 +75,17 @@ internal static partial class Win32
         // spawned (often behind other windows). NOACTIVATE keeps the three tiled
         // windows from fighting over keyboard focus as each is placed.
         SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    /// <summary>Lift a window to the top of the z-order without moving, resizing,
+    /// or activating it. Windows Terminal snaps its width up to a whole number of
+    /// character cells, so it spills a few pixels into Word's tile; raising Word
+    /// back above it afterwards keeps that spill hidden and the two tiled cleanly.</summary>
+    public static void Raise(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return;
+        SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
     /// <summary>Find a top-level window of <paramref name="className"/> whose title
