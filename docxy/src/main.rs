@@ -1194,11 +1194,16 @@ impl App {
     /// activates it (open the file / step into the folder).
     fn bs_mouse(&mut self, x: u16, y: u16) {
         use backstage::{ITEMS, Item, Pane};
-        // Row 0 is the ribbon tab strip (drawn over the backstage): a click there
-        // leaves the File panel — File closes it, another tab switches to it.
+        // Row 0 is the ribbon tab strip (drawn over the backstage). A click on
+        // another tab switches to it; a click on File — or anywhere else on the
+        // strip (its padding or the hint) — just leaves the panel, so the small
+        // File header isn't a pixel-perfect target.
         if y == 0 {
-            if let ribbon::Hit::Tab(i) = self.ribbon.hit(x, 0, false) {
-                self.backstage_tab_click(i);
+            match self.ribbon.hit(x, 0, false) {
+                ribbon::Hit::Tab(i) if self.ribbon.tab_label(i) != Some("File") => {
+                    self.backstage_tab_click(i)
+                }
+                _ => self.backstage_tab_click(0),
             }
             return;
         }
@@ -5659,20 +5664,30 @@ mod tests {
     #[test]
     fn backstage_tab_strip_leaves_the_panel() {
         let mut app = app_with(&["x"]);
-        app.open_backstage();
-        assert!(app.backstage.is_some());
+        let click0 = |app: &mut App, col: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: col,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
         // A click on the File header (row 0) closes the panel back to the document.
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 3, // inside "File"
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
+        app.open_backstage();
+        click0(&mut app, 3); // inside "File"
         assert!(
             app.backstage.is_none(),
             "File header should close the panel"
         );
-        // Reopen, then clicking another tab switches to it and opens its ribbon.
+        // Clicking the strip's leading padding (left of File) also leaves it, so
+        // the tiny header isn't a pixel-perfect target.
+        app.open_backstage();
+        click0(&mut app, 0);
+        assert!(
+            app.backstage.is_none(),
+            "strip padding should close the panel"
+        );
+        // Clicking another tab switches to it and opens its ribbon.
         app.open_backstage();
         app.backstage_tab_click(1); // Home
         assert!(app.backstage.is_none());
