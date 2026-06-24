@@ -78,7 +78,10 @@ pub enum Inline {
     Run(Run),
     Hyperlink(Hyperlink),
     Break(BreakKind),
-    Tab,
+    /// A tab character. Carries the run properties of the run it came from, so an
+    /// underlined tab (the common "type a line across the footer" trick) keeps its
+    /// underline both on screen and on save.
+    Tab(RunProps),
     /// A SmartArt / DrawingML diagram. `raw` is the original run XML, preserved
     /// verbatim for lossless save; `text` is the diagram's node text, extracted
     /// from the external diagram part at load time. The terminal can't draw the
@@ -128,7 +131,7 @@ impl Inline {
         match self {
             Inline::Run(r) => r.text.clone(),
             Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
-            Inline::Tab => "\t".to_string(),
+            Inline::Tab(_) => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
             Inline::SmartArt { text, .. } => text.join("\n"),
             Inline::Chart { chart, .. } => chart.title.clone().unwrap_or_default(),

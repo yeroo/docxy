@@ -308,7 +308,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     }
                 }
             }
-            Inline::Tab => {
+            Inline::Tab(_) => {
                 for _ in 0..4 {
                     segs.last_mut().unwrap().push(plain_cell(' '));
                 }

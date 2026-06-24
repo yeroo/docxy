@@ -763,7 +763,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     p.skip_element();
                 }
                 "w:tab" => {
-                    out.push(Inline::Tab);
+                    out.push(Inline::Tab(props.clone()));
                     p.skip_element();
                 }
                 "w:drawing" | "w:pict" | "w:object" | "w:fldChar" | "w:instrText" | "w:sym"
@@ -1258,7 +1258,7 @@ mod tests {
         let d = doc(xml);
         let c = &first_para(&d).content;
         assert!(matches!(c[0], Inline::Run(_)));
-        assert!(matches!(c[1], Inline::Tab));
+        assert!(matches!(c[1], Inline::Tab(_)));
         assert!(matches!(c[2], Inline::Run(_)));
         assert!(matches!(c[3], Inline::Break(BreakKind::Line)));
     }

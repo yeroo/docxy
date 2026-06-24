@@ -812,7 +812,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
         match it {
             Inline::Run(r) => w += str_width(&r.text),
             Inline::Hyperlink(h) => w += h.runs.iter().map(|r| str_width(&r.text)).sum::<usize>(),
-            Inline::Tab | Inline::Break(_) => break,
+            Inline::Tab(_) | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
             Inline::SmartArt { .. }
@@ -891,7 +891,7 @@ fn flatten_para(
         // Inline content that lands right after a block marker starts a fresh text
         // seg, so it renders below the block (not appended to the block's marker).
         let produces_inline = match item {
-            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab | Inline::Field { .. } => true,
+            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab(_) | Inline::Field { .. } => true,
             Inline::Equation { text, .. } => !text.contains('\n'),
             Inline::Raw(raw) => inline_image(raw).is_some(),
             _ => false,
@@ -950,8 +950,11 @@ fn flatten_para(
                     }
                 }
             }
-            Inline::Tab => {
+            Inline::Tab(rp) => {
                 let hl = sel_at(mc);
+                // The run style behind the tab — so an underlined tab draws its
+                // underline across the whole filled width (Word's "line" trick).
+                let tab_style = style_from_run(rp);
                 let cur = segs.last().unwrap().glyphs.len();
                 // Next tab stop strictly beyond the current column, else a default
                 // stop every 8 cells.
@@ -981,11 +984,11 @@ fn flatten_para(
                     let (ch, mut style) = if inv && col == cur {
                         ('→', invis_style())
                     } else if leader == TabLeader::None {
-                        (' ', Style::default())
+                        (' ', tab_style.clone())
                     } else {
                         (fill_ch, dim_style())
                     };
-                    style.highlight = hl;
+                    style.highlight |= hl;
                     seg.push(Glyph {
                         ch,
                         disp: None,
@@ -1160,7 +1163,7 @@ fn wrap_glyphs(glyphs: &[Glyph], width: usize) -> Vec<Vec<Glyph>> {
         if cur_w > width {
             if let Some(sp) = last_space {
                 let rest = cur.split_off(sp + 1);
-                while cur.last().map(|g| g.ch == ' ').unwrap_or(false) {
+                while cur.last().map(is_trim_space).unwrap_or(false) {
                     cur.pop();
                 }
                 lines.push(std::mem::take(&mut cur));
@@ -1176,13 +1179,20 @@ fn wrap_glyphs(glyphs: &[Glyph], width: usize) -> Vec<Vec<Glyph>> {
             }
         }
     }
-    while cur.last().map(|g| g.ch == ' ').unwrap_or(false) {
+    while cur.last().map(is_trim_space).unwrap_or(false) {
         cur.pop();
     }
     if !cur.is_empty() || lines.is_empty() {
         lines.push(cur);
     }
     lines
+}
+
+/// Whether a trailing glyph may be trimmed from a line's end. Plain spaces go,
+/// but a space carrying an underline or strike is a drawn rule (the "underlined
+/// tab makes a line" trick) and must survive trailing-whitespace trimming.
+fn is_trim_space(g: &Glyph) -> bool {
+    g.ch == ' ' && !g.style.underline && !g.style.strike
 }
 
 fn glyphs_to_spans(glyphs: &[Glyph]) -> Vec<Span> {
@@ -3248,7 +3258,7 @@ mod tests {
             },
             content: vec![
                 run("Title", RunProps::default()),
-                Inline::Tab,
+                Inline::Tab(RunProps::default()),
                 run("9", RunProps::default()),
             ],
         });
@@ -3258,6 +3268,37 @@ mod tests {
         assert!(
             line.trim_end().ends_with('9'),
             "page number not right-aligned: {line:?}"
+        );
+    }
+
+    #[test]
+    fn underlined_tab_draws_a_line() {
+        // The footer "type a line across the page" trick: an underlined tab fills
+        // to its stop with underlined spaces, so the run's underline becomes a
+        // horizontal rule.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                tabs: vec![TabStop {
+                    pos: 4000,
+                    align: TabAlign::Left,
+                    leader: TabLeader::None,
+                }],
+                ..Default::default()
+            },
+            content: vec![Inline::Tab(RunProps {
+                underline: true,
+                ..Default::default()
+            })],
+        });
+        let lines = render(&doc(vec![p]), &opts(50));
+        let underlined_run = lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.underline && !s.text.is_empty() && s.text.chars().all(|c| c == ' '));
+        assert!(
+            underlined_run,
+            "underlined tab should fill with underlined spaces: {:?}",
+            lines[0].spans
         );
     }
 
@@ -3284,9 +3325,9 @@ mod tests {
             },
             content: vec![
                 run("1.1", RunProps::default()),
-                Inline::Tab,
+                Inline::Tab(RunProps::default()),
                 run("Motivation", RunProps::default()),
-                Inline::Tab,
+                Inline::Tab(RunProps::default()),
                 run("9", RunProps::default()),
             ],
         });
@@ -3313,7 +3354,7 @@ mod tests {
             },
             content: vec![
                 run("1 Introduction", RunProps::default()),
-                Inline::Tab,
+                Inline::Tab(RunProps::default()),
                 run("9", RunProps::default()),
             ],
         });
@@ -3388,7 +3429,7 @@ mod tests {
         o.show_invisibles = true;
         let d = doc(vec![para(vec![
             run("a", RunProps::default()),
-            Inline::Tab,
+            Inline::Tab(RunProps::default()),
             run("b", RunProps::default()),
         ])]);
         let lines = render(&d, &o);

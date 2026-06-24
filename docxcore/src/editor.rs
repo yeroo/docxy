@@ -73,7 +73,7 @@ impl Clip {
                                 props: RunProps::default(),
                             }));
                         }
-                        inl.push(Inline::Tab);
+                        inl.push(Inline::Tab(RunProps::default()));
                     }
                     _ => buf.push(ch),
                 }
@@ -1332,7 +1332,7 @@ fn inline_len(i: &Inline) -> usize {
     match i {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),
-        Inline::Tab | Inline::Break(_) => 1,
+        Inline::Tab(_) | Inline::Break(_) => 1,
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
         | Inline::Chart { .. }
@@ -1390,7 +1390,7 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                     }));
                 }
             }
-            Inline::Tab => out.push(Inline::Tab),
+            Inline::Tab(rp) => out.push(Inline::Tab(rp.clone())),
             Inline::Break(k) => out.push(Inline::Break(*k)),
             Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
                 raw: raw.clone(),
@@ -1489,7 +1489,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                     runs_insert(&mut h.runs, local, ch);
                     return;
                 }
-                Inline::Tab
+                Inline::Tab(_)
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
@@ -1564,7 +1564,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                         content.remove(i);
                     }
                 }
-                Inline::Tab
+                Inline::Tab(_)
                 | Inline::Break(_)
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
@@ -1640,7 +1640,7 @@ fn range_all_have(
                     }
                 }
             }
-            Inline::Tab | Inline::Break(_) => pos += 1,
+            Inline::Tab(_) | Inline::Break(_) => pos += 1,
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -1721,8 +1721,8 @@ fn edit_run_range(
                 pos = p;
                 out.push(Inline::Hyperlink(h));
             }
-            Inline::Tab => {
-                out.push(Inline::Tab);
+            Inline::Tab(rp) => {
+                out.push(Inline::Tab(rp));
                 pos += 1;
             }
             Inline::Break(k) => {
@@ -1802,7 +1802,7 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
         let runs: &[Run] = match inline {
             Inline::Run(r) => std::slice::from_ref(r),
             Inline::Hyperlink(h) => &h.runs,
-            Inline::Tab | Inline::Break(_) => {
+            Inline::Tab(_) | Inline::Break(_) => {
                 pos += 1;
                 continue;
             }
@@ -2327,7 +2327,7 @@ mod tests {
         let c = Clip::from_text("hello\tworld\nsecond");
         assert_eq!(c.paras.len(), 2);
         assert_eq!(c.to_text(), "hello\tworld\nsecond");
-        assert!(matches!(c.paras[0][1], Inline::Tab));
+        assert!(matches!(c.paras[0][1], Inline::Tab(_)));
     }
 
     #[test]

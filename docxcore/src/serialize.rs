@@ -204,7 +204,11 @@ fn write_ppr(s: &mut String, props: &ParProps) {
 fn write_inline(s: &mut String, item: &Inline) {
     match item {
         Inline::Run(r) => write_run(s, r),
-        Inline::Tab => s.push_str("<w:r><w:tab/></w:r>"),
+        Inline::Tab(props) => {
+            s.push_str("<w:r>");
+            write_rpr(s, props);
+            s.push_str("<w:tab/></w:r>");
+        }
         Inline::Break(kind) => match kind {
             BreakKind::Line => s.push_str("<w:r><w:br/></w:r>"),
             BreakKind::Page => s.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
@@ -607,7 +611,7 @@ mod tests {
                 ParProps::default(),
                 vec![
                     run("a", RunProps::default()),
-                    Inline::Tab,
+                    Inline::Tab(RunProps::default()),
                     run("b", RunProps::default()),
                     Inline::Break(BreakKind::Line),
                     Inline::Break(BreakKind::Page),
@@ -615,6 +619,25 @@ mod tests {
             )],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn underlined_tab_keeps_its_underline() {
+        // A tab carries the run props of its run, so the footer "underlined tab =
+        // a line" trick survives a load/save round-trip instead of dropping rPr.
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![Inline::Tab(RunProps {
+                    underline: true,
+                    ..Default::default()
+                })],
+            )],
+        };
+        let back = roundtrip(&d, &Relationships::default());
+        assert_eq!(back, d);
+        assert!(matches!(&back.body[0], Block::Paragraph(p)
+            if matches!(&p.content[0], Inline::Tab(rp) if rp.underline)));
     }
 
     #[test]
