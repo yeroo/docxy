@@ -1081,6 +1081,22 @@ impl App {
         self.dirty = true;
     }
 
+    /// Leave the File backstage via a click on the ribbon tab strip. Clicking the
+    /// File header closes the panel back to the document; any other tab switches
+    /// to it and opens its ribbon.
+    fn backstage_tab_click(&mut self, tab: usize) {
+        self.backstage = None;
+        if self.ribbon.tab_label(tab) == Some("File") {
+            self.ribbon_focus = ribbon::Focus::None;
+            self.ribbon_open = !self.auto_hide_ribbon;
+        } else {
+            self.ribbon.set_active(tab);
+            self.ribbon_open = true;
+            self.ribbon_focus = ribbon::Focus::Tab(tab);
+        }
+        self.dirty = true;
+    }
+
     fn backstage_key(&mut self, key: KeyEvent) -> bool {
         use backstage::Pane;
         let pane = match &self.backstage {
@@ -1089,6 +1105,8 @@ impl App {
         };
         if key.code == KeyCode::Esc {
             self.backstage = None;
+            // Restore the pinned ribbon (expanded when auto-hide is off).
+            self.ribbon_open = !self.auto_hide_ribbon;
             self.dirty = true;
             return false;
         }
@@ -1176,6 +1194,14 @@ impl App {
     /// activates it (open the file / step into the folder).
     fn bs_mouse(&mut self, x: u16, y: u16) {
         use backstage::{ITEMS, Item, Pane};
+        // Row 0 is the ribbon tab strip (drawn over the backstage): a click there
+        // leaves the File panel — File closes it, another tab switches to it.
+        if y == 0 {
+            if let ribbon::Hit::Tab(i) = self.ribbon.hit(x, 0, false) {
+                self.backstage_tab_click(i);
+            }
+            return;
+        }
         // Left menu column. The navigational items (Open / Save As / Info) just
         // switch the right pane, so a single click engages them right away —
         // Save As prefills the name and lets you type immediately. The acting
@@ -1676,10 +1702,14 @@ impl App {
         let rev = Style::default().add_modifier(Modifier::REVERSED);
 
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-        f.render_widget(
-            Paragraph::new(RLine::styled("  File      (Esc to close)", rev)),
-            rows[0],
-        );
+        // Keep the ribbon tab headers visible (File highlighted): clicking another
+        // tab leaves the backstage, and clicking File closes it back to the
+        // document — so the panel can be dismissed entirely with the mouse.
+        let mut tabline = self.ribbon.render_tabs_as(0); // 0 = File
+        tabline
+            .spans
+            .push(RSpan::styled("   (click a tab or Esc to leave)", dim));
+        f.render_widget(Paragraph::new(tabline), rows[0]);
         let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).split(rows[1]);
 
         // left menu
@@ -5624,6 +5654,30 @@ mod tests {
         assert!(app.show_ruler);
         app.run_act(ribbon::Act::ToggleNav);
         assert!(app.show_nav);
+    }
+
+    #[test]
+    fn backstage_tab_strip_leaves_the_panel() {
+        let mut app = app_with(&["x"]);
+        app.open_backstage();
+        assert!(app.backstage.is_some());
+        // A click on the File header (row 0) closes the panel back to the document.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3, // inside "File"
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.backstage.is_none(),
+            "File header should close the panel"
+        );
+        // Reopen, then clicking another tab switches to it and opens its ribbon.
+        app.open_backstage();
+        app.backstage_tab_click(1); // Home
+        assert!(app.backstage.is_none());
+        assert_eq!(app.ribbon.active_tab(), 1);
+        assert!(app.ribbon_open);
     }
 
     #[test]

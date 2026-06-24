@@ -719,6 +719,24 @@ impl Ribbon {
         Line::from(spans)
     }
 
+    /// Render the tab strip with `active_tab` drawn as the selected (highlighted)
+    /// tab and the rest dimmed. Used by the File backstage so the File header
+    /// looks selected while the other tabs stay visible and clickable (their
+    /// columns match [`Ribbon::hit`]).
+    pub fn render_tabs_as(&self, active_tab: usize) -> Line<'static> {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, t) in self.tabs.iter().enumerate() {
+            let style = if i == active_tab {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            spans.push(Span::styled(t.to_string(), style));
+            spans.push(Span::raw("   "));
+        }
+        Line::from(spans)
+    }
+
     /// Render the expanded ribbon body (box + buttons + group titles). Does not
     /// include the tab strip (line 0) or the hint bar.
     pub fn render_body(&self, focus: Focus) -> Vec<Line<'static>> {
