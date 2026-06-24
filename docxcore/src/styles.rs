@@ -58,6 +58,11 @@ struct StyleDef {
     align: Option<Align>,
     tabs: Vec<TabStop>,
     borders: ParBorders,
+    /// Display name (`w:name`), e.g. "heading 1".
+    name: Option<String>,
+    /// Whether this is a paragraph style (`w:type="paragraph"`), so the
+    /// Apply-Styles picker can list only paragraph styles.
+    is_paragraph: bool,
 }
 
 /// A parsed `styles.xml`: document defaults plus named style definitions.
@@ -68,6 +73,19 @@ pub struct StyleSheet {
 }
 
 impl StyleSheet {
+    /// Every paragraph style as `(styleId, display name)`, sorted by name. Used
+    /// by the Apply-Styles dialog to offer every style the document defines.
+    pub fn paragraph_styles(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .styles
+            .iter()
+            .filter(|(_, d)| d.is_paragraph)
+            .map(|(id, d)| (id.clone(), d.name.clone().unwrap_or_else(|| id.clone())))
+            .collect();
+        v.sort_by_key(|(_, name)| name.to_lowercase());
+        v
+    }
+
     /// Effective run properties combining defaults, the paragraph style, the
     /// character style, and direct properties.
     pub fn effective_run(
@@ -223,7 +241,11 @@ pub fn parse_styles_xml(xml: &str) -> StyleSheet {
                 "w:docDefaults" => parse_doc_defaults(&mut p, &mut ss.default_run),
                 "w:style" => {
                     let id = p.attr("w:styleId").to_string();
-                    let def = parse_style(&mut p);
+                    let ty = p.attr("w:type");
+                    // w:type defaults to "paragraph" when omitted.
+                    let is_paragraph = ty.is_empty() || ty == "paragraph";
+                    let mut def = parse_style(&mut p);
+                    def.is_paragraph = is_paragraph;
                     if !id.is_empty() {
                         ss.styles.insert(id, def);
                     }
@@ -246,6 +268,13 @@ fn parse_style(p: &mut XmlParser) -> StyleDef {
                     let v = p.attr("w:val");
                     if !v.is_empty() {
                         def.based_on = Some(v.to_string());
+                    }
+                    p.skip_element();
+                }
+                "w:name" => {
+                    let v = p.attr("w:val");
+                    if !v.is_empty() {
+                        def.name = Some(v.to_string());
                     }
                     p.skip_element();
                 }
@@ -400,6 +429,24 @@ fn parse_tabs(p: &mut XmlParser, tabs: &mut Vec<TabStop>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paragraph_styles_lists_names_sorted_excluding_char_styles() {
+        let xml = r#"<w:styles>
+            <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+            <w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+            <w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/></w:style>
+        </w:styles>"#;
+        let ps = parse_styles_xml(xml).paragraph_styles();
+        // The character style is excluded; the rest sort by display name.
+        assert_eq!(
+            ps,
+            vec![
+                ("Heading1".to_string(), "heading 1".to_string()),
+                ("Normal".to_string(), "Normal".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn paragraph_style_supplies_bold_and_size() {

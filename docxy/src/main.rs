@@ -422,6 +422,16 @@ fn twips_in(tw: i32) -> String {
     format!("{:.2}\"", tw as f32 / 1440.0)
 }
 
+/// The Apply-Styles dialog: a scrollable list of every paragraph style the
+/// document defines, applied to the selected paragraph(s) on Enter.
+struct StylesDialog {
+    /// `(styleId, display name)` pairs, sorted by name.
+    items: Vec<(String, String)>,
+    sel: usize,
+    /// Index of the first visible row (scroll offset), maintained by the drawer.
+    top: usize,
+}
+
 /// What a [`Picker`] sets on the selection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PickerKind {
@@ -627,6 +637,10 @@ struct App {
     para_dialog: Option<ParagraphDialog>,
     pd_rows: Vec<Rect>,
     pd_btns: [Rect; 2],
+    /// The modal Apply-Styles dialog, plus its visible row rects and buttons.
+    styles_dialog: Option<StylesDialog>,
+    sd_rows: Vec<Rect>,
+    sd_btns: [Rect; 2],
     /// The modal font/size/colour/highlight picker, plus its row/button rects.
     font_picker: Option<FontPicker>,
     fp_rows: Vec<Rect>,
@@ -773,6 +787,9 @@ impl App {
             para_dialog: None,
             pd_rows: Vec::new(),
             pd_btns: [Rect::default(); 2],
+            styles_dialog: None,
+            sd_rows: Vec::new(),
+            sd_btns: [Rect::default(); 2],
             font_picker: None,
             fp_rows: Vec::new(),
             fp_btns: [Rect::default(); 2],
@@ -1089,6 +1106,12 @@ impl App {
             }
             EditHeader => self.enter_hf_edit(true),
             EditFooter => self.enter_hf_edit(false),
+            ApplyStyle(id) => {
+                self.editor.set_para_style(Some(id));
+                self.after_edit();
+                self.status = Some(format!("Applied style: {id}"));
+            }
+            StylesDialog => self.open_styles_dialog(),
             Todo(name) => {
                 self.status = Some(format!("{name} — not implemented yet"));
                 self.dirty = true;
@@ -3089,6 +3112,75 @@ impl App {
         self.dirty = true;
     }
 
+    // ---- Apply-Styles dialog ----
+
+    /// Open the Apply-Styles dialog. Lists every paragraph style the document
+    /// defines; falls back to the common built-ins if styles.xml is bare.
+    fn open_styles_dialog(&mut self) {
+        let mut items = self.styles.paragraph_styles();
+        if items.is_empty() {
+            items = ribbon::STYLE_BUTTONS
+                .iter()
+                .map(|(label, id)| (id.to_string(), label.to_string()))
+                .collect();
+        }
+        // Start on the caret paragraph's current style, if it's in the list.
+        let cur = self.editor.caret_para_style();
+        let sel = cur
+            .as_deref()
+            .and_then(|c| items.iter().position(|(id, _)| id == c))
+            .unwrap_or(0);
+        self.styles_dialog = Some(StylesDialog { items, sel, top: 0 });
+        self.dirty = true;
+    }
+
+    fn apply_styles_dialog(&mut self) {
+        let Some(d) = self.styles_dialog.take() else {
+            return;
+        };
+        if let Some((id, name)) = d.items.get(d.sel) {
+            self.editor.set_para_style(Some(id));
+            self.after_edit();
+            self.status = Some(format!("Applied style: {name}"));
+        }
+    }
+
+    fn styles_dialog_key(&mut self, key: KeyEvent) -> bool {
+        let Some(d) = self.styles_dialog.as_mut() else {
+            return false;
+        };
+        let n = d.items.len();
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Home => d.sel = 0,
+            KeyCode::End => d.sel = n.saturating_sub(1),
+            KeyCode::Enter => self.apply_styles_dialog(),
+            KeyCode::Esc => self.styles_dialog = None,
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn styles_dialog_mouse(&mut self, x: u16, y: u16) {
+        let p = Position { x, y };
+        if let Some(d) = self.styles_dialog.as_mut() {
+            // The visible rows map to item indices via the stored top offset.
+            if let Some(i) = self.sd_rows.iter().position(|r| r.contains(p)) {
+                d.sel = (d.top + i).min(d.items.len().saturating_sub(1));
+                self.dirty = true;
+                return;
+            }
+        }
+        if self.sd_btns[0].contains(p) {
+            self.apply_styles_dialog();
+        } else if self.sd_btns[1].contains(p) {
+            self.styles_dialog = None;
+        }
+        self.dirty = true;
+    }
+
     /// Re-read numbering.xml from the package (after a list is created/changed).
     fn reparse_numbering(&mut self) {
         let n = self
@@ -3287,6 +3379,12 @@ impl App {
         if self.para_dialog.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.para_dialog_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.styles_dialog.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.styles_dialog_mouse(m.column, m.row);
             }
             return;
         }
@@ -4011,6 +4109,9 @@ impl App {
         if self.para_dialog.is_some() {
             return self.para_dialog_key(key);
         }
+        if self.styles_dialog.is_some() {
+            return self.styles_dialog_key(key);
+        }
         if self.font_picker.is_some() {
             return self.picker_key(key);
         }
@@ -4342,6 +4443,12 @@ impl App {
             Some(hf) if hf.is_header => ribbon::Act::EditHeader,
             Some(_) => ribbon::Act::EditFooter,
         });
+        // Highlight the Styles button matching the caret paragraph's style.
+        if let Some(sid) = self.editor.caret_para_style() {
+            if let Some((_, id)) = ribbon::STYLE_BUTTONS.iter().find(|(_, id)| *id == sid) {
+                toggles.push(ribbon::Act::ApplyStyle(id));
+            }
+        }
         // Font toggles reflect the run formatting at the caret.
         let rp = self.editor.caret_props();
         for (on, act) in [
@@ -4642,6 +4749,9 @@ impl App {
         if self.para_dialog.is_some() {
             self.draw_para_dialog(f, f.area());
         }
+        if self.styles_dialog.is_some() {
+            self.draw_styles_dialog(f, f.area());
+        }
         if self.font_picker.is_some() {
             self.draw_picker(f, f.area());
         }
@@ -4892,6 +5002,89 @@ impl App {
         f.render_widget(Paragraph::new(ol).style(on_style), ok_rect);
         f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
         self.pd_btns = [ok_rect, cancel_rect];
+    }
+
+    fn draw_styles_dialog(&mut self, f: &mut Frame, area: Rect) {
+        let n = match &self.styles_dialog {
+            Some(d) => d.items.len(),
+            None => return,
+        };
+        let w = 40u16.clamp(24, area.width.saturating_sub(2).max(24));
+        // Up to ~16 visible rows, but never taller than the screen (+border+buttons).
+        let max_list = 16u16;
+        let list_h = max_list.min(area.height.saturating_sub(4)).max(1);
+        let h = (list_h + 4).min(area.height); // border(2) + list + blank(1) + buttons(1)
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Apply Styles ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let vis = inner.height.saturating_sub(2) as usize; // leave a row for buttons + gap
+        let vis = vis.max(1);
+        let sel = self.styles_dialog.as_ref().unwrap().sel;
+        let top = sel.saturating_sub(vis / 2).min(n.saturating_sub(vis));
+        if let Some(d) = self.styles_dialog.as_mut() {
+            d.top = top;
+        }
+        let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        self.sd_rows.clear();
+        let items = &self.styles_dialog.as_ref().unwrap().items;
+        for row in 0..vis {
+            let idx = top + row;
+            if idx >= n {
+                break;
+            }
+            let r = Rect {
+                x: inner.x + 1,
+                y: inner.y + row as u16,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            let (id, name) = &items[idx];
+            let on = idx == sel;
+            // Show the display name, with the style id dimmed when it differs.
+            let label = if name.eq_ignore_ascii_case(id) {
+                format!(" {} {}", if on { "▶" } else { " " }, name)
+            } else {
+                format!(" {} {}  ({id})", if on { "▶" } else { " " }, name)
+            };
+            f.render_widget(
+                Paragraph::new(label).style(if on { on_style } else { Style::default() }),
+                r,
+            );
+            self.sd_rows.push(r);
+        }
+
+        let (ol, cl) = (" Apply ", " Cancel ");
+        let (ow, cw) = (ol.len() as u16, cl.len() as u16);
+        let total = ow + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let ok_rect = Rect {
+            x: bx,
+            y: by,
+            width: ow,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + ow + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(ol).style(on_style), ok_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.sd_btns = [ok_rect, cancel_rect];
     }
 
     fn draw_paste_special(&mut self, f: &mut Frame, area: Rect) {
@@ -5820,11 +6013,11 @@ mod tests {
     #[test]
     fn review_tab_present_and_toggle_flips_the_panel() {
         let mut app = app_with(&["body text"]);
-        // The ribbon has a Review tab after File, Home and Insert.
-        assert_eq!(app.ribbon.tab_label(3), Some("Review"));
+        // The ribbon has a Review tab after File, Home, Styles and Insert.
+        assert_eq!(app.ribbon.tab_label(4), Some("Review"));
         // Switching to it activates the Review ribbon.
-        app.ribbon.set_active(3);
-        assert_eq!(app.ribbon.active_tab(), 3);
+        app.ribbon.set_active(4);
+        assert_eq!(app.ribbon.active_tab(), 4);
         // The Comments toggle flips the side-panel flag.
         assert!(!app.show_comments);
         app.run_act(ribbon::Act::ToggleComments);
@@ -5866,7 +6059,7 @@ mod tests {
     #[test]
     fn view_ribbon_actions_toggle_their_state() {
         let mut app = app_with(&["heading"]);
-        assert_eq!(app.ribbon.tab_label(4), Some("View"));
+        assert_eq!(app.ribbon.tab_label(5), Some("View"));
         app.run_act(ribbon::Act::PrintLayout);
         assert!(app.page_view);
         app.run_act(ribbon::Act::ReadMode);
@@ -6229,8 +6422,8 @@ mod tests {
     #[test]
     fn insert_tab_button_inserts_a_horizontal_line() {
         let mut app = app_with(&["hello"]);
-        // The ribbon has an Insert tab between Home and Review.
-        assert_eq!(app.ribbon.tab_label(2), Some("Insert"));
+        // The ribbon has an Insert tab between Styles and Review.
+        assert_eq!(app.ribbon.tab_label(3), Some("Insert"));
         app.run_act(ribbon::Act::HorizontalLine);
         match &app.editor.doc.body[0] {
             Block::Paragraph(p) => assert_eq!(
@@ -6410,6 +6603,40 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(app.para_dialog.is_none());
         assert_eq!(app.editor.caret_para_indent(), (0, 0));
+    }
+
+    #[test]
+    fn styles_tab_is_present() {
+        let app = app_with(&["x"]);
+        assert_eq!(app.ribbon.tab_label(2), Some("Styles"));
+    }
+
+    #[test]
+    fn styles_ribbon_applies_a_named_style() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::ApplyStyle("Heading1"));
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => {
+                assert_eq!(p.props.style_id.as_deref(), Some("Heading1"));
+                assert_eq!(p.props.heading_level, Some(1));
+            }
+            _ => panic!(),
+        }
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn styles_dialog_opens_applies_and_cancels() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::StylesDialog);
+        let d = app.styles_dialog.as_ref().expect("dialog opened");
+        assert!(!d.items.is_empty(), "falls back to built-in styles");
+        app.apply_styles_dialog();
+        assert!(app.styles_dialog.is_none(), "closes on apply");
+        // A second open then Esc leaves the paragraph unchanged.
+        app.run_act(ribbon::Act::StylesDialog);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.styles_dialog.is_none());
     }
 
     #[test]

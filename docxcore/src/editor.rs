@@ -924,6 +924,22 @@ impl Editor {
         (pr.indent, pr.first_line)
     }
 
+    /// Apply a paragraph style (`w:pStyle`) to the selected paragraphs, updating
+    /// each one's heading level so headings render with their rule. `None` clears
+    /// the style back to the default.
+    pub fn set_para_style(&mut self, style_id: Option<&str>) {
+        let sid = style_id.map(str::to_string);
+        self.for_each_para(move |pr| {
+            pr.heading_level = sid.as_deref().and_then(crate::load::heading_level);
+            pr.style_id = sid.clone();
+        });
+    }
+
+    /// The paragraph style id at the caret (for syncing the Styles ribbon/dialog).
+    pub fn caret_para_style(&self) -> Option<String> {
+        self.caret_para_props().style_id
+    }
+
     /// Set (or clear) the list membership of the selected paragraphs.
     pub fn set_list(&mut self, num_id: Option<i32>) {
         self.for_each_para(move |pr| {

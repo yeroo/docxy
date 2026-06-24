@@ -88,9 +88,25 @@ pub enum Act {
     EditDocument,
     EditHeader,
     EditFooter,
+    /// Apply a named paragraph style (the `&str` is the `w:styleId`).
+    ApplyStyle(&'static str),
+    /// Open the Apply-Styles dialog (every style the document defines).
+    StylesDialog,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
+
+/// The named styles offered on the Styles ribbon, as `(label, styleId)`. Kept in
+/// one place so the buttons and the active-style highlight can't drift apart.
+pub const STYLE_BUTTONS: &[(&str, &str)] = &[
+    ("Normal", "Normal"),
+    ("No Spacing", "NoSpacing"),
+    ("Title", "Title"),
+    ("Subtitle", "Subtitle"),
+    ("Heading 1", "Heading1"),
+    ("Heading 2", "Heading2"),
+    ("Heading 3", "Heading3"),
+];
 
 impl Act {
     fn enabled(self) -> bool {
@@ -179,12 +195,13 @@ const ROW1: usize = 2; // y of second button row
 impl Ribbon {
     pub fn home() -> Ribbon {
         let mut r = Ribbon {
-            // File opens the backstage; Home/Review/View are ribbons.
-            tabs: vec!["File", "Home", "Insert", "Review", "View"],
+            // File opens the backstage; the rest are ribbons.
+            tabs: vec!["File", "Home", "Styles", "Insert", "Review", "View"],
             active: 1,
             tab_groups: vec![
                 Vec::new(),
                 home_groups(),
+                styles_groups(),
                 insert_groups(),
                 review_groups(),
                 view_groups(),
@@ -357,6 +374,44 @@ fn home_groups() -> Vec<Group> {
             ],
         },
     ]
+}
+
+/// The Styles tab: a gallery of common paragraph styles plus a "More…" launcher
+/// for the full Apply-Styles dialog. Button labels/ids come from [`STYLE_BUTTONS`].
+fn styles_groups() -> Vec<Group> {
+    use Act::*;
+    let b = |label: &'static str, id: &'static str| {
+        btn(
+            label,
+            label.chars().count(),
+            ApplyStyle(id),
+            "Apply this paragraph style",
+        )
+    };
+    vec![Group {
+        title: "Styles",
+        width: 35,
+        rows: [
+            vec![
+                b("Normal", "Normal"),
+                Seg::Gap(" "),
+                b("No Spacing", "NoSpacing"),
+                Seg::Gap(" "),
+                b("Title", "Title"),
+                Seg::Gap(" "),
+                b("Subtitle", "Subtitle"),
+            ],
+            vec![
+                b("Heading 1", "Heading1"),
+                Seg::Gap(" "),
+                b("Heading 2", "Heading2"),
+                Seg::Gap(" "),
+                b("Heading 3", "Heading3"),
+                Seg::Gap(" "),
+                btn("More…", 5, StylesDialog, "Apply Styles — pick any style…"),
+            ],
+        ],
+    }]
 }
 
 /// The Review tab's groups (Comments / Tracking).
@@ -934,8 +989,8 @@ mod tests {
     #[test]
     fn an_on_toggle_button_is_drawn_inverted() {
         let mut r = Ribbon::home();
-        r.set_active(4); // View tab has Read/Print toggles
-        assert_eq!(r.tab_label(4), Some("View"));
+        r.set_active(5); // View tab has Read/Print toggles
+        assert_eq!(r.tab_label(5), Some("View"));
         // nothing inverted yet
         let plain = r.render_body(Focus::None);
         let any_rev = |ls: &[Line]| {
@@ -952,7 +1007,7 @@ mod tests {
     #[test]
     fn dark_mode_icon_flips_with_the_page() {
         let mut r = Ribbon::home();
-        r.set_active(4);
+        r.set_active(5);
         let body = |r: &Ribbon| {
             r.render_body(Focus::None)
                 .iter()

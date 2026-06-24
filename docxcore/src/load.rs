@@ -137,7 +137,8 @@ fn map_align(jc: &str) -> Align {
     }
 }
 
-fn heading_level(style_id: &str) -> Option<u8> {
+/// Map a paragraph style id to a heading level (`Heading2` → 2), if it is one.
+pub fn heading_level(style_id: &str) -> Option<u8> {
     let t = style_id.replace([' ', '-', '_'], "").to_ascii_lowercase();
     let rest = t.strip_prefix("heading")?;
     let n: u8 = rest.parse().ok()?;
