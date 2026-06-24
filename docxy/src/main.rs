@@ -385,6 +385,43 @@ struct InsertFieldDialog {
     sel: usize,
 }
 
+/// The Paragraph dialog: precise left indent plus a first-line / hanging
+/// "special" indent. Values are twips; rows are adjusted with ←/→ (steppers).
+struct ParagraphDialog {
+    left: i32,   // left indent (>= 0)
+    special: u8, // 0 = none, 1 = first line, 2 = hanging
+    by: i32,     // the first-line/hanging amount (>= 0)
+    sel: usize,  // focused row: 0 = left, 1 = special, 2 = by
+}
+
+impl ParagraphDialog {
+    const ROWS: usize = 3;
+    const STEP: i32 = 360; // 0.25"
+
+    /// The signed first-line delta this dialog represents.
+    fn first_line(&self) -> i32 {
+        match self.special {
+            1 => self.by,
+            2 => -self.by,
+            _ => 0,
+        }
+    }
+
+    /// Adjust the focused row by `dir` (+1 / -1).
+    fn adjust(&mut self, dir: i32) {
+        match self.sel {
+            0 => self.left = (self.left + dir * Self::STEP).max(0),
+            1 => self.special = (self.special as i32 + dir).rem_euclid(3) as u8,
+            _ => self.by = (self.by + dir * Self::STEP).max(0),
+        }
+    }
+}
+
+/// Format twips as inches for display, e.g. 720 → `0.50"`.
+fn twips_in(tw: i32) -> String {
+    format!("{:.2}\"", tw as f32 / 1440.0)
+}
+
 /// What a [`Picker`] sets on the selection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PickerKind {
@@ -586,6 +623,10 @@ struct App {
     insert_field: Option<InsertFieldDialog>,
     if_rows: Vec<Rect>,
     if_btns: [Rect; 2],
+    /// The modal Paragraph dialog (precise indent), plus its row/button rects.
+    para_dialog: Option<ParagraphDialog>,
+    pd_rows: Vec<Rect>,
+    pd_btns: [Rect; 2],
     /// The modal font/size/colour/highlight picker, plus its row/button rects.
     font_picker: Option<FontPicker>,
     fp_rows: Vec<Rect>,
@@ -729,6 +770,9 @@ impl App {
             insert_field: None,
             if_rows: Vec::new(),
             if_btns: [Rect::default(); 2],
+            para_dialog: None,
+            pd_rows: Vec::new(),
+            pd_btns: [Rect::default(); 2],
             font_picker: None,
             fp_rows: Vec::new(),
             fp_btns: [Rect::default(); 2],
@@ -956,6 +1000,15 @@ impl App {
                 self.editor.change_indent(-720);
                 self.after_edit();
             }
+            FirstLineIndent => {
+                self.editor.set_first_line(720);
+                self.after_edit();
+            }
+            HangingIndent => {
+                self.editor.set_first_line(-720);
+                self.after_edit();
+            }
+            ParagraphDialog => self.open_para_dialog(),
             Sort => {
                 self.editor.sort_paragraphs();
                 self.after_edit();
@@ -2974,6 +3027,68 @@ impl App {
         self.dirty = true;
     }
 
+    // ---- Paragraph dialog (precise indent) ----
+
+    /// Open the Paragraph dialog seeded from the caret paragraph's indents.
+    fn open_para_dialog(&mut self) {
+        let (left, fl) = self.editor.caret_para_indent();
+        let (special, by) = match fl.cmp(&0) {
+            std::cmp::Ordering::Greater => (1u8, fl),
+            std::cmp::Ordering::Less => (2u8, -fl),
+            std::cmp::Ordering::Equal => (0u8, 720), // default 0.5" once a special is picked
+        };
+        self.para_dialog = Some(ParagraphDialog {
+            left,
+            special,
+            by,
+            sel: 0,
+        });
+        self.dirty = true;
+    }
+
+    fn apply_para_dialog(&mut self) {
+        let Some(d) = self.para_dialog.take() else {
+            return;
+        };
+        self.editor.set_indent(d.left, d.first_line());
+        self.after_edit();
+        self.status = Some("Paragraph indent applied".to_string());
+    }
+
+    fn para_dialog_key(&mut self, key: KeyEvent) -> bool {
+        let Some(d) = self.para_dialog.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(ParagraphDialog::ROWS - 1),
+            KeyCode::Left => d.adjust(-1),
+            KeyCode::Right => d.adjust(1),
+            KeyCode::Enter => self.apply_para_dialog(),
+            KeyCode::Esc => self.para_dialog = None,
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn para_dialog_mouse(&mut self, x: u16, y: u16) {
+        let p = Position { x, y };
+        if let Some(i) = self.pd_rows.iter().position(|r| r.contains(p)) {
+            if let Some(d) = self.para_dialog.as_mut() {
+                d.sel = i;
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.pd_btns[0].contains(p) {
+            self.apply_para_dialog();
+        } else if self.pd_btns[1].contains(p) {
+            self.para_dialog = None;
+        }
+        self.dirty = true;
+    }
+
     /// Re-read numbering.xml from the package (after a list is created/changed).
     fn reparse_numbering(&mut self) {
         let n = self
@@ -3166,6 +3281,12 @@ impl App {
         if self.insert_field.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.insert_field_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.para_dialog.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.para_dialog_mouse(m.column, m.row);
             }
             return;
         }
@@ -3887,6 +4008,9 @@ impl App {
         if self.insert_field.is_some() {
             return self.insert_field_key(key);
         }
+        if self.para_dialog.is_some() {
+            return self.para_dialog_key(key);
+        }
         if self.font_picker.is_some() {
             return self.picker_key(key);
         }
@@ -4515,6 +4639,9 @@ impl App {
         if self.insert_field.is_some() {
             self.draw_insert_field(f, f.area());
         }
+        if self.para_dialog.is_some() {
+            self.draw_para_dialog(f, f.area());
+        }
         if self.font_picker.is_some() {
             self.draw_picker(f, f.area());
         }
@@ -4673,6 +4800,98 @@ impl App {
         f.render_widget(Paragraph::new(il).style(on_style), insert_rect);
         f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
         self.if_btns = [insert_rect, cancel_rect];
+    }
+
+    fn draw_para_dialog(&mut self, f: &mut Frame, area: Rect) {
+        let Some(d) = &self.para_dialog else {
+            return;
+        };
+        // 3 setting rows + blank + hint + blank + buttons, inside a border.
+        let inner_h = ParagraphDialog::ROWS as u16 + 1 + 1 + 1 + 1;
+        let w = 44u16.clamp(30, area.width.saturating_sub(2).max(30));
+        let h = (inner_h + 2).min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Paragraph ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let line = |row: u16| Rect {
+            x: inner.x + 1,
+            y: inner.y + row,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let special = ["(none)", "First line", "Hanging"][d.special.min(2) as usize];
+        // Each row shows "Label:   ◂ value ▸" so the arrows hint the steppers.
+        let rows = [
+            ("Left indent", twips_in(d.left)),
+            ("Special", special.to_string()),
+            ("By", twips_in(d.by)),
+        ];
+        self.pd_rows.clear();
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let r = line(i as u16);
+            let on = i == d.sel;
+            // "By" is irrelevant when no special indent is set — dim it.
+            let muted = i == 2 && d.special == 0;
+            let arrows = if on {
+                format!("◂ {value} ▸")
+            } else {
+                value.clone()
+            };
+            let text = format!(
+                " {:<13}{:>width$}",
+                format!("{label}:"),
+                arrows,
+                width = inner.width.saturating_sub(16) as usize
+            );
+            let style = if on {
+                on_style
+            } else if muted {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
+            };
+            f.render_widget(Paragraph::new(text).style(style), r);
+            self.pd_rows.push(r);
+        }
+        f.render_widget(
+            Paragraph::new("↑↓ row · ←→ adjust · Enter apply")
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            line(ParagraphDialog::ROWS as u16 + 1),
+        );
+
+        let (ol, cl) = (" OK ", " Cancel ");
+        let (ow, cw) = (ol.len() as u16, cl.len() as u16);
+        let total = ow + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let ok_rect = Rect {
+            x: bx,
+            y: by,
+            width: ow,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + ow + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(ol).style(on_style), ok_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.pd_btns = [ok_rect, cancel_rect];
     }
 
     fn draw_paste_special(&mut self, f: &mut Frame, area: Rect) {
@@ -6155,6 +6374,42 @@ mod tests {
             _ => panic!(),
         }
         assert!(app.modified);
+    }
+
+    #[test]
+    fn ribbon_first_line_and_hanging_indent() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::FirstLineIndent);
+        assert_eq!(app.editor.caret_para_indent(), (0, 720));
+        app.run_act(ribbon::Act::HangingIndent);
+        assert_eq!(app.editor.caret_para_indent(), (0, -720));
+    }
+
+    #[test]
+    fn paragraph_dialog_sets_left_and_first_line_indent() {
+        let mut app = app_with(&["hello world"]);
+        app.run_act(ribbon::Act::ParagraphDialog);
+        assert!(app.para_dialog.is_some(), "dialog opened");
+        {
+            let d = app.para_dialog.as_mut().unwrap();
+            d.adjust(1); // left += 0.25"
+            d.adjust(1); // left = 0.5" (720)
+            d.sel = 1; // Special row
+            d.adjust(1); // none -> first line (by defaults to 0.5")
+        }
+        app.apply_para_dialog();
+        assert!(app.para_dialog.is_none(), "dialog closes on apply");
+        assert_eq!(app.editor.caret_para_indent(), (720, 720));
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn paragraph_dialog_esc_cancels() {
+        let mut app = app_with(&["x"]);
+        app.run_act(ribbon::Act::ParagraphDialog);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.para_dialog.is_none());
+        assert_eq!(app.editor.caret_para_indent(), (0, 0));
     }
 
     #[test]

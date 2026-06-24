@@ -643,6 +643,13 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     if let Some(v) = frame_int(p, "w:left").or_else(|| frame_int(p, "w:start")) {
                         props.indent = v;
                     }
+                    // First-line indent: `w:firstLine` adds to the first line,
+                    // `w:hanging` pulls it left (mutually exclusive in the schema).
+                    if let Some(v) = frame_int(p, "w:firstLine") {
+                        props.first_line = v;
+                    } else if let Some(v) = frame_int(p, "w:hanging") {
+                        props.first_line = -v;
+                    }
                     p.skip_element();
                 }
                 "w:sectPr" => {

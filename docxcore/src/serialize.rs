@@ -182,8 +182,22 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         s.push_str("</w:tabs>");
     }
     // w:ind precedes w:jc in the schema order.
-    if props.indent != 0 {
-        s.push_str(&format!("<w:ind w:left=\"{}\"/>", props.indent));
+    if props.indent != 0 || props.first_line != 0 {
+        s.push_str("<w:ind");
+        if props.indent != 0 {
+            s.push_str(&format!(" w:left=\"{}\"", props.indent));
+        }
+        // firstLine and hanging are mutually exclusive; both are non-negative.
+        match props.first_line.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                s.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
+            }
+            std::cmp::Ordering::Less => {
+                s.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        s.push_str("/>");
     }
     match props.align {
         Align::Left => {}
@@ -485,6 +499,7 @@ mod tests {
                 top: None,
             },
             indent: 720,
+            first_line: -360,
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],

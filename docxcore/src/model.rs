@@ -172,6 +172,11 @@ pub struct ParProps {
     pub borders: ParBorders,
     /// Left indent in twips (`w:ind w:left`/`w:start`). Rendered as leading space.
     pub indent: i32,
+    /// Extra indent on the paragraph's first line, in twips, relative to `indent`:
+    /// positive = `w:firstLine` (first line indented more), negative = `w:hanging`
+    /// (first line pulled left of the rest, as in lists/bibliographies). Zero =
+    /// every line shares `indent`.
+    pub first_line: i32,
 }
 
 /// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since

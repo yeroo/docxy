@@ -1267,9 +1267,17 @@ fn render_paragraph(
         let cont = " ".repeat(first.chars().count());
         (first, cont)
     } else {
-        (indent.clone(), indent)
+        // The first line may indent more (`w:firstLine`) or less (`w:hanging`)
+        // than the continuation lines.
+        let first = " ".repeat(((para.props.indent + para.props.first_line).max(0) / 120) as usize);
+        (first, indent)
     };
-    let prefix_w = first_prefix.chars().count();
+    // Wrap against the wider of the two prefixes so a hanging indent's longer
+    // continuation prefix can't push text past the right edge.
+    let prefix_w = first_prefix
+        .chars()
+        .count()
+        .max(cont_prefix.chars().count());
     // Honor the requested width down to a single cell — narrow table columns rely
     // on wrapping to their exact width, else cells overflow and break the borders.
     let avail = width.saturating_sub(prefix_w).max(1);
@@ -3300,6 +3308,38 @@ mod tests {
             "underlined tab should fill with underlined spaces: {:?}",
             lines[0].spans
         );
+    }
+
+    #[test]
+    fn first_line_and_hanging_indent_offset_line_one() {
+        let body = "one two three four five six seven eight nine ten eleven twelve";
+        // First-line indent: line 1 starts further right than the wrapped rest.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                indent: 720,     // 6 cells
+                first_line: 720, // +6 cells on line 1 only
+                ..Default::default()
+            },
+            content: vec![run(body, RunProps::default())],
+        });
+        let lines = render(&doc(vec![p]), &opts(40));
+        let lead = |s: &str| s.len() - s.trim_start().len();
+        assert!(lines.len() >= 2, "expected wrapping: {lines:?}");
+        assert_eq!(lead(&lines[0].plain()), 12, "first line indent");
+        assert_eq!(lead(&lines[1].plain()), 6, "continuation indent");
+
+        // Hanging indent: line 1 starts left of the wrapped continuation.
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                indent: 720,
+                first_line: -720, // hanging: line 1 back to col 0
+                ..Default::default()
+            },
+            content: vec![run(body, RunProps::default())],
+        });
+        let lines = render(&doc(vec![p]), &opts(40));
+        assert_eq!(lead(&lines[0].plain()), 0, "hanging first line");
+        assert_eq!(lead(&lines[1].plain()), 6, "hanging continuation");
     }
 
     #[test]

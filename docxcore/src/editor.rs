@@ -901,6 +901,29 @@ impl Editor {
         self.for_each_para(|pr| pr.indent = (pr.indent + delta).max(0));
     }
 
+    /// Set the left indent and first-line delta (twips) of the selected
+    /// paragraphs. `first_line` > 0 is a first-line indent, < 0 a hanging indent,
+    /// 0 none. Used by the Paragraph dialog.
+    pub fn set_indent(&mut self, left: i32, first_line: i32) {
+        self.for_each_para(move |pr| {
+            pr.indent = left.max(0);
+            pr.first_line = first_line;
+        });
+    }
+
+    /// Set just the first-line delta (twips) of the selected paragraphs, leaving
+    /// the left indent alone. Used by the First-line / Hanging ribbon buttons.
+    pub fn set_first_line(&mut self, first_line: i32) {
+        self.for_each_para(move |pr| pr.first_line = first_line);
+    }
+
+    /// The left indent and first-line delta at the caret (for syncing the
+    /// Paragraph dialog and ribbon state).
+    pub fn caret_para_indent(&self) -> (i32, i32) {
+        let pr = self.caret_para_props();
+        (pr.indent, pr.first_line)
+    }
+
     /// Set (or clear) the list membership of the selected paragraphs.
     pub fn set_list(&mut self, num_id: Option<i32>) {
         self.for_each_para(move |pr| {

@@ -21,3 +21,6 @@ should_implement_trait = "allow"
 field_reassign_with_default = "allow"
 # Nested `if let { if … }` reads clearer than edition-2024 let-chains here.
 collapsible_if = "allow"
+# `Block::Paragraph` is the dominant variant by far, so boxing it to equalize
+# variant sizes would just add an allocation to the hot path for no real win.
+large_enum_variant = "allow"
