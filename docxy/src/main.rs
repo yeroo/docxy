@@ -5272,6 +5272,9 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     app.show_nav = prefs.show_nav;
     app.show_comments = prefs.show_comments;
     app.auto_hide_ribbon = prefs.auto_hide_ribbon;
+    // With auto-hide off the ribbon is pinned, so start it expanded (focus stays
+    // in the document); with auto-hide on it starts collapsed to the tab strip.
+    app.ribbon_open = !app.auto_hide_ribbon;
     app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
