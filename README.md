@@ -32,6 +32,10 @@ on a small, dependency-free OOXML engine (`docxcore`) with a thin
 - Safe **clickable links** — only `http(s)`, shown for confirmation, opened without
   a shell.
 - **PDF export**, headless: `docxy in.docx --pdf out.pdf`.
+- **Markdown**: open and edit `.md` files directly; **Save As** to a `.md` or
+  `.docx` name converts between the two. View ▸ Markdown toggles a `.md` file
+  between the rendered document and its raw source (headings, bold/italic/strike,
+  links, bullet/ordered lists, thematic rules, and pipe tables all map across).
 
 ## Install
 
@@ -46,9 +50,9 @@ checksummed, cosign-signed, and carries a build-provenance attestation.
 ## Usage
 
 ```sh
-docxy <file.docx>               # open in the editor
-docxy <file.docx> --vim         # open with vim keybindings
-docxy <file.docx> --pdf <out>   # export to PDF and exit
+docxy <file.docx|.md>           # open a Word or Markdown file
+docxy <file> --vim              # open with vim keybindings
+docxy <file> --pdf <out>        # export to PDF and exit
 ```
 
 ### Keys

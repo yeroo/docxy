@@ -20,9 +20,10 @@ use std::process::ExitCode;
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
+use docxcore::markdown::{from_markdown, to_markdown_with};
 use docxcore::model::{Align, Block, Document, Hyperlink, Inline, PageGeom, Run, RunProps};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
-use docxcore::package::{Package, load_package, new_package, save_package};
+use docxcore::package::{Package, load_package, new_markdown_package, new_package, save_package};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images,
@@ -52,6 +53,72 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
+/// The on-disk format the open document is bound to. Drives load (`.docx` vs
+/// Markdown), save, and whether the View ▸ Markdown source/rendered switch shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocFormat {
+    Docx,
+    Markdown,
+}
+
+/// Pick a format from a path's extension (Markdown for `.md`/`.markdown`/`.mdown`,
+/// `.docx` otherwise).
+fn format_for(path: &str) -> DocFormat {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown") {
+        DocFormat::Markdown
+    } else {
+        DocFormat::Docx
+    }
+}
+
+/// Load a file into a package, parsing Markdown into a numbered package when the
+/// path is a `.md`. Returns the package and the format it was read as.
+fn load_input(path: &str) -> Result<(Package, DocFormat), String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    match format_for(path) {
+        DocFormat::Markdown => {
+            let text = String::from_utf8_lossy(&data).into_owned();
+            Ok((
+                new_markdown_package(from_markdown(&text)),
+                DocFormat::Markdown,
+            ))
+        }
+        DocFormat::Docx => load_package(&data)
+            .map(|p| (p, DocFormat::Docx))
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Turn Markdown text into a document of literal lines: one paragraph per line,
+/// each holding the line verbatim (no inline parsing). This is the editable buffer
+/// for Markdown *source* view; toggling back to rendered re-parses it.
+fn source_lines_to_doc(md: &str) -> Document {
+    use docxcore::model::{Inline, ParProps, Paragraph, Run, RunProps};
+    let mut body: Vec<Block> = md
+        .trim_end_matches('\n')
+        .split('\n')
+        .map(|line| {
+            let content = if line.is_empty() {
+                Vec::new()
+            } else {
+                vec![Inline::Run(Run {
+                    text: line.to_string(),
+                    props: RunProps::default(),
+                })]
+            };
+            Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })
+        })
+        .collect();
+    if body.is_empty() {
+        body.push(Block::Paragraph(docxcore::model::Paragraph::default()));
+    }
+    Document { body }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match parse_args(&args) {
@@ -66,25 +133,16 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
-    // With a file argument we load it; with none, start a fresh blank document.
-    let (pkg, input) = match parsed.input {
-        Some(input) => {
-            let data = match std::fs::read(&input) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("error: cannot read {input}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let pkg = match load_package(&data) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            (pkg, input)
-        }
+    // With a file argument we load it (Markdown or .docx, by extension); with none,
+    // start a fresh blank document.
+    let (pkg, input, format) = match parsed.input {
+        Some(input) => match load_input(&input) {
+            Ok((pkg, fmt)) => (pkg, input, fmt),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
         None => {
             if parsed.pdf_out.is_some() {
                 eprintln!("error: --pdf requires an input file");
@@ -93,7 +151,7 @@ fn main() -> ExitCode {
             let pkg = new_package(Document {
                 body: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
             });
-            (pkg, "untitled.docx".to_string())
+            (pkg, "untitled.docx".to_string(), DocFormat::Docx)
         }
     };
 
@@ -117,7 +175,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run_tui(pkg, &input, parsed.vim) {
+    match run_tui(pkg, &input, format, parsed.vim) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -128,12 +186,14 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "Docxy — terminal .docx viewer & editor\n\n\
+        "Docxy — terminal .docx & Markdown editor\n\n\
          USAGE:\n  \
            docxy                           new blank document in the editor\n  \
-           docxy <file.docx>               open in the editor\n  \
-           docxy <file.docx> --vim         open with vim keybindings\n  \
-           docxy <file.docx> --pdf <out>   export to PDF and exit\n\n\
+           docxy <file.docx|.md>           open a Word or Markdown file\n  \
+           docxy <file> --vim              open with vim keybindings\n  \
+           docxy <file> --pdf <out>        export to PDF and exit\n  \
+           (Save As to a .md/.docx name converts between the two formats;\n   \
+            View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \
            type / Enter / Backspace / Delete    edit text\n  \
            arrows / Home / End / PgUp / PgDn     move   (Ctrl-←/→ by word)\n  \
@@ -553,6 +613,11 @@ struct App {
     pkg: Package,
     editor: Editor,
     path: String,
+    /// The on-disk format this document is bound to (`.docx` or Markdown).
+    format: DocFormat,
+    /// While editing a Markdown file: `true` shows the raw source (each line an
+    /// editable paragraph), `false` shows it rendered. Always `false` for `.docx`.
+    md_source: bool,
     modified: bool,
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
@@ -737,6 +802,8 @@ impl App {
             pkg,
             editor: Editor::new(doc),
             path: path.to_string(),
+            format: format_for(path),
+            md_source: false,
             modified: false,
             quit_requested: false,
             status: None,
@@ -1106,6 +1173,8 @@ impl App {
             }
             EditHeader => self.enter_hf_edit(true),
             EditFooter => self.enter_hf_edit(false),
+            MdRendered => self.set_md_source(false),
+            MdSource => self.set_md_source(true),
             ApplyStyle(id) => {
                 self.editor.set_para_style(Some(id));
                 self.after_edit();
@@ -1619,8 +1688,10 @@ impl App {
         false
     }
 
-    /// Write the document to `dir/name_input` (adding `.docx` if absent), make it
-    /// the current file, and close the backstage.
+    /// Write the document to `dir/name_input`, picking the format from the typed
+    /// extension (`.md`/`.markdown` → Markdown, `.docx` → Word; none → keep the
+    /// current format). This is how a `.docx` is exported to Markdown and vice
+    /// versa. Makes the new file current and closes the backstage.
     fn commit_save_as(&mut self) {
         let (dir, name) = match &self.backstage {
             Some(b) => (b.dir.clone(), b.name_input.trim().to_string()),
@@ -1630,22 +1701,45 @@ impl App {
             self.status = Some("Save As — type a file name first.".to_string());
             return;
         }
-        let mut fname = name;
-        if !fname.to_ascii_lowercase().ends_with(".docx") {
-            fname.push_str(".docx");
-        }
+        // Resolve the target format + ensure the name carries an extension.
+        let lower = name.to_ascii_lowercase();
+        let known = [".docx", ".md", ".markdown", ".mdown"];
+        let (mut fname, target) = if known.iter().any(|e| lower.ends_with(e)) {
+            let fmt = format_for(&name);
+            (name, fmt)
+        } else {
+            let mut f = name;
+            f.push_str(match self.format {
+                DocFormat::Markdown => ".md",
+                DocFormat::Docx => ".docx",
+            });
+            (f, self.format)
+        };
+        fname = fname.trim().to_string();
         let path = dir.join(&fname);
+        let path_str = path.to_string_lossy().into_owned();
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
-        self.pkg.document = self.editor.doc.clone();
-        let bytes = save_package(&self.pkg);
+        // Serialize in the target format, then rebind in-memory state to the saved
+        // file so format, view and numbering all stay consistent.
+        let (bytes, pkg) = match target {
+            DocFormat::Markdown => {
+                let md = self.current_markdown();
+                let pkg = new_markdown_package(from_markdown(&md));
+                (md.into_bytes(), pkg)
+            }
+            DocFormat::Docx => {
+                self.pkg.document = self.current_document();
+                (save_package(&self.pkg), self.pkg.clone())
+            }
+        };
         match std::fs::write(&path, &bytes) {
             Ok(()) => {
-                self.path = path.to_string_lossy().into_owned();
-                self.modified = false;
+                let n = bytes.len();
+                self.load_package_state(pkg, path_str.clone());
                 self.backstage = None;
-                self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
+                self.status = Some(format!("Saved {path_str} ({n} bytes)"));
             }
             Err(e) => self.status = Some(format!("save failed: {e}")),
         }
@@ -1693,14 +1787,15 @@ impl App {
         }
     }
 
-    /// Replace the open document with one loaded from `path`.
+    /// Replace the open document with one loaded from `path` (Markdown or `.docx`).
     fn open_path(&mut self, path: &std::path::Path) {
-        match std::fs::read(path).ok().and_then(|d| load_package(&d).ok()) {
-            Some(pkg) => {
-                self.load_package_state(pkg, path.display().to_string());
-                self.status = Some(format!("opened {}", path.display()));
+        let p = path.display().to_string();
+        match load_input(&p) {
+            Ok((pkg, _fmt)) => {
+                self.load_package_state(pkg, p.clone());
+                self.status = Some(format!("opened {p}"));
             }
-            None => self.status = Some(format!("cannot open {}", path.display())),
+            Err(e) => self.status = Some(format!("cannot open {p}: {e}")),
         }
     }
 
@@ -1766,6 +1861,8 @@ impl App {
         self.styles = Rc::new(styles);
         self.numbering = Rc::new(numbering);
         self.rels = rels;
+        self.format = format_for(&path);
+        self.md_source = false;
         self.path = path;
         self.modified = false;
         self.scroll = 0;
@@ -2789,15 +2886,87 @@ impl App {
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
-        self.pkg.document = self.editor.doc.clone();
-        let bytes = save_package(&self.pkg);
-        match std::fs::write(&self.path, &bytes) {
+        let path = self.path.clone();
+        let bytes = match self.format {
+            DocFormat::Markdown => self.current_markdown().into_bytes(),
+            DocFormat::Docx => {
+                self.pkg.document = self.editor.doc.clone();
+                save_package(&self.pkg)
+            }
+        };
+        match std::fs::write(&path, &bytes) {
             Ok(()) => {
                 self.modified = false;
-                self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
+                self.status = Some(format!("Saved {} ({} bytes)", path, bytes.len()));
             }
             Err(e) => self.status = Some(format!("save failed: {e}")),
         }
+    }
+
+    /// The raw source text of the editor, one paragraph per line. Only meaningful
+    /// in Markdown source view, where each line of source is its own paragraph.
+    fn source_text(&self) -> String {
+        self.editor
+            .doc
+            .body
+            .iter()
+            .map(|b| b.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The current document as Markdown text, regardless of which view is active.
+    fn current_markdown(&self) -> String {
+        if self.md_source {
+            self.source_text()
+        } else {
+            let markers = compute_markers(&self.editor.doc, &self.numbering);
+            to_markdown_with(&self.editor.doc, &markers)
+        }
+    }
+
+    /// The canonical rendered [`Document`] for the current state — parsing the raw
+    /// source first when in Markdown source view, so a Save As to `.docx` always
+    /// gets a real document tree.
+    fn current_document(&self) -> Document {
+        if self.format == DocFormat::Markdown && self.md_source {
+            from_markdown(&self.source_text())
+        } else {
+            self.editor.doc.clone()
+        }
+    }
+
+    /// Switch a Markdown file between rendered and raw-source editing. Converts the
+    /// editor buffer in place (rendered ⇄ Markdown text) so edits in either view
+    /// carry over. A no-op for `.docx` or when already in the requested view.
+    fn set_md_source(&mut self, source: bool) {
+        if self.format != DocFormat::Markdown || self.md_source == source {
+            return;
+        }
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let doc = if source {
+            // Render the live document to Markdown, then edit it as literal lines.
+            let markers = compute_markers(&self.editor.doc, &self.numbering);
+            source_lines_to_doc(&to_markdown_with(&self.editor.doc, &markers))
+        } else {
+            // Re-parse the edited source back into a rendered document.
+            from_markdown(&self.source_text())
+        };
+        self.editor = Editor::new(doc);
+        self.md_source = source;
+        self.scroll = 0;
+        self.follow_caret = true;
+        self.dirty = true;
+        self.status = Some(
+            if source {
+                "Markdown source view (edit the raw text)"
+            } else {
+                "Rendered view"
+            }
+            .to_string(),
+        );
     }
 
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
@@ -4466,6 +4635,17 @@ impl App {
             docxcore::model::VertAlign::Superscript => toggles.push(ribbon::Act::Superscript),
             docxcore::model::VertAlign::Baseline => {}
         }
+        // Markdown files get a contextual View ▸ Markdown group; highlight whichever
+        // of Rendered/Source is active.
+        let is_md = self.format == DocFormat::Markdown;
+        self.ribbon.set_markdown(is_md);
+        if is_md {
+            toggles.push(if self.md_source {
+                ribbon::Act::MdSource
+            } else {
+                ribbon::Act::MdRendered
+            });
+        }
         self.ribbon.set_toggles(toggles);
         self.ribbon.set_light_page(self.light_page);
         let chunks = Layout::vertical([
@@ -5694,7 +5874,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
     }
 }
 
-fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
+fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -5709,6 +5889,7 @@ fn run_tui(pkg: Package, path: &str, vim: bool) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path, vim);
+    app.format = format;
     // Restore persisted view-mode toggles and enable saving them going forward.
     let prefs = ViewPrefs::load();
     app.page_view = prefs.page_view;
@@ -5854,6 +6035,75 @@ mod tests {
     }
 
     #[test]
+    fn format_for_picks_markdown_by_extension() {
+        assert_eq!(format_for("notes.md"), DocFormat::Markdown);
+        assert_eq!(format_for("README.MARKDOWN"), DocFormat::Markdown);
+        assert_eq!(format_for("report.docx"), DocFormat::Docx);
+        assert_eq!(format_for("plain.txt"), DocFormat::Docx);
+    }
+
+    #[test]
+    fn markdown_file_opens_rendered_and_round_trips() {
+        let src = "# Title\n\nSome **bold** text.\n\n- a\n- b";
+        let app = App::new(new_markdown_package(from_markdown(src)), "doc.md", false);
+        assert_eq!(app.format, DocFormat::Markdown);
+        assert!(!app.md_source, "opens in rendered view");
+        // The first block is a level-1 heading.
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(1)),
+            _ => panic!("expected heading paragraph"),
+        }
+        // Saving regenerates Markdown (heading, bold, bullets all present).
+        let md = app.current_markdown();
+        assert!(md.contains("# Title"), "{md}");
+        assert!(md.contains("**bold**"), "{md}");
+        assert!(md.contains("- a"), "{md}");
+    }
+
+    #[test]
+    fn markdown_source_toggle_converts_both_ways() {
+        let mut app = App::new(
+            new_markdown_package(from_markdown("# Hi\n\nbody")),
+            "x.md",
+            false,
+        );
+        // Switch to source view: the buffer becomes literal Markdown lines.
+        app.set_md_source(true);
+        assert!(app.md_source);
+        assert!(app.source_text().contains("# Hi"));
+        // current_document() re-parses the source back to a heading.
+        match &app.current_document().body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(1)),
+            _ => panic!("expected heading"),
+        }
+        // Back to rendered: the editor holds the parsed tree again.
+        app.set_md_source(false);
+        assert!(!app.md_source);
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(1)),
+            _ => panic!("expected heading"),
+        }
+    }
+
+    #[test]
+    fn source_toggle_is_noop_for_docx() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.set_md_source(true);
+        assert!(!app.md_source, "docx never enters source view");
+    }
+
+    #[test]
+    fn view_tab_shows_markdown_group_only_for_md() {
+        let mut r = ribbon::Ribbon::home();
+        r.set_active(5); // View
+        let before = r.button_count();
+        r.set_markdown(true);
+        let after = r.button_count();
+        assert!(after > before, "Markdown group should add buttons");
+    }
+
+    #[test]
     fn orient_sectpr_swaps_dimensions_and_keeps_other_props() {
         let portrait =
             "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\"/></w:sectPr>";
@@ -5985,6 +6235,56 @@ mod tests {
         assert!(app.backstage.is_none());
         assert!(app.path.ends_with("copy.docx"));
         assert!(!app.modified);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn save_as_converts_docx_to_markdown_and_back() {
+        let tmp = std::env::temp_dir().join("docxy_md_convert");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // A .docx with a heading, exported to Markdown via Save As.
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph {
+            props: docxcore::model::ParProps {
+                heading_level: Some(1),
+                style_id: Some("Heading1".to_string()),
+                ..Default::default()
+            },
+            content: vec![docxcore::model::Inline::Run(docxcore::model::Run {
+                text: "My Title".to_string(),
+                props: Default::default(),
+            })],
+        })];
+        let mut app = App::new(new_package(Document { body }), "src.docx", false);
+        app.backstage = Some(backstage::Backstage::open(tmp.clone()));
+        if let Some(b) = app.backstage.as_mut() {
+            b.name_input = "out.md".to_string();
+        }
+        app.commit_save_as();
+        let md_path = tmp.join("out.md");
+        assert!(md_path.exists(), "markdown file not written");
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(md.contains("# My Title"), "{md}");
+        // The app rebound to the Markdown file.
+        assert_eq!(app.format, DocFormat::Markdown);
+
+        // Now reload that .md from disk and export it back to .docx.
+        let (pkg, fmt) = load_input(&md_path.to_string_lossy()).expect("load .md");
+        assert_eq!(fmt, DocFormat::Markdown);
+        let mut app2 = App::new(pkg, &md_path.to_string_lossy(), false);
+        app2.backstage = Some(backstage::Backstage::open(tmp.clone()));
+        if let Some(b) = app2.backstage.as_mut() {
+            b.name_input = "roundtrip.docx".to_string();
+        }
+        app2.commit_save_as();
+        let docx_path = tmp.join("roundtrip.docx");
+        assert!(docx_path.exists(), "docx not written");
+        let (back, _) = load_input(&docx_path.to_string_lossy()).expect("load .docx");
+        match &back.document.body[0] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(1)),
+            _ => panic!("expected heading after round-trip"),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

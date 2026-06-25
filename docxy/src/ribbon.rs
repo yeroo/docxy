@@ -88,6 +88,10 @@ pub enum Act {
     EditDocument,
     EditHeader,
     EditFooter,
+    /// Markdown view switch (only on the View tab for `.md` files): show the
+    /// document rendered, or edit the raw Markdown source.
+    MdRendered,
+    MdSource,
     /// Apply a named paragraph style (the `&str` is the `w:styleId`).
     ApplyStyle(&'static str),
     /// Open the Apply-Styles dialog (every style the document defines).
@@ -187,6 +191,8 @@ pub struct Ribbon {
     active_toggles: Vec<Act>,
     /// Whether the document page is light (drives the View ▸ Dark Mode icon).
     light_page: bool,
+    /// Whether a Markdown file is open (adds the View ▸ Markdown group).
+    markdown: bool,
 }
 
 const ROW0: usize = 1; // y of first button row inside the expanded ribbon
@@ -204,16 +210,32 @@ impl Ribbon {
                 styles_groups(),
                 insert_groups(),
                 review_groups(),
-                view_groups(),
+                view_groups(false),
             ],
             placed: Vec::new(),
             tab_cols: Vec::new(),
             width: 0,
             active_toggles: Vec::new(),
             light_page: false,
+            markdown: false,
         };
         r.layout();
         r
+    }
+
+    /// Show or hide the contextual View ▸ Markdown group (Rendered / Source). A
+    /// no-op when already in the requested state; relays out if View is active.
+    pub fn set_markdown(&mut self, on: bool) {
+        if self.markdown == on {
+            return;
+        }
+        self.markdown = on;
+        if let Some(idx) = self.tabs.iter().position(|t| *t == "View") {
+            self.tab_groups[idx] = view_groups(on);
+            if self.active == idx {
+                self.layout();
+            }
+        }
     }
 
     /// Set which toggle buttons are "on" (drawn inverted).
@@ -514,10 +536,11 @@ fn review_groups() -> Vec<Group> {
     ]
 }
 
-/// The View tab's groups (Views / Page / Show).
-fn view_groups() -> Vec<Group> {
+/// The View tab's groups (Views / Page / Show / Ribbon / Edit, plus a contextual
+/// Markdown group when a `.md` file is open).
+fn view_groups(markdown: bool) -> Vec<Group> {
     use Act::*;
-    vec![
+    let mut groups = vec![
         Group {
             title: "Views",
             width: 5,
@@ -587,7 +610,28 @@ fn view_groups() -> Vec<Group> {
                 vec![btn("Footer", 6, EditFooter, "Edit the page footer (F7)")],
             ],
         },
-    ]
+    ];
+    if markdown {
+        groups.push(Group {
+            title: "Markdown",
+            width: 8,
+            rows: [
+                vec![btn(
+                    "Rendered",
+                    8,
+                    MdRendered,
+                    "Show the document rendered (formatted)",
+                )],
+                vec![btn(
+                    "Source",
+                    6,
+                    MdSource,
+                    "Edit the raw Markdown source text",
+                )],
+            ],
+        });
+    }
+    groups
 }
 
 impl Ribbon {
@@ -950,6 +994,7 @@ mod tests {
         // A group whose declared `width` is narrower than its widest row overflows
         // the next "│" border (this once broke the View ▸ Edit group's right edge).
         let mut r = Ribbon::home();
+        r.set_markdown(true); // also exercise the contextual View ▸ Markdown group
         for tab in 0..r.tabs.len() {
             r.set_active(tab);
             for g in r.groups() {

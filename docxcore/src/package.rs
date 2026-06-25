@@ -421,6 +421,65 @@ pub fn new_package(document: Document) -> Package {
     }
 }
 
+/// Build a package for a Markdown-backed document: like [`new_package`] but with
+/// a `word/numbering.xml` that defines `numId` 1 (bullets) and `numId` 2 (decimal)
+/// across nine levels — the two ids [`crate::markdown::from_markdown`] emits. This
+/// makes Markdown list paragraphs render real markers in the TUI and survive a
+/// save to `.docx` (Word picks up the numbering part too).
+pub fn new_markdown_package(document: Document) -> Package {
+    const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let mut pkg = new_package(document);
+
+    let mut bullets = String::new();
+    let mut decimals = String::new();
+    for lvl in 0..9 {
+        bullets.push_str(&format!(
+            "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
+        ));
+        decimals.push_str(&format!(
+            "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%{}.\"/></w:lvl>",
+            lvl + 1
+        ));
+    }
+    let numbering = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:numbering xmlns:w=\"{W}\">\
+         <w:abstractNum w:abstractNumId=\"100\">{bullets}</w:abstractNum>\
+         <w:abstractNum w:abstractNumId=\"101\">{decimals}</w:abstractNum>\
+         <w:num w:numId=\"1\"><w:abstractNumId w:val=\"100\"/></w:num>\
+         <w:num w:numId=\"2\"><w:abstractNumId w:val=\"101\"/></w:num>\
+         </w:numbering>"
+    );
+    pkg.parts
+        .push(("word/numbering.xml".to_string(), numbering.into_bytes()));
+
+    // Content-type override for the new part.
+    if let Some(b) = pkg.part("[Content_Types].xml") {
+        let ct = String::from_utf8_lossy(b).into_owned();
+        let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
+        pkg.set_part(
+            "[Content_Types].xml",
+            ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                .into_bytes(),
+        );
+    }
+    // Relationship from document.xml to the numbering part.
+    let rels_name = "word/_rels/document.xml.rels";
+    if let Some(b) = pkg.part(rels_name) {
+        let rels = String::from_utf8_lossy(b).into_owned();
+        let rid = next_rid(&rels);
+        let rel = format!(
+            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
+        );
+        pkg.set_part(
+            rels_name,
+            rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                .into_bytes(),
+        );
+    }
+    pkg
+}
+
 /// Serialize the package back to `.docx` bytes (STORED ZIP).
 pub fn save_package(pkg: &Package) -> Vec<u8> {
     let mut xml = document_to_xml(&pkg.document);

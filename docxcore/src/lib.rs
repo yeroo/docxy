@@ -24,6 +24,7 @@ pub mod export;
 pub mod field;
 pub mod inflate;
 pub mod load;
+pub mod markdown;
 pub mod mathbox;
 pub mod model;
 pub mod numbering;
