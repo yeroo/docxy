@@ -956,12 +956,17 @@ fn flatten_para(
                 // underline across the whole filled width (Word's "line" trick).
                 let tab_style = style_from_run(rp);
                 let cur = segs.last().unwrap().glyphs.len();
-                // Next tab stop strictly beyond the current column, else a default
-                // stop every 8 cells.
+                // The next tab stop at or beyond the current column, else a default
+                // stop every 8 cells. `>= cur` (not `> cur`) matters at narrow
+                // widths: a left stop can project onto the very column where the
+                // preceding text ends (e.g. a TOC "5.1." with a left stop near the
+                // start). Excluding it would make this tab grab a later right-aligned
+                // dot stop, right-aligning the title and pushing the page number off
+                // the line. The fill below still advances at least one column.
                 let stop = tab_stops
                     .iter()
                     .map(|t| (tab_col(t.pos), t.align, t.leader))
-                    .filter(|(col, _, _)| *col > cur)
+                    .filter(|(col, _, _)| *col >= cur)
                     .min_by_key(|(col, _, _)| *col)
                     .unwrap_or(((cur / 8 + 1) * 8, TabAlign::Left, TabLeader::None));
                 let (target, align, leader) = stop;
@@ -3376,6 +3381,61 @@ mod tests {
         assert!(
             line.trim_end().ends_with('9'),
             "page number not right-aligned: {line:?}"
+        );
+    }
+
+    #[test]
+    fn toc_left_tab_not_swallowed_by_right_stop_at_narrow_width() {
+        // Regression: a TOC entry like "5.1.<tab>Title<tab>3" with a left stop near
+        // the start and a right dot-leader stop near the margin. At a narrow content
+        // width (e.g. page view, where the page margins shrink `avail`), the left
+        // stop projects onto the same column as the end of "5.1." If the tab-stop
+        // selection requires strictly-greater, the first tab wrongly grabs the
+        // right-aligned dot stop, right-aligning the title and dropping the page
+        // number onto its own line. The title must follow "5.1." and the number
+        // must stay on the line, right-aligned after the dots.
+        let mut o = opts(70);
+        o.page = crate::model::PageGeom {
+            w: 12240,
+            ml: 1296,
+            mr: 1296,
+            ..crate::model::PageGeom::default()
+        };
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps {
+                tabs: vec![
+                    TabStop {
+                        pos: 600,
+                        align: TabAlign::Left,
+                        leader: TabLeader::None,
+                    },
+                    TabStop {
+                        pos: 9345,
+                        align: TabAlign::Right,
+                        leader: TabLeader::Dot,
+                    },
+                ],
+                ..Default::default()
+            },
+            content: vec![
+                run("5.1.", RunProps::default()),
+                Inline::Tab(RunProps::default()),
+                run("Target customers", RunProps::default()),
+                Inline::Tab(RunProps::default()),
+                run("3", RunProps::default()),
+            ],
+        });
+        let line = render(&doc(vec![p]), &o)[0].plain();
+        // The title follows the number, not right-aligned to the margin.
+        let title_at = line.find("Target customers").expect("title present");
+        assert!(
+            title_at <= 6,
+            "title should follow '5.1.' near the start, got col {title_at}: {line:?}"
+        );
+        assert!(line.contains("...."), "no dot leader: {line:?}");
+        assert!(
+            line.trim_end().ends_with('3'),
+            "page number not on the line / not right-aligned: {line:?}"
         );
     }
 
