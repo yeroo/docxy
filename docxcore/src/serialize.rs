@@ -280,6 +280,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.italic
         || p.underline
         || p.strike
+        || p.code
         || p.caps
         || p.small_caps
         || p.vanish
@@ -293,7 +294,13 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         return;
     }
     s.push_str("<w:rPr>");
-    if let Some(st) = &p.style_id {
+    // Inline code carries the "Code" character style unless a more specific
+    // character style is already set (which then implies the code styling).
+    let rstyle = p
+        .style_id
+        .as_deref()
+        .or(if p.code { Some("Code") } else { None });
+    if let Some(st) = rstyle {
         s.push_str("<w:rStyle w:val=\"");
         esc_attr(st, s);
         s.push_str("\"/>");
@@ -427,6 +434,7 @@ mod tests {
             italic: true,
             underline: true,
             strike: true,
+            code: false,
             caps: true,
             small_caps: true,
             vanish: true,

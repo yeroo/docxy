@@ -833,6 +833,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                     }
                     "w:rStyle" if !val.is_empty() => {
                         props.style_id = Some(val.to_string());
+                        // The "Code" character style is our inline-code marker.
+                        if val.eq_ignore_ascii_case("Code") {
+                            props.code = true;
+                        }
                     }
                     _ => {}
                 }

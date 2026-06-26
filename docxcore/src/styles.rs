@@ -108,6 +108,7 @@ impl StyleSheet {
             italic: direct.italic || agg.italic.unwrap_or(false),
             underline: direct.underline || agg.underline.unwrap_or(false),
             strike: direct.strike || agg.strike.unwrap_or(false),
+            code: direct.code,
             caps: direct.caps,
             small_caps: direct.small_caps,
             vanish: direct.vanish,

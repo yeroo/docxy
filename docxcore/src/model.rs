@@ -29,6 +29,8 @@ pub struct RunProps {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+    /// Inline code / monospace (`<w:rStyle w:val="Code"/>`). Markdown `` `x` ``.
+    pub code: bool,
     pub caps: bool,
     pub small_caps: bool,
     /// Hidden text (`w:vanish` / `w:webHidden`).

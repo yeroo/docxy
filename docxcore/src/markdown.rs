@@ -16,6 +16,12 @@
 //! underline, and treating `_` as emphasis mangles `snake_case`/URLs. The list
 //! markers used on output come from the document's numbering when available, so a
 //! real `.docx` exported to Markdown keeps its ordered vs. bulleted lists.
+//!
+//! These round-trip via dedicated styles so the marker survives both a Markdown →
+//! Markdown pass and a `.docx` save/reload:
+//! - inline `` `code` `` ⇄ a run with the `Code` character style (`RunProps.code`);
+//! - `> blockquote` ⇄ a paragraph with the `Quote` style;
+//! - fenced code blocks ⇄ `SourceCode`-styled paragraphs, re-fenced on output.
 
 use std::collections::HashMap;
 
@@ -40,13 +46,40 @@ pub fn to_markdown(doc: &Document) -> String {
 /// to choose `1.` ordered vs `-` bulleted list items.
 pub fn to_markdown_with(doc: &Document, markers: &HashMap<Vec<usize>, String>) -> String {
     let mut out = String::new();
-    let mut prev_is_list = false;
+    // The list a paragraph belongs to (`num_id`), or `None` when it isn't a list
+    // item. Tracked so items of the *same* list pack together while a switch to a
+    // different list (e.g. bullets → ordered) still gets a separating blank line.
+    let mut prev_list: Option<i32> = None;
     let mut prev_any = false;
-    for (i, b) in doc.body.iter().enumerate() {
-        let is_list =
-            matches!(b, Block::Paragraph(p) if p.props.num_id.is_some() && !is_hrule_para(p));
-        // Blank line between blocks, except between adjacent list items.
-        if prev_any && !(prev_is_list && is_list) {
+    let mut i = 0;
+    while i < doc.body.len() {
+        let b = &doc.body[i];
+        // A run of "SourceCode" paragraphs becomes one fenced code block.
+        if matches!(b, Block::Paragraph(p) if is_source_code(p)) {
+            if prev_any {
+                out.push('\n');
+            }
+            out.push_str("```\n");
+            while let Some(Block::Paragraph(p)) = doc.body.get(i) {
+                if !is_source_code(p) {
+                    break;
+                }
+                out.push_str(&p.plain_text());
+                out.push('\n');
+                i += 1;
+            }
+            out.push_str("```\n");
+            prev_list = None;
+            prev_any = true;
+            continue;
+        }
+        let cur_list = match b {
+            Block::Paragraph(p) if p.props.num_id.is_some() && !is_hrule_para(p) => p.props.num_id,
+            _ => None,
+        };
+        // Blank line between blocks, except between adjacent items of one list.
+        let same_list = cur_list.is_some() && cur_list == prev_list;
+        if prev_any && !same_list {
             out.push('\n');
         }
         match b {
@@ -54,12 +87,32 @@ pub fn to_markdown_with(doc: &Document, markers: &HashMap<Vec<usize>, String>) -
                 para_to_md(p, markers.get(&vec![i]).map(String::as_str), &mut out)
             }
             Block::Table(t) => table_to_md(t, &mut out),
-            Block::Raw(_) => continue,
+            Block::Raw(_) => {
+                i += 1;
+                continue;
+            }
         }
-        prev_is_list = is_list;
+        prev_list = cur_list;
         prev_any = true;
+        i += 1;
     }
     out
+}
+
+/// Whether a paragraph carries the "SourceCode" style (a fenced code-block line).
+fn is_source_code(p: &Paragraph) -> bool {
+    p.props
+        .style_id
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("SourceCode"))
+}
+
+/// Whether a paragraph carries the "Quote" style (a blockquote line).
+fn is_quote(p: &Paragraph) -> bool {
+    p.props
+        .style_id
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("Quote"))
 }
 
 fn para_to_md(p: &Paragraph, marker: Option<&str>, out: &mut String) {
@@ -72,6 +125,12 @@ fn para_to_md(p: &Paragraph, marker: Option<&str>, out: &mut String) {
     }
     if is_hrule_para(p) {
         out.push_str("---\n");
+        return;
+    }
+    if is_quote(p) {
+        out.push_str("> ");
+        out.push_str(&inlines_to_md(&p.content));
+        out.push('\n');
         return;
     }
     let text = inlines_to_md(&p.content);
@@ -171,6 +230,11 @@ fn inlines_to_md(content: &[Inline]) -> String {
 }
 
 fn run_to_md(text: &str, props: &RunProps) -> String {
+    // Inline code is literal: wrap in a backtick fence (longer than any backtick
+    // run inside) and do not escape or apply emphasis markers within.
+    if props.code && !text.is_empty() {
+        return code_span(text);
+    }
     let esc = escape_inline(text);
     if text.trim().is_empty() {
         return esc; // never wrap pure whitespace in ** / * markers
@@ -186,6 +250,29 @@ fn run_to_md(text: &str, props: &RunProps) -> String {
         s = format!("~~{s}~~");
     }
     s
+}
+
+/// Wrap `text` as a Markdown code span, using a backtick fence one longer than
+/// the longest backtick run inside it (and padding with a space when the content
+/// itself starts or ends with a backtick), per CommonMark.
+fn code_span(text: &str) -> String {
+    let mut longest = 0;
+    let mut cur = 0;
+    for c in text.chars() {
+        if c == '`' {
+            cur += 1;
+            longest = longest.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 fn escape_inline(text: &str) -> String {
@@ -236,11 +323,12 @@ pub fn from_markdown(src: &str) -> Document {
             i += 1;
             continue;
         }
-        // Fenced code block: keep each inner line as a plain paragraph.
+        // Fenced code block: each inner line becomes a verbatim "SourceCode"
+        // paragraph, so the block survives a round-trip (re-fenced on output).
         if let Some(fence) = code_fence(trimmed) {
             i += 1;
             while i < lines.len() && code_fence(lines[i].trim()) != Some(fence) {
-                body.push(plain_para(lines[i]));
+                body.push(source_para(lines[i]));
                 i += 1;
             }
             if i < lines.len() {
@@ -491,6 +579,9 @@ fn list_para(ilvl: i32, ordered: bool, content: &str) -> Block {
 fn quote_para(text: &str) -> Block {
     Paragraph {
         props: ParProps {
+            // The "Quote" style is the round-trip marker; the direct indent keeps
+            // it visually offset even when no styles.xml defines "Quote".
+            style_id: Some("Quote".to_string()),
             indent: 360,
             ..ParProps::default()
         },
@@ -499,9 +590,15 @@ fn quote_para(text: &str) -> Block {
     .into()
 }
 
-fn plain_para(text: &str) -> Block {
+/// One verbatim line of a fenced code block: a "SourceCode"-styled paragraph
+/// holding the raw text (no inline parsing). [`to_markdown_with`] groups
+/// consecutive such paragraphs back into a fence.
+fn source_para(text: &str) -> Block {
     Paragraph {
-        props: ParProps::default(),
+        props: ParProps {
+            style_id: Some("SourceCode".to_string()),
+            ..ParProps::default()
+        },
         content: vec![Inline::Run(Run {
             text: text.to_string(),
             props: RunProps::default(),
@@ -549,14 +646,26 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
             }
         }
         if c == '`' {
-            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
+            // A code span opens with a run of N backticks and closes with the next
+            // run of exactly N backticks (CommonMark), so backticks can appear
+            // inside a longer fence.
+            let n = chars[i..].iter().take_while(|&&ch| ch == '`').count();
+            if let Some((content_end, close_end)) = find_code_close(&chars, i + n, n) {
                 push_run(&mut out, &mut buf, bold, italic, strike);
-                let code: String = chars[i + 1..end].iter().collect();
+                let mut code: String = chars[i + n..content_end].iter().collect();
+                // Strip one surrounding space when present on both ends (lets a
+                // span hold leading/trailing backticks): `` `a` `` → `a`.
+                if code.len() >= 2 && code.starts_with(' ') && code.ends_with(' ') {
+                    code = code[1..code.len() - 1].to_string();
+                }
                 out.push(Inline::Run(Run {
                     text: code,
-                    props: RunProps::default(),
+                    props: RunProps {
+                        code: true,
+                        ..RunProps::default()
+                    },
                 }));
-                i = end + 1;
+                i = close_end;
                 continue;
             }
         }
@@ -613,6 +722,25 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     let label: String = chars[start + 1..close].iter().collect();
     let url: String = chars[close + 2..url_end].iter().collect();
     Some((label, url, url_end + 1 - start))
+}
+
+/// Find the closing fence of a code span: the next run of *exactly* `n` backticks
+/// at or after `from`. Returns `(content_end, close_end)` — the start of the
+/// closing fence and the index just past it — or `None` if unterminated.
+fn find_code_close(chars: &[char], from: usize, n: usize) -> Option<(usize, usize)> {
+    let mut j = from;
+    while j < chars.len() {
+        if chars[j] == '`' {
+            let run = chars[j..].iter().take_while(|&&c| c == '`').count();
+            if run == n {
+                return Some((j, j + run));
+            }
+            j += run;
+        } else {
+            j += 1;
+        }
+    }
+    None
 }
 
 // Small ergonomics: build a Block straight from a Paragraph.
@@ -727,6 +855,21 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_lists_of_different_kinds_are_separated() {
+        // A bullet list then an ordered list: a blank line keeps them distinct,
+        // but items within each list stay packed together. Ordered markers come
+        // from a marker map, as the app supplies via compute_markers.
+        let doc = from_markdown("- a\n  - b\n\n1. one\n2. two");
+        let mut markers = HashMap::new();
+        markers.insert(vec![2], "1.".to_string());
+        markers.insert(vec![3], "2.".to_string());
+        let md = to_markdown_with(&doc, &markers);
+        assert_eq!(md, "- a\n  - b\n\n1. one\n2. two\n", "{md:?}");
+        // The blank line is exactly the list boundary: items within a list pack.
+        assert!(!md.contains("- a\n\n  - b"));
+    }
+
+    #[test]
     fn nested_list_levels() {
         let doc = from_markdown("- a\n  - b\n    - c");
         let lvls: Vec<i32> = doc
@@ -800,6 +943,61 @@ mod tests {
     fn empty_input_yields_one_paragraph() {
         let doc = from_markdown("");
         assert_eq!(doc.body.len(), 1);
+    }
+
+    #[test]
+    fn inline_code_round_trips() {
+        let doc = from_markdown("use `let x = 1;` here");
+        let p = match &doc.body[0] {
+            Block::Paragraph(p) => p,
+            _ => panic!(),
+        };
+        assert!(
+            p.content
+                .iter()
+                .any(|i| matches!(i, Inline::Run(r) if r.props.code && r.text == "let x = 1;")),
+            "{:?}",
+            p.content
+        );
+        let md = to_markdown(&doc);
+        assert!(md.contains("`let x = 1;`"), "{md}");
+        // A backtick inside the span widens the fence (CommonMark) and parses back.
+        let doc2 = from_markdown("a ``b`c`` d");
+        let md2 = to_markdown(&doc2);
+        assert_eq!(from_markdown(&md2).body[0].plain_text(), "a b`c d");
+    }
+
+    #[test]
+    fn blockquote_round_trips() {
+        let doc = from_markdown("> quoted line");
+        let p = match &doc.body[0] {
+            Block::Paragraph(p) => p,
+            _ => panic!(),
+        };
+        assert_eq!(p.props.style_id.as_deref(), Some("Quote"));
+        assert_eq!(p.plain_text(), "quoted line");
+        assert!(to_markdown(&doc).contains("> quoted line"));
+    }
+
+    #[test]
+    fn fenced_code_block_round_trips() {
+        let src = "```\nlet x = 1;\nlet y = 2;\n```";
+        let doc = from_markdown(src);
+        // Two SourceCode paragraphs, verbatim.
+        let code: Vec<_> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) if is_source_code(p) => Some(p.plain_text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, vec!["let x = 1;", "let y = 2;"]);
+        // Re-emitted as one fence (not separate paragraphs), and re-parses identically.
+        let md = to_markdown(&doc);
+        assert!(md.contains("```\nlet x = 1;\nlet y = 2;\n```"), "{md}");
+        let again = from_markdown(&md);
+        assert_eq!(again, doc);
     }
 
     #[test]

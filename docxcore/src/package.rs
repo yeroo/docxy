@@ -293,20 +293,7 @@ impl Package {
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
 fn next_rid(rels: &str) -> String {
-    let mut max = 0u32;
-    let mut i = 0;
-    while let Some(p) = rels[i..].find("Id=\"rId") {
-        let s = i + p + "Id=\"rId".len();
-        let num: String = rels[s..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if let Ok(n) = num.parse::<u32>() {
-            max = max.max(n);
-        }
-        i = s;
-    }
-    format!("rId{}", max + 1)
+    format!("rId{}", next_rid_num(rels))
 }
 
 /// Insert a child element as the first child of `<w:sectPr>` (creating/expanding
@@ -477,18 +464,165 @@ pub fn new_markdown_package(document: Document) -> Package {
                 .into_bytes(),
         );
     }
+
+    // Define the styles that Markdown maps onto, so Word (and our renderer)
+    // actually format them. A `<w:pStyle w:val="Heading1"/>` with no matching
+    // definition in styles.xml renders as plain Normal text — that is why a
+    // `# heading` looked unstyled in Word.
+    pkg.set_part("word/styles.xml", markdown_styles_xml().into_bytes());
     pkg
+}
+
+/// A `styles.xml` defining the built-in styles Markdown uses: Normal, Title,
+/// Heading1–6, Quote, the SourceCode paragraph style, and the Code character
+/// style. Word recognizes the headings by their `styleId`/`name`.
+fn markdown_styles_xml() -> String {
+    const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    // Heading sizes in half-points (H1..H6), decreasing.
+    let sizes = [36u32, 32, 28, 26, 24, 22];
+    let mut heads = String::new();
+    for (idx, sz) in sizes.iter().enumerate() {
+        let n = idx + 1;
+        heads.push_str(&format!(
+            "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\">\
+             <w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:next w:val=\"Normal\"/>\
+             <w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"60\"/>\
+             <w:outlineLvl w:val=\"{idx}\"/></w:pPr>\
+             <w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>"
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:styles xmlns:w=\"{W}\">\
+         <w:docDefaults><w:rPrDefault><w:rPr>\
+         <w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\"/><w:sz w:val=\"22\"/>\
+         </w:rPr></w:rPrDefault></w:docDefaults>\
+         <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">\
+         <w:name w:val=\"Normal\"/></w:style>\
+         <w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/>\
+         <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
+         <w:rPr><w:b/><w:sz w:val=\"56\"/></w:rPr></w:style>\
+         {heads}\
+         <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/>\
+         <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
+         <w:pPr><w:ind w:left=\"720\"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>\
+         <w:style w:type=\"paragraph\" w:styleId=\"SourceCode\">\
+         <w:name w:val=\"Source Code\"/><w:basedOn w:val=\"Normal\"/>\
+         <w:next w:val=\"Normal\"/>\
+         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
+         <w:style w:type=\"character\" w:styleId=\"Code\"><w:name w:val=\"Code\"/>\
+         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
+         </w:styles>"
+    )
 }
 
 /// Serialize the package back to `.docx` bytes (STORED ZIP).
 pub fn save_package(pkg: &Package) -> Vec<u8> {
-    let mut xml = document_to_xml(&pkg.document);
+    // External hyperlinks need a relationship (`r:id` → `.rels` Target) or their
+    // URL is lost. Links we modelled from a loaded `.docx` already carry `rel_id`;
+    // links created in-app or from Markdown have a `target` but no `rel_id`. Mint
+    // a relationship for each before serializing so the URL survives the save.
+    let mut document = pkg.document.clone();
+    let mut parts = pkg.parts.clone();
+    let rels_name = "word/_rels/document.xml.rels";
+    if let Some((_, rels_bytes)) = parts.iter().find(|(n, _)| n == rels_name) {
+        let mut new_rels = String::new();
+        let mut next = next_rid_num(&String::from_utf8_lossy(rels_bytes));
+        let mut links = Vec::new();
+        collect_unlinked_externals(&mut document.body, &mut links);
+        for h in links {
+            let rid = format!("rId{next}");
+            next += 1;
+            let target = h.target.as_deref().unwrap_or_default();
+            new_rels.push_str(&format!(
+                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
+                esc_xml_attr(target)
+            ));
+            h.rel_id = Some(rid);
+        }
+        if !new_rels.is_empty() {
+            let rels = String::from_utf8_lossy(rels_bytes).into_owned();
+            let updated = rels.replacen(
+                "</Relationships>",
+                &format!("{new_rels}</Relationships>"),
+                1,
+            );
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_name) {
+                p.1 = updated.into_bytes();
+            }
+        }
+    }
+
+    let mut xml = document_to_xml(&document);
     if !pkg.sect_pr.is_empty() {
         xml = xml.replacen("</w:body>", &format!("{}</w:body>", pkg.sect_pr), 1);
     }
-    let mut parts = pkg.parts.clone();
     parts[pkg.doc_index].1 = xml.into_bytes();
     write_zip(&parts)
+}
+
+/// Highest `rIdN` number in a `.rels` string, plus one (the next free id).
+fn next_rid_num(rels: &str) -> u32 {
+    let mut max = 0u32;
+    let mut i = 0;
+    while let Some(p) = rels[i..].find("Id=\"rId") {
+        let s = i + p + "Id=\"rId".len();
+        let num: String = rels[s..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = num.parse::<u32>() {
+            max = max.max(n);
+        }
+        i = s;
+    }
+    max + 1
+}
+
+/// Collect `&mut` references to every external hyperlink (`target` set) that has
+/// no relationship id yet, walking paragraphs and table cells recursively.
+fn collect_unlinked_externals<'a>(
+    blocks: &'a mut [crate::model::Block],
+    out: &mut Vec<&'a mut crate::model::Hyperlink>,
+) {
+    use crate::model::{Block, Inline};
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => {
+                for inl in &mut p.content {
+                    if let Inline::Hyperlink(h) = inl {
+                        if h.target.is_some() && h.rel_id.is_none() {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        collect_unlinked_externals(&mut cell.blocks, out);
+                    }
+                }
+            }
+            Block::Raw(_) => {}
+        }
+    }
+}
+
+/// Minimal XML attribute escaping for relationship targets (URLs).
+fn esc_xml_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Capture the last (body-level) `w:sectPr` element verbatim, if any.
@@ -634,6 +768,78 @@ mod tests {
     #[test]
     fn rejects_non_docx() {
         assert_eq!(load_package(b"nope").unwrap_err(), LoadError::NotZip);
+    }
+
+    #[test]
+    fn markdown_package_defines_heading_styles() {
+        use crate::markdown::from_markdown;
+        // The styles a `# heading` references must be defined, or Word renders it
+        // as plain Normal text.
+        let pkg = new_markdown_package(from_markdown("# Title\n\n## Sub"));
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(styles.contains("w:styleId=\"Heading1\""), "{styles}");
+        assert!(styles.contains("w:val=\"heading 1\""), "{styles}");
+        assert!(styles.contains("w:styleId=\"Heading2\""), "{styles}");
+        // And the document still references the style.
+        let doc_xml = save_package(&pkg);
+        let re = load_package(&doc_xml).expect("reload");
+        let dx = String::from_utf8_lossy(re.part("word/document.xml").unwrap()).into_owned();
+        assert!(dx.contains("w:pStyle w:val=\"Heading1\""), "{dx}");
+    }
+
+    #[test]
+    fn markdown_styles_survive_docx_round_trip() {
+        use crate::markdown::{from_markdown, to_markdown};
+        // Inline code, blockquote, and a fenced code block.
+        let src = "para with `code`\n\n> a quote\n\n```\nline one\nline two\n```";
+        let pkg = new_markdown_package(from_markdown(src));
+        let reloaded = load_package(&save_package(&pkg)).expect("reload");
+        let md = to_markdown(&reloaded.document);
+        assert!(md.contains("`code`"), "inline code lost: {md}");
+        assert!(md.contains("> a quote"), "blockquote lost: {md}");
+        assert!(
+            md.contains("```\nline one\nline two\n```"),
+            "fenced code lost: {md}"
+        );
+    }
+
+    #[test]
+    fn save_mints_relationship_for_target_only_hyperlink() {
+        use crate::model::{Document, Hyperlink, Paragraph, Run};
+        // A link created in-app / from Markdown: a target but no rel_id.
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://example.com/a?x=1&y=2".to_string()),
+            anchor: None,
+            rel_id: None,
+            runs: vec![Run {
+                text: "docs".to_string(),
+                ..Run::default()
+            }],
+        });
+        let pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![link],
+                ..Paragraph::default()
+            })],
+        });
+        let saved = save_package(&pkg);
+        let re = load_package(&saved).expect("reload");
+        // The URL survived: load resolves r:id back to the external target,
+        // including the escaped `&`.
+        let h = re
+            .document
+            .body
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => p.content.iter().find_map(|i| match i {
+                    Inline::Hyperlink(h) => Some(h),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("a hyperlink");
+        assert_eq!(h.target.as_deref(), Some("https://example.com/a?x=1&y=2"));
+        assert!(h.rel_id.is_some(), "should have been assigned a rel id");
     }
 
     #[test]
