@@ -4,6 +4,8 @@
 //!   docxy                          open the editor with a new blank document
 //!   docxy <file.docx>              open in the editor
 //!   docxy <file.docx> --pdf <out>  headless: export to PDF and exit
+//!   docxy <in> --md <out.md>       headless: convert to Markdown and exit
+//!   docxy <in> --docx <out.docx>   headless: convert to .docx and exit
 //!
 //! The logic lives in the pure `docxcore` crate; this binary is the TUI shell:
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
@@ -60,6 +62,14 @@ enum DocFormat {
     Docx,
     Markdown,
 }
+
+/// The welcome-screen menu items, in order (indexes match `start_activate`).
+const START_ITEMS: [&str; 4] = [
+    "New Word document   (.docx)",
+    "New Markdown document (.md)",
+    "Open an existing file…",
+    "Quit",
+];
 
 /// Pick a format from a path's extension (Markdown for `.md`/`.markdown`/`.mdown`,
 /// `.docx` otherwise).
@@ -133,6 +143,8 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
+    // No file argument → open on the welcome screen instead of a blank document.
+    let start = parsed.input.is_none();
     // With a file argument we load it (Markdown or .docx, by extension); with none,
     // start a fresh blank document.
     let (pkg, input, format) = match parsed.input {
@@ -144,8 +156,8 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            if parsed.pdf_out.is_some() {
-                eprintln!("error: --pdf requires an input file");
+            if parsed.pdf_out.is_some() || parsed.md_out.is_some() || parsed.docx_out.is_some() {
+                eprintln!("error: headless conversion (--pdf/--md/--docx) requires an input file");
                 return ExitCode::from(2);
             }
             let pkg = new_package(Document {
@@ -175,7 +187,36 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run_tui(pkg, &input, format, parsed.vim) {
+    // Headless format conversion: `--md` renders the document to Markdown,
+    // `--docx` writes it as a Word package. Either way `pkg` already holds the
+    // document parsed from the input (Markdown opened via `new_markdown_package`,
+    // `.docx` via `load_package`), so conversion is just re-serialization.
+    if let Some(out) = parsed.md_out {
+        let numbering = pkg
+            .part("word/numbering.xml")
+            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let markers = compute_markers(&pkg.document, &numbering);
+        let md = to_markdown_with(&pkg.document, &markers);
+        if let Err(e) = std::fs::write(&out, md.as_bytes()) {
+            eprintln!("error: cannot write {out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("wrote {out} ({} bytes)", md.len());
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(out) = parsed.docx_out {
+        let bytes = save_package(&pkg);
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            eprintln!("error: cannot write {out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("wrote {out} ({} bytes)", bytes.len());
+        return ExitCode::SUCCESS;
+    }
+
+    match run_tui(pkg, &input, format, parsed.vim, start) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -188,10 +229,12 @@ fn print_usage() {
     eprintln!(
         "Docxy — terminal .docx & Markdown editor\n\n\
          USAGE:\n  \
-           docxy                           new blank document in the editor\n  \
+           docxy                           welcome screen (new .docx/.md, open)\n  \
            docxy <file.docx|.md>           open a Word or Markdown file\n  \
            docxy <file> --vim              open with vim keybindings\n  \
            docxy <file> --pdf <out>        export to PDF and exit\n  \
+           docxy <file> --md <out.md>      convert to Markdown and exit\n  \
+           docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
            (Save As to a .md/.docx name converts between the two formats;\n   \
             View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \
@@ -213,6 +256,8 @@ fn print_usage() {
 struct Parsed {
     input: Option<String>,
     pdf_out: Option<String>,
+    md_out: Option<String>,
+    docx_out: Option<String>,
     help: bool,
     vim: bool,
 }
@@ -220,20 +265,25 @@ struct Parsed {
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut input = None;
     let mut pdf_out = None;
+    let mut md_out = None;
+    let mut docx_out = None;
     let mut help = false;
     let mut vim = false;
     let mut i = 0;
+    // Read the path argument following a flag like `--pdf`, erroring if missing.
+    let value = |i: &mut usize, flag: &str| -> Result<String, String> {
+        *i += 1;
+        args.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("error: {flag} requires an output path"))
+    };
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => help = true,
             "--vim" => vim = true,
-            "--pdf" => {
-                i += 1;
-                match args.get(i) {
-                    Some(p) => pdf_out = Some(p.clone()),
-                    None => return Err("error: --pdf requires an output path".to_string()),
-                }
-            }
+            "--pdf" => pdf_out = Some(value(&mut i, "--pdf")?),
+            "--md" => md_out = Some(value(&mut i, "--md")?),
+            "--docx" => docx_out = Some(value(&mut i, "--docx")?),
             s if s.starts_with('-') => return Err(format!("error: unknown option {s}")),
             s => {
                 if input.is_some() {
@@ -247,6 +297,8 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     Ok(Parsed {
         input,
         pdf_out,
+        md_out,
+        docx_out,
         help,
         vim,
     })
@@ -332,9 +384,11 @@ struct HfEdit {
 }
 
 /// What a confirmed (Yes) modal should do.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum ConfirmAction {
     Exit,
+    /// Overwrite an existing PDF at this path during Export.
+    OverwritePdf(std::path::PathBuf),
 }
 
 /// A modal Yes/No dialog.
@@ -619,6 +673,12 @@ struct App {
     /// editable paragraph), `false` shows it rendered. Always `false` for `.docx`.
     md_source: bool,
     modified: bool,
+    /// When launched with no file, a welcome/start screen overlays everything
+    /// until the user picks New/Open/Quit. `start_sel` is the highlighted item.
+    start_screen: bool,
+    start_sel: usize,
+    /// Click targets for the welcome-screen menu items (filled in by `draw`).
+    start_btns: [Rect; START_ITEMS.len()],
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
@@ -805,6 +865,9 @@ impl App {
             format: format_for(path),
             md_source: false,
             modified: false,
+            start_screen: false,
+            start_sel: 0,
+            start_btns: [Rect::default(); START_ITEMS.len()],
             quit_requested: false,
             status: None,
             scroll: 0,
@@ -1190,6 +1253,12 @@ impl App {
 
     /// Set print-layout (page) view on/off and persist it.
     fn set_page_view(&mut self, on: bool) {
+        // Markdown is a reflowable format with no fixed pages, so print layout
+        // doesn't apply — page view is only meaningful for `.docx`.
+        if on && self.format == DocFormat::Markdown {
+            self.status = Some("Page view isn't available for Markdown.".to_string());
+            return;
+        }
         if self.page_view != on {
             self.page_view = on;
             self.save_view_prefs();
@@ -1352,22 +1421,23 @@ impl App {
             }
             return;
         }
-        // Left menu column. The navigational items (Open / Save As / Info) just
-        // switch the right pane, so a single click engages them right away —
-        // Save As prefills the name and lets you type immediately. The acting
-        // items (New / Save / Print / Export / Exit) need a second click on the
-        // already-selected row, so a stray click can't discard or quit.
+        // Left menu column. Every item acts on a single click: Open / Save As /
+        // Info switch the right pane (Save As prefills the name to type), while
+        // Save / Print / Export / Exit run straight away — Exit raises its own
+        // confirm dialog, the others just write a file, so a click is safe.
+        // Only New is guarded: it discards the current document without a prompt,
+        // so it needs a confirming second click on the already-selected row.
         if x < 14 {
             if y >= 1 {
                 let idx = (y - 1) as usize;
                 if idx < ITEMS.len() {
                     let it = ITEMS[idx];
                     let cur = self.backstage.as_ref().map(|b| b.item);
-                    let navigational = matches!(it, Item::Open | Item::SaveAs | Item::Info);
+                    let guarded = matches!(it, Item::New);
                     if let Some(b) = self.backstage.as_mut() {
                         b.item = it;
                     }
-                    if navigational || cur == Some(it) {
+                    if !guarded || cur == Some(it) {
                         let _ = self.bs_menu_activate();
                     } else if let Some(b) = self.backstage.as_mut() {
                         b.pane = Pane::Menu;
@@ -1641,6 +1711,7 @@ impl App {
                         self.quit_requested = true;
                         return true;
                     }
+                    ConfirmAction::OverwritePdf(out) => self.write_pdf(out),
                 }
             }
         }
@@ -1807,9 +1878,114 @@ impl App {
         self.status = Some("new document".to_string());
     }
 
+    /// Start a fresh blank Markdown document (one empty paragraph) in the editor.
+    fn new_markdown_document(&mut self) {
+        let pkg = new_markdown_package(from_markdown(""));
+        self.load_package_state(pkg, "untitled.md".to_string());
+        self.status = Some("new Markdown document".to_string());
+    }
+
+    /// Keys for the welcome/start screen. Returns true to quit the app.
+    fn start_screen_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.start_sel = (self.start_sel + START_ITEMS.len() - 1) % START_ITEMS.len();
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.start_sel = (self.start_sel + 1) % START_ITEMS.len();
+                self.dirty = true;
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                self.start_sel = c as usize - '1' as usize;
+                return self.start_activate();
+            }
+            KeyCode::Enter => return self.start_activate(),
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            _ => {}
+        }
+        false
+    }
+
+    /// Act on the highlighted welcome-screen item. Returns true to quit.
+    fn start_activate(&mut self) -> bool {
+        self.start_screen = false;
+        match self.start_sel {
+            0 => self.new_document(),
+            1 => self.new_markdown_document(),
+            2 => self.open_backstage(),
+            _ => return true, // Quit
+        }
+        self.dirty = true;
+        false
+    }
+
+    fn draw_start_screen(&mut self, f: &mut Frame, area: Rect) {
+        let w = 46u16.min(area.width);
+        let h = (START_ITEMS.len() as u16 + 7).min(area.height);
+        let panel = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        let block = RBlock::default().borders(Borders::ALL).title(" docxy ");
+        let inner = block.inner(panel);
+        f.render_widget(block, panel);
+
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let mut lines = vec![
+            RLine::from("terminal .docx & Markdown editor"),
+            RLine::from(""),
+        ];
+        for (i, it) in START_ITEMS.iter().enumerate() {
+            let style = if i == self.start_sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(RLine::from(RSpan::styled(format!("  {it}  "), style)));
+            // Each item occupies one row; the first two lines are the blurb +
+            // blank spacer, so item `i` sits at inner row `2 + i`. Make the whole
+            // row clickable for a forgiving target.
+            self.start_btns[i] = Rect {
+                x: inner.x,
+                y: inner.y + 2 + i as u16,
+                width: inner.width,
+                height: 1,
+            };
+        }
+        lines.push(RLine::from(""));
+        lines.push(RLine::from(RSpan::styled(
+            "↑/↓ select · Enter open · Esc quit",
+            dim,
+        )));
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    }
+
     fn export_pdf(&mut self) {
         let mut out = std::path::PathBuf::from(&self.path);
         out.set_extension("pdf");
+        // Don't clobber an existing PDF silently — ask first.
+        if out.exists() {
+            let name = out
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| out.display().to_string());
+            self.confirm = Some(Confirm {
+                prompt: format!("{name} already exists. Overwrite it?"),
+                yes: false,
+                action: ConfirmAction::OverwritePdf(out),
+            });
+            self.dirty = true;
+            return;
+        }
+        self.write_pdf(out);
+    }
+
+    /// Render the document to a PDF at `out` and report the result in the status
+    /// line. Callers handle any overwrite confirmation first.
+    fn write_pdf(&mut self, out: std::path::PathBuf) {
         let pdf = to_pdf(
             &self.editor.doc,
             &PdfOptions {
@@ -1862,6 +2038,10 @@ impl App {
         self.numbering = Rc::new(numbering);
         self.rels = rels;
         self.format = format_for(&path);
+        // Page view has no meaning for Markdown (no fixed pages).
+        if self.format == DocFormat::Markdown {
+            self.page_view = false;
+        }
         self.md_source = false;
         self.path = path;
         self.modified = false;
@@ -3526,6 +3706,28 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        // The welcome screen owns the whole terminal; handle its clicks here so
+        // nothing leaks to the hidden document behind it. Hovering highlights an
+        // item, clicking activates it.
+        if self.start_screen {
+            let p = Position {
+                x: m.column,
+                y: m.row,
+            };
+            if let Some(i) = self.start_btns.iter().position(|r| r.contains(p)) {
+                if self.start_sel != i {
+                    self.start_sel = i;
+                    self.dirty = true;
+                }
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    // start_activate may quit; the quit flag is read elsewhere.
+                    if self.start_activate() {
+                        self.quit_requested = true;
+                    }
+                }
+            }
+            return;
+        }
         if self.confirm.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 // quit (if any) propagates via quit_requested in handle_event
@@ -4264,6 +4466,10 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // Keyboard actions should keep the caret on screen; wheel/drag don't.
         self.follow_caret = true;
+        // The welcome screen (no file given) owns all keys until dismissed.
+        if self.start_screen {
+            return self.start_screen_key(key);
+        }
         // A modal confirmation owns all keys while open.
         if self.confirm.is_some() {
             return self.confirm_key(key);
@@ -4514,11 +4720,7 @@ impl App {
                 }
                 self.dirty = true;
             }
-            KeyCode::F(2) => {
-                self.page_view = !self.page_view;
-                self.save_view_prefs();
-                self.dirty = true;
-            }
+            KeyCode::F(2) => self.set_page_view(!self.page_view),
             KeyCode::F(3) => {
                 self.invisibles = !self.invisibles;
                 self.save_view_prefs();
@@ -4544,6 +4746,12 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // The welcome screen overlays everything when launched with no file.
+        if self.start_screen {
+            f.render_widget(Clear, f.area());
+            self.draw_start_screen(f, f.area());
+            return;
+        }
         // A confirmation modal owns the whole screen — no content behind it.
         if let Some(c) = &self.confirm {
             let (prompt, yes) = (c.prompt.clone(), c.yes);
@@ -4592,11 +4800,14 @@ impl App {
         if self.show_comments {
             toggles.push(ribbon::Act::ToggleComments);
         }
-        toggles.push(if self.page_view {
-            ribbon::Act::PrintLayout
-        } else {
-            ribbon::Act::ReadMode
-        });
+        // Read/Print layout applies to `.docx` only; Markdown has no such group.
+        if self.format != DocFormat::Markdown {
+            toggles.push(if self.page_view {
+                ribbon::Act::PrintLayout
+            } else {
+                ribbon::Act::ReadMode
+            });
+        }
         if self.show_ruler {
             toggles.push(ribbon::Act::ToggleRuler);
         }
@@ -5874,7 +6085,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
     }
 }
 
-fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool) -> io::Result<()> {
+fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -5892,7 +6103,8 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool) -> io::Result
     app.format = format;
     // Restore persisted view-mode toggles and enable saving them going forward.
     let prefs = ViewPrefs::load();
-    app.page_view = prefs.page_view;
+    // Page view is a `.docx`-only concept; never restore it for Markdown.
+    app.page_view = prefs.page_view && app.format != DocFormat::Markdown;
     app.invisibles = prefs.invisibles;
     app.borderless = prefs.borderless;
     app.light_page = prefs.light_page;
@@ -5903,6 +6115,7 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool) -> io::Result
     // With auto-hide off the ribbon is pinned, so start it expanded (focus stays
     // in the document); with auto-hide on it starts collapsed to the tab strip.
     app.ribbon_open = !app.auto_hide_ribbon;
+    app.start_screen = start;
     app.persist_prefs = true;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back
     // to a half-block renderer if the query fails (e.g. a plain console).
@@ -6086,6 +6299,102 @@ mod tests {
     }
 
     #[test]
+    fn start_screen_actions() {
+        // New Word document.
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.start_sel = 0;
+        assert!(!app.start_activate());
+        assert!(!app.start_screen);
+        assert_eq!(app.format, DocFormat::Docx);
+        assert!(app.path.ends_with(".docx"));
+
+        // New Markdown document.
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.start_sel = 1;
+        assert!(!app.start_activate());
+        assert_eq!(app.format, DocFormat::Markdown);
+        assert!(app.path.ends_with(".md"));
+
+        // Open → drops into the File backstage.
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.start_sel = 2;
+        assert!(!app.start_activate());
+        assert!(app.backstage.is_some());
+
+        // Quit.
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.start_sel = 3;
+        assert!(app.start_activate(), "Quit returns true");
+    }
+
+    #[test]
+    fn start_screen_navigation_wraps_and_digits_pick() {
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.on_key(KeyEvent::from(KeyCode::Up)); // wrap 0 → last
+        assert_eq!(app.start_sel, START_ITEMS.len() - 1);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // wrap back to 0
+        assert_eq!(app.start_sel, 0);
+        // A digit selects and activates: '2' → New Markdown.
+        assert!(!app.on_key(KeyEvent::from(KeyCode::Char('2'))));
+        assert_eq!(app.format, DocFormat::Markdown);
+        assert!(!app.start_screen);
+    }
+
+    #[test]
+    fn start_screen_mouse_hovers_and_clicks() {
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        // Pretend `draw` laid the four items out on rows 5..=8, full-width.
+        for (i, r) in app.start_btns.iter_mut().enumerate() {
+            *r = Rect {
+                x: 0,
+                y: 5 + i as u16,
+                width: 40,
+                height: 1,
+            };
+        }
+        // Hovering over the Markdown row highlights it without activating.
+        app.on_mouse(mouse(MouseEventKind::Moved, 10, 6));
+        assert_eq!(app.start_sel, 1);
+        assert!(app.start_screen, "hover must not leave the welcome screen");
+        // Clicking the Open row activates it → File backstage.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 7));
+        assert!(!app.start_screen);
+        assert!(app.backstage.is_some());
+
+        // Clicking Quit sets the quit flag.
+        let mut app = app_with(&["x"]);
+        app.start_screen = true;
+        app.start_btns[3] = Rect {
+            x: 0,
+            y: 8,
+            width: 40,
+            height: 1,
+        };
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 8));
+        assert!(app.quit_requested, "clicking Quit requests shutdown");
+    }
+
+    #[test]
+    fn page_view_is_unavailable_for_markdown() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_markdown_package(Document { body }), "a.md", false);
+        // Requesting page view is ignored for Markdown.
+        app.set_page_view(true);
+        assert!(!app.page_view, "Markdown must not enter page view");
+        // Even a doc that was in page view drops it when a .md is loaded.
+        app.page_view = true;
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        app.load_package_state(new_package(Document { body }), "x.md".to_string());
+        assert!(!app.page_view);
+    }
+
+    #[test]
     fn source_toggle_is_noop_for_docx() {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         let mut app = App::new(new_package(Document { body }), "a.docx", false);
@@ -6097,10 +6406,52 @@ mod tests {
     fn view_tab_shows_markdown_group_only_for_md() {
         let mut r = ribbon::Ribbon::home();
         r.set_active(5); // View
-        let before = r.button_count();
+        // For .docx: Read/Print Layout present, no Markdown switch.
+        assert!(r.has_act(ribbon::Act::PrintLayout));
+        assert!(!r.has_act(ribbon::Act::MdRendered));
+        // For Markdown: the page-view group is gone, replaced by Rendered/Source.
         r.set_markdown(true);
-        let after = r.button_count();
-        assert!(after > before, "Markdown group should add buttons");
+        assert!(
+            !r.has_act(ribbon::Act::ReadMode),
+            "Read Mode should be hidden"
+        );
+        assert!(
+            !r.has_act(ribbon::Act::PrintLayout),
+            "Print Layout should be hidden"
+        );
+        assert!(r.has_act(ribbon::Act::MdRendered));
+        assert!(r.has_act(ribbon::Act::MdSource));
+    }
+
+    #[test]
+    fn home_tab_trims_unsupported_buttons_for_markdown() {
+        let mut r = ribbon::Ribbon::home();
+        r.set_active(1); // Home
+        // .docx exposes the full Font/Paragraph controls.
+        assert!(r.has_act(ribbon::Act::FontColor));
+        assert!(r.has_act(ribbon::Act::Underline));
+        assert!(r.has_act(ribbon::Act::AlignCenter));
+        // Markdown keeps only what it can express.
+        r.set_markdown(true);
+        for gone in [
+            ribbon::Act::FontColor,
+            ribbon::Act::Underline,
+            ribbon::Act::Highlight,
+            ribbon::Act::Subscript,
+            ribbon::Act::AlignCenter,
+            ribbon::Act::IncreaseIndent,
+        ] {
+            assert!(!r.has_act(gone), "{gone:?} should be hidden for Markdown");
+        }
+        for kept in [
+            ribbon::Act::Bold,
+            ribbon::Act::Italic,
+            ribbon::Act::Strike,
+            ribbon::Act::Bullets,
+            ribbon::Act::Numbering,
+        ] {
+            assert!(r.has_act(kept), "{kept:?} should remain for Markdown");
+        }
     }
 
     #[test]
@@ -6560,6 +6911,40 @@ mod tests {
     }
 
     #[test]
+    fn export_pdf_asks_before_overwriting() {
+        let tmp = std::env::temp_dir().join("docxy_pdf_overwrite");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let docx = tmp.join("note.docx");
+        let pdf = tmp.join("note.pdf");
+
+        // No PDF yet → export writes straight away, no prompt.
+        let mut app = app_with(&["hello"]);
+        app.path = docx.to_string_lossy().into_owned();
+        app.export_pdf();
+        assert!(app.confirm.is_none(), "no prompt when the PDF is new");
+        assert!(pdf.exists(), "PDF written on first export");
+
+        // PDF now exists → a second export asks first, defaulting to No.
+        app.status = None;
+        app.export_pdf();
+        let c = app.confirm.as_ref().expect("overwrite prompt shown");
+        assert!(!c.yes, "default is No for a destructive overwrite");
+        assert_eq!(c.action, ConfirmAction::OverwritePdf(pdf.clone()));
+        assert!(app.status.is_none(), "nothing written until confirmed");
+
+        // Confirming overwrites the file.
+        if let Some(c) = app.confirm.as_mut() {
+            c.yes = true;
+        }
+        app.apply_confirm();
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_deref().unwrap().starts_with("exported"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn file_menu_exit_asks_to_confirm_then_quits() {
         let mut app = app_with(&["doc"]);
         app.open_backstage();
@@ -6587,6 +6972,37 @@ mod tests {
         let quit = app.on_key(key(KeyCode::Char('y')));
         assert!(quit);
         assert!(app.quit_requested);
+    }
+
+    #[test]
+    fn single_click_exit_opens_confirm_and_new_stays_guarded() {
+        // Exit is index 7 in the menu, drawn at screen row 1 + idx.
+        let exit_row = 1 + backstage::ITEMS
+            .iter()
+            .position(|i| *i == backstage::Item::Exit)
+            .unwrap() as u16;
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        // One click on Exit goes straight to the confirm modal — no second click.
+        app.bs_mouse(3, exit_row);
+        assert!(app.backstage.is_none(), "Exit closes the backstage");
+        assert!(app.confirm.is_some(), "Exit raises the confirm dialog");
+
+        // New is guarded: a first click only selects it (discarding work needs a
+        // confirming second click).
+        let new_row = 1 + backstage::ITEMS
+            .iter()
+            .position(|i| *i == backstage::Item::New)
+            .unwrap() as u16;
+        let mut app = app_with(&["doc"]);
+        app.open_backstage();
+        app.bs_mouse(3, new_row);
+        assert!(app.backstage.is_some(), "first New click only selects");
+        assert_eq!(app.backstage.as_ref().unwrap().item, backstage::Item::New);
+        // Second click on the already-selected New actually starts a new doc.
+        app.bs_mouse(3, new_row);
+        assert!(app.backstage.is_none());
+        assert!(app.path.ends_with("untitled.docx"));
     }
 
     #[test]
@@ -7185,6 +7601,28 @@ mod tests {
         assert_eq!(p.pdf_out.as_deref(), Some("o.pdf"));
         assert!(parse_args(&["a.docx".to_string(), "--pdf".to_string()]).is_err());
         assert!(parse_args(&["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_md_and_docx_conversion() {
+        let m = parse_args(&[
+            "in.docx".to_string(),
+            "--md".to_string(),
+            "out.md".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(m.input.as_deref(), Some("in.docx"));
+        assert_eq!(m.md_out.as_deref(), Some("out.md"));
+        let d = parse_args(&[
+            "in.md".to_string(),
+            "--docx".to_string(),
+            "out.docx".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(d.docx_out.as_deref(), Some("out.docx"));
+        // Missing output paths are errors.
+        assert!(parse_args(&["in.docx".to_string(), "--md".to_string()]).is_err());
+        assert!(parse_args(&["in.md".to_string(), "--docx".to_string()]).is_err());
     }
 
     #[test]

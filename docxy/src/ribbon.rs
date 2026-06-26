@@ -206,7 +206,7 @@ impl Ribbon {
             active: 1,
             tab_groups: vec![
                 Vec::new(),
-                home_groups(),
+                home_groups(false),
                 styles_groups(),
                 insert_groups(),
                 review_groups(),
@@ -230,11 +230,19 @@ impl Ribbon {
             return;
         }
         self.markdown = on;
-        if let Some(idx) = self.tabs.iter().position(|t| *t == "View") {
-            self.tab_groups[idx] = view_groups(on);
-            if self.active == idx {
-                self.layout();
+        // The View tab gains a Markdown group; the Home tab drops the formatting
+        // controls Markdown can't express (font, colour, alignment, indent…).
+        let mut relayout = false;
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            match *tab {
+                "View" => self.tab_groups[idx] = view_groups(on),
+                "Home" => self.tab_groups[idx] = home_groups(on),
+                _ => continue,
             }
+            relayout |= self.active == idx;
+        }
+        if relayout {
+            self.layout();
         }
     }
 
@@ -264,9 +272,9 @@ impl Ribbon {
 }
 
 /// The Home tab's groups (Clipboard / Font / Paragraph / Editing).
-fn home_groups() -> Vec<Group> {
+fn home_groups(markdown: bool) -> Vec<Group> {
     use Act::*;
-    vec![
+    let mut groups = vec![
         Group {
             title: "Clipboard",
             width: 9,
@@ -395,7 +403,43 @@ fn home_groups() -> Vec<Group> {
                 ],
             ],
         },
-    ]
+    ];
+    // Markdown can't express most character/paragraph formatting, so the Home tab
+    // keeps only the controls that map to Markdown: bold/italic/strike and lists.
+    if markdown {
+        groups[1] = Group {
+            title: "Font",
+            width: 9,
+            rows: [
+                vec![
+                    btn("B", 1, Bold, "Bold (Ctrl+B) — **text**"),
+                    Seg::Gap("  "),
+                    btn("I", 1, Italic, "Italic (Ctrl+I) — *text*"),
+                    Seg::Gap("  "),
+                    btn("S", 1, Strike, "Strikethrough — ~~text~~"),
+                ],
+                vec![],
+            ],
+        };
+        groups[2] = Group {
+            title: "Paragraph",
+            width: 11,
+            rows: [
+                vec![
+                    btn("•──", 3, Bullets, "Bullets — bulleted list"),
+                    Seg::Gap(" "),
+                    btn("1──", 3, Numbering, "Numbering — numbered list"),
+                ],
+                vec![btn(
+                    "¶",
+                    1,
+                    ShowHide,
+                    "Show/hide formatting marks (Ctrl+Shift+8)",
+                )],
+            ],
+        };
+    }
+    groups
 }
 
 /// The Styles tab: a gallery of common paragraph styles plus a "More…" launcher
@@ -612,6 +656,9 @@ fn view_groups(markdown: bool) -> Vec<Group> {
         },
     ];
     if markdown {
+        // Markdown has no fixed pages, so drop the Views (Read / Print Layout)
+        // group and offer the Rendered / Source switch instead.
+        groups.remove(0);
         groups.push(Group {
             title: "Markdown",
             width: 8,
@@ -685,6 +732,10 @@ impl Ribbon {
     #[cfg(test)]
     pub fn button_count(&self) -> usize {
         self.placed.len()
+    }
+    #[cfg(test)]
+    pub fn has_act(&self, act: Act) -> bool {
+        self.placed.iter().any(|p| p.act == act)
     }
     #[cfg(test)]
     pub fn focus_hint(&self, f: Focus) -> Option<&'static str> {
