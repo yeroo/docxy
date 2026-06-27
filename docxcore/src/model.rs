@@ -99,12 +99,16 @@ pub enum Inline {
         raw: String,
         chart: crate::chart::Chart,
     },
-    /// A legacy Equation Editor (`Equation.3`) object decoded to Unicode math
-    /// text. `raw` is the original run XML (preserved verbatim for lossless save);
-    /// `text` is the decoded equation, rendered as inline text at body size.
+    /// A math equation. `raw` is the original XML preserved verbatim for lossless
+    /// save: OMML (`<m:oMath>`/`<m:oMathPara>`) for native Word math, or a legacy
+    /// Equation Editor (`Equation.3`) object's run XML. `text` is the equation
+    /// rendered to Unicode, shown inline at body size. `latex` is the LaTeX source
+    /// when known (Markdown-authored math, or derived from OMML) — `None` for
+    /// legacy objects; it lets `$…$` round-trip exactly through Markdown.
     Equation {
         raw: String,
         text: String,
+        latex: Option<String>,
     },
     /// A text box / shape with text (`<w:txbxContent>`). `blocks` is its editable
     /// content (addressable by path, so the caret can enter it); `raw` is the

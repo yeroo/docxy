@@ -344,6 +344,14 @@ fn extract_diagram_text(xml: &str) -> Vec<String> {
 /// text, a SmartArt diagram becomes a `SmartArt` box, otherwise the run is
 /// preserved verbatim as `Raw`.
 fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
+    // A Mermaid diagram we generated: its source is embedded in the drawing's
+    // descr. Recover it as a SmartArt box (node labels shown in the terminal,
+    // raw preserved for save, source recoverable on Markdown export). Checked
+    // before the text-box case because our node shapes also use txbxContent.
+    if let Some(src) = crate::mermaid::source_of(&raw) {
+        let text = crate::mermaid::labels(&src);
+        return Inline::SmartArt { raw, text };
+    }
     // A text box / shape with text: model its content so the caret can enter it.
     if raw.contains("txbxContent") {
         let blocks = parse_textbox_blocks(&raw);
@@ -358,6 +366,7 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
                 return Inline::Equation {
                     raw,
                     text: text.clone(),
+                    latex: None,
                 };
             }
         }
@@ -465,7 +474,11 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                     let text = crate::omath::render_omath(&raw);
                     blocks.push(Block::Paragraph(Paragraph {
                         props: Default::default(),
-                        content: vec![Inline::Equation { raw, text }],
+                        content: vec![Inline::Equation {
+                            raw,
+                            text,
+                            latex: None,
+                        }],
                     }));
                 }
                 _ => {
@@ -515,7 +528,11 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     p.skip_element();
                     let raw = p.raw_slice(start, p.pos()).to_string();
                     let text = crate::omath::render_omath(&raw);
-                    para.content.push(Inline::Equation { raw, text });
+                    para.content.push(Inline::Equation {
+                        raw,
+                        text,
+                        latex: None,
+                    });
                 }
                 _ => {
                     // Unmodeled inline content (bookmarks, fields): preserve raw.
@@ -774,8 +791,14 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     out.push(Inline::Tab(props.clone()));
                     p.skip_element();
                 }
-                "w:drawing" | "w:pict" | "w:object" | "w:fldChar" | "w:instrText" | "w:sym"
-                | "w:commentReference" => {
+                "w:drawing"
+                | "w:pict"
+                | "w:object"
+                | "w:fldChar"
+                | "w:instrText"
+                | "w:sym"
+                | "w:commentReference"
+                | "mc:AlternateContent" => {
                     had_raw = true;
                     p.skip_element();
                 }

@@ -11,6 +11,7 @@
 //! - `---`/`***`/`___` thematic breaks ⇄ a bottom-border (Word "horizontal line").
 //! - GFM pipe tables ⇄ [`Table`].
 //! - Fenced code blocks become plain paragraphs (the fence isn't re-modeled).
+//! - `$…$` / `$$…$$` math ⇄ Word equations (OMML), via [`crate::latex`].
 //!
 //! Underline and `_emphasis_` are intentionally *not* parsed: Markdown has no
 //! underline, and treating `_` as emphasis mangles `snake_case`/URLs. The list
@@ -115,7 +116,54 @@ fn is_quote(p: &Paragraph) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("Quote"))
 }
 
+/// The LaTeX for an equation, or `None` if it isn't native OMML math (a legacy
+/// Equation Editor object, which has no LaTeX form). Uses the stored LaTeX when
+/// present, else derives it from the OMML.
+fn equation_latex(raw: &str, latex: &Option<String>) -> Option<String> {
+    if !raw.contains("m:oMath") {
+        return None;
+    }
+    Some(
+        latex
+            .clone()
+            .unwrap_or_else(|| crate::latex::omml_to_latex(raw)),
+    )
+}
+
+/// If the paragraph is a standalone Mermaid diagram (its only content is a
+/// SmartArt drawing carrying embedded Mermaid source), return that source.
+fn mermaid_of(p: &Paragraph) -> Option<String> {
+    if let [Inline::SmartArt { raw, .. }] = p.content.as_slice() {
+        return crate::mermaid::source_of(raw);
+    }
+    None
+}
+
+/// If the paragraph is a standalone display-math block (its only content is an
+/// `oMathPara` equation), return its LaTeX.
+fn display_math_of(p: &Paragraph) -> Option<String> {
+    if let [Inline::Equation { raw, latex, .. }] = p.content.as_slice() {
+        if raw.contains("m:oMathPara") {
+            return equation_latex(raw, latex);
+        }
+    }
+    None
+}
+
 fn para_to_md(p: &Paragraph, marker: Option<&str>, out: &mut String) {
+    if let Some(src) = mermaid_of(p) {
+        out.push_str("```mermaid\n");
+        out.push_str(&src);
+        out.push('\n');
+        out.push_str("```\n");
+        return;
+    }
+    if let Some(latex) = display_math_of(p) {
+        out.push_str("$$\n");
+        out.push_str(&latex);
+        out.push_str("\n$$\n");
+        return;
+    }
     if let Some(level) = heading_level_of(p) {
         out.push_str(&"#".repeat(level));
         out.push(' ');
@@ -219,9 +267,14 @@ fn inlines_to_md(content: &[Inline]) -> String {
             }
             Inline::Break(_) => s.push_str("  \n"),
             Inline::Tab(_) => s.push('\t'),
-            Inline::Field { text, .. } | Inline::Equation { text, .. } => {
-                s.push_str(&escape_inline(text))
-            }
+            Inline::Equation { raw, text, latex } => match equation_latex(raw, latex) {
+                // Native math → `$…$` (inline) or `$$…$$` (display) with LaTeX.
+                Some(l) if raw.contains("m:oMathPara") => s.push_str(&format!("$${l}$$")),
+                Some(l) => s.push_str(&format!("${l}$")),
+                // Legacy Equation Editor object: fall back to its Unicode text.
+                None => s.push_str(&escape_inline(text)),
+            },
+            Inline::Field { text, .. } => s.push_str(&escape_inline(text)),
             Inline::SmartArt { text, .. } => s.push_str(&escape_inline(&text.join(" "))),
             Inline::Chart { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
         }
@@ -323,17 +376,67 @@ pub fn from_markdown(src: &str) -> Document {
             i += 1;
             continue;
         }
-        // Fenced code block: each inner line becomes a verbatim "SourceCode"
-        // paragraph, so the block survives a round-trip (re-fenced on output).
+        // Fenced code block. A `mermaid` info string becomes a Word diagram;
+        // any other fence becomes verbatim "SourceCode" paragraphs (re-fenced on
+        // output), so the block survives a round-trip.
         if let Some(fence) = code_fence(trimmed) {
+            let lang = trimmed
+                .trim_start_matches(fence)
+                .trim()
+                .to_ascii_lowercase();
             i += 1;
+            let start = i;
             while i < lines.len() && code_fence(lines[i].trim()) != Some(fence) {
-                body.push(source_para(lines[i]));
                 i += 1;
             }
+            let inner = &lines[start..i];
             if i < lines.len() {
                 i += 1; // consume closing fence
             }
+            if lang == "mermaid" {
+                body.push(mermaid_para(&inner.join("\n")));
+            } else {
+                for l in inner {
+                    body.push(source_para(l));
+                }
+            }
+            continue;
+        }
+        // Display math block: `$$ … $$`, on one line or spanning several.
+        if let Some(rest) = trimmed.strip_prefix("$$") {
+            // Single-line `$$ … $$`.
+            if let Some(one) = rest.strip_suffix("$$") {
+                if !rest.is_empty() {
+                    body.push(display_math_para(one.trim()));
+                    i += 1;
+                    continue;
+                }
+            }
+            // Opener: gather lines until a closing `$$`.
+            let mut content = String::new();
+            if !rest.trim().is_empty() {
+                content.push_str(rest.trim());
+            }
+            i += 1;
+            while i < lines.len() {
+                let lt = lines[i].trim();
+                if let Some(before) = lt.strip_suffix("$$") {
+                    if !before.trim().is_empty() {
+                        if !content.is_empty() {
+                            content.push(' ');
+                        }
+                        content.push_str(before.trim());
+                    }
+                    i += 1;
+                    break;
+                }
+                if !content.is_empty() {
+                    content.push(' ');
+                }
+                content.push_str(lt);
+                i += 1;
+            }
+            body.push(display_math_para(content.trim()));
             continue;
         }
         // ATX heading.
@@ -413,6 +516,7 @@ fn starts_block(line: &str, next: Option<&str>) -> bool {
     atx_heading(t).is_some()
         || is_thematic_break(t)
         || code_fence(t).is_some()
+        || t.starts_with("$$")
         || list_item(line).is_some()
         || t.starts_with('>')
         || (t.contains('|') && next.map(is_table_separator).unwrap_or(false))
@@ -590,6 +694,28 @@ fn quote_para(text: &str) -> Block {
     .into()
 }
 
+/// A Mermaid diagram paragraph: holds a single SmartArt drawing generated from
+/// the source (which is also embedded in the drawing for lossless recovery).
+fn mermaid_para(src: &str) -> Block {
+    let (raw, text) = crate::mermaid::to_drawing(src);
+    Paragraph {
+        props: ParProps::default(),
+        content: vec![Inline::SmartArt { raw, text }],
+    }
+    .into()
+}
+
+/// A standalone display-math paragraph (`$$ … $$`): a paragraph whose only
+/// content is a block (`oMathPara`) equation. [`to_markdown_with`] re-emits it as
+/// a `$$`-fenced block.
+fn display_math_para(latex: &str) -> Block {
+    Paragraph {
+        props: ParProps::default(),
+        content: vec![math_equation(latex, true)],
+    }
+    .into()
+}
+
 /// One verbatim line of a fenced code block: a "SourceCode"-styled paragraph
 /// holding the raw text (no inline parsing). [`to_markdown_with`] groups
 /// consecutive such paragraphs back into a fence.
@@ -669,6 +795,23 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
                 continue;
             }
         }
+        // Inline math: `$x^2$` (or display `$$…$$`). The delimiters must hug
+        // their content (no inner space at the edges), so prose dollar signs like
+        // "$5 and $10" aren't mistaken for math. Literal `\$` is handled above.
+        if c == '$' {
+            let n = chars[i..]
+                .iter()
+                .take_while(|&&ch| ch == '$')
+                .count()
+                .min(2);
+            if let Some(close) = find_math_close(&chars, i + n, n) {
+                push_run(&mut out, &mut buf, bold, italic, strike);
+                let latex: String = chars[i + n..close].iter().collect();
+                out.push(math_equation(latex.trim(), n == 2));
+                i = close + n;
+                continue;
+            }
+        }
         if c == '~' && chars.get(i + 1) == Some(&'~') {
             push_run(&mut out, &mut buf, bold, italic, strike);
             strike = !strike;
@@ -695,6 +838,43 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
         out.push(Inline::Run(Run::default()));
     }
     out
+}
+
+/// Find the closing run of `n` dollar signs for inline math opened at `from`.
+/// Returns the index of the first closing `$`. The content must be non-empty and
+/// neither start nor end with whitespace (so currency in prose isn't math).
+fn find_math_close(chars: &[char], from: usize, n: usize) -> Option<usize> {
+    if chars.get(from).is_some_and(|c| c.is_whitespace()) {
+        return None; // opener immediately followed by space → not math
+    }
+    let mut j = from;
+    while j < chars.len() {
+        if chars[j] == '$' {
+            let run = chars[j..].iter().take_while(|&&c| c == '$').count();
+            if run >= n {
+                // Need real content and no space hugging the closing delimiter.
+                if j > from && !chars[j - 1].is_whitespace() {
+                    return Some(j);
+                }
+                return None;
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Build an equation inline from LaTeX: generate OMML (so it saves as real Word
+/// math), render Unicode for the terminal, and keep the LaTeX for exact Markdown
+/// round-trips. `display` selects `$$…$$` (block) over `$…$` (inline).
+fn math_equation(latex: &str, display: bool) -> Inline {
+    let raw = crate::latex::latex_to_omml(latex, display);
+    let text = crate::omath::render_omath(&raw);
+    Inline::Equation {
+        raw,
+        text,
+        latex: Some(latex.to_string()),
+    }
 }
 
 fn push_run(out: &mut Vec<Inline>, buf: &mut String, bold: bool, italic: bool, strike: bool) {
@@ -998,6 +1178,150 @@ mod tests {
         assert!(md.contains("```\nlet x = 1;\nlet y = 2;\n```"), "{md}");
         let again = from_markdown(&md);
         assert_eq!(again, doc);
+    }
+
+    #[test]
+    fn inline_math_round_trips_and_makes_omml() {
+        let doc = from_markdown("Einstein: $E=mc^2$ changed physics.");
+        let p = match &doc.body[0] {
+            Block::Paragraph(p) => p,
+            _ => panic!(),
+        };
+        // Parsed to a native-math equation carrying OMML + the original LaTeX.
+        let eq = p
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Equation { raw, latex, .. } => Some((raw, latex)),
+                _ => None,
+            })
+            .expect("an equation inline");
+        assert!(
+            eq.0.contains("<m:oMath>") && eq.0.contains("<m:sSup>"),
+            "{}",
+            eq.0
+        );
+        assert_eq!(eq.1.as_deref(), Some("E=mc^2"));
+        // Re-emitted as `$…$` and re-parses to the same document.
+        let md = to_markdown(&doc);
+        assert!(md.contains("$E=mc^2$"), "{md}");
+        assert_eq!(from_markdown(&md), doc);
+    }
+
+    #[test]
+    fn display_math_block_round_trips() {
+        let src = "$$\nx=\\frac{-b\\pm \\sqrt{b^{2}-4ac}}{2a}\n$$";
+        let doc = from_markdown(src);
+        // One paragraph holding a display (oMathPara) equation.
+        let p = match &doc.body[0] {
+            Block::Paragraph(p) => p,
+            _ => panic!(),
+        };
+        match p.content.as_slice() {
+            [Inline::Equation { raw, .. }] => assert!(raw.contains("<m:oMathPara>"), "{raw}"),
+            other => panic!("expected one display equation, got {other:?}"),
+        }
+        let md = to_markdown(&doc);
+        assert!(
+            md.contains("$$\nx=\\frac{-b\\pm \\sqrt{b^{2}-4ac}}{2a}\n$$"),
+            "{md}"
+        );
+        assert_eq!(from_markdown(&md), doc);
+    }
+
+    #[test]
+    fn math_survives_a_docx_round_trip() {
+        // Markdown math → package → .docx bytes → reload → Markdown again.
+        let doc = from_markdown("Mass-energy: $E=mc^2$.\n\n$$\n\\frac{a}{b}\n$$");
+        let pkg = crate::package::new_markdown_package(doc);
+        let bytes = crate::package::save_package(&pkg);
+        let reloaded = crate::load::load(&bytes).expect("reload");
+        // The inline and display equations both came back as OMML.
+        let omml: Vec<&str> = reloaded
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => p.content.iter().find_map(|i| match i {
+                    Inline::Equation { raw, .. } => Some(raw.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            omml.iter().any(|r| r.contains("<m:sSup>")),
+            "inline sup lost: {omml:?}"
+        );
+        assert!(
+            omml.iter().any(|r| r.contains("<m:f>")),
+            "fraction lost: {omml:?}"
+        );
+        // And exporting to Markdown again yields `$…$` / `$$…$$` with the LaTeX.
+        let md = to_markdown(&reloaded);
+        assert!(md.contains("$E=mc^{2}$"), "{md}");
+        assert!(md.contains("$$\n\\frac{a}{b}\n$$"), "{md}");
+    }
+
+    #[test]
+    fn mermaid_block_becomes_a_diagram_and_round_trips() {
+        let src = "flowchart TD\nA[Start] --> B{OK?}\nB -->|yes| C[Done]\nB -->|no| A";
+        let md = format!("# Diagram\n\n```mermaid\n{src}\n```\n");
+        let doc = from_markdown(&md);
+        // The fence became a SmartArt drawing carrying the embedded source.
+        let sa = doc
+            .body
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => p.content.iter().find_map(|i| match i {
+                    Inline::SmartArt { raw, .. } => Some(raw),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("a mermaid SmartArt");
+        assert!(sa.contains("<w:drawing>") && sa.contains("wordprocessingGroup"));
+        assert!(sa.contains("descr=\"mermaid:"));
+        // Re-emitted as a ```mermaid fence with the exact original source.
+        let out = to_markdown(&doc);
+        assert!(out.contains(&format!("```mermaid\n{src}\n```")), "{out}");
+        // And it parses back identically (the source is the source of truth).
+        assert_eq!(from_markdown(&out), doc);
+    }
+
+    #[test]
+    fn mermaid_survives_a_docx_round_trip() {
+        let src = "graph LR\nA[One] --> B[Two]";
+        let doc = from_markdown(&format!("```mermaid\n{src}\n```"));
+        let pkg = crate::package::new_markdown_package(doc);
+        let bytes = crate::package::save_package(&pkg);
+        let reloaded = crate::load::load(&bytes).expect("reload");
+        // Reloaded as a SmartArt whose embedded source recovers the diagram.
+        let md = to_markdown(&reloaded);
+        assert!(md.contains(&format!("```mermaid\n{src}\n```")), "{md}");
+    }
+
+    #[test]
+    fn non_mermaid_fence_stays_source_code() {
+        let doc = from_markdown("```rust\nlet x = 1;\n```");
+        // Not a diagram — still SourceCode paragraphs.
+        assert!(doc.body.iter().all(|b| !matches!(
+            b,
+            Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::SmartArt { .. }))
+        )));
+        assert!(to_markdown(&doc).contains("```\nlet x = 1;\n```"));
+    }
+
+    #[test]
+    fn lone_dollar_signs_are_not_math() {
+        // Currency in prose must not be captured as an equation.
+        let doc = from_markdown("It cost $5 and then $10 total.");
+        assert!(!doc.body[0].plain_text().is_empty(), "text preserved");
+        assert!(
+            !matches!(&doc.body[0], Block::Paragraph(p)
+                if p.content.iter().any(|i| matches!(i, Inline::Equation { .. }))),
+            "no equation should be parsed from prose dollars"
+        );
+        assert!(to_markdown(&doc).contains("$5 and then $10"));
     }
 
     #[test]

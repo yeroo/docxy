@@ -1439,9 +1439,10 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 raw: raw.clone(),
                 chart: chart.clone(),
             }),
-            Inline::Equation { raw, text } => out.push(Inline::Equation {
+            Inline::Equation { raw, text, latex } => out.push(Inline::Equation {
                 raw: raw.clone(),
                 text: text.clone(),
+                latex: latex.clone(),
             }),
             Inline::Field { raw, text } => out.push(Inline::Field {
                 raw: raw.clone(),

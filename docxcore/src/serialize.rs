@@ -10,13 +10,16 @@ use crate::model::*;
 
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
 /// Serialize a document to the bytes of `word/document.xml`.
 pub fn document_to_xml(doc: &Document) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    // The `m:` namespace is declared so equations (`<m:oMath>`) authored from
+    // Markdown serialize as valid Office Math.
     s.push_str(&format!(
-        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:body>"
+        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\"><w:body>"
     ));
     for block in &doc.body {
         write_block(&mut s, block);
