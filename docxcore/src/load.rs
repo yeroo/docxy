@@ -791,8 +791,14 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     out.push(Inline::Tab(props.clone()));
                     p.skip_element();
                 }
-                "w:drawing" | "w:pict" | "w:object" | "w:fldChar" | "w:instrText" | "w:sym"
-                | "w:commentReference" => {
+                "w:drawing"
+                | "w:pict"
+                | "w:object"
+                | "w:fldChar"
+                | "w:instrText"
+                | "w:sym"
+                | "w:commentReference"
+                | "mc:AlternateContent" => {
                     had_raw = true;
                     p.skip_element();
                 }

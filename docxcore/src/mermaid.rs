@@ -530,10 +530,14 @@ fn assign_ranks(d: &mut Diagram) {
 // DrawingML emission
 // ===========================================================================
 
+const NS_MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const NS_WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
 const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const NS_WPG: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingGroup";
-const NS_WPS: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingShape";
+// Word-processing shapes/groups live in the Office 2010 extension namespaces
+// (NOT the drawingml/2006 ones) and must be wrapped in mc:AlternateContent with
+// `Requires="wpg"`, or Word refuses to open the document.
+const NS_WPG: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup";
+const NS_WPS: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
 
 fn emit_drawing(d: &Diagram, src: &str) -> String {
     let (w, h) = canvas_extent(d);
@@ -553,7 +557,10 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
 
     let descr = format!("{MARKER}{}", escape_source(src));
     format!(
-        "<w:r><w:drawing>\
+        "<w:r>\
+         <mc:AlternateContent xmlns:mc=\"{NS_MC}\">\
+         <mc:Choice Requires=\"wpg\" xmlns:wpg=\"{NS_WPG}\">\
+         <w:drawing>\
          <wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" xmlns:wp=\"{NS_WP}\">\
          <wp:extent cx=\"{w}\" cy=\"{h}\"/>\
          <wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
@@ -561,14 +568,15 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
          <wp:cNvGraphicFramePr/>\
          <a:graphic xmlns:a=\"{NS_A}\">\
          <a:graphicData uri=\"{NS_WPG}\">\
-         <wpg:wgp xmlns:wpg=\"{NS_WPG}\" xmlns:wps=\"{NS_WPS}\">\
+         <wpg:wgp xmlns:wps=\"{NS_WPS}\">\
          <wpg:cNvGrpSpPr/>\
          <wpg:grpSpPr>\
          <a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/>\
          <a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
          </wpg:grpSpPr>\
          {shapes}\
-         </wpg:wgp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>",
+         </wpg:wgp></a:graphicData></a:graphic></wp:inline></w:drawing>\
+         </mc:Choice><mc:Fallback/></mc:AlternateContent></w:r>",
         descr_attr = xml_escape_attr(&descr),
     )
 }
@@ -639,7 +647,7 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
          <wps:cNvCnPr/>\
          <wps:spPr>\
          <a:xfrm{flip_h}{flip_v}><a:off x=\"{ox}\" y=\"{oy}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-         <a:prstGeom prst=\"line\"><a:avLst/></a:prstGeom>\
+         <a:prstGeom prst=\"straightConnector1\"><a:avLst/></a:prstGeom>\
          <a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
          <a:tailEnd type=\"triangle\"/></a:ln>\
          </wps:spPr>\
@@ -777,9 +785,20 @@ mod tests {
     fn emits_drawingml_with_shapes_and_connector() {
         let (xml, text) = to_drawing("flowchart TD\nA[Start]-->B[End]");
         assert!(xml.contains("<w:drawing>"), "{xml}");
-        assert!(xml.contains("wordprocessingGroup"), "{xml}");
+        // Wrapped for Word with the Office 2010 wpg namespace.
+        assert!(
+            xml.contains("mc:AlternateContent") && xml.contains("Requires=\"wpg\""),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("office/word/2010/wordprocessingGroup"),
+            "{xml}"
+        );
         assert!(xml.contains("prst=\"roundRect\"") || xml.contains("prst=\"rect\""));
-        assert!(xml.contains("prst=\"line\""), "connector missing");
+        assert!(
+            xml.contains("prst=\"straightConnector1\""),
+            "connector missing"
+        );
         assert!(xml.contains("Start") && xml.contains("End"));
         assert_eq!(text, vec!["Start".to_string(), "End".to_string()]);
     }
