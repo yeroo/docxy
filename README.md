@@ -5,54 +5,107 @@
 [![crates.io](https://img.shields.io/crates/v/docxy.svg)](https://crates.io/crates/docxy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A fast terminal (TUI) viewer and editor for Microsoft Word `.docx` documents.**
+**A fast terminal (TUI) viewer and editor for Microsoft Word `.docx` and Markdown — right where you live, in the terminal.**
 
-Docxy opens real `.docx` files in your terminal — text, tables, lists, styles, and
-images — lets you edit and save them losslessly, and can export to PDF. It's built
-on a small, dependency-free OOXML engine (`docxcore`) with a thin
-[ratatui](https://ratatui.rs) UI on top.
+Docxy opens real `.docx` files — text, tables, lists, styles, even images —
+renders them faithfully in a character grid, and lets you **edit and save** them
+losslessly. It reads and writes **Markdown** too, converts between the two, and
+exports to **PDF**. No Office, no browser, no network: it's a single static
+binary on top of a small, dependency-free OOXML engine.
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="docxy editing a Word document in the terminal" width="860">
+</p>
 
 > Docxy deliberately doesn't reproduce Word's pixel-perfect layout — it renders a
-> faithful, readable view of the document in a character grid.
+> faithful, readable view of the document in a character grid, with a familiar
+> ribbon, mouse support, and an optional Vim mode.
+
+## Why docxy?
+
+- **Stay in the terminal.** Read and edit Word documents over SSH, in tmux, or
+  from your editor's shell — no GUI required.
+- **Lossless by design.** Anything docxy doesn't model (bookmarks, fields,
+  content controls, section properties) is preserved byte-for-faithful on save.
+- **Zero-dependency core.** The `docxcore` crate is pure `std` — its own
+  ZIP/DEFLATE, XML parser, renderer, and PDF writer — so it's auditable and
+  trivially embeddable.
+- **One file does it all.** `.docx` ⇄ `.md` conversion and `.docx → .pdf` export
+  are built in, scriptable, and headless.
+
+## Quick start
+
+```sh
+cargo install docxy          # or grab a prebuilt binary (see Install)
+
+docxy report.docx            # open a Word document
+docxy notes.md               # open / edit Markdown
+docxy                        # launch the welcome screen (new file or open)
+```
+
+Want to see it immediately? Generate the showcase document and open it:
+
+```sh
+cargo run -p docxcore --example gen_sample   # writes assets/sample.docx
+docxy assets/sample.docx
+```
 
 ## Features
 
-- **View & edit** paragraphs, runs (bold/italic/underline/strike/color), and
-  **tables** (including merged cells) — navigate and type directly into cells.
-- **Lossless save** — everything Docxy doesn't model (bookmarks, fields, content
-  controls, section properties) is preserved byte-for-faithful on save.
-- **Styles** resolved from `styles.xml`; **lists** numbered from `numbering.xml`.
-- **Images**: raster (PNG/JPEG/GIF/BMP/TIFF) rendered as real pixels via
-  kitty/iTerm2/**Sixel** graphics, and legacy **WMF/EMF vector** images rasterized
-  through the OS (Windows). Floating (frame-anchored) images are projected to their
-  real page positions.
-- **Find & replace**, full **clipboard** (copies to the OS clipboard too),
+### Documents & editing
+- **View & edit** paragraphs and runs (bold / italic / underline / strike /
+  color / highlight / sub- & superscript) and **tables**, including merged
+  cells — navigate and type directly into cells.
+- **Styles** resolved from `styles.xml`; **lists** numbered from `numbering.xml`;
+  headings, indents, alignment, tab stops, and horizontal rules.
+- **Lossless save** — unmodeled parts are preserved exactly.
+- **Find & replace**, full **clipboard** (syncs with the OS clipboard),
   **selection + formatting**, word navigation, and **show-invisibles**.
+- **Headers & footers**, multi-section page layout, and **print/page view**.
+
+### Markdown
+- Open and edit `.md` files directly; **Save As** to a `.md` or `.docx` name
+  converts between the two.
+- **View ▸ Markdown** toggles a `.md` file between the rendered document and its
+  raw source.
+- Headings, **bold/italic/strike**, inline `code`, fenced code blocks,
+  blockquotes, links, bullet/ordered lists, thematic rules, and pipe tables all
+  map across — and round-trip through `.docx` via real Word styles.
+- **Scientific formulas**: `$…$` inline and `$$…$$` display math (LaTeX) convert
+  to and from native Word equations (OMML) — fractions, roots, `\sum`/`\int`
+  with limits, Greek, scripts, `\left…\right`, and named functions.
+- **Mermaid diagrams**: a ```` ```mermaid ```` block becomes a native Word
+  drawing (DrawingML shapes + connectors, laid out automatically); the Mermaid
+  source is embedded so Word → Markdown restores the exact block. Flowcharts are
+  laid out fully; other diagram types are best-effort.
+
+### Images
+- Raster (PNG / JPEG / GIF / BMP / TIFF) rendered as **real pixels** via
+  kitty / iTerm2 / **Sixel** graphics.
+- Legacy **WMF/EMF vector** images rasterized through the OS (Windows).
+- Floating, frame-anchored images projected to their real page positions.
+
+### Niceties
+- **Welcome screen** on launch with no file: create a `.docx`/`.md` or open one —
+  keyboard- and mouse-driven.
+- **Mouse** everywhere: click to move, click a link to open, wheel/drag to
+  scroll/select, and a fully clickable ribbon and File menu.
+- Safe **clickable links** — only `http(s)`, shown for confirmation, opened
+  without a shell.
 - **Vim mode** (`--vim`): motions, operators, visual mode, `/` search, `:w`/`:q`.
-- Safe **clickable links** — only `http(s)`, shown for confirmation, opened without
-  a shell.
-- **PDF export**, headless: `docxy in.docx --pdf out.pdf`.
-- **Markdown**: open and edit `.md` files directly; **Save As** to a `.md` or
-  `.docx` name converts between the two. View ▸ Markdown toggles a `.md` file
-  between the rendered document and its raw source (headings, bold/italic/strike,
-  links, bullet/ordered lists, thematic rules, and pipe tables all map across).
-
-## Install
-
-```sh
-cargo install docxy
-```
-
-Or grab a prebuilt binary (Linux / Windows / macOS) from the
-[latest release](https://github.com/yeroo/docxy/releases/latest) — each is
-checksummed, cosign-signed, and carries a build-provenance attestation.
+- **PDF export**, including headless.
 
 ## Usage
 
 ```sh
 docxy <file.docx|.md>           # open a Word or Markdown file
-docxy <file> --vim              # open with vim keybindings
-docxy <file> --pdf <out>        # export to PDF and exit
+docxy                           # welcome screen (new .docx/.md, or open)
+docxy <file> --vim              # open with Vim keybindings
+
+# Headless conversion / export (no UI):
+docxy in.docx  --pdf  out.pdf   # export to PDF
+docxy in.docx  --md   out.md    # convert Word → Markdown
+docxy in.md    --docx out.docx  # convert Markdown → Word
 ```
 
 ### Keys
@@ -72,6 +125,16 @@ docxy <file> --pdf <out>        # export to PDF and exit
 | F6 · F7 | edit header · edit footer (Esc returns) |
 | F8 · F9 | insert landscape · portrait section at cursor |
 | mouse | click to move · click a link to open · wheel/drag to scroll/select |
+
+## Install
+
+```sh
+cargo install docxy
+```
+
+Or grab a prebuilt binary (Linux / Windows / macOS) from the
+[latest release](https://github.com/yeroo/docxy/releases/latest) — each is
+checksummed, cosign-signed, and carries a build-provenance attestation.
 
 ## Image support
 
@@ -99,6 +162,13 @@ The workspace has two crates:
   rendering, and the from-scratch PDF writer). No third-party dependencies.
 - **`docxy`** — the terminal UI (ratatui), clipboard (arboard), and image rendering
   (ratatui-image).
+
+### Examples
+
+```sh
+cargo run -p docxcore --example gen_sample [out.docx]   # build the showcase doc
+cargo run -p docxcore --example dump_doc -- assets/sample.docx   # inspect a .docx
+```
 
 ## License
 
