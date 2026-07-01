@@ -26,7 +26,7 @@ ratatui = "0.29"
 # OS clipboard bridge (copy/paste across applications).
 arboard = "3"
 # Inline images (kitty/iTerm2/Sixel, with a half-block fallback).
-ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 # Only the raster formats Word actually embeds; avoids heavy AVIF/AV1 codecs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
 
