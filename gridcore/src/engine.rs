@@ -72,18 +72,8 @@ impl Engine {
         }
         match formula::parse(src) {
             Ok(ast) => {
-                let mut named = Vec::new();
-                collect_refs(&ast, &mut named);
-                let deps = named
-                    .into_iter()
-                    .filter_map(|(sheet, r1, c1, r2, c2)| {
-                        let s = match sheet {
-                            None => Some(key.0),
-                            Some(name) => wb.sheet_index(&name),
-                        };
-                        s.map(|s| (s, r1, c1, r2, c2))
-                    })
-                    .collect();
+                let mut deps = Vec::new();
+                collect_deps(wb, key.0, &ast, &mut deps, 0);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
@@ -262,6 +252,34 @@ impl Engine {
     }
 }
 
+/// Dependency rects of an AST, with sheet names resolved and defined names
+/// expanded through the workbook (depth-capped against name→name loops).
+fn collect_deps(wb: &Workbook, sheet: usize, ast: &Expr, out: &mut Vec<Rect>, depth: u32) {
+    let mut named = Vec::new();
+    collect_refs(ast, &mut named);
+    for (sheet_name, r1, c1, r2, c2) in named {
+        let s = match sheet_name {
+            None => Some(sheet),
+            Some(name) => wb.sheet_index(&name),
+        };
+        if let Some(s) = s {
+            out.push((s, r1, c1, r2, c2));
+        }
+    }
+    if depth >= 8 {
+        return;
+    }
+    let mut names = Vec::new();
+    formula::collect_names(ast, &mut names);
+    for n in names {
+        if let Some(def) = wb.defined_name(&n, sheet) {
+            if let Ok(def_ast) = formula::parse(def) {
+                collect_deps(wb, sheet, &def_ast, out, depth + 1);
+            }
+        }
+    }
+}
+
 /// Engine result → stored cell value. A formula referencing an empty cell
 /// yields 0 in Excel (`=Z99` shows 0), so Empty lands as Number(0).
 fn value_to_cell(v: Value) -> CellValue {
@@ -327,6 +345,20 @@ impl Resolver for WbResolver<'_> {
 
     fn today(&self) -> Option<f64> {
         self.clock
+    }
+
+    fn used_size(&self, sheet: usize) -> (u32, u32) {
+        self.wb
+            .sheets
+            .get(sheet)
+            .map(|s| s.used_size())
+            .unwrap_or((0, 0))
+    }
+
+    fn defined_name(&self, name: &str, current_sheet: usize) -> Option<String> {
+        self.wb
+            .defined_name(name, current_sheet)
+            .map(str::to_string)
     }
 
     fn rand(&self) -> Option<f64> {
@@ -433,7 +465,7 @@ mod tests {
                 "B1",
                 Cell {
                     value: CellValue::Number(42.0), // Excel's cached result
-                    formula: Some("XLOOKUP(A1,D1:D3,E1:E3)".to_string()),
+                    formula: Some("SEQUENCE(A1,4)".to_string()),
                     ..Cell::default()
                 },
             ),
@@ -530,6 +562,33 @@ mod tests {
         let mut eng = Engine::new(&wb); // no clock
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(44_000.0));
+    }
+
+    #[test]
+    fn defined_names_and_whole_columns_drive_recalc() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("B1", Cell::formula("SUM(Data)")),
+            ("C1", Cell::formula("SUM(A:A)")),
+        ]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Data".to_string(),
+            scope: None,
+            formula: "Sheet1!$A$1:$A$5".to_string(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(3.0));
+        // An edit inside the named range dirties the SUM through the name.
+        set(&mut eng, &mut wb, "A4", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(13.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(13.0));
+        // Deep in the column (outside the name) only the A:A sum changes.
+        set(&mut eng, &mut wb, "A100", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(13.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(14.0));
     }
 
     #[test]

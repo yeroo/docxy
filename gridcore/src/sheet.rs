@@ -288,10 +288,22 @@ impl Sheet {
 // Workbook
 // ---------------------------------------------------------------------------
 
+/// A workbook-level defined name: `TaxRate` → `0.21`, `Data` →
+/// `Sheet1!$A$1:$B$9`. `scope` restricts the name to one sheet
+/// (`localSheetId`); None = workbook-global.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefinedName {
+    pub name: String,
+    pub scope: Option<usize>,
+    /// The definition as formula text (no leading `=`).
+    pub formula: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     pub sheets: Vec<Sheet>,
     pub styles: Styles,
+    pub defined_names: Vec<DefinedName>,
     /// True when the workbook uses the 1904 date system (Mac legacy).
     pub date1904: bool,
 }
@@ -302,6 +314,18 @@ impl Workbook {
         self.sheets
             .iter()
             .position(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Resolve a defined name as seen from `current_sheet`: a name scoped to
+    /// that sheet shadows a global one (Excel's rule).
+    pub fn defined_name(&self, name: &str, current_sheet: usize) -> Option<&str> {
+        let find = |scope: Option<usize>| {
+            self.defined_names
+                .iter()
+                .find(|d| d.scope == scope && d.name.eq_ignore_ascii_case(name))
+                .map(|d| d.formula.as_str())
+        };
+        find(Some(current_sheet)).or_else(|| find(None))
     }
 }
 

@@ -24,8 +24,8 @@ use opccore::zipwrite::write_zip;
 
 use crate::formula::translate_formula;
 use crate::sheet::{
-    Cell, CellValue, ColDef, NumFmt, Sheet, Styles, Workbook, Xf, cell_name, classify_builtin,
-    classify_format_code, parse_cell_name, parse_range_name,
+    Cell, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Workbook, Xf, cell_name,
+    classify_builtin, classify_format_code, parse_cell_name, parse_range_name,
 };
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -148,8 +148,8 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         }
     };
 
-    // Workbook: sheet list + date system.
-    let (sheet_meta, date1904) = parse_workbook_xml(&wb_xml);
+    // Workbook: sheet list + date system + defined names.
+    let (sheet_meta, date1904, raw_names) = parse_workbook_xml(&wb_xml);
 
     // Shared strings + styles (relative to the workbook dir).
     let shared = rels
@@ -167,21 +167,39 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
 
     let mut sheets = Vec::new();
     let mut sheet_parts = Vec::new();
+    // localSheetId counts workbook.xml order; map it to model indices in
+    // case a sheet part is missing and gets skipped.
+    let mut orig_to_model: Vec<Option<usize>> = Vec::new();
     for (name, rid) in sheet_meta {
         let part = rels
             .iter()
             .find(|(id, _, _)| *id == rid)
             .map(|(_, _, t)| resolve(t));
-        let Some(part) = part else { continue };
-        let Some(xml) = get_str(&part) else { continue };
+        let Some(part) = part else {
+            orig_to_model.push(None);
+            continue;
+        };
+        let Some(xml) = get_str(&part) else {
+            orig_to_model.push(None);
+            continue;
+        };
         let mut sheet = parse_worksheet(&xml, &shared);
         sheet.name = name;
+        orig_to_model.push(Some(sheets.len()));
         sheets.push(sheet);
         sheet_parts.push(part);
     }
     if sheets.is_empty() {
         return Err(XlsxError::MissingWorkbook);
     }
+    let defined_names = raw_names
+        .into_iter()
+        .map(|(name, scope, formula)| DefinedName {
+            name,
+            scope: scope.and_then(|i| orig_to_model.get(i).copied().flatten()),
+            formula,
+        })
+        .collect();
 
     Ok(SheetPackage {
         parts,
@@ -190,6 +208,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         workbook: Workbook {
             sheets,
             styles,
+            defined_names,
             date1904,
         },
     })
@@ -215,11 +234,21 @@ fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// Sheet (name, r:id) pairs plus the 1904 flag from `xl/workbook.xml`.
-fn parse_workbook_xml(xml: &str) -> (Vec<(String, String)>, bool) {
+/// Sheet (name, r:id) pairs, the 1904 flag, and defined names (name, scope,
+/// formula) from `xl/workbook.xml`.
+#[allow(clippy::type_complexity)]
+fn parse_workbook_xml(
+    xml: &str,
+) -> (
+    Vec<(String, String)>,
+    bool,
+    Vec<(String, Option<usize>, String)>,
+) {
     let mut sheets = Vec::new();
     let mut date1904 = false;
+    let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
+    let mut cur_name: Option<(String, Option<usize>, String)> = None;
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -242,13 +271,31 @@ fn parse_workbook_xml(xml: &str) -> (Vec<(String, String)>, bool) {
                     let v = p.attr("date1904");
                     date1904 = v == "1" || v == "true";
                 }
+                "definedName" => {
+                    let scope = p.attr("localSheetId").parse::<usize>().ok();
+                    cur_name = Some((decode(p.attr("name")), scope, String::new()));
+                }
                 _ => {}
             },
+            Event::Text => {
+                if let Some((_, _, f)) = &mut cur_name {
+                    XmlParser::append_decoded(p.text(), f);
+                }
+            }
+            Event::End => {
+                if local(p.name()) == "definedName" {
+                    if let Some(n) = cur_name.take() {
+                        // Skip Excel's internal names (print areas etc.).
+                        if !n.0.starts_with("_xlnm.") && !n.2.is_empty() {
+                            names.push(n);
+                        }
+                    }
+                }
+            }
             Event::Eof => break,
-            _ => {}
         }
     }
-    (sheets, date1904)
+    (sheets, date1904, names)
 }
 
 /// Plain text of each `<si>` (rich-text runs concatenated).
@@ -1171,6 +1218,7 @@ pub fn new_xlsx() -> SheetPackage {
             styles: Styles {
                 xfs: vec![Xf::default()],
             },
+            defined_names: Vec::new(),
             date1904: false,
         },
     }
@@ -1189,7 +1237,7 @@ mod tests {
         let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/></font><font><b/><color rgb="FFFF0000"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="14" fontId="1" applyNumberFormat="1"/></cellXfs></styleSheet>"#;
         let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029"/></workbook>"#;
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="Total">Data!$B$2</definedName><definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$C$3</definedName></definedNames><calcPr calcId="191029"/></workbook>"#;
         let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/></Relationships>"#;
         let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1237,6 +1285,9 @@ mod tests {
         assert_eq!(xf.numfmt, NumFmt::Date);
         assert!(xf.bold);
         assert_eq!(xf.color, Some((255, 0, 0)));
+        // Defined names: real ones load, built-in _xlnm ones are skipped.
+        assert_eq!(wb.defined_names.len(), 1);
+        assert_eq!(wb.defined_name("total", 0), Some("Data!$B$2"));
         // Column width + row attrs + merges.
         assert_eq!(s.col_width(1), 20.0);
         assert!(s.row_attrs.get(&0).unwrap().contains("customHeight"));

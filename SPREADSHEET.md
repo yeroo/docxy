@@ -209,12 +209,12 @@ The strategic piece: **conformance is measured, not claimed.**
 
 ## 9. Phased roadmap
 
-- **Phase A — Foundation (this branch).** `opc` extraction; `gridcore` model +
+- **Phase A — Foundation (this branch)** ✅ *shipped.* `opc` extraction; `gridcore` model +
   lossless xlsx I/O; formula parser/serializer; dependency-graph recalc;
   ~100 functions; `xlsxy` grid TUI; headless `--recalc`/`--csv`; fixtures +
   round-trip tests. *Acceptance:* real workbooks open/edit/save/reopen cleanly
   in Excel; recalc matches cached values on fixtures; docxy untouched.
-- **Phase B — Conformance push.** Corpus oracle harness + scoreboard; function
+- **Phase B — Conformance push** 🔄 *in progress: oracle harness (`--verify` + corpus/xlsx CI gate), whole-row/col refs, defined names, INDIRECT/OFFSET, XLOOKUP/*IFS, date/financial/statistical batch, best-effort TEXT. Remaining: 3D refs, structured table refs, iterative calc, full TEXT()/number-format runtime, corpus growth.* Corpus oracle harness + scoreboard; function
   coverage to ~300 (date/time, statistical, financial, text); defined names,
   whole-row/col refs, 3D refs, structured table refs; `INDIRECT`/`OFFSET`
   dynamic deps; volatile functions; iterative calculation; `TEXT()` and the

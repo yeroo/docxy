@@ -79,13 +79,23 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() {
-                eprintln!("error: headless conversion (--recalc/--csv) requires an input file");
+            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() || parsed.verify {
+                eprintln!("error: headless modes (--recalc/--csv/--verify) require an input file");
                 return ExitCode::from(2);
             }
             (new_xlsx(), "untitled.xlsx".to_string())
         }
     };
+
+    if parsed.verify {
+        let (report, ok) = verify_report(&pkg, &path);
+        print!("{report}");
+        return if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
 
     if let Some(out) = parsed.recalc_out {
         let mut pkg = pkg;
@@ -126,6 +136,7 @@ struct Parsed {
     input: Option<String>,
     recalc_out: Option<String>,
     csv_out: Option<String>,
+    verify: bool,
     help: bool,
 }
 
@@ -134,12 +145,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         input: None,
         recalc_out: None,
         csv_out: None,
+        verify: false,
         help: false,
     };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => p.help = true,
+            "--verify" => p.verify = true,
             "--recalc" => {
                 i += 1;
                 p.recalc_out = Some(args.get(i).ok_or("--recalc needs an output path")?.clone());
@@ -168,7 +181,9 @@ fn print_usage() {
            xlsxy                            new blank workbook\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
-           xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n\n\
+           xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
+           xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
+                                            and diff against Excel's cached values\n\n\
          EDITOR KEYS:\n  \
            type to replace · F2 edit in place · = starts a formula\n  \
            Enter/Tab commit (move down/right) · Esc cancel · Del clear\n  \
@@ -196,6 +211,97 @@ fn entropy_seed() -> Option<u64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_nanos() as u64 | 1)
+}
+
+/// The conformance oracle: every formula cell in a real .xlsx carries the
+/// value Excel last computed. Recalculate everything with our engine and
+/// diff — the resulting scoreboard measures calculation fidelity on real
+/// workbooks and catches semantic regressions.
+fn verify_report(pkg: &SheetPackage, path: &str) -> (String, bool) {
+    use gridcore::formula::{is_volatile, parse};
+    use gridcore::sheet::Workbook;
+
+    let original: &Workbook = &pkg.workbook;
+    let mut wb = pkg.workbook.clone();
+    let mut engine = Engine::new(&wb);
+    engine.clock = now_serial();
+    engine.seed = entropy_seed();
+    engine.recalc_all(&mut wb);
+
+    let mut total = 0usize;
+    let mut matched = 0usize;
+    let mut unsupported = 0usize;
+    let mut volatile = 0usize;
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for (s, sheet) in original.sheets.iter().enumerate() {
+        for (&(r, c), cell) in &sheet.cells {
+            let Some(src) = &cell.formula else { continue };
+            total += 1;
+            if engine.is_unsupported((s, r, c)) {
+                unsupported += 1;
+                continue;
+            }
+            if parse(src).map(|ast| is_volatile(&ast)).unwrap_or(false) {
+                volatile += 1;
+                continue;
+            }
+            let expected = &cell.value;
+            let got = wb.sheets[s]
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or(CellValue::Empty);
+            if values_agree(expected, &got) {
+                matched += 1;
+            } else if mismatches.len() < 20 {
+                mismatches.push(format!(
+                    "  {}!{}: ={src}\n    excel: {expected:?}\n    ours:  {got:?}",
+                    sheet.name,
+                    cell_name(r, c)
+                ));
+            }
+        }
+    }
+
+    let compared = total - unsupported - volatile;
+    let mismatched = compared - matched;
+    let pct = if compared > 0 {
+        matched as f64 / compared as f64 * 100.0
+    } else {
+        100.0
+    };
+    let mut out = format!(
+        "{path}: {total} formula cells\n  \
+         matched      {matched}/{compared} ({pct:.1}%)\n  \
+         mismatched   {mismatched}\n  \
+         unsupported  {unsupported} (kept Excel's cached values)\n  \
+         volatile     {volatile} (excluded: time/random dependent)\n"
+    );
+    if !mismatches.is_empty() {
+        out.push_str("mismatches (first 20):\n");
+        for m in &mismatches {
+            out.push_str(m);
+            out.push('\n');
+        }
+    }
+    (out, mismatched == 0)
+}
+
+/// Cached-vs-recomputed comparison: numbers within 1e-9 relative tolerance
+/// (Excel stores ~15 significant digits), everything else exact.
+fn values_agree(a: &CellValue, b: &CellValue) -> bool {
+    match (a, b) {
+        (CellValue::Number(x), CellValue::Number(y)) => {
+            let scale = x.abs().max(y.abs()).max(1.0);
+            (x - y).abs() <= 1e-9 * scale
+        }
+        // A formula whose cache was never written compares as 0 (Excel
+        // writes 0 for untouched formula results).
+        (CellValue::Empty, CellValue::Number(n)) | (CellValue::Number(n), CellValue::Empty) => {
+            *n == 0.0
+        }
+        _ => a == b,
+    }
 }
 
 // ---------------------------------------------------------------------------
