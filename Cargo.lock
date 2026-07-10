@@ -205,6 +205,9 @@ dependencies = [
 [[package]]
 name = "docxcore"
 version = "0.2.0"
+dependencies = [
+ "opccore",
+]
 
 [[package]]
 name = "docxy"
@@ -306,6 +309,13 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "gridcore"
+version = "0.1.0"
+dependencies = [
+ "opccore",
 ]
 
 [[package]]
@@ -558,6 +568,10 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
 ]
+
+[[package]]
+name = "opccore"
+version = "0.1.0"
 
 [[package]]
 name = "outref"
@@ -1137,6 +1151,15 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xlsxy"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "gridcore",
+ "ratatui",
+]
 
 [[package]]
 name = "zerocopy"

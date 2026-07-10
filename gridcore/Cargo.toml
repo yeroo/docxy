@@ -1,15 +1,16 @@
 [package]
-name = "docxcore"
-description = "Dependency-free DOCX (OOXML) I/O: ZIP, DEFLATE, XML, document model, and PDF export."
-version.workspace = true
+name = "gridcore"
+description = "Dependency-free XLSX (SpreadsheetML) engine: workbook model, lossless I/O, and an Excel-compatible formula/recalculation engine."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 readme = "../README.md"
-keywords = ["docx", "ooxml", "word", "zip", "pdf"]
-categories = ["parser-implementations", "text-processing"]
+keywords = ["xlsx", "excel", "spreadsheet", "ooxml", "formula"]
+categories = ["parser-implementations", "mathematics"]
 
 [lints]
 workspace = true

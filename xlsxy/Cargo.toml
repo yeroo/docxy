@@ -1,0 +1,28 @@
+[package]
+name = "xlsxy"
+description = "Xlsxy — a fast terminal (TUI) viewer and editor for Microsoft Excel .xlsx workbooks, with a real recalculation engine."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["xlsx", "excel", "spreadsheet", "tui", "editor"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "xlsxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Path + version so `xlsxy` can be published once `gridcore` is on crates.io.
+gridcore = { version = "0.1.0", path = "../gridcore" }
+# ratatui re-exports crossterm, so we don't depend on crossterm separately.
+ratatui = "0.29"
+# OS clipboard bridge (copy/paste across applications), same as docxy.
+arboard = "3"

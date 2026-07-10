@@ -6,9 +6,9 @@
 //! (TUI) is built on top of it.
 //!
 //! Layers (built bottom-up):
-//! - [`inflate`] — DEFLATE (RFC 1951) decompressor.
-//! - [`zip`] — read-only ZIP reader (stored + deflate).
-//! - [`xml`] — minimal pull parser tuned for OOXML.
+//! - [`inflate`] — DEFLATE (RFC 1951) decompressor (from `opccore`).
+//! - [`zip`] — read-only ZIP reader (stored + deflate, from `opccore`).
+//! - [`xml`] — minimal pull parser tuned for OOXML (from `opccore`).
 //!
 //! Higher layers:
 //! - [`model`] — the editable document tree.
@@ -16,13 +16,17 @@
 //!
 //! Save and PDF export are added in later phases per `ARCHITECTURE.md`.
 
+// The container plumbing lives in the shared `opccore` crate (it is OPC-level,
+// not Word-specific — `gridcore` builds `.xlsx` support on the same layers).
+// Re-exported here so `docxcore::zip::ZipArchive` etc. keep working.
+pub use opccore::{inflate, xml, zip, zipwrite};
+
 pub mod chart;
 pub mod comments;
 pub mod editor;
 pub mod equation;
 pub mod export;
 pub mod field;
-pub mod inflate;
 pub mod latex;
 pub mod load;
 pub mod markdown;
@@ -35,6 +39,3 @@ pub mod package;
 pub mod render;
 pub mod serialize;
 pub mod styles;
-pub mod xml;
-pub mod zip;
-pub mod zipwrite;
