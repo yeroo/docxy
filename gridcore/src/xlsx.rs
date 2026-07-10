@@ -778,6 +778,14 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         }
     }
 
+    // --- sheet names: the model is authoritative ----------------------------
+    // workbook.xml is otherwise preserved verbatim, so a rename in the model
+    // must be patched into the <sheet name="…"> attributes (in order).
+    if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        p.1 = patch_sheet_names(&xml, &wb.sheets).into_bytes();
+    }
+
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
     if any_formulas {
         parts.retain(|(n, _)| n != "xl/calcChain.xml");
@@ -948,6 +956,50 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
             out.replace_range(start..end, &cols_xml);
         } else if let Some(start) = out.find("<sheetData") {
             out.insert_str(start, &cols_xml);
+        }
+    }
+    out
+}
+
+/// Rewrite the `name` attribute of each `<sheet …>` element (in document
+/// order) from the model's sheet names.
+fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    let mut idx = 0usize;
+    while let Some(pos) = rest.find("<sheet ") {
+        let (head, tail) = rest.split_at(pos);
+        out.push_str(head);
+        let elem_end = tail.find('>').map(|i| i + 1).unwrap_or(tail.len());
+        let elem = &tail[..elem_end];
+        if let (Some(sheet), Some(ns)) = (sheets.get(idx), elem.find("name=\"")) {
+            let vs = ns + "name=\"".len();
+            if let Some(ve) = elem[vs..].find('"') {
+                out.push_str(&elem[..vs]);
+                out.push_str(&esc_attr(&sheet.name));
+                out.push_str(&elem[vs + ve..]);
+            } else {
+                out.push_str(elem);
+            }
+        } else {
+            out.push_str(elem);
+        }
+        idx += 1;
+        rest = &tail[elem_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn esc_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
         }
     }
     out
@@ -1299,6 +1351,15 @@ mod tests {
             s.cell(2, 0).unwrap().value,
             CellValue::Text("  padded  ".into())
         );
+    }
+
+    #[test]
+    fn sheet_rename_persists() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].name = "Budget & Plans".to_string();
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).expect("reload");
+        assert_eq!(pkg2.workbook.sheets[0].name, "Budget & Plans");
     }
 
     #[test]

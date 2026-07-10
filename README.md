@@ -126,6 +126,29 @@ docxy in.md    --docx out.docx  # convert Markdown → Word
 | F8 · F9 | insert landscape · portrait section at cursor |
 | mouse | click to move · click a link to open · wheel/drag to scroll/select |
 
+## Xlsxy — spreadsheets too
+
+The workspace now ships a sibling app: **`xlsxy`**, a terminal editor for
+Microsoft Excel `.xlsx` workbooks built on `gridcore`, a dependency-free
+SpreadsheetML engine with a real **recalculation engine** — a dependency
+graph over your formulas, ~100 Excel functions, Excel-faithful semantics
+(error values, coercions, the 1900 leap-year quirk), and the same lossless
+round-trip guarantee: anything it doesn't model (charts, pivots, conditional
+formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
+Excel's cached results and are saved untouched.
+
+```sh
+xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
+xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
+xlsxy in.xlsx --csv out.csv       # headless: export the first sheet as CSV
+```
+
+Type to replace, `F2` to edit, `=` starts a formula; copy/paste translates
+relative references like Excel; range selections show Sum/Average/Count in
+the status bar. Try it: `cargo run -p gridcore --example gen_sample_xlsx &&
+xlsxy assets/sample.xlsx`. The design and roadmap (conformance scoreboard,
+dynamic arrays, pivot engine) live in [SPREADSHEET.md](SPREADSHEET.md).
+
 ## Install
 
 ```sh
@@ -156,18 +179,24 @@ cargo build --release
 cargo test
 ```
 
-The workspace has two crates:
+The workspace has five crates:
 
-- **`docxcore`** — pure, `std`-only OOXML I/O (ZIP/DEFLATE/XML, the document model,
-  rendering, and the from-scratch PDF writer). No third-party dependencies.
-- **`docxy`** — the terminal UI (ratatui), clipboard (arboard), and image rendering
-  (ratatui-image).
+- **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
+  DEFLATE, XML pull parser) shared by both engines.
+- **`docxcore`** — the WordprocessingML engine (document model, rendering,
+  and the from-scratch PDF writer). No third-party dependencies.
+- **`gridcore`** — the SpreadsheetML engine (workbook model, formula
+  parser/evaluator, dependency-graph recalculation, lossless xlsx I/O).
+- **`docxy`** — the document TUI (ratatui), clipboard (arboard), and image
+  rendering (ratatui-image).
+- **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).
 
 ### Examples
 
 ```sh
 cargo run -p docxcore --example gen_sample [out.docx]   # build the showcase doc
 cargo run -p docxcore --example dump_doc -- assets/sample.docx   # inspect a .docx
+cargo run -p gridcore --example gen_sample_xlsx   # build the showcase workbook
 ```
 
 ## License

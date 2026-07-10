@@ -85,6 +85,12 @@ fn format_for(path: &str) -> DocFormat {
 /// Load a file into a package, parsing Markdown into a numbered package when the
 /// path is a `.md`. Returns the package and the format it was read as.
 fn load_input(path: &str) -> Result<(Package, DocFormat), String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+        return Err(format!(
+            "{path} is a spreadsheet, not a document — try: xlsxy {path}"
+        ));
+    }
     let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     match format_for(path) {
         DocFormat::Markdown => {
