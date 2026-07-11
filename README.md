@@ -139,9 +139,10 @@ number-format runtime, **dynamic arrays** (`FILTER`/`SORT`/`UNIQUE`/
 `SEQUENCE` spill into neighboring cells, `A1#` spill references, `@`,
 `LET`, `#SPILL!` blocking and recovery), **`LAMBDA`** (custom functions via
 defined names, `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`,
-elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh** (a columnar
-group-by/aggregate engine recomputes pivots from current data — `F9` in the
-TUI, automatic under `--recalc`), and the same lossless
+elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh and editing** (a
+columnar group-by/aggregate engine recomputes pivots from current data —
+`F9` in the TUI, automatic under `--recalc`; `Ctrl-P` opens a field editor
+to rearrange rows/columns/values and aggregations), and the same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
 Excel's cached results and are saved untouched.

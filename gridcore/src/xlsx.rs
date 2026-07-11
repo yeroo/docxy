@@ -1031,7 +1031,11 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
     // layout from the same definition on open.
     for piv in &wb.pivots {
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.part) {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            // An edited field layout rewrites the definition wholesale.
+            if piv.edited {
+                xml = crate::pivot::rewrite_pivot_definition(&xml, piv);
+            }
             let (r1, c1, r2, c2) = piv.location;
             let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
             p.1 = patch_ref_attr(&xml, "<location", &full).into_bytes();
@@ -2060,6 +2064,56 @@ mod tests {
             pkg3.workbook.sheets[1].cell(r, c).unwrap().value,
             CellValue::Number(130.0)
         );
+    }
+
+    #[test]
+    fn edited_pivot_round_trips_through_save() {
+        use crate::frame::Agg;
+        use crate::pivot::{DataField, refresh_pivots};
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        // Simulate the TUI editor: rows = Product, value = Average of Sales.
+        {
+            let piv = &mut pkg.workbook.pivots[0];
+            piv.row_fields = vec![1];
+            piv.data_fields = vec![DataField {
+                name: "Average of Sales".into(),
+                field: 2,
+                agg: Agg::Average,
+            }];
+            piv.edited = true;
+        }
+        refresh_pivots(&mut pkg.workbook);
+        let bytes = save_xlsx(&pkg);
+
+        // The rewritten definition survives a reload and refreshes to the
+        // same result.
+        let mut pkg2 = load_xlsx(&bytes).unwrap();
+        let piv = &pkg2.workbook.pivots[0];
+        assert_eq!(piv.row_fields, vec![1]);
+        assert_eq!(piv.data_fields[0].agg, Agg::Average);
+        assert_eq!(piv.data_fields[0].name, "Average of Sales");
+        assert!(!piv.unsupported);
+        refresh_pivots(&mut pkg2.workbook);
+        let report = &pkg2.workbook.sheets[1];
+        let val = |name: &str| {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            report
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        // Products sorted: Ink 30, Pad 20, Pen (10+40)/2 = 25.
+        assert_eq!(val("A3"), CellValue::Text("Product".into()));
+        assert_eq!(val("A4"), CellValue::Text("Ink".into()));
+        assert_eq!(val("B4"), CellValue::Number(30.0));
+        assert_eq!(val("B5"), CellValue::Number(20.0));
+        assert_eq!(val("A6"), CellValue::Text("Pen".into()));
+        assert_eq!(val("B6"), CellValue::Number(25.0));
+        // Grand total of an Average is the average over all records.
+        assert_eq!(val("B7"), CellValue::Number(25.0));
+        // Second save stays deterministic.
+        let again = save_xlsx(&pkg2);
+        assert_eq!(again, save_xlsx(&pkg2));
     }
 
     #[test]

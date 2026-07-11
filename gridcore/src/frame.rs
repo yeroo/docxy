@@ -122,6 +122,23 @@ impl Agg {
         })
     }
 
+    /// The `subtotal` attribute value to store; `None` = sum (omitted).
+    pub fn subtotal_code(&self) -> Option<&'static str> {
+        Some(match self {
+            Agg::Sum => return None,
+            Agg::Count => "count",
+            Agg::CountNums => "countNums",
+            Agg::Average => "average",
+            Agg::Max => "max",
+            Agg::Min => "min",
+            Agg::Product => "product",
+            Agg::StdDev => "stdDev",
+            Agg::StdDevP => "stdDevp",
+            Agg::Var => "var",
+            Agg::VarP => "varp",
+        })
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Agg::Sum => "Sum",

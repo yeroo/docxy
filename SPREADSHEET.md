@@ -253,9 +253,14 @@ The strategic piece: **conformance is measured, not claimed.**
   patches the location ref and sets `refreshOnLoad="1"` so real Excel
   rebuilds its own layout from the same definition. Pivots using features
   we don't model — page filters, hidden items, calculated fields,
-  measures-on-rows — are never refreshed (stale-not-wrong). Remaining:
-  pivot *editing* in the TUI (add/move fields), subtotals, real-Excel
-  pivot corpus files.* Pivot parts parsed (already preserved from A);
+  measures-on-rows — are never refreshed (stale-not-wrong). Pivot *editing*
+  shipped too: `Ctrl-P` opens a field editor in the TUI (add fields to
+  rows/columns/values, remove them, cycle aggregations) with live refresh
+  after every change; save rewrites the edited definition part
+  (regenerated `pivotFields`/`rowFields`/`colFields`/`dataFields`, stale
+  `rowItems`/`colItems` dropped, styles preserved) so the layout round-trips
+  and real Excel rebuilds from it. Remaining: subtotals, creating pivots
+  from scratch, real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
   XML — is the point: it is the aggregation core everything later builds on.

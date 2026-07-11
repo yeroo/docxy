@@ -53,6 +53,9 @@ pub struct Pivot {
     pub grand_cols: bool,
     /// Uses features refresh doesn't model — never refreshed.
     pub unsupported: bool,
+    /// Field layout changed in the editor — save must rewrite the
+    /// definition part (not just patch the location).
+    pub edited: bool,
     /// Part names, for save-time patching.
     pub part: String,
     pub cache_part: String,
@@ -74,6 +77,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         grand_rows: true,
         grand_cols: true,
         unsupported: false,
+        edited: false,
         part: part.to_string(),
         cache_part: String::new(),
     };
@@ -327,6 +331,114 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
     out
 }
 
+/// Rewrite an edited pivot's definition XML: regenerate the field layout
+/// (`pivotFields`/`rowFields`/`colFields`/`dataFields`) from the model and
+/// drop the stale cached layout (`rowItems`/`colItems`). Everything else —
+/// location, styles, formats — is preserved.
+pub fn rewrite_pivot_definition(xml: &str, p: &Pivot) -> String {
+    let mut out = xml.to_string();
+    for tag in [
+        "pivotFields",
+        "rowFields",
+        "rowItems",
+        "colFields",
+        "colItems",
+        "dataFields",
+    ] {
+        out = remove_block(&out, tag);
+    }
+
+    let mut ins = String::new();
+    // pivotFields: one entry per cache field, in cache order.
+    ins.push_str(&format!("<pivotFields count=\"{}\">", p.fields.len()));
+    for i in 0..p.fields.len() {
+        let mut attrs = String::new();
+        if p.row_fields.contains(&i) {
+            attrs.push_str(" axis=\"axisRow\"");
+        } else if p.col_fields.contains(&i) {
+            attrs.push_str(" axis=\"axisCol\"");
+        }
+        if p.data_fields.iter().any(|d| d.field == i) {
+            attrs.push_str(" dataField=\"1\"");
+        }
+        ins.push_str(&format!("<pivotField{attrs} showAll=\"0\"/>"));
+    }
+    ins.push_str("</pivotFields>");
+    if !p.row_fields.is_empty() {
+        ins.push_str(&format!("<rowFields count=\"{}\">", p.row_fields.len()));
+        for &i in &p.row_fields {
+            ins.push_str(&format!("<field x=\"{i}\"/>"));
+        }
+        ins.push_str("</rowFields>");
+    }
+    // With several measures Excel places the "Values" pseudo-field (x = -2)
+    // on the column axis — matching our measures-innermost layout.
+    let values_on_cols = p.data_fields.len() > 1;
+    if !p.col_fields.is_empty() || values_on_cols {
+        let n = p.col_fields.len() + usize::from(values_on_cols);
+        ins.push_str(&format!("<colFields count=\"{n}\">"));
+        for &i in &p.col_fields {
+            ins.push_str(&format!("<field x=\"{i}\"/>"));
+        }
+        if values_on_cols {
+            ins.push_str("<field x=\"-2\"/>");
+        }
+        ins.push_str("</colFields>");
+    }
+    if !p.data_fields.is_empty() {
+        ins.push_str(&format!("<dataFields count=\"{}\">", p.data_fields.len()));
+        for df in &p.data_fields {
+            let sub = df
+                .agg
+                .subtotal_code()
+                .map(|c| format!(" subtotal=\"{c}\""))
+                .unwrap_or_default();
+            ins.push_str(&format!(
+                "<dataField name=\"{}\" fld=\"{}\" baseField=\"0\" baseItem=\"0\"{sub}/>",
+                xml_escape(&df.name),
+                df.field
+            ));
+        }
+        ins.push_str("</dataFields>");
+    }
+
+    // Insert right after the location element (schema order).
+    if let Some(pos) = element_end(&out, "location") {
+        out.insert_str(pos, &ins);
+    }
+    out
+}
+
+/// Byte offset just past the end of the first `<tag …/>` or `<tag …>…</tag>`.
+fn element_end(xml: &str, tag: &str) -> Option<usize> {
+    let start = xml.find(&format!("<{tag}"))?;
+    let gt = start + xml[start..].find('>')?;
+    if xml[..gt].ends_with('/') {
+        return Some(gt + 1);
+    }
+    let close = format!("</{tag}>");
+    let end = gt + xml[gt..].find(&close)?;
+    Some(end + close.len())
+}
+
+/// Remove the first `<tag …/>` or `<tag …>…</tag>` block, if present.
+fn remove_block(xml: &str, tag: &str) -> String {
+    let Some(start) = xml.find(&format!("<{tag}")) else {
+        return xml.to_string();
+    };
+    let Some(end) = element_end(xml, tag) else {
+        return xml.to_string();
+    };
+    format!("{}{}", &xml[..start], &xml[end..])
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn local_name(name: &str) -> &str {
     match name.rfind(':') {
         Some(i) => &name[i + 1..],
@@ -374,6 +486,49 @@ mod tests {
         let (p, _) = parse_pivot_table_xml(with_page, 0, "p").unwrap();
         assert!(p.unsupported);
         assert_eq!(p.data_fields[0].agg, Agg::Average);
+    }
+
+    #[test]
+    fn rewrite_regenerates_field_layout() {
+        let xml = r#"<?xml version="1.0"?><pivotTableDefinition name="P" cacheId="1"><location ref="A3:B6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow"><items count="2"><item x="0"/><item t="default"/></items></pivotField><pivotField/><pivotField dataField="1"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="2"><i><x/></i><i t="grand"><x/></i></rowItems><dataFields count="1"><dataField name="Sum of Sales" fld="2"/></dataFields><pivotTableStyleInfo name="PivotStyleLight16"/></pivotTableDefinition>"#;
+        let (mut piv, _) = parse_pivot_table_xml(xml, 0, "p").unwrap();
+        piv.fields = vec!["Region".into(), "Product".into(), "Sales".into()];
+        // Edit: rows = Product, cols = Region, value = Average of Sales.
+        piv.row_fields = vec![1];
+        piv.col_fields = vec![0];
+        piv.data_fields = vec![DataField {
+            name: "Average of Sales".into(),
+            field: 2,
+            agg: Agg::Average,
+        }];
+        piv.edited = true;
+        let out = rewrite_pivot_definition(xml, &piv);
+        assert!(out.contains(r#"<rowFields count="1"><field x="1"/></rowFields>"#));
+        assert!(out.contains(r#"<colFields count="1"><field x="0"/></colFields>"#));
+        assert!(out.contains(
+            r#"<dataField name="Average of Sales" fld="2" baseField="0" baseItem="0" subtotal="average"/>"#
+        ));
+        assert!(out.contains(r#"<pivotField axis="axisCol" showAll="0"/>"#));
+        assert!(out.contains(r#"<pivotField axis="axisRow" showAll="0"/>"#));
+        assert!(out.contains(r#"<pivotField dataField="1" showAll="0"/>"#));
+        // Stale cached layout dropped; everything else preserved.
+        assert!(!out.contains("rowItems"));
+        assert!(out.contains(r#"<location ref="A3:B6""#));
+        assert!(out.contains("PivotStyleLight16"));
+        // The rewritten definition parses back to the edited model.
+        let (p2, _) = parse_pivot_table_xml(&out, 0, "p").unwrap();
+        assert_eq!(p2.row_fields, vec![1]);
+        assert_eq!(p2.col_fields, vec![0]);
+        assert_eq!(p2.data_fields[0].agg, Agg::Average);
+        assert!(!p2.unsupported);
+        // Two measures put the Values pseudo-field on the column axis.
+        piv.data_fields.push(DataField {
+            name: "Count of Sales".into(),
+            field: 2,
+            agg: Agg::Count,
+        });
+        let out = rewrite_pivot_definition(xml, &piv);
+        assert!(out.contains(r#"<colFields count="2"><field x="0"/><field x="-2"/></colFields>"#));
     }
 
     #[test]

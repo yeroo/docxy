@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
+use gridcore::frame::Agg;
 use gridcore::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, cell_name, col_name, format_with,
     sheet_to_csv,
@@ -35,7 +36,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 fn main() -> ExitCode {
@@ -451,6 +452,14 @@ struct Prompt {
     cursor: usize,
 }
 
+/// The pivot field editor's state: which pivot, which pane (0 = available
+/// fields, 1 = rows, 2 = columns, 3 = values), and the selected entry.
+struct PivotEdit {
+    pivot: usize,
+    pane: usize,
+    sel: usize,
+}
+
 /// An internal clipboard: a rect of cells plus its source corner so pasted
 /// formulas can shift their relative references (Excel semantics).
 #[derive(Clone)]
@@ -480,6 +489,7 @@ struct App {
     confirm_quit: bool,
     confirm_delete_sheet: bool,
     prompt: Option<Prompt>,
+    pivot_edit: Option<PivotEdit>,
     last_find: Option<String>,
     quit: bool,
     // Geometry captured during draw, for mouse hit-testing.
@@ -514,6 +524,7 @@ impl App {
             confirm_quit: false,
             confirm_delete_sheet: false,
             prompt: None,
+            pivot_edit: None,
             last_find: None,
             quit: false,
             grid_area: Rect::default(),
@@ -663,6 +674,190 @@ impl App {
         engine.seed = entropy_seed();
         engine.recalc_all(&mut self.pkg.workbook);
         self.engine = engine;
+    }
+
+    // --- pivot editor -------------------------------------------------------
+
+    /// Ctrl-P — open the field editor for the pivot under the cursor (or the
+    /// first pivot on this sheet / in the workbook).
+    fn open_pivot_editor(&mut self) {
+        let wb = &self.pkg.workbook;
+        if wb.pivots.is_empty() {
+            self.status = Some("No pivot tables in this workbook".to_string());
+            return;
+        }
+        let (r, c) = self.cur;
+        let here = wb.pivots.iter().position(|p| {
+            p.sheet == self.sheet
+                && r >= p.location.0
+                && r <= p.location.2
+                && c >= p.location.1
+                && c <= p.location.3
+        });
+        let idx = here
+            .or_else(|| wb.pivots.iter().position(|p| p.sheet == self.sheet))
+            .unwrap_or(0);
+        if wb.pivots[idx].unsupported {
+            self.status = Some(format!(
+                "Pivot '{}' uses features beyond the editor (filters, calculated fields…) — left on cached values",
+                wb.pivots[idx].name
+            ));
+            return;
+        }
+        self.pivot_edit = Some(PivotEdit {
+            pivot: idx,
+            pane: 0,
+            sel: 0,
+        });
+    }
+
+    /// Items in one editor pane, as display strings.
+    fn pivot_pane_items(&self, pe: &PivotEdit, pane: usize) -> Vec<String> {
+        let p = &self.pkg.workbook.pivots[pe.pivot];
+        match pane {
+            0 => p.fields.clone(),
+            1 => p
+                .row_fields
+                .iter()
+                .map(|&i| p.fields.get(i).cloned().unwrap_or_default())
+                .collect(),
+            2 => p
+                .col_fields
+                .iter()
+                .map(|&i| p.fields.get(i).cloned().unwrap_or_default())
+                .collect(),
+            _ => p.data_fields.iter().map(|d| d.name.clone()).collect(),
+        }
+    }
+
+    /// A layout change happened: recompute the pivot and its dependents.
+    fn apply_pivot_edit(&mut self, pe_pivot: usize) {
+        self.pkg.workbook.pivots[pe_pivot].edited = true;
+        let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+        if !outcome.changed.is_empty() {
+            self.engine
+                .recalc_from(&mut self.pkg.workbook, &outcome.changed);
+        }
+        self.modified = true;
+    }
+
+    /// Key handling inside the pivot editor. Returns None when the editor
+    /// closed.
+    fn pivot_editor_key(&mut self, code: KeyCode) {
+        let Some(mut pe) = self.pivot_edit.take() else {
+            return;
+        };
+        let field_name = |p: &gridcore::pivot::Pivot, i: usize| -> String {
+            p.fields.get(i).cloned().unwrap_or_default()
+        };
+        let mut changed = false;
+        match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.status = Some("Pivot editor closed".to_string());
+                return; // editor stays taken (closed)
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                pe.pane = (pe.pane + 1) % 4;
+                pe.sel = 0;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                pe.pane = (pe.pane + 3) % 4;
+                pe.sel = 0;
+            }
+            KeyCode::Up => pe.sel = pe.sel.saturating_sub(1),
+            KeyCode::Down => {
+                let len = self.pivot_pane_items(&pe, pe.pane).len();
+                pe.sel = (pe.sel + 1).min(len.saturating_sub(1));
+            }
+            // Add the selected available field to an area.
+            KeyCode::Char('r') | KeyCode::Char('c') if pe.pane == 0 => {
+                let p = &mut self.pkg.workbook.pivots[pe.pivot];
+                let i = pe.sel.min(p.fields.len().saturating_sub(1));
+                if !p.row_fields.contains(&i) && !p.col_fields.contains(&i) {
+                    if code == KeyCode::Char('r') {
+                        p.row_fields.push(i);
+                    } else {
+                        p.col_fields.push(i);
+                    }
+                    changed = true;
+                } else {
+                    self.status = Some("Field is already on an axis".to_string());
+                }
+            }
+            KeyCode::Char('v') if pe.pane == 0 => {
+                let p = &mut self.pkg.workbook.pivots[pe.pivot];
+                let i = pe.sel.min(p.fields.len().saturating_sub(1));
+                let name = format!("Sum of {}", field_name(p, i));
+                p.data_fields.push(gridcore::pivot::DataField {
+                    name,
+                    field: i,
+                    agg: Agg::Sum,
+                });
+                changed = true;
+            }
+            // Remove the selected entry from its area.
+            KeyCode::Char('d') | KeyCode::Delete if pe.pane > 0 => {
+                let p = &mut self.pkg.workbook.pivots[pe.pivot];
+                let removed = match pe.pane {
+                    1 if pe.sel < p.row_fields.len() => {
+                        p.row_fields.remove(pe.sel);
+                        true
+                    }
+                    2 if pe.sel < p.col_fields.len() => {
+                        p.col_fields.remove(pe.sel);
+                        true
+                    }
+                    3 if pe.sel < p.data_fields.len() => {
+                        p.data_fields.remove(pe.sel);
+                        true
+                    }
+                    _ => false,
+                };
+                if removed {
+                    let no_values = p.data_fields.is_empty();
+                    if no_values {
+                        // Refresh with zero measures would blank the pivot;
+                        // keep the model consistent but skip the refresh.
+                        p.edited = true;
+                        self.status = Some("A pivot needs at least one value field".to_string());
+                        self.modified = true;
+                    } else {
+                        changed = true;
+                    }
+                    pe.sel = pe.sel.saturating_sub(usize::from(
+                        pe.sel >= self.pivot_pane_items(&pe, pe.pane).len(),
+                    ));
+                }
+            }
+            // Cycle the aggregation of the selected value field.
+            KeyCode::Char('a') if pe.pane == 3 => {
+                let p = &mut self.pkg.workbook.pivots[pe.pivot];
+                let fields = p.fields.clone();
+                if let Some(df) = p.data_fields.get_mut(pe.sel) {
+                    df.agg = match df.agg {
+                        Agg::Sum => Agg::Count,
+                        Agg::Count => Agg::Average,
+                        Agg::Average => Agg::Max,
+                        Agg::Max => Agg::Min,
+                        Agg::Min => Agg::Product,
+                        Agg::Product => Agg::CountNums,
+                        Agg::CountNums => Agg::StdDev,
+                        Agg::StdDev => Agg::StdDevP,
+                        Agg::StdDevP => Agg::Var,
+                        Agg::Var => Agg::VarP,
+                        Agg::VarP => Agg::Sum,
+                    };
+                    let fname = fields.get(df.field).cloned().unwrap_or_default();
+                    df.name = format!("{} of {}", df.agg.label(), fname);
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        if changed {
+            self.apply_pivot_edit(pe.pivot);
+        }
+        self.pivot_edit = Some(pe);
     }
 
     /// F9 — full recalculation plus pivot refresh (like Excel's refresh-all).
@@ -1443,6 +1638,11 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     f.render_widget(Paragraph::new(lines), grid);
 
+    // --- pivot editor overlay -------------------------------------------------
+    if let Some(pe) = &app.pivot_edit {
+        draw_pivot_editor(app, pe, f, grid);
+    }
+
     // --- sheet tabs + stats ---------------------------------------------------
     app.tab_spans.clear();
     let mut tab_spans_ui: Vec<RSpan> = vec![RSpan::raw(" ")];
@@ -1494,7 +1694,10 @@ fn draw(app: &mut App, f: &mut Frame) {
         );
         return;
     }
-    let hint = if app.confirm_quit {
+    let hint = if app.pivot_edit.is_some() {
+        "Pivot: ←/→ pane · ↑/↓ select · r/c/v add to Rows/Cols/Values · d remove · a aggregation · Esc close"
+            .to_string()
+    } else if app.confirm_quit {
         "Unsaved changes — press Ctrl-Q again to quit without saving, Esc to stay".to_string()
     } else if app.confirm_delete_sheet {
         format!(
@@ -1544,6 +1747,57 @@ fn center(s: &str, w: usize) -> String {
     format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - count - lead))
 }
 
+/// The pivot field editor: four panes over a cleared overlay rect.
+fn draw_pivot_editor(app: &App, pe: &PivotEdit, f: &mut Frame, grid: Rect) {
+    let piv = &app.pkg.workbook.pivots[pe.pivot];
+    // Never exceed the grid area (tiny terminals must not underflow).
+    let w = grid.width.min(76);
+    let h = grid.height.min(14);
+    if w < 12 || h < 4 {
+        return;
+    }
+    let x = grid.x + (grid.width - w) / 2;
+    let y = grid.y + (grid.height - h) / 2;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+
+    let col_w = (w as usize - 2) / 4;
+    let titles = ["Fields", "Rows", "Columns", "Values"];
+    let mut lines: Vec<RLine> = Vec::new();
+    lines.push(RLine::from(RSpan::styled(
+        fit(&format!(" Pivot: {}", piv.name), w as usize, false),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )));
+    let mut hdr: Vec<RSpan> = vec![RSpan::raw(" ")];
+    for (i, t) in titles.iter().enumerate() {
+        let style = if i == pe.pane {
+            Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        } else {
+            Style::new().add_modifier(Modifier::BOLD)
+        };
+        hdr.push(RSpan::styled(fit(t, col_w, false), style));
+    }
+    lines.push(RLine::from(hdr));
+    let panes: Vec<Vec<String>> = (0..4).map(|i| app.pivot_pane_items(pe, i)).collect();
+    let rows = h as usize - 3;
+    for row in 0..rows {
+        let mut spans: Vec<RSpan> = vec![RSpan::raw(" ")];
+        for (i, items) in panes.iter().enumerate() {
+            let text = items.get(row).cloned().unwrap_or_default();
+            let mut style = Style::new();
+            if i == pe.pane && row == pe.sel && !text.is_empty() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(RSpan::styled(fit(&text, col_w, false), style));
+        }
+        lines.push(RLine::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(Color::Black).fg(Color::White)),
+        area,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -1586,6 +1840,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         } else {
             app.status = Some("Sheet deletion cancelled".to_string());
         }
+        return false;
+    }
+
+    // --- pivot editor ---------------------------------------------------------
+    if app.pivot_edit.is_some() {
+        app.pivot_editor_key(key.code);
         return false;
     }
 
@@ -1752,6 +2012,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::F(9) => app.recalc_and_refresh(),
+        KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
         KeyCode::F(12) => app.open_prompt(PromptKind::SaveAs),
         KeyCode::F(2) if shift => app.open_prompt(PromptKind::RenameSheet),
         KeyCode::F(5) if shift => app.row_op(false),
@@ -2228,5 +2489,131 @@ mod tests {
         assert_eq!(app.current_input_text(), "=2*3");
         app.cur = (1, 0);
         assert_eq!(app.current_input_text(), "plain");
+    }
+
+    #[test]
+    fn pivot_editor_edits_fields_and_refreshes_live() {
+        use gridcore::pivot::{DataField, Pivot, PivotSource};
+        let mut pkg = new_xlsx();
+        // Data: Region | Sales
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::text("Region"));
+        sh.set_cell(0, 1, Cell::text("Sales"));
+        for (i, (r, v)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)]
+            .iter()
+            .enumerate()
+        {
+            sh.set_cell(i as u32 + 1, 0, Cell::text(r));
+            sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+        }
+        pkg.workbook.pivots.push(Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 3, 0, 3), // D1
+            source: PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 3, 1),
+            },
+            fields: vec!["Region".into(), "Sales".into()],
+            row_fields: vec![0],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Sales".into(),
+                field: 1,
+                agg: gridcore::frame::Agg::Sum,
+            }],
+            grand_rows: true,
+            grand_cols: true,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        });
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app.open_pivot_editor();
+        assert!(app.pivot_edit.is_some());
+
+        // Cycle the value field's aggregation: Values pane, 'a' → Count.
+        app.pivot_editor_key(KeyCode::Tab); // rows
+        app.pivot_editor_key(KeyCode::Tab); // cols
+        app.pivot_editor_key(KeyCode::Tab); // values
+        app.pivot_editor_key(KeyCode::Char('a'));
+        let piv = &app.pkg.workbook.pivots[0];
+        assert_eq!(piv.data_fields[0].agg, gridcore::frame::Agg::Count);
+        assert_eq!(piv.data_fields[0].name, "Count of Sales");
+        assert!(piv.edited);
+        // Live refresh wrote the new output (East 2, West 1, total 3).
+        let val = |app: &App, r: u32, c: u32| {
+            app.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(val(&app, 0, 4), CellValue::Text("Count of Sales".into()));
+        assert_eq!(val(&app, 1, 4), CellValue::Number(2.0));
+        assert_eq!(val(&app, 2, 4), CellValue::Number(1.0));
+        assert_eq!(val(&app, 3, 4), CellValue::Number(3.0));
+
+        // Remove the row field: Rows pane, 'd' → single Total row.
+        app.pivot_editor_key(KeyCode::BackTab);
+        app.pivot_editor_key(KeyCode::BackTab); // rows
+        app.pivot_editor_key(KeyCode::Char('d'));
+        assert!(app.pkg.workbook.pivots[0].row_fields.is_empty());
+        assert_eq!(val(&app, 1, 3), CellValue::Text("Total".into()));
+        assert_eq!(val(&app, 1, 4), CellValue::Number(3.0));
+
+        // Esc closes.
+        app.pivot_editor_key(KeyCode::Esc);
+        assert!(app.pivot_edit.is_none());
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn pivot_editor_overlay_renders_on_small_terminals() {
+        use gridcore::pivot::{DataField, Pivot, PivotSource};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Region"));
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Sales"));
+        pkg.workbook.pivots.push(Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 3, 0, 3),
+            source: PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 1, 1),
+            },
+            fields: vec!["Region".into(), "Sales".into()],
+            row_fields: vec![0],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Sales".into(),
+                field: 1,
+                agg: gridcore::frame::Agg::Sum,
+            }],
+            grand_rows: true,
+            grand_cols: true,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        });
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app.open_pivot_editor();
+        // A comfortable size and pathologically small ones must not panic.
+        for (w, h) in [(100u16, 30u16), (20, 6), (13, 5)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(&mut app, f)).unwrap();
+        }
+        // The overlay shows the pane titles at a normal size.
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Fields"));
+        assert!(text.contains("Values"));
+        assert!(text.contains("Pivot: P"));
     }
 }
