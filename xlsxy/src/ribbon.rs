@@ -120,9 +120,11 @@ const ROW1: usize = 2;
 impl Ribbon {
     pub fn new() -> Ribbon {
         let mut r = Ribbon {
-            tabs: vec!["Home", "Insert", "Review", "View"],
-            active: 0,
+            // "File" has no body — it opens the backstage instead.
+            tabs: vec!["File", "Home", "Insert", "Review", "View"],
+            active: 1,
             tab_groups: vec![
+                Vec::new(),
                 home_groups(),
                 insert_groups(),
                 review_groups(),
@@ -135,6 +137,11 @@ impl Ribbon {
         };
         r.layout();
         r
+    }
+
+    /// Whether tab `i` is the bodyless File tab (opens the backstage).
+    pub fn tab_is_file(&self, i: usize) -> bool {
+        self.tabs.get(i) == Some(&"File")
     }
 
     pub fn set_toggles(&mut self, acts: Vec<Act>) {

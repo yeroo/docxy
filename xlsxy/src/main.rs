@@ -15,6 +15,7 @@ use std::io;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
+mod backstage;
 mod ribbon;
 
 use gridcore::comments::Comment;
@@ -195,12 +196,32 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run_tui(pkg, &path) {
+    let welcome = parsed.inputs.is_empty();
+    match run_tui(pkg, &path, welcome) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Load a workbook from disk (`.xlsx`, or `.csv`/`.tsv` imported as one sheet),
+/// returning the package and the path it should save back to.
+fn load_workbook(path: &str) -> Result<(SheetPackage, String), String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import".to_string());
+        let base = &path[..path.len() - 4];
+        Ok((csv_to_pkg(&text, &stem), format!("{base}.xlsx")))
+    } else {
+        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        let pkg = load_xlsx(&data).map_err(|e| e.to_string())?;
+        Ok((pkg, path.to_string()))
     }
 }
 
@@ -369,6 +390,48 @@ fn iso_now() -> String {
         ),
         None => "1899-12-31T00:00:00Z".to_string(),
     }
+}
+
+/// Welcome-screen menu items (index maps to `start_activate`).
+const START_ITEMS: [(&str, &str); 3] = [
+    ("New workbook", "Start a fresh blank .xlsx"),
+    ("Open…", "Browse for a workbook or CSV"),
+    ("Quit", "Exit xlsxy"),
+];
+
+/// Render the first sheet of a workbook (or a CSV) as preview text lines,
+/// bounded so a huge file can't stall the browser.
+fn preview_lines(path: &str, width: usize) -> Vec<String> {
+    let (pkg, _) = match load_workbook(path) {
+        Ok(x) => x,
+        Err(e) => return vec![format!("(cannot preview: {e})")],
+    };
+    let sheet = &pkg.workbook.sheets[0];
+    let styles = &pkg.workbook.styles;
+    let d1904 = pkg.workbook.date1904;
+    let (rows, cols) = sheet.used_size();
+    let rows = rows.min(40);
+    let cols = cols.clamp(1, 12);
+    let colw = ((width.saturating_sub(1)) / cols as usize).clamp(4, 16);
+    let mut out = Vec::new();
+    for r in 0..rows {
+        let mut line = String::new();
+        for c in 0..cols {
+            let text = sheet
+                .cell(r, c)
+                .map(|cl| format_with(&styles.xf(cl.style), &cl.value, d1904))
+                .unwrap_or_default();
+            line.push_str(&fit(&text, colw, false));
+        }
+        out.push(line.trim_end().to_string());
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push("(empty)".to_string());
+    }
+    out
 }
 
 /// The author name stamped on new comments — the OS user, else "xlsxy".
@@ -641,6 +704,11 @@ struct App {
     comments: Vec<Comment>,
     show_comments: bool,
     comment_sel: usize,
+    // The File backstage (folder browser / preview / info / save-as).
+    backstage: Option<backstage::Backstage>,
+    // The welcome screen shown when launched with no file.
+    start_screen: bool,
+    start_sel: usize,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -689,6 +757,9 @@ impl App {
             comments,
             show_comments: false,
             comment_sel: 0,
+            backstage: None,
+            start_screen: false,
+            start_sel: 0,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -1762,6 +1833,10 @@ impl App {
             KeyCode::Up => self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Up),
             KeyCode::Down => self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Down),
             KeyCode::Enter => match self.ribbon_focus {
+                Focus::Tab(t) if self.ribbon.tab_is_file(t) => {
+                    self.ribbon_focus = Focus::None;
+                    self.open_backstage();
+                }
                 Focus::Tab(t) => {
                     self.ribbon.set_active(t);
                     self.ribbon_focus = self.ribbon.enter_body();
@@ -1807,6 +1882,303 @@ impl App {
             ToggleComments => self.toggle_comments(),
             Todo(name) => self.status = Some(format!("{name}: not implemented yet")),
         }
+    }
+
+    // --- File backstage ------------------------------------------------------
+
+    /// Open the File backstage rooted at the current file's directory.
+    fn open_backstage(&mut self) {
+        let dir = std::path::Path::new(&self.path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        self.backstage = Some(backstage::Backstage::open(dir));
+        self.ribbon_focus = ribbon::Focus::None;
+    }
+
+    /// Replace the whole editing session with a freshly loaded workbook.
+    fn open_workbook(&mut self, path: &str) {
+        match load_workbook(path) {
+            Ok((pkg, p)) => {
+                let (rels, meas) = pkg
+                    .part(MODEL_PART)
+                    .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
+                    .unwrap_or_default();
+                let comments = pkg.comments();
+                let mut engine = Engine::new(&pkg.workbook);
+                engine.clock = now_serial();
+                engine.seed = entropy_seed();
+                self.engine = engine;
+                self.pkg = pkg;
+                self.path = p;
+                self.model_rels = rels;
+                self.model_measures = meas;
+                self.comments = comments;
+                self.reset_view();
+                self.modified = false;
+                self.backstage = None;
+                self.start_screen = false;
+                self.status = Some(format!("Opened {}", self.path));
+            }
+            Err(e) => self.status = Some(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Start a fresh blank workbook (discarding the current one).
+    fn new_workbook(&mut self) {
+        let pkg = new_xlsx();
+        let mut engine = Engine::new(&pkg.workbook);
+        engine.clock = now_serial();
+        engine.seed = entropy_seed();
+        self.engine = engine;
+        self.pkg = pkg;
+        self.path = "untitled.xlsx".to_string();
+        self.model_rels = Vec::new();
+        self.model_measures = Vec::new();
+        self.comments = Vec::new();
+        self.reset_view();
+        self.modified = false;
+        self.backstage = None;
+        self.start_screen = false;
+        self.status = Some("New workbook".to_string());
+    }
+
+    fn reset_view(&mut self) {
+        self.sheet = 0;
+        self.cur = (0, 0);
+        self.top = 0;
+        self.left = 0;
+        self.anchor = None;
+        self.edit = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.comment_sel = 0;
+    }
+
+    /// Export the current sheet to a `.csv` next to the workbook.
+    fn export_csv(&mut self) {
+        let csv = sheet_to_csv(
+            self.sheet(),
+            &self.pkg.workbook.styles,
+            self.pkg.workbook.date1904,
+        );
+        let out = match self.path.rsplit_once('.') {
+            Some((base, _)) => format!("{base}.csv"),
+            None => format!("{}.csv", self.path),
+        };
+        match std::fs::write(&out, csv.as_bytes()) {
+            Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
+            Err(e) => self.status = Some(format!("Export failed: {e}")),
+        }
+        self.backstage = None;
+    }
+
+    /// Fill the backstage preview with the highlighted workbook's first sheet.
+    fn bs_update_preview(&mut self, width: usize) {
+        let Some(bs) = &self.backstage else { return };
+        let path = bs.selected_file();
+        // Nothing to do if the same file at the same width is already rendered.
+        if bs.preview_path == path && bs.preview_w == width && !bs.preview.is_empty() {
+            return;
+        }
+        let lines = match &path {
+            Some(p) => preview_lines(&p.to_string_lossy(), width),
+            None => Vec::new(),
+        };
+        if let Some(bs) = &mut self.backstage {
+            bs.preview = lines;
+            bs.preview_path = path;
+            bs.preview_w = width;
+            bs.preview_scroll = 0;
+        }
+    }
+
+    /// Route a key to the backstage. Returns true when the app should exit.
+    fn backstage_key(&mut self, code: KeyCode) -> bool {
+        use backstage::{Item, Pane};
+        let Some(bs) = &mut self.backstage else {
+            return false;
+        };
+        match bs.pane {
+            Pane::Menu => match code {
+                KeyCode::Esc => self.backstage = None,
+                KeyCode::Up => {
+                    let i = backstage::ITEMS
+                        .iter()
+                        .position(|x| *x == bs.item)
+                        .unwrap_or(0);
+                    bs.item = backstage::ITEMS[i.saturating_sub(1)];
+                }
+                KeyCode::Down => {
+                    let i = backstage::ITEMS
+                        .iter()
+                        .position(|x| *x == bs.item)
+                        .unwrap_or(0);
+                    bs.item = backstage::ITEMS[(i + 1).min(backstage::ITEMS.len() - 1)];
+                }
+                KeyCode::Enter | KeyCode::Right => return self.bs_activate_item(),
+                _ => {}
+            },
+            Pane::Browser => match code {
+                KeyCode::Esc | KeyCode::Tab => bs.pane = Pane::Menu,
+                KeyCode::Up => bs.move_sel(false),
+                KeyCode::Down => bs.move_sel(true),
+                KeyCode::Left | KeyCode::Backspace => bs.go_up(),
+                KeyCode::Enter | KeyCode::Right => {
+                    if let Some(path) = bs.enter() {
+                        let p = path.to_string_lossy().into_owned();
+                        self.open_workbook(&p);
+                    }
+                }
+                _ => {}
+            },
+            Pane::Preview => match code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Tab => bs.pane = Pane::Browser,
+                KeyCode::Up => bs.preview_scroll = bs.preview_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    bs.preview_scroll =
+                        (bs.preview_scroll + 1).min(bs.preview.len().saturating_sub(1))
+                }
+                _ => {}
+            },
+            Pane::SaveAs => return self.bs_saveas_key(code),
+        }
+        // Reflect Open/Info highlighting into the item field.
+        if let Some(bs) = &mut self.backstage {
+            if bs.pane == Pane::Menu && matches!(code, KeyCode::Up | KeyCode::Down) {
+                // Sync the right pane to the highlighted item.
+                if bs.item == Item::Open || bs.item == Item::Info {
+                    bs.preview_path = None; // force a refresh next draw
+                }
+            }
+        }
+        false
+    }
+
+    /// Activate the highlighted backstage menu item. Returns true to exit.
+    fn bs_activate_item(&mut self) -> bool {
+        use backstage::{Item, Pane};
+        let Some(bs) = &mut self.backstage else {
+            return false;
+        };
+        match bs.item {
+            Item::New => self.new_workbook(),
+            Item::Open => bs.pane = Pane::Browser,
+            Item::Info => bs.pane = Pane::Preview,
+            Item::Save => {
+                self.save();
+                self.backstage = None;
+            }
+            Item::SaveAs => {
+                bs.name_input = std::path::Path::new(&self.path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled.xlsx".to_string());
+                bs.name_cursor = bs.name_input.chars().count();
+                bs.name_focus = true;
+                bs.pane = Pane::SaveAs;
+            }
+            Item::Export => self.export_csv(),
+            Item::Exit => {
+                if self.modified {
+                    self.confirm_quit = true;
+                    self.backstage = None;
+                } else {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Save As pane: type a name (or browse to a folder) then commit.
+    fn bs_saveas_key(&mut self, code: KeyCode) -> bool {
+        use backstage::Pane;
+        let Some(bs) = &mut self.backstage else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => bs.pane = backstage::Pane::Menu,
+            KeyCode::Tab => bs.name_focus = !bs.name_focus,
+            KeyCode::Enter => {
+                let name = bs.name_input.trim().to_string();
+                if name.is_empty() {
+                    return false;
+                }
+                let full = bs.dir.join(&name);
+                self.path = full.to_string_lossy().into_owned();
+                self.backstage = None;
+                self.save();
+                return false;
+            }
+            _ if bs.name_focus => match code {
+                KeyCode::Left => bs.name_cursor = bs.name_cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    bs.name_cursor = (bs.name_cursor + 1).min(bs.name_input.chars().count())
+                }
+                KeyCode::Backspace => {
+                    if bs.name_cursor > 0 {
+                        let idx = char_index(&bs.name_input, bs.name_cursor - 1);
+                        bs.name_input.remove(idx);
+                        bs.name_cursor -= 1;
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    let idx = char_index(&bs.name_input, bs.name_cursor);
+                    bs.name_input.insert(idx, ch);
+                    bs.name_cursor += 1;
+                }
+                _ => {}
+            },
+            KeyCode::Up => bs.move_sel(false),
+            KeyCode::Down => bs.move_sel(true),
+            KeyCode::Left | KeyCode::Backspace => bs.go_up(),
+            KeyCode::Right => {
+                if let Some(e) = bs.selected() {
+                    if e.is_dir {
+                        bs.enter();
+                    }
+                }
+            }
+            _ => {}
+        }
+        let _ = Pane::Menu;
+        false
+    }
+
+    // --- welcome / start screen ----------------------------------------------
+
+    /// Route a key on the welcome screen. Returns true to exit.
+    fn start_screen_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Up => self.start_sel = self.start_sel.saturating_sub(1),
+            KeyCode::Down => self.start_sel = (self.start_sel + 1).min(START_ITEMS.len() - 1),
+            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Char(c @ '1'..='3') => {
+                self.start_sel = c as usize - '1' as usize;
+                return self.start_activate();
+            }
+            KeyCode::Enter => return self.start_activate(),
+            _ => {}
+        }
+        false
+    }
+
+    fn start_activate(&mut self) -> bool {
+        match self.start_sel {
+            0 => self.new_workbook(), // New workbook
+            1 => {
+                // Open → jump into the backstage browser.
+                self.start_screen = false;
+                self.open_backstage();
+                if let Some(bs) = &mut self.backstage {
+                    bs.pane = backstage::Pane::Browser;
+                }
+            }
+            _ => return true, // Quit
+        }
+        false
     }
 
     fn clear_selection(&mut self) {
@@ -2240,6 +2612,17 @@ fn draw(app: &mut App, f: &mut Frame) {
     if area.height < 8 || area.width < 12 {
         return;
     }
+    // Full-screen surfaces paint over everything else.
+    if app.start_screen {
+        draw_start_screen(app, f, area);
+        return;
+    }
+    if app.backstage.is_some() {
+        let preview_w = (area.width as usize * 6 / 10).max(10);
+        app.bs_update_preview(preview_w);
+        draw_backstage(app, f, area);
+        return;
+    }
     // --- ribbon (tab strip, plus body + hint when engaged) --------------------
     let toggles = app.ribbon_toggles();
     app.ribbon.set_toggles(toggles);
@@ -2606,6 +2989,225 @@ fn draw_pivot_editor(app: &App, pe: &PivotEdit, f: &mut Frame, grid: Rect) {
     );
 }
 
+/// The welcome screen shown when launched with no file.
+fn draw_start_screen(app: &App, f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let w = 52u16.min(area.width.saturating_sub(2));
+    let h = (START_ITEMS.len() as u16 + 6).min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 3;
+    let mut lines: Vec<RLine> = vec![
+        RLine::from(RSpan::styled(
+            "  xlsxy",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        RLine::from(RSpan::styled(
+            "  a terminal spreadsheet editor with a real calc engine",
+            Style::new().add_modifier(Modifier::DIM),
+        )),
+        RLine::from(""),
+    ];
+    for (i, (label, desc)) in START_ITEMS.iter().enumerate() {
+        let sel = i == app.start_sel;
+        let style = if sel {
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(RLine::from(vec![
+            RSpan::styled(format!("  {}. {label}", i + 1), style),
+            RSpan::styled(
+                format!("   {desc}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    lines.push(RLine::from(""));
+    lines.push(RLine::from(RSpan::styled(
+        "  ↑↓ select · Enter open · 1-3 · Esc quit",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    f.render_widget(Paragraph::new(lines), Rect::new(x, y, w, h));
+}
+
+/// The File backstage: a left menu, plus a folder browser + workbook preview
+/// (or the Info screen).
+fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
+    use backstage::{Item, Pane};
+    let Some(bs) = &app.backstage else { return };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(RLine::from(RSpan::styled(
+            fit(" File", area.width as usize, false),
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let menu_w = 16u16.min(area.width / 2);
+    let body_y = area.y + 2;
+    let body_h = area.height.saturating_sub(3);
+    let mut mlines: Vec<RLine> = Vec::new();
+    for it in backstage::ITEMS {
+        let selected = it == bs.item;
+        let style = if selected && bs.pane == Pane::Menu {
+            Style::new().fg(Color::Black).bg(Color::White)
+        } else if selected {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        mlines.push(RLine::from(RSpan::styled(
+            fit(&format!("  {}", it.label()), menu_w as usize, false),
+            style,
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(mlines),
+        Rect::new(area.x, body_y, menu_w, body_h),
+    );
+
+    let right = Rect::new(area.x + menu_w + 1, body_y, area.width - menu_w - 1, body_h);
+    if bs.item == Item::Info {
+        draw_bs_info(app, f, right);
+    } else {
+        draw_bs_browser(f, right, bs);
+    }
+
+    let hint = match bs.pane {
+        Pane::Menu => "↑↓ menu · Enter choose · Esc close",
+        Pane::Browser => "↑↓ files · Enter open · ← up · Tab menu · Esc back",
+        Pane::Preview => "↑↓ scroll · Esc back",
+        Pane::SaveAs => "type name · Tab switch field · Enter save · Esc back",
+    };
+    f.render_widget(
+        Paragraph::new(RLine::styled(
+            fit(hint, area.width as usize, false),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        )),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    );
+}
+
+fn draw_bs_info(app: &App, f: &mut Frame, area: Rect) {
+    let wb = &app.pkg.workbook;
+    let sheets: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    let info = |k: &str, v: String| {
+        RLine::from(vec![
+            RSpan::styled(
+                format!("  {k:<12}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+            RSpan::raw(v),
+        ])
+    };
+    let lines = vec![
+        RLine::from(RSpan::styled(
+            "  Info",
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        RLine::from(""),
+        info("Path", app.path.clone()),
+        info(
+            "Modified",
+            if app.modified { "yes" } else { "no" }.to_string(),
+        ),
+        info(
+            "Sheets",
+            format!("{} ({})", sheets.len(), sheets.join(", ")),
+        ),
+        info("Comments", app.comments.len().to_string()),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
+    use backstage::Pane;
+    let list_w = (area.width * 4 / 10).clamp(18, area.width.saturating_sub(10));
+    let mut y = area.y;
+    // Current directory.
+    f.render_widget(
+        Paragraph::new(RLine::styled(
+            fit(&bs.dir.to_string_lossy(), list_w as usize, false),
+            Style::new().add_modifier(Modifier::DIM),
+        )),
+        Rect::new(area.x, y, list_w, 1),
+    );
+    y += 1;
+    // Save As name field.
+    if bs.pane == Pane::SaveAs {
+        let field_style = if bs.name_focus {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        f.render_widget(
+            Paragraph::new(RLine::from(vec![
+                RSpan::styled("name: ", Style::new().add_modifier(Modifier::DIM)),
+                RSpan::styled(bs.name_input.clone(), field_style),
+            ])),
+            Rect::new(area.x, y, list_w, 1),
+        );
+        y += 1;
+    }
+    let list = Rect::new(area.x, y, list_w, area.y + area.height - y);
+    let list_focused =
+        matches!(bs.pane, Pane::Browser) || (bs.pane == Pane::SaveAs && !bs.name_focus);
+    let vis = list.height.max(1) as usize;
+    let top = bs.sel.saturating_sub(vis.saturating_sub(1));
+    let mut lines: Vec<RLine> = Vec::new();
+    for (i, e) in bs.entries.iter().enumerate().skip(top).take(vis) {
+        let mark = if e.is_dir { "▸ " } else { "  " };
+        let size = e.size_str();
+        let label = fit(
+            &format!("{mark}{}", e.name),
+            list_w as usize - size.len() - 1,
+            false,
+        );
+        let base = if e.locked {
+            Style::new().add_modifier(Modifier::DIM)
+        } else if e.is_dir {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        let style = if i == bs.sel && list_focused {
+            base.add_modifier(Modifier::REVERSED)
+        } else {
+            base
+        };
+        lines.push(RLine::from(vec![
+            RSpan::styled(label, style),
+            RSpan::styled(format!(" {size}"), Style::new().add_modifier(Modifier::DIM)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+
+    // Preview to the right.
+    let prev = Rect::new(
+        area.x + list_w + 1,
+        area.y,
+        area.width - list_w - 1,
+        area.height,
+    );
+    let mut plines: Vec<RLine> = vec![RLine::from(RSpan::styled(
+        "Preview",
+        Style::new().add_modifier(Modifier::DIM),
+    ))];
+    for l in bs
+        .preview
+        .iter()
+        .skip(bs.preview_scroll)
+        .take(prev.height.saturating_sub(1) as usize)
+    {
+        plines.push(RLine::from(RSpan::raw(fit(l, prev.width as usize, false))));
+    }
+    f.render_widget(Paragraph::new(plines), prev);
+}
+
 /// The data-model view: tables summary plus relationship/measure panes.
 fn draw_model_view(app: &App, pane: usize, sel: usize, f: &mut Frame, grid: Rect) {
     let w = grid.width.min(76);
@@ -2783,6 +3385,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     app.status = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Full-screen surfaces own the keyboard entirely.
+    if app.start_screen {
+        return app.start_screen_key(key.code);
+    }
+    if app.backstage.is_some() {
+        return app.backstage_key(key.code);
+    }
 
     if app.confirm_quit {
         match key.code {
@@ -2988,6 +3599,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('v') | KeyCode::Char('V') if ctrl => app.paste(),
         KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(true),
         KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(false),
+        KeyCode::Char('f') | KeyCode::Char('F') if alt => app.open_backstage(),
+        KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
+            app.open_backstage();
+            if let Some(bs) = &mut app.backstage {
+                bs.pane = backstage::Pane::Browser;
+            }
+        }
         KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
         KeyCode::Char('t') | KeyCode::Char('T') if ctrl => app.open_prompt(PromptKind::AddSheet),
         KeyCode::F(3) => {
@@ -3122,6 +3740,9 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             if !drag && m.row < app.ribbon_rows {
                 let expanded = app.ribbon_focus != ribbon::Focus::None;
                 match app.ribbon.hit(m.column, m.row, expanded) {
+                    ribbon::Hit::Tab(t) if app.ribbon.tab_is_file(t) => {
+                        app.open_backstage();
+                    }
                     ribbon::Hit::Tab(t) => {
                         app.ribbon.set_active(t);
                         app.ribbon_focus = ribbon::Focus::Tab(t);
@@ -3191,7 +3812,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 // Terminal shell
 // ---------------------------------------------------------------------------
 
-fn run_tui(pkg: SheetPackage, path: &str) -> io::Result<()> {
+fn run_tui(pkg: SheetPackage, path: &str, welcome: bool) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -3206,6 +3827,7 @@ fn run_tui(pkg: SheetPackage, path: &str) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path);
+    app.start_screen = welcome;
     let result = loop {
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
             break Err(e);
@@ -3328,6 +3950,47 @@ mod tests {
         let cs = reloaded.comments();
         assert_eq!(cs.iter().filter(|c| c.threaded).count(), 2);
         assert_eq!(cs.iter().filter(|c| !c.threaded).count(), 1);
+    }
+
+    #[test]
+    fn backstage_open_and_new_workbook() {
+        let tmp = std::env::temp_dir().join("xlsxy_open_flow.xlsx");
+        // Author a workbook with a value and save it.
+        let mut src = App::new(new_xlsx(), tmp.to_str().unwrap());
+        src.os_clip = None;
+        src.start_edit(Some('7'));
+        assert!(src.commit_edit());
+        src.save();
+
+        // A different session opens it.
+        let mut app = App::new(new_xlsx(), "other.xlsx");
+        app.os_clip = None;
+        app.open_workbook(tmp.to_str().unwrap());
+        assert_eq!(app.path, tmp.to_str().unwrap());
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(7.0))
+        );
+        assert!(!app.modified);
+
+        // New workbook wipes back to a blank untitled sheet.
+        app.new_workbook();
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(app.sheet().cell(0, 0).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn start_screen_activation() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.start_screen = true;
+        app.start_sel = 0; // New workbook
+        assert!(!app.start_activate());
+        assert!(!app.start_screen);
+        // Quit returns true (exit).
+        app.start_screen = true;
+        app.start_sel = 2;
+        assert!(app.start_activate());
     }
 
     #[test]
