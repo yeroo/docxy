@@ -45,6 +45,11 @@ pub enum Act {
     PrevComment,
     NextComment,
     ToggleComments,
+    /// View toggles.
+    FormulaView,
+    FreezePanes,
+    ThemeToggle,
+    AutoHideRibbon,
     Todo(&'static str),
 }
 
@@ -623,19 +628,52 @@ fn review_groups() -> Vec<Group> {
 
 fn view_groups() -> Vec<Group> {
     use Act::*;
-    vec![Group {
-        title: "Show",
-        width: 12,
-        rows: [
-            vec![btn(
-                "▤ Comments",
-                10,
-                ToggleComments,
-                "Show/hide the comments panel",
-            )],
-            vec![],
-        ],
-    }]
+    vec![
+        Group {
+            title: "Show",
+            width: 20,
+            rows: [
+                vec![btn(
+                    "ƒ Formulas",
+                    10,
+                    FormulaView,
+                    "Show formulas instead of values (Ctrl+`)",
+                )],
+                vec![btn(
+                    "❄ Freeze",
+                    8,
+                    FreezePanes,
+                    "Freeze panes at the cursor (toggle)",
+                )],
+            ],
+        },
+        Group {
+            title: "Window",
+            width: 14,
+            rows: [
+                vec![btn("◐ Theme", 7, ThemeToggle, "Toggle light / dark theme")],
+                vec![btn(
+                    "⬒ Auto-hide",
+                    11,
+                    AutoHideRibbon,
+                    "Auto-hide the ribbon after each use",
+                )],
+            ],
+        },
+        Group {
+            title: "Panel",
+            width: 12,
+            rows: [
+                vec![btn(
+                    "▤ Comments",
+                    10,
+                    ToggleComments,
+                    "Show/hide the comments panel",
+                )],
+                vec![],
+            ],
+        },
+    ]
 }
 
 #[cfg(test)]

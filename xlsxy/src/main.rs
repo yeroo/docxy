@@ -434,6 +434,15 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Path of the persisted view-preferences file (XDG / APPDATA).
+fn view_prefs_path() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
+    Some(dir.join("xlsxy").join("view.conf"))
+}
+
 /// The author name stamped on new comments — the OS user, else "xlsxy".
 fn comment_author() -> String {
     std::env::var("USER")
@@ -758,10 +767,17 @@ struct App {
     start_sel: usize,
     // The formatting popup (number format / font & fill color).
     format_picker: Option<FormatPicker>,
+    // View preferences (persisted to a config file).
+    formula_view: bool,
+    light_theme: bool,
+    auto_hide_ribbon: bool,
+    /// Frozen (rows, cols) that stay pinned while scrolling.
+    freeze: (u32, u32),
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
     vis_cols: Vec<(u32, u16, u16)>, // (col, x, width)
+    vis_rows: Vec<u32>,             // sheet row per screen line (freeze-aware)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
 }
@@ -810,9 +826,14 @@ impl App {
             start_screen: false,
             start_sel: 0,
             format_picker: None,
+            formula_view: false,
+            light_theme: false,
+            auto_hide_ribbon: false,
+            freeze: (0, 0),
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
+            vis_rows: Vec::new(),
             tab_spans: Vec::new(),
             ribbon_rows: 1,
         }
@@ -1860,6 +1881,18 @@ impl App {
         if self.show_comments {
             v.push(ribbon::Act::ToggleComments);
         }
+        if self.formula_view {
+            v.push(ribbon::Act::FormulaView);
+        }
+        if self.freeze != (0, 0) {
+            v.push(ribbon::Act::FreezePanes);
+        }
+        if self.light_theme {
+            v.push(ribbon::Act::ThemeToggle);
+        }
+        if self.auto_hide_ribbon {
+            v.push(ribbon::Act::AutoHideRibbon);
+        }
         v
     }
 
@@ -2003,6 +2036,90 @@ impl App {
         }
     }
 
+    // --- view toggles --------------------------------------------------------
+
+    fn base_style(&self) -> Style {
+        if self.light_theme {
+            Style::new().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::new()
+        }
+    }
+
+    fn toggle_formula_view(&mut self) {
+        self.formula_view = !self.formula_view;
+        self.status = Some(
+            if self.formula_view {
+                "Showing formulas"
+            } else {
+                "Showing values"
+            }
+            .to_string(),
+        );
+    }
+
+    fn toggle_freeze(&mut self) {
+        if self.freeze == (0, 0) {
+            self.freeze = self.cur;
+            self.status = Some(if self.cur == (0, 0) {
+                "Nothing to freeze at A1".to_string()
+            } else {
+                format!("Froze {} row(s), {} col(s)", self.cur.0, self.cur.1)
+            });
+        } else {
+            self.freeze = (0, 0);
+            self.status = Some("Unfroze panes".to_string());
+        }
+    }
+
+    fn toggle_theme(&mut self) {
+        self.light_theme = !self.light_theme;
+        self.status = Some(
+            if self.light_theme {
+                "Light theme"
+            } else {
+                "Dark theme"
+            }
+            .to_string(),
+        );
+    }
+
+    /// Load persisted view preferences (best effort).
+    fn load_view_prefs(&mut self) {
+        let Some(p) = view_prefs_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return;
+        };
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let on = v.trim() == "1";
+                match k.trim() {
+                    "formula_view" => self.formula_view = on,
+                    "light_theme" => self.light_theme = on,
+                    "auto_hide_ribbon" => self.auto_hide_ribbon = on,
+                    "show_comments" => self.show_comments = on,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Persist view preferences (best effort; freeze is per-file, not saved).
+    fn save_view_prefs(&self) {
+        let Some(p) = view_prefs_path() else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = format!(
+            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
+            self.formula_view as u8,
+            self.light_theme as u8,
+            self.auto_hide_ribbon as u8,
+            self.show_comments as u8,
+        );
+        let _ = std::fs::write(&p, body);
+    }
+
     /// Dispatch a ribbon command to the matching editor operation.
     fn ribbon_act(&mut self, act: ribbon::Act) {
         use ribbon::Act::*;
@@ -2038,6 +2155,20 @@ impl App {
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
             ToggleComments => self.toggle_comments(),
+            FormulaView => self.toggle_formula_view(),
+            FreezePanes => self.toggle_freeze(),
+            ThemeToggle => self.toggle_theme(),
+            AutoHideRibbon => {
+                self.auto_hide_ribbon = !self.auto_hide_ribbon;
+                self.status = Some(
+                    if self.auto_hide_ribbon {
+                        "Ribbon auto-hide on"
+                    } else {
+                        "Ribbon auto-hide off"
+                    }
+                    .to_string(),
+                );
+            }
             Todo(name) => self.status = Some(format!("{name}: not implemented yet")),
         }
     }
@@ -2785,14 +2916,22 @@ fn draw(app: &mut App, f: &mut Frame) {
     let toggles = app.ribbon_toggles();
     app.ribbon.set_toggles(toggles);
     let engaged = app.ribbon_focus != ribbon::Focus::None;
-    let ribbon_h: u16 = if engaged { 7 } else { 1 };
+    let ribbon_h: u16 = if engaged {
+        7
+    } else if app.auto_hide_ribbon {
+        0 // auto-hide reclaims the tab strip line for the grid
+    } else {
+        1
+    };
     app.ribbon_rows = ribbon_h;
     let mut y = area.y;
-    f.render_widget(
-        Paragraph::new(app.ribbon.render_tabs(app.ribbon_focus)),
-        Rect::new(area.x, y, area.width, 1),
-    );
-    y += 1;
+    if ribbon_h >= 1 {
+        f.render_widget(
+            Paragraph::new(app.ribbon.render_tabs(app.ribbon_focus)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
     if engaged {
         let body = app.ribbon.render_body(app.ribbon_focus);
         f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 5));
@@ -2826,21 +2965,54 @@ fn draw(app: &mut App, f: &mut Frame) {
     };
     app.grid_area = grid;
 
+    // Freeze: keep the scroll origin at or past the frozen region.
+    let (fr, fc) = app.freeze;
+    if app.left < fc {
+        app.left = fc;
+    }
+    if app.top < fr {
+        app.top = fr;
+    }
+
     // Row gutter sized for the largest visible row number.
     let max_row = app.top + grid.height as u32;
     app.gutter_w = (max_row + 1).to_string().len().max(3) as u16 + 1;
 
-    // Visible columns.
+    // Visible columns: frozen columns (0..fc) pinned, then scrollable from left.
     app.vis_cols.clear();
     {
         let mut x = app.gutter_w;
-        let mut col = app.left;
-        while x < grid.width && col < MAX_COLS {
-            let w = app.col_disp_width(col).min(grid.width - x);
-            app.vis_cols.push((col, x, w));
-            x += w;
+        let push = |app: &mut App, col: u32, x: &mut u16| {
+            if *x < grid.width && col < MAX_COLS {
+                let w = app.col_disp_width(col).min(grid.width - *x);
+                app.vis_cols.push((col, *x, w));
+                *x += w;
+                true
+            } else {
+                false
+            }
+        };
+        for col in 0..fc {
+            push(app, col, &mut x);
+        }
+        let mut col = app.left.max(fc);
+        while push(app, col, &mut x) {
             col += 1;
         }
+    }
+
+    // Visible rows: frozen rows (0..fr) pinned, then scrollable from top.
+    app.vis_rows.clear();
+    for row in 0..fr {
+        if app.vis_rows.len() >= grid.height as usize {
+            break;
+        }
+        app.vis_rows.push(row);
+    }
+    let mut row = app.top.max(fr);
+    while app.vis_rows.len() < grid.height as usize && row < MAX_ROWS {
+        app.vis_rows.push(row);
+        row += 1;
     }
 
     // --- formula bar --------------------------------------------------------
@@ -2900,12 +3072,14 @@ fn draw(app: &mut App, f: &mut Frame) {
         .filter(|c| c.sheet == cur_sheet)
         .map(|c| (c.row, c.col))
         .collect();
+    let base = app.base_style();
+    let formula_view = app.formula_view;
+    let vis_rows = app.vis_rows.clone();
     let sheet = app.sheet();
     let styles = &app.pkg.workbook.styles;
     let date1904 = app.pkg.workbook.date1904;
     let mut lines: Vec<RLine> = Vec::with_capacity(grid.height as usize);
-    for vy in 0..grid.height {
-        let row = app.top + vy as u32;
+    for &row in &vis_rows {
         let mut spans: Vec<RSpan> = Vec::with_capacity(app.vis_cols.len() + 1);
         let gut_style = if row == r { HDR_CUR } else { HDR_STYLE };
         spans.push(RSpan::styled(
@@ -2916,18 +3090,26 @@ fn draw(app: &mut App, f: &mut Frame) {
             let cell = sheet.cell(row, col);
             let xf = cell.map(|cl| styles.xf(cl.style)).unwrap_or_default();
             let text = match cell {
+                Some(cl) if formula_view && cl.formula.is_some() => {
+                    format!("={}", cl.formula.as_ref().unwrap())
+                }
                 Some(cl) => format_with(&xf, &cl.value, date1904),
                 None => String::new(),
             };
             let numeric = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))
                 && xf.numfmt != NumFmt::Text;
-            let display = match xf.align {
-                Align::Left => fit(&text, w as usize, false),
-                Align::Right => fit(&text, w as usize, true),
-                Align::Center => center(&text, w as usize),
-                Align::General => fit(&text, w as usize, numeric),
+            // Formula view is always left-aligned (Excel shows the raw text).
+            let display = if formula_view {
+                fit(&text, w as usize, false)
+            } else {
+                match xf.align {
+                    Align::Left => fit(&text, w as usize, false),
+                    Align::Right => fit(&text, w as usize, true),
+                    Align::Center => center(&text, w as usize),
+                    Align::General => fit(&text, w as usize, numeric),
+                }
             };
-            let mut style = Style::new();
+            let mut style = base;
             if xf.bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
@@ -3853,6 +4035,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('b') | KeyCode::Char('B') if ctrl => app.toggle_bold(),
         KeyCode::Char('i') | KeyCode::Char('I') if ctrl => app.toggle_italic(),
+        KeyCode::Char('`') if ctrl => app.toggle_formula_view(),
         KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
         KeyCode::Char('t') | KeyCode::Char('T') if ctrl => app.open_prompt(PromptKind::AddSheet),
         KeyCode::F(3) => {
@@ -4024,10 +4207,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             if m.row < g.y || m.row >= g.y + g.height || m.column < g.x + app.gutter_w {
                 return;
             }
-            // Clamp to the grid: rendering can show phantom rows past the
-            // last one, and a click there must not create an out-of-range
-            // cell (which the loader would later reject and relocate).
-            let row = (app.top + (m.row - g.y) as u32).min(MAX_ROWS - 1);
+            // Map the screen line to a sheet row via the freeze-aware table.
+            let vy = (m.row - g.y) as usize;
+            let row = app
+                .vis_rows
+                .get(vy)
+                .copied()
+                .unwrap_or_else(|| app.top + vy as u32)
+                .min(MAX_ROWS - 1);
             let mut col = None;
             for &(cidx, x, w) in &app.vis_cols {
                 if m.column >= x && m.column < x + w {
@@ -4074,6 +4261,7 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path);
+    app.load_view_prefs();
     app.start_screen = welcome;
     let result = loop {
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
@@ -4124,6 +4312,7 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool) -> io::Result<()> {
         }
     };
 
+    app.save_view_prefs();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -4274,6 +4463,25 @@ mod tests {
         assert_eq!(app.path, "untitled.xlsx");
         assert!(app.sheet().cell(0, 0).is_none());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn view_toggles_and_ribbon_state() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        assert!(!app.formula_view);
+        app.toggle_formula_view();
+        assert!(app.formula_view);
+        app.cur = (3, 2);
+        app.toggle_freeze();
+        assert_eq!(app.freeze, (3, 2));
+        app.toggle_freeze();
+        assert_eq!(app.freeze, (0, 0));
+        app.toggle_theme();
+        assert!(app.light_theme);
+        let t = app.ribbon_toggles();
+        assert!(t.contains(&ribbon::Act::FormulaView));
+        assert!(t.contains(&ribbon::Act::ThemeToggle));
+        assert!(!t.contains(&ribbon::Act::FreezePanes));
     }
 
     #[test]
