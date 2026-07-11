@@ -2759,7 +2759,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.model_view.is_some()
         || app.prompt.is_some()
         || app.edit.is_some();
-    if key.code == KeyCode::F(9) && !overlay_open {
+    // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
+    if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
             ribbon::Focus::Tab(app.ribbon.active_tab())
         } else {
@@ -2946,6 +2947,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.open_prompt(PromptKind::Find);
             }
         }
+        // Plain F9 opens the ribbon (handled earlier); Shift+F9 forces recalc.
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
         KeyCode::Char('m') | KeyCode::Char('M') if ctrl => app.open_model_view(),
