@@ -6398,6 +6398,203 @@ impl<'a> Eval<'a> {
                 }
             }
 
+            // ---- more math -------------------------------------------------
+            "MROUND" => self.two_num(args, |n, m| {
+                if m == 0.0 {
+                    return Value::Num(0.0);
+                }
+                if n != 0.0 && (n < 0.0) != (m < 0.0) {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((n / m).round() * m)
+            }),
+            "SQRTPI" => self.one_num(args, |n| {
+                if n < 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((n * std::f64::consts::PI).sqrt())
+            }),
+            "ROMAN" => {
+                // Optional form arg is accepted but ignored (classic form only).
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0]));
+                match to_roman(n.trunc() as i64) {
+                    Some(s) => Value::Str(s),
+                    None => Value::Err(ExcelError::Value),
+                }
+            }
+            "ARABIC" => self.one_text(args, |s| {
+                if s.chars().count() > 255 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (neg, body) = match s.trim().strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, s.trim()),
+                };
+                match from_roman(body) {
+                    Some(v) => num(if neg { -v } else { v }),
+                    None => Value::Err(ExcelError::Value),
+                }
+            }),
+            "BASE" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0])).trunc();
+                let radix = try_num!(self.eval(&args[1])).trunc();
+                if n < 0.0 || n >= 2f64.powi(53) || !(2.0..=36.0).contains(&radix) {
+                    return Value::Err(ExcelError::Num);
+                }
+                let mut s = to_base(n as u64, radix as u32);
+                if let Some(e) = args.get(2) {
+                    let min_len = try_num!(self.eval(e)).trunc();
+                    if !(0.0..=255.0).contains(&min_len) {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    let w = min_len as usize;
+                    if s.len() < w {
+                        s = format!("{s:0>w$}");
+                    }
+                }
+                Value::Str(s)
+            }
+            "DECIMAL" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let s = try_text!(self.eval(&args[0]));
+                let radix = try_num!(self.eval(&args[1])).trunc();
+                if !(2.0..=36.0).contains(&radix) {
+                    return Value::Err(ExcelError::Num);
+                }
+                match from_base(&s, radix as u32) {
+                    Some(v) => num(v),
+                    None => Value::Err(ExcelError::Num),
+                }
+            }
+            "SUMX2MY2" | "SUMX2PY2" | "SUMXMY2" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (xs, ys) = match self.two_arrays(&args[0], &args[1]) {
+                    Ok(p) => p,
+                    Err(v) => return v,
+                };
+                let total: f64 = xs
+                    .iter()
+                    .zip(ys.iter())
+                    .map(|(&x, &y)| match name {
+                        "SUMX2MY2" => x * x - y * y,
+                        "SUMX2PY2" => x * x + y * y,
+                        _ => (x - y) * (x - y),
+                    })
+                    .sum();
+                num(total)
+            }
+            "MULTINOMIAL" => match self.collect_values(args, true) {
+                Ok(vals) => {
+                    let mut sum = 0.0f64;
+                    let mut denom = 1.0f64;
+                    for v in &vals {
+                        if *v < 0.0 {
+                            return Value::Err(ExcelError::Num);
+                        }
+                        let k = v.trunc();
+                        sum += k;
+                        for i in 2..=(k as u64) {
+                            denom *= i as f64;
+                        }
+                    }
+                    if sum > 170.0 {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    let mut numer = 1.0f64;
+                    for i in 2..=(sum as u64) {
+                        numer *= i as f64;
+                    }
+                    num(numer / denom)
+                }
+                Err(e) => Value::Err(e),
+            },
+            "SERIESSUM" => {
+                if args.len() != 4 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let x = try_num!(self.eval(&args[0]));
+                let n = try_num!(self.eval(&args[1]));
+                let m = try_num!(self.eval(&args[2]));
+                let coeffs = match self.collect_values(&args[3..], true) {
+                    Ok(c) => c,
+                    Err(e) => return Value::Err(e),
+                };
+                let mut total = 0.0f64;
+                for (i, &c) in coeffs.iter().enumerate() {
+                    total += c * x.powf(n + i as f64 * m);
+                }
+                num(total)
+            }
+
+            // ---- engineering: bit ops & base conversion --------------------
+            "BITAND" | "BITOR" | "BITXOR" => self.two_num(args, |a, b| {
+                if a < 0.0 || b < 0.0 || a.fract() != 0.0 || b.fract() != 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let lim = 2f64.powi(48);
+                if a >= lim || b >= lim {
+                    return Value::Err(ExcelError::Num);
+                }
+                let (x, y) = (a as u64, b as u64);
+                num(match name {
+                    "BITAND" => x & y,
+                    "BITOR" => x | y,
+                    _ => x ^ y,
+                } as f64)
+            }),
+            "BITLSHIFT" | "BITRSHIFT" => self.two_num(args, |a, shift| {
+                if a < 0.0 || a.fract() != 0.0 || a >= 2f64.powi(48) {
+                    return Value::Err(ExcelError::Num);
+                }
+                if shift.abs() > 53.0 || shift.fract() != 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let sh = if name == "BITRSHIFT" { -shift } else { shift };
+                let r = (a * 2f64.powi(sh as i32)).floor();
+                if r >= 2f64.powi(53) {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(r)
+            }),
+            "DEC2BIN" => self.dec_base_call(args, 2, -512.0, 511.0),
+            "DEC2OCT" => self.dec_base_call(args, 8, -536_870_912.0, 536_870_911.0),
+            "DEC2HEX" => self.dec_base_call(args, 16, -549_755_813_888.0, 549_755_813_887.0),
+            "BIN2DEC" => self.one_text(args, |s| base_to_dec(&s, 2, 10)),
+            "OCT2DEC" => self.one_text(args, |s| base_to_dec(&s, 8, 10)),
+            "HEX2DEC" => self.one_text(args, |s| base_to_dec(&s, 16, 10)),
+            "DELTA" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let a = try_num!(self.eval(&args[0]));
+                let b = match args.get(1) {
+                    None | Some(Expr::Missing) => 0.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                num(if a == b { 1.0 } else { 0.0 })
+            }
+            "GESTEP" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let a = try_num!(self.eval(&args[0]));
+                let step = match args.get(1) {
+                    None | Some(Expr::Missing) => 0.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                num(if a >= step { 1.0 } else { 0.0 })
+            }
+
             // ---- unknown ---------------------------------------------------
             _ => {
                 self.unsupported = true;
@@ -6446,10 +6643,205 @@ impl<'a> Eval<'a> {
             _ => Value::Err(ExcelError::Value),
         }
     }
+
+    /// DEC2BIN/OCT/HEX dispatch: number plus an optional `places` width.
+    fn dec_base_call(&mut self, args: &[Expr], radix: u32, lo: f64, hi: f64) -> Value {
+        if args.is_empty() || args.len() > 2 {
+            return Value::Err(ExcelError::Value);
+        }
+        let n = try_num!(self.eval(&args[0]));
+        let places = match args.get(1) {
+            None | Some(Expr::Missing) => None,
+            Some(e) => Some(try_num!(self.eval(e))),
+        };
+        dec_to_base(n, radix, places, lo, hi)
+    }
+
+    /// Flatten any argument to a dense, row-major `Vec<Value>` (blanks kept as
+    /// `Value::Empty`), so paired-array functions can align by position.
+    fn flat_dense(&mut self, e: &Expr) -> Result<Vec<Value>, Value> {
+        match self.eval_arg(e) {
+            Arg::Scalar(Value::Err(er)) => Err(Value::Err(er)),
+            Arg::Scalar(v) => Ok(vec![v]),
+            Arg::Range(s, r1, c1, r2, c2) => {
+                let (a, b, c, d) = self.clamp(s, r1, c1, r2, c2);
+                let mut out = Vec::new();
+                for r in a..=c {
+                    for col in b..=d {
+                        out.push(self.res.value(s, r, col));
+                    }
+                }
+                Ok(out)
+            }
+            Arg::Matrix(m) => Ok(m.into_iter().flatten().collect()),
+            Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
+        }
+    }
+
+    /// Two equal-shaped arrays reduced to the numeric pairs they share
+    /// (positions where either side is non-numeric are dropped). Mismatched
+    /// lengths yield `#N/A`, matching Excel's paired-array functions.
+    fn two_arrays(&mut self, a: &Expr, b: &Expr) -> Result<(Vec<f64>, Vec<f64>), Value> {
+        let xa = self.flat_dense(a)?;
+        let xb = self.flat_dense(b)?;
+        if xa.len() != xb.len() {
+            return Err(Value::Err(ExcelError::NA));
+        }
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (u, v) in xa.iter().zip(xb.iter()) {
+            if let (Value::Num(x), Value::Num(y)) = (u, v) {
+                xs.push(*x);
+                ys.push(*y);
+            }
+        }
+        Ok((xs, ys))
+    }
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Render a non-negative integer in `radix` (2..=36) using upper-case digits.
+fn to_base(mut n: u64, radix: u32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut s = Vec::new();
+    while n > 0 {
+        s.push(DIGITS[(n % radix as u64) as usize]);
+        n /= radix as u64;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap()
+}
+
+/// Parse a string of base-`radix` digits into a value (case-insensitive).
+fn from_base(s: &str, radix: u32) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc: f64 = 0.0;
+    for c in s.chars() {
+        let d = c.to_digit(radix)?;
+        acc = acc * radix as f64 + d as f64;
+    }
+    Some(acc)
+}
+
+/// Integer 1..=3999 → classic (subtractive) Roman numerals.
+fn to_roman(mut n: i64) -> Option<String> {
+    if !(1..=3999).contains(&n) {
+        return None;
+    }
+    const TABLE: &[(i64, &str)] = &[
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut s = String::new();
+    for &(v, sym) in TABLE {
+        while n >= v {
+            s.push_str(sym);
+            n -= v;
+        }
+    }
+    Some(s)
+}
+
+/// Roman numerals (subtractive) → integer; empty string is 0.
+fn from_roman(s: &str) -> Option<f64> {
+    let s = s.trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return Some(0.0);
+    }
+    let val = |c: char| -> i64 {
+        match c {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => 0,
+        }
+    };
+    let mut total = 0i64;
+    let mut prev = 0i64;
+    for c in s.chars().rev() {
+        let v = val(c);
+        if v == 0 {
+            return None;
+        }
+        if v < prev {
+            total -= v;
+        } else {
+            total += v;
+            prev = v;
+        }
+    }
+    Some(total as f64)
+}
+
+/// DEC2BIN/OCT/HEX: two's-complement render into `radix` over 10 digits.
+fn dec_to_base(n: f64, radix: u32, places: Option<f64>, lo: f64, hi: f64) -> Value {
+    let n = n.trunc();
+    if !(lo..=hi).contains(&n) {
+        return Value::Err(ExcelError::Num);
+    }
+    if n < 0.0 {
+        // 10-digit two's complement; `places` is ignored for negatives.
+        let m = (radix as i128).pow(10) + n as i128;
+        return Value::Str(to_base(m as u64, radix));
+    }
+    let mut s = to_base(n as u64, radix);
+    if let Some(p) = places {
+        let p = p.trunc();
+        if !(1.0..=10.0).contains(&p) {
+            return Value::Err(ExcelError::Num);
+        }
+        let p = p as usize;
+        if s.len() > p {
+            return Value::Err(ExcelError::Num);
+        }
+        s = format!("{s:0>p$}");
+    }
+    Value::Str(s)
+}
+
+/// BIN2DEC/OCT2DEC/HEX2DEC: signed two's-complement over `digits` positions.
+fn base_to_dec(s: &str, radix: u32, digits: u32) -> Value {
+    let s = s.trim();
+    if s.is_empty() {
+        return Value::Num(0.0);
+    }
+    if s.chars().count() as u32 > digits {
+        return Value::Err(ExcelError::Num);
+    }
+    let mut acc: i128 = 0;
+    for c in s.chars() {
+        match c.to_digit(radix) {
+            Some(d) => acc = acc * radix as i128 + d as i128,
+            None => return Value::Err(ExcelError::Num),
+        }
+    }
+    let full = (radix as i128).pow(digits);
+    let out = if acc >= full / 2 { acc - full } else { acc };
+    Value::Num(out as f64)
 }
 
 fn days_in_month(year: i64, month: u32) -> u32 {
@@ -7870,5 +8262,56 @@ mod tests {
             eval_str("WEEKDAY(45306,4)", &g),
             Value::Err(ExcelError::Num)
         );
+    }
+
+    #[test]
+    fn math_and_engineering_coverage() {
+        let g = empty();
+        // MROUND / SQRTPI.
+        assert_eq!(n("MROUND(10,3)", &g), 9.0);
+        assert_eq!(n("MROUND(-10,-3)", &g), -9.0);
+        assert_eq!(n("MROUND(1.3,0.2)", &g), 1.4000000000000001);
+        assert_eq!(eval_str("MROUND(5,-2)", &g), Value::Err(ExcelError::Num));
+        assert!((n("SQRTPI(4)", &g) - (4.0 * std::f64::consts::PI).sqrt()).abs() < 1e-9);
+        // ROMAN / ARABIC round-trip.
+        assert_eq!(eval_str("ROMAN(1994)", &g), Value::Str("MCMXCIV".into()));
+        assert_eq!(n("ARABIC(\"MCMXCIV\")", &g), 1994.0);
+        assert_eq!(n("ARABIC(\"-IV\")", &g), -4.0);
+        assert_eq!(n("ARABIC(\"\")", &g), 0.0);
+        // BASE / DECIMAL.
+        assert_eq!(eval_str("BASE(255,16)", &g), Value::Str("FF".into()));
+        assert_eq!(eval_str("BASE(7,2,8)", &g), Value::Str("00000111".into()));
+        assert_eq!(n("DECIMAL(\"FF\",16)", &g), 255.0);
+        assert_eq!(n("DECIMAL(\"111\",2)", &g), 7.0);
+        // Paired-array sums.
+        let gg = Grid::new(&[
+            ("A1", Value::Num(2.0)),
+            ("A2", Value::Num(3.0)),
+            ("B1", Value::Num(1.0)),
+            ("B2", Value::Num(1.0)),
+        ]);
+        assert_eq!(n("SUMX2MY2(A1:A2,B1:B2)", &gg), 11.0); // (4-1)+(9-1)
+        assert_eq!(n("SUMX2PY2(A1:A2,B1:B2)", &gg), 15.0);
+        assert_eq!(n("SUMXMY2(A1:A2,B1:B2)", &gg), 5.0); // 1+4
+        assert_eq!(eval_str("SUMXMY2(A1:A2,B1:B1)", &gg), Value::Err(ExcelError::NA));
+        assert_eq!(n("MULTINOMIAL(2,3,4)", &g), 1260.0);
+        // Bit ops.
+        assert_eq!(n("BITAND(12,10)", &g), 8.0);
+        assert_eq!(n("BITOR(12,10)", &g), 14.0);
+        assert_eq!(n("BITXOR(12,10)", &g), 6.0);
+        assert_eq!(n("BITLSHIFT(4,2)", &g), 16.0);
+        assert_eq!(n("BITRSHIFT(16,2)", &g), 4.0);
+        // Base conversion with two's complement.
+        assert_eq!(eval_str("DEC2BIN(9)", &g), Value::Str("1001".into()));
+        assert_eq!(eval_str("DEC2BIN(-1)", &g), Value::Str("1111111111".into()));
+        assert_eq!(eval_str("DEC2HEX(255)", &g), Value::Str("FF".into()));
+        assert_eq!(n("BIN2DEC(\"1111111111\")", &g), -1.0);
+        assert_eq!(n("HEX2DEC(\"FF\")", &g), 255.0);
+        assert_eq!(n("OCT2DEC(\"777\")", &g), 511.0);
+        // DELTA / GESTEP.
+        assert_eq!(n("DELTA(5,5)", &g), 1.0);
+        assert_eq!(n("DELTA(5,4)", &g), 0.0);
+        assert_eq!(n("GESTEP(5,4)", &g), 1.0);
+        assert_eq!(n("GESTEP(3,4)", &g), 0.0);
     }
 }
