@@ -31,6 +31,7 @@ pub enum Act {
     SaveAs,
     /// Review ▸ Comments.
     NewComment,
+    NewNote,
     DeleteComment,
     PrevComment,
     NextComment,
@@ -544,10 +545,15 @@ fn review_groups() -> Vec<Group> {
     use Act::*;
     vec![Group {
         title: "Comments",
-        width: 27,
+        width: 33,
         rows: [
             vec![
-                btn("✎ New", 5, NewComment, "New comment on the current cell"),
+                btn(
+                    "✎ Comment",
+                    9,
+                    NewComment,
+                    "New threaded comment / reply on the current cell",
+                ),
                 Seg::Gap("  "),
                 btn(
                     "✗ Delete",
@@ -557,11 +563,13 @@ fn review_groups() -> Vec<Group> {
                 ),
             ],
             vec![
+                btn("☰ Note", 6, NewNote, "New legacy note on the current cell"),
+                Seg::Gap(" "),
                 btn("‹ Prev", 6, PrevComment, "Previous comment"),
                 Seg::Gap(" "),
                 btn("Next ›", 6, NextComment, "Next comment"),
-                Seg::Gap("  "),
-                btn("▤ Panel", 7, ToggleComments, "Show/hide the comments panel"),
+                Seg::Gap(" "),
+                btn("▤", 1, ToggleComments, "Show/hide the comments panel"),
             ],
         ],
     }]

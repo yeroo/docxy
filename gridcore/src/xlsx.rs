@@ -1505,7 +1505,11 @@ pub(crate) fn add_rel(
     String::new()
 }
 
-fn add_workbook_rel(parts: &mut [(String, Vec<u8>)], rel_type: &str, target: &str) -> String {
+pub(crate) fn add_workbook_rel(
+    parts: &mut [(String, Vec<u8>)],
+    rel_type: &str,
+    target: &str,
+) -> String {
     if let Some(p) = parts
         .iter_mut()
         .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")

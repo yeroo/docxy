@@ -8,7 +8,10 @@
 //! `<legacyDrawing>` hook, content types, and relationships.
 
 use crate::sheet::{cell_name, parse_col};
-use crate::xlsx::{SheetPackage, add_content_type_override, add_rel, parse_rels, resolve_relative};
+use crate::xlsx::{
+    SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
+    resolve_relative,
+};
 
 const SS_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const COMMENTS_CT: &str =
@@ -18,6 +21,13 @@ const COMMENTS_REL: &str =
 const VML_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
 const VML_CT: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+
+// Modern threaded comments (Excel 2019+ / 365).
+const TC_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments";
+const TC_CT: &str = "application/vnd.ms-excel.threadedcomments+xml";
+const TC_REL: &str = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+const PERSON_CT: &str = "application/vnd.ms-excel.person+xml";
+const PERSON_REL: &str = "http://schemas.microsoft.com/office/2017/10/relationships/person";
 
 /// One comment anchored to a cell, flattened for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +227,11 @@ fn parse_legacy(xml: &str, sheet: usize, out: &mut Vec<Comment>) {
             .and_then(|s| s.parse::<usize>().ok())
             .and_then(|i| authors.get(i).cloned())
             .unwrap_or_default();
+        // `tc=…` authored comments are the down-level *shadow* of a threaded
+        // comment — the threaded part is authoritative, so skip them here.
+        if author.starts_with("tc=") {
+            return;
+        }
         out.push(Comment {
             sheet,
             row: cell.0,
@@ -276,32 +291,65 @@ impl SheetPackage {
         self.write_notes(sheet, &ws_part, &notes);
     }
 
-    /// Remove the note on `(row, col)` of `sheet` (no-op when absent).
+    /// Remove the comment on `(row, col)` of `sheet` — the threaded
+    /// conversation if present, otherwise the legacy note.
     pub fn remove_comment(&mut self, sheet: usize, row: u32, col: u32) {
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
             return;
         };
+        // Drop any threaded conversation on the cell first (so the rebuilt
+        // legacy shadow no longer includes it).
+        let removed_thread = self.remove_thread_entries(&ws_part, row, col);
         let mut notes = self.sheet_notes(sheet);
         let before = notes.len();
         notes.retain(|n| !(n.row == row && n.col == col));
-        if notes.len() == before {
+        if notes.len() == before && !removed_thread {
             return;
         }
         self.write_notes(sheet, &ws_part, &notes);
     }
 
-    /// The legacy notes currently on a sheet (ignores threaded comments).
+    /// The legacy notes to serialize for a sheet: real notes plus a down-level
+    /// *shadow* note for every threaded conversation, so old readers still see
+    /// something and modern Excel de-dupes the two via the `tc=` author marker.
     fn sheet_notes(&self, sheet: usize) -> Vec<Note> {
-        self.comments()
-            .into_iter()
+        let all = self.comments();
+        let mut notes: Vec<Note> = all
+            .iter()
             .filter(|c| c.sheet == sheet && !c.threaded)
             .map(|c| Note {
                 row: c.row,
                 col: c.col,
-                author: c.author,
-                text: c.text,
+                author: c.author.clone(),
+                text: c.text.clone(),
             })
-            .collect()
+            .collect();
+        // One shadow per threaded conversation (grouped by cell, in order).
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        for c in all.iter().filter(|c| c.sheet == sheet && c.threaded) {
+            if seen.contains(&(c.row, c.col)) {
+                continue;
+            }
+            seen.push((c.row, c.col));
+            let thread: Vec<&Comment> = all
+                .iter()
+                .filter(|t| t.sheet == sheet && t.threaded && t.row == c.row && t.col == c.col)
+                .collect();
+            let pid = guid_from(&[&thread[0].author]);
+            let text = thread
+                .iter()
+                .map(|t| format!("{}:\n    {}", t.author, t.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            notes.push(Note {
+                row: c.row,
+                col: c.col,
+                author: format!("tc={pid}"),
+                text,
+            });
+        }
+        notes.sort_by_key(|n| (n.row, n.col));
+        notes
     }
 
     /// Resolve (or mint) the comments + VML part names for a sheet.
@@ -362,6 +410,220 @@ impl SheetPackage {
         };
         self.ensure_legacy_drawing(ws_part, &vml_rid);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Authoring (modern threaded conversations)
+// ---------------------------------------------------------------------------
+
+impl SheetPackage {
+    /// Append a threaded comment on `(row, col)` — a new conversation, or a
+    /// reply if the cell already has one. `when` is an ISO-8601 timestamp
+    /// (e.g. `2024-01-02T03:04:05Z`); the caller supplies it so the engine
+    /// stays clock-free. Writes the persons + threadedComments parts, wires
+    /// them, and keeps a legacy shadow note so every reader shows the thread.
+    pub fn add_threaded_comment(
+        &mut self,
+        sheet: usize,
+        row: u32,
+        col: u32,
+        author: &str,
+        text: &str,
+        when: &str,
+    ) {
+        use crate::xlsx::{esc_attr, esc_text};
+        let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
+            return;
+        };
+        let (dir, file) = split_part(&ws_part);
+        let rels_name = format!("{dir}/_rels/{file}.rels");
+
+        // Resolve (or mint) the threadedComments and persons part names.
+        let tc_part = self
+            .find_rel_target(&rels_name, "/threadedComment")
+            .unwrap_or_else(|| self.unique_part("xl/threadedComments/threadedComment", ".xml"));
+        let persons_part = self
+            .parts
+            .iter()
+            .map(|(n, _)| n.clone())
+            .find(|n| n.contains("persons/"))
+            .unwrap_or_else(|| "xl/persons/person1.xml".to_string());
+
+        // A stable person id per author name.
+        let pid = guid_from(&[author]);
+        self.ensure_person(&persons_part, &pid, author);
+
+        // Reply if a root already exists on this cell.
+        let cellref = cell_name(row, col);
+        let existing = self.part_str(&tc_part).unwrap_or_default();
+        let root_id = find_root_id(&existing, &cellref);
+        let new_id = guid_from(&[author, &cellref, text, &existing.len().to_string()]);
+        let parent = root_id
+            .map(|r| format!(" parentId=\"{r}\""))
+            .unwrap_or_default();
+        let el = format!(
+            "<threadedComment ref=\"{cellref}\" dT=\"{}\" personId=\"{pid}\" id=\"{new_id}\"{parent}><text>{}</text></threadedComment>",
+            esc_attr(when),
+            esc_text(text),
+        );
+        let updated = if existing.trim().is_empty() {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<ThreadedComments xmlns=\"{TC_NS}\">{el}</ThreadedComments>"
+            )
+        } else {
+            existing.replacen(
+                "</ThreadedComments>",
+                &format!("{el}</ThreadedComments>"),
+                1,
+            )
+        };
+        self.set_part(&tc_part, updated.into_bytes());
+
+        // Content types + relationships (threadedComments on the worksheet,
+        // persons on the workbook).
+        add_content_type_override(&mut self.parts, &format!("/{tc_part}"), TC_CT);
+        add_content_type_override(&mut self.parts, &format!("/{persons_part}"), PERSON_CT);
+        add_rel(
+            &mut self.parts,
+            &rels_name,
+            TC_REL,
+            &rel_target(dir, &tc_part),
+        );
+        let persons_wb_target = persons_part.strip_prefix("xl/").unwrap_or(&persons_part);
+        add_workbook_rel(&mut self.parts, PERSON_REL, persons_wb_target);
+
+        // Rebuild the legacy shadow so down-level readers see the thread too.
+        let notes = self.sheet_notes(sheet);
+        self.write_notes(sheet, &ws_part, &notes);
+    }
+
+    /// Ensure `persons_part` declares person `pid` with `display`.
+    fn ensure_person(&mut self, persons_part: &str, pid: &str, display: &str) {
+        use crate::xlsx::esc_attr;
+        let el = format!(
+            "<person displayName=\"{}\" id=\"{pid}\" providerId=\"None\"/>",
+            esc_attr(display)
+        );
+        match self.part_str(persons_part) {
+            Some(xml) if xml.contains(pid) => {}
+            Some(xml) => {
+                let u = xml.replacen("</personList>", &format!("{el}</personList>"), 1);
+                self.set_part(persons_part, u.into_bytes());
+            }
+            None => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<personList xmlns=\"{TC_NS}\">{el}</personList>"
+                );
+                self.set_part(persons_part, body.into_bytes());
+            }
+        }
+    }
+
+    /// Remove every threaded comment on `(row, col)` from the sheet's thread
+    /// part; returns whether anything was removed.
+    fn remove_thread_entries(&mut self, ws_part: &str, row: u32, col: u32) -> bool {
+        let (dir, file) = split_part(ws_part);
+        let rels_name = format!("{dir}/_rels/{file}.rels");
+        let Some(tc_part) = self.find_rel_target(&rels_name, "/threadedComment") else {
+            return false;
+        };
+        let Some(xml) = self.part_str(&tc_part) else {
+            return false;
+        };
+        let cellref = cell_name(row, col);
+        let mut out = String::new();
+        let mut removed = false;
+        let mut rest = xml.as_str();
+        while let Some(p) = rest.find("<threadedComment") {
+            out.push_str(&rest[..p]);
+            let after = &rest[p..];
+            let end = match after.find("</threadedComment>") {
+                Some(e) => e + "</threadedComment>".len(),
+                None => {
+                    // self-closing?
+                    after.find("/>").map(|e| e + 2).unwrap_or(after.len())
+                }
+            };
+            let el = &after[..end];
+            if attr(el, "ref") == Some(cellref.as_str()) {
+                removed = true;
+            } else {
+                out.push_str(el);
+            }
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        if removed {
+            // If the thread list is now empty, tear its wiring down too.
+            if !out.contains("<threadedComment") {
+                self.remove_part(&tc_part);
+                self.strip_content_type(&format!("/{tc_part}"));
+                self.strip_rels(&rels_name, &tc_part, dir);
+            } else {
+                self.set_part(&tc_part, out.into_bytes());
+            }
+        }
+        removed
+    }
+
+    /// The target part of the first relationship whose type ends with `suffix`.
+    fn find_rel_target(&self, rels_name: &str, suffix: &str) -> Option<String> {
+        let dir = rels_name
+            .split_once("/_rels/")
+            .map(|(d, _)| d)
+            .unwrap_or("");
+        let rels = self.part_str(rels_name)?;
+        parse_rels(&rels)
+            .into_iter()
+            .find(|(_, ty, _)| ty.ends_with(suffix))
+            .map(|(_, _, target)| resolve_relative(dir, &target))
+    }
+
+    /// A `{prefix}{n}{ext}` part name not already present.
+    fn unique_part(&self, prefix: &str, ext: &str) -> String {
+        let mut n = 1;
+        while self.part(&format!("{prefix}{n}{ext}")).is_some() {
+            n += 1;
+        }
+        format!("{prefix}{n}{ext}")
+    }
+}
+
+/// The `id` of the root (parent-less) threaded comment on `cellref`, if any.
+fn find_root_id(xml: &str, cellref: &str) -> Option<String> {
+    let mut found = None;
+    for_each_element(xml, "threadedComment", |el| {
+        if found.is_none() && attr(el, "ref") == Some(cellref) && attr(el, "parentId").is_none() {
+            found = attr(el, "id").map(str::to_string);
+        }
+    });
+    found
+}
+
+/// FNV-1a 64-bit hash.
+fn hash64(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// A deterministic, stable GUID string from the joined parts (so the same
+/// author always maps to the same person id, and threads stay linkable).
+fn guid_from(parts: &[&str]) -> String {
+    let joined = parts.join("|");
+    let a = hash64(&joined);
+    let b = hash64(&format!("{joined}#salt"));
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        a as u16,
+        (b >> 48) as u16,
+        b & 0xFFFF_FFFF_FFFF,
+    )
 }
 
 /// A legacy note during authoring.
@@ -683,5 +945,79 @@ mod tests {
         assert_eq!(cs[0].author, "Jane Doe");
         assert_eq!(cs[0].text, "Looks good");
         assert!(cs[0].threaded);
+    }
+
+    #[test]
+    fn authors_a_threaded_conversation() {
+        let mut pkg = blank();
+        pkg.add_threaded_comment(0, 1, 1, "Ana", "Is this final?", "2024-01-02T03:04:05Z");
+        pkg.add_threaded_comment(0, 1, 1, "Bob", "Yes, ship it", "2024-01-02T04:00:00Z");
+        // A second, independent thread elsewhere.
+        pkg.add_threaded_comment(0, 5, 0, "Ana", "Typo here", "2024-01-02T05:00:00Z");
+
+        let bytes = save_xlsx(&pkg);
+        let reloaded = load_xlsx(&bytes).expect("reload");
+        let cs = reloaded.comments();
+        // Three threaded comments, no duplicate legacy shadows leaking through.
+        assert_eq!(cs.iter().filter(|c| c.threaded).count(), 3);
+        assert!(cs.iter().all(|c| c.threaded));
+        assert!(!cs.iter().any(|c| c.author.starts_with("tc=")));
+
+        // The reply is linked under the same cell's root.
+        let a1: Vec<&Comment> = cs.iter().filter(|c| c.row == 1 && c.col == 1).collect();
+        assert_eq!(a1.len(), 2);
+        assert_eq!(a1[0].author, "Ana");
+        assert_eq!(a1[1].author, "Bob");
+        assert_eq!(a1[1].text, "Yes, ship it");
+
+        // The threaded parts and their wiring exist.
+        assert!(reloaded.part("xl/persons/person1.xml").is_some());
+        assert!(
+            reloaded
+                .part_names()
+                .iter()
+                .any(|n| n.contains("threadedComments/"))
+        );
+        // A legacy shadow rides along for down-level readers.
+        assert!(
+            reloaded
+                .part_names()
+                .iter()
+                .any(|n| n.starts_with("xl/comments"))
+        );
+    }
+
+    #[test]
+    fn deleting_a_thread_removes_it_cleanly() {
+        let mut pkg = blank();
+        pkg.add_threaded_comment(0, 0, 0, "Ana", "First", "2024-01-01T00:00:00Z");
+        pkg.add_threaded_comment(0, 2, 2, "Bob", "Second", "2024-01-01T00:00:00Z");
+        assert_eq!(pkg.comments().len(), 2);
+
+        pkg.remove_comment(0, 0, 0);
+        let cs = pkg.comments();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].row, 2);
+
+        // Round-trips with just the survivor.
+        let reloaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let cs = reloaded.comments();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].text, "Second");
+        assert!(cs[0].threaded);
+    }
+
+    #[test]
+    fn legacy_note_and_thread_coexist_on_a_sheet() {
+        let mut pkg = blank();
+        pkg.set_comment(0, 0, 0, "Reviewer", "A plain note");
+        pkg.add_threaded_comment(0, 3, 3, "Ana", "A conversation", "2024-01-01T00:00:00Z");
+        let reloaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let cs = reloaded.comments();
+        assert_eq!(cs.len(), 2);
+        let note = cs.iter().find(|c| !c.threaded).unwrap();
+        let thread = cs.iter().find(|c| c.threaded).unwrap();
+        assert_eq!(note.text, "A plain note");
+        assert_eq!(thread.text, "A conversation");
     }
 }

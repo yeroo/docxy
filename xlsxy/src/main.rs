@@ -358,6 +358,19 @@ fn entropy_seed() -> Option<u64> {
         .map(|d| d.as_nanos() as u64 | 1)
 }
 
+/// Current UTC time as an ISO-8601 string for threaded-comment timestamps.
+/// Falls back to the Excel epoch if the clock is unavailable.
+fn iso_now() -> String {
+    let serial = now_serial().unwrap_or(1.0);
+    match gridcore::sheet::serial_to_parts(serial, false) {
+        Some(p) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            p.year, p.month, p.day, p.hour, p.minute, p.second
+        ),
+        None => "1899-12-31T00:00:00Z".to_string(),
+    }
+}
+
 /// The author name stamped on new comments — the OS user, else "xlsxy".
 fn comment_author() -> String {
     std::env::var("USER")
@@ -566,8 +579,10 @@ enum PromptKind {
     Measure,
     /// `Sales; Groups[Category]; Total[; Products[Name]]` — build a report.
     ModelPivot,
-    /// The body text of a new comment on the current cell.
+    /// The body text of a new threaded comment/reply on the current cell.
     NewComment,
+    /// The body text of a new legacy note on the current cell.
+    NewNote,
 }
 
 struct Prompt {
@@ -1607,15 +1622,22 @@ impl App {
         self.comment_at(row, col).is_some()
     }
 
-    /// Start authoring a comment on the current cell (pre-filled when editing
-    /// an existing one).
+    /// Start a threaded comment (or a reply, if the cell already has a thread)
+    /// on the current cell.
     fn start_comment(&mut self) {
+        self.open_prompt(PromptKind::NewComment);
+        self.show_comments = true;
+    }
+
+    /// Start a legacy note on the current cell (pre-filled when one exists).
+    fn start_note(&mut self) {
         let (r, c) = self.cur;
         let existing = self
             .comment_at(r, c)
+            .filter(|cm| !cm.threaded)
             .map(|cm| cm.text.clone())
             .unwrap_or_default();
-        self.open_prompt(PromptKind::NewComment);
+        self.open_prompt(PromptKind::NewNote);
         if let Some(p) = &mut self.prompt {
             p.text = existing;
             p.cursor = p.text.chars().count();
@@ -1623,7 +1645,7 @@ impl App {
         self.show_comments = true;
     }
 
-    /// Commit the drafted comment text onto the current cell.
+    /// Commit a threaded comment/reply onto the current cell.
     fn commit_comment(&mut self, text: &str) {
         let (r, c) = self.cur;
         let text = text.trim();
@@ -1632,10 +1654,35 @@ impl App {
             return;
         }
         let author = comment_author();
+        let reply = self.comment_at(r, c).is_some_and(|cm| cm.threaded);
+        self.pkg
+            .add_threaded_comment(self.sheet, r, c, &author, text, &iso_now());
+        self.modified = true;
+        self.refresh_comments();
+        self.status = Some(format!(
+            "{} on {}",
+            if reply {
+                "Reply added"
+            } else {
+                "Comment added"
+            },
+            cell_name(r, c)
+        ));
+    }
+
+    /// Commit a legacy note onto the current cell.
+    fn commit_note(&mut self, text: &str) {
+        let (r, c) = self.cur;
+        let text = text.trim();
+        if text.is_empty() {
+            self.status = Some("Note cancelled (empty)".to_string());
+            return;
+        }
+        let author = comment_author();
         self.pkg.set_comment(self.sheet, r, c, &author, text);
         self.modified = true;
         self.refresh_comments();
-        self.status = Some(format!("Comment added on {}", cell_name(r, c)));
+        self.status = Some(format!("Note added on {}", cell_name(r, c)));
     }
 
     fn delete_comment(&mut self) {
@@ -1753,6 +1800,7 @@ impl App {
             Save => self.save(),
             SaveAs => self.open_prompt(PromptKind::SaveAs),
             NewComment => self.start_comment(),
+            NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
@@ -1936,7 +1984,8 @@ impl App {
             PromptKind::Relate => ("Relate  From[Col] = To[Col]: ", String::new()),
             PromptKind::Measure => ("Measure  Name = FORMULA: ", String::new()),
             PromptKind::ModelPivot => ("Report  Base; rows; values[; cols]: ", String::new()),
-            PromptKind::NewComment => ("Comment: ", String::new()),
+            PromptKind::NewComment => ("Comment (threaded): ", String::new()),
+            PromptKind::NewNote => ("Note: ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -1958,6 +2007,7 @@ impl App {
                 }
             }
             PromptKind::NewComment => self.commit_comment(&text),
+            PromptKind::NewNote => self.commit_note(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -3249,6 +3299,35 @@ mod tests {
         let cs = reloaded.comments();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].text, "Please double-check");
+    }
+
+    #[test]
+    fn threaded_comment_and_reply_flow() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // First threaded comment on A1, then a reply on the same cell.
+        app.commit_comment("Is this right?");
+        app.commit_comment("Yes, confirmed");
+        let a1: Vec<&Comment> = app
+            .comments
+            .iter()
+            .filter(|c| c.row == 0 && c.col == 0)
+            .collect();
+        assert_eq!(a1.len(), 2);
+        assert!(a1.iter().all(|c| c.threaded));
+        assert_eq!(a1[1].text, "Yes, confirmed");
+
+        // A legacy note lands on a different cell as a non-threaded comment.
+        app.cur = (3, 3);
+        app.commit_note("A plain note");
+        let note = app.comment_at(3, 3).unwrap();
+        assert!(!note.threaded);
+
+        // Both survive a round-trip.
+        let reloaded = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let cs = reloaded.comments();
+        assert_eq!(cs.iter().filter(|c| c.threaded).count(), 2);
+        assert_eq!(cs.iter().filter(|c| !c.threaded).count(), 1);
     }
 
     #[test]
