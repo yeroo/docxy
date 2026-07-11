@@ -134,6 +134,18 @@ fn main() -> ExitCode {
         engine.clock = now_serial();
         engine.seed = entropy_seed();
         engine.recalc_all(&mut pkg.workbook);
+        // Refresh pivots from the recalculated data, then recalculate
+        // anything that reads pivot output cells.
+        let pivots = gridcore::pivot::refresh_pivots(&mut pkg.workbook);
+        if !pivots.changed.is_empty() {
+            engine.recalc_from(&mut pkg.workbook, &pivots.changed);
+        }
+        if pivots.refreshed + pivots.skipped > 0 {
+            println!(
+                "pivots: {} refreshed, {} kept on cached values",
+                pivots.refreshed, pivots.skipped
+            );
+        }
         let bytes = save_xlsx(&pkg);
         if let Err(e) = std::fs::write(&out, &bytes) {
             eprintln!("error: cannot write {out}: {e}");
@@ -651,6 +663,22 @@ impl App {
         engine.seed = entropy_seed();
         engine.recalc_all(&mut self.pkg.workbook);
         self.engine = engine;
+    }
+
+    /// F9 — full recalculation plus pivot refresh (like Excel's refresh-all).
+    fn recalc_and_refresh(&mut self) {
+        self.engine.recalc_all(&mut self.pkg.workbook);
+        let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+        if !outcome.changed.is_empty() {
+            self.engine
+                .recalc_from(&mut self.pkg.workbook, &outcome.changed);
+            self.modified = true;
+        }
+        self.status = Some(match (outcome.refreshed, outcome.skipped) {
+            (0, 0) => "Recalculated".to_string(),
+            (r, 0) => format!("Recalculated; {r} pivot(s) refreshed"),
+            (r, s) => format!("Recalculated; {r} pivot(s) refreshed, {s} kept cached values"),
+        });
     }
 
     fn clamp_cursor(&mut self) {
@@ -1723,6 +1751,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.open_prompt(PromptKind::Find);
             }
         }
+        KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::F(12) => app.open_prompt(PromptKind::SaveAs),
         KeyCode::F(2) if shift => app.open_prompt(PromptKind::RenameSheet),
         KeyCode::F(5) if shift => app.row_op(false),

@@ -241,7 +241,21 @@ The strategic piece: **conformance is measured, not claimed.**
   coverage (needs LibreOffice 24.8+/real Excel — 24.2 predates these
   functions).* Spill semantics + `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`,
   `SEQUENCE`, `XLOOKUP`; `LET`/`LAMBDA` (closures).
-- **Phase D — Pivot engine.** Pivot parts parsed (already preserved from A);
+- **Phase D — Pivot engine** 🔄 *in progress: the columnar query core
+  (`gridcore::frame`) shipped — `Frame` snapshots of ranges/Tables,
+  group-by on rows and columns, all eleven pivot aggregations
+  (sum/count/countNums/average/max/min/product/stdDev(p)/var(p)), filters,
+  grand totals, Excel's case-insensitive grouping and default ascending
+  sort. Pivot parts (`pivotTableDefinition` + `pivotCacheDefinition`, wired
+  through workbook `pivotCaches`) parse read-only into the model, and
+  **refresh** recomputes the output region from current source data:
+  `xlsxy --recalc` refreshes headlessly, `F9` refreshes in the TUI, save
+  patches the location ref and sets `refreshOnLoad="1"` so real Excel
+  rebuilds its own layout from the same definition. Pivots using features
+  we don't model — page filters, hidden items, calculated fields,
+  measures-on-rows — are never refreshed (stale-not-wrong). Remaining:
+  pivot *editing* in the TUI (add/move fields), subtotals, real-Excel
+  pivot corpus files.* Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
   XML — is the point: it is the aggregation core everything later builds on.

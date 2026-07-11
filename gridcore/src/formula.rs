@@ -3713,7 +3713,7 @@ pub fn to_bool(v: &Value) -> Result<bool, ExcelError> {
 
 /// Excel's comparison: case-insensitive text; cross-type ordering
 /// Number < Text < Logical; empty coerces to the other side's zero value.
-fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
+pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
     use std::cmp::Ordering;
     if let Value::Err(e) = a {
         return Err(*e);

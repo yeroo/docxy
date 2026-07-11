@@ -168,6 +168,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let mut sheets = Vec::new();
     let mut sheet_parts = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
+    let mut pending_pivots: Vec<(usize, String)> = Vec::new();
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
@@ -189,20 +190,22 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         let sheet_idx = sheets.len();
         orig_to_model.push(Some(sheet_idx));
 
-        // Excel Tables attached to this worksheet, via its own rels part.
+        // Excel Tables and pivot tables attached to this worksheet, via its
+        // own rels part.
         let ws_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let ws_file = part.rsplit_once('/').map(|(_, f)| f).unwrap_or(&part);
         let ws_rels_name = format!("{ws_dir}/_rels/{ws_file}.rels");
         if let Some(rels_xml) = get_str(&ws_rels_name) {
             for (_, ty, target) in parse_rels(&rels_xml) {
-                if !ty.ends_with("/table") {
-                    continue;
-                }
-                let table_part = resolve_relative(ws_dir, &target);
-                if let Some(txml) = get_str(&table_part) {
-                    if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
-                        tables.push(t);
+                if ty.ends_with("/table") {
+                    let table_part = resolve_relative(ws_dir, &target);
+                    if let Some(txml) = get_str(&table_part) {
+                        if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
+                            tables.push(t);
+                        }
                     }
+                } else if ty.ends_with("/pivotTable") {
+                    pending_pivots.push((sheet_idx, resolve_relative(ws_dir, &target)));
                 }
             }
         }
@@ -222,6 +225,44 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         })
         .collect();
 
+    // Pivot tables: wire each pivot part to its cache through workbook.xml's
+    // <pivotCaches> (cacheId → r:id → cache part).
+    let cache_parts: Vec<(u32, String)> = parse_pivot_cache_ids(&wb_xml)
+        .into_iter()
+        .filter_map(|(cache_id, rid)| {
+            rels.iter()
+                .find(|(id, _, _)| *id == rid)
+                .map(|(_, _, t)| (cache_id, resolve(t)))
+        })
+        .collect();
+    let mut pivots = Vec::new();
+    for (sheet_idx, pivot_part) in pending_pivots {
+        let Some(xml) = get_str(&pivot_part) else {
+            continue;
+        };
+        let Some((mut piv, cache_id)) =
+            crate::pivot::parse_pivot_table_xml(&xml, sheet_idx, &pivot_part)
+        else {
+            continue;
+        };
+        let cache = cache_parts
+            .iter()
+            .find(|(id, _)| *id == cache_id)
+            .and_then(|(_, part)| get_str(part).map(|xml| (part.clone(), xml)));
+        match cache
+            .and_then(|(part, xml)| crate::pivot::parse_pivot_cache_xml(&xml).map(|c| (part, c)))
+        {
+            Some((cache_part, (source, fields, cache_unsupported))) => {
+                piv.cache_part = cache_part;
+                piv.source = source;
+                piv.fields = fields;
+                piv.unsupported |= cache_unsupported;
+            }
+            None => piv.unsupported = true,
+        }
+        pivots.push(piv);
+    }
+
     Ok(SheetPackage {
         parts,
         sheet_parts,
@@ -231,10 +272,36 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             styles,
             defined_names,
             tables,
+            pivots,
             date1904,
             iterate,
         },
     })
+}
+
+/// `<pivotCaches><pivotCache cacheId="0" r:id="rId4"/></pivotCaches>` in
+/// workbook.xml → (cacheId, rId) pairs.
+fn parse_pivot_cache_ids(wb_xml: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(wb_xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "pivotCache" => {
+                if let Ok(id) = p.attr("cacheId").parse::<u32>() {
+                    let rid = p
+                        .attrs()
+                        .iter()
+                        .find(|a| local(a.name) == "id")
+                        .map(|a| a.value.to_string())
+                        .unwrap_or_default();
+                    out.push((id, rid));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Resolve a rels target relative to a directory ("../tables/table1.xml"
@@ -958,6 +1025,23 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         p.1 = updated.into_bytes();
     }
 
+    // --- pivots: patch the refreshed location, ask Excel to rebuild --------
+    // Refresh may have grown/shrunk the output region; the location ref must
+    // match what we wrote. refreshOnLoad makes real Excel re-derive its own
+    // layout from the same definition on open.
+    for piv in &wb.pivots {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.part) {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let (r1, c1, r2, c2) = piv.location;
+            let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+            p.1 = patch_ref_attr(&xml, "<location", &full).into_bytes();
+        }
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.cache_part) {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = set_refresh_on_load(&xml).into_bytes();
+        }
+    }
+
     // --- sheet names: the model is authoritative ----------------------------
     // workbook.xml is otherwise preserved verbatim, so a rename in the model
     // must be patched into the <sheet name="…"> attributes (in order).
@@ -1197,6 +1281,34 @@ fn esc_attr(s: &str) -> String {
 }
 
 /// Replace the `ref="…"` attribute value of the first `prefix` element.
+/// Ensure `refreshOnLoad="1"` on the pivotCacheDefinition root element.
+/// Idempotent, so a second save stays byte-identical.
+fn set_refresh_on_load(xml: &str) -> String {
+    let Some(start) = xml.find("<pivotCacheDefinition") else {
+        return xml.to_string();
+    };
+    let Some(end) = xml[start..].find('>').map(|i| start + i) else {
+        return xml.to_string();
+    };
+    let tag = &xml[start..end];
+    if let Some(rel) = tag.find("refreshOnLoad=\"") {
+        let vs = start + rel + "refreshOnLoad=\"".len();
+        let Some(ve) = xml[vs..].find('"').map(|i| vs + i) else {
+            return xml.to_string();
+        };
+        let mut out = xml.to_string();
+        out.replace_range(vs..ve, "1");
+        out
+    } else {
+        let mut out = xml.to_string();
+        out.insert_str(
+            start + "<pivotCacheDefinition".len(),
+            " refreshOnLoad=\"1\"",
+        );
+        out
+    }
+}
+
 fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
     let Some(el) = xml.find(prefix) else {
         return xml.to_string();
@@ -1552,6 +1664,7 @@ pub fn new_xlsx() -> SheetPackage {
             },
             defined_names: Vec::new(),
             tables: Vec::new(),
+            pivots: Vec::new(),
             date1904: false,
             iterate: None,
         },
@@ -1827,6 +1940,145 @@ mod tests {
         assert_eq!(
             pkg3.workbook.sheets[0].cell(1, 0).unwrap().value,
             crate::sheet::CellValue::Number(2.0)
+        );
+    }
+
+    /// A minimal two-sheet workbook with a real pivot: Data!A1:C5 sourcing a
+    /// row-field/data-field pivot on the second sheet (stale cached output).
+    fn pivot_fixture() -> Vec<u8> {
+        let sheet1 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="str"><v>Region</v></c><c r="B1" t="str"><v>Product</v></c><c r="C1" t="str"><v>Sales</v></c></row><row r="2"><c r="A2" t="str"><v>East</v></c><c r="B2" t="str"><v>Pen</v></c><c r="C2"><v>10</v></c></row><row r="3"><c r="A3" t="str"><v>West</v></c><c r="B3" t="str"><v>Pad</v></c><c r="C3"><v>20</v></c></row><row r="4"><c r="A4" t="str"><v>East</v></c><c r="B4" t="str"><v>Ink</v></c><c r="C4"><v>30</v></c></row><row r="5"><c r="A5" t="str"><v>West</v></c><c r="B5" t="str"><v>Pen</v></c><c r="C5"><v>40</v></c></row></sheetData></worksheet>"#;
+        let sheet2 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="3"><c r="A3" t="str"><v>Region</v></c><c r="B3" t="str"><v>Sum of Sales</v></c></row><row r="4"><c r="A4" t="str"><v>East</v></c><c r="B4"><v>999</v></c></row><row r="5"><c r="A5" t="str"><v>Grand Total</v></c><c r="B5"><v>999</v></c></row></sheetData></worksheet>"#;
+        let sheet2_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#;
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1" dataCaption="Values"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs></styleSheet>"#;
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Report" sheetId="2" r:id="rId2"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId5"/></pivotCaches></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+
+        write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
+            ("xl/worksheets/sheet2.xml".into(), sheet2.into()),
+            (
+                "xl/worksheets/_rels/sheet2.xml.rels".into(),
+                sheet2_rels.into(),
+            ),
+            ("xl/pivotTables/pivotTable1.xml".into(), pivot_table.into()),
+            (
+                "xl/pivotCache/pivotCacheDefinition1.xml".into(),
+                cache.into(),
+            ),
+            ("xl/styles.xml".into(), styles.into()),
+        ])
+    }
+
+    #[test]
+    fn pivot_loads_refreshes_and_round_trips() {
+        use crate::pivot::{PivotSource, refresh_pivots};
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        // Parsed and wired to its cache.
+        assert_eq!(pkg.workbook.pivots.len(), 1);
+        let piv = &pkg.workbook.pivots[0];
+        assert_eq!(piv.name, "PivotTable1");
+        assert_eq!(piv.sheet, 1);
+        assert_eq!(piv.fields, vec!["Region", "Product", "Sales"]);
+        assert_eq!(piv.row_fields, vec![0]);
+        assert_eq!(piv.data_fields.len(), 1);
+        assert!(!piv.unsupported);
+        assert_eq!(
+            piv.source,
+            PivotSource::Range {
+                sheet: "Data".into(),
+                rect: (0, 0, 4, 2)
+            }
+        );
+
+        // Refresh replaces the stale cached output with real aggregates.
+        let outcome = refresh_pivots(&mut pkg.workbook);
+        assert_eq!((outcome.refreshed, outcome.skipped), (1, 0));
+        let report = &pkg.workbook.sheets[1];
+        let val = |name: &str| {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            report
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(val("A3"), CellValue::Text("Region".into()));
+        assert_eq!(val("B3"), CellValue::Text("Sum of Sales".into()));
+        assert_eq!(val("A4"), CellValue::Text("East".into()));
+        assert_eq!(val("B4"), CellValue::Number(40.0));
+        assert_eq!(val("A5"), CellValue::Text("West".into()));
+        assert_eq!(val("B5"), CellValue::Number(60.0));
+        assert_eq!(val("A6"), CellValue::Text("Grand Total".into()));
+        assert_eq!(val("B6"), CellValue::Number(100.0));
+        // The location grew by the West row: A3:B5 → A3:B6.
+        assert_eq!(pkg.workbook.pivots[0].location, (2, 0, 5, 1));
+
+        // Save: location ref patched, cache marked refreshOnLoad; second
+        // save byte-identical (deterministic writer).
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).unwrap();
+        let part = |name: &str| {
+            let b = &pkg2.parts.iter().find(|(n, _)| n == name).unwrap().1;
+            String::from_utf8_lossy(b).into_owned()
+        };
+        assert!(part("xl/pivotTables/pivotTable1.xml").contains("ref=\"A3:B6\""));
+        assert!(part("xl/pivotCache/pivotCacheDefinition1.xml").contains("refreshOnLoad=\"1\""));
+        assert_eq!(save_xlsx(&pkg2), save_xlsx(&pkg2));
+        // The reloaded pivot refreshes to the same values (idempotent).
+        let mut pkg3 = pkg2;
+        let outcome = refresh_pivots(&mut pkg3.workbook);
+        assert_eq!(outcome.refreshed, 1);
+        let (r, c) = crate::sheet::parse_cell_name("B6").unwrap();
+        assert_eq!(
+            pkg3.workbook.sheets[1].cell(r, c).unwrap().value,
+            CellValue::Number(100.0)
+        );
+
+        // Source edit → refresh reflects it.
+        let (r, c) = crate::sheet::parse_cell_name("C2").unwrap();
+        pkg3.workbook.sheets[0].set_cell(r, c, crate::sheet::Cell::number(100.0));
+        refresh_pivots(&mut pkg3.workbook);
+        let (r, c) = crate::sheet::parse_cell_name("B4").unwrap();
+        assert_eq!(
+            pkg3.workbook.sheets[1].cell(r, c).unwrap().value,
+            CellValue::Number(130.0)
+        );
+    }
+
+    #[test]
+    fn filtered_pivot_is_skipped_not_wrong() {
+        // A pivot with a hidden item (an active filter) must keep its cached
+        // cells rather than refresh to numbers that ignore the filter.
+        let bytes = pivot_fixture();
+        let s = String::from_utf8(bytes.clone()).ok(); // zip is binary; patch at part level instead
+        drop(s);
+        let mut pkg = load_xlsx(&bytes).unwrap();
+        // Simulate: mark the loaded pivot as filtered the way the parser
+        // does for h="1" items.
+        pkg.workbook.pivots[0].unsupported = true;
+        let outcome = crate::pivot::refresh_pivots(&mut pkg.workbook);
+        assert_eq!((outcome.refreshed, outcome.skipped), (0, 1));
+        let (r, c) = crate::sheet::parse_cell_name("B4").unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[1].cell(r, c).unwrap().value,
+            CellValue::Number(999.0) // stale cache, untouched
         );
     }
 }

@@ -356,6 +356,9 @@ pub struct Workbook {
     pub styles: Styles,
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
+    /// Pivot tables (parsed read-only from their preserved parts, so they
+    /// can be refreshed from current source data).
+    pub pivots: Vec<crate::pivot::Pivot>,
     /// True when the workbook uses the 1904 date system (Mac legacy).
     pub date1904: bool,
     /// Iterative calculation opt-in from `<calcPr iterate="1">`:

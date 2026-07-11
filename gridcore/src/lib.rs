@@ -26,6 +26,8 @@
 pub mod edit;
 pub mod engine;
 pub mod formula;
+pub mod frame;
 pub mod numfmt;
+pub mod pivot;
 pub mod sheet;
 pub mod xlsx;
