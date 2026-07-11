@@ -2819,9 +2819,14 @@ impl App {
         // Multi-key prefixes.
         match pending {
             'g' => {
-                if code == KeyCode::Char('g') {
-                    self.cur.0 = 0;
-                    self.ensure_visible();
+                match code {
+                    KeyCode::Char('g') => {
+                        self.cur.0 = 0;
+                        self.ensure_visible();
+                    }
+                    KeyCode::Char('t') => self.switch_sheet(1), // next sheet
+                    KeyCode::Char('T') => self.switch_sheet(-1), // previous sheet
+                    _ => {}
                 }
                 return false;
             }
@@ -2908,6 +2913,8 @@ impl App {
                 }
             }
             KeyCode::Char('p') => self.paste(),
+            KeyCode::PageUp if ctrl => self.switch_sheet(-1),
+            KeyCode::PageDown if ctrl => self.switch_sheet(1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('r') if ctrl => self.redo(),
             KeyCode::Char('s') if ctrl => self.save(),
