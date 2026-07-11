@@ -15,8 +15,10 @@
 use std::cell::Cell as StdCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::formula::{self, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile};
-use crate::sheet::{Cell, CellValue, Workbook};
+use crate::formula::{
+    self, DynResult, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile,
+};
+use crate::sheet::{Cell, CellValue, Sheet, Workbook};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -27,6 +29,9 @@ type Rect = (usize, u32, u32, u32, u32);
 struct FormulaInfo {
     ast: Expr,
     volatile: bool,
+    /// Contains a spill reference (`A1#`) — its dep rects must be refreshed
+    /// whenever spill extents may have changed.
+    spillref: bool,
     /// Dependency rects with sheet names resolved to indices. References to
     /// unknown sheets simply have no edge (they evaluate to `#REF!`).
     deps: Vec<Rect>,
@@ -37,12 +42,19 @@ pub struct Engine {
     formulas: HashMap<Key, FormulaInfo>,
     /// Cells whose formulas we must not re-evaluate (see module docs).
     unsupported: HashSet<Key>,
+    /// Dynamic-array anchors currently showing `#SPILL!` — retried on every
+    /// recalculation so they recover the moment the blockage clears.
+    spill_blocked: HashSet<Key>,
     /// Current moment as an Excel serial, supplied by the app (None = no
     /// clock → `TODAY`/`NOW` formulas stay on their cached values).
     pub clock: Option<f64>,
     /// PRNG state for `RAND`; None = no randomness source.
     pub seed: Option<u64>,
 }
+
+/// Spill chains (an anchor whose array feeds another anchor's spill cells)
+/// resolve through repeated post-passes; this bounds pathological loops.
+const MAX_SPILL_PASSES: u32 = 8;
 
 impl Engine {
     /// Parse all formulas in the workbook and build the dependency graph.
@@ -51,7 +63,14 @@ impl Engine {
         for (s, sheet) in wb.sheets.iter().enumerate() {
             for (&(r, c), cell) in &sheet.cells {
                 if let Some(src) = &cell.formula {
-                    eng.index_formula(wb, (s, r, c), src, cell.f_attrs.is_some());
+                    // Array formulas (`t="array"`) are ours to evaluate — the
+                    // dynamic-array engine recomputes their spill. Other
+                    // preserved `<f>` attributes stay frozen.
+                    let preserved = cell
+                        .f_attrs
+                        .as_deref()
+                        .is_some_and(|a| !a.contains("t=\"array\""));
+                    eng.index_formula(wb, (s, r, c), src, preserved);
                 }
             }
         }
@@ -74,10 +93,13 @@ impl Engine {
             Ok(ast) => {
                 let mut deps = Vec::new();
                 collect_deps(wb, key, &ast, &mut deps, 0);
+                let mut spills = Vec::new();
+                formula::collect_spillrefs(&ast, &mut spills);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
                         volatile: is_volatile(&ast),
+                        spillref: !spills.is_empty(),
                         ast,
                         deps,
                     },
@@ -101,6 +123,23 @@ impl Engine {
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
         self.unsupported.remove(&key);
+        self.spill_blocked.remove(&key);
+        let mut changed = vec![key];
+        if let Some(sheet) = wb.sheets.get_mut(s) {
+            // Replacing a spill anchor orphans its spilled cells: clear them.
+            if let Some(ext) = sheet.cell(r, c).and_then(|cl| cl.spill) {
+                changed.extend(clear_spill(sheet, s, (r, c), ext, None));
+            }
+            // An edit landing inside another anchor's spill breaks that
+            // spill: clear its cells and let the anchor recalc to #SPILL!.
+            if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
+                changed.extend(clear_spill(sheet, s, anchor, ext, Some((r, c))));
+                if let Some(a) = sheet.cells.get_mut(&anchor) {
+                    a.spill = None;
+                }
+                changed.push((s, anchor.0, anchor.1));
+            }
+        }
         if let Some(src) = cell.formula.clone() {
             cell.f_attrs = None; // an edited formula is ours now
             self.index_formula(wb, key, &src, false);
@@ -108,19 +147,40 @@ impl Engine {
         if s < wb.sheets.len() {
             wb.sheets[s].set_cell(r, c, cell);
         }
-        self.recalc_from(wb, &[key]);
+        self.recalc_from(wb, &changed);
     }
 
     /// Recalculate every formula in the workbook (headless `--recalc`, or
     /// after load when a full refresh is wanted).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
         let all: HashSet<Key> = self.formulas.keys().copied().collect();
-        self.evaluate(wb, all);
+        self.evaluate(wb, all, 0);
     }
 
     /// Dirty the transitive dependents of `changed` (plus volatiles) and
     /// re-evaluate them.
     pub fn recalc_from(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.recalc_from_depth(wb, changed, 0);
+    }
+
+    fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
+        // Spill extents may have moved since indexing — refresh the dep
+        // rects of every formula that reads one (`A1#`).
+        let with_spillrefs: Vec<Key> = self
+            .formulas
+            .iter()
+            .filter(|(_, i)| i.spillref)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in with_spillrefs {
+            let mut deps = Vec::new();
+            if let Some(info) = self.formulas.get(&k) {
+                collect_deps(wb, k, &info.ast, &mut deps, 0);
+            }
+            if let Some(info) = self.formulas.get_mut(&k) {
+                info.deps = deps;
+            }
+        }
         let mut dirty: HashSet<Key> = HashSet::new();
         // Sources whose dependents still need discovering. Edited cells seed
         // the walk whether or not they hold formulas.
@@ -133,6 +193,14 @@ impl Engine {
         }
         for (&k, info) in &self.formulas {
             if info.volatile && dirty.insert(k) {
+                frontier.push_back(k);
+            }
+        }
+        // Blocked anchors retry every pass — a cleared blockage isn't
+        // otherwise visible to the dependency walk.
+        let blocked: Vec<Key> = self.spill_blocked.iter().copied().collect();
+        for k in blocked {
+            if self.formulas.contains_key(&k) && dirty.insert(k) {
                 frontier.push_back(k);
             }
         }
@@ -150,11 +218,11 @@ impl Engine {
                 }
             }
         }
-        self.evaluate(wb, dirty);
+        self.evaluate(wb, dirty, depth);
     }
 
     /// Kahn's algorithm over the dirty subgraph, then evaluation in order.
-    fn evaluate(&mut self, wb: &mut Workbook, dirty: HashSet<Key>) {
+    fn evaluate(&mut self, wb: &mut Workbook, dirty: HashSet<Key>, depth: u32) {
         // Only supported formulas actually evaluate; unsupported ones keep
         // their cached values but still satisfy dependents.
         let dirty: Vec<Key> = dirty
@@ -192,9 +260,10 @@ impl Engine {
             .map(|(&k, _)| k)
             .collect();
         let mut done: HashSet<Key> = HashSet::new();
+        let mut spilled: Vec<Key> = Vec::new();
         while let Some(k) = queue.pop_front() {
             done.insert(k);
-            self.eval_one(wb, k);
+            spilled.extend(self.eval_one(wb, k));
             if let Some(dependents) = edges.get(&k).cloned() {
                 for d in dependents {
                     let e = indeg.get_mut(&d).unwrap();
@@ -218,52 +287,62 @@ impl Engine {
             v.sort_unstable();
             v
         };
-        if cycle.is_empty() {
-            return;
-        }
-        match wb.iterate {
-            Some((count, delta)) => {
-                for _ in 0..count.max(1) {
-                    let mut max_change = 0.0f64;
-                    for &k in &cycle {
-                        let before = wb.sheets[k.0]
-                            .cell(k.1, k.2)
-                            .map(|c| c.value.clone())
-                            .unwrap_or_default();
-                        self.eval_one(wb, k);
-                        let after = wb.sheets[k.0]
-                            .cell(k.1, k.2)
-                            .map(|c| c.value.clone())
-                            .unwrap_or_default();
-                        if let (CellValue::Number(x), CellValue::Number(y)) = (&before, &after) {
-                            max_change = max_change.max((x - y).abs());
-                        } else if before != after {
-                            max_change = f64::MAX;
+        if !cycle.is_empty() {
+            match wb.iterate {
+                Some((count, delta)) => {
+                    for _ in 0..count.max(1) {
+                        let mut max_change = 0.0f64;
+                        for &k in &cycle {
+                            let before = wb.sheets[k.0]
+                                .cell(k.1, k.2)
+                                .map(|c| c.value.clone())
+                                .unwrap_or_default();
+                            spilled.extend(self.eval_one(wb, k));
+                            let after = wb.sheets[k.0]
+                                .cell(k.1, k.2)
+                                .map(|c| c.value.clone())
+                                .unwrap_or_default();
+                            if let (CellValue::Number(x), CellValue::Number(y)) = (&before, &after)
+                            {
+                                max_change = max_change.max((x - y).abs());
+                            } else if before != after {
+                                max_change = f64::MAX;
+                            }
+                        }
+                        if max_change < delta {
+                            break;
                         }
                     }
-                    if max_change < delta {
-                        break;
+                }
+                None => {
+                    for &(s, r, c) in &cycle {
+                        if let Some(cell) = wb
+                            .sheets
+                            .get_mut(s)
+                            .and_then(|sh| sh.cells.get_mut(&(r, c)))
+                        {
+                            cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
+                        }
                     }
                 }
             }
-            None => {
-                for &(s, r, c) in &cycle {
-                    if let Some(cell) = wb
-                        .sheets
-                        .get_mut(s)
-                        .and_then(|sh| sh.cells.get_mut(&(r, c)))
-                    {
-                        cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
-                    }
-                }
-            }
+        }
+        // Spill writes change plain-value cells whose dependents the dirty
+        // walk couldn't see (only the anchor is a formula). One more pass
+        // over those cells picks them up; chains converge quickly.
+        if !spilled.is_empty() && depth < MAX_SPILL_PASSES {
+            spilled.sort_unstable();
+            spilled.dedup();
+            self.recalc_from_depth(wb, &spilled, depth + 1);
         }
     }
 
-    fn eval_one(&mut self, wb: &mut Workbook, key: Key) {
+    /// Evaluate one formula and store its result. Returns the keys of cells
+    /// beyond the anchor whose stored values changed (spill writes/clears).
+    fn eval_one(&mut self, wb: &mut Workbook, key: Key) -> Vec<Key> {
         let info = match self.formulas.get(&key) {
             Some(i) => i,
-            None => return,
+            None => return Vec::new(),
         };
         let resolver = WbResolver {
             wb,
@@ -272,7 +351,7 @@ impl Engine {
             has_rand: self.seed.is_some(),
         };
         let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
-        let value = ev.eval(&info.ast);
+        let result = ev.eval_dynamic(&info.ast);
         let unsupported = ev.unsupported;
         if self.seed.is_some() {
             self.seed = Some(resolver.rand_state.get());
@@ -281,14 +360,116 @@ impl Engine {
             // Something beyond the engine: freeze this cell on its cached
             // value from here on.
             self.unsupported.insert(key);
-            return;
+            return Vec::new();
         }
         let (s, r, c) = key;
-        if let Some(sheet) = wb.sheets.get_mut(s) {
-            let entry = sheet.cells.entry((r, c)).or_default();
-            entry.value = value_to_cell(value);
+        let Some(sheet) = wb.sheets.get_mut(s) else {
+            return Vec::new();
+        };
+        let old = sheet.cell(r, c).and_then(|cl| cl.spill).unwrap_or((1, 1));
+        let mut changed = Vec::new();
+        match result {
+            DynResult::Scalar(v) => {
+                changed.extend(clear_spill(sheet, s, (r, c), old, None));
+                let entry = sheet.cells.entry((r, c)).or_default();
+                entry.value = value_to_cell(v);
+                entry.spill = None;
+                self.spill_blocked.remove(&key);
+            }
+            DynResult::Array(m) => {
+                let (h, w) = (m.len() as u32, m[0].len() as u32);
+                // Blocked when the array runs off the grid, or any target
+                // cell (other than the anchor) holds content that isn't this
+                // anchor's previous spill.
+                let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
+                let blocked = off_grid
+                    || (r..r + h).any(|rr| {
+                        (c..c + w).any(|cc| {
+                            if (rr, cc) == (r, c) {
+                                return false;
+                            }
+                            let Some(cell) = sheet.cell(rr, cc) else {
+                                return false;
+                            };
+                            let ours = rr < r + old.0 && cc < c + old.1 && cell.formula.is_none();
+                            !cell.is_blank() && !ours
+                        })
+                    });
+                if blocked {
+                    changed.extend(clear_spill(sheet, s, (r, c), old, None));
+                    let entry = sheet.cells.entry((r, c)).or_default();
+                    entry.value = CellValue::Error(ExcelError::Spill.code().to_string());
+                    entry.spill = None;
+                    self.spill_blocked.insert(key);
+                } else {
+                    changed.extend(clear_spill(sheet, s, (r, c), old, Some((h, w))));
+                    for (i, row) in m.into_iter().enumerate() {
+                        for (j, v) in row.into_iter().enumerate() {
+                            let (rr, cc) = (r + i as u32, c + j as u32);
+                            let entry = sheet.cells.entry((rr, cc)).or_default();
+                            entry.value = value_to_cell(v);
+                            if (rr, cc) != (r, c) {
+                                entry.formula = None;
+                                entry.f_attrs = None;
+                                entry.spill = None;
+                                changed.push((s, rr, cc));
+                            }
+                        }
+                    }
+                    let entry = sheet.cells.entry((r, c)).or_default();
+                    entry.spill = Some((h, w));
+                    self.spill_blocked.remove(&key);
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Clear the plain-value cells of a spill (keeping styles) outside the
+/// surviving extent `keep` (None = clear all but the anchor). Returns the
+/// cleared keys. Cells holding formulas are left alone.
+fn clear_spill(
+    sheet: &mut Sheet,
+    s: usize,
+    anchor: (u32, u32),
+    old: (u32, u32),
+    keep: Option<(u32, u32)>,
+) -> Vec<Key> {
+    let (r, c) = anchor;
+    let (kh, kw) = keep.unwrap_or((1, 1));
+    let mut out = Vec::new();
+    for rr in r..r + old.0 {
+        for cc in c..c + old.1 {
+            if (rr, cc) == (r, c) || (rr < r + kh && cc < c + kw) {
+                continue;
+            }
+            if sheet
+                .cell(rr, cc)
+                .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
+            {
+                sheet.clear_cell(rr, cc);
+                out.push((s, rr, cc));
+            }
         }
     }
+    out
+}
+
+/// The anchor whose spill contains (r, c), if any (excluding (r, c) itself
+/// being the anchor).
+fn spill_owner(sheet: &Sheet, r: u32, c: u32) -> Option<((u32, u32), (u32, u32))> {
+    for (&(ar, ac), cell) in &sheet.cells {
+        if ar > r {
+            break;
+        }
+        if let Some((h, w)) = cell.spill {
+            if (ar, ac) != (r, c) && r >= ar && r < ar + h && c >= ac && c < ac + w {
+                return Some(((ar, ac), (h, w)));
+            }
+        }
+    }
+    None
 }
 
 /// Dependency rects of an AST, with sheet names resolved, defined names
@@ -307,6 +488,24 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
         };
         if let Some(s) = s {
             out.push((s, r1, c1, r2, c2));
+        }
+    }
+    let mut spillrefs = Vec::new();
+    formula::collect_spillrefs(ast, &mut spillrefs);
+    for (sheet_name, r, c) in spillrefs {
+        let s = match sheet_name {
+            None => Some(sheet),
+            Some(name) => wb.sheet_index(&name),
+        };
+        if let Some(s) = s {
+            // Widen to the anchor's current spill extent (at least itself).
+            let (h, w) = wb
+                .sheets
+                .get(s)
+                .and_then(|sh| sh.cell(r, c))
+                .and_then(|cl| cl.spill)
+                .unwrap_or((1, 1));
+            out.push((s, r, c, r + h - 1, c + w - 1));
         }
     }
     let mut spans = Vec::new();
@@ -445,6 +644,14 @@ impl Resolver for WbResolver<'_> {
         self.wb.table_at(sheet, row, col).map(to_table_info)
     }
 
+    fn spill_extent(&self, sheet: usize, row: u32, col: u32) -> Option<(u32, u32)> {
+        self.wb
+            .sheets
+            .get(sheet)
+            .and_then(|s| s.cell(row, col))
+            .and_then(|c| c.spill)
+    }
+
     fn rand(&self) -> Option<f64> {
         if !self.has_rand {
             return None;
@@ -549,7 +756,7 @@ mod tests {
                 "B1",
                 Cell {
                     value: CellValue::Number(42.0), // Excel's cached result
-                    formula: Some("SEQUENCE(A1,4)".to_string()),
+                    formula: Some("PIVOTBY(A1,4)".to_string()),
                     ..Cell::default()
                 },
             ),
@@ -794,5 +1001,156 @@ mod tests {
             CellValue::Number(n) => assert!((0.0..1.0).contains(&n)),
             v => panic!("RAND gave {v:?}"),
         }
+    }
+
+    // ---- dynamic arrays / spilling ------------------------------------
+
+    #[test]
+    fn sequence_spills_and_resizes() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("SEQUENCE(3)")),
+            ("C1", Cell::formula("SUM(A1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+        assert_eq!(wb.sheets[0].cell(0, 0).unwrap().spill, Some((3, 1)));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
+        // Growing the spill updates both the grid and the A1# dependent.
+        set(
+            &mut eng,
+            &mut wb,
+            "A1",
+            Cell::formula("SEQUENCE(4,1,10,10)"),
+        );
+        assert_eq!(value_at(&wb, "A4"), CellValue::Number(40.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(100.0));
+        // Shrinking clears the cells that fell off the end.
+        set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(2)"));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "A4"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn blocked_spill_errors_and_recovers() {
+        let mut wb = wb_one_sheet(&[
+            ("A3", Cell::number(99.0)),
+            ("A1", Cell::formula("SEQUENCE(3)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#SPILL!".into()));
+        // The blocker keeps its value; nothing was overwritten.
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(99.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Empty);
+        // Clearing the blockage lets the anchor spill on the next recalc.
+        set(&mut eng, &mut wb, "A3", Cell::default());
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn typing_into_a_spill_breaks_it() {
+        let mut wb = wb_one_sheet(&[("A1", Cell::formula("SEQUENCE(3)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+        // A value typed into a spilled cell wins; the anchor turns #SPILL!.
+        set(&mut eng, &mut wb, "A2", Cell::number(7.0));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(7.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Empty);
+        // Removing it heals the spill.
+        set(&mut eng, &mut wb, "A2", Cell::default());
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn clearing_an_anchor_clears_its_spill() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("SEQUENCE(3)")),
+            ("C1", Cell::formula("A2*10")), // direct dependent of a spill cell
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(20.0));
+        set(&mut eng, &mut wb, "A1", Cell::default());
+        assert_eq!(value_at(&wb, "A2"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "A3"), CellValue::Empty);
+        // The dependent saw the cleared cell (empty*10 = 0).
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(0.0));
+    }
+
+    #[test]
+    fn dependents_of_spilled_cells_update() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("SEQUENCE(3,1,10,10)")),
+            ("C1", Cell::formula("A2+1")), // A2 is a spilled cell, not a formula
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(21.0));
+        set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(3,1,5,5)"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(11.0));
+    }
+
+    #[test]
+    fn filter_spills_from_sheet_data() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(5.0)),
+            ("A2", Cell::number(15.0)),
+            ("A3", Cell::number(25.0)),
+            ("A4", Cell::number(8.0)),
+            ("C1", Cell::formula("FILTER(A1:A4,A1:A4>9)")),
+            ("E1", Cell::formula("COUNT(C1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(15.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(25.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(2.0));
+        // Data edit reshapes the filter result and its dependents.
+        set(&mut eng, &mut wb, "A4", Cell::number(80.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(80.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn plain_range_formula_spills() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("C1", Cell::formula("A1:A2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((2, 1)));
+    }
+
+    #[test]
+    fn spill_ref_to_non_anchor_is_ref_error() {
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(3.0)), ("B1", Cell::formula("SUM(A1#)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "B1"), CellValue::Error("#REF!".into()));
+    }
+
+    #[test]
+    fn spill_off_grid_is_blocked() {
+        let last = crate::sheet::MAX_ROWS; // 1-based name of the last row
+        let mut wb = wb_one_sheet(&[(format!("A{last}").as_str(), Cell::formula("SEQUENCE(2)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(
+            value_at(&wb, &format!("A{last}")),
+            CellValue::Error("#SPILL!".into())
+        );
     }
 }

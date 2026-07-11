@@ -145,6 +145,8 @@ pub enum UnOp {
     Pos,
     /// Postfix `%`.
     Percent,
+    /// Prefix `@` — implicit intersection (stored as `_xlfn.SINGLE(…)`).
+    Implicit,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,6 +198,12 @@ pub enum Expr {
     },
     /// A defined name, resolved through the workbook at evaluation time.
     Name(String),
+    /// `A1#` — the spill range of the dynamic-array anchor at `A1` (stored in
+    /// files as `_xlfn.ANCHORARRAY(A1)`). Resolves to the anchor's current
+    /// spill extent; `#REF!` when the anchor doesn't spill.
+    SpillRef(CellRef),
+    /// `{1,2;3,4}` — an array constant (rows separated by `;`).
+    ArrayLit(Vec<Vec<Expr>>),
     Func(String, Vec<Expr>),
     Un(UnOp, Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -218,9 +226,15 @@ enum Tok {
     Err(ExcelError),
     LParen,
     RParen,
+    LBrace,
+    RBrace,
     Comma,
+    Semi,
     Colon,
     Bang,
+    At,
+    /// Postfix `#` (spill reference).
+    Hash,
     Percent,
     Amp,
     Plus,
@@ -262,6 +276,10 @@ impl<'a> Lexer<'a> {
         Ok(match c {
             b'(' => Tok::LParen,
             b')' => Tok::RParen,
+            b'{' => Tok::LBrace,
+            b'}' => Tok::RBrace,
+            b';' => Tok::Semi,
+            b'@' => Tok::At,
             b'[' => {
                 // Scan to the matching ']' (structured refs nest one level:
                 // Table1[[#Totals],[My Col]]); a single quote escapes the
@@ -382,6 +400,9 @@ impl<'a> Lexer<'a> {
                 let lit = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
                 match ExcelError::from_code(lit) {
                     Some(e) => Tok::Err(e),
+                    // A bare `#` (nothing error-like after it) is the postfix
+                    // spill-reference operator: `A1#`.
+                    None if lit == "#" => Tok::Hash,
                     None => return Err(format!("bad error literal {lit}")),
                 }
             }
@@ -572,15 +593,31 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Expr::Un(UnOp::Pos, Box::new(self.unary()?)))
             }
+            Tok::At => {
+                self.bump()?;
+                Ok(Expr::Un(UnOp::Implicit, Box::new(self.unary()?)))
+            }
             _ => self.postfix(),
         }
     }
 
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        while self.tok == Tok::Percent {
-            self.bump()?;
-            e = Expr::Un(UnOp::Percent, Box::new(e));
+        loop {
+            match self.tok {
+                Tok::Percent => {
+                    self.bump()?;
+                    e = Expr::Un(UnOp::Percent, Box::new(e));
+                }
+                Tok::Hash => {
+                    self.bump()?;
+                    let Expr::Ref(r) = e else {
+                        return Err("# after a non-cell reference".into());
+                    };
+                    e = Expr::SpillRef(r);
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -621,6 +658,31 @@ impl<'a> Parser<'a> {
                 }
                 self.bump()?;
                 Ok(e)
+            }
+            Tok::LBrace => {
+                // `{1,2;3,4}` — an array constant. Rows must be rectangular.
+                self.bump()?;
+                let mut rows: Vec<Vec<Expr>> = vec![Vec::new()];
+                loop {
+                    rows.last_mut().unwrap().push(self.compare()?);
+                    match self.tok {
+                        Tok::Comma => self.bump()?,
+                        Tok::Semi => {
+                            self.bump()?;
+                            rows.push(Vec::new());
+                        }
+                        Tok::RBrace => {
+                            self.bump()?;
+                            break;
+                        }
+                        _ => return Err("expected , ; or } in array constant".into()),
+                    }
+                }
+                let w = rows[0].len();
+                if rows.iter().any(|r| r.len() != w) {
+                    return Err("ragged array constant".into());
+                }
+                Ok(Expr::ArrayLit(rows))
             }
             Tok::Quoted(name) => {
                 self.bump()?;
@@ -698,12 +760,28 @@ impl<'a> Parser<'a> {
                                 }
                             }
                         }
-                        // Excel writes post-2007 functions as _xlfn.NAME.
+                        // Excel writes post-2007 functions as _xlfn.NAME, and
+                        // spells the dynamic-array operators as functions in
+                        // stored formulas: `A1#` is `_xlfn.ANCHORARRAY(A1)`,
+                        // `@x` is `_xlfn.SINGLE(x)`.
                         let name = id
                             .strip_prefix("_xlfn.")
                             .unwrap_or(&id)
                             .to_ascii_uppercase();
-                        Ok(Expr::Func(name, args))
+                        let name = name.strip_prefix("_XLWS.").unwrap_or(&name).to_string();
+                        match (name.as_str(), args.len()) {
+                            ("ANCHORARRAY", 1) => {
+                                if let Expr::Ref(r) = &args[0] {
+                                    return Ok(Expr::SpillRef(r.clone()));
+                                }
+                                Err("ANCHORARRAY needs a cell reference".into())
+                            }
+                            ("SINGLE", 1) => Ok(Expr::Un(
+                                UnOp::Implicit,
+                                Box::new(args.into_iter().next().unwrap()),
+                            )),
+                            _ => Ok(Expr::Func(name, args)),
+                        }
                     }
                     _ => self.ident_expr(id, None),
                 }
@@ -1159,7 +1237,7 @@ fn prec(e: &Expr) -> u8 {
             BinOp::Mul | BinOp::Div => 4,
             BinOp::Pow => 5,
         },
-        Expr::Un(UnOp::Neg | UnOp::Pos, _) => 6,
+        Expr::Un(UnOp::Neg | UnOp::Pos | UnOp::Implicit, _) => 6,
         Expr::Un(UnOp::Percent, _) => 7,
         _ => 8,
     }
@@ -1286,6 +1364,14 @@ pub fn to_string(e: &Expr) -> String {
             col2,
         } => structured_to_string(table, *item, col1, col2),
         Expr::Name(n) => n.clone(),
+        Expr::SpillRef(r) => format!("{}#", ref_to_string(r)),
+        Expr::ArrayLit(rows) => {
+            let body: Vec<String> = rows
+                .iter()
+                .map(|row| row.iter().map(to_string).collect::<Vec<_>>().join(","))
+                .collect();
+            format!("{{{}}}", body.join(";"))
+        }
         Expr::Func(name, args) => {
             let list: Vec<String> = args.iter().map(to_string).collect();
             format!("{}({})", name, list.join(","))
@@ -1300,6 +1386,7 @@ pub fn to_string(e: &Expr) -> String {
                 UnOp::Neg => format!("-{inner}"),
                 UnOp::Pos => format!("+{inner}"),
                 UnOp::Percent => format!("{inner}%"),
+                UnOp::Implicit => format!("@{inner}"),
             }
         }
         Expr::Bin(op, l, r) => {
@@ -1349,6 +1436,12 @@ fn translate_ref(r: &CellRef, dr: i64, dc: i64) -> CellRef {
 pub fn translate(e: &Expr, dr: i64, dc: i64) -> Expr {
     match e {
         Expr::Ref(r) => Expr::Ref(translate_ref(r, dr, dc)),
+        Expr::SpillRef(r) => Expr::SpillRef(translate_ref(r, dr, dc)),
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(|x| translate(x, dr, dc)).collect())
+                .collect(),
+        ),
         Expr::Range(a, b) => Expr::Range(translate_ref(a, dr, dc), translate_ref(b, dr, dc)),
         Expr::Ref3D { first, last, a, b } => Expr::Ref3D {
             first: first.clone(),
@@ -1481,6 +1574,16 @@ fn targets(sheet: &Option<String>, home_is_target: bool, target: &str) -> bool {
 pub fn adjust_for_edit(e: &Expr, home_is_target: bool, target: &str, shift: &EditShift) -> Expr {
     let recur = |x: &Expr| adjust_for_edit(x, home_is_target, target, shift);
     match e {
+        // A spill ref follows its anchor cell.
+        Expr::SpillRef(r) => match recur(&Expr::Ref(r.clone())) {
+            Expr::Ref(r2) => Expr::SpillRef(r2),
+            other => other,
+        },
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect(),
+        ),
         Expr::Ref(r) => {
             if !targets(&r.sheet, home_is_target, target) || r.row < 0 || r.col < 0 {
                 return e.clone();
@@ -1638,6 +1741,15 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
                 sheet: fix(&r.sheet),
                 ..r.clone()
             }),
+            Expr::SpillRef(r) => Expr::SpillRef(CellRef {
+                sheet: fix(&r.sheet),
+                ..r.clone()
+            }),
+            Expr::ArrayLit(rows) => Expr::ArrayLit(
+                rows.iter()
+                    .map(|row| row.iter().map(|x| walk(x, old, new)).collect())
+                    .collect(),
+            ),
             Expr::Ref3D { first, last, a, b } => {
                 let ren = |n: &String| -> String {
                     if n.eq_ignore_ascii_case(old) {
@@ -1706,7 +1818,9 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
 /// Ranges are reported normalized. Negative (poisoned) refs are skipped.
 pub fn collect_refs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32, u32, u32)>) {
     match e {
-        Expr::Ref(r) => {
+        // The anchor cell itself; the engine widens spill refs to the
+        // anchor's current extent separately (see `collect_spillrefs`).
+        Expr::Ref(r) | Expr::SpillRef(r) => {
             if r.row >= 0 && r.col >= 0 {
                 out.push((
                     r.sheet.clone(),
@@ -1751,10 +1865,47 @@ pub fn collect_refs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32, u32, u32)
                 collect_refs(a, out);
             }
         }
+        Expr::ArrayLit(rows) => {
+            for row in rows {
+                for x in row {
+                    collect_refs(x, out);
+                }
+            }
+        }
         Expr::Un(_, x) => collect_refs(x, out),
         Expr::Bin(_, l, r) => {
             collect_refs(l, out);
             collect_refs(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect every spill reference (`A1#`) in a formula: (sheet, row, col) of
+/// the anchor. The engine widens each to the anchor's current spill extent.
+pub fn collect_spillrefs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32)>) {
+    match e {
+        Expr::SpillRef(r) => {
+            if r.row >= 0 && r.col >= 0 {
+                out.push((r.sheet.clone(), r.row as u32, r.col as u32));
+            }
+        }
+        Expr::Func(_, args) => {
+            for a in args {
+                collect_spillrefs(a, out);
+            }
+        }
+        Expr::ArrayLit(rows) => {
+            for row in rows {
+                for x in row {
+                    collect_spillrefs(x, out);
+                }
+            }
+        }
+        Expr::Un(_, x) => collect_spillrefs(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_spillrefs(l, out);
+            collect_spillrefs(r, out);
         }
         _ => {}
     }
@@ -1843,9 +1994,10 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::Func(name, args) => {
             matches!(
                 name.as_str(),
-                "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "INDIRECT" | "OFFSET"
+                "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "INDIRECT" | "OFFSET"
             ) || args.iter().any(is_volatile)
         }
+        Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
         Expr::Un(_, x) => is_volatile(x),
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
@@ -1905,6 +2057,13 @@ pub trait Resolver {
     }
     /// The table containing a cell (for bare `[@Col]` references).
     fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<TableInfo> {
+        let _ = (sheet, row, col);
+        None
+    }
+    /// (rows, cols) of the dynamic-array spill anchored at a cell, including
+    /// the anchor itself. `None` = the cell doesn't anchor a spill (an `A1#`
+    /// reference to it is `#REF!`).
+    fn spill_extent(&self, sheet: usize, row: u32, col: u32) -> Option<(u32, u32)> {
         let _ = (sheet, row, col);
         None
     }
@@ -1997,12 +2156,31 @@ pub struct Eval<'a> {
     pub unsupported: bool,
     /// Defined-name expansion depth (guards against name→name cycles).
     depth: u32,
+    /// `LET` bindings currently in scope, innermost last.
+    lets: Vec<(String, Arg)>,
 }
 
-/// An evaluated argument: scalar, or a still-lazy range.
+/// A matrix of computed values (a dynamic-array result). Always non-empty
+/// and rectangular.
+pub type Matrix = Vec<Vec<Value>>;
+
+/// Ceiling on materialized array size (cells). Excel errors with `#NUM!`
+/// when an array result won't fit; we draw the line well before memory pain.
+const MAX_ARRAY_CELLS: u64 = 2_000_000;
+
+/// An evaluated argument: scalar, a still-lazy range, or a computed array.
+#[derive(Clone)]
 enum Arg {
     Scalar(Value),
     Range(usize, u32, u32, u32, u32),
+    Matrix(Matrix),
+}
+
+/// A formula's overall result: a single value, or an array to be spilled
+/// into the cells below/right of the anchor.
+pub enum DynResult {
+    Scalar(Value),
+    Array(Matrix),
 }
 
 impl<'a> Eval<'a> {
@@ -2013,6 +2191,7 @@ impl<'a> Eval<'a> {
             cell,
             unsupported: false,
             depth: 0,
+            lets: Vec::new(),
         }
     }
 
@@ -2028,7 +2207,166 @@ impl<'a> Eval<'a> {
                     Value::Err(ExcelError::Value)
                 }
             }
+            Arg::Matrix(m) => {
+                if m.len() == 1 && m[0].len() == 1 {
+                    m[0][0].clone()
+                } else {
+                    Value::Err(ExcelError::Value)
+                }
+            }
         }
+    }
+
+    /// Evaluate a whole formula with dynamic-array semantics: a multi-cell
+    /// range or computed array becomes an [`DynResult::Array`] for the engine
+    /// to spill; everything else stays scalar.
+    pub fn eval_dynamic(&mut self, e: &Expr) -> DynResult {
+        match self.eval_arg(e) {
+            Arg::Scalar(v) => DynResult::Scalar(v),
+            Arg::Range(s, r1, c1, r2, c2) => {
+                let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
+                if r1 == r2 && c1 == c2 {
+                    DynResult::Scalar(self.res.value(s, r1, c1))
+                } else {
+                    DynResult::Array(self.range_matrix(s, r1, c1, r2, c2))
+                }
+            }
+            Arg::Matrix(m) => {
+                if m.len() == 1 && m[0].len() == 1 {
+                    DynResult::Scalar(m[0][0].clone())
+                } else {
+                    DynResult::Array(m)
+                }
+            }
+        }
+    }
+
+    /// Materialize a rect as a matrix (dense, empties included).
+    fn range_matrix(&self, s: usize, r1: u32, c1: u32, r2: u32, c2: u32) -> Matrix {
+        (r1..=r2)
+            .map(|r| (c1..=c2).map(|c| self.res.value(s, r, c)).collect())
+            .collect()
+    }
+
+    /// Clamp only oversized (whole-column/row style) rects to the used range;
+    /// explicit small ranges keep their exact shape so `=A1:B5` spills 5×2
+    /// even past the used area (as Excel does).
+    fn clamp_huge(&self, s: usize, r1: u32, c1: u32, r2: u32, c2: u32) -> (u32, u32, u32, u32) {
+        if r2 - r1 >= 65_535 || c2 - c1 >= 16_383 {
+            self.clamp(s, r1, c1, r2, c2)
+        } else {
+            (r1, c1, r2, c2)
+        }
+    }
+
+    /// Any argument as a matrix: scalars become 1×1, ranges materialize.
+    /// Scalar errors propagate.
+    fn materialize(&mut self, a: Arg) -> Result<Matrix, ExcelError> {
+        match a {
+            Arg::Scalar(Value::Err(e)) => Err(e),
+            Arg::Scalar(v) => Ok(vec![vec![v]]),
+            Arg::Range(s, r1, c1, r2, c2) => {
+                let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > MAX_ARRAY_CELLS {
+                    return Err(ExcelError::Num);
+                }
+                Ok(self.range_matrix(s, r1, c1, r2, c2))
+            }
+            Arg::Matrix(m) => Ok(m),
+        }
+    }
+
+    /// Elementwise binary op with Excel's broadcast rules: a 1-sized axis
+    /// stretches; positions outside a non-conforming operand get `#N/A`.
+    fn broadcast_bin(&mut self, op: BinOp, l: Arg, r: Arg) -> Arg {
+        if let (Arg::Scalar(a), Arg::Scalar(b)) = (&l, &r) {
+            return Arg::Scalar(bin_op(op, a, b));
+        }
+        let lm = match self.materialize(l) {
+            Ok(m) => m,
+            Err(e) => return Arg::Scalar(Value::Err(e)),
+        };
+        let rm = match self.materialize(r) {
+            Ok(m) => m,
+            Err(e) => return Arg::Scalar(Value::Err(e)),
+        };
+        let (lr, lc) = (lm.len(), lm[0].len());
+        let (rr, rc) = (rm.len(), rm[0].len());
+        let rows = lr.max(rr);
+        let cols = lc.max(rc);
+        let pick = |m: &Matrix, mr: usize, mc: usize, i: usize, j: usize| -> Option<Value> {
+            let ri = if mr == 1 { 0 } else { i };
+            let ci = if mc == 1 { 0 } else { j };
+            if ri < mr && ci < mc {
+                Some(m[ri][ci].clone())
+            } else {
+                None
+            }
+        };
+        let out: Matrix = (0..rows)
+            .map(|i| {
+                (0..cols)
+                    .map(
+                        |j| match (pick(&lm, lr, lc, i, j), pick(&rm, rr, rc, i, j)) {
+                            (Some(a), Some(b)) => bin_op(op, &a, &b),
+                            _ => Value::Err(ExcelError::NA),
+                        },
+                    )
+                    .collect()
+            })
+            .collect();
+        Arg::Matrix(out)
+    }
+
+    /// Elementwise unary op (`-`, `+`, `%`) over a non-scalar operand.
+    fn broadcast_un(&mut self, op: UnOp, x: Arg) -> Arg {
+        let un = |v: &Value| -> Value {
+            match op {
+                UnOp::Neg => match to_num(v) {
+                    Ok(n) => num(-n),
+                    Err(e) => Value::Err(e),
+                },
+                UnOp::Pos => v.clone(),
+                UnOp::Percent => match to_num(v) {
+                    Ok(n) => num(n / 100.0),
+                    Err(e) => Value::Err(e),
+                },
+                UnOp::Implicit => v.clone(),
+            }
+        };
+        match x {
+            Arg::Scalar(v) => Arg::Scalar(un(&v)),
+            other => match self.materialize(other) {
+                Ok(m) => Arg::Matrix(
+                    m.into_iter()
+                        .map(|row| row.iter().map(&un).collect())
+                        .collect(),
+                ),
+                Err(e) => Arg::Scalar(Value::Err(e)),
+            },
+        }
+    }
+
+    /// `@x` — implicit intersection: pick the operand's value in the
+    /// formula's own row (single-column ranges) or column (single-row
+    /// ranges); a computed array yields its top-left value.
+    fn implicit_intersect(&mut self, x: Arg) -> Arg {
+        let (cur_r, cur_c) = self.cell;
+        Arg::Scalar(match x {
+            Arg::Scalar(v) => v,
+            Arg::Range(s, r1, c1, r2, c2) => {
+                if r1 == r2 && c1 == c2 {
+                    self.res.value(s, r1, c1)
+                } else if c1 == c2 && cur_r >= r1 && cur_r <= r2 {
+                    self.res.value(s, cur_r, c1)
+                } else if r1 == r2 && cur_c >= c1 && cur_c <= c2 {
+                    self.res.value(s, r1, cur_c)
+                } else {
+                    Value::Err(ExcelError::Value)
+                }
+            }
+            Arg::Matrix(m) => m[0][0].clone(),
+        })
     }
 
     fn resolve_sheet(&mut self, name: &Option<String>) -> Result<usize, Value> {
@@ -2072,7 +2410,35 @@ impl<'a> Eval<'a> {
                     None => Arg::Scalar(Value::Err(ExcelError::Ref)),
                 }
             }
+            Expr::SpillRef(r) => {
+                if r.row < 0 || r.col < 0 {
+                    return Arg::Scalar(Value::Err(ExcelError::Ref));
+                }
+                match self.resolve_sheet(&r.sheet) {
+                    Ok(s) => {
+                        let (ar, ac) = (r.row as u32, r.col as u32);
+                        match self.res.spill_extent(s, ar, ac) {
+                            Some((h, w)) => Arg::Range(s, ar, ac, ar + h - 1, ac + w - 1),
+                            None => Arg::Scalar(Value::Err(ExcelError::Ref)),
+                        }
+                    }
+                    Err(v) => Arg::Scalar(v),
+                }
+            }
+            Expr::ArrayLit(rows) => Arg::Matrix(
+                rows.iter()
+                    .map(|row| row.iter().map(|x| self.eval(x)).collect())
+                    .collect(),
+            ),
             Expr::Name(n) => {
+                // `LET` bindings shadow workbook names, innermost first.
+                if let Some(i) = self
+                    .lets
+                    .iter()
+                    .rposition(|(name, _)| name.eq_ignore_ascii_case(n))
+                {
+                    return self.lets[i].1.clone();
+                }
                 // A defined name expands to its definition formula. Depth cap
                 // guards name→name cycles (Excel rejects those at entry).
                 match self.res.defined_name(n, self.sheet) {
@@ -2149,31 +2515,508 @@ impl<'a> Eval<'a> {
                     Err(v) => Arg::Scalar(v),
                 }
             }
+            Expr::Un(UnOp::Implicit, x) => {
+                let v = self.eval_arg(x);
+                self.implicit_intersect(v)
+            }
             Expr::Un(op, x) => {
-                let v = self.eval(x);
-                Arg::Scalar(match op {
-                    UnOp::Neg => match to_num(&v) {
-                        Ok(n) => num(-n),
-                        Err(e) => Value::Err(e),
-                    },
-                    UnOp::Pos => v,
-                    UnOp::Percent => match to_num(&v) {
-                        Ok(n) => num(n / 100.0),
-                        Err(e) => Value::Err(e),
-                    },
-                })
+                let v = self.eval_arg(x);
+                self.broadcast_un(*op, v)
             }
             Expr::Bin(op, l, r) => {
-                let lv = self.eval(l);
-                let rv = self.eval(r);
-                Arg::Scalar(bin_op(*op, &lv, &rv))
+                let lv = self.eval_arg(l);
+                let rv = self.eval_arg(r);
+                self.broadcast_bin(*op, lv, rv)
             }
             // INDIRECT and OFFSET can *return references*, so they are
             // resolved here where a range result is expressible. Both are
             // volatile (the dependency graph can't see through them).
             Expr::Func(name, args) if name == "INDIRECT" => self.indirect(args),
             Expr::Func(name, args) if name == "OFFSET" => self.offset(args),
+            // LET and the dynamic-array functions return arrays/ranges, so
+            // they resolve here where non-scalar results are expressible.
+            Expr::Func(name, args) if name == "LET" => self.let_fn(args),
+            Expr::Func(name, args) if is_array_fn(name) => self.array_fn(name, args),
             Expr::Func(name, args) => Arg::Scalar(self.call(name, args)),
+        }
+    }
+
+    /// `LET(name1, value1, …, calculation)` — scoped bindings, evaluated
+    /// left to right (later bindings may use earlier ones).
+    fn let_fn(&mut self, args: &[Expr]) -> Arg {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
+        let mark = self.lets.len();
+        for pair in args[..args.len() - 1].chunks(2) {
+            let Expr::Name(name) = &pair[0] else {
+                self.lets.truncate(mark);
+                return Arg::Scalar(Value::Err(ExcelError::Value));
+            };
+            let v = self.eval_arg(&pair[1]);
+            self.lets.push((name.clone(), v));
+        }
+        let out = self.eval_arg(&args[args.len() - 1]);
+        self.lets.truncate(mark);
+        out
+    }
+
+    /// An argument materialized as a matrix (scalar → 1×1; errors propagate).
+    fn arg_matrix(&mut self, e: &Expr) -> Result<Matrix, Value> {
+        let a = self.eval_arg(e);
+        self.materialize(a).map_err(Value::Err)
+    }
+
+    /// Optional numeric argument with a default.
+    fn opt_num(&mut self, args: &[Expr], i: usize, default: f64) -> Result<f64, Value> {
+        match args.get(i) {
+            None | Some(Expr::Missing) => Ok(default),
+            Some(e) => to_num(&self.eval(e)).map_err(Value::Err),
+        }
+    }
+
+    /// The dynamic-array function library. Everything here can return a
+    /// matrix; scalar errors come back as `Arg::Scalar(Value::Err(…))`.
+    fn array_fn(&mut self, name: &str, args: &[Expr]) -> Arg {
+        match self.array_fn_inner(name, args) {
+            Ok(m) => {
+                if m.is_empty() || m[0].is_empty() {
+                    Arg::Scalar(Value::Err(ExcelError::Calc))
+                } else {
+                    Arg::Matrix(m)
+                }
+            }
+            Err(v) => Arg::Scalar(v),
+        }
+    }
+
+    fn array_fn_inner(&mut self, name: &str, args: &[Expr]) -> Result<Matrix, Value> {
+        let err = |e: ExcelError| -> Result<Matrix, Value> { Err(Value::Err(e)) };
+        match name {
+            "SEQUENCE" => {
+                if args.is_empty() || args.len() > 4 {
+                    return err(ExcelError::Value);
+                }
+                let rows = to_num(&self.eval(&args[0])).map_err(Value::Err)?.trunc() as i64;
+                let cols = self.opt_num(args, 1, 1.0)?.trunc() as i64;
+                let start = self.opt_num(args, 2, 1.0)?;
+                let step = self.opt_num(args, 3, 1.0)?;
+                if rows < 1 || cols < 1 {
+                    return err(ExcelError::Value);
+                }
+                if rows as u64 * cols as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                let mut v = start;
+                Ok((0..rows)
+                    .map(|_| {
+                        (0..cols)
+                            .map(|_| {
+                                let out = v;
+                                v += step;
+                                num(out)
+                            })
+                            .collect()
+                    })
+                    .collect())
+            }
+            "RANDARRAY" => {
+                if args.len() > 5 {
+                    return err(ExcelError::Value);
+                }
+                let rows = self.opt_num(args, 0, 1.0)?.trunc() as i64;
+                let cols = self.opt_num(args, 1, 1.0)?.trunc() as i64;
+                let lo = self.opt_num(args, 2, 0.0)?;
+                let hi = self.opt_num(args, 3, 1.0)?;
+                let whole = match args.get(4) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                if rows < 1 || cols < 1 || lo > hi {
+                    return err(ExcelError::Value);
+                }
+                if rows as u64 * cols as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                if whole && (lo.fract() != 0.0 || hi.fract() != 0.0) {
+                    return err(ExcelError::Value);
+                }
+                let mut cells = Vec::new();
+                for _ in 0..rows * cols {
+                    match self.res.rand() {
+                        Some(r) => cells.push(if whole {
+                            num(lo + (r * (hi - lo + 1.0)).floor())
+                        } else {
+                            num(lo + r * (hi - lo))
+                        }),
+                        None => {
+                            self.unsupported = true;
+                            return err(ExcelError::Value);
+                        }
+                    }
+                }
+                Ok(cells
+                    .chunks(cols as usize)
+                    .map(|row| row.to_vec())
+                    .collect())
+            }
+            "TRANSPOSE" => {
+                if args.len() != 1 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                Ok((0..m[0].len())
+                    .map(|j| (0..m.len()).map(|i| m[i][j].clone()).collect())
+                    .collect())
+            }
+            "SORT" => {
+                if args.is_empty() || args.len() > 4 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let idx = self.opt_num(args, 1, 1.0)?.trunc() as i64;
+                let order = self.opt_num(args, 2, 1.0)?.trunc() as i64;
+                let by_col = match args.get(3) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                if order != 1 && order != -1 {
+                    return err(ExcelError::Value);
+                }
+                let m = if by_col { transpose(&m) } else { m };
+                if idx < 1 || idx as usize > m[0].len() {
+                    return err(ExcelError::Value);
+                }
+                let key = idx as usize - 1;
+                let mut rows = m;
+                rows.sort_by(|a, b| {
+                    let ord = compare(&a[key], &b[key]).unwrap_or(std::cmp::Ordering::Equal);
+                    if order == 1 { ord } else { ord.reverse() }
+                });
+                Ok(if by_col { transpose(&rows) } else { rows })
+            }
+            "SORTBY" => {
+                if args.len() < 2 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                // (key vector, order) pairs; a trailing pair may omit order.
+                let mut keys: Vec<(Vec<Value>, i64)> = Vec::new();
+                let mut i = 1;
+                while i < args.len() {
+                    let by = self.arg_matrix(&args[i])?;
+                    let vec = flatten_vector(&by).ok_or(Value::Err(ExcelError::Value))?;
+                    if vec.len() != m.len() {
+                        return err(ExcelError::Value);
+                    }
+                    let order = if i + 1 < args.len() {
+                        self.opt_num(args, i + 1, 1.0)?.trunc() as i64
+                    } else {
+                        1
+                    };
+                    if order != 1 && order != -1 {
+                        return err(ExcelError::Value);
+                    }
+                    keys.push((vec, order));
+                    i += 2;
+                }
+                let mut order_idx: Vec<usize> = (0..m.len()).collect();
+                order_idx.sort_by(|&a, &b| {
+                    for (vec, ord) in &keys {
+                        let o = compare(&vec[a], &vec[b]).unwrap_or(std::cmp::Ordering::Equal);
+                        let o = if *ord == 1 { o } else { o.reverse() };
+                        if o != std::cmp::Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                Ok(order_idx.into_iter().map(|i| m[i].clone()).collect())
+            }
+            "UNIQUE" => {
+                if args.is_empty() || args.len() > 3 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let by_col = match args.get(1) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                let once = match args.get(2) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                let m = if by_col { transpose(&m) } else { m };
+                let eq = |a: &[Value], b: &[Value]| {
+                    a.len() == b.len()
+                        && a.iter().zip(b).all(|(x, y)| {
+                            matches!(compare(x, y), Ok(std::cmp::Ordering::Equal))
+                                && std::mem::discriminant(x) == std::mem::discriminant(y)
+                        })
+                };
+                let mut out: Vec<Vec<Value>> = Vec::new();
+                let mut counts: Vec<usize> = Vec::new();
+                for row in &m {
+                    match out.iter().position(|o| eq(o, row)) {
+                        Some(i) => counts[i] += 1,
+                        None => {
+                            out.push(row.clone());
+                            counts.push(1);
+                        }
+                    }
+                }
+                if once {
+                    out = out
+                        .into_iter()
+                        .zip(&counts)
+                        .filter(|&(_, &c)| c == 1)
+                        .map(|(r, _)| r)
+                        .collect();
+                }
+                Ok(if by_col { transpose(&out) } else { out })
+            }
+            "FILTER" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let inc = self.arg_matrix(&args[1])?;
+                let filtered: Matrix = if inc[0].len() == 1 && inc.len() == m.len() {
+                    // R×1 include → keep matching rows.
+                    let mut keep = Vec::new();
+                    for (i, row) in inc.iter().enumerate() {
+                        if to_bool(&row[0]).map_err(Value::Err)? {
+                            keep.push(m[i].clone());
+                        }
+                    }
+                    keep
+                } else if inc.len() == 1 && inc[0].len() == m[0].len() {
+                    // 1×C include → keep matching columns.
+                    let cols: Vec<usize> = {
+                        let mut v = Vec::new();
+                        for (j, val) in inc[0].iter().enumerate() {
+                            if to_bool(val).map_err(Value::Err)? {
+                                v.push(j);
+                            }
+                        }
+                        v
+                    };
+                    m.iter()
+                        .map(|row| cols.iter().map(|&j| row[j].clone()).collect())
+                        .collect()
+                } else {
+                    return err(ExcelError::Value);
+                };
+                if filtered.is_empty() || filtered.first().is_some_and(|r| r.is_empty()) {
+                    return match args.get(2) {
+                        None | Some(Expr::Missing) => err(ExcelError::Calc),
+                        Some(e) => self.arg_matrix(e),
+                    };
+                }
+                Ok(filtered)
+            }
+            "CHOOSEROWS" | "CHOOSECOLS" => {
+                if args.len() < 2 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let m = if name == "CHOOSECOLS" {
+                    transpose(&m)
+                } else {
+                    m
+                };
+                let n = m.len() as i64;
+                let mut picks = Vec::new();
+                for e in &args[1..] {
+                    let km = self.arg_matrix(e)?;
+                    for v in km.iter().flatten() {
+                        let k = to_num(v).map_err(Value::Err)?.trunc() as i64;
+                        let i = if k > 0 && k <= n {
+                            k - 1
+                        } else if k < 0 && -k <= n {
+                            n + k
+                        } else {
+                            return err(ExcelError::Value);
+                        };
+                        picks.push(m[i as usize].clone());
+                    }
+                }
+                Ok(if name == "CHOOSECOLS" {
+                    transpose(&picks)
+                } else {
+                    picks
+                })
+            }
+            "TAKE" | "DROP" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let (nr, nc) = (m.len() as i64, m[0].len() as i64);
+                let rows = match args.get(1) {
+                    Some(Expr::Missing) => {
+                        if name == "TAKE" {
+                            nr
+                        } else {
+                            0
+                        }
+                    }
+                    _ => to_num(&self.eval(&args[1])).map_err(Value::Err)?.trunc() as i64,
+                };
+                let cols = match args.get(2) {
+                    None | Some(Expr::Missing) => {
+                        if name == "TAKE" {
+                            nc
+                        } else {
+                            0
+                        }
+                    }
+                    Some(e) => to_num(&self.eval(e)).map_err(Value::Err)?.trunc() as i64,
+                };
+                let span = |take: bool, k: i64, n: i64| -> Option<(i64, i64)> {
+                    // Half-open [lo, hi) of surviving indices along one axis.
+                    if take {
+                        if k == 0 {
+                            return None;
+                        }
+                        let k = k.clamp(-n, n);
+                        Some(if k > 0 { (0, k) } else { (n + k, n) })
+                    } else {
+                        let k = k.clamp(-n, n);
+                        let (lo, hi) = if k >= 0 { (k, n) } else { (0, n + k) };
+                        if lo >= hi { None } else { Some((lo, hi)) }
+                    }
+                };
+                let take = name == "TAKE";
+                let (r_lo, r_hi) = span(take, rows, nr).ok_or(Value::Err(ExcelError::Calc))?;
+                let (c_lo, c_hi) = span(take, cols, nc).ok_or(Value::Err(ExcelError::Calc))?;
+                Ok(m[r_lo as usize..r_hi as usize]
+                    .iter()
+                    .map(|row| row[c_lo as usize..c_hi as usize].to_vec())
+                    .collect())
+            }
+            "HSTACK" | "VSTACK" => {
+                if args.is_empty() {
+                    return err(ExcelError::Value);
+                }
+                let mut parts = Vec::new();
+                for e in args {
+                    parts.push(self.arg_matrix(e)?);
+                }
+                if name == "VSTACK" {
+                    let cols = parts.iter().map(|p| p[0].len()).max().unwrap();
+                    let mut out = Vec::new();
+                    for p in parts {
+                        for row in p {
+                            let mut r = row;
+                            r.resize(cols, Value::Err(ExcelError::NA));
+                            out.push(r);
+                        }
+                    }
+                    Ok(out)
+                } else {
+                    let rows = parts.iter().map(|p| p.len()).max().unwrap();
+                    let mut out: Matrix = vec![Vec::new(); rows];
+                    for p in parts {
+                        let w = p[0].len();
+                        for (i, out_row) in out.iter_mut().enumerate() {
+                            match p.get(i) {
+                                Some(row) => out_row.extend(row.iter().cloned()),
+                                None => {
+                                    out_row.extend((0..w).map(|_| Value::Err(ExcelError::NA)));
+                                }
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
+            }
+            "TOCOL" | "TOROW" => {
+                if args.is_empty() || args.len() > 3 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let ignore = self.opt_num(args, 1, 0.0)?.trunc() as i64;
+                let by_col = match args.get(2) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                let m = if by_col { transpose(&m) } else { m };
+                let vals: Vec<Value> = m
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| {
+                        !((ignore & 1 != 0 && matches!(v, Value::Empty))
+                            || (ignore & 2 != 0 && v.is_err()))
+                    })
+                    .collect();
+                if vals.is_empty() {
+                    return err(ExcelError::Calc);
+                }
+                Ok(if name == "TOCOL" {
+                    vals.into_iter().map(|v| vec![v]).collect()
+                } else {
+                    vec![vals]
+                })
+            }
+            "EXPAND" => {
+                if args.len() < 2 || args.len() > 4 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let rows = to_num(&self.eval(&args[1])).map_err(Value::Err)?.trunc() as i64;
+                let cols = self.opt_num(args, 2, m[0].len() as f64)?.trunc() as i64;
+                let pad = match args.get(3) {
+                    None | Some(Expr::Missing) => Value::Err(ExcelError::NA),
+                    Some(e) => self.eval(e),
+                };
+                if rows < m.len() as i64 || cols < m[0].len() as i64 {
+                    return err(ExcelError::Value);
+                }
+                if rows as u64 * cols as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                Ok((0..rows as usize)
+                    .map(|i| {
+                        (0..cols as usize)
+                            .map(|j| {
+                                m.get(i)
+                                    .and_then(|row| row.get(j))
+                                    .cloned()
+                                    .unwrap_or_else(|| pad.clone())
+                            })
+                            .collect()
+                    })
+                    .collect())
+            }
+            "WRAPROWS" | "WRAPCOLS" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return err(ExcelError::Value);
+                }
+                let m = self.arg_matrix(&args[0])?;
+                let vec = flatten_vector(&m).ok_or(Value::Err(ExcelError::Value))?;
+                let count = to_num(&self.eval(&args[1])).map_err(Value::Err)?.trunc() as i64;
+                let pad = match args.get(2) {
+                    None | Some(Expr::Missing) => Value::Err(ExcelError::NA),
+                    Some(e) => self.eval(e),
+                };
+                if count < 1 {
+                    return err(ExcelError::Num);
+                }
+                let mut rows: Matrix = vec
+                    .chunks(count as usize)
+                    .map(|chunk| {
+                        let mut r = chunk.to_vec();
+                        r.resize(count as usize, pad.clone());
+                        r
+                    })
+                    .collect();
+                if name == "WRAPCOLS" {
+                    rows = transpose(&rows);
+                }
+                Ok(rows)
+            }
+            _ => err(ExcelError::Name),
         }
     }
 
@@ -2228,6 +3071,8 @@ impl<'a> Eval<'a> {
             },
             e => match self.eval_arg(e) {
                 Arg::Range(s, a, b, c, d) => (s, a, b, c, d),
+                // OFFSET needs an actual reference; computed arrays and
+                // scalars don't qualify.
                 Arg::Scalar(v) => {
                     return Arg::Scalar(if v.is_err() {
                         v
@@ -2235,6 +3080,7 @@ impl<'a> Eval<'a> {
                         Value::Err(ExcelError::Value)
                     });
                 }
+                Arg::Matrix(_) => return Arg::Scalar(Value::Err(ExcelError::Value)),
             },
         };
         let dr = match to_num(&self.eval(&args[1])) {
@@ -2381,6 +3227,59 @@ fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => rank(&a2).cmp(&rank(&b2)),
     })
+}
+
+/// A lookup table for VLOOKUP/MATCH/INDEX and friends: an on-sheet rect or
+/// a computed matrix (e.g. `INDEX(UNIQUE(A1:A9),2)`).
+enum TView {
+    Range(usize, u32, u32, u32, u32),
+    Mat(Matrix),
+}
+
+/// Is this one of the dynamic-array functions resolved in `eval_arg` (they
+/// can return matrices)?
+fn is_array_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "SEQUENCE"
+            | "RANDARRAY"
+            | "TRANSPOSE"
+            | "SORT"
+            | "SORTBY"
+            | "UNIQUE"
+            | "FILTER"
+            | "CHOOSEROWS"
+            | "CHOOSECOLS"
+            | "TAKE"
+            | "DROP"
+            | "HSTACK"
+            | "VSTACK"
+            | "TOCOL"
+            | "TOROW"
+            | "EXPAND"
+            | "WRAPROWS"
+            | "WRAPCOLS"
+    )
+}
+
+fn transpose(m: &Matrix) -> Matrix {
+    if m.is_empty() || m[0].is_empty() {
+        return Vec::new();
+    }
+    (0..m[0].len())
+        .map(|j| (0..m.len()).map(|i| m[i][j].clone()).collect())
+        .collect()
+}
+
+/// A single row or column matrix as a flat vector; `None` for 2D shapes.
+fn flatten_vector(m: &Matrix) -> Option<Vec<Value>> {
+    if m.len() == 1 {
+        Some(m[0].clone())
+    } else if m.iter().all(|r| r.len() == 1) {
+        Some(m.iter().map(|r| r[0].clone()).collect())
+    } else {
+        None
+    }
 }
 
 fn zero_of(v: &Value) -> Value {
@@ -2620,6 +3519,18 @@ impl<'a> Eval<'a> {
                         }
                     }
                 }
+                // Computed arrays aggregate by the same rules as ranges,
+                // e.g. SUM((A1:A3)*2) or SUM(SEQUENCE(5)).
+                Arg::Matrix(m) => {
+                    for v in m.iter().flatten() {
+                        match v {
+                            Value::Num(n) => out.push(*n),
+                            Value::Err(e) => return Err(*e),
+                            Value::Bool(b) if !numbers_only => out.push(if *b { 1.0 } else { 0.0 }),
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -2649,7 +3560,8 @@ impl<'a> Eval<'a> {
             .collect())
     }
 
-    /// A range argument or an error value (scalars don't qualify).
+    /// A range argument or an error value (scalars and computed arrays
+    /// don't qualify — criteria functions need actual references).
     fn arg_range(&mut self, e: &Expr) -> Result<(usize, u32, u32, u32, u32), Value> {
         match self.eval_arg(e) {
             Arg::Range(s, a, b, c, d) => Ok((s, a, b, c, d)),
@@ -2658,28 +3570,75 @@ impl<'a> Eval<'a> {
             } else {
                 Value::Err(ExcelError::Value)
             }),
+            Arg::Matrix(_) => Err(Value::Err(ExcelError::Value)),
         }
     }
 
-    /// A 1-D range (single row or column) read densely, clamped to the used
+    /// A lookup table argument: an on-sheet rect or a computed matrix
+    /// (scalars don't qualify).
+    fn arg_view(&mut self, e: &Expr) -> Result<TView, Value> {
+        match self.eval_arg(e) {
+            Arg::Range(s, a, b, c, d) => Ok(TView::Range(s, a, b, c, d)),
+            Arg::Matrix(m) => Ok(TView::Mat(m)),
+            Arg::Scalar(v) => Err(if v.is_err() {
+                v
+            } else {
+                Value::Err(ExcelError::Value)
+            }),
+        }
+    }
+
+    /// Logical (unclamped) dims of a view.
+    fn view_dims(&self, v: &TView) -> (u32, u32) {
+        match v {
+            TView::Range(_, r1, c1, r2, c2) => (r2 - r1 + 1, c2 - c1 + 1),
+            TView::Mat(m) => (m.len() as u32, m[0].len() as u32),
+        }
+    }
+
+    /// Dims clamped to the used range, for dense scans (whole-column refs
+    /// would otherwise walk a million cells).
+    fn view_scan_dims(&self, v: &TView) -> (u32, u32) {
+        match v {
+            TView::Range(s, r1, c1, r2, c2) => {
+                let (r1c, c1c, r2c, c2c) = self.clamp(*s, *r1, *c1, *r2, *c2);
+                (r2c - r1c + 1, c2c - c1c + 1)
+            }
+            TView::Mat(m) => (m.len() as u32, m[0].len() as u32),
+        }
+    }
+
+    /// Element at (row, col) offsets from a view's top-left.
+    fn view_get(&self, v: &TView, dr: u32, dc: u32) -> Value {
+        match v {
+            TView::Range(s, r1, c1, ..) => self.res.value(*s, r1 + dr, c1 + dc),
+            TView::Mat(m) => m
+                .get(dr as usize)
+                .and_then(|row| row.get(dc as usize))
+                .cloned()
+                .unwrap_or(Value::Empty),
+        }
+    }
+
+    /// A 1-D vector (single row or column) read densely, clamped to the used
     /// range — the shape XLOOKUP/LOOKUP/MATCH vectors want.
-    fn arg_vector(&mut self, e: &Expr) -> Result<(usize, Vec<(u32, u32)>), Value> {
-        let (s, r1, c1, r2, c2) = self.arg_range(e)?;
-        let (r1, c1, r2, c2) = self.clamp(s, r1, c1, r2, c2);
-        if r1 != r2 && c1 != c2 {
+    fn arg_vector(&mut self, e: &Expr) -> Result<Vec<Value>, Value> {
+        let view = self.arg_view(e)?;
+        let (h, w) = self.view_scan_dims(&view);
+        if h != 1 && w != 1 {
             return Err(Value::Err(ExcelError::Value));
         }
-        let mut cells = Vec::new();
-        if c1 == c2 {
-            for r in r1..=r2 {
-                cells.push((r, c1));
+        let mut vals = Vec::new();
+        if w == 1 {
+            for r in 0..h {
+                vals.push(self.view_get(&view, r, 0));
             }
         } else {
-            for c in c1..=c2 {
-                cells.push((r1, c));
+            for c in 0..w {
+                vals.push(self.view_get(&view, 0, c));
             }
         }
-        Ok((s, cells))
+        Ok(vals)
     }
 
     /// The multi-criteria core of SUMIFS/COUNTIFS/AVERAGEIFS/MAXIFS/MINIFS:
@@ -2742,28 +3701,13 @@ impl<'a> Eval<'a> {
         criteria: &Expr,
         sum_range: Option<&Expr>,
     ) -> Result<(usize, Vec<f64>), Value> {
-        let (s, r1, c1, r2, c2) = match self.eval_arg(range) {
-            Arg::Range(s, r1, c1, r2, c2) => (s, r1, c1, r2, c2),
-            Arg::Scalar(v) => {
-                return Err(if v.is_err() {
-                    v
-                } else {
-                    Value::Err(ExcelError::Value)
-                });
-            }
-        };
+        let (s, r1, c1, r2, c2) = self.arg_range(range)?;
         let (ss, sr1, sc1) = match sum_range {
             None => (s, r1, c1),
-            Some(e) => match self.eval_arg(e) {
-                Arg::Range(ss, a, b, _, _) => (ss, a, b),
-                Arg::Scalar(v) => {
-                    return Err(if v.is_err() {
-                        v
-                    } else {
-                        Value::Err(ExcelError::Value)
-                    });
-                }
-            },
+            Some(e) => {
+                let (ss, a, b, _, _) = self.arg_range(e)?;
+                (ss, a, b)
+            }
         };
         let crit = parse_criteria(&self.eval(criteria));
         let mut count = 0usize;
@@ -3025,37 +3969,31 @@ impl<'a> Eval<'a> {
                 }
             }
             "SUMPRODUCT" => {
-                // Same-shape ranges only (the overwhelmingly common form);
-                // scalar/array-expression factors arrive with dynamic arrays.
-                let mut rects = Vec::new();
+                // Same-shape factors, elementwise product summed. Factors may
+                // be ranges or computed arrays: SUMPRODUCT((A1:A3>2)*1,B1:B3).
+                let mut mats: Vec<Matrix> = Vec::new();
                 for a in args {
-                    match self.eval_arg(a) {
-                        Arg::Range(s, r1, c1, r2, c2) => {
-                            let (r1, c1, r2, c2) = self.clamp(s, r1, c1, r2, c2);
-                            rects.push((s, r1, c1, r2, c2));
-                        }
-                        Arg::Scalar(Value::Err(e)) => return Value::Err(e),
-                        Arg::Scalar(_) => return Value::Err(ExcelError::Value),
+                    let arg = self.eval_arg(a);
+                    match self.materialize(arg) {
+                        Ok(m) => mats.push(m),
+                        Err(e) => return Value::Err(e),
                     }
                 }
-                if rects.is_empty() {
+                if mats.is_empty() {
                     return Value::Err(ExcelError::Value);
                 }
-                let (rows, cols) = (rects[0].3 - rects[0].1 + 1, rects[0].4 - rects[0].2 + 1);
-                for r in &rects {
-                    if r.3 - r.1 + 1 != rows || r.4 - r.2 + 1 != cols {
-                        return Value::Err(ExcelError::Value);
-                    }
+                let (rows, cols) = (mats[0].len(), mats[0][0].len());
+                if mats.iter().any(|m| m.len() != rows || m[0].len() != cols) {
+                    return Value::Err(ExcelError::Value);
                 }
                 let mut total = 0.0;
-                for dr in 0..rows {
-                    for dc in 0..cols {
+                for i in 0..rows {
+                    for j in 0..cols {
                         let mut p = 1.0;
-                        for &(s, r1, c1, _, _) in &rects {
-                            let v = self.res.value(s, r1 + dr, c1 + dc);
-                            p *= match v {
-                                Value::Num(n) => n,
-                                Value::Err(e) => return Value::Err(e),
+                        for m in &mats {
+                            p *= match &m[i][j] {
+                                Value::Num(n) => *n,
+                                Value::Err(e) => return Value::Err(*e),
                                 _ => 0.0, // text/bool/empty count as 0
                             };
                         }
@@ -3196,6 +4134,13 @@ impl<'a> Eval<'a> {
                                 .filter(|(_, v)| matches!(v, Value::Num(_)))
                                 .count();
                         }
+                        Arg::Matrix(m) => {
+                            n += m
+                                .iter()
+                                .flatten()
+                                .filter(|v| matches!(v, Value::Num(_)))
+                                .count();
+                        }
                     }
                 }
                 Value::Num(n as f64)
@@ -3217,6 +4162,13 @@ impl<'a> Eval<'a> {
                         Arg::Range(s, r1, c1, r2, c2) => {
                             n += self.res.cells_in(s, r1, c1, r2, c2).len();
                         }
+                        Arg::Matrix(m) => {
+                            n += m
+                                .iter()
+                                .flatten()
+                                .filter(|v| !matches!(v, Value::Empty))
+                                .count();
+                        }
                     }
                 }
                 Value::Num(n as f64)
@@ -3233,6 +4185,15 @@ impl<'a> Eval<'a> {
                             .count();
                         Value::Num((area - filled) as f64)
                     }
+                    Arg::Matrix(m) => Value::Num(
+                        m.iter()
+                            .flatten()
+                            .filter(|v| {
+                                matches!(v, Value::Empty)
+                                    || matches!(v, Value::Str(s) if s.is_empty())
+                            })
+                            .count() as f64,
+                    ),
                     Arg::Scalar(_) => Value::Err(ExcelError::Value),
                 },
                 _ => Value::Err(ExcelError::Value),
@@ -3316,6 +4277,25 @@ impl<'a> Eval<'a> {
                                         };
                                     }
                                     Value::Err(e) => return Value::Err(e),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Array results contribute like ranges: bools and
+                        // numbers count, text/empty skipped, errors propagate.
+                        Arg::Matrix(m) => {
+                            for v in m.iter().flatten() {
+                                match v {
+                                    Value::Bool(_) | Value::Num(_) => {
+                                        let b = *v != Value::Bool(false) && *v != Value::Num(0.0);
+                                        any = true;
+                                        acc = match name {
+                                            "AND" => acc && b,
+                                            "OR" => acc || b,
+                                            _ => acc ^ b,
+                                        };
+                                    }
+                                    Value::Err(e) => return Value::Err(*e),
                                     _ => {}
                                 }
                             }
@@ -3464,6 +4444,11 @@ impl<'a> Eval<'a> {
                                 out.push_str(&try_text!(v));
                             }
                         }
+                        Arg::Matrix(m) => {
+                            for v in m.into_iter().flatten() {
+                                out.push_str(&try_text!(v));
+                            }
+                        }
                     }
                 }
                 Value::Str(out)
@@ -3481,6 +4466,13 @@ impl<'a> Eval<'a> {
                         Arg::Range(s, r1, c1, r2, c2) => {
                             for (_, v) in self.res.cells_in(s, r1, c1, r2, c2) {
                                 parts.push(try_text!(v));
+                            }
+                        }
+                        Arg::Matrix(m) => {
+                            for v in m.into_iter().flatten() {
+                                if !matches!(v, Value::Empty) {
+                                    parts.push(try_text!(v));
+                                }
                             }
                         }
                     }
@@ -3757,15 +4749,9 @@ impl<'a> Eval<'a> {
                 if let Value::Err(e) = needle {
                     return Value::Err(e);
                 }
-                let (s, r1, c1, r2, c2) = match self.eval_arg(&args[1]) {
-                    Arg::Range(s, a, b, c, d) => (s, a, b, c, d),
-                    Arg::Scalar(v) => {
-                        return if v.is_err() {
-                            v
-                        } else {
-                            Value::Err(ExcelError::Value)
-                        };
-                    }
+                let view = match self.arg_view(&args[1]) {
+                    Ok(v) => v,
+                    Err(v) => return v,
                 };
                 let idx = try_num!(self.eval(&args[2])).trunc();
                 if idx < 1.0 {
@@ -3777,14 +4763,14 @@ impl<'a> Eval<'a> {
                     None => true,
                 };
                 let vertical = name == "VLOOKUP";
-                let (r1, c1, r2c, c2c) = self.clamp(s, r1, c1, r2, c2);
-                let lanes = if vertical { r1..=r2c } else { c1..=c2c };
+                let (h, w) = self.view_dims(&view);
+                let (sh, sw) = self.view_scan_dims(&view);
                 let mut best: Option<u32> = None;
-                for lane in lanes {
+                for lane in 0..(if vertical { sh } else { sw }) {
                     let key = if vertical {
-                        self.res.value(s, lane, c1)
+                        self.view_get(&view, lane, 0)
                     } else {
-                        self.res.value(s, r1, lane)
+                        self.view_get(&view, 0, lane)
                     };
                     if matches!(key, Value::Empty) {
                         continue;
@@ -3803,16 +4789,13 @@ impl<'a> Eval<'a> {
                 match best {
                     None => Value::Err(ExcelError::NA),
                     Some(lane) => {
+                        if idx >= if vertical { w } else { h } {
+                            return Value::Err(ExcelError::Ref);
+                        }
                         if vertical {
-                            if c1 + idx > c2 {
-                                return Value::Err(ExcelError::Ref);
-                            }
-                            self.res.value(s, lane, c1 + idx)
+                            self.view_get(&view, lane, idx)
                         } else {
-                            if r1 + idx > r2 {
-                                return Value::Err(ExcelError::Ref);
-                            }
-                            self.res.value(s, r1 + idx, lane)
+                            self.view_get(&view, idx, lane)
                         }
                     }
                 }
@@ -3822,8 +4805,9 @@ impl<'a> Eval<'a> {
                     return Value::Err(ExcelError::Value);
                 }
                 let needle = self.eval(&args[0]);
-                let (s, r1, c1, r2, c2) = match self.eval_arg(&args[1]) {
-                    Arg::Range(s, a, b, c, d) => (s, a, b, c, d),
+                let view = match self.eval_arg(&args[1]) {
+                    Arg::Range(s, a, b, c, d) => TView::Range(s, a, b, c, d),
+                    Arg::Matrix(m) => TView::Mat(m),
                     Arg::Scalar(v) => {
                         return if v.is_err() {
                             v
@@ -3832,27 +4816,30 @@ impl<'a> Eval<'a> {
                         };
                     }
                 };
+                let (h, w) = self.view_scan_dims(&view);
+                if h != 1 && w != 1 {
+                    return Value::Err(ExcelError::NA);
+                }
+                let mut vals = Vec::new();
+                if w == 1 {
+                    for r in 0..h {
+                        vals.push(self.view_get(&view, r, 0));
+                    }
+                } else {
+                    for c in 0..w {
+                        vals.push(self.view_get(&view, 0, c));
+                    }
+                }
                 let mode = match args.get(2) {
                     Some(e) => try_num!(self.eval(e)),
                     None => 1.0,
                 };
-                let vertical = c1 == c2;
-                if !vertical && r1 != r2 {
-                    return Value::Err(ExcelError::NA);
-                }
-                let (r1, c1, r2, c2) = self.clamp(s, r1, c1, r2, c2);
-                let len = if vertical { r2 - r1 } else { c2 - c1 } + 1;
-                let mut best: Option<u32> = None;
-                for i in 0..len {
-                    let v = if vertical {
-                        self.res.value(s, r1 + i, c1)
-                    } else {
-                        self.res.value(s, r1, c1 + i)
-                    };
+                let mut best: Option<usize> = None;
+                for (i, v) in vals.iter().enumerate() {
                     if matches!(v, Value::Empty) {
                         continue;
                     }
-                    match compare(&v, &needle) {
+                    match compare(v, &needle) {
                         Ok(std::cmp::Ordering::Equal) => {
                             best = Some(i);
                             if mode == 0.0 {
@@ -3868,13 +4855,8 @@ impl<'a> Eval<'a> {
                 if best.is_none() && mode == 0.0 {
                     if let Value::Str(pat) = &needle {
                         if pat.contains(['*', '?']) {
-                            for i in 0..len {
-                                let v = if vertical {
-                                    self.res.value(s, r1 + i, c1)
-                                } else {
-                                    self.res.value(s, r1, c1 + i)
-                                };
-                                if let Value::Str(t) = &v {
+                            for (i, v) in vals.iter().enumerate() {
+                                if let Value::Str(t) = v {
                                     if wildcard_match(pat, t) {
                                         best = Some(i);
                                         break;
@@ -3893,27 +4875,21 @@ impl<'a> Eval<'a> {
                 if args.len() < 2 || args.len() > 3 {
                     return Value::Err(ExcelError::Value);
                 }
-                let (s, r1, c1, r2, c2) = match self.eval_arg(&args[0]) {
-                    Arg::Range(s, a, b, c, d) => (s, a, b, c, d),
-                    Arg::Scalar(v) => {
-                        return if v.is_err() {
-                            v
-                        } else {
-                            Value::Err(ExcelError::Value)
-                        };
-                    }
+                let view = match self.arg_view(&args[0]) {
+                    Ok(v) => v,
+                    Err(v) => return v,
                 };
+                let (h, w) = self.view_dims(&view);
                 let ri = try_num!(self.eval(&args[1])).trunc() as i64;
                 let ci = match args.get(2) {
                     Some(e) => try_num!(self.eval(e)).trunc() as i64,
                     None => {
                         // One-dimensional form: index along the single lane.
-                        if r1 == r2 {
-                            let k = ri;
-                            if k < 1 || c1 as i64 + k - 1 > c2 as i64 {
+                        if h == 1 {
+                            if ri < 1 || ri > w as i64 {
                                 return Value::Err(ExcelError::Ref);
                             }
-                            return self.res.value(s, r1, (c1 as i64 + k - 1) as u32);
+                            return self.view_get(&view, 0, ri as u32 - 1);
                         }
                         1
                     }
@@ -3921,11 +4897,10 @@ impl<'a> Eval<'a> {
                 if ri < 1 || ci < 1 {
                     return Value::Err(ExcelError::Value);
                 }
-                let (r, c) = (r1 as i64 + ri - 1, c1 as i64 + ci - 1);
-                if r > r2 as i64 || c > c2 as i64 {
+                if ri > h as i64 || ci > w as i64 {
                     return Value::Err(ExcelError::Ref);
                 }
-                self.res.value(s, r as u32, c as u32)
+                self.view_get(&view, ri as u32 - 1, ci as u32 - 1)
             }
 
             // ---- multi-criteria aggregation ----------------------------------
@@ -4014,11 +4989,11 @@ impl<'a> Eval<'a> {
                 if let Value::Err(e) = needle {
                     return Value::Err(e);
                 }
-                let (ls, lookup) = match self.arg_vector(&args[1]) {
+                let lookup = match self.arg_vector(&args[1]) {
                     Ok(v) => v,
                     Err(v) => return v,
                 };
-                let (rs, ret) = match self.arg_vector(&args[2]) {
+                let ret = match self.arg_vector(&args[2]) {
                     Ok(v) => v,
                     Err(v) => return v,
                 };
@@ -4041,8 +5016,7 @@ impl<'a> Eval<'a> {
                 let mut exact: Option<usize> = None;
                 let mut nearest: Option<(usize, Value)> = None;
                 for i in order {
-                    let (r, c) = lookup[i];
-                    let v = self.res.value(ls, r, c);
+                    let v = lookup[i].clone();
                     if match_mode == 2.0 {
                         if let (Value::Str(pat), Value::Str(t)) = (&needle, &v) {
                             if wildcard_match(pat, t) {
@@ -4084,10 +5058,7 @@ impl<'a> Eval<'a> {
                     }
                 }
                 match exact.or(nearest.map(|(i, _)| i)) {
-                    Some(i) => {
-                        let (r, c) = ret[i];
-                        self.res.value(rs, r, c)
-                    }
+                    Some(i) => ret[i].clone(),
                     None => match args.get(3) {
                         None | Some(Expr::Missing) => Value::Err(ExcelError::NA),
                         Some(e) => self.eval(e),
@@ -4101,24 +5072,23 @@ impl<'a> Eval<'a> {
                     return Value::Err(ExcelError::Value);
                 }
                 let needle = self.eval(&args[0]);
-                let (ls, lookup) = match self.arg_vector(&args[1]) {
+                let lookup = match self.arg_vector(&args[1]) {
                     Ok(v) => v,
                     Err(v) => return v,
                 };
-                let (rs, ret) = match args.get(2) {
+                let ret = match args.get(2) {
                     Some(e) => match self.arg_vector(e) {
                         Ok(v) => v,
                         Err(v) => return v,
                     },
-                    None => (ls, lookup.clone()),
+                    None => lookup.clone(),
                 };
                 let mut best: Option<usize> = None;
-                for (i, &(r, c)) in lookup.iter().enumerate() {
-                    let v = self.res.value(ls, r, c);
+                for (i, v) in lookup.iter().enumerate() {
                     if matches!(v, Value::Empty) {
                         continue;
                     }
-                    match compare(&v, &needle) {
+                    match compare(v, &needle) {
                         Ok(std::cmp::Ordering::Equal) | Ok(std::cmp::Ordering::Less) => {
                             best = Some(i);
                         }
@@ -4126,10 +5096,7 @@ impl<'a> Eval<'a> {
                     }
                 }
                 match best {
-                    Some(i) if i < ret.len() => {
-                        let (r, c) = ret[i];
-                        self.res.value(rs, r, c)
-                    }
+                    Some(i) if i < ret.len() => ret[i].clone(),
                     _ => Value::Err(ExcelError::NA),
                 }
             }
@@ -5059,7 +6026,7 @@ mod tests {
     #[test]
     fn unknown_function_sets_unsupported() {
         let g = empty();
-        let ast = parse("SEQUENCE(3)").unwrap();
+        let ast = parse("PIVOTBY(3)").unwrap();
         let mut ev = Eval::new(&g, 0, (0, 0));
         let v = ev.eval(&ast);
         assert_eq!(v, Value::Err(ExcelError::Name));
@@ -5476,5 +6443,250 @@ mod tests {
         let mut ev = Eval::new(&g2, 0, (0, 5));
         let _ = ev.eval(&ast);
         assert!(ev.unsupported);
+    }
+
+    // ---- dynamic arrays ---------------------------------------------------
+
+    /// Evaluate with dynamic semantics, expecting an array result.
+    fn eval_array(src: &str, grid: &Grid) -> Matrix {
+        let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let mut ev = Eval::new(grid, 0, (0, 0));
+        match ev.eval_dynamic(&ast) {
+            DynResult::Array(m) => m,
+            DynResult::Scalar(v) => panic!("{src} → scalar {v:?}, expected array"),
+        }
+    }
+
+    fn nums(m: &Matrix) -> Vec<Vec<f64>> {
+        m.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| match v {
+                        Value::Num(n) => *n,
+                        other => panic!("expected number, got {other:?}"),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spill_ref_and_implicit_parse_and_print() {
+        // A1# round-trips, and Excel's stored spellings map onto it.
+        let ast = parse("SUM(A1#)").unwrap();
+        assert_eq!(to_string(&ast), "SUM(A1#)");
+        let stored = parse("SUM(_xlfn.ANCHORARRAY(A1))").unwrap();
+        assert_eq!(to_string(&stored), "SUM(A1#)");
+        let ast = parse("Sheet1!B2#").unwrap();
+        assert_eq!(to_string(&ast), "Sheet1!B2#");
+        // @ / SINGLE.
+        let ast = parse("@A1:A3").unwrap();
+        assert_eq!(to_string(&ast), "@A1:A3");
+        let stored = parse("_xlfn.SINGLE(A1:A3)").unwrap();
+        assert_eq!(to_string(&stored), "@A1:A3");
+        // Copy/fill translation follows the anchor.
+        assert_eq!(translate_formula("SUM(A1#)", 1, 1).unwrap(), "SUM(B2#)");
+        // # after anything but a cell ref is rejected.
+        assert!(parse("SUM(A1:A3#)").is_err());
+    }
+
+    #[test]
+    fn array_literals() {
+        let g = empty();
+        let m = eval_array("{1,2;3,4}", &g);
+        assert_eq!(nums(&m), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let ast = parse("{1,2;3,4}").unwrap();
+        assert_eq!(to_string(&ast), "{1,2;3,4}");
+        assert_eq!(n("SUM({1,2;3,4})", &g), 10.0);
+        assert_eq!(n("INDEX({10,20;30,40},2,1)", &g), 30.0);
+        // Ragged constants are rejected.
+        assert!(parse("{1,2;3}").is_err());
+    }
+
+    #[test]
+    fn operator_broadcasting() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("A2", Value::Num(2.0)),
+            ("A3", Value::Num(3.0)),
+        ]);
+        let m = eval_array("A1:A3*2", &g);
+        assert_eq!(nums(&m), vec![vec![2.0], vec![4.0], vec![6.0]]);
+        // Column vector + row vector broadcasts to the outer shape.
+        let m = eval_array("{1;2}+{10,20}", &g);
+        assert_eq!(nums(&m), vec![vec![11.0, 21.0], vec![12.0, 22.0]]);
+        // Comparisons lift too — the shape FILTER's include argument needs.
+        let m = eval_array("A1:A3>1", &g);
+        assert_eq!(
+            m,
+            vec![
+                vec![Value::Bool(false)],
+                vec![Value::Bool(true)],
+                vec![Value::Bool(true)]
+            ]
+        );
+        // Aggregates consume array expressions (old SUMPRODUCT-only idiom).
+        assert_eq!(n("SUM((A1:A3)*10)", &g), 60.0);
+        // Non-conforming positions become #N/A.
+        let m = eval_array("{1;2;3}+{1;2}", &g);
+        assert_eq!(m[2][0], Value::Err(ExcelError::NA));
+    }
+
+    #[test]
+    fn sequence_and_friends() {
+        let g = empty();
+        assert_eq!(
+            nums(&eval_array("SEQUENCE(2,3)", &g)),
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("SEQUENCE(3,1,10,-2)", &g)),
+            vec![vec![10.0], vec![8.0], vec![6.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("TRANSPOSE({1,2;3,4})", &g)),
+            vec![vec![1.0, 3.0], vec![2.0, 4.0]]
+        );
+        assert_eq!(eval_str("SEQUENCE(0)", &g), Value::Err(ExcelError::Value));
+        // 1×1 results stay scalar.
+        assert_eq!(n("SEQUENCE(1)", &g), 1.0);
+    }
+
+    #[test]
+    fn sort_sortby_unique() {
+        let g = empty();
+        assert_eq!(
+            nums(&eval_array("SORT({3;1;2})", &g)),
+            vec![vec![1.0], vec![2.0], vec![3.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("SORT({3;1;2},1,-1)", &g)),
+            vec![vec![3.0], vec![2.0], vec![1.0]]
+        );
+        // Sort rows by the second column.
+        assert_eq!(
+            nums(&eval_array("SORT({1,9;2,7;3,8},2,1)", &g)),
+            vec![vec![2.0, 7.0], vec![3.0, 8.0], vec![1.0, 9.0]]
+        );
+        // SORTBY with an external key vector.
+        assert_eq!(
+            nums(&eval_array("SORTBY({10;20;30},{3;1;2})", &g)),
+            vec![vec![20.0], vec![30.0], vec![10.0]]
+        );
+        let m = eval_array("UNIQUE({1;2;1;3;2})", &g);
+        assert_eq!(nums(&m), vec![vec![1.0], vec![2.0], vec![3.0]]);
+        // The lone exactly-once value collapses to a 1×1 scalar.
+        assert_eq!(n("UNIQUE({1;2;1;3;2},FALSE,TRUE)", &g), 3.0);
+        // Case-insensitive like Excel: "a" and "A" are one value.
+        let m = eval_array("UNIQUE({\"a\";\"A\";\"b\"})", &g);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn filter_function() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(5.0)),
+            ("A2", Value::Num(15.0)),
+            ("A3", Value::Num(25.0)),
+        ]);
+        let m = eval_array("FILTER(A1:A3,A1:A3>10)", &g);
+        assert_eq!(nums(&m), vec![vec![15.0], vec![25.0]]);
+        // No matches → #CALC! without a fallback, the fallback otherwise.
+        assert_eq!(
+            eval_str("FILTER(A1:A3,A1:A3>99)", &g),
+            Value::Err(ExcelError::Calc)
+        );
+        assert_eq!(n("FILTER(A1:A3,A1:A3>99,-1)", &g), -1.0);
+    }
+
+    #[test]
+    fn shaping_functions() {
+        let g = empty();
+        assert_eq!(
+            nums(&eval_array("TAKE(SEQUENCE(5),2)", &g)),
+            vec![vec![1.0], vec![2.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("TAKE(SEQUENCE(5),-2)", &g)),
+            vec![vec![4.0], vec![5.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("DROP(SEQUENCE(5),3)", &g)),
+            vec![vec![4.0], vec![5.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("CHOOSEROWS({1;2;3},3,1)", &g)),
+            vec![vec![3.0], vec![1.0]]
+        );
+        assert_eq!(n("CHOOSECOLS({1,2,3},-1)", &g), 3.0);
+        assert_eq!(
+            nums(&eval_array("VSTACK({1;2},{3;4})", &g)),
+            vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("HSTACK({1;2},{3;4})", &g)),
+            vec![vec![1.0, 3.0], vec![2.0, 4.0]]
+        );
+        // Ragged stacks pad with #N/A.
+        let m = eval_array("VSTACK({1,2},{3})", &g);
+        assert_eq!(m[1][1], Value::Err(ExcelError::NA));
+        assert_eq!(
+            nums(&eval_array("TOROW({1;2;3})", &g)),
+            vec![vec![1.0, 2.0, 3.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("TOCOL({1,2;3,4})", &g)),
+            vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("WRAPROWS({1;2;3;4;5;6},3)", &g)),
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]
+        );
+        let m = eval_array("EXPAND({1},2,2,0)", &g);
+        assert_eq!(nums(&m), vec![vec![1.0, 0.0], vec![0.0, 0.0]]);
+    }
+
+    #[test]
+    fn let_bindings() {
+        let g = Grid::new(&[("A1", Value::Num(7.0))]);
+        assert_eq!(n("LET(x,2,x*3)", &g), 6.0);
+        assert_eq!(n("LET(x,2,y,x+1,x*y)", &g), 6.0);
+        assert_eq!(n("LET(x,A1,x+1)", &g), 8.0);
+        // Bindings feed array functions and can hold ranges.
+        assert_eq!(n("LET(v,{3;1;2},SUM(SORT(v)))", &g), 6.0);
+        // Malformed shapes are rejected.
+        assert_eq!(eval_str("LET(x,1)", &g), Value::Err(ExcelError::Value));
+        assert_eq!(eval_str("LET(1,2,3)", &g), Value::Err(ExcelError::Value));
+        // LET names shadow defined names, and scope ends with the LET.
+        let g = Grid::new(&[("A1", Value::Num(1.0))]).with_name("K", "Sheet1!$A$1");
+        assert_eq!(n("LET(K,10,K)+K", &g), 11.0);
+    }
+
+    #[test]
+    fn implicit_intersection_rules() {
+        let g = Grid::new(&[
+            ("B1", Value::Num(10.0)),
+            ("B2", Value::Num(20.0)),
+            ("B3", Value::Num(30.0)),
+        ]);
+        // Formula in row 2: @B1:B3 picks the same-row value.
+        let ast = parse("@B1:B3").unwrap();
+        let mut ev = Eval::new(&g, 0, (1, 0));
+        assert_eq!(ev.eval(&ast), Value::Num(20.0));
+        // Outside the range's rows → #VALUE!.
+        let mut ev = Eval::new(&g, 0, (9, 0));
+        assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Value));
+        // @ on a computed array takes the top-left value.
+        assert_eq!(n("@SORT({3;1;2})", &g), 1.0);
+    }
+
+    #[test]
+    fn lookups_accept_computed_arrays() {
+        let g = empty();
+        assert_eq!(n("INDEX(SORT({3;1;2}),1)", &g), 1.0);
+        assert_eq!(n("MATCH(5,{1;3;5;7},0)", &g), 3.0);
+        assert_eq!(n("VLOOKUP(2,{1,10;2,20;3,30},2,FALSE)", &g), 20.0);
+        assert_eq!(n("XLOOKUP(\"b\",{\"a\";\"b\";\"c\"},{1;2;3})", &g), 2.0);
+        assert_eq!(n("SUMPRODUCT({1;2;3},{4;5;6})", &g), 32.0);
     }
 }

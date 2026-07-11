@@ -131,10 +131,13 @@ docxy in.md    --docx out.docx  # convert Markdown → Word
 The workspace now ships a sibling app: **`xlsxy`**, a terminal editor for
 Microsoft Excel `.xlsx` workbooks built on `gridcore`, a dependency-free
 SpreadsheetML engine with a real **recalculation engine** — a dependency
-graph over your formulas, ~100 Excel functions, Excel-faithful semantics
+graph over your formulas, ~170 Excel functions, Excel-faithful semantics
 (error values, coercions, the 1900 leap-year quirk), whole-column
-references, defined names, `INDIRECT`/`OFFSET`, `XLOOKUP` and the `*IFS`
-family, and the same lossless
+references, defined names, structured table references, 3D sheet spans,
+`INDIRECT`/`OFFSET`, `XLOOKUP` and the `*IFS` family, the full
+number-format runtime, **dynamic arrays** (`FILTER`/`SORT`/`UNIQUE`/
+`SEQUENCE` spill into neighboring cells, `A1#` spill references, `@`,
+`LET`, `#SPILL!` blocking and recovery), and the same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
 Excel's cached results and are saved untouched.
@@ -144,7 +147,7 @@ xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
 xlsxy in.xlsx --csv out.csv       # headless: export the first sheet as CSV
 xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
-                                  # against cached values (415/415 = 100%
+                                  # against cached values (461/461 = 100%
                                   # on the LibreOffice-oracle corpus)
 ```
 

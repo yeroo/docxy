@@ -54,9 +54,10 @@ python3 corpus/tools/gen_xlsx_corpus.py
 
 - Post-2007 function names must be written with their `_xlfn.` prefix in
   stored formulas, or engines cache `#NAME?` (the generator handles this).
-- LibreOffice 24.2 predates `XLOOKUP` (added in 24.8), so it can't oracle
-  those; XLOOKUP is covered by gridcore's unit tests until a real-Excel
-  corpus file provides it.
+- LibreOffice 24.2 predates `XLOOKUP` (added in 24.8) and the dynamic-array
+  functions (`FILTER`/`SORT`/`UNIQUE`/`SEQUENCE`…), so it can't oracle those;
+  they are covered by gridcore's unit tests until a real-Excel corpus file
+  (or a newer LibreOffice) provides oracle values.
 - LibreOffice does not evaluate the bare `[@Col]` sugar when authored via
   openpyxl (it caches `#N/A`); the equivalent explicit
   `Table[[#This Row],[Col]]` form works and is what the generator emits.

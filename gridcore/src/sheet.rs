@@ -115,12 +115,19 @@ pub struct Cell {
     pub value: CellValue,
     /// Formula source *without* the leading `=`.
     pub formula: Option<String>,
-    /// Raw attributes of a `<f>` element we must preserve verbatim (array and
-    /// data-table formulas, unparseable shared groups). Cells carrying this are
-    /// never re-evaluated and their `<f>` is written back exactly.
+    /// Raw attributes of a `<f>` element we must preserve verbatim
+    /// (data-table formulas, unparseable shared groups). Cells carrying this
+    /// are never re-evaluated and their `<f>` is written back exactly — with
+    /// one exception: array formulas (`t="array"`) are evaluated by the
+    /// dynamic-array engine, which tracks their extent in [`Cell::spill`].
     pub f_attrs: Option<String>,
     /// Index into [`Styles::xfs`] (`s=` attribute); 0 is the default style.
     pub style: u32,
+    /// (rows, cols) of the dynamic-array spill anchored here, including this
+    /// cell — set by the recalc engine (or from `<f t="array" ref="…">` at
+    /// load). The spilled cells themselves are plain values owned by this
+    /// anchor. `None` = no spill (scalar result).
+    pub spill: Option<(u32, u32)>,
 }
 
 impl Cell {

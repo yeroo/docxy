@@ -214,13 +214,28 @@ The strategic piece: **conformance is measured, not claimed.**
   ~100 functions; `xlsxy` grid TUI; headless `--recalc`/`--csv`; fixtures +
   round-trip tests. *Acceptance:* real workbooks open/edit/save/reopen cleanly
   in Excel; recalc matches cached values on fixtures; docxy untouched.
-- **Phase B — Conformance push** 🔄 *in progress: oracle harness (`--verify` + corpus/xlsx CI gate), whole-row/col refs, defined names, INDIRECT/OFFSET, XLOOKUP/*IFS, date/financial/statistical batch, best-effort TEXT. Corpus: 14 oracle workbooks (415 formula cells, 100% match) generated via LibreOffice Calc headless + full round-trip/robustness suite in CI. Structured table refs, 3D sheet spans, iterative calculation, and the full number-format runtime (real format-code rendering behind TEXT() and cell display) all shipped and oracle-validated — corpus at 461/461 across 17 workbooks. Remaining: real-Excel corpus files, then phase C.* Corpus oracle harness + scoreboard; function
+- **Phase B — Conformance push** ✅ *shipped: oracle harness (`--verify` + corpus/xlsx CI gate); whole-row/col refs, defined names, INDIRECT/OFFSET, XLOOKUP/*IFS, date/financial/statistical batch; structured table refs; 3D sheet spans; iterative calculation; the full number-format runtime (real format-code rendering behind TEXT() and cell display). Corpus: 17 LibreOffice-oracle workbooks, 461/461 formula cells (100%), plus the round-trip/robustness suite in CI. Remaining (rolls forward): real-Excel corpus files.* Corpus oracle harness + scoreboard; function
   coverage to ~300 (date/time, statistical, financial, text); defined names,
   whole-row/col refs, 3D refs, structured table refs; `INDIRECT`/`OFFSET`
   dynamic deps; volatile functions; iterative calculation; `TEXT()` and the
   full number-format runtime.
-- **Phase C — Dynamic arrays.** Spill semantics + `#SPILL!`; `FILTER`, `SORT`,
-  `UNIQUE`, `SEQUENCE`, `XLOOKUP`; `LET`/`LAMBDA` (closures).
+- **Phase C — Dynamic arrays** 🔄 *in progress: the spill engine shipped —
+  formulas whose results are arrays spill into neighboring cells with
+  `#SPILL!` blocking/recovery, ownership tracking (typing into a spill breaks
+  it, Excel-style), and spill-aware recalculation; `A1#` spill references
+  (stored as `_xlfn.ANCHORARRAY`), `@` implicit intersection (`_xlfn.SINGLE`),
+  array constants `{1,2;3,4}`, elementwise operator broadcasting, and `LET`;
+  array functions: `SEQUENCE`, `RANDARRAY`, `TRANSPOSE`, `SORT`, `SORTBY`,
+  `UNIQUE`, `FILTER`, `CHOOSEROWS`/`CHOOSECOLS`, `TAKE`/`DROP`,
+  `HSTACK`/`VSTACK`, `TOCOL`/`TOROW`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`; lookups
+  (`INDEX`/`MATCH`/`V·HLOOKUP`/`XLOOKUP`/`SUMPRODUCT`) accept computed arrays.
+  Anchors save as `<f t="array" ref="…">` with cached spill values, so other
+  engines read the results. Remaining: `LAMBDA` + the functional battery
+  (`MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`), whole-function
+  elementwise lifting, dynamic-array oracle coverage (needs LibreOffice
+  24.8+/real Excel — 24.2 predates these functions).* Spill semantics +
+  `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`, `SEQUENCE`, `XLOOKUP`;
+  `LET`/`LAMBDA` (closures).
 - **Phase D — Pivot engine.** Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the

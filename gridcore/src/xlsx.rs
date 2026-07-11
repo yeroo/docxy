@@ -792,11 +792,26 @@ fn parse_cell_body(
         }
     };
 
+    // An array formula's `ref` records its spill extent (dynamic arrays and
+    // legacy CSE alike); the engine re-derives it on recalculation.
+    let spill = f_attrs.as_deref().and_then(|a| {
+        if !a.contains("t=\"array\"") {
+            return None;
+        }
+        let ref_val = a.split("ref=\"").nth(1)?.split('"').next()?;
+        let (r1, c1, r2, c2) = crate::sheet::parse_range_name(ref_val)?;
+        if (r1, c1) != (row, col) {
+            return None;
+        }
+        Some((r2 - r1 + 1, c2 - c1 + 1))
+    });
+
     Cell {
         value,
         formula,
         f_attrs,
         style,
+        spill,
     }
 }
 
@@ -1040,6 +1055,17 @@ fn cell_xml(
     };
 
     let f_xml = match (&cell.formula, &cell.f_attrs) {
+        // A spilling anchor writes fresh array attributes — its extent may
+        // have changed since load, so any stored ref would be stale.
+        (Some(src), _) if cell.spill.is_some() && !src.is_empty() => {
+            let (h, w) = cell.spill.unwrap();
+            format!(
+                "<f t=\"array\" ref=\"{}:{}\">{}</f>",
+                cell_name(row, col),
+                cell_name(row + h - 1, col + w - 1),
+                esc_text(src)
+            )
+        }
         (Some(src), None) => format!("<f>{}</f>", esc_text(src)),
         (Some(src), Some(fa)) if src.is_empty() => format!("<f{fa}/>"),
         (Some(src), Some(fa)) => format!("<f{fa}>{}</f>", esc_text(src)),
@@ -1765,5 +1791,42 @@ mod tests {
         let ws =
             String::from_utf8_lossy(pkg2.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(ws.contains("<dimension ref=\"A1:Z100\"/>"), "{ws}");
+    }
+
+    #[test]
+    fn spill_round_trips_as_array_formula() {
+        // A workbook with a spilling anchor saves as <f t="array" ref="…">
+        // and loads back with the extent on Cell::spill.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::formula("SEQUENCE(3)"));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().spill,
+            Some((3, 1))
+        );
+
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).unwrap();
+        let anchor = pkg2.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(anchor.formula.as_deref(), Some("SEQUENCE(3)"));
+        assert_eq!(anchor.spill, Some((3, 1)));
+        assert!(anchor.f_attrs.as_deref().unwrap().contains("t=\"array\""));
+        assert!(anchor.f_attrs.as_deref().unwrap().contains("ref=\"A1:A3\""));
+        // Spilled values persisted as plain cells…
+        assert_eq!(
+            pkg2.workbook.sheets[0].cell(2, 0).unwrap().value,
+            crate::sheet::CellValue::Number(3.0)
+        );
+        // …and the loaded engine evaluates the anchor (not frozen) to the
+        // same result.
+        let mut pkg3 = load_xlsx(&bytes).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg3.workbook);
+        assert!(!eng.is_unsupported((0, 0, 0)));
+        eng.recalc_all(&mut pkg3.workbook);
+        assert_eq!(
+            pkg3.workbook.sheets[0].cell(1, 0).unwrap().value,
+            crate::sheet::CellValue::Number(2.0)
+        );
     }
 }
