@@ -84,6 +84,103 @@ impl Frame {
     pub fn col_index(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
     }
+
+    /// Parse CSV text (RFC 4180-ish: quoted fields, doubled quotes, CRLF)
+    /// into a Frame. The first record is the header row; fields are typed by
+    /// inference (number, TRUE/FALSE, empty, text). Ragged records are
+    /// padded with empties.
+    pub fn from_csv(text: &str) -> Frame {
+        let records = parse_csv(text);
+        let mut it = records.into_iter();
+        let Some(header) = it.next() else {
+            return Frame::default();
+        };
+        let names: Vec<String> = header
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let t = h.trim();
+                if t.is_empty() {
+                    format!("Column{}", i + 1)
+                } else {
+                    t.to_string()
+                }
+            })
+            .collect();
+        let width = names.len().max(1);
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); width];
+        for rec in it {
+            for (i, col) in cols.iter_mut().enumerate() {
+                col.push(infer_value(rec.get(i).map(String::as_str).unwrap_or("")));
+            }
+        }
+        Frame { names, cols }
+    }
+}
+
+/// CSV field → typed value.
+fn infer_value(field: &str) -> Value {
+    let t = field.trim();
+    if t.is_empty() {
+        return Value::Empty;
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        if n.is_finite() {
+            return Value::Num(n);
+        }
+    }
+    if t.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+    Value::Str(field.to_string())
+}
+
+/// Split CSV text into records of raw string fields.
+pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    let mut any = false;
+    while let Some(ch) = chars.next() {
+        any = true;
+        if in_quotes {
+            match ch {
+                '"' => {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                _ => field.push(ch),
+            }
+        } else {
+            match ch {
+                '"' => in_quotes = true,
+                ',' => {
+                    record.push(std::mem::take(&mut field));
+                    any = true;
+                }
+                '\r' => {} // swallowed; \n terminates the record
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                _ => field.push(ch),
+            }
+        }
+    }
+    if any && (!field.is_empty() || !record.is_empty()) {
+        record.push(field);
+        records.push(record);
+    }
+    records
 }
 
 /// Pivot aggregation functions (the `subtotal` values of SpreadsheetML data
@@ -259,7 +356,7 @@ pub struct PivotOut {
 
 /// A grouping key: normalized for equality/hashing, displaying the first
 /// value seen (Excel groups text case-insensitively).
-fn key_of(v: &Value) -> String {
+pub(crate) fn key_of(v: &Value) -> String {
     match v {
         Value::Empty => "\u{0}empty".to_string(),
         Value::Num(n) => format!("\u{0}n{}", n.to_bits()),
@@ -269,7 +366,7 @@ fn key_of(v: &Value) -> String {
     }
 }
 
-fn keys_lt(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+pub(crate) fn keys_lt(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     for (x, y) in a.iter().zip(b) {
         let ord = compare(x, y).unwrap_or(std::cmp::Ordering::Equal);
         if ord != std::cmp::Ordering::Equal {

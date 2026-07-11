@@ -142,7 +142,10 @@ defined names, `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`,
 elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh and editing** (a
 columnar group-by/aggregate engine recomputes pivots from current data —
 `F9` in the TUI, automatic under `--recalc`; `Ctrl-P` opens a field editor
-to rearrange rows/columns/values and aggregations), and the same lossless
+to rearrange rows/columns/values and aggregations), a **data model**
+(`gridcore::model`: multiple tables with relationships and Excel-formula
+measures, filter context through star schemas, CSV sources — `xlsxy
+data.csv` imports directly), and the same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
 Excel's cached results and are saved untouched.

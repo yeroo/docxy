@@ -105,6 +105,24 @@ fn main() -> ExitCode {
     }
 
     let (pkg, path) = match parsed.inputs.first() {
+        // CSV imports as a one-sheet workbook (Ctrl-S then writes .xlsx —
+        // the path is rebound so a spreadsheet never lands in a .csv file).
+        Some(input) if input.to_ascii_lowercase().ends_with(".csv") => {
+            match std::fs::read_to_string(input) {
+                Ok(text) => {
+                    let stem = std::path::Path::new(input)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "import".to_string());
+                    let base = &input[..input.len() - ".csv".len()];
+                    (csv_to_pkg(&text, &stem), format!("{base}.xlsx"))
+                }
+                Err(e) => {
+                    eprintln!("error: cannot read {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
                 Ok(pkg) => (pkg, input.clone()),
@@ -176,6 +194,39 @@ fn main() -> ExitCode {
     }
 }
 
+/// Import CSV text as a fresh one-sheet workbook.
+fn csv_to_pkg(text: &str, sheet_name: &str) -> SheetPackage {
+    let frame = gridcore::frame::Frame::from_csv(text);
+    let mut pkg = new_xlsx();
+    let sh = &mut pkg.workbook.sheets[0];
+    if !sheet_name.is_empty() {
+        sh.name = sheet_name.chars().take(31).collect();
+    }
+    for (c, name) in frame.names.iter().enumerate() {
+        sh.set_cell(0, c as u32, Cell::text(name));
+    }
+    for (c, col) in frame.cols.iter().enumerate() {
+        for (r, v) in col.iter().enumerate() {
+            let value = match v {
+                gridcore::formula::Value::Empty => continue,
+                gridcore::formula::Value::Num(n) => CellValue::Number(*n),
+                gridcore::formula::Value::Str(s) => CellValue::Text(s.clone()),
+                gridcore::formula::Value::Bool(b) => CellValue::Bool(*b),
+                gridcore::formula::Value::Err(e) => CellValue::Error(e.code().to_string()),
+            };
+            sh.set_cell(
+                r as u32 + 1,
+                c as u32,
+                Cell {
+                    value,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+    pkg
+}
+
 struct Parsed {
     inputs: Vec<String>,
     recalc_out: Option<String>,
@@ -219,6 +270,7 @@ fn print_usage() {
          USAGE:\n  \
            xlsxy                            new blank workbook\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
+           xlsxy <file.csv>                 import CSV as a new workbook\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
            xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
@@ -2615,5 +2667,29 @@ mod tests {
         assert!(text.contains("Fields"));
         assert!(text.contains("Values"));
         assert!(text.contains("Pivot: P"));
+    }
+
+    #[test]
+    fn csv_imports_as_workbook() {
+        let pkg = csv_to_pkg("Region,Sales\nEast,10\n\"West, far\",20.5\n", "sales");
+        let sh = &pkg.workbook.sheets[0];
+        assert_eq!(sh.name, "sales");
+        assert_eq!(
+            sh.cell(0, 0).unwrap().value,
+            CellValue::Text("Region".into())
+        );
+        assert_eq!(sh.cell(1, 1).unwrap().value, CellValue::Number(10.0));
+        assert_eq!(
+            sh.cell(2, 0).unwrap().value,
+            CellValue::Text("West, far".into())
+        );
+        assert_eq!(sh.cell(2, 1).unwrap().value, CellValue::Number(20.5));
+        // The imported workbook saves as a valid xlsx and round-trips.
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).unwrap();
+        assert_eq!(
+            pkg2.workbook.sheets[0].cell(2, 1).unwrap().value,
+            CellValue::Number(20.5)
+        );
     }
 }

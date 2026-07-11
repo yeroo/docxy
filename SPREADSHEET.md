@@ -264,10 +264,24 @@ The strategic piece: **conformance is measured, not claimed.**
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
   XML — is the point: it is the aggregation core everything later builds on.
-- **Phase E — Data model.** Multiple tables, relationships, measures over the
-  phase-D query core; sources beyond xlsx (CSV first). Headless-first: by this
-  point `gridcore` is a small BI engine that happens to have a terminal
-  frontend.
+- **Phase E — Data model** 🔄 *in progress: the core shipped as
+  `gridcore::model`. A `DataModel` holds named `Frame`s (from workbook
+  Tables, CSV via the std-only `Frame::from_csv` parser, or built
+  programmatically), **many-to-one relationships** (`Sales[ProductID]` →
+  `Products[ID]`, one-side uniqueness enforced), and named **measures**
+  written in ordinary Excel formula syntax over `Table[Column]` references —
+  the whole gridcore function library works inside measures
+  (`SUM(Sales[Amount])/SUM(Sales[Qty])`, `SUMIFS`, `SUMPRODUCT`, …), and
+  measures compose by name. `expanded_frame` joins related dimension
+  columns transitively (star schema, `RELATED`-style blanks for unmatched
+  keys); `model_pivot` groups by any related column and evaluates measures
+  per group with **filter context** propagated through the relationships.
+  xlsxy opens `.csv` files directly (imported as a workbook, saved as
+  `.xlsx`). Remaining: a TUI surface for the model (relationship/measure
+  editors), persistence of model definitions, more sources.* Multiple
+  tables, relationships, measures over the phase-D query core; sources
+  beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
+  small BI engine that happens to have a terminal frontend.
 
 Each phase ships independently through the existing signed-release pipeline.
 
