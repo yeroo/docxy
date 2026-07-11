@@ -6908,6 +6908,89 @@ impl<'a> Eval<'a> {
                 num(total)
             }
 
+            // ---- database functions --------------------------------------------
+            "DSUM" | "DAVERAGE" | "DMAX" | "DMIN" | "DPRODUCT" | "DCOUNT" | "DCOUNTA"
+            | "DGET" | "DVAR" | "DVARP" | "DSTDEV" | "DSTDEVP" => {
+                let cells = match self.db_query(args) {
+                    Ok(c) => c,
+                    Err(v) => return v,
+                };
+                if name == "DCOUNTA" {
+                    return num(cells.iter().filter(|v| !matches!(v, Value::Empty)).count() as f64);
+                }
+                if name == "DGET" {
+                    let non_blank: Vec<&Value> =
+                        cells.iter().filter(|v| !matches!(v, Value::Empty)).collect();
+                    return match non_blank.len() {
+                        0 => Value::Err(ExcelError::Value),
+                        1 => non_blank[0].clone(),
+                        _ => Value::Err(ExcelError::Num),
+                    };
+                }
+                // Everything else works over the numeric field values.
+                let nums: Vec<f64> = cells
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Num(n) => Some(*n),
+                        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                        _ => None,
+                    })
+                    .collect();
+                match name {
+                    "DCOUNT" => num(nums.len() as f64),
+                    "DSUM" => num(nums.iter().sum()),
+                    "DPRODUCT" => {
+                        if nums.is_empty() {
+                            num(0.0)
+                        } else {
+                            num(nums.iter().product())
+                        }
+                    }
+                    "DAVERAGE" => {
+                        if nums.is_empty() {
+                            Value::Err(ExcelError::Div0)
+                        } else {
+                            num(nums.iter().sum::<f64>() / nums.len() as f64)
+                        }
+                    }
+                    "DMAX" => {
+                        if nums.is_empty() {
+                            num(0.0)
+                        } else {
+                            num(nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max))
+                        }
+                    }
+                    "DMIN" => {
+                        if nums.is_empty() {
+                            num(0.0)
+                        } else {
+                            num(nums.iter().cloned().fold(f64::INFINITY, f64::min))
+                        }
+                    }
+                    _ => {
+                        // DVAR/DVARP/DSTDEV/DSTDEVP.
+                        let pop = name == "DVARP" || name == "DSTDEVP";
+                        let min_n = if pop { 1 } else { 2 };
+                        if nums.len() < min_n {
+                            return Value::Err(ExcelError::Div0);
+                        }
+                        let m = nums.iter().sum::<f64>() / nums.len() as f64;
+                        let ss: f64 = nums.iter().map(|x| (x - m) * (x - m)).sum();
+                        let denom = if pop {
+                            nums.len() as f64
+                        } else {
+                            nums.len() as f64 - 1.0
+                        };
+                        let var = ss / denom;
+                        if name.starts_with("DSTDEV") {
+                            num(var.sqrt())
+                        } else {
+                            num(var)
+                        }
+                    }
+                }
+            }
+
             // ---- more statistics --------------------------------------------------
             "RANK" | "RANK.EQ" => {
                 if args.len() < 2 || args.len() > 3 {
@@ -7961,6 +8044,100 @@ impl<'a> Eval<'a> {
             Arg::Matrix(m) => Ok(m.into_iter().flatten().collect()),
             Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
         }
+    }
+
+    /// A 2-D dense grid of an argument (row-major), clamped to the used range.
+    /// Scalars become a 1×1 grid; the shape database functions want.
+    fn flat_grid(&mut self, e: &Expr) -> Result<Vec<Vec<Value>>, Value> {
+        match self.eval_arg(e) {
+            Arg::Scalar(Value::Err(er)) => Err(Value::Err(er)),
+            Arg::Scalar(v) => Ok(vec![vec![v]]),
+            Arg::Range(s, r1, c1, r2, c2) => {
+                let (a, b, c, d) = self.clamp(s, r1, c1, r2, c2);
+                Ok((a..=c)
+                    .map(|r| (b..=d).map(|col| self.res.value(s, r, col)).collect())
+                    .collect())
+            }
+            Arg::Matrix(m) => Ok(m),
+            Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
+        }
+    }
+
+    /// Shared core of the D-functions: the `field` column's values over every
+    /// database row that satisfies the criteria range.
+    /// `args` = [database, field, criteria].
+    fn db_query(&mut self, args: &[Expr]) -> Result<Vec<Value>, Value> {
+        if args.len() != 3 {
+            return Err(Value::Err(ExcelError::Value));
+        }
+        let db = self.flat_grid(&args[0])?;
+        let field = self.eval(&args[1]);
+        let crit = self.flat_grid(&args[2])?;
+        if db.len() < 2 || db[0].is_empty() || crit.is_empty() {
+            return Err(Value::Err(ExcelError::Value));
+        }
+        let headers = &db[0];
+        let text_eq = |a: &Value, b: &str| {
+            to_text(a).map(|t| t.eq_ignore_ascii_case(b)).unwrap_or(false)
+        };
+        // Resolve the field to a column index (1-based number, or header name).
+        let col = match &field {
+            Value::Num(n) => {
+                let i = n.trunc() as i64 - 1;
+                if i < 0 || i as usize >= headers.len() {
+                    return Err(Value::Err(ExcelError::Value));
+                }
+                i as usize
+            }
+            _ => {
+                let name = to_text(&field).map_err(Value::Err)?;
+                match headers.iter().position(|h| text_eq(h, &name)) {
+                    Some(i) => i,
+                    None => return Err(Value::Err(ExcelError::Value)),
+                }
+            }
+        };
+        // Map each criteria column to a database column via its header text.
+        let crit_headers = &crit[0];
+        let crit_cols: Vec<Option<usize>> = crit_headers
+            .iter()
+            .map(|ch| {
+                to_text(ch)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| headers.iter().position(|h| text_eq(h, &s)))
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for row in &db[1..] {
+            // Criteria rows are OR'd; cells within a row are AND'd.
+            let mut matched = crit.len() <= 1; // no criteria rows → all match
+            for cr in &crit[1..] {
+                let mut row_ok = true;
+                for (ci, dbcol) in crit_cols.iter().enumerate() {
+                    let Some(dbcol) = dbcol else { continue };
+                    let cval = cr.get(ci).cloned().unwrap_or(Value::Empty);
+                    if matches!(cval, Value::Empty) {
+                        continue;
+                    }
+                    let c = parse_criteria(&cval);
+                    let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
+                    if !criteria_match(&c, &cell) {
+                        row_ok = false;
+                        break;
+                    }
+                }
+                if row_ok {
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                out.push(row.get(col).cloned().unwrap_or(Value::Empty));
+            }
+        }
+        Ok(out)
     }
 
     /// Two equal-shaped arrays reduced to the numeric pairs they share
@@ -10258,7 +10435,7 @@ mod tests {
         approx("SEC(1)", &g, 1.850816);
         approx("CSC(1)", &g, 1.188395);
         approx("COT(1)", &g, 0.642093);
-        approx("ACOT(1)", &g, 0.785398);
+        approx("ACOT(1)", &g, std::f64::consts::FRAC_PI_4);
         approx("ACOTH(2)", &g, 0.549306);
         approx("SECH(1)", &g, 0.648054);
         assert_eq!(eval_str("ATANH(1)", &g), Value::Err(ExcelError::Num));
@@ -10272,5 +10449,63 @@ mod tests {
         assert_eq!(eval_str("OCT2HEX(\"17\")", &g), Value::Str("F".into()));
         assert_eq!(eval_str("BIN2OCT(\"1000\")", &g), Value::Str("10".into()));
         assert_eq!(n("HEX2DEC(BIN2HEX(\"1010\"))", &g), 10.0);
+    }
+
+    #[test]
+    fn database_functions() {
+        // A little orchard database (Microsoft's classic D-function example).
+        let g = Grid::new(&[
+            ("A1", Value::Str("Tree".into())),
+            ("B1", Value::Str("Height".into())),
+            ("C1", Value::Str("Profit".into())),
+            ("A2", Value::Str("Apple".into())),
+            ("B2", Value::Num(18.0)),
+            ("C2", Value::Num(105.0)),
+            ("A3", Value::Str("Pear".into())),
+            ("B3", Value::Num(12.0)),
+            ("C3", Value::Num(96.0)),
+            ("A4", Value::Str("Apple".into())),
+            ("B4", Value::Num(13.0)),
+            ("C4", Value::Num(105.0)),
+            ("A5", Value::Str("Cherry".into())),
+            ("B5", Value::Num(9.0)),
+            ("C5", Value::Num(75.0)),
+            ("A6", Value::Str("Apple".into())),
+            ("B6", Value::Num(8.0)),
+            ("C6", Value::Num(76.0)),
+            // Criteria block: Tree = Apple, Height > 10.
+            ("E1", Value::Str("Tree".into())),
+            ("F1", Value::Str("Height".into())),
+            ("E2", Value::Str("Apple".into())),
+            ("F2", Value::Str(">10".into())),
+        ]);
+        // Apples taller than 10: rows 2 (18,105) and 4 (13,105).
+        assert_eq!(n("DSUM(A1:C6,\"Profit\",E1:F2)", &g), 210.0);
+        assert_eq!(n("DSUM(A1:C6,3,E1:F2)", &g), 210.0);
+        assert_eq!(n("DCOUNT(A1:C6,\"Height\",E1:F2)", &g), 2.0);
+        assert_eq!(n("DCOUNTA(A1:C6,\"Tree\",E1:F2)", &g), 2.0);
+        assert_eq!(n("DAVERAGE(A1:C6,\"Profit\",E1:F2)", &g), 105.0);
+        assert_eq!(n("DMAX(A1:C6,\"Height\",E1:F2)", &g), 18.0);
+        assert_eq!(n("DMIN(A1:C6,\"Height\",E1:F2)", &g), 13.0);
+        assert_eq!(
+            eval_str("DGET(A1:C6,\"Tree\",E1:F2)", &g),
+            Value::Err(ExcelError::Num) // two matches
+        );
+
+        // Narrow to a single row (Height > 15) so DGET returns it.
+        let g2 = Grid::new(&[
+            ("A1", Value::Str("Tree".into())),
+            ("B1", Value::Str("Height".into())),
+            ("A2", Value::Str("Apple".into())),
+            ("B2", Value::Num(18.0)),
+            ("A3", Value::Str("Pear".into())),
+            ("B3", Value::Num(12.0)),
+            ("E1", Value::Str("Height".into())),
+            ("E2", Value::Str(">15".into())),
+        ]);
+        assert_eq!(
+            eval_str("DGET(A1:B3,\"Tree\",E1:E2)", &g2),
+            Value::Str("Apple".into())
+        );
     }
 }
