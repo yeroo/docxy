@@ -1,0 +1,554 @@
+{
+  "root": "xlsx",
+  "count": 17,
+  "categories": {
+    "calc": 12,
+    "edge": 1,
+    "oracle": 1,
+    "shape": 3
+  },
+  "tags": {
+    "formulas": {
+      "count": 17,
+      "doc": "Cells with formulas (<f>)"
+    },
+    "number-formats": {
+      "count": 16,
+      "doc": "Custom number formats"
+    },
+    "fn-math": {
+      "count": 9,
+      "doc": "Math & trigonometry functions"
+    },
+    "fn-logical": {
+      "count": 7,
+      "doc": "Logical functions"
+    },
+    "fn-stat": {
+      "count": 7,
+      "doc": "Statistical functions"
+    },
+    "fn-text": {
+      "count": 4,
+      "doc": "Text functions"
+    },
+    "fn-financial": {
+      "count": 3,
+      "doc": "Financial functions"
+    },
+    "fn-info": {
+      "count": 3,
+      "doc": "Information functions"
+    },
+    "fn-lookup": {
+      "count": 3,
+      "doc": "Lookup & reference functions"
+    },
+    "cross-sheet-refs": {
+      "count": 2,
+      "doc": "References across sheets (Sheet!A1)"
+    },
+    "defined-names": {
+      "count": 2,
+      "doc": "Defined names / named ranges"
+    },
+    "multi-sheet": {
+      "count": 2,
+      "doc": "More than one worksheet"
+    },
+    "3d-refs": {
+      "count": 1,
+      "doc": "3-D references (Sheet1:Sheet3!A1)"
+    },
+    "fn-datetime": {
+      "count": 1,
+      "doc": "Date & time functions"
+    },
+    "merged-cells": {
+      "count": 1,
+      "doc": "Merged cell ranges"
+    },
+    "tables": {
+      "count": 1,
+      "doc": "Structured tables (xl/tables)"
+    }
+  },
+  "files": [
+    {
+      "name": "calc-3d.xlsx",
+      "path": "xlsx/calc-3d.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "3d-refs",
+        "cross-sheet-refs",
+        "fn-math",
+        "fn-stat",
+        "formulas",
+        "multi-sheet",
+        "number-formats"
+      ],
+      "functions": [
+        "AVERAGE",
+        "COUNT",
+        "MAX",
+        "MIN",
+        "SUM"
+      ],
+      "size": 8869
+    },
+    {
+      "name": "calc-arithmetic.xlsx",
+      "path": "xlsx/calc-arithmetic.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-logical",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "TRUE"
+      ],
+      "size": 6453
+    },
+    {
+      "name": "calc-criteria.xlsx",
+      "path": "xlsx/calc-criteria.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-math",
+        "fn-stat",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "AVERAGEIF",
+        "AVERAGEIFS",
+        "COUNTIF",
+        "COUNTIFS",
+        "MAXIFS",
+        "MINIFS",
+        "SUMIF",
+        "SUMIFS"
+      ],
+      "size": 6418
+    },
+    {
+      "name": "calc-dates.xlsx",
+      "path": "xlsx/calc-dates.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-datetime",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "DATE",
+        "DATEDIF",
+        "DAY",
+        "DAYS",
+        "EDATE",
+        "EOMONTH",
+        "HOUR",
+        "ISOWEEKNUM",
+        "MINUTE",
+        "MONTH",
+        "SECOND",
+        "TIME",
+        "WEEKDAY",
+        "WEEKNUM",
+        "YEAR"
+      ],
+      "size": 6219
+    },
+    {
+      "name": "calc-financial.xlsx",
+      "path": "xlsx/calc-financial.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-financial",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "FV",
+        "IRR",
+        "NPER",
+        "NPV",
+        "PMT",
+        "PV",
+        "RATE"
+      ],
+      "size": 6086
+    },
+    {
+      "name": "calc-logic.xlsx",
+      "path": "xlsx/calc-logic.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-info",
+        "fn-logical",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "AND",
+        "FALSE",
+        "IF",
+        "IFERROR",
+        "IFNA",
+        "IFS",
+        "ISBLANK",
+        "ISERR",
+        "ISERROR",
+        "ISEVEN",
+        "ISLOGICAL",
+        "ISNA",
+        "ISNUMBER",
+        "ISODD",
+        "ISTEXT",
+        "NA",
+        "NOT",
+        "OR",
+        "SWITCH",
+        "TRUE",
+        "XOR"
+      ],
+      "size": 6539
+    },
+    {
+      "name": "calc-lookup.xlsx",
+      "path": "xlsx/calc-lookup.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-logical",
+        "fn-lookup",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "CHOOSE",
+        "COLUMN",
+        "COLUMNS",
+        "FALSE",
+        "HLOOKUP",
+        "INDEX",
+        "LOOKUP",
+        "MATCH",
+        "ROW",
+        "ROWS",
+        "VLOOKUP"
+      ],
+      "size": 6477
+    },
+    {
+      "name": "calc-math.xlsx",
+      "path": "xlsx/calc-math.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-math",
+        "fn-stat",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "ABS",
+        "ATAN2",
+        "CEILING",
+        "COMBIN",
+        "COS",
+        "COSH",
+        "DEGREES",
+        "EVEN",
+        "EXP",
+        "FACT",
+        "FLOOR",
+        "GCD",
+        "INT",
+        "LCM",
+        "LN",
+        "LOG",
+        "LOG10",
+        "MOD",
+        "ODD",
+        "PERMUT",
+        "PI",
+        "POWER",
+        "QUOTIENT",
+        "RADIANS",
+        "ROUND",
+        "ROUNDDOWN",
+        "ROUNDUP",
+        "SIGN",
+        "SIN",
+        "SINH",
+        "SQRT",
+        "SUMSQ",
+        "TANH",
+        "TRUNC"
+      ],
+      "size": 6445
+    },
+    {
+      "name": "calc-refs.xlsx",
+      "path": "xlsx/calc-refs.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "cross-sheet-refs",
+        "defined-names",
+        "fn-math",
+        "formulas",
+        "multi-sheet",
+        "number-formats"
+      ],
+      "functions": [
+        "SUM"
+      ],
+      "size": 6949
+    },
+    {
+      "name": "calc-stats.xlsx",
+      "path": "xlsx/calc-stats.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-math",
+        "fn-stat",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "AVERAGE",
+        "COUNT",
+        "COUNTA",
+        "COUNTBLANK",
+        "LARGE",
+        "MAX",
+        "MEDIAN",
+        "MIN",
+        "MODE",
+        "PERCENTILE",
+        "PRODUCT",
+        "QUARTILE",
+        "RANK",
+        "SMALL",
+        "STDEV",
+        "STDEVP",
+        "SUM",
+        "SUMPRODUCT",
+        "VAR",
+        "VARP"
+      ],
+      "size": 6197
+    },
+    {
+      "name": "calc-text.xlsx",
+      "path": "xlsx/calc-text.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-info",
+        "fn-logical",
+        "fn-text",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "CHAR",
+        "CLEAN",
+        "CODE",
+        "CONCAT",
+        "CONCATENATE",
+        "EXACT",
+        "FIND",
+        "LEFT",
+        "LEN",
+        "LOWER",
+        "MID",
+        "N",
+        "PROPER",
+        "REPLACE",
+        "REPT",
+        "RIGHT",
+        "SEARCH",
+        "SUBSTITUTE",
+        "T",
+        "TEXT",
+        "TEXTJOIN",
+        "TRIM",
+        "TRUE",
+        "UPPER",
+        "VALUE"
+      ],
+      "size": 6791
+    },
+    {
+      "name": "calc-textfmt.xlsx",
+      "path": "xlsx/calc-textfmt.xlsx",
+      "folder": "",
+      "category": "calc",
+      "tags": [
+        "fn-text",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "TEXT"
+      ],
+      "size": 6302
+    },
+    {
+      "name": "edge-cases.xlsx",
+      "path": "xlsx/edge-cases.xlsx",
+      "folder": "",
+      "category": "edge",
+      "tags": [
+        "fn-info",
+        "fn-logical",
+        "fn-math",
+        "fn-text",
+        "formulas",
+        "merged-cells",
+        "number-formats"
+      ],
+      "functions": [
+        "IFERROR",
+        "ISERROR",
+        "LEN",
+        "NA",
+        "SUM",
+        "UPPER"
+      ],
+      "size": 7063
+    },
+    {
+      "name": "oracle-basic.xlsx",
+      "path": "xlsx/oracle-basic.xlsx",
+      "folder": "",
+      "category": "oracle",
+      "tags": [
+        "defined-names",
+        "fn-financial",
+        "fn-logical",
+        "fn-lookup",
+        "fn-math",
+        "fn-stat",
+        "fn-text",
+        "formulas"
+      ],
+      "functions": [
+        "ABS",
+        "AND",
+        "AVERAGE",
+        "CHOOSE",
+        "CONCATENATE",
+        "COUNT",
+        "COUNTA",
+        "COUNTIF",
+        "EXACT",
+        "FIND",
+        "IF",
+        "IFERROR",
+        "INDEX",
+        "INT",
+        "LARGE",
+        "LEFT",
+        "LEN",
+        "LOWER",
+        "MATCH",
+        "MAX",
+        "MEDIAN",
+        "MID",
+        "MIN",
+        "MOD",
+        "NOT",
+        "NPV",
+        "OR",
+        "PMT",
+        "POWER",
+        "ROUND",
+        "SMALL",
+        "SQRT",
+        "STDEV",
+        "SUBSTITUTE",
+        "SUM",
+        "SUMIF",
+        "SUMPRODUCT",
+        "TRIM",
+        "TRUNC",
+        "UPPER",
+        "VAR",
+        "VLOOKUP"
+      ],
+      "size": 5819
+    },
+    {
+      "name": "shape-amortization.xlsx",
+      "path": "xlsx/shape-amortization.xlsx",
+      "folder": "",
+      "category": "shape",
+      "tags": [
+        "fn-financial",
+        "fn-math",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "PMT",
+        "SUM"
+      ],
+      "size": 7860
+    },
+    {
+      "name": "shape-gradebook.xlsx",
+      "path": "xlsx/shape-gradebook.xlsx",
+      "folder": "",
+      "category": "shape",
+      "tags": [
+        "fn-logical",
+        "fn-lookup",
+        "fn-stat",
+        "formulas",
+        "number-formats"
+      ],
+      "functions": [
+        "AVERAGE",
+        "COUNTIF",
+        "IF",
+        "INDEX",
+        "MATCH",
+        "MAX"
+      ],
+      "size": 6458
+    },
+    {
+      "name": "shape-salestable.xlsx",
+      "path": "xlsx/shape-salestable.xlsx",
+      "folder": "",
+      "category": "shape",
+      "tags": [
+        "fn-math",
+        "fn-stat",
+        "formulas",
+        "number-formats",
+        "tables"
+      ],
+      "functions": [
+        "AVERAGE",
+        "COUNTA",
+        "SUM",
+        "SUMIF",
+        "SUMPRODUCT"
+      ],
+      "size": 7215
+    }
+  ]
+}
