@@ -17,8 +17,11 @@
 //! - [`formula`] — lexer/parser/AST/serializer + evaluator for the formula
 //!   language.
 //! - [`engine`] — dependency-graph recalculation over a workbook.
+//! - [`edit`] — structural edits (insert/delete rows & columns, renames)
+//!   with workbook-wide reference rewriting.
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 
+pub mod edit;
 pub mod engine;
 pub mod formula;
 pub mod sheet;

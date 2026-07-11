@@ -1117,14 +1117,14 @@ fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, c
     }
 }
 
-fn add_workbook_rel(parts: &mut [(String, Vec<u8>)], rel_type: &str, target: &str) {
+fn add_workbook_rel(parts: &mut [(String, Vec<u8>)], rel_type: &str, target: &str) -> String {
     if let Some(p) = parts
         .iter_mut()
         .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
     {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
-        if xml.contains(target) {
-            return;
+        if xml.contains(&format!("Target=\"{target}\"")) {
+            return String::new();
         }
         // Next free rIdN.
         let mut max = 0u32;
@@ -1140,14 +1140,185 @@ fn add_workbook_rel(parts: &mut [(String, Vec<u8>)], rel_type: &str, target: &st
             }
             i = s;
         }
-        let rel = format!(
-            "<Relationship Id=\"rId{}\" Type=\"{rel_type}\" Target=\"{target}\"/>",
-            max + 1
-        );
+        let rid = format!("rId{}", max + 1);
+        let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
         p.1 = xml
             .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
             .into_bytes();
+        return rid;
     }
+    String::new()
+}
+
+// ---------------------------------------------------------------------------
+// Sheet management
+// ---------------------------------------------------------------------------
+
+impl SheetPackage {
+    /// Append a blank sheet named `name`; returns its index. Wires up the
+    /// part, content type, relationship, and the workbook.xml entry.
+    pub fn add_sheet(&mut self, name: &str) -> usize {
+        // Unused part name xl/worksheets/sheetN.xml.
+        let mut n = 1;
+        while self.part(&format!("xl/worksheets/sheet{n}.xml")).is_some() {
+            n += 1;
+        }
+        let part_name = format!("xl/worksheets/sheet{n}.xml");
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{SPREADSHEET_NS}\"><dimension ref=\"A1\"/><sheetData/></worksheet>"
+        );
+        self.parts.push((part_name.clone(), body.into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{part_name}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+        );
+        let rid = add_workbook_rel(
+            &mut self.parts,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+            &format!("worksheets/sheet{n}.xml"),
+        );
+        // workbook.xml <sheets> entry with the next free sheetId.
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(pn, _)| pn == "xl/workbook.xml")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let mut max_id = 0u32;
+            let mut i = 0;
+            while let Some(pos) = xml[i..].find("sheetId=\"") {
+                let s = i + pos + "sheetId=\"".len();
+                let digits: String = xml[s..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(v) = digits.parse::<u32>() {
+                    max_id = max_id.max(v);
+                }
+                i = s;
+            }
+            let entry = format!(
+                "<sheet name=\"{}\" sheetId=\"{}\" r:id=\"{rid}\"/>",
+                esc_attr(name),
+                max_id + 1
+            );
+            p.1 = xml
+                .replacen("</sheets>", &format!("{entry}</sheets>"), 1)
+                .into_bytes();
+        }
+        self.workbook.sheets.push(Sheet {
+            name: name.to_string(),
+            ..Sheet::default()
+        });
+        self.sheet_parts.push(part_name);
+        self.workbook.sheets.len() - 1
+    }
+
+    /// Remove the sheet at `idx`. Returns false (and does nothing) when it
+    /// is the last sheet — a workbook must keep at least one.
+    pub fn remove_sheet(&mut self, idx: usize) -> bool {
+        if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
+            return false;
+        }
+        let part_name = self.sheet_parts.remove(idx);
+        self.workbook.sheets.remove(idx);
+        self.parts.retain(|(n, _)| *n != part_name);
+        // Content-type override for the removed part.
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "[Content_Types].xml")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 =
+                remove_element_containing(&xml, "<Override", &format!("/{part_name}")).into_bytes();
+        }
+        // Relationship (by target) — capture its rId first.
+        let target = part_name.trim_start_matches("xl/").to_string();
+        let mut rid = String::new();
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some(rel_pos) = xml.find(&format!("Target=\"{target}\"")) {
+                if let Some(id_pos) = xml[..rel_pos].rfind("Id=\"") {
+                    let s = id_pos + 4;
+                    if let Some(e) = xml[s..].find('\"') {
+                        rid = xml[s..s + e].to_string();
+                    }
+                }
+            }
+            p.1 = remove_element_containing(&xml, "<Relationship", &format!("Target=\"{target}\""))
+                .into_bytes();
+        }
+        // workbook.xml: drop the <sheet> element and fix defined-name scopes
+        // (localSheetId counts sheets in document order).
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let mut xml = if rid.is_empty() {
+                xml
+            } else {
+                remove_element_containing(&xml, "<sheet ", &format!(":id=\"{rid}\""))
+            };
+            xml = shift_local_sheet_ids(&xml, idx);
+            p.1 = xml.into_bytes();
+        }
+        self.workbook.defined_names.retain(|d| d.scope != Some(idx));
+        for d in &mut self.workbook.defined_names {
+            if let Some(s) = d.scope {
+                if s > idx {
+                    d.scope = Some(s - 1);
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Drop `<definedName localSheetId="removed">…</definedName>` elements and
+/// decrement higher indices after a sheet removal.
+fn shift_local_sheet_ids(xml: &str, removed: usize) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(pos) = rest.find("localSheetId=\"") {
+        let vs = pos + "localSheetId=\"".len();
+        let Some(ve) = rest[vs..].find('\"') else {
+            break;
+        };
+        let digits = &rest[vs..vs + ve];
+        match digits.parse::<usize>() {
+            Ok(id) if id == removed => {
+                // Remove the whole enclosing <definedName …>…</definedName>.
+                if let Some(el_start) = rest[..pos].rfind("<definedName") {
+                    let after = &rest[el_start..];
+                    let el_end = after
+                        .find("</definedName>")
+                        .map(|i| i + "</definedName>".len())
+                        .or_else(|| after.find("/>").map(|i| i + 2))
+                        .unwrap_or(after.len());
+                    out.push_str(&rest[..el_start]);
+                    rest = &rest[el_start + el_end..];
+                    continue;
+                }
+                out.push_str(&rest[..vs + ve]);
+                rest = &rest[vs + ve..];
+            }
+            Ok(id) if id > removed => {
+                out.push_str(&rest[..vs]);
+                out.push_str(&(id - 1).to_string());
+                rest = &rest[vs + ve..];
+            }
+            _ => {
+                out.push_str(&rest[..vs + ve]);
+                rest = &rest[vs + ve..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1590,33 @@ mod tests {
         ole.extend_from_slice(&[0u8; 100]);
         assert_eq!(load_xlsx(&ole).err(), Some(XlsxError::LegacyXls));
         assert_eq!(load_xlsx(b"not a zip").err(), Some(XlsxError::NotZip));
+    }
+
+    #[test]
+    fn add_and_remove_sheets() {
+        let mut pkg = new_xlsx();
+        let idx = pkg.add_sheet("Report & Co");
+        assert_eq!(idx, 1);
+        pkg.workbook.sheets[1].set_cell(0, 0, Cell::text("hi"));
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).expect("reload with added sheet");
+        assert_eq!(pkg2.workbook.sheets.len(), 2);
+        assert_eq!(pkg2.workbook.sheets[1].name, "Report & Co");
+        assert_eq!(
+            pkg2.workbook.sheets[1].cell(0, 0).unwrap().value,
+            CellValue::Text("hi".into())
+        );
+        // Removing the first sheet keeps the second intact.
+        let mut pkg3 = pkg2.clone();
+        assert!(pkg3.remove_sheet(0));
+        let bytes = save_xlsx(&pkg3);
+        let pkg4 = load_xlsx(&bytes).expect("reload after removal");
+        assert_eq!(pkg4.workbook.sheets.len(), 1);
+        assert_eq!(pkg4.workbook.sheets[0].name, "Report & Co");
+        // The last sheet cannot be removed.
+        let mut pkg5 = pkg4.clone();
+        assert!(!pkg5.remove_sheet(0));
     }
 
     #[test]

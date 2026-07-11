@@ -127,8 +127,8 @@ open cleanly in Excel; a corpus round-trip test enforces it (§8).
 - **Shared formulas** (`<f t="shared">`): expand the master by shifting
   relative refs.
 - **Copy/paste**: Excel translates relative refs by the paste offset.
-- **Row/column insert/delete** (later): shift every affected ref, `#REF!` the
-  deleted ones.
+- **Row/column insert/delete** (shipped): shift every affected ref across
+  the whole workbook — absolute or not — and `#REF!` the deleted ones.
 
 AST covers: numbers, strings, booleans, errors; refs with `$` anchoring and
 sheet qualifiers (`Sheet1!A1`, `'My Sheet'!A1`); ranges (incl. whole-row/col

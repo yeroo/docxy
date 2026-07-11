@@ -148,9 +148,11 @@ xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
                                   # on the LibreOffice-oracle corpus)
 ```
 
-Type to replace, `F2` to edit, `=` starts a formula; copy/paste translates
-relative references like Excel; range selections show Sum/Average/Count in
-the status bar. Try it: `cargo run -p gridcore --example gen_sample_xlsx &&
+Type to replace, `F2` to edit, `=` starts a formula; copy/paste and
+fill-down translate relative references like Excel; insert/delete rows and
+columns rewrites every affected formula workbook-wide; find, Save As, and
+sheet add/rename/delete round out the basics; range selections show
+Sum/Average/Count in the status bar. Try it: `cargo run -p gridcore --example gen_sample_xlsx &&
 xlsxy assets/sample.xlsx`. The design and roadmap (conformance scoreboard,
 dynamic arrays, pivot engine) live in [SPREADSHEET.md](SPREADSHEET.md).
 

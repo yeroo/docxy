@@ -1021,6 +1021,271 @@ pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
     Some(to_string(&translate(&ast, dr, dc)))
 }
 
+// ---------------------------------------------------------------------------
+// Structural edits (insert / delete rows & columns)
+// ---------------------------------------------------------------------------
+
+/// A row/column insertion or deletion on one sheet, as seen by formulas.
+#[derive(Clone, Copy, Debug)]
+pub struct EditShift {
+    /// True = rows, false = columns.
+    pub rows: bool,
+    /// 0-based index where the insert/delete begins.
+    pub at: u32,
+    /// Positive = insert this many, negative = delete this many.
+    pub delta: i64,
+}
+
+/// Adjust one coordinate for the shift. `None` = the coordinate was deleted.
+/// Unlike copy/paste translation, `$` anchoring is irrelevant here — Excel
+/// shifts absolute references too when the grid itself moves.
+fn shift_point(v: i64, shift: &EditShift) -> Option<i64> {
+    let at = shift.at as i64;
+    if shift.delta >= 0 {
+        Some(if v >= at { v + shift.delta } else { v })
+    } else {
+        let n = -shift.delta;
+        if v < at {
+            Some(v)
+        } else if v < at + n {
+            None
+        } else {
+            Some(v - n)
+        }
+    }
+}
+
+/// Adjust a range endpoint pair; deletes clamp endpoints into the surviving
+/// area, and a fully-deleted range becomes `None` (→ `#REF!`).
+fn shift_span(a: i64, b: i64, shift: &EditShift) -> Option<(i64, i64)> {
+    let at = shift.at as i64;
+    let (lo, hi) = (a.min(b), a.max(b));
+    let lo2 = shift_point(lo, shift).unwrap_or(at);
+    let hi2 = shift_point(hi, shift).unwrap_or(at - 1);
+    if lo2 > hi2 { None } else { Some((lo2, hi2)) }
+}
+
+/// Does a reference (with optional sheet qualifier) target the edited sheet?
+/// `home_is_target` says whether the formula itself lives on that sheet.
+fn targets(sheet: &Option<String>, home_is_target: bool, target: &str) -> bool {
+    match sheet {
+        None => home_is_target,
+        Some(n) => n.eq_ignore_ascii_case(target),
+    }
+}
+
+/// Rewrite every reference in a formula for a row/column insert or delete on
+/// sheet `target`. References into deleted cells become `#REF!` — exactly
+/// Excel's behavior.
+pub fn adjust_for_edit(e: &Expr, home_is_target: bool, target: &str, shift: &EditShift) -> Expr {
+    let recur = |x: &Expr| adjust_for_edit(x, home_is_target, target, shift);
+    match e {
+        Expr::Ref(r) => {
+            if !targets(&r.sheet, home_is_target, target) || r.row < 0 || r.col < 0 {
+                return e.clone();
+            }
+            let mut out = r.clone();
+            let v = if shift.rows { r.row } else { r.col };
+            match shift_point(v, shift) {
+                Some(n) if n < axis_max(shift.rows) => {
+                    if shift.rows {
+                        out.row = n;
+                    } else {
+                        out.col = n;
+                    }
+                }
+                _ => {
+                    out.row = -1;
+                    out.col = -1; // poison → #REF!
+                }
+            }
+            Expr::Ref(out)
+        }
+        Expr::Range(p, q) => {
+            if !targets(&p.sheet, home_is_target, target)
+                || p.row < 0
+                || p.col < 0
+                || q.row < 0
+                || q.col < 0
+            {
+                return e.clone();
+            }
+            let (mut p2, mut q2) = (p.clone(), q.clone());
+            let span = if shift.rows {
+                shift_span(p.row, q.row, shift)
+            } else {
+                shift_span(p.col, q.col, shift)
+            };
+            match span {
+                Some((lo, hi)) if hi < axis_max(shift.rows) => {
+                    if shift.rows {
+                        p2.row = lo;
+                        q2.row = hi;
+                    } else {
+                        p2.col = lo;
+                        q2.col = hi;
+                    }
+                    Expr::Range(p2, q2)
+                }
+                _ => {
+                    p2.row = -1;
+                    p2.col = -1;
+                    q2.row = -1;
+                    q2.col = -1;
+                    Expr::Range(p2, q2)
+                }
+            }
+        }
+        Expr::ColRange {
+            sheet,
+            c1,
+            c2,
+            abs1,
+            abs2,
+        } => {
+            if shift.rows || !targets(sheet, home_is_target, target) || *c1 < 0 || *c2 < 0 {
+                return e.clone();
+            }
+            match shift_span(*c1, *c2, shift) {
+                Some((lo, hi)) if hi < axis_max(false) => Expr::ColRange {
+                    sheet: sheet.clone(),
+                    c1: lo,
+                    c2: hi,
+                    abs1: *abs1,
+                    abs2: *abs2,
+                },
+                _ => Expr::ColRange {
+                    sheet: sheet.clone(),
+                    c1: -1,
+                    c2: -1,
+                    abs1: *abs1,
+                    abs2: *abs2,
+                },
+            }
+        }
+        Expr::RowRange {
+            sheet,
+            r1,
+            r2,
+            abs1,
+            abs2,
+        } => {
+            if !shift.rows || !targets(sheet, home_is_target, target) || *r1 < 0 || *r2 < 0 {
+                return e.clone();
+            }
+            match shift_span(*r1, *r2, shift) {
+                Some((lo, hi)) if hi < axis_max(true) => Expr::RowRange {
+                    sheet: sheet.clone(),
+                    r1: lo,
+                    r2: hi,
+                    abs1: *abs1,
+                    abs2: *abs2,
+                },
+                _ => Expr::RowRange {
+                    sheet: sheet.clone(),
+                    r1: -1,
+                    r2: -1,
+                    abs1: *abs1,
+                    abs2: *abs2,
+                },
+            }
+        }
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
+        other => other.clone(),
+    }
+}
+
+fn axis_max(rows: bool) -> i64 {
+    if rows {
+        crate::sheet::MAX_ROWS as i64
+    } else {
+        crate::sheet::MAX_COLS as i64
+    }
+}
+
+/// Parse–adjust–print for a structural edit; `None` when the source doesn't
+/// parse (the caller leaves such formulas untouched).
+pub fn adjust_formula_for_edit(
+    src: &str,
+    home_is_target: bool,
+    target: &str,
+    shift: &EditShift,
+) -> Option<String> {
+    let ast = parse(src).ok()?;
+    Some(to_string(&adjust_for_edit(
+        &ast,
+        home_is_target,
+        target,
+        shift,
+    )))
+}
+
+/// Rewrite sheet qualifiers after a sheet rename (Excel updates formulas on
+/// rename). Returns the new text, or `None` if the source doesn't parse.
+pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String> {
+    fn walk(e: &Expr, old: &str, new: &str) -> Expr {
+        let fix = |s: &Option<String>| -> Option<String> {
+            match s {
+                Some(n) if n.eq_ignore_ascii_case(old) => Some(new.to_string()),
+                other => other.clone(),
+            }
+        };
+        match e {
+            Expr::Ref(r) => Expr::Ref(CellRef {
+                sheet: fix(&r.sheet),
+                ..r.clone()
+            }),
+            Expr::Range(a, b) => Expr::Range(
+                CellRef {
+                    sheet: fix(&a.sheet),
+                    ..a.clone()
+                },
+                b.clone(),
+            ),
+            Expr::ColRange {
+                sheet,
+                c1,
+                c2,
+                abs1,
+                abs2,
+            } => Expr::ColRange {
+                sheet: fix(sheet),
+                c1: *c1,
+                c2: *c2,
+                abs1: *abs1,
+                abs2: *abs2,
+            },
+            Expr::RowRange {
+                sheet,
+                r1,
+                r2,
+                abs1,
+                abs2,
+            } => Expr::RowRange {
+                sheet: fix(sheet),
+                r1: *r1,
+                r2: *r2,
+                abs1: *abs1,
+                abs2: *abs2,
+            },
+            Expr::Func(n, args) => {
+                Expr::Func(n.clone(), args.iter().map(|a| walk(a, old, new)).collect())
+            }
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, old, new))),
+            Expr::Bin(op, l, r) => Expr::Bin(
+                *op,
+                Box::new(walk(l, old, new)),
+                Box::new(walk(r, old, new)),
+            ),
+            other => other.clone(),
+        }
+    }
+    let ast = parse(src).ok()?;
+    Some(to_string(&walk(&ast, old, new)))
+}
+
 /// Collect every reference in a formula (for dependency-graph edges).
 /// Ranges are reported normalized. Negative (poisoned) refs are skipped.
 pub fn collect_refs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32, u32, u32)>) {

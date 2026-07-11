@@ -218,7 +218,10 @@ fn print_usage() {
            Ctrl-C copy   Ctrl-X cut   Ctrl-V paste (relative refs translate)\n  \
            Ctrl-Z undo   Ctrl-Y redo   Ctrl-S save   Ctrl-Q quit\n  \
            Ctrl-PgUp/PgDn or click tabs to switch sheets\n  \
-           F7 / F8 shrink / widen the current column\n  \
+           Ctrl-D/Ctrl-R fill down/right   Ctrl-F find (F3 next)\n  \
+           F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
+           Ctrl-T add sheet  Shift-F2 rename sheet  Shift-Del delete sheet\n  \
+           F12 Save As   F7 / F8 shrink / widen the current column\n  \
            mouse: click to move · drag to select · wheel to scroll"
     );
 }
@@ -403,6 +406,39 @@ struct UndoGroup {
     changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
 }
 
+/// Sheets + defined names — the whole calculated state, snapshotted around
+/// structural edits (row/column insert-delete, sheet rename) whose inverse
+/// is not expressible as per-cell changes.
+#[derive(Clone)]
+struct WbSnapshot {
+    sheets: Vec<gridcore::sheet::Sheet>,
+    names: Vec<gridcore::sheet::DefinedName>,
+}
+
+enum UndoAction {
+    Cells(UndoGroup),
+    Structural {
+        before: WbSnapshot,
+        after: WbSnapshot,
+    },
+}
+
+/// What the minibuffer prompt is collecting.
+#[derive(PartialEq)]
+enum PromptKind {
+    Find,
+    SaveAs,
+    RenameSheet,
+    AddSheet,
+}
+
+struct Prompt {
+    kind: PromptKind,
+    label: &'static str,
+    text: String,
+    cursor: usize,
+}
+
 /// An internal clipboard: a rect of cells plus its source corner so pasted
 /// formulas can shift their relative references (Excel semantics).
 #[derive(Clone)]
@@ -424,12 +460,15 @@ struct App {
     edit: Option<EditState>,
     modified: bool,
     status: Option<String>,
-    undo: Vec<UndoGroup>,
-    redo: Vec<UndoGroup>,
+    undo: Vec<UndoAction>,
+    redo: Vec<UndoAction>,
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
     confirm_quit: bool,
+    confirm_delete_sheet: bool,
+    prompt: Option<Prompt>,
+    last_find: Option<String>,
     quit: bool,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
@@ -461,6 +500,9 @@ impl App {
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
             confirm_quit: false,
+            confirm_delete_sheet: false,
+            prompt: None,
+            last_find: None,
             quit: false,
             grid_area: Rect::default(),
             gutter_w: 4,
@@ -570,48 +612,102 @@ impl App {
             let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
             group.changes.push((r, c, before, after));
         }
-        self.undo.push(group);
+        self.undo.push(UndoAction::Cells(group));
         self.redo.clear();
         self.modified = true;
     }
 
+    /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
+    /// the inverse isn't per-cell, so undo restores the whole grid state.
+    fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
+        let before = WbSnapshot {
+            sheets: self.pkg.workbook.sheets.clone(),
+            names: self.pkg.workbook.defined_names.clone(),
+        };
+        op(&mut self.pkg.workbook);
+        self.rebuild_engine();
+        let after = WbSnapshot {
+            sheets: self.pkg.workbook.sheets.clone(),
+            names: self.pkg.workbook.defined_names.clone(),
+        };
+        self.undo.push(UndoAction::Structural { before, after });
+        self.redo.clear();
+        self.modified = true;
+        self.clamp_cursor();
+    }
+
+    fn restore(&mut self, snap: &WbSnapshot) {
+        self.pkg.workbook.sheets = snap.sheets.clone();
+        self.pkg.workbook.defined_names = snap.names.clone();
+        self.rebuild_engine();
+        self.clamp_cursor();
+        self.modified = true;
+    }
+
+    /// Formulas changed wholesale — reparse the graph and refresh values.
+    fn rebuild_engine(&mut self) {
+        let mut engine = Engine::new(&self.pkg.workbook);
+        engine.clock = now_serial();
+        engine.seed = entropy_seed();
+        engine.recalc_all(&mut self.pkg.workbook);
+        self.engine = engine;
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
+        self.anchor = None;
+        self.ensure_visible();
+    }
+
     fn undo(&mut self) {
-        if let Some(group) = self.undo.pop() {
-            self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-            for &(r, c, ref before, _) in group.changes.iter().rev() {
-                let cell = before.clone().unwrap_or_default();
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+        match self.undo.pop() {
+            Some(UndoAction::Cells(group)) => {
+                self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
+                for &(r, c, ref before, _) in group.changes.iter().rev() {
+                    let cell = before.clone().unwrap_or_default();
+                    self.engine
+                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                }
+                if let Some(&(r, c, _, _)) = group.changes.first() {
+                    self.cur = (r, c);
+                    self.ensure_visible();
+                }
+                self.redo.push(UndoAction::Cells(group));
+                self.modified = true;
+                self.status = Some("Undid".to_string());
             }
-            if let Some(&(r, c, _, _)) = group.changes.first() {
-                self.cur = (r, c);
-                self.ensure_visible();
+            Some(UndoAction::Structural { before, after }) => {
+                self.restore(&before);
+                self.redo.push(UndoAction::Structural { before, after });
+                self.status = Some("Undid".to_string());
             }
-            self.redo.push(group);
-            self.modified = true;
-            self.status = Some("Undid".to_string());
-        } else {
-            self.status = Some("Nothing to undo".to_string());
+            None => self.status = Some("Nothing to undo".to_string()),
         }
     }
 
     fn redo(&mut self) {
-        if let Some(group) = self.redo.pop() {
-            self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-            for &(r, c, _, ref after) in group.changes.iter() {
-                let cell = after.clone().unwrap_or_default();
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+        match self.redo.pop() {
+            Some(UndoAction::Cells(group)) => {
+                self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
+                for &(r, c, _, ref after) in group.changes.iter() {
+                    let cell = after.clone().unwrap_or_default();
+                    self.engine
+                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                }
+                if let Some(&(r, c, _, _)) = group.changes.first() {
+                    self.cur = (r, c);
+                    self.ensure_visible();
+                }
+                self.undo.push(UndoAction::Cells(group));
+                self.modified = true;
+                self.status = Some("Redid".to_string());
             }
-            if let Some(&(r, c, _, _)) = group.changes.first() {
-                self.cur = (r, c);
-                self.ensure_visible();
+            Some(UndoAction::Structural { before, after }) => {
+                self.restore(&after);
+                self.undo.push(UndoAction::Structural { before, after });
+                self.status = Some("Redid".to_string());
             }
-            self.undo.push(group);
-            self.modified = true;
-            self.status = Some("Redid".to_string());
-        } else {
-            self.status = Some("Nothing to redo".to_string());
+            None => self.status = Some("Nothing to redo".to_string()),
         }
     }
 
@@ -888,6 +984,222 @@ impl App {
         self.anchor = None;
     }
 
+    // --- editor sprint operations -------------------------------------------
+
+    /// Insert `count` rows above the selection (or delete the selected rows).
+    fn row_op(&mut self, insert: bool) {
+        let (r1, _, r2, _) = self.selection();
+        let count = r2 - r1 + 1;
+        let sheet = self.sheet;
+        self.structural(|wb| {
+            if insert {
+                gridcore::edit::insert_rows(wb, sheet, r1, count);
+            } else {
+                gridcore::edit::delete_rows(wb, sheet, r1, count);
+            }
+        });
+        self.status = Some(format!(
+            "{} {count} row{}",
+            if insert { "Inserted" } else { "Deleted" },
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn col_op(&mut self, insert: bool) {
+        let (_, c1, _, c2) = self.selection();
+        let count = c2 - c1 + 1;
+        let sheet = self.sheet;
+        self.structural(|wb| {
+            if insert {
+                gridcore::edit::insert_cols(wb, sheet, c1, count);
+            } else {
+                gridcore::edit::delete_cols(wb, sheet, c1, count);
+            }
+        });
+        self.status = Some(format!(
+            "{} {count} column{}",
+            if insert { "Inserted" } else { "Deleted" },
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
+    /// translating relative refs — or, on a single cell, pull from the
+    /// neighbor above/left.
+    fn fill(&mut self, down: bool) {
+        let (r1, c1, r2, c2) = self.selection();
+        let single = r1 == r2 && c1 == c2;
+        let mut changes = Vec::new();
+        let copy_from = |sr: u32, sc: u32, tr: u32, tc: u32, changes: &mut Vec<_>| {
+            let mut cell = self.pkg.workbook.sheets[self.sheet]
+                .cell(sr, sc)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(f) = &cell.formula {
+                if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64)
+                {
+                    cell.formula = Some(t);
+                }
+            }
+            changes.push((tr, tc, cell));
+        };
+        if single {
+            let (r, c) = self.cur;
+            if down && r > 0 {
+                copy_from(r - 1, c, r, c, &mut changes);
+            } else if !down && c > 0 {
+                copy_from(r, c - 1, r, c, &mut changes);
+            }
+        } else if down {
+            for c in c1..=c2 {
+                for r in r1 + 1..=r2 {
+                    copy_from(r1, c, r, c, &mut changes);
+                }
+            }
+        } else {
+            for r in r1..=r2 {
+                for c in c1 + 1..=c2 {
+                    copy_from(r, c1, r, c, &mut changes);
+                }
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let n = changes.len();
+        self.apply(changes);
+        self.status = Some(format!(
+            "Filled {n} cell{} {}",
+            if n == 1 { "" } else { "s" },
+            if down { "down" } else { "right" }
+        ));
+    }
+
+    /// Jump to the next cell (row-major, wrapping) whose display text or
+    /// formula contains `query`, case-insensitively.
+    fn find_next(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+        let q = query.to_lowercase();
+        let sheet = self.sheet();
+        let keys: Vec<(u32, u32)> = sheet.cells.keys().copied().collect();
+        if keys.is_empty() {
+            self.status = Some(format!("Not found: {query}"));
+            return;
+        }
+        let start = keys.iter().position(|&k| k > self.cur).unwrap_or(0);
+        let date1904 = self.pkg.workbook.date1904;
+        for i in 0..keys.len() {
+            let (r, c) = keys[(start + i) % keys.len()];
+            let cell = sheet.cell(r, c).unwrap();
+            let shown = format_value(
+                &cell.value,
+                self.pkg.workbook.styles.xf(cell.style).numfmt,
+                date1904,
+            );
+            let hit = shown.to_lowercase().contains(&q)
+                || cell
+                    .formula
+                    .as_deref()
+                    .is_some_and(|f| f.to_lowercase().contains(&q));
+            if hit {
+                self.cur = (r, c);
+                self.anchor = None;
+                self.ensure_visible();
+                self.status = Some(format!("Found at {}", cell_name(r, c)));
+                return;
+            }
+        }
+        self.status = Some(format!("Not found: {query}"));
+    }
+
+    fn open_prompt(&mut self, kind: PromptKind) {
+        let (label, text) = match kind {
+            PromptKind::Find => ("Find: ", self.last_find.clone().unwrap_or_default()),
+            PromptKind::SaveAs => ("Save as: ", self.path.clone()),
+            PromptKind::RenameSheet => (
+                "Rename sheet: ",
+                self.pkg.workbook.sheets[self.sheet].name.clone(),
+            ),
+            PromptKind::AddSheet => (
+                "New sheet name: ",
+                format!("Sheet{}", self.pkg.workbook.sheets.len() + 1),
+            ),
+        };
+        let cursor = text.chars().count();
+        self.prompt = Some(Prompt {
+            kind,
+            label,
+            text,
+            cursor,
+        });
+    }
+
+    fn commit_prompt(&mut self) {
+        let Some(p) = self.prompt.take() else { return };
+        let text = p.text.trim().to_string();
+        match p.kind {
+            PromptKind::Find => {
+                if !text.is_empty() {
+                    self.last_find = Some(text.clone());
+                    self.find_next(&text);
+                }
+            }
+            PromptKind::SaveAs => {
+                if !text.is_empty() {
+                    self.path = text;
+                    self.save();
+                }
+            }
+            PromptKind::RenameSheet => {
+                if !text.is_empty() && !text.contains(['[', ']', '*', '?', ':', '/', '\\']) {
+                    let idx = self.sheet;
+                    self.structural(|wb| gridcore::edit::rename_sheet(wb, idx, &text));
+                    self.status = Some(format!("Renamed sheet to {text}"));
+                } else {
+                    self.status = Some("Invalid sheet name".to_string());
+                }
+            }
+            PromptKind::AddSheet => {
+                if text.is_empty() || self.pkg.workbook.sheet_index(&text).is_some() {
+                    self.status = Some("Sheet name empty or already taken".to_string());
+                } else {
+                    let new_idx = self.pkg.add_sheet(&text);
+                    self.sheet = new_idx;
+                    self.cur = (0, 0);
+                    self.top = 0;
+                    self.left = 0;
+                    self.anchor = None;
+                    // Package parts changed: old snapshots no longer line up.
+                    self.undo.clear();
+                    self.redo.clear();
+                    self.rebuild_engine();
+                    self.modified = true;
+                    self.status = Some(format!("Added sheet {text}"));
+                }
+            }
+        }
+    }
+
+    fn delete_current_sheet(&mut self) {
+        let name = self.pkg.workbook.sheets[self.sheet].name.clone();
+        if self.pkg.remove_sheet(self.sheet) {
+            self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
+            self.cur = (0, 0);
+            self.top = 0;
+            self.left = 0;
+            self.anchor = None;
+            self.undo.clear();
+            self.redo.clear();
+            self.rebuild_engine();
+            self.modified = true;
+            self.status = Some(format!("Deleted sheet {name}"));
+        } else {
+            self.status = Some("Cannot delete the last sheet".to_string());
+        }
+    }
+
     /// Numeric stats over the selection for the status bar, Excel-style.
     fn selection_stats(&self) -> Option<String> {
         let (r1, c1, r2, c2) = self.selection();
@@ -1130,15 +1442,44 @@ fn draw(app: &mut App, f: &mut Frame) {
     f.render_widget(Paragraph::new(tabs_line_ui), tabs_line);
 
     // --- hints / status ---------------------------------------------------------
+    if let Some(p) = &app.prompt {
+        // Minibuffer with a visible cursor block.
+        let chars: Vec<char> = p.text.chars().collect();
+        let before: String = chars[..p.cursor.min(chars.len())].iter().collect();
+        let at: String = chars
+            .get(p.cursor)
+            .map(|ch| ch.to_string())
+            .unwrap_or_else(|| " ".to_string());
+        let after: String = if p.cursor < chars.len() {
+            chars[(p.cursor + 1).min(chars.len())..].iter().collect()
+        } else {
+            String::new()
+        };
+        f.render_widget(
+            Paragraph::new(RLine::from(vec![
+                RSpan::styled(p.label, Style::new().add_modifier(Modifier::BOLD)),
+                RSpan::raw(before),
+                RSpan::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+                RSpan::raw(after),
+            ])),
+            hint_line,
+        );
+        return;
+    }
     let hint = if app.confirm_quit {
         "Unsaved changes — press Ctrl-Q again to quit without saving, Esc to stay".to_string()
+    } else if app.confirm_delete_sheet {
+        format!(
+            "Delete sheet '{}'? Shift-Del again to confirm, any key to cancel",
+            app.pkg.workbook.sheets[app.sheet].name
+        )
     } else if let Some(s) = &app.status {
         s.clone()
     } else if app.edit.is_some() {
         "Enter commit ↓ · Tab commit → · Esc cancel".to_string()
     } else {
         format!(
-            "{}{}  ^S save  ^Q quit  ^Z undo  ^C/^X/^V clip  F2 edit  = formula  F7/F8 col width",
+            "{}{}  ^S save  F12 save-as  ^Q quit  ^Z undo  ^F find  ^D/^R fill  F5/F6 +row/col  ^T sheet",
             app.path,
             if app.modified { " *" } else { "" }
         )
@@ -1208,6 +1549,72 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 return false;
             }
         }
+    }
+
+    if app.confirm_delete_sheet {
+        app.confirm_delete_sheet = false;
+        if key.code == KeyCode::Delete && shift {
+            app.delete_current_sheet();
+        } else {
+            app.status = Some("Sheet deletion cancelled".to_string());
+        }
+        return false;
+    }
+
+    // --- minibuffer prompt ----------------------------------------------------
+    if app.prompt.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.prompt = None;
+            }
+            KeyCode::Enter => app.commit_prompt(),
+            KeyCode::Left => {
+                if let Some(p) = &mut app.prompt {
+                    p.cursor = p.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(p) = &mut app.prompt {
+                    p.cursor = (p.cursor + 1).min(p.text.chars().count());
+                }
+            }
+            KeyCode::Home => {
+                if let Some(p) = &mut app.prompt {
+                    p.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(p) = &mut app.prompt {
+                    p.cursor = p.text.chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = &mut app.prompt {
+                    if p.cursor > 0 {
+                        let idx = char_index(&p.text, p.cursor - 1);
+                        p.text.remove(idx);
+                        p.cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(p) = &mut app.prompt {
+                    if p.cursor < p.text.chars().count() {
+                        let idx = char_index(&p.text, p.cursor);
+                        p.text.remove(idx);
+                    }
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(p) = &mut app.prompt {
+                    let idx = char_index(&p.text, p.cursor);
+                    p.text.insert(idx, ch);
+                    p.cursor += 1;
+                }
+            }
+            _ => {}
+        }
+        return false;
     }
 
     // --- edit mode -----------------------------------------------------------
@@ -1305,6 +1712,27 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => app.copy(false),
         KeyCode::Char('x') | KeyCode::Char('X') if ctrl => app.copy(true),
         KeyCode::Char('v') | KeyCode::Char('V') if ctrl => app.paste(),
+        KeyCode::Char('d') | KeyCode::Char('D') if ctrl => app.fill(true),
+        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => app.fill(false),
+        KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
+        KeyCode::Char('t') | KeyCode::Char('T') if ctrl => app.open_prompt(PromptKind::AddSheet),
+        KeyCode::F(3) => {
+            if let Some(q) = app.last_find.clone() {
+                app.find_next(&q);
+            } else {
+                app.open_prompt(PromptKind::Find);
+            }
+        }
+        KeyCode::F(12) => app.open_prompt(PromptKind::SaveAs),
+        KeyCode::F(2) if shift => app.open_prompt(PromptKind::RenameSheet),
+        KeyCode::F(5) if shift => app.row_op(false),
+        KeyCode::F(5) => app.row_op(true),
+        KeyCode::F(6) if shift => app.col_op(false),
+        KeyCode::F(6) => app.col_op(true),
+        KeyCode::Delete if shift => {
+            app.confirm_delete_sheet = true;
+            return false;
+        }
         KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
             let (rows, cols) = app.sheet().used_size();
             if rows > 0 {
@@ -1639,6 +2067,117 @@ mod tests {
                 .unwrap_or("")
                 .contains("formula error")
         );
+    }
+
+    #[test]
+    fn row_insert_rewrites_and_undoes() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(1.0));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(2.0));
+        pkg.workbook.sheets[0].set_cell(
+            2,
+            0,
+            Cell {
+                value: CellValue::Number(3.0),
+                formula: Some("SUM(A1:A2)".into()),
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (1, 0); // insert one row above row 2
+        app.row_op(true);
+        let s = &app.pkg.workbook.sheets[0];
+        assert_eq!(s.cell(2, 0).unwrap().value, CellValue::Number(2.0));
+        assert_eq!(s.cell(3, 0).unwrap().formula.as_deref(), Some("SUM(A1:A3)"));
+        assert_eq!(s.cell(3, 0).unwrap().value, CellValue::Number(3.0));
+        // Structural undo restores the original grid.
+        app.undo();
+        let s = &app.pkg.workbook.sheets[0];
+        assert_eq!(s.cell(1, 0).unwrap().value, CellValue::Number(2.0));
+        assert_eq!(s.cell(2, 0).unwrap().formula.as_deref(), Some("SUM(A1:A2)"));
+        // And redo replays it.
+        app.redo();
+        let s = &app.pkg.workbook.sheets[0];
+        assert_eq!(s.cell(3, 0).unwrap().formula.as_deref(), Some("SUM(A1:A3)"));
+    }
+
+    #[test]
+    fn fill_down_translates_relative_refs() {
+        let mut pkg = new_xlsx();
+        for r in 0..4 {
+            pkg.workbook.sheets[0].set_cell(r, 0, Cell::number((r + 1) as f64));
+        }
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1*2".into()),
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        // Select B1:B4 and fill down.
+        app.cur = (3, 1);
+        app.anchor = Some((0, 1));
+        app.fill(true);
+        let s = &app.pkg.workbook.sheets[0];
+        assert_eq!(s.cell(2, 1).unwrap().formula.as_deref(), Some("A3*2"));
+        assert_eq!(s.cell(3, 1).unwrap().value, CellValue::Number(8.0));
+    }
+
+    #[test]
+    fn find_wraps_and_matches_formulas() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("hello world"));
+        pkg.workbook.sheets[0].set_cell(
+            4,
+            2,
+            Cell {
+                value: CellValue::Number(0.0),
+                formula: Some("SUM(Z1:Z9)".into()),
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.find_next("WORLD");
+        assert_eq!(app.cur, (0, 0));
+        app.find_next("sum(z");
+        assert_eq!(app.cur, (4, 2));
+        // Wraps back around.
+        app.find_next("world");
+        assert_eq!(app.cur, (0, 0));
+    }
+
+    #[test]
+    fn sheet_add_rename_delete() {
+        let pkg = new_xlsx();
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        // Add a sheet via the prompt path.
+        app.open_prompt(PromptKind::AddSheet);
+        if let Some(p) = &mut app.prompt {
+            p.text = "Budget".to_string();
+        }
+        app.commit_prompt();
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        assert_eq!(app.sheet, 1);
+        // Rename it (structural: formulas elsewhere would follow).
+        app.open_prompt(PromptKind::RenameSheet);
+        if let Some(p) = &mut app.prompt {
+            p.text = "Plan".to_string();
+        }
+        app.commit_prompt();
+        assert_eq!(app.pkg.workbook.sheets[1].name, "Plan");
+        // Delete it.
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        // The last one refuses to go.
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
     }
 
     #[test]
