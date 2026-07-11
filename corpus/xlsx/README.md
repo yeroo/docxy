@@ -9,7 +9,7 @@ workbook (or several — an aggregate is printed) with:
 xlsxy corpus/xlsx/*.xlsx --verify
 ```
 
-Current scoreboard: **427/427 formula cells (100%)** across 15 files.
+Current scoreboard: **461/461 formula cells (100%)** across 17 files.
 
 ## The test suite over this corpus (runs in CI)
 
@@ -38,7 +38,9 @@ Current scoreboard: **427/427 formula cells (100%)** across 15 files.
   realistic amortization table (exercises shared-formula groups as written
   by LibreOffice), a gradebook (INDEX/MATCH, nested IF), a real Excel Table
   with calculated columns and structured references
-  (`shape-salestable.xlsx`), and edge cases
+  (`shape-salestable.xlsx`), 3D sheet spans (`calc-3d.xlsx`), a TEXT()
+  battery across the format-code surface (`calc-textfmt.xlsx`), and edge
+  cases
   (XML-hostile text, unicode, long dependency chains, error values, merged
   cells).
 

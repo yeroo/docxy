@@ -174,6 +174,14 @@ pub enum Expr {
         abs1: bool,
         abs2: bool,
     },
+    /// A 3D span: `Sheet1:Sheet3!A1:B2` — the same rect across a run of
+    /// sheets (tab order). Supported in aggregate contexts.
+    Ref3D {
+        first: String,
+        last: String,
+        a: CellRef,
+        b: CellRef,
+    },
     /// A structured (table) reference: `Table1[Amount]`, `[@Price]`,
     /// `Table1[[#Totals],[Amount]]`. Resolved through the workbook's table
     /// definitions at evaluation time.
@@ -616,6 +624,25 @@ impl<'a> Parser<'a> {
             }
             Tok::Quoted(name) => {
                 self.bump()?;
+                if self.tok == Tok::Colon {
+                    self.bump()?;
+                    let last = match std::mem::replace(&mut self.tok, Tok::Eof) {
+                        Tok::Ident(l) => {
+                            self.bump()?;
+                            l
+                        }
+                        Tok::Quoted(l) => {
+                            self.bump()?;
+                            l
+                        }
+                        t => return Err(format!("expected sheet name after :, got {t:?}")),
+                    };
+                    if self.tok != Tok::Bang {
+                        return Err("expected ! after 3D sheet span".into());
+                    }
+                    self.bump()?;
+                    return self.three_d(name, last);
+                }
                 if self.tok != Tok::Bang {
                     return Err("quoted name without !".into());
                 }
@@ -737,44 +764,113 @@ impl<'a> Parser<'a> {
             _ => {}
         }
         if let Some(mut r) = parse_ref_text(&id) {
-            r.sheet = sheet;
+            r.sheet = sheet.clone();
             if self.tok == Tok::Colon {
                 self.bump()?;
-                let second = match std::mem::replace(&mut self.tok, Tok::Eof) {
+                let (second, id2) = match std::mem::replace(&mut self.tok, Tok::Eof) {
                     Tok::Ident(id2) => {
                         self.bump()?;
-                        parse_ref_text(&id2).ok_or("bad range end")?
+                        (parse_ref_text(&id2), id2)
+                    }
+                    Tok::Quoted(l) => {
+                        // `Q1:'My Last'!A1` — a 3D span whose first sheet
+                        // name happens to look like a cell reference.
+                        self.bump()?;
+                        if sheet.is_some() {
+                            return Err("nested sheet qualifiers".into());
+                        }
+                        if self.tok != Tok::Bang {
+                            return Err("expected ! after 3D sheet span".into());
+                        }
+                        self.bump()?;
+                        return self.three_d(id, l);
                     }
                     t => return Err(format!("expected range end, got {t:?}")),
                 };
+                // `Q1:Q3!A1` — both endpoints looked like cell refs, but the
+                // trailing ! reveals a 3D sheet span (sheets named Q1..Q3).
+                if self.tok == Tok::Bang {
+                    if sheet.is_some() {
+                        return Err("nested sheet qualifiers".into());
+                    }
+                    self.bump()?;
+                    return self.three_d(id, id2);
+                }
+                let second = second.ok_or("bad range end")?;
                 return Ok(Expr::Range(r, second));
             }
             return Ok(Expr::Ref(r));
         }
-        // `A:C` / `$A:$A` — whole columns (only valid when a `:` follows).
+        // After `X:` the next tokens decide what X was: `X:Y!ref` is a 3D
+        // sheet span (even when X looks like column letters — sheets can be
+        // named "One"); otherwise `A:C` is a whole-column range.
         if self.tok == Tok::Colon {
-            if let Some((c1, abs1)) = parse_col_text(&id) {
-                self.bump()?;
-                let (c2, abs2) = match std::mem::replace(&mut self.tok, Tok::Eof) {
-                    Tok::Ident(id2) => {
-                        self.bump()?;
-                        parse_col_text(&id2).ok_or("bad column range end")?
+            self.bump()?;
+            match std::mem::replace(&mut self.tok, Tok::Eof) {
+                Tok::Quoted(l) => {
+                    self.bump()?;
+                    if sheet.is_some() {
+                        return Err("nested sheet qualifiers".into());
                     }
-                    t => return Err(format!("expected column after :, got {t:?}")),
-                };
-                return Ok(Expr::ColRange {
-                    sheet,
-                    c1,
-                    c2,
-                    abs1,
-                    abs2,
-                });
+                    if self.tok != Tok::Bang {
+                        return Err("expected ! after 3D sheet span".into());
+                    }
+                    self.bump()?;
+                    return self.three_d(id, l);
+                }
+                Tok::Ident(id2) => {
+                    self.bump()?;
+                    if self.tok == Tok::Bang {
+                        if sheet.is_some() {
+                            return Err("nested sheet qualifiers".into());
+                        }
+                        self.bump()?;
+                        return self.three_d(id, id2);
+                    }
+                    let (Some((c1, abs1)), Some((c2, abs2))) =
+                        (parse_col_text(&id), parse_col_text(&id2))
+                    else {
+                        return Err("bad column range".into());
+                    };
+                    return Ok(Expr::ColRange {
+                        sheet,
+                        c1,
+                        c2,
+                        abs1,
+                        abs2,
+                    });
+                }
+                t => return Err(format!("expected name after :, got {t:?}")),
             }
         }
         if sheet.is_some() {
             return Err("sheet-qualified name".into());
         }
         Ok(Expr::Name(id))
+    }
+
+    /// The reference part of `First:Last!…`.
+    fn three_d(&mut self, first: String, last: String) -> Result<Expr, String> {
+        match std::mem::replace(&mut self.tok, Tok::Eof) {
+            Tok::Ident(id) => {
+                self.bump()?;
+                let a = parse_ref_text(&id).ok_or("bad 3D reference")?;
+                if self.tok == Tok::Colon {
+                    self.bump()?;
+                    let b = match std::mem::replace(&mut self.tok, Tok::Eof) {
+                        Tok::Ident(id2) => {
+                            self.bump()?;
+                            parse_ref_text(&id2).ok_or("bad 3D range end")?
+                        }
+                        t => return Err(format!("expected range end, got {t:?}")),
+                    };
+                    return Ok(Expr::Ref3D { first, last, a, b });
+                }
+                let b = a.clone();
+                Ok(Expr::Ref3D { first, last, a, b })
+            }
+            t => Err(format!("expected reference in 3D span, got {t:?}")),
+        }
     }
 }
 
@@ -1171,6 +1267,18 @@ pub fn to_string(e: &Expr) -> String {
             ));
             s
         }
+        Expr::Ref3D { first, last, a, b } => {
+            let f = sheet_prefix(first);
+            let f = f.trim_end_matches('!');
+            let l = sheet_prefix(last);
+            let l = l.trim_end_matches('!');
+            let head = format!("{f}:{l}!");
+            if a == b {
+                format!("{head}{}", ref_to_string(a))
+            } else {
+                format!("{head}{}:{}", ref_to_string(a), ref_to_string(b))
+            }
+        }
         Expr::Structured {
             table,
             item,
@@ -1242,6 +1350,12 @@ pub fn translate(e: &Expr, dr: i64, dc: i64) -> Expr {
     match e {
         Expr::Ref(r) => Expr::Ref(translate_ref(r, dr, dc)),
         Expr::Range(a, b) => Expr::Range(translate_ref(a, dr, dc), translate_ref(b, dr, dc)),
+        Expr::Ref3D { first, last, a, b } => Expr::Ref3D {
+            first: first.clone(),
+            last: last.clone(),
+            a: translate_ref(a, dr, dc),
+            b: translate_ref(b, dr, dc),
+        },
         Expr::ColRange {
             sheet,
             c1,
@@ -1524,6 +1638,21 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
                 sheet: fix(&r.sheet),
                 ..r.clone()
             }),
+            Expr::Ref3D { first, last, a, b } => {
+                let ren = |n: &String| -> String {
+                    if n.eq_ignore_ascii_case(old) {
+                        new.to_string()
+                    } else {
+                        n.clone()
+                    }
+                };
+                Expr::Ref3D {
+                    first: ren(first),
+                    last: ren(last),
+                    a: a.clone(),
+                    b: b.clone(),
+                }
+            }
             Expr::Range(a, b) => Expr::Range(
                 CellRef {
                     sheet: fix(&a.sheet),
@@ -1645,6 +1774,36 @@ pub fn collect_names(e: &Expr, out: &mut Vec<String>) {
         Expr::Bin(_, l, r) => {
             collect_names(l, out);
             collect_names(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect every 3D span in a formula: (first, last, r1, c1, r2, c2).
+#[allow(clippy::type_complexity)]
+pub fn collect_ref3d(e: &Expr, out: &mut Vec<(String, String, u32, u32, u32, u32)>) {
+    match e {
+        Expr::Ref3D { first, last, a, b } => {
+            if a.row >= 0 && a.col >= 0 && b.row >= 0 && b.col >= 0 {
+                out.push((
+                    first.clone(),
+                    last.clone(),
+                    a.row.min(b.row) as u32,
+                    a.col.min(b.col) as u32,
+                    a.row.max(b.row) as u32,
+                    a.col.max(b.col) as u32,
+                ));
+            }
+        }
+        Expr::Func(_, args) => {
+            for a in args {
+                collect_ref3d(a, out);
+            }
+        }
+        Expr::Un(_, x) => collect_ref3d(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_ref3d(l, out);
+            collect_ref3d(r, out);
         }
         _ => {}
     }
@@ -1889,6 +2048,9 @@ impl<'a> Eval<'a> {
             Expr::Bool(b) => Arg::Scalar(Value::Bool(*b)),
             Expr::Err(x) => Arg::Scalar(Value::Err(*x)),
             Expr::Missing => Arg::Scalar(Value::Empty),
+            // 3D spans only make sense in aggregate argument positions,
+            // where the caller expands them via [`Self::resolve_3d`].
+            Expr::Ref3D { .. } => Arg::Scalar(Value::Err(ExcelError::Value)),
             Expr::Structured {
                 table,
                 item,
@@ -2428,6 +2590,19 @@ impl<'a> Eval<'a> {
     ) -> Result<Vec<f64>, ExcelError> {
         let mut out = Vec::new();
         for a in args {
+            if matches!(a, Expr::Ref3D { .. }) {
+                for (s, r1, c1, r2, c2) in self.resolve_3d(a)? {
+                    for (_, v) in self.res.cells_in(s, r1, c1, r2, c2) {
+                        match v {
+                            Value::Num(n) => out.push(n),
+                            Value::Err(e) => return Err(e),
+                            Value::Bool(b) if !numbers_only => out.push(if b { 1.0 } else { 0.0 }),
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
             match self.eval_arg(a) {
                 Arg::Scalar(Value::Err(e)) => return Err(e),
                 Arg::Scalar(Value::Empty) => {}
@@ -2448,6 +2623,30 @@ impl<'a> Eval<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Expand a 3D span into one rect per sheet in the run (tab order).
+    #[allow(clippy::type_complexity)]
+    fn resolve_3d(&mut self, e: &Expr) -> Result<Vec<(usize, u32, u32, u32, u32)>, ExcelError> {
+        let Expr::Ref3D { first, last, a, b } = e else {
+            return Err(ExcelError::Value);
+        };
+        if a.row < 0 || a.col < 0 || b.row < 0 || b.col < 0 {
+            return Err(ExcelError::Ref);
+        }
+        let (Some(s1), Some(s2)) = (self.res.sheet_index(first), self.res.sheet_index(last)) else {
+            return Err(ExcelError::Ref);
+        };
+        let (lo, hi) = (s1.min(s2), s1.max(s2));
+        let rect = (
+            a.row.min(b.row) as u32,
+            a.col.min(b.col) as u32,
+            a.row.max(b.row) as u32,
+            a.col.max(b.col) as u32,
+        );
+        Ok((lo..=hi)
+            .map(|s| (s, rect.0, rect.1, rect.2, rect.3))
+            .collect())
     }
 
     /// A range argument or an error value (scalars don't qualify).
@@ -2970,6 +3169,19 @@ impl<'a> Eval<'a> {
             "COUNT" => {
                 let mut n = 0usize;
                 for a in args {
+                    if matches!(a, Expr::Ref3D { .. }) {
+                        if let Ok(rects) = self.resolve_3d(a) {
+                            for (s, r1, c1, r2, c2) in rects {
+                                n += self
+                                    .res
+                                    .cells_in(s, r1, c1, r2, c2)
+                                    .iter()
+                                    .filter(|(_, v)| matches!(v, Value::Num(_)))
+                                    .count();
+                            }
+                        }
+                        continue;
+                    }
                     match self.eval_arg(a) {
                         Arg::Scalar(v) => {
                             if to_num(&v).is_ok() && !matches!(v, Value::Empty) {
@@ -2991,6 +3203,14 @@ impl<'a> Eval<'a> {
             "COUNTA" => {
                 let mut n = 0usize;
                 for a in args {
+                    if matches!(a, Expr::Ref3D { .. }) {
+                        if let Ok(rects) = self.resolve_3d(a) {
+                            for (s, r1, c1, r2, c2) in rects {
+                                n += self.res.cells_in(s, r1, c1, r2, c2).len();
+                            }
+                        }
+                        continue;
+                    }
                     match self.eval_arg(a) {
                         Arg::Scalar(Value::Empty) => {}
                         Arg::Scalar(_) => n += 1,
@@ -4309,23 +4529,23 @@ impl<'a> Eval<'a> {
                     return Value::Err(e);
                 }
                 let code = try_text!(self.eval(&args[1]));
-                let fmt = crate::sheet::classify_format_code(&code);
-                let bare = code.trim().to_ascii_lowercase();
-                // Only claim formats our classifier genuinely understood; an
-                // unrecognized code must not fabricate output.
-                if fmt == crate::sheet::NumFmt::General && !(bare == "general" || bare.is_empty()) {
+                // The real format-code runtime; formats it can't honestly
+                // render mark the formula unsupported (keep the cache).
+                let Some(fmt) = crate::numfmt::parse_format(&code) else {
                     self.unsupported = true;
                     return Value::Err(ExcelError::Value);
-                }
+                };
                 match &v {
-                    Value::Str(s) => Value::Str(s.clone()),
-                    Value::Empty => Value::Str(String::new()),
+                    Value::Str(s) => Value::Str(fmt.format_text(s)),
+                    Value::Empty => Value::Str(fmt.format_text("")),
                     Value::Bool(b) => Value::Str(if *b { "TRUE" } else { "FALSE" }.to_string()),
-                    Value::Num(n) => Value::Str(crate::sheet::format_value(
-                        &crate::sheet::CellValue::Number(*n),
-                        fmt,
-                        self.res.date1904(),
-                    )),
+                    Value::Num(n) => match fmt.format_number(*n, self.res.date1904()) {
+                        Some(s) => Value::Str(s),
+                        None => {
+                            self.unsupported = true;
+                            Value::Err(ExcelError::Value)
+                        }
+                    },
                     Value::Err(_) => unreachable!(),
                 }
             }
@@ -5112,13 +5332,21 @@ mod tests {
             eval_str("TEXT(45306,\"yyyy-mm-dd\")", &g),
             Value::Str("2024-01-15".into())
         );
-        // A format we can't honestly render must mark unsupported, not guess.
-        let ast = parse("TEXT(1234,\"$#,##0;[Red]($#,##0)\")").unwrap();
-        let mut ev = Eval::new(&g, 0, (0, 0));
-        let _ = ev.eval(&ast);
-        // ($#,##0 classifies as thousands-number, so this one actually works;
-        // use a truly opaque code instead.)
-        let ast = parse("TEXT(1234,\"\"\"kg\"\"\")").unwrap();
+        // The runtime renders sections, conditions, and literal codes…
+        assert_eq!(
+            eval_str("TEXT(-1234,\"$#,##0;[Red]($#,##0)\")", &g),
+            Value::Str("($1,234)".into())
+        );
+        assert_eq!(
+            eval_str("TEXT(1234,\"\"\"kg\"\"\")", &g),
+            Value::Str("kg".into())
+        );
+        assert_eq!(
+            eval_str("TEXT(45306.25,\"dddd h:mm AM/PM\")", &g),
+            Value::Str("Monday 6:00 AM".into())
+        );
+        // …and refuses what it can't honestly do (fractions).
+        let ast = parse("TEXT(1234,\"# ?/?\")").unwrap();
         let mut ev = Eval::new(&g, 0, (0, 0));
         let _ = ev.eval(&ast);
         assert!(ev.unsupported);
@@ -5190,6 +5418,30 @@ mod tests {
             panic!("not a func");
         }
         assert_eq!(parse(&to_string(&ast)).unwrap(), ast);
+    }
+
+    #[test]
+    fn three_d_parse_and_print() {
+        for src in [
+            "SUM(Sheet1:Sheet3!A1)",
+            "SUM(Sheet1:Sheet3!A1:B2)",
+            "SUM('My First':'My Last'!$A$1)",
+            "COUNT(One:Three!A1:B2)",
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            let printed = to_string(&ast);
+            assert_eq!(parse(&printed).unwrap(), ast, "{src} → {printed}");
+        }
+        // Copy translation shifts the rect, keeps the span.
+        assert_eq!(
+            translate_formula("SUM(One:Three!A1)", 2, 1).unwrap(),
+            "SUM(One:Three!B3)"
+        );
+        // Sheet rename touches matching endpoints.
+        assert_eq!(
+            rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
+            "SUM(One:'Last Q'!A1)"
+        );
     }
 
     #[test]

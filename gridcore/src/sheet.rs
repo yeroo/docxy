@@ -351,6 +351,9 @@ pub struct Workbook {
     pub tables: Vec<Table>,
     /// True when the workbook uses the 1904 date system (Mac legacy).
     pub date1904: bool,
+    /// Iterative calculation opt-in from `<calcPr iterate="1">`:
+    /// (max iterations, convergence delta). None = cycles are errors.
+    pub iterate: Option<(u32, f64)>,
 }
 
 impl Workbook {
@@ -418,6 +421,9 @@ pub enum NumFmt {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Xf {
     pub numfmt: NumFmt,
+    /// The raw format code, when known — rendered by [`crate::numfmt`];
+    /// [`NumFmt`] classification is the fallback (and drives alignment).
+    pub code: Option<String>,
     pub bold: bool,
     pub italic: bool,
     /// Font color as (r, g, b) when the file gives a concrete RGB.
@@ -747,6 +753,26 @@ pub fn format_value(value: &CellValue, fmt: NumFmt, date1904: bool) -> String {
     }
 }
 
+/// Render a cell value through its full style: the real format-code runtime
+/// when the code is known and renderable, the classified approximation
+/// otherwise.
+pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
+    if let Some(code) = &xf.code {
+        if let Some(fmt) = crate::numfmt::parse_format(code) {
+            match value {
+                CellValue::Number(n) => {
+                    if let Some(s) = fmt.format_number(*n, date1904) {
+                        return s;
+                    }
+                }
+                CellValue::Text(s) => return fmt.format_text(s),
+                _ => {}
+            }
+        }
+    }
+    format_value(value, xf.numfmt, date1904)
+}
+
 /// Export one sheet as RFC-4180-ish CSV (display values, formulas evaluated
 /// to their cached results).
 pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
@@ -758,7 +784,7 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
                 out.push(',');
             }
             if let Some(cell) = sheet.cell(r, c) {
-                let text = format_value(&cell.value, styles.xf(cell.style).numfmt, date1904);
+                let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
                 if text.contains([',', '"', '\n']) {
                     out.push('"');
                     out.push_str(&text.replace('"', "\"\""));

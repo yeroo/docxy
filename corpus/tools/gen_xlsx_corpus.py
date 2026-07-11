@@ -310,6 +310,52 @@ def wb_gradebook(wb):
     ws["G4"] = '=INDEX(A2:A6,MATCH(MAX(D2:D6),D2:D6,0))'
 
 
+def wb_3d(wb):
+    """3D sheet spans: the same cell across a run of sheets."""
+    q1 = wb.active
+    q1.title = "Q1"
+    for name, vals in [("Q1", [100, 20]), ("Q2", [110, 25]), ("Q3", [120, 30])]:
+        ws = q1 if name == "Q1" else wb.create_sheet(name)
+        ws["A1"] = vals[0]
+        ws["A2"] = vals[1]
+    total = wb.create_sheet("Total")
+    total["A1"] = "=SUM(Q1:Q3!A1)"
+    total["A2"] = "=SUM(Q1:Q3!A1:A2)"
+    total["A3"] = "=AVERAGE(Q1:Q3!A2)"
+    total["A4"] = "=COUNT(Q1:Q3!A1:A2)"
+    total["A5"] = "=MAX(Q1:Q3!A1)"
+    total["A6"] = "=MIN(Q1:Q3!A2)"
+
+
+def wb_textfmt(wb):
+    """TEXT() across the format-code surface — oracle-validates the
+    number-format runtime."""
+    ws = wb.active
+    ws.title = "Fmt"
+    ws["A1"] = 1234.567
+    ws["A2"] = -1234.567
+    ws["A3"] = 0.28456
+    ws["A4"] = 45306.7708333333  # 2024-01-15 18:30
+    ws["A5"] = 12200000
+    ws["A6"] = 0.000123
+    fx = [
+        '=TEXT(A1,"0")', '=TEXT(A1,"0.00")', '=TEXT(A1,"#,##0")',
+        '=TEXT(A1,"#,##0.00")', '=TEXT(A2,"0.00")', '=TEXT(A1,"00000")',
+        '=TEXT(A3,"0%")', '=TEXT(A3,"0.0%")', '=TEXT(A3,"0.00%")',
+        '=TEXT(A1,"$#,##0.00")', '=TEXT(A2,"0.00;(0.00)")',
+        '=TEXT(0,"0;-0;""zero""")', '=TEXT(A5,"#,##0,")',
+        '=TEXT(A5,"0.0,,")', '=TEXT(A6,"0.00E+00")', '=TEXT(A1,"0.00E+00")',
+        '=TEXT(A4,"yyyy-mm-dd")', '=TEXT(A4,"m/d/yyyy")',
+        '=TEXT(A4,"d-mmm-yy")', '=TEXT(A4,"dddd")', '=TEXT(A4,"mmmm")',
+        '=TEXT(A4,"hh:mm:ss")', '=TEXT(A4,"h:mm AM/PM")',
+        '=TEXT(A4,"yyyy-mm-dd hh:mm")', '=TEXT(1.5,"[h]:mm")',
+        '=TEXT(A1,"0.0""kg""")', '=TEXT(A1,"General")',
+        '=TEXT("hello","@")',
+    ]
+    for i, f in enumerate(fx, start=1):
+        ws.cell(row=i, column=3, value=f)
+
+
 def wb_salestable(wb):
     """A real Excel Table (ListObject) with calculated columns and
     structured-reference aggregations."""
@@ -375,6 +421,8 @@ WORKBOOKS = {
     "calc-refs": wb_refs,
     "shape-amortization": wb_amortization,
     "shape-gradebook": wb_gradebook,
+    "calc-3d": wb_3d,
+    "calc-textfmt": wb_textfmt,
     "shape-salestable": wb_salestable,
     "edge-cases": wb_edge_cases,
 }

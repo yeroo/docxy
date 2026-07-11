@@ -19,10 +19,13 @@
 //! - [`engine`] — dependency-graph recalculation over a workbook.
 //! - [`edit`] — structural edits (insert/delete rows & columns, renames)
 //!   with workbook-wide reference rewriting.
+//! - [`numfmt`] — the number-format runtime: real rendering of format codes
+//!   (powers `TEXT()` and cell display).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 
 pub mod edit;
 pub mod engine;
 pub mod formula;
+pub mod numfmt;
 pub mod sheet;
 pub mod xlsx;

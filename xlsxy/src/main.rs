@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::sheet::{
-    Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, cell_name, col_name, format_value,
+    Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, cell_name, col_name, format_with,
     sheet_to_csv,
 };
 use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
@@ -726,9 +726,9 @@ impl App {
                 }
                 let cell = sheet.cell(r, c).cloned();
                 if let Some(cl) = &cell {
-                    tsv.push_str(&format_value(
+                    tsv.push_str(&format_with(
+                        &self.pkg.workbook.styles.xf(cl.style),
                         &cl.value,
-                        self.pkg.workbook.styles.xf(cl.style).numfmt,
                         self.pkg.workbook.date1904,
                     ));
                 }
@@ -1093,9 +1093,9 @@ impl App {
         for i in 0..keys.len() {
             let (r, c) = keys[(start + i) % keys.len()];
             let cell = sheet.cell(r, c).unwrap();
-            let shown = format_value(
+            let shown = format_with(
+                &self.pkg.workbook.styles.xf(cell.style),
                 &cell.value,
-                self.pkg.workbook.styles.xf(cell.style).numfmt,
                 date1904,
             );
             let hit = shown.to_lowercase().contains(&q)
@@ -1386,7 +1386,7 @@ fn draw(app: &mut App, f: &mut Frame) {
             let cell = sheet.cell(row, col);
             let xf = cell.map(|cl| styles.xf(cl.style)).unwrap_or_default();
             let text = match cell {
-                Some(cl) => format_value(&cl.value, xf.numfmt, date1904),
+                Some(cl) => format_with(&xf, &cl.value, date1904),
                 None => String::new(),
             };
             let right = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))

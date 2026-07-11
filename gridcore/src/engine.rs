@@ -172,9 +172,9 @@ impl Engine {
         for &f in &dirty {
             let info = &self.formulas[&f];
             for &g in &dirty_set {
-                if g == f {
-                    continue;
-                }
+                // Note g == f is NOT skipped: a formula whose own cell falls
+                // inside its dependency rect is a self-reference, and must
+                // land in the cycle remainder like any other circularity.
                 let (gs, gr, gc) = g;
                 let depends = info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
                     ds == gs && gr >= r1 && gr <= r2 && gc >= c1 && gc <= c2
@@ -206,16 +206,55 @@ impl Engine {
             }
         }
 
-        // Whatever never reached in-degree 0 sits on a cycle.
-        for &k in &dirty {
-            if !done.contains(&k) {
-                let (s, r, c) = k;
-                if let Some(cell) = wb
-                    .sheets
-                    .get_mut(s)
-                    .and_then(|sh| sh.cells.get_mut(&(r, c)))
-                {
-                    cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
+        // Whatever never reached in-degree 0 sits on a cycle. With the
+        // workbook's iterative-calculation opt-in, converge them the way
+        // Excel does; otherwise flag the circularity honestly.
+        let cycle: Vec<Key> = {
+            let mut v: Vec<Key> = dirty
+                .iter()
+                .copied()
+                .filter(|k| !done.contains(k))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        if cycle.is_empty() {
+            return;
+        }
+        match wb.iterate {
+            Some((count, delta)) => {
+                for _ in 0..count.max(1) {
+                    let mut max_change = 0.0f64;
+                    for &k in &cycle {
+                        let before = wb.sheets[k.0]
+                            .cell(k.1, k.2)
+                            .map(|c| c.value.clone())
+                            .unwrap_or_default();
+                        self.eval_one(wb, k);
+                        let after = wb.sheets[k.0]
+                            .cell(k.1, k.2)
+                            .map(|c| c.value.clone())
+                            .unwrap_or_default();
+                        if let (CellValue::Number(x), CellValue::Number(y)) = (&before, &after) {
+                            max_change = max_change.max((x - y).abs());
+                        } else if before != after {
+                            max_change = f64::MAX;
+                        }
+                    }
+                    if max_change < delta {
+                        break;
+                    }
+                }
+            }
+            None => {
+                for &(s, r, c) in &cycle {
+                    if let Some(cell) = wb
+                        .sheets
+                        .get_mut(s)
+                        .and_then(|sh| sh.cells.get_mut(&(r, c)))
+                    {
+                        cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
+                    }
                 }
             }
         }
@@ -268,6 +307,15 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
         };
         if let Some(s) = s {
             out.push((s, r1, c1, r2, c2));
+        }
+    }
+    let mut spans = Vec::new();
+    formula::collect_ref3d(ast, &mut spans);
+    for (first, last, r1, c1, r2, c2) in spans {
+        if let (Some(a), Some(b)) = (wb.sheet_index(&first), wb.sheet_index(&last)) {
+            for s in a.min(b)..=a.max(b) {
+                out.push((s, r1, c1, r2, c2));
+            }
         }
     }
     let mut structured = Vec::new();
@@ -661,6 +709,79 @@ mod tests {
         set(&mut eng, &mut wb, "B2", Cell::number(10.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(20.0));
         assert_eq!(value_at(&wb, "E1"), CellValue::Number(28.0));
+    }
+
+    #[test]
+    fn three_d_spans_aggregate_and_propagate() {
+        let mut wb = Workbook::default();
+        for (i, name) in ["One", "Two", "Three", "Sum"].iter().enumerate() {
+            let mut s = Sheet {
+                name: name.to_string(),
+                ..Sheet::default()
+            };
+            if i < 3 {
+                s.set_cell(0, 0, Cell::number((i + 1) as f64 * 10.0));
+            }
+            wb.sheets.push(s);
+        }
+        wb.sheets[3].set_cell(0, 0, Cell::formula("SUM(One:Three!A1)"));
+        wb.sheets[3].set_cell(1, 0, Cell::formula("COUNT(One:Three!A1:B2)"));
+        wb.sheets[3].set_cell(2, 0, Cell::formula("AVERAGE(One:Three!A1)"));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(
+            wb.sheets[3].cell(0, 0).unwrap().value,
+            CellValue::Number(60.0)
+        );
+        assert_eq!(
+            wb.sheets[3].cell(1, 0).unwrap().value,
+            CellValue::Number(3.0)
+        );
+        assert_eq!(
+            wb.sheets[3].cell(2, 0).unwrap().value,
+            CellValue::Number(20.0)
+        );
+        // Editing a middle sheet dirties the span's dependents.
+        eng.set_cell(&mut wb, (1, 0, 0), Cell::number(100.0));
+        assert_eq!(
+            wb.sheets[3].cell(0, 0).unwrap().value,
+            CellValue::Number(140.0)
+        );
+        // Scalar context rejects a 3D span.
+        eng.set_cell(&mut wb, (3, 0, 1), Cell::formula("One:Three!A1*2"));
+        assert_eq!(
+            wb.sheets[3].cell(0, 1).unwrap().value,
+            CellValue::Error("#VALUE!".into())
+        );
+    }
+
+    #[test]
+    fn iterative_calculation_converges() {
+        // A1 = (A1+10)/2 → fixed point at 10. Without the opt-in: #CYCLE!.
+        let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#CYCLE!".into()));
+        // With iteration enabled it converges.
+        let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
+        wb.iterate = Some((100, 1e-9));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        match value_at(&wb, "A1") {
+            CellValue::Number(n) => assert!((n - 10.0).abs() < 1e-6, "{n}"),
+            v => panic!("expected convergence, got {v:?}"),
+        }
+        // Mutual pair: A2 = B2+1, B2 = A2/2 → A2 = 2, B2 = 1.
+        let mut wb = wb_one_sheet(&[("A2", Cell::formula("B2+1")), ("B2", Cell::formula("A2/2"))]);
+        wb.iterate = Some((200, 1e-12));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        match (value_at(&wb, "A2"), value_at(&wb, "B2")) {
+            (CellValue::Number(a), CellValue::Number(b)) => {
+                assert!((a - 2.0).abs() < 1e-6 && (b - 1.0).abs() < 1e-6, "{a} {b}");
+            }
+            v => panic!("expected numbers, got {v:?}"),
+        }
     }
 
     #[test]

@@ -149,7 +149,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     };
 
     // Workbook: sheet list + date system + defined names.
-    let (sheet_meta, date1904, raw_names) = parse_workbook_xml(&wb_xml);
+    let (sheet_meta, date1904, iterate, raw_names) = parse_workbook_xml(&wb_xml);
 
     // Shared strings + styles (relative to the workbook dir).
     let shared = rels
@@ -232,6 +232,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             defined_names,
             tables,
             date1904,
+            iterate,
         },
     })
 }
@@ -325,10 +326,12 @@ fn parse_workbook_xml(
 ) -> (
     Vec<(String, String)>,
     bool,
+    Option<(u32, f64)>,
     Vec<(String, Option<usize>, String)>,
 ) {
     let mut sheets = Vec::new();
     let mut date1904 = false;
+    let mut iterate = None;
     let mut names = Vec::new();
     let mut p = XmlParser::new(xml);
     let mut cur_name: Option<(String, Option<usize>, String)> = None;
@@ -354,6 +357,14 @@ fn parse_workbook_xml(
                     let v = p.attr("date1904");
                     date1904 = v == "1" || v == "true";
                 }
+                "calcPr" => {
+                    let it = p.attr("iterate");
+                    if it == "1" || it == "true" {
+                        let count = p.attr("iterateCount").parse().unwrap_or(100);
+                        let delta = p.attr("iterateDelta").parse().unwrap_or(0.001);
+                        iterate = Some((count, delta));
+                    }
+                }
                 "definedName" => {
                     let scope = p.attr("localSheetId").parse::<usize>().ok();
                     cur_name = Some((decode(p.attr("name")), scope, String::new()));
@@ -378,7 +389,7 @@ fn parse_workbook_xml(
             Event::Eof => break,
         }
     }
-    (sheets, date1904, names)
+    (sheets, date1904, iterate, names)
 }
 
 /// Plain text of each `<si>` (rich-text runs concatenated).
@@ -429,6 +440,7 @@ fn parse_styles(xml: &str) -> Styles {
         color: Option<(u8, u8, u8)>,
     }
     let mut numfmts: BTreeMap<u32, NumFmt> = BTreeMap::new();
+    let mut codes: BTreeMap<u32, String> = BTreeMap::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut xfs: Vec<Xf> = Vec::new();
 
@@ -441,7 +453,9 @@ fn parse_styles(xml: &str) -> Styles {
             Event::Start => match local(p.name()) {
                 "numFmt" => {
                     if let Ok(id) = p.attr("numFmtId").parse::<u32>() {
-                        numfmts.insert(id, classify_format_code(&decode(p.attr("formatCode"))));
+                        let code = decode(p.attr("formatCode"));
+                        numfmts.insert(id, classify_format_code(&code));
+                        codes.insert(id, code);
                     }
                 }
                 "fonts" => in_fonts = true,
@@ -478,9 +492,14 @@ fn parse_styles(xml: &str) -> Styles {
                         .get(&numfmt_id)
                         .copied()
                         .unwrap_or_else(|| classify_builtin(numfmt_id));
+                    let code = codes
+                        .get(&numfmt_id)
+                        .cloned()
+                        .or_else(|| crate::numfmt::builtin_code(numfmt_id).map(str::to_string));
                     let font = fonts.get(font_id).cloned().unwrap_or_default();
                     xfs.push(Xf {
                         numfmt,
+                        code,
                         bold: font.bold,
                         italic: font.italic,
                         color: font.color,
@@ -1508,6 +1527,7 @@ pub fn new_xlsx() -> SheetPackage {
             defined_names: Vec::new(),
             tables: Vec::new(),
             date1904: false,
+            iterate: None,
         },
     }
 }
