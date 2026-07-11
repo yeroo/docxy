@@ -6258,6 +6258,300 @@ impl<'a> Eval<'a> {
                 }
             }
 
+            "IPMT" | "PPMT" => {
+                if args.len() < 4 || args.len() > 6 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let rate = try_num!(self.eval(&args[0]));
+                let per = try_num!(self.eval(&args[1]));
+                let nper = try_num!(self.eval(&args[2]));
+                let pv = try_num!(self.eval(&args[3]));
+                let fv = match args.get(4) {
+                    None | Some(Expr::Missing) => 0.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                let t = match args.get(5) {
+                    None | Some(Expr::Missing) => 0.0,
+                    Some(e) => {
+                        if try_num!(self.eval(e)) != 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+                if per < 1.0 || per > nper {
+                    return Value::Err(ExcelError::Num);
+                }
+                let ipmt = fin_ipmt(rate, per, nper, pv, fv, t);
+                if name == "IPMT" {
+                    num(ipmt)
+                } else {
+                    num(fin_pmt(rate, nper, pv, fv, t) - ipmt)
+                }
+            }
+            "ISPMT" => {
+                if args.len() != 4 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let rate = try_num!(self.eval(&args[0]));
+                let per = try_num!(self.eval(&args[1]));
+                let nper = try_num!(self.eval(&args[2]));
+                let pv = try_num!(self.eval(&args[3]));
+                if nper == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(pv * rate * (per / nper - 1.0))
+            }
+            "SLN" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let cost = try_num!(self.eval(&args[0]));
+                let salvage = try_num!(self.eval(&args[1]));
+                let life = try_num!(self.eval(&args[2]));
+                if life == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num((cost - salvage) / life)
+            }
+            "SYD" => {
+                if args.len() != 4 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let cost = try_num!(self.eval(&args[0]));
+                let salvage = try_num!(self.eval(&args[1]));
+                let life = try_num!(self.eval(&args[2]));
+                let per = try_num!(self.eval(&args[3]));
+                if life <= 0.0 || per < 1.0 || per > life {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((cost - salvage) * (life - per + 1.0) * 2.0 / (life * (life + 1.0)))
+            }
+            "DDB" => {
+                if args.len() < 4 || args.len() > 5 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let cost = try_num!(self.eval(&args[0]));
+                let salvage = try_num!(self.eval(&args[1]));
+                let life = try_num!(self.eval(&args[2]));
+                let period = try_num!(self.eval(&args[3]));
+                let factor = match args.get(4) {
+                    None | Some(Expr::Missing) => 2.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period < 1.0 || period > life
+                    || factor <= 0.0
+                {
+                    return Value::Err(ExcelError::Num);
+                }
+                let interest = (factor / life).min(1.0);
+                let old_val = if interest >= 1.0 {
+                    if period == 1.0 { cost } else { 0.0 }
+                } else {
+                    cost * (1.0 - interest).powf(period - 1.0)
+                };
+                let new_val = cost * (1.0 - interest).powf(period);
+                let ddb = if new_val < salvage {
+                    old_val - salvage
+                } else {
+                    old_val - new_val
+                };
+                num(ddb.max(0.0))
+            }
+            "DB" => {
+                if args.len() < 4 || args.len() > 5 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let cost = try_num!(self.eval(&args[0]));
+                let salvage = try_num!(self.eval(&args[1]));
+                let life = try_num!(self.eval(&args[2]));
+                let period = try_num!(self.eval(&args[3]));
+                let month = match args.get(4) {
+                    None | Some(Expr::Missing) => 12.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                match fin_db(cost, salvage, life, period, month) {
+                    Some(v) => num(v),
+                    None => Value::Err(ExcelError::Num),
+                }
+            }
+            "EFFECT" => self.two_num(args, |nominal, npery| {
+                let npery = npery.trunc();
+                if nominal <= 0.0 || npery < 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((1.0 + nominal / npery).powf(npery) - 1.0)
+            }),
+            "NOMINAL" => self.two_num(args, |effect, npery| {
+                let npery = npery.trunc();
+                if effect <= 0.0 || npery < 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(npery * ((1.0 + effect).powf(1.0 / npery) - 1.0))
+            }),
+            "PDURATION" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let rate = try_num!(self.eval(&args[0]));
+                let pv = try_num!(self.eval(&args[1]));
+                let fv = try_num!(self.eval(&args[2]));
+                if rate <= 0.0 || pv <= 0.0 || fv <= 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((fv.ln() - pv.ln()) / (1.0 + rate).ln())
+            }
+            "RRI" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let nper = try_num!(self.eval(&args[0]));
+                let pv = try_num!(self.eval(&args[1]));
+                let fv = try_num!(self.eval(&args[2]));
+                if nper <= 0.0 || pv == 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((fv / pv).powf(1.0 / nper) - 1.0)
+            }
+            "DOLLARDE" | "DOLLARFR" => self.two_num(args, |d, frac| {
+                let frac = frac.trunc();
+                if frac < 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                if frac == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                let sign = if d < 0.0 { -1.0 } else { 1.0 };
+                let d = d.abs();
+                let int_part = d.trunc();
+                let frac_part = d - int_part;
+                // Number of decimal positions the fraction occupies.
+                let digits = 10f64.powf(frac.log10().ceil().max(0.0));
+                let r = if name == "DOLLARDE" {
+                    int_part + frac_part * digits / frac
+                } else {
+                    int_part + frac_part * frac / digits
+                };
+                num(sign * r)
+            }),
+            "MIRR" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let vals = match self.collect_values(&args[..1], true) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Err(e),
+                };
+                let finance = try_num!(self.eval(&args[1]));
+                let reinvest = try_num!(self.eval(&args[2]));
+                let n = vals.len();
+                if n < 2 || !vals.iter().any(|&v| v > 0.0) || !vals.iter().any(|&v| v < 0.0) {
+                    return Value::Err(ExcelError::Div0);
+                }
+                let mut pv_neg = 0.0;
+                let mut fv_pos = 0.0;
+                for (i, &v) in vals.iter().enumerate() {
+                    if v < 0.0 {
+                        pv_neg += v / (1.0 + finance).powi(i as i32);
+                    } else {
+                        fv_pos += v * (1.0 + reinvest).powi((n - 1 - i) as i32);
+                    }
+                }
+                if pv_neg == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num((-fv_pos / pv_neg).powf(1.0 / (n as f64 - 1.0)) - 1.0)
+            }
+            "XNPV" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let rate = try_num!(self.eval(&args[0]));
+                let vals = match self.collect_values(&args[1..2], true) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Err(e),
+                };
+                let dates = match self.collect_values(&args[2..3], true) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Err(e),
+                };
+                if vals.len() != dates.len() || vals.is_empty() || rate <= -1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let d0 = dates[0];
+                let mut total = 0.0;
+                for (v, d) in vals.iter().zip(dates.iter()) {
+                    total += v / (1.0 + rate).powf((d.trunc() - d0.trunc()) / 365.0);
+                }
+                num(total)
+            }
+            "XIRR" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let vals = match self.collect_values(&args[..1], true) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Err(e),
+                };
+                let dates = match self.collect_values(&args[1..2], true) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Err(e),
+                };
+                if vals.len() != dates.len() || vals.len() < 2 {
+                    return Value::Err(ExcelError::Num);
+                }
+                if !vals.iter().any(|&v| v > 0.0) || !vals.iter().any(|&v| v < 0.0) {
+                    return Value::Err(ExcelError::Num);
+                }
+                let guess = match args.get(2) {
+                    None | Some(Expr::Missing) => 0.1,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                let d0 = dates[0].trunc();
+                let xnpv = |r: f64| -> f64 {
+                    vals.iter()
+                        .zip(dates.iter())
+                        .map(|(v, d)| v / (1.0 + r).powf((d.trunc() - d0) / 365.0))
+                        .sum()
+                };
+                match solve_fn(xnpv, guess) {
+                    Some(r) => num(r),
+                    None => Value::Err(ExcelError::Num),
+                }
+            }
+            "CUMIPMT" | "CUMPRINC" => {
+                if args.len() != 6 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let rate = try_num!(self.eval(&args[0]));
+                let nper = try_num!(self.eval(&args[1]));
+                let pv = try_num!(self.eval(&args[2]));
+                let start = try_num!(self.eval(&args[3]));
+                let end = try_num!(self.eval(&args[4]));
+                let t = if try_num!(self.eval(&args[5])) != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                if rate <= 0.0
+                    || nper <= 0.0
+                    || pv <= 0.0
+                    || start < 1.0
+                    || end < start
+                    || end > nper
+                {
+                    return Value::Err(ExcelError::Num);
+                }
+                let pmt = fin_pmt(rate, nper, pv, 0.0, t);
+                let mut total = 0.0;
+                for per in (start.trunc() as i64)..=(end.trunc() as i64) {
+                    let ipmt = fin_ipmt(rate, per as f64, nper, pv, 0.0, t);
+                    total += if name == "CUMIPMT" { ipmt } else { pmt - ipmt };
+                }
+                num(total)
+            }
+
             // ---- more statistics --------------------------------------------------
             "RANK" | "RANK.EQ" => {
                 if args.len() < 2 || args.len() > 3 {
@@ -6955,6 +7249,113 @@ fn solve_rate(nper: f64, pmt: f64, pv: f64, fv: f64, t: f64, guess: f64) -> Opti
         }
     }
     Some((lo + hi) / 2.0)
+}
+
+/// Find a root of `f` (rate ≥ -1) via Newton with a bisection fallback.
+/// Used by XIRR, whose objective isn't the plain cash-flow polynomial.
+fn solve_fn(f: impl Fn(f64) -> f64, guess: f64) -> Option<f64> {
+    let mut r = guess.max(-0.99);
+    for _ in 0..80 {
+        let y = f(r);
+        if y.abs() < 1e-9 {
+            return Some(r);
+        }
+        let h = 1e-6;
+        let dy = (f(r + h) - y) / h;
+        if dy.abs() < 1e-12 {
+            break;
+        }
+        let next = r - y / dy;
+        if !next.is_finite() || next <= -1.0 {
+            break;
+        }
+        if (next - r).abs() < 1e-10 {
+            return Some(next);
+        }
+        r = next;
+    }
+    let (mut lo, mut hi) = (-0.999_999, 1e6);
+    let (flo, fhi) = (f(lo), f(hi));
+    if !flo.is_finite() || !fhi.is_finite() || flo * fhi > 0.0 {
+        return None;
+    }
+    for _ in 0..300 {
+        let mid = (lo + hi) / 2.0;
+        let fm = f(mid);
+        if fm.abs() < 1e-9 {
+            return Some(mid);
+        }
+        if flo * fm < 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some((lo + hi) / 2.0)
+}
+
+/// Payment per period (Excel PMT sign convention).
+fn fin_pmt(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
+    if rate == 0.0 {
+        -(pv + fv) / nper
+    } else {
+        let f = (1.0 + rate).powf(nper);
+        -(fv + pv * f) * rate / ((f - 1.0) * (1.0 + rate * t))
+    }
+}
+
+/// Future value (Excel FV sign convention).
+fn fin_fv(rate: f64, nper: f64, pmt: f64, pv: f64, t: f64) -> f64 {
+    if rate == 0.0 {
+        -(pv + pmt * nper)
+    } else {
+        let f = (1.0 + rate).powf(nper);
+        -(pv * f + pmt * (1.0 + rate * t) * (f - 1.0) / rate)
+    }
+}
+
+/// Interest portion of the `per`-th payment (Excel IPMT).
+fn fin_ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
+    let pmt = fin_pmt(rate, nper, pv, fv, t);
+    let temp = if per == 1.0 {
+        if t == 1.0 { 0.0 } else { -pv }
+    } else if t == 1.0 {
+        fin_fv(rate, per - 2.0, pmt, pv, 1.0) - pmt
+    } else {
+        fin_fv(rate, per - 1.0, pmt, pv, 0.0)
+    };
+    temp * rate
+}
+
+/// Fixed-declining-balance depreciation for one period (Excel DB).
+fn fin_db(cost: f64, salvage: f64, life: f64, period: f64, month: f64) -> Option<f64> {
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period < 1.0 || !(1.0..=12.0).contains(&month)
+    {
+        return None;
+    }
+    let rate = if cost == 0.0 {
+        0.0
+    } else {
+        1.0 - (salvage / cost).powf(1.0 / life)
+    };
+    let rate = (rate * 1000.0).round() / 1000.0;
+    let first = cost * rate * month / 12.0;
+    let p = period.trunc() as i64;
+    if p == 1 {
+        return Some(first);
+    }
+    let life_i = life.trunc() as i64;
+    let mut total = first;
+    let mut dep = first;
+    for i in 2..=p {
+        dep = if i == life_i + 1 {
+            (cost - total) * rate * (12.0 - month) / 12.0
+        } else {
+            (cost - total) * rate
+        };
+        total += dep;
+    }
+    Some(dep)
 }
 
 #[cfg(test)]
@@ -8313,5 +8714,64 @@ mod tests {
         assert_eq!(n("DELTA(5,4)", &g), 0.0);
         assert_eq!(n("GESTEP(5,4)", &g), 1.0);
         assert_eq!(n("GESTEP(3,4)", &g), 0.0);
+    }
+
+    fn approx(src: &str, grid: &Grid, want: f64) {
+        let got = n(src, grid);
+        assert!(
+            (got - want).abs() < 1e-2,
+            "{src} → {got}, expected ≈ {want}"
+        );
+    }
+
+    #[test]
+    fn financial_coverage() {
+        let g = empty();
+        // IPMT/PPMT of a 3-year, 8000 loan at 10%/yr.
+        approx("IPMT(0.1/12,1,36,8000)", &g, -66.67);
+        approx("PPMT(0.1/12,1,36,8000)", &g, -191.47);
+        approx("ISPMT(0.1,1,3,8000)", &g, -533.33);
+        // Depreciation.
+        approx("SLN(10000,1000,5)", &g, 1800.0);
+        approx("SYD(10000,1000,5,1)", &g, 3000.0);
+        approx("DDB(10000,1000,5,1)", &g, 4000.0);
+        approx("DB(1000000,100000,6,1,7)", &g, 186083.33);
+        // Rate conversion.
+        approx("EFFECT(0.0525,4)", &g, 0.053543);
+        approx("NOMINAL(0.053543,4)", &g, 0.0525);
+        // Growth helpers.
+        approx("PDURATION(0.025,2000,2200)", &g, 3.86);
+        approx("RRI(96,10000,11000)", &g, 0.000992);
+        // Dollar fraction round-trip.
+        approx("DOLLARDE(1.02,16)", &g, 1.125);
+        approx("DOLLARFR(1.125,16)", &g, 1.02);
+        // MIRR.
+        let cf = Grid::new(&[
+            ("A1", Value::Num(-120000.0)),
+            ("A2", Value::Num(39000.0)),
+            ("A3", Value::Num(30000.0)),
+            ("A4", Value::Num(21000.0)),
+            ("A5", Value::Num(37000.0)),
+            ("A6", Value::Num(46000.0)),
+        ]);
+        approx("MIRR(A1:A6,0.1,0.12)", &cf, 0.126094);
+        // XNPV / XIRR with explicit dates (serials).
+        let xg = Grid::new(&[
+            ("A1", Value::Num(-10000.0)),
+            ("A2", Value::Num(2750.0)),
+            ("A3", Value::Num(4250.0)),
+            ("A4", Value::Num(3250.0)),
+            ("A5", Value::Num(2750.0)),
+            ("B1", Value::Num(39448.0)), // 2008-01-01
+            ("B2", Value::Num(39508.0)),
+            ("B3", Value::Num(39751.0)),
+            ("B4", Value::Num(39859.0)),
+            ("B5", Value::Num(39904.0)),
+        ]);
+        approx("XNPV(0.09,A1:A5,B1:B5)", &xg, 2086.65);
+        approx("XIRR(A1:A5,B1:B5)", &xg, 0.373363);
+        // CUMIPMT/CUMPRINC — Microsoft's documented examples.
+        approx("CUMIPMT(0.09/12,360,125000,13,24,0)", &g, -11135.23);
+        approx("CUMPRINC(0.09/12,360,125000,1,1,0)", &g, -68.28);
     }
 }
