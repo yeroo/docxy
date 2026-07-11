@@ -443,6 +443,33 @@ fn view_prefs_path() -> Option<std::path::PathBuf> {
     Some(dir.join("xlsxy").join("view.conf"))
 }
 
+/// Parse an A1 cell reference (`A1`, `$A$1`) into 0-based (row, col).
+fn parse_a1(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim().trim_start_matches('$');
+    let (col, used) = gridcore::sheet::parse_col(s)?;
+    let row: u32 = s[used..].trim_start_matches('$').parse().ok()?;
+    if row == 0 {
+        return None;
+    }
+    Some((row - 1, col))
+}
+
+/// The text a cell would show in the formula bar (`=formula`, or the value as
+/// re-entered) — the surface Find/Replace operates on.
+fn input_text_of(cell: &Cell) -> String {
+    if let Some(f) = &cell.formula {
+        format!("={f}")
+    } else {
+        match &cell.value {
+            CellValue::Empty => String::new(),
+            CellValue::Number(n) => gridcore::sheet::fmt_general(*n),
+            CellValue::Text(s) => s.clone(),
+            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            CellValue::Error(e) => e.clone(),
+        }
+    }
+}
+
 /// The author name stamped on new comments — the OS user, else "xlsxy".
 fn comment_author() -> String {
     std::env::var("USER")
@@ -655,6 +682,11 @@ enum PromptKind {
     NewComment,
     /// The body text of a new legacy note on the current cell.
     NewNote,
+    /// Find & Replace: the search text, then the replacement.
+    ReplaceFind,
+    ReplaceWith,
+    /// Go To: a cell reference or defined name to jump to.
+    GoTo,
 }
 
 struct Prompt {
@@ -773,6 +805,8 @@ struct App {
     auto_hide_ribbon: bool,
     /// Frozen (rows, cols) that stay pinned while scrolling.
     freeze: (u32, u32),
+    /// The pending Find text while the Replace-with prompt is open.
+    replace_find: Option<String>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -830,6 +864,7 @@ impl App {
             light_theme: false,
             auto_hide_ribbon: false,
             freeze: (0, 0),
+            replace_find: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -886,22 +921,10 @@ impl App {
     /// the value as it would be re-entered.
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
-        match self.sheet().cell(r, c) {
-            None => String::new(),
-            Some(cell) => {
-                if let Some(f) = &cell.formula {
-                    format!("={f}")
-                } else {
-                    match &cell.value {
-                        CellValue::Empty => String::new(),
-                        CellValue::Number(n) => gridcore::sheet::fmt_general(*n),
-                        CellValue::Text(s) => s.clone(),
-                        CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-                        CellValue::Error(e) => e.clone(),
-                    }
-                }
-            }
-        }
+        self.sheet()
+            .cell(r, c)
+            .map(input_text_of)
+            .unwrap_or_default()
     }
 
     /// Commit the editor text into the current cell. Returns false (and
@@ -2130,6 +2153,8 @@ impl App {
             Undo => self.undo(),
             Redo => self.redo(),
             Find => self.open_prompt(PromptKind::Find),
+            Replace => self.open_prompt(PromptKind::ReplaceFind),
+            GoTo => self.open_prompt(PromptKind::GoTo),
             ClearContents => self.clear_selection(),
             FillDown => self.fill(true),
             FillRight => self.fill(false),
@@ -2630,6 +2655,81 @@ impl App {
         self.status = Some(format!("Not found: {query}"));
     }
 
+    /// Literally replace `find` with `with` in every cell's input text
+    /// (formula or entered value), reparsing each — one undoable edit.
+    fn replace_all(&mut self, find: &str, with: &str) {
+        if find.is_empty() {
+            self.status = Some("Nothing to find".to_string());
+            return;
+        }
+        let sheet = self.sheet();
+        let changes: Vec<(u32, u32, Cell)> = sheet
+            .cells
+            .iter()
+            .filter_map(|(&(r, c), cell)| {
+                let text = input_text_of(cell);
+                if text.contains(find) {
+                    let mut newcell = parse_input(&text.replace(find, with));
+                    newcell.style = cell.style;
+                    Some((r, c, newcell))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = changes.len();
+        if n == 0 {
+            self.status = Some(format!("Not found: {find}"));
+            return;
+        }
+        self.apply(changes);
+        self.status = Some(format!("Replaced in {n} cell(s)"));
+    }
+
+    /// Jump the cursor to a cell reference (`A1`, `Sheet2!B3`) or a defined name.
+    fn goto(&mut self, target: &str) {
+        let target = target.trim();
+        if target.is_empty() {
+            return;
+        }
+        // A defined name → jump to the top-left of its reference.
+        let resolved = self
+            .pkg
+            .workbook
+            .defined_names
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(target))
+            .map(|d| d.formula.clone());
+        let refstr = resolved.as_deref().unwrap_or(target);
+        // Optional Sheet! prefix.
+        let (sheet_name, cellref) = match refstr.rsplit_once('!') {
+            Some((s, r)) => (Some(s.trim_matches(['\'', ' '])), r),
+            None => (None, refstr),
+        };
+        if let Some(name) = sheet_name {
+            if let Some(i) = self
+                .pkg
+                .workbook
+                .sheets
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(name))
+            {
+                self.sheet = i;
+            }
+        }
+        // First cell of the (possibly ranged) reference.
+        let first = cellref.split(':').next().unwrap_or(cellref);
+        match parse_a1(first) {
+            Some((row, col)) => {
+                self.cur = (row.min(MAX_ROWS - 1), col.min(MAX_COLS - 1));
+                self.anchor = None;
+                self.ensure_visible();
+                self.status = Some(format!("Went to {}", cell_name(self.cur.0, self.cur.1)));
+            }
+            None => self.status = Some(format!("Can't go to: {target}")),
+        }
+    }
+
     fn open_prompt(&mut self, kind: PromptKind) {
         let (label, text) = match kind {
             PromptKind::Find => ("Find: ", self.last_find.clone().unwrap_or_default()),
@@ -2647,6 +2747,12 @@ impl App {
             PromptKind::ModelPivot => ("Report  Base; rows; values[; cols]: ", String::new()),
             PromptKind::NewComment => ("Comment (threaded): ", String::new()),
             PromptKind::NewNote => ("Note: ", String::new()),
+            PromptKind::ReplaceFind => (
+                "Replace — find: ",
+                self.last_find.clone().unwrap_or_default(),
+            ),
+            PromptKind::ReplaceWith => ("Replace with: ", String::new()),
+            PromptKind::GoTo => ("Go to: ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -2669,6 +2775,19 @@ impl App {
             }
             PromptKind::NewComment => self.commit_comment(&text),
             PromptKind::NewNote => self.commit_note(&text),
+            PromptKind::ReplaceFind => {
+                if !text.is_empty() {
+                    self.replace_find = Some(text.clone());
+                    self.last_find = Some(text);
+                    self.open_prompt(PromptKind::ReplaceWith);
+                }
+            }
+            PromptKind::ReplaceWith => {
+                if let Some(find) = self.replace_find.take() {
+                    self.replace_all(&find, &text);
+                }
+            }
+            PromptKind::GoTo => self.goto(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -4037,6 +4156,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('i') | KeyCode::Char('I') if ctrl => app.toggle_italic(),
         KeyCode::Char('`') if ctrl => app.toggle_formula_view(),
         KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
+        KeyCode::Char('h') | KeyCode::Char('H') if ctrl => app.open_prompt(PromptKind::ReplaceFind),
+        KeyCode::Char('g') | KeyCode::Char('G') if ctrl => app.open_prompt(PromptKind::GoTo),
         KeyCode::Char('t') | KeyCode::Char('T') if ctrl => app.open_prompt(PromptKind::AddSheet),
         KeyCode::F(3) => {
             if let Some(q) = app.last_find.clone() {
@@ -4463,6 +4584,48 @@ mod tests {
         assert_eq!(app.path, "untitled.xlsx");
         assert!(app.sheet().cell(0, 0).is_none());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn find_replace_and_goto() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // A1 = "foo bar", A2 = "=foo", B1 = 3
+        app.cur = (0, 0);
+        app.start_edit(Some('f'));
+        if let Some(e) = &mut app.edit {
+            e.text = "foo bar".into();
+            e.cursor = 7;
+        }
+        assert!(app.commit_edit());
+        app.cur = (1, 0);
+        app.start_edit(Some('='));
+        if let Some(e) = &mut app.edit {
+            e.text = "=\"foo\"".into();
+            e.cursor = 6;
+        }
+        assert!(app.commit_edit());
+
+        // Replace foo → baz across the sheet.
+        app.replace_all("foo", "baz");
+        assert_eq!(
+            app.pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("baz bar".into())
+        );
+        assert_eq!(
+            app.pkg.workbook.sheets[0]
+                .cell(1, 0)
+                .unwrap()
+                .formula
+                .as_deref(),
+            Some("\"baz\"")
+        );
+
+        // Go To jumps the cursor.
+        app.goto("C5");
+        assert_eq!(app.cur, (4, 2));
+        app.goto("A1");
+        assert_eq!(app.cur, (0, 0));
     }
 
     #[test]

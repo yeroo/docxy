@@ -18,6 +18,8 @@ pub enum Act {
     Undo,
     Redo,
     Find,
+    Replace,
+    GoTo,
     ClearContents,
     FillDown,
     FillRight,
@@ -535,17 +537,21 @@ fn home_groups() -> Vec<Group> {
         },
         Group {
             title: "Editing",
-            width: 18,
+            width: 22,
             rows: [
                 vec![
                     btn("⌕ Find", 6, Find, "Find (Ctrl+F)"),
                     Seg::Gap(" "),
-                    btn("⌫ Clear", 7, ClearContents, "Clear contents (Del)"),
+                    btn("⇄ Replace", 9, Replace, "Replace (Ctrl+H)"),
+                    Seg::Gap(" "),
+                    btn("→", 1, GoTo, "Go To (Ctrl+G)"),
                 ],
                 vec![
                     btn("↶ Undo", 6, Undo, "Undo (Ctrl+Z)"),
                     Seg::Gap(" "),
                     btn("↷ Redo", 6, Redo, "Redo (Ctrl+Y)"),
+                    Seg::Gap(" "),
+                    btn("⌫ Clear", 7, ClearContents, "Clear (Del)"),
                 ],
             ],
         },
