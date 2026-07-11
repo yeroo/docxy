@@ -38,7 +38,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -436,6 +436,16 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
         out.push("(empty)".to_string());
     }
     out
+}
+
+/// The terminal window title: `* AppName - filename` (the `* ` only when the
+/// file has unsaved changes).
+fn window_title(app: &str, path: &str, modified: bool) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    format!("{}{app} - {name}", if modified { "* " } else { "" })
 }
 
 /// Path of the persisted view-preferences file (XDG / APPDATA).
@@ -4786,7 +4796,14 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
         });
     }
     app.start_screen = welcome;
+    let mut last_title = String::new();
     let result = loop {
+        // Reflect the file + dirty state in the terminal window title.
+        let title = window_title("xlsxy", &app.path, app.modified);
+        if title != last_title {
+            let _ = execute!(io::stdout(), SetTitle(&title));
+            last_title = title;
+        }
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
             break Err(e);
         }
@@ -5062,6 +5079,22 @@ mod tests {
         app.vim_key(KeyCode::Char(':'), false, false);
         app.vim_key(KeyCode::Char('q'), false, false);
         assert!(app.vim_key(KeyCode::Enter, false, false));
+    }
+
+    #[test]
+    fn window_title_format() {
+        assert_eq!(
+            window_title("xlsxy", "/tmp/report.xlsx", false),
+            "xlsxy - report.xlsx"
+        );
+        assert_eq!(
+            window_title("xlsxy", "/tmp/report.xlsx", true),
+            "* xlsxy - report.xlsx"
+        );
+        assert_eq!(
+            window_title("xlsxy", "book.xlsx", true),
+            "* xlsxy - book.xlsx"
+        );
     }
 
     #[test]

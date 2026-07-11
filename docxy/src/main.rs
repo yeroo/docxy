@@ -41,7 +41,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -80,6 +80,16 @@ fn format_for(path: &str) -> DocFormat {
     } else {
         DocFormat::Docx
     }
+}
+
+/// The terminal window title: `* AppName - filename` (the `* ` only when the
+/// document has unsaved changes).
+fn window_title(app: &str, path: &str, dirty: bool) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    format!("{}{app} - {name}", if dirty { "* " } else { "" })
 }
 
 /// Load a file into a package, parsing Markdown into a numbered package when the
@@ -6127,7 +6137,14 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
     // to a half-block renderer if the query fails (e.g. a plain console).
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
+    let mut last_title = String::new();
     let result = loop {
+        // Reflect the file + dirty state in the terminal window title.
+        let title = window_title("docxy", &app.path, app.dirty);
+        if title != last_title {
+            let _ = execute!(io::stdout(), SetTitle(&title));
+            last_title = title;
+        }
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(e);
         }
@@ -6195,6 +6212,18 @@ mod tests {
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
     use docxcore::package::new_package;
+
+    #[test]
+    fn window_title_format() {
+        assert_eq!(
+            window_title("docxy", "/tmp/notes.docx", false),
+            "docxy - notes.docx"
+        );
+        assert_eq!(
+            window_title("docxy", "/tmp/notes.docx", true),
+            "* docxy - notes.docx"
+        );
+    }
 
     #[test]
     fn page_on_black_paints_margin_black_and_page_white() {
