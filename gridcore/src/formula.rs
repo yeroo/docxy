@@ -3623,6 +3623,56 @@ impl<'a> Eval<'a> {
                 }
                 Ok(rows)
             }
+            "MUNIT" => {
+                if args.len() != 1 {
+                    return err(ExcelError::Value);
+                }
+                let n = to_num(&self.eval(&args[0])).map_err(Value::Err)?.trunc() as i64;
+                if n < 1 {
+                    return err(ExcelError::Value);
+                }
+                if (n * n) as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                Ok((0..n)
+                    .map(|i| (0..n).map(|j| num(if i == j { 1.0 } else { 0.0 })).collect())
+                    .collect())
+            }
+            "MINVERSE" => {
+                if args.len() != 1 {
+                    return err(ExcelError::Value);
+                }
+                let m = to_num_matrix(&self.arg_matrix(&args[0])?)?;
+                match matrix_inverse(&m) {
+                    Some(inv) => Ok(inv
+                        .into_iter()
+                        .map(|row| row.into_iter().map(num).collect())
+                        .collect()),
+                    None => err(ExcelError::Num),
+                }
+            }
+            "MMULT" => {
+                if args.len() != 2 {
+                    return err(ExcelError::Value);
+                }
+                let a = to_num_matrix(&self.arg_matrix(&args[0])?)?;
+                let b = to_num_matrix(&self.arg_matrix(&args[1])?)?;
+                let (ar, ac) = (a.len(), a[0].len());
+                let (br, bc) = (b.len(), b[0].len());
+                if ac != br || a.iter().any(|r| r.len() != ac) || b.iter().any(|r| r.len() != bc) {
+                    return err(ExcelError::Value);
+                }
+                if (ar * bc) as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                Ok((0..ar)
+                    .map(|i| {
+                        (0..bc)
+                            .map(|j| num((0..ac).map(|k| a[i][k] * b[k][j]).sum()))
+                            .collect()
+                    })
+                    .collect())
+            }
             "TEXTSPLIT" => {
                 // TEXTSPLIT(text, col_delim, [row_delim], [ignore_empty],
                 //           [match_mode], [pad_with]).
@@ -3999,6 +4049,9 @@ fn is_array_fn(name: &str) -> bool {
             | "WRAPROWS"
             | "WRAPCOLS"
             | "TEXTSPLIT"
+            | "MMULT"
+            | "MINVERSE"
+            | "MUNIT"
     )
 }
 
@@ -7750,6 +7803,22 @@ impl<'a> Eval<'a> {
                 }
                 num((n * std::f64::consts::PI).sqrt())
             }),
+            "MDETERM" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let m = match self.arg_matrix(&args[0]) {
+                    Ok(m) => match to_num_matrix(&m) {
+                        Ok(nm) => nm,
+                        Err(v) => return v,
+                    },
+                    Err(v) => return v,
+                };
+                match matrix_det(&m) {
+                    Some(d) => num(d),
+                    None => Value::Err(ExcelError::Value),
+                }
+            }
             "ROMAN" => {
                 // Optional form arg is accepted but ignored (classic form only).
                 if args.is_empty() || args.len() > 2 {
@@ -8571,6 +8640,97 @@ fn days_360(y1: i64, m1: u32, mut d1: u32, y2: i64, m2: u32, mut d2: u32, europe
         }
     }
     (y2 - y1) * 360 + (m2 as i64 - m1 as i64) * 30 + (d2 as i64 - d1 as i64)
+}
+
+/// Convert a value matrix to `f64`s, or a `#VALUE!` on any non-number.
+fn to_num_matrix(m: &Matrix) -> Result<Vec<Vec<f64>>, Value> {
+    let mut out = Vec::with_capacity(m.len());
+    for row in m {
+        let mut r = Vec::with_capacity(row.len());
+        for v in row {
+            r.push(to_num(v).map_err(Value::Err)?);
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// Determinant of a square matrix via LU with partial pivoting.
+fn matrix_det(a: &[Vec<f64>]) -> Option<f64> {
+    let n = a.len();
+    if n == 0 || a.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    let mut m: Vec<Vec<f64>> = a.to_vec();
+    let mut det = 1.0f64;
+    for col in 0..n {
+        // Partial pivot.
+        let mut piv = col;
+        for r in col + 1..n {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col] == 0.0 {
+            return Some(0.0);
+        }
+        if piv != col {
+            m.swap(piv, col);
+            det = -det;
+        }
+        det *= m[col][col];
+        for r in col + 1..n {
+            let f = m[r][col] / m[col][col];
+            for c in col..n {
+                m[r][c] -= f * m[col][c];
+            }
+        }
+    }
+    Some(det)
+}
+
+/// Inverse of a square matrix via Gauss-Jordan; `None` if singular.
+fn matrix_inverse(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = a.len();
+    if n == 0 || a.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    // Augment [A | I].
+    let mut m: Vec<Vec<f64>> = a
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut r = row.clone();
+            r.extend((0..n).map(|j| if i == j { 1.0 } else { 0.0 }));
+            r
+        })
+        .collect();
+    for col in 0..n {
+        let mut piv = col;
+        for r in col + 1..n {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col].abs() < 1e-300 {
+            return None;
+        }
+        m.swap(piv, col);
+        let d = m[col][col];
+        for c in 0..2 * n {
+            m[col][c] /= d;
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let f = m[r][col];
+            for c in 0..2 * n {
+                m[r][c] -= f * m[col][c];
+            }
+        }
+    }
+    Some(m.iter().map(|row| row[n..].to_vec()).collect())
 }
 
 fn days_in_month(year: i64, month: u32) -> u32 {
@@ -10506,6 +10666,37 @@ mod tests {
         assert_eq!(
             eval_str("DGET(A1:B3,\"Tree\",E1:E2)", &g2),
             Value::Str("Apple".into())
+        );
+    }
+
+    #[test]
+    fn matrix_functions() {
+        // 2×2 with determinant 1×4 − 2×3 = −2.
+        let g = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("B1", Value::Num(2.0)),
+            ("A2", Value::Num(3.0)),
+            ("B2", Value::Num(4.0)),
+        ]);
+        approx("MDETERM(A1:B2)", &g, -2.0);
+        // Inverse of [[1,2],[3,4]] = [[-2,1],[1.5,-0.5]].
+        let inv = eval_array("MINVERSE(A1:B2)", &g);
+        assert!((nums(&inv)[0][0] - -2.0).abs() < 1e-9);
+        assert!((nums(&inv)[1][0] - 1.5).abs() < 1e-9);
+        // A · A⁻¹ = I.
+        let prod = eval_array("MMULT(A1:B2,MINVERSE(A1:B2))", &g);
+        let p = nums(&prod);
+        assert!((p[0][0] - 1.0).abs() < 1e-9 && (p[1][1] - 1.0).abs() < 1e-9);
+        assert!(p[0][1].abs() < 1e-9 && p[1][0].abs() < 1e-9);
+        // MUNIT identity.
+        assert_eq!(
+            nums(&eval_array("MUNIT(2)", &g)),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+        // 2×2 · 2×1 = 2×1: [[1·1+2·3],[3·1+4·3]] = [[7],[15]].
+        assert_eq!(
+            nums(&eval_array("MMULT(A1:B2,A1:A2)", &g)),
+            vec![vec![7.0], vec![15.0]]
         );
     }
 }
