@@ -26,3 +26,6 @@ gridcore = { version = "0.1.0", path = "../gridcore" }
 ratatui = "0.29"
 # OS clipboard bridge (copy/paste across applications), same as docxy.
 arboard = "3"
+# Display-column widths for correct grid alignment + mouse hit-testing with
+# wide (CJK/emoji) glyphs. Already in ratatui's tree.
+unicode-width = "0.2"

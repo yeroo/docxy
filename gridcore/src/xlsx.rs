@@ -554,7 +554,9 @@ fn parse_styles(xml: &str) -> Styles {
                 "color" => {
                     if let Some(f) = &mut cur_font {
                         let rgb = p.attr("rgb");
-                        if rgb.len() == 8 {
+                        // `len()` is bytes; only slice when it's 8 ASCII bytes,
+                        // or a multibyte char straddling an index would panic.
+                        if rgb.len() == 8 && rgb.is_ascii() {
                             if let (Ok(r), Ok(g), Ok(b)) = (
                                 u8::from_str_radix(&rgb[2..4], 16),
                                 u8::from_str_radix(&rgb[4..6], 16),
@@ -646,7 +648,12 @@ fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
                     });
                 }
                 "row" => {
-                    cur_row = p.attr("r").parse::<u32>().map(|r| r - 1).unwrap_or(cur_row);
+                    // `r` is 1-based; a crafted `r="0"` must not underflow.
+                    cur_row = p
+                        .attr("r")
+                        .parse::<u32>()
+                        .map(|r| r.saturating_sub(1))
+                        .unwrap_or(cur_row);
                     next_col = 0;
                     let mut attrs = String::new();
                     for a in p.attrs() {
@@ -776,11 +783,14 @@ fn parse_cell_body(
                                 // follower carries none. Record both.
                                 if let Ok(si) = si.parse::<u32>() {
                                     followers.push((row, col, si));
-                                    // The master registers itself once its
-                                    // text arrives (see Event::End for f).
-                                    shared_masters
-                                        .entry(si)
-                                        .or_insert((row, col, String::new()));
+                                    // Only the master carries a `ref=` span;
+                                    // seed the group's source cell from it. A
+                                    // follower seen before its master must not
+                                    // claim the slot (which would leave the
+                                    // group's source empty), so key on `ref`.
+                                    if !ref_attr.is_empty() {
+                                        shared_masters.insert(si, (row, col, String::new()));
+                                    }
                                 }
                             }
                             "" | "normal" => {}
@@ -797,7 +807,6 @@ fn parse_cell_body(
                                 f_attrs = Some(attrs);
                             }
                         }
-                        let _ = ref_attr;
                     }
                     "t" => in_is_t = true,
                     "rPh" => {
@@ -1181,10 +1190,45 @@ fn cell_xml(
     }
 }
 
+/// Byte offset of a real `<tag` element start in XML, skipping any occurrence
+/// inside a `<!-- … -->` comment and requiring the tag name to be followed by
+/// whitespace, `>`, or `/` (so `<sheetDataX` and a `<sheetData` literal buried
+/// in a comment don't misdirect the splice). `None` if not present.
+fn find_element(hay: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{tag}");
+    let bytes = hay.as_bytes();
+    let mut i = 0;
+    while i < hay.len() {
+        // Skip over comments wholesale.
+        if hay[i..].starts_with("<!--") {
+            // Unterminated comment: nothing usable after it.
+            let rel = hay[i..].find("-->")?;
+            i += rel + 3;
+            continue;
+        }
+        if hay[i..].starts_with(&needle) {
+            let after = bytes.get(i + needle.len()).copied();
+            if matches!(
+                after,
+                None | Some(b'>')
+                    | Some(b'/')
+                    | Some(b' ')
+                    | Some(b'\t')
+                    | Some(b'\r')
+                    | Some(b'\n')
+            ) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Replace `<sheetData>…</sheetData>` (or `<sheetData/>`) in the original
 /// worksheet XML, refresh `<dimension>`, and regenerate `<cols>`.
 fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
-    let mut out = match source.find("<sheetData") {
+    let mut out = match find_element(source, "sheetData") {
         Some(start) => {
             let after = &source[start..];
             let gt = after
@@ -1215,7 +1259,7 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     } else {
         format!("A1:{}", cell_name(rows - 1, cols.max(1) - 1))
     };
-    if let Some(i) = out.find("<dimension") {
+    if let Some(i) = find_element(&out, "dimension") {
         if let Some(rel) = out[i..].find("ref=\"") {
             let vs = i + rel + 5;
             if let Some(ve) = out[vs..].find('"') {
@@ -1240,14 +1284,14 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
             ));
         }
         cols_xml.push_str("</cols>");
-        if let Some(start) = out.find("<cols") {
+        if let Some(start) = find_element(&out, "cols") {
             let end = out[start..]
                 .find("</cols>")
                 .map(|i| start + i + "</cols>".len())
                 .or_else(|| out[start..].find("/>").map(|i| start + i + 2))
                 .unwrap_or(start);
             out.replace_range(start..end, &cols_xml);
-        } else if let Some(start) = out.find("<sheetData") {
+        } else if let Some(start) = find_element(&out, "sheetData") {
             out.insert_str(start, &cols_xml);
         }
     }
@@ -1257,6 +1301,14 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
 /// Rewrite the `name` attribute of each `<sheet …>` element (in document
 /// order) from the model's sheet names.
 fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
+    // Positional patching is only safe when the `<sheet>` elements line up
+    // one-to-one with the model. They can diverge if a worksheet part was
+    // missing at load and its sheet was dropped from the model; renaming by
+    // index would then write names onto the wrong elements. Bail out (leaving
+    // the original names) rather than corrupt them.
+    if xml.matches("<sheet ").count() != sheets.len() {
+        return xml.to_string();
+    }
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     let mut idx = 0usize;
@@ -1936,6 +1988,49 @@ mod tests {
             ("xl/sharedStrings.xml".into(), sst.into()),
             ("xl/calcChain.xml".into(), calc_chain.into()),
         ])
+    }
+
+    #[test]
+    fn hostile_worksheet_loads_and_saves_without_panic() {
+        // A crafted worksheet: r="0" (would underflow), a non-ASCII 8-byte
+        // rgb (would slice on a char boundary), and a comment containing a
+        // "<sheetData>" literal ahead of the real element (would misdirect
+        // the splice). None may panic or corrupt the save.
+        let sheet1 = concat!(
+            r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+            "<!-- <sheetData><row r=\"1\"><c r=\"A1\"/></row></sheetData> -->",
+            r#"<dimension ref="A1"/><sheetData><row r="0"><c r="A1"><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><f>A1+1</f><v>8</v></c></row></sheetData></worksheet>"#,
+        );
+        let styles = concat!(
+            r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+            r#"<fonts count="1"><font><color rgb="aébcdef"/></font></fonts>"#,
+            r#"<fills count="1"><fill><patternFill patternType="none"/></fill></fills>"#,
+            r#"<borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs>"#,
+            r#"<cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs></styleSheet>"#,
+        );
+        let workbook = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let data = write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
+            ("xl/styles.xml".into(), styles.into()),
+        ]);
+        let mut pkg = load_xlsx(&data).expect("hostile file still loads");
+        // r="0" clamped to row 0 (A1); the formula recalculates.
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        // Save must not corrupt: the comment stays a comment, real data spliced.
+        let out = save_xlsx(&pkg);
+        let reopened = load_xlsx(&out).expect("re-save reloads");
+        let ws = String::from_utf8_lossy(reopened.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(ws.contains("<!-- "), "comment preserved");
+        assert!(ws.contains("<c r=\"A2\""), "real cell present");
     }
 
     #[test]

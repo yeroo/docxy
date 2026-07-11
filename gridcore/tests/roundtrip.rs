@@ -31,6 +31,11 @@ fn assert_same_model(a: &SheetPackage, b: &SheetPackage, ctx: &str) {
         assert_eq!(sa.name, sb.name, "{ctx}: sheet name");
         assert_eq!(sa.merges, sb.merges, "{ctx}: merges in {}", sa.name);
         assert_eq!(
+            sa.col_defs, sb.col_defs,
+            "{ctx}: column defs in {}",
+            sa.name
+        );
+        assert_eq!(
             sa.row_attrs, sb.row_attrs,
             "{ctx}: row attrs in {}",
             sa.name

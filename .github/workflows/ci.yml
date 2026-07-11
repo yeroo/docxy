@@ -36,9 +36,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   msrv:
     name: msrv (1.88)
@@ -51,4 +51,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - run: cargo build --workspace
+        # Compile tests too, so a newer-than-MSRV feature in test code is
+        # caught rather than sailing through a bin-only build.
+      - run: cargo build --workspace --all-targets --locked

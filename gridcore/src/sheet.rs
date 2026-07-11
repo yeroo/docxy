@@ -601,7 +601,10 @@ pub struct DateParts {
 /// (a phantom 1900-02-29 at serial 60). We use the standard workaround:
 /// epoch 1899-12-30 for serials ≥ 61, one day later below that.
 pub fn serial_to_parts(serial: f64, date1904: bool) -> Option<DateParts> {
-    if !serial.is_finite() || serial < 0.0 {
+    // Reject non-finite, negative, and out-of-Excel-range serials. The upper
+    // bound is Excel's own ceiling (9999-12-31 ≈ serial 2,958,465); without it
+    // a huge value like 1e19 would overflow the civil-date arithmetic below.
+    if !serial.is_finite() || !(0.0..2_958_466.0).contains(&serial) {
         return None;
     }
     let days = serial.floor() as i64;
@@ -795,7 +798,7 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
             }
             if let Some(cell) = sheet.cell(r, c) {
                 let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
-                if text.contains([',', '"', '\n']) {
+                if text.contains([',', '"', '\n', '\r']) {
                     out.push('"');
                     out.push_str(&text.replace('"', "\"\""));
                     out.push('"');
@@ -1002,5 +1005,14 @@ mod tests {
         s.set_cell(1, 0, Cell::text("plain"));
         let csv = sheet_to_csv(&s, &Styles::default(), false);
         assert_eq!(csv, "\"a,b\",2\nplain,\n");
+    }
+
+    #[test]
+    fn serial_bounds_and_weekday_helpers() {
+        // Out-of-range serials are rejected, not overflowed.
+        assert!(serial_to_parts(1e19, false).is_none());
+        assert!(serial_to_parts(2_958_466.0, false).is_none()); // past 9999-12-31
+        assert!(serial_to_parts(-1.0, false).is_none());
+        assert!(serial_to_parts(45306.0, false).is_some()); // 2024-01-15 ok
     }
 }

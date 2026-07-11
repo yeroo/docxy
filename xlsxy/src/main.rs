@@ -4,7 +4,7 @@
 //!   xlsxy                               open a new blank workbook
 //!   xlsxy <file.xlsx>                   open in the editor
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
-//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export active sheet as CSV
+//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the first sheet as CSV
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -293,10 +293,21 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 i += 1;
                 p.csv_out = Some(args.get(i).ok_or("--csv needs an output path")?.clone());
             }
+            // A lone "-" is a filename-ish token, not an option; reject it
+            // explicitly (stdin isn't supported) rather than as "unknown -".
+            "-" => return Err("stdin (\"-\") is not supported; pass a file path".to_string()),
             a if a.starts_with('-') => return Err(format!("unknown option {a}")),
             a => p.inputs.push(a.to_string()),
         }
         i += 1;
+    }
+    // The headless modes are mutually exclusive — silently dropping one would
+    // surprise; reject the combination instead.
+    let modes = usize::from(p.recalc_out.is_some())
+        + usize::from(p.csv_out.is_some())
+        + usize::from(p.verify);
+    if modes > 1 {
+        return Err("choose only one of --recalc, --csv, --verify".to_string());
     }
     Ok(p)
 }
@@ -401,8 +412,11 @@ fn verify_report(pkg: &SheetPackage, path: &str) -> (String, VerifyStats) {
     let original: &Workbook = &pkg.workbook;
     let mut wb = pkg.workbook.clone();
     let mut engine = Engine::new(&wb);
-    engine.clock = now_serial();
-    engine.seed = entropy_seed();
+    // Deliberately give the engine *no* clock or RNG: volatile cells
+    // (NOW/TODAY/RAND) then keep their cached values instead of being
+    // recomputed to a fresh moment, so their non-volatile dependents
+    // (e.g. `=A1*2` where A1 is `=NOW()`) recompute from the cached inputs
+    // and still agree with Excel's cache — no false mismatches.
     engine.recalc_all(&mut wb);
 
     let mut total = 0usize;
@@ -415,12 +429,14 @@ fn verify_report(pkg: &SheetPackage, path: &str) -> (String, VerifyStats) {
         for (&(r, c), cell) in &sheet.cells {
             let Some(src) = &cell.formula else { continue };
             total += 1;
-            if engine.is_unsupported((s, r, c)) {
-                unsupported += 1;
-                continue;
-            }
+            // Report volatiles before unsupported: with no clock they also
+            // read as unsupported, but "volatile" is the meaningful label.
             if parse(src).map(|ast| is_volatile(&ast)).unwrap_or(false) {
                 volatile += 1;
+                continue;
+            }
+            if engine.is_unsupported((s, r, c)) {
+                unsupported += 1;
                 continue;
             }
             let expected = &cell.value;
@@ -590,7 +606,6 @@ struct App {
     model_rels: Vec<Relationship>,
     model_measures: Vec<gridcore::model::Measure>,
     last_find: Option<String>,
-    quit: bool,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -632,7 +647,6 @@ impl App {
             model_rels,
             model_measures,
             last_find: None,
-            quit: false,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -651,6 +665,20 @@ impl App {
             Some((ar, ac)) => (ar.min(r), ac.min(c), ar.max(r), ac.max(c)),
             None => (r, c, r, c),
         }
+    }
+
+    /// The selection intersected with the sheet's used range, so operations
+    /// that iterate every coordinate (copy, clear) never walk the full
+    /// 1,048,576 × 16,384 grid when the user selects whole rows/columns or
+    /// the entire sheet. Falls back to the cursor cell when the selection
+    /// covers only empty area (nothing to iterate).
+    fn iter_selection(&self) -> (u32, u32, u32, u32) {
+        let (r1, c1, r2, c2) = self.selection();
+        let (used_r, used_c) = self.sheet().used_size();
+        if used_r == 0 || used_c == 0 || r1 >= used_r || c1 >= used_c {
+            return (r1, c1, r1, c1); // just the anchor corner
+        }
+        (r1, c1, r2.min(used_r - 1), c2.min(used_c - 1))
     }
 
     // --- editing -----------------------------------------------------------
@@ -1256,7 +1284,7 @@ impl App {
     // --- clipboard -----------------------------------------------------------
 
     fn copy(&mut self, cut: bool) {
-        let (r1, c1, r2, c2) = self.selection();
+        let (r1, c1, r2, c2) = self.iter_selection();
         let sheet = self.sheet();
         let mut rows = Vec::new();
         let mut tsv = String::new();
@@ -1349,22 +1377,45 @@ impl App {
             }
         }
         if let Some(text) = os_text {
-            // External TSV/plain text.
+            // External TSV/plain text. Cap the paste so a hostile/huge
+            // clipboard can't lock the UI in per-cell recalcs.
+            const MAX_PASTE_CELLS: usize = 100_000;
             let mut changes = Vec::new();
-            for (dr, line) in text.trim_end_matches('\n').split('\n').enumerate() {
+            let mut truncated = false;
+            'outer: for (dr, line) in text.trim_end_matches('\n').split('\n').enumerate() {
                 for (dc, field) in line.trim_end_matches('\r').split('\t').enumerate() {
+                    if changes.len() >= MAX_PASTE_CELLS {
+                        truncated = true;
+                        break 'outer;
+                    }
                     let (r, c) = (r0 + dr as u32, c0 + dc as u32);
                     if r >= MAX_ROWS || c >= MAX_COLS {
                         continue;
                     }
                     let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
                     let mut cell = parse_input(field);
+                    // A pasted `=…` that doesn't parse would freeze as an
+                    // unsupported cell; demote it to literal text instead
+                    // (entry-time editing rejects such input outright).
+                    if let Some(f) = &cell.formula {
+                        if Engine::validate(f).is_err() {
+                            cell = Cell {
+                                value: CellValue::Text(field.to_string()),
+                                style,
+                                ..Cell::default()
+                            };
+                        }
+                    }
                     cell.style = style;
                     changes.push((r, c, cell));
                 }
             }
             self.apply(changes);
-            self.status = Some("Pasted".to_string());
+            self.status = Some(if truncated {
+                format!("Pasted (clipped to {MAX_PASTE_CELLS} cells)")
+            } else {
+                "Pasted".to_string()
+            });
         }
     }
 
@@ -1508,7 +1559,7 @@ impl App {
     }
 
     fn clear_selection(&mut self) {
-        let (r1, c1, r2, c2) = self.selection();
+        let (r1, c1, r2, c2) = self.iter_selection();
         let mut changes = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
@@ -1892,7 +1943,10 @@ fn parse_input(text: &str) -> Cell {
     }
     if let Some(pct) = t.strip_suffix('%') {
         if let Ok(n) = pct.trim().parse::<f64>() {
-            return Cell::number(n / 100.0);
+            let v = n / 100.0;
+            if v.is_finite() {
+                return Cell::number(v);
+            }
         }
     }
     if t.eq_ignore_ascii_case("TRUE") {
@@ -2144,27 +2198,52 @@ fn draw(app: &mut App, f: &mut Frame) {
     );
 }
 
-/// Pad/clip to exactly `w` columns (char-count based; wide glyphs are rare in
-/// spreadsheets and only cost alignment, not correctness).
+/// Display width of a string in terminal columns (wide CJK/emoji glyphs count
+/// as 2), so grid layout and mouse hit-testing stay aligned with what's drawn.
+fn disp_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Truncate a string to at most `w` display columns, returning it and the
+/// columns it actually occupies (a wide glyph may stop one short of `w`).
+fn truncate_width(s: &str, w: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    (out, used)
+}
+
+/// Pad/clip to exactly `w` display columns. Wide glyphs are measured by their
+/// terminal width so alignment (and mouse hit-testing over `vis_cols`) holds.
 fn fit(s: &str, w: usize, right: bool) -> String {
-    let count = s.chars().count();
-    if count >= w {
-        let cut: String = s.chars().take(w.saturating_sub(1)).collect();
-        format!("{cut} ")
+    let width = disp_width(s);
+    if width >= w {
+        // Leave a trailing space as a clipped-content indicator.
+        let (cut, used) = truncate_width(s, w.saturating_sub(1));
+        format!("{cut}{}", " ".repeat(w - used))
     } else if right {
-        format!("{}{} ", " ".repeat(w - count - 1), s)
+        format!("{}{} ", " ".repeat(w - width - 1), s)
     } else {
-        format!("{}{}", s, " ".repeat(w - count))
+        format!("{}{}", s, " ".repeat(w - width))
     }
 }
 
 fn center(s: &str, w: usize) -> String {
-    let count = s.chars().count();
-    if count >= w {
-        return s.chars().take(w).collect();
+    let width = disp_width(s);
+    if width >= w {
+        return truncate_width(s, w).0;
     }
-    let lead = (w - count) / 2;
-    format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - count - lead))
+    let lead = (w - width) / 2;
+    format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - width - lead))
 }
 
 /// The pivot field editor: four panes over a cleared overlay rect.
@@ -2305,7 +2384,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
         Event::Key(key) => handle_key(app, key),
         Event::Mouse(m) => {
             handle_mouse(app, m);
-            app.quit
+            false
         }
         Event::Resize(_, _) => false,
         _ => false,
@@ -2656,11 +2735,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             if m.row < g.y || m.row >= g.y + g.height || m.column < g.x + app.gutter_w {
                 return;
             }
-            let row = app.top + (m.row - g.y) as u32;
+            // Clamp to the grid: rendering can show phantom rows past the
+            // last one, and a click there must not create an out-of-range
+            // cell (which the loader would later reject and relocate).
+            let row = (app.top + (m.row - g.y) as u32).min(MAX_ROWS - 1);
             let mut col = None;
             for &(cidx, x, w) in &app.vis_cols {
                 if m.column >= x && m.column < x + w {
-                    col = Some(cidx);
+                    col = Some(cidx.min(MAX_COLS - 1));
                     break;
                 }
             }
@@ -3370,5 +3452,46 @@ mod tests {
         app.pivot_editor_key(KeyCode::Up, true);
         app.pivot_editor_key(KeyCode::Up, true);
         assert_eq!(app.pkg.workbook.pivots[0].row_fields, vec![1, 0]);
+    }
+
+    #[test]
+    fn robustness_fixes() {
+        // Whole-sheet clear/copy iterate only the used range, not the grid.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(1.0));
+        pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(2.0));
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        // Select A1 : XFD1048576 (the whole grid) and clear — must be instant.
+        app.cur = (MAX_ROWS - 1, MAX_COLS - 1);
+        app.anchor = Some((0, 0));
+        app.clear_selection();
+        assert_eq!(app.sheet().cell(0, 0), None);
+        assert_eq!(app.sheet().cell(1, 1), None);
+
+        // parse_input never yields a non-finite number.
+        assert!(matches!(parse_input("1e999").value, CellValue::Text(_)));
+        assert!(matches!(parse_input("1e999%").value, CellValue::Text(_)));
+
+        // Display-width fit is exact for wide glyphs.
+        assert_eq!(disp_width("中文"), 4);
+        assert_eq!(fit("中", 4, false).chars().count(), 3); // 2 cols glyph + 2 pad spaces = 4 cols
+        assert_eq!(disp_width(&fit("中文字", 4, false)), 4);
+    }
+
+    #[test]
+    fn arg_parsing_guards() {
+        assert!(
+            parse_args(&[
+                "a.xlsx".into(),
+                "--recalc".into(),
+                "o.xlsx".into(),
+                "--csv".into(),
+                "o.csv".into()
+            ])
+            .is_err()
+        );
+        assert!(parse_args(&["-".into()]).is_err());
+        assert!(parse_args(&["a.xlsx".into(), "--recalc".into(), "o.xlsx".into()]).is_ok());
     }
 }

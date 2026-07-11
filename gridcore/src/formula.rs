@@ -498,14 +498,27 @@ impl<'a> Lexer<'a> {
 struct Parser<'a> {
     lex: Lexer<'a>,
     tok: Tok,
+    /// Recursion depth of the descent (bumped at each nesting point: parens,
+    /// unary chains, function args). Capped so a hostile formula like
+    /// `((((…))))` or `----…` from an untrusted file can't overflow the
+    /// stack — it fails to parse instead, and the engine keeps the cached
+    /// value like any other unparseable formula.
+    depth: u32,
 }
+
+/// Cap on parser recursion. Bumped ~twice per parenthesis/unary level, so
+/// this allows ~64 levels of nesting — matching Excel's own limit on nested
+/// functions — while keeping the worst-case frame count small enough to stay
+/// safe even on a 2 MB thread stack. Deeper input fails to parse (and the
+/// engine keeps the cached value) instead of overflowing the native stack.
+const MAX_PARSE_DEPTH: u32 = 128;
 
 /// Parse a formula body (no leading `=`). Errors are strings — the engine
 /// treats any parse failure as "unsupported: preserve, don't evaluate".
 pub fn parse(src: &str) -> Result<Expr, String> {
     let mut lex = Lexer::new(src);
     let tok = lex.next_tok()?;
-    let mut p = Parser { lex, tok };
+    let mut p = Parser { lex, tok, depth: 0 };
     let e = p.compare()?;
     if p.tok != Tok::Eof {
         return Err(format!("unexpected trailing token {:?}", p.tok));
@@ -519,7 +532,27 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The recursion entry points (`compare`, `unary`) run their body through
+    /// this so depth is bumped and restored exactly once per level, aborting
+    /// before the native stack can overflow.
+    fn nest(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<Expr, String>,
+    ) -> Result<Expr, String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err("formula nesting too deep".into());
+        }
+        let r = body(self);
+        self.depth -= 1;
+        r
+    }
+
     fn compare(&mut self) -> Result<Expr, String> {
+        self.nest(Self::compare_inner)
+    }
+
+    fn compare_inner(&mut self) -> Result<Expr, String> {
         let mut e = self.concat()?;
         loop {
             let op = match self.tok {
@@ -591,6 +624,10 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        self.nest(Self::unary_inner)
+    }
+
+    fn unary_inner(&mut self) -> Result<Expr, String> {
         match self.tok {
             Tok::Minus => {
                 self.bump()?;
@@ -4087,23 +4124,63 @@ fn parse_criteria(v: &Value) -> Criteria {
 }
 
 /// `*` / `?` wildcards, `~` escapes — case-insensitive.
+///
+/// Iterative two-pointer matcher with a single backtrack point for `*`, so
+/// it runs in O(pattern × text) rather than the exponential time a naive
+/// recursive `*`-backtracker would take on adversarial patterns like
+/// `a*a*a*…z` (both pattern and text come from untrusted workbooks).
 fn wildcard_match(pat: &str, text: &str) -> bool {
-    fn inner(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            '*' => (0..=t.len()).any(|k| inner(&p[1..], &t[k..])),
-            '?' => !t.is_empty() && inner(&p[1..], &t[1..]),
-            '~' if p.len() > 1 => {
-                !t.is_empty() && p[1].eq_ignore_ascii_case(&t[0]) && inner(&p[2..], &t[1..])
-            }
-            c => !t.is_empty() && c.eq_ignore_ascii_case(&t[0]) && inner(&p[1..], &t[1..]),
-        }
-    }
     let p: Vec<char> = pat.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
-    inner(&p, &t)
+
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Where to resume if a tentative `*` match fails: the `*`'s pattern index
+    // and the text position it was last tried against.
+    let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
+
+    while ti < t.len() {
+        // A literal or `?` (or `~`-escaped literal) that matches consumes one
+        // char from each side.
+        let matched = match p.get(pi) {
+            Some('*') => {
+                star = Some(pi);
+                star_ti = ti;
+                pi += 1;
+                continue;
+            }
+            Some('~') if pi + 1 < p.len() => {
+                if p[pi + 1] == t[ti] {
+                    pi += 2;
+                    ti += 1;
+                    continue;
+                }
+                false
+            }
+            Some('?') => {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+            Some(&c) => c == t[ti],
+            None => false,
+        };
+        if matched {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more text char.
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Trailing pattern must be all `*` to match the exhausted text.
+    while p.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn criteria_match(c: &Criteria, v: &Value) -> bool {
@@ -5148,8 +5225,12 @@ impl<'a> Eval<'a> {
                     return Value::Err(ExcelError::Value);
                 }
                 let chars: Vec<char> = s.chars().collect();
-                let from = ((start.trunc() as usize) - 1).min(chars.len());
-                let to = (from + count.trunc() as usize).min(chars.len());
+                // Clamp both bounds to the string length *before* adding — a
+                // huge `count` (e.g. 1e20) saturates `as usize` to usize::MAX,
+                // and `from + that` would overflow and panic on the slice.
+                let from = ((start.trunc() as usize).saturating_sub(1)).min(chars.len());
+                let count = (count.trunc() as usize).min(chars.len());
+                let to = from.saturating_add(count).min(chars.len());
                 Value::Str(chars[from..to].iter().collect())
             }
             "LOWER" => self.one_text(args, |s| Value::Str(s.to_lowercase())),
@@ -5273,8 +5354,11 @@ impl<'a> Eval<'a> {
                     return Value::Err(ExcelError::Value);
                 }
                 let chars: Vec<char> = s.chars().collect();
-                let from = ((start.trunc() as usize) - 1).min(chars.len());
-                let to = (from + count.trunc() as usize).min(chars.len());
+                // Clamp before adding (see MID) — a huge `count` would
+                // otherwise overflow `from + count` and panic.
+                let from = ((start.trunc() as usize).saturating_sub(1)).min(chars.len());
+                let count = (count.trunc() as usize).min(chars.len());
+                let to = from.saturating_add(count).min(chars.len());
                 let mut out: String = chars[..from].iter().collect();
                 out.push_str(&new);
                 out.extend(&chars[to..]);
@@ -5393,9 +5477,16 @@ impl<'a> Eval<'a> {
                 if args.len() != 3 {
                     return Value::Err(ExcelError::Value);
                 }
-                let y = try_num!(self.eval(&args[0])).trunc() as i64;
-                let m = try_num!(self.eval(&args[1])).trunc() as i64;
-                let d = try_num!(self.eval(&args[2])).trunc() as i64;
+                let y = try_num!(self.eval(&args[0])).trunc();
+                let m = try_num!(self.eval(&args[1])).trunc();
+                let d = try_num!(self.eval(&args[2])).trunc();
+                // Excel caps years at 9999; bounding here also keeps the
+                // month/day rollover arithmetic well inside i64 (a huge year
+                // argument would otherwise overflow `y * 12`).
+                if !(0.0..=10_000.0).contains(&y) || m.abs() > 1_200_000.0 || d.abs() > 1e9 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let (y, m, d) = (y as i64, m as i64, d as i64);
                 // Excel normalizes out-of-range months/days by rolling over.
                 let y = if y < 1900 { y + 1900 } else { y };
                 let total_months = y * 12 + (m - 1);
@@ -5447,11 +5538,22 @@ impl<'a> Eval<'a> {
                         } else {
                             1
                         };
-                        let sun0 = (((serial.floor() as i64 - 1) % 7) + 7) % 7;
+                        // The weekday formula assumes the 1900 epoch (serial 1
+                        // = "Sunday"); a 1904 workbook's serials are shifted by
+                        // 1462 days, so rebase before the mod-7.
+                        let day1900 =
+                            serial.floor() as i64 + if self.res.date1904() { 1462 } else { 0 };
+                        let sun0 = ((day1900 - 1) % 7 + 7) % 7; // 0=Sun … 6=Sat
+                        let mon0 = (sun0 + 6) % 7; // 0=Mon … 6=Sun
                         match mode {
-                            1 => Value::Num(sun0 as f64 + 1.0),
-                            2 => Value::Num(((sun0 + 6) % 7) as f64 + 1.0),
-                            3 => Value::Num(((sun0 + 6) % 7) as f64),
+                            1 => Value::Num(sun0 as f64 + 1.0),      // Sun=1 … Sat=7
+                            2 | 11 => Value::Num(mon0 as f64 + 1.0), // Mon=1 … Sun=7
+                            3 => Value::Num(mon0 as f64),            // Mon=0 … Sun=6
+                            // 12..17: week starts Tue..Sun, result 1..7.
+                            12..=17 => {
+                                let k = mode - 11; // days after Monday the week starts
+                                Value::Num(((mon0 - k).rem_euclid(7)) as f64 + 1.0)
+                            }
                             _ => Value::Err(ExcelError::Num),
                         }
                     }
@@ -6234,8 +6336,14 @@ impl<'a> Eval<'a> {
                 }
                 let mut r = 1.0f64;
                 let k = k.min(n - k);
-                for i in 0..(k as u64) {
+                // The result exceeds f64 range long before k is large; cap the
+                // loop so a huge argument can't spin ~10^14 iterations.
+                let iters = (k as u64).min(1_000_000);
+                for i in 0..iters {
                     r = r * (n - i as f64) / (i as f64 + 1.0);
+                    if !r.is_finite() {
+                        return Value::Err(ExcelError::Num);
+                    }
                 }
                 num(r.round())
             }),
@@ -6245,8 +6353,12 @@ impl<'a> Eval<'a> {
                     return Value::Err(ExcelError::Num);
                 }
                 let mut r = 1.0f64;
-                for i in 0..(k as u64) {
+                let iters = (k as u64).min(1_000_000);
+                for i in 0..iters {
                     r *= n - i as f64;
+                    if !r.is_finite() {
+                        return Value::Err(ExcelError::Num);
+                    }
                 }
                 num(r)
             }),
@@ -7691,6 +7803,72 @@ mod tests {
                 &g
             ),
             50.0
+        );
+    }
+
+    #[test]
+    fn adversarial_input_does_not_crash_or_hang() {
+        // Deeply nested parens / unary chains must fail to parse, not
+        // overflow the stack.
+        let deep_parens = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(parse(&deep_parens).is_err());
+        let deep_unary = format!("{}1", "-".repeat(5000));
+        assert!(parse(&deep_unary).is_err());
+        // A legitimately (but modestly) nested formula still parses.
+        assert_eq!(
+            n(&format!("{}5{}", "(".repeat(30), ")".repeat(30)), &empty()),
+            5.0
+        );
+        // MID / REPLACE with an enormous count must not panic.
+        let g = empty();
+        assert_eq!(eval_str("MID(\"ab\",2,1e20)", &g), Value::Str("b".into()));
+        assert_eq!(
+            eval_str("REPLACE(\"hello\",2,1e20,\"x\")", &g),
+            Value::Str("hx".into())
+        );
+        // The wildcard matcher is linear, not exponential: an adversarial
+        // pattern returns quickly (this test would hang on the old matcher).
+        let g = Grid::new(&[("A1", Value::Str("a".repeat(40)))]);
+        let pat = "a*".repeat(20) + "z";
+        let f = format!("COUNTIF(A1:A2,\"{pat}\")");
+        assert_eq!(eval_str(&f, &g), Value::Num(0.0));
+        // COMBIN / DATE with extreme arguments are #NUM!, not a hang/overflow.
+        assert_eq!(
+            eval_str("COMBIN(1e15,5e14)", &g),
+            Value::Err(ExcelError::Num)
+        );
+        assert_eq!(eval_str("DATE(9e18,1,1)", &g), Value::Err(ExcelError::Num));
+    }
+
+    #[test]
+    fn wildcard_matcher_semantics() {
+        assert!(wildcard_match("a*c", "abbbc"));
+        assert!(wildcard_match("a*c", "ac"));
+        assert!(!wildcard_match("a*c", "abbb"));
+        assert!(wildcard_match("h?llo", "hello"));
+        assert!(!wildcard_match("h?llo", "hllo"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("**a", "xxa"));
+        // ~ escapes a literal * / ?.
+        assert!(wildcard_match("a~*b", "a*b"));
+        assert!(!wildcard_match("a~*b", "axb"));
+        // Case-insensitive incl. non-ASCII.
+        assert!(wildcard_match("cafÉ*", "café latte"));
+    }
+
+    #[test]
+    fn weekday_modes_and_1904() {
+        // 2024-01-15 is a Monday. 1900-system serial 45306.
+        let g = empty();
+        assert_eq!(n("WEEKDAY(45306,1)", &g), 2.0); // Sun=1 -> Mon=2
+        assert_eq!(n("WEEKDAY(45306,2)", &g), 1.0); // Mon=1
+        assert_eq!(n("WEEKDAY(45306,3)", &g), 0.0); // Mon=0
+        assert_eq!(n("WEEKDAY(45306,11)", &g), 1.0); // week starts Mon
+        assert_eq!(n("WEEKDAY(45306,12)", &g), 7.0); // week starts Tue -> Mon=7
+        assert_eq!(n("WEEKDAY(45306,13)", &g), 6.0); // week starts Wed
+        assert_eq!(
+            eval_str("WEEKDAY(45306,4)", &g),
+            Value::Err(ExcelError::Num)
         );
     }
 }

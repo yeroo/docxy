@@ -435,6 +435,15 @@ WORKBOOKS = {
 def main():
     if shutil.which("soffice") is None:
         sys.exit("soffice (libreoffice-calc) not found on PATH")
+    # The oracle values LibreOffice caches for TEXT()/VALUE()/percent formats
+    # are locale-sensitive (decimal/grouping separators). Pin a locale so the
+    # corpus is reproducible regardless of the generating machine's settings,
+    # and record which LibreOffice produced it for provenance.
+    ver = subprocess.run(
+        ["soffice", "--version"], capture_output=True, text=True
+    ).stdout.strip()
+    print(f"generating with: {ver}")
+    lc_env = {**os.environ, "LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}
     os.makedirs(OUT_DIR, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         src_dir = os.path.join(tmp, "src")
@@ -457,6 +466,7 @@ def main():
             + [os.path.join(src_dir, f"{n}.xlsx") for n in WORKBOOKS],
             check=True,
             stdout=subprocess.DEVNULL,
+            env=lc_env,
         )
         for name in WORKBOOKS:
             path = os.path.join(out_dir, f"{name}.xlsx")
