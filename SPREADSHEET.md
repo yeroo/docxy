@@ -303,6 +303,28 @@ The strategic piece: **conformance is measured, not claimed.**
   beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
   small BI engine that happens to have a terminal frontend.
 
+- **Phase F — Breadth push** ✅ *shipped: a wide worksheet-function
+  expansion so real workbooks stop hitting `#NAME?`. Added families across
+  the library — financial (`IPMT`/`PPMT`, `SLN`/`SYD`/`DDB`/`DB`,
+  `EFFECT`/`NOMINAL`, `MIRR`/`XNPV`/`XIRR`, `CUMIPMT`/`CUMPRINC`,
+  `PDURATION`/`RRI`/`ISPMT`/`DOLLARDE`/`DOLLARFR`); statistics
+  (`CORREL`/`PEARSON`/`SLOPE`/`INTERCEPT`/`RSQ`/`FORECAST`, `COVARIANCE.*`,
+  `DEVSQ`/`AVEDEV`/`GEOMEAN`/`HARMEAN`/`STANDARDIZE`/`TRIMMEAN`,
+  `SKEW`/`KURT`/`FISHER`/`FISHERINV`, `PERCENTRANK`/`PERCENTILE.EXC`/
+  `QUARTILE.EXC`, the `…A` variants); date/time (`DATEVALUE`/`TIMEVALUE`,
+  `YEARFRAC`, `DAYS360`, `WORKDAY`/`NETWORKDAYS` incl. `.INTL`); text
+  (`TEXTBEFORE`/`TEXTAFTER`/`TEXTSPLIT`, `DOLLAR`/`FIXED`); lookup/info
+  (`XMATCH`, `ADDRESS`, `ERROR.TYPE`, `TYPE`); math (`MROUND`, `ROMAN`/
+  `ARABIC`, `BASE`/`DECIMAL`, `SQRTPI`, `SUMX2MY2`-family, `COMBINA`/
+  `FACTDOUBLE`, the hyperbolic/reciprocal trig set, matrix `MMULT`/
+  `MINVERSE`/`MDETERM`/`MUNIT`); engineering (`BITAND`-family, `DEC2BIN`/
+  `HEX2DEC` and all cross-base conversions, `DELTA`/`GESTEP`); and the full
+  database family (`DSUM`/`DCOUNT`/`DGET`/…). Each batch lands with
+  Microsoft-documented conformance tests; the corpus stays 461/461. Twin
+  of docxy's browser, `compare-xlsx/` tiles xlsxy next to Excel over the
+  xlsx corpus classified by `corpus/tools/classify_xlsx.py` (search by
+  feature tag or worksheet-function name).*
+
 Each phase ships independently through the existing signed-release pipeline.
 
 ---

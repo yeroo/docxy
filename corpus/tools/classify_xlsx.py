@@ -73,13 +73,14 @@ TAG_DOC = {
 # Worksheet functions grouped by family. Used to tag which areas a file covers.
 FN_FAMILIES = {
     "fn-math": {
-        "ABS", "ACOS", "ACOSH", "ACOT", "ARABIC", "ASIN", "ATAN", "ATAN2",
-        "BASE", "CEILING", "CEILING.MATH", "COMBIN", "COMBINA", "COS", "COSH",
-        "COT", "CSC", "DECIMAL", "DEGREES", "EVEN", "EXP", "FACT", "FACTDOUBLE",
-        "FLOOR", "FLOOR.MATH", "GCD", "INT", "LCM", "LN", "LOG", "LOG10",
-        "MDETERM", "MINVERSE", "MMULT", "MOD", "MROUND", "MULTINOMIAL", "ODD",
-        "PI", "POWER", "PRODUCT", "QUOTIENT", "RADIANS", "RAND", "RANDARRAY",
-        "RANDBETWEEN", "ROMAN", "ROUND", "ROUNDDOWN", "ROUNDUP", "SEC", "SERIESSUM",
+        "ABS", "ACOS", "ACOSH", "ACOT", "ACOTH", "ARABIC", "ASIN", "ASINH",
+        "ATAN", "ATAN2", "ATANH", "BASE", "CEILING", "CEILING.MATH", "COMBIN",
+        "COMBINA", "COS", "COSH", "COT", "COTH", "CSC", "CSCH", "DECIMAL",
+        "DEGREES", "EVEN", "EXP", "FACT", "FACTDOUBLE", "FLOOR", "FLOOR.MATH",
+        "GCD", "INT", "LCM", "LN", "LOG", "LOG10", "MDETERM", "MINVERSE",
+        "MMULT", "MOD", "MROUND", "MULTINOMIAL", "MUNIT", "ODD", "PI", "POWER",
+        "PRODUCT", "QUOTIENT", "RADIANS", "RAND", "RANDARRAY", "RANDBETWEEN",
+        "ROMAN", "ROUND", "ROUNDDOWN", "ROUNDUP", "SEC", "SECH", "SERIESSUM",
         "SIGN", "SIN", "SINH", "SQRT", "SQRTPI", "SUM", "SUMIF", "SUMIFS",
         "SUMPRODUCT", "SUMSQ", "SUMX2MY2", "SUMX2PY2", "SUMXMY2", "TAN", "TANH",
         "TRUNC",
