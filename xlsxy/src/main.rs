@@ -197,7 +197,7 @@ fn main() -> ExitCode {
     }
 
     let welcome = parsed.inputs.is_empty();
-    match run_tui(pkg, &path, welcome) {
+    match run_tui(pkg, &path, welcome, parsed.vim) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -294,6 +294,7 @@ struct Parsed {
     csv_out: Option<String>,
     verify: bool,
     help: bool,
+    vim: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
@@ -303,11 +304,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         csv_out: None,
         verify: false,
         help: false,
+        vim: false,
     };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => p.help = true,
+            "--vim" => p.vim = true,
             "--verify" => p.verify = true,
             "--recalc" => {
                 i += 1;
@@ -346,7 +349,8 @@ fn print_usage() {
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
            xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
-                                            and diff against Excel's cached values\n\n\
+                                            and diff against Excel's cached values\n  \
+           xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n\n\
          EDITOR KEYS:\n  \
            type to replace · F2 edit in place · = starts a formula\n  \
            Enter/Tab commit (move down/right) · Esc cancel · Del clear\n  \
@@ -696,6 +700,22 @@ struct Prompt {
     cursor: usize,
 }
 
+/// Vim editing modes for the grid (`--vim`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VimMode {
+    Normal,
+    Visual,
+    VisualLine,
+}
+
+/// Vim-mode state: current mode, a pending multi-key prefix (`g`, `d`, `y`),
+/// and the `:` command line while it's being typed.
+struct VimState {
+    mode: VimMode,
+    pending: char,
+    cmdline: Option<String>,
+}
+
 /// Which formatting popup is open.
 #[derive(Clone, Copy, PartialEq)]
 enum PickKind {
@@ -807,6 +827,8 @@ struct App {
     freeze: (u32, u32),
     /// The pending Find text while the Replace-with prompt is open.
     replace_find: Option<String>,
+    /// Vim-mode state (Some when launched with `--vim`).
+    vim: Option<VimState>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -865,6 +887,7 @@ impl App {
             auto_hide_ribbon: false,
             freeze: (0, 0),
             replace_find: None,
+            vim: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -2730,6 +2753,236 @@ impl App {
         }
     }
 
+    // --- vim mode ------------------------------------------------------------
+
+    fn vim_mode(&self) -> VimMode {
+        self.vim.as_ref().map(|v| v.mode).unwrap_or(VimMode::Normal)
+    }
+
+    fn vim_exit_visual(&mut self) {
+        if let Some(v) = &mut self.vim {
+            v.mode = VimMode::Normal;
+        }
+        self.anchor = None;
+    }
+
+    fn vim_toggle_visual(&mut self, target: VimMode) {
+        let cur = self.vim_mode();
+        if cur == target {
+            self.vim_exit_visual();
+            return;
+        }
+        if let Some(v) = &mut self.vim {
+            v.mode = target;
+        }
+        self.anchor = Some(self.cur);
+        if target == VimMode::VisualLine {
+            self.vim_extend_line();
+        }
+    }
+
+    /// In VisualLine mode, span the selection across full rows.
+    fn vim_extend_line(&mut self) {
+        let (_, used_c) = self.sheet().used_size();
+        let last = used_c.saturating_sub(1);
+        self.anchor = Some((self.anchor.map(|a| a.0).unwrap_or(self.cur.0), 0));
+        self.cur.1 = last;
+    }
+
+    /// Move to the next/prev non-empty cell in the current row (or by one).
+    fn vim_next_used(&mut self, dir: i64) {
+        let (r, c) = self.cur;
+        let (_, used_c) = self.sheet().used_size();
+        let mut nc = c as i64 + dir;
+        while nc >= 0 && (nc as u32) < used_c {
+            if self.sheet().cell(r, nc as u32).is_some() {
+                self.cur = (r, nc as u32);
+                self.ensure_visible();
+                return;
+            }
+            nc += dir;
+        }
+        self.move_cur(0, dir, self.vim_mode() != VimMode::Normal);
+    }
+
+    /// Route a key while in vim mode (not editing). Returns true to exit.
+    fn vim_key(&mut self, code: KeyCode, ctrl: bool, _shift: bool) -> bool {
+        if self.vim.as_ref().and_then(|v| v.cmdline.as_ref()).is_some() {
+            return self.vim_cmdline_key(code);
+        }
+        let pending = self.vim.as_ref().map(|v| v.pending).unwrap_or('\0');
+        if let Some(v) = &mut self.vim {
+            v.pending = '\0';
+        }
+        let visual = self.vim_mode() != VimMode::Normal;
+
+        // Multi-key prefixes.
+        match pending {
+            'g' => {
+                if code == KeyCode::Char('g') {
+                    self.cur.0 = 0;
+                    self.ensure_visible();
+                }
+                return false;
+            }
+            'd' => {
+                if code == KeyCode::Char('d') {
+                    self.row_op(false);
+                }
+                return false;
+            }
+            'y' => {
+                if code == KeyCode::Char('y') {
+                    let saved = self.anchor;
+                    let (_, used_c) = self.sheet().used_size();
+                    self.anchor = Some((self.cur.0, 0));
+                    self.cur.1 = used_c.saturating_sub(1);
+                    self.copy(false);
+                    self.anchor = saved;
+                }
+                return false;
+            }
+            _ => {}
+        }
+
+        match code {
+            KeyCode::Char(':') => {
+                if let Some(v) = &mut self.vim {
+                    v.cmdline = Some(String::new());
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.move_cur(0, -1, visual),
+            KeyCode::Char('l') | KeyCode::Right => self.move_cur(0, 1, visual),
+            KeyCode::Char('k') | KeyCode::Up => self.move_cur(-1, 0, visual),
+            KeyCode::Char('j') | KeyCode::Down => self.move_cur(1, 0, visual),
+            KeyCode::Char('0') => {
+                self.cur.1 = 0;
+                self.ensure_visible();
+            }
+            KeyCode::Char('$') => {
+                let (_, used_c) = self.sheet().used_size();
+                self.cur.1 = used_c.saturating_sub(1);
+                self.ensure_visible();
+            }
+            KeyCode::Char('G') => {
+                let (used_r, _) = self.sheet().used_size();
+                self.cur.0 = used_r.saturating_sub(1);
+                self.ensure_visible();
+            }
+            KeyCode::Char('g') => {
+                if let Some(v) = &mut self.vim {
+                    v.pending = 'g';
+                }
+            }
+            KeyCode::Char('w') => self.vim_next_used(1),
+            KeyCode::Char('b') => self.vim_next_used(-1),
+            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
+                self.vim_exit_visual();
+                self.start_edit(None);
+            }
+            KeyCode::Char('c') => {
+                self.vim_exit_visual();
+                self.start_edit(Some(' '));
+                if let Some(e) = &mut self.edit {
+                    e.text.clear();
+                    e.cursor = 0;
+                }
+            }
+            KeyCode::Char('x') => self.clear_selection(),
+            KeyCode::Char('v') => self.vim_toggle_visual(VimMode::Visual),
+            KeyCode::Char('V') => self.vim_toggle_visual(VimMode::VisualLine),
+            KeyCode::Char('y') => {
+                if visual {
+                    self.copy(false);
+                    self.vim_exit_visual();
+                } else if let Some(v) = &mut self.vim {
+                    v.pending = 'y';
+                }
+            }
+            KeyCode::Char('d') => {
+                if visual {
+                    self.clear_selection();
+                    self.vim_exit_visual();
+                } else if let Some(v) = &mut self.vim {
+                    v.pending = 'd';
+                }
+            }
+            KeyCode::Char('p') => self.paste(),
+            KeyCode::Char('u') => self.undo(),
+            KeyCode::Char('r') if ctrl => self.redo(),
+            KeyCode::Char('s') if ctrl => self.save(),
+            KeyCode::Char('q') if ctrl => {
+                if self.modified {
+                    self.confirm_quit = true;
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::Esc => self.vim_exit_visual(),
+            _ => {}
+        }
+        if self.vim_mode() == VimMode::VisualLine {
+            self.vim_extend_line();
+        }
+        false
+    }
+
+    fn vim_cmdline_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                if let Some(v) = &mut self.vim {
+                    v.cmdline = None;
+                }
+            }
+            KeyCode::Enter => {
+                let cmd = self
+                    .vim
+                    .as_mut()
+                    .and_then(|v| v.cmdline.take())
+                    .unwrap_or_default();
+                return self.vim_run_command(&cmd);
+            }
+            KeyCode::Backspace => {
+                if let Some(Some(c)) = self.vim.as_mut().map(|v| v.cmdline.as_mut()) {
+                    c.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(Some(c)) = self.vim.as_mut().map(|v| v.cmdline.as_mut()) {
+                    c.push(ch);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn vim_run_command(&mut self, cmd: &str) -> bool {
+        match cmd.trim() {
+            "w" => {
+                self.save();
+                false
+            }
+            "wq" | "x" => {
+                self.save();
+                true
+            }
+            "q" => {
+                if self.modified {
+                    self.status = Some("Unsaved changes (use :q! to discard)".to_string());
+                    false
+                } else {
+                    true
+                }
+            }
+            "q!" => true,
+            other => {
+                self.status = Some(format!("Not a command: :{other}"));
+                false
+            }
+        }
+    }
+
     fn open_prompt(&mut self, kind: PromptKind) {
         let (label, text) = match kind {
             PromptKind::Find => ("Find: ", self.last_find.clone().unwrap_or_default()),
@@ -3329,7 +3582,22 @@ fn draw(app: &mut App, f: &mut Frame) {
         );
         return;
     }
-    let hint = if app.model_view.is_some() && app.prompt.is_none() {
+    let hint = if let Some(v) = app.vim.as_ref().filter(|_| app.prompt.is_none()) {
+        match &v.cmdline {
+            Some(c) => format!(":{c}"),
+            None => match v.mode {
+                VimMode::Normal => {
+                    "-- NORMAL --  hjkl move · i edit · v visual · :w :q".to_string()
+                }
+                VimMode::Visual => {
+                    "-- VISUAL --  hjkl extend · y yank · d/x delete · Esc".to_string()
+                }
+                VimMode::VisualLine => {
+                    "-- VISUAL LINE --  j/k rows · y yank · d delete · Esc".to_string()
+                }
+            },
+        }
+    } else if app.model_view.is_some() && app.prompt.is_none() {
         "Model: ←/→ pane · ↑/↓ select · r relate · m measure · p report · d delete · Esc close"
             .to_string()
     } else if app.pivot_edit.is_some() {
@@ -4128,6 +4396,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // --- vim mode (normal / visual / command-line) ------------------------------
+    if app.vim.is_some() {
+        return app.vim_key(key.code, ctrl, shift);
+    }
+
     // --- navigation / commands --------------------------------------------------
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') if ctrl => {
@@ -4367,7 +4640,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 // Terminal shell
 // ---------------------------------------------------------------------------
 
-fn run_tui(pkg: SheetPackage, path: &str, welcome: bool) -> io::Result<()> {
+fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -4383,6 +4656,13 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool) -> io::Result<()> {
 
     let mut app = App::new(pkg, path);
     app.load_view_prefs();
+    if vim {
+        app.vim = Some(VimState {
+            mode: VimMode::Normal,
+            pending: '\0',
+            cmdline: None,
+        });
+    }
     app.start_screen = welcome;
     let result = loop {
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
@@ -4626,6 +4906,40 @@ mod tests {
         assert_eq!(app.cur, (4, 2));
         app.goto("A1");
         assert_eq!(app.cur, (0, 0));
+    }
+
+    #[test]
+    fn vim_mode_navigation_and_commands() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.vim = Some(VimState {
+            mode: VimMode::Normal,
+            pending: '\0',
+            cmdline: None,
+        });
+        // l l j → right, right, down.
+        app.vim_key(KeyCode::Char('l'), false, false);
+        app.vim_key(KeyCode::Char('l'), false, false);
+        app.vim_key(KeyCode::Char('j'), false, false);
+        assert_eq!(app.cur, (1, 2));
+        // gg → first row.
+        app.vim_key(KeyCode::Char('g'), false, false);
+        app.vim_key(KeyCode::Char('g'), false, false);
+        assert_eq!(app.cur.0, 0);
+        // Visual select + yank returns to Normal.
+        app.vim_key(KeyCode::Char('v'), false, false);
+        assert_eq!(app.vim_mode(), VimMode::Visual);
+        app.vim_key(KeyCode::Char('l'), false, false);
+        app.vim_key(KeyCode::Char('y'), false, false);
+        assert_eq!(app.vim_mode(), VimMode::Normal);
+        // `i` enters insert (edit) mode.
+        app.vim_key(KeyCode::Char('i'), false, false);
+        assert!(app.edit.is_some());
+        app.cancel_edit();
+        // :q on an unmodified sheet exits.
+        app.vim_key(KeyCode::Char(':'), false, false);
+        app.vim_key(KeyCode::Char('q'), false, false);
+        assert!(app.vim_key(KeyCode::Enter, false, false));
     }
 
     #[test]
