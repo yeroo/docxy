@@ -341,6 +341,18 @@ impl formula::Resolver for ModelResolver<'_> {
         })
     }
 
+    fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<TableInfo> {
+        // Row-context iteration positions the evaluator inside a virtual
+        // table sheet; any in-range cell belongs to that table.
+        let (_, f) = self.model.tables.get(sheet)?;
+        let (rows, cols) = (f.rows() as u32, f.cols.len() as u32);
+        if row <= rows && col < cols {
+            let name = &self.model.tables[sheet].0;
+            return self.table(name);
+        }
+        None
+    }
+
     fn defined_name(&self, name: &str, _current_sheet: usize) -> Option<String> {
         self.model
             .measures
@@ -640,6 +652,29 @@ mod tests {
         assert_eq!(m.eval_measure("AvgPerUnit"), v(115.0 / 11.0));
         // Unknown names surface as #NAME?.
         assert_eq!(m.eval_measure("Nonsense+1"), Value::Err(ExcelError::Name));
+    }
+
+    #[test]
+    fn sumx_measures_respect_filter_context() {
+        let mut m = star();
+        // Row-context measure: revenue-weighted... just Qty*Amount per row.
+        m.add_measure("Weighted", "SUMX(Sales,[@Qty]*[@Amount])");
+        assert_eq!(
+            m.eval_measure("Weighted"),
+            v(2.0 * 20.0 + 15.0 + 3.0 * 30.0 + 5.0 * 50.0)
+        );
+        // Under filter context, only the group's fact rows iterate.
+        let spec = ModelSpec {
+            rows: vec!["Groups[Category]".into()],
+            measures: vec![("W".into(), "Weighted".into())],
+            grand_rows: true,
+            ..ModelSpec::default()
+        };
+        let out = model_pivot(&m, "Sales", &spec).unwrap();
+        // Office = products 1,2: 2*20 + 1*15 + 3*30 = 145; Supplies = 5*50.
+        assert_eq!(out.grid[1], vec![t("Office"), v(145.0)]);
+        assert_eq!(out.grid[2], vec![t("Supplies"), v(250.0)]);
+        assert_eq!(out.grid[3], vec![t("Grand Total"), v(395.0)]);
     }
 
     #[test]

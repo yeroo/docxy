@@ -3754,6 +3754,61 @@ enum TView {
     Mat(Matrix),
 }
 
+trait NumOrZero {
+    fn num_or_zero(self, nums: &[f64]) -> Value;
+}
+impl NumOrZero for Value {
+    /// MAXX/MINX over rows yielding no numbers give 0 (like pivot Max/Min).
+    fn num_or_zero(self, nums: &[f64]) -> Value {
+        if nums.is_empty() {
+            Value::Num(0.0)
+        } else {
+            self
+        }
+    }
+}
+
+/// Collect the table names iterated by SUMX-family calls (their rows are
+/// real dependencies even though the name isn't a reference).
+pub fn collect_iterated_tables(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Func(name, args) => {
+            if matches!(
+                name.as_str(),
+                "SUMX" | "AVERAGEX" | "MAXX" | "MINX" | "COUNTX" | "COUNTAX"
+            ) {
+                match args.first() {
+                    Some(Expr::Name(n)) => out.push(n.clone()),
+                    Some(Expr::Structured { table: Some(t), .. }) => out.push(t.clone()),
+                    _ => {}
+                }
+            }
+            for a in args {
+                collect_iterated_tables(a, out);
+            }
+        }
+        Expr::Call(callee, args) => {
+            collect_iterated_tables(callee, out);
+            for a in args {
+                collect_iterated_tables(a, out);
+            }
+        }
+        Expr::ArrayLit(rows) => {
+            for row in rows {
+                for x in row {
+                    collect_iterated_tables(x, out);
+                }
+            }
+        }
+        Expr::Un(_, x) => collect_iterated_tables(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_iterated_tables(l, out);
+            collect_iterated_tables(r, out);
+        }
+        _ => {}
+    }
+}
+
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they
 /// can return matrices)?
 fn is_array_fn(name: &str) -> bool {
@@ -4552,6 +4607,77 @@ impl<'a> Eval<'a> {
                 match self.eval_if_ranges(&args[0], &args[1], None) {
                     Ok((count, _)) => Value::Num(count as f64),
                     Err(v) => v,
+                }
+            }
+            // ---- row-context iterators (DAX-flavored) -----------------
+            // SUMX(Table, expr) evaluates expr once per data row of the
+            // table, with bare [@Col] references resolving to that row.
+            "SUMX" | "AVERAGEX" | "MAXX" | "MINX" | "COUNTX" | "COUNTAX" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let info = match &args[0] {
+                    Expr::Name(n) => self.res.table(n),
+                    Expr::Structured {
+                        table: Some(t),
+                        item: TableItem::Data | TableItem::All,
+                        col1: None,
+                        ..
+                    } => self.res.table(t),
+                    _ => None,
+                };
+                let Some(info) = info else {
+                    // A table we can't see — don't guess.
+                    self.unsupported = true;
+                    return Value::Err(ExcelError::Name);
+                };
+                let (r1, c1, r2, _) = info.range;
+                let lo = r1 + info.header_rows;
+                let Some(hi) = r2.checked_sub(info.totals_rows) else {
+                    return Value::Err(ExcelError::Ref);
+                };
+                if lo > hi {
+                    return Value::Err(ExcelError::Ref);
+                }
+                let (save_sheet, save_cell) = (self.sheet, self.cell);
+                let mut results: Vec<Value> = Vec::with_capacity((hi - lo + 1) as usize);
+                for r in lo..=hi {
+                    self.sheet = info.sheet;
+                    self.cell = (r, c1);
+                    results.push(self.eval(&args[1]));
+                }
+                self.sheet = save_sheet;
+                self.cell = save_cell;
+                let mut nums = Vec::with_capacity(results.len());
+                let mut nonempty = 0usize;
+                for v in &results {
+                    match v {
+                        Value::Err(e) => return Value::Err(*e),
+                        Value::Num(x) => {
+                            nums.push(*x);
+                            nonempty += 1;
+                        }
+                        Value::Empty => {}
+                        _ => nonempty += 1,
+                    }
+                }
+                match name {
+                    "SUMX" => num(nums.iter().sum()),
+                    "AVERAGEX" => {
+                        if nums.is_empty() {
+                            Value::Err(ExcelError::Div0)
+                        } else {
+                            num(nums.iter().sum::<f64>() / nums.len() as f64)
+                        }
+                    }
+                    "MAXX" => {
+                        Value::Num(nums.iter().copied().fold(f64::MIN, f64::max)).num_or_zero(&nums)
+                    }
+                    "MINX" => {
+                        Value::Num(nums.iter().copied().fold(f64::MAX, f64::min)).num_or_zero(&nums)
+                    }
+                    "COUNTX" => Value::Num(nums.len() as f64),
+                    _ => Value::Num(nonempty as f64), // COUNTAX
                 }
             }
             "SUMPRODUCT" => {
@@ -7443,5 +7569,40 @@ mod tests {
             ),
             56.0 // 4 + 16 + 36
         );
+    }
+
+    #[test]
+    fn sumx_family_iterates_rows() {
+        // A 2-column table: Qty (col 0) and Price (col 1), rows 1..=3.
+        let g = Grid::new(&[
+            ("A1", Value::Str("Qty".into())),
+            ("B1", Value::Str("Price".into())),
+            ("A2", Value::Num(2.0)),
+            ("B2", Value::Num(10.0)),
+            ("A3", Value::Num(3.0)),
+            ("B3", Value::Num(5.0)),
+            ("A4", Value::Num(1.0)),
+            ("B4", Value::Num(100.0)),
+        ])
+        .with_table(TableInfo {
+            sheet: 0,
+            range: (0, 0, 3, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+        });
+        // Row context: [@Qty]*[@Price] per row → 20 + 15 + 100.
+        assert_eq!(n("SUMX(Sales,[@Qty]*[@Price])", &g), 135.0);
+        assert_eq!(n("AVERAGEX(Sales,[@Qty]*[@Price])", &g), 45.0);
+        assert_eq!(n("MAXX(Sales,[@Qty]*[@Price])", &g), 100.0);
+        assert_eq!(n("MINX(Sales,[@Qty]*[@Price])", &g), 15.0);
+        assert_eq!(n("COUNTX(Sales,[@Price])", &g), 3.0);
+        // Conditional row logic.
+        assert_eq!(n("SUMX(Sales,IF([@Qty]>1,[@Qty]*[@Price],0))", &g), 35.0);
+        // Unknown table: honest #NAME? and unsupported.
+        let ast = parse("SUMX(Nope,[@Qty])").unwrap();
+        let mut ev = Eval::new(&g, 0, (0, 0));
+        assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Name));
+        assert!(ev.unsupported);
     }
 }

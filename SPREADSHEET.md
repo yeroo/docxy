@@ -291,7 +291,12 @@ The strategic piece: **conformance is measured, not claimed.**
   (`Base; rows; values[; cols]`) into a fresh sheet, `d` deletes.
   Definitions persist across save/load in a custom `xl/gridcoreModel.xml`
   part (a gridcore extension — Excel ignores it; our round-trip keeps it).
-  Remaining: more sources, DAX-style row-context iterators (SUMX).* Multiple
+  DAX-style row-context iterators shipped: `SUMX`/`AVERAGEX`/`MAXX`/
+  `MINX`/`COUNTX`/`COUNTAX` evaluate an expression once per table data row
+  with bare `[@Col]` references bound to that row — in sheet formulas over
+  Excel Tables (with whole-table dependency tracking) and in model
+  measures, where filter context restricts the iterated rows. Remaining:
+  more sources.* Multiple
   tables, relationships, measures over the phase-D query core; sources
   beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
   small BI engine that happens to have a terminal frontend.

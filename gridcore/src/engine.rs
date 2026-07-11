@@ -517,6 +517,14 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+    // Tables iterated by SUMX-family calls: the whole data region is read.
+    let mut iterated = Vec::new();
+    formula::collect_iterated_tables(ast, &mut iterated);
+    for name in iterated {
+        if let Some(t) = wb.table(&name) {
+            out.push((t.sheet, t.range.0, t.range.1, t.range.2, t.range.3));
+        }
+    }
     let mut structured = Vec::new();
     formula::collect_structured(ast, &mut structured);
     for (tname, item, col1, col2) in structured {
@@ -1202,5 +1210,33 @@ mod tests {
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(5.0));
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn sumx_tracks_table_dependencies() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Qty")),
+            ("B1", Cell::text("Price")),
+            ("A2", Cell::number(2.0)),
+            ("B2", Cell::number(10.0)),
+            ("A3", Cell::number(3.0)),
+            ("B3", Cell::number(5.0)),
+            ("D1", Cell::formula("SUMX(Sales,[@Qty]*[@Price])")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 0, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            part: String::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(35.0));
+        // Editing a row inside the iterated table recalculates the SUMX.
+        set(&mut eng, &mut wb, "B3", Cell::number(100.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(320.0));
     }
 }

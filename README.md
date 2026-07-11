@@ -143,10 +143,11 @@ elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh and editing** (a
 columnar group-by/aggregate engine recomputes pivots from current data —
 `F9` in the TUI, automatic under `--recalc`; `Ctrl-P` edits a pivot's
 fields — or creates a new pivot from the selected data range), a **data model**
-(`gridcore::model`: multiple tables with relationships and Excel-formula
-measures, filter context through star schemas, CSV sources — `xlsxy
-data.csv` imports directly; `Ctrl-M` manages the model in the TUI and
-materializes reports, with definitions persisted in the file), and the
+(`gridcore::model`: multiple tables with relationships, Excel-formula
+measures plus DAX-style row-context iterators like
+`SUMX(Sales,[@Qty]*[@Price])`, filter context through star schemas, CSV
+sources — `xlsxy data.csv` imports directly; `Ctrl-M` manages the model in
+the TUI and materializes reports, with definitions persisted in the file), and the
 same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
