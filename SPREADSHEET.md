@@ -325,6 +325,19 @@ The strategic piece: **conformance is measured, not claimed.**
   xlsx corpus classified by `corpus/tools/classify_xlsx.py` (search by
   feature tag or worksheet-function name).*
 
+- **Phase G — Review & comments** ✅ *shipped: cell comments, modelled the
+  same way docxy handles Word review comments. `gridcore::comments` reads
+  both legacy `xl/comments*.xml` notes and modern threaded conversations
+  (resolving authors through `xl/persons`), and authors legacy notes with
+  the full OPC wiring — comments part, VML note box, worksheet
+  `<legacyDrawing>` hook, content types, relationships — so a note written
+  in xlsxy opens as a real note in Excel and survives round-trips. xlsxy
+  grew a Word/Excel-style **ribbon** (F9 to engage; Home / Insert / Review /
+  View tabs, mouse- and keyboard-driven) whose **Review** tab drives the
+  comment lifecycle: New, Delete, Prev/Next navigation, and a toggleable
+  side panel. Commented cells are underlined in the grid (the terminal
+  analogue of Excel's red triangle).*
+
 Each phase ships independently through the existing signed-release pipeline.
 
 ---
