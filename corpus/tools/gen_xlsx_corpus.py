@@ -310,6 +310,33 @@ def wb_gradebook(wb):
     ws["G4"] = '=INDEX(A2:A6,MATCH(MAX(D2:D6),D2:D6,0))'
 
 
+def wb_salestable(wb):
+    """A real Excel Table (ListObject) with calculated columns and
+    structured-reference aggregations."""
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    ws = wb.active
+    ws.title = "Orders"
+    ws.append(["Item", "Qty", "Price", "Amount"])
+    # LibreOffice evaluates the explicit [#This Row] form; the bare [@Col]
+    # sugar (identical semantics) is covered by gridcore's unit tests.
+    for item, qty, price in [("pen", 3, 1.5), ("pad", 2, 4), ("ink", 5, 2),
+                             ("clip", 10, 0.25)]:
+        ws.append([item, qty, price,
+                   "=Sales[[#This Row],[Qty]]*Sales[[#This Row],[Price]]"])
+    tab = Table(displayName="Sales", ref="A1:D5")
+    tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2",
+                                        showRowStripes=True)
+    ws.add_table(tab)
+    ws["F1"] = "=SUM(Sales[Amount])"
+    ws["F2"] = "=SUM(Sales[Qty])"
+    ws["F3"] = "=COUNTA(Sales[#Headers])"
+    ws["F4"] = "=SUM(Sales[[Qty]:[Price]])"
+    ws["F5"] = "=AVERAGE(Sales[Price])"
+    ws["F6"] = "=SUMPRODUCT(Sales[Qty],Sales[Price])"
+    ws["F7"] = "=SUM(Sales[#All])"
+    ws["F8"] = '=SUMIF(Sales[Item],"p*",Sales[Amount])'
+
+
 def wb_edge_cases(wb):
     ws = wb.active
     ws.title = "Edgy"
@@ -348,6 +375,7 @@ WORKBOOKS = {
     "calc-refs": wb_refs,
     "shape-amortization": wb_amortization,
     "shape-gradebook": wb_gradebook,
+    "shape-salestable": wb_salestable,
     "edge-cases": wb_edge_cases,
 }
 

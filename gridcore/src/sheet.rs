@@ -288,6 +288,50 @@ impl Sheet {
 // Workbook
 // ---------------------------------------------------------------------------
 
+/// An Excel Table (ListObject): a named rectangular region with headers,
+/// resolvable by structured references (`Table1[Amount]`, `[@Price]`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Table {
+    /// The displayName — what formulas use.
+    pub name: String,
+    /// Owning sheet index in `Workbook::sheets`.
+    pub sheet: usize,
+    /// Full region incl. header and totals rows: (r1, c1, r2, c2), 0-based.
+    pub range: (u32, u32, u32, u32),
+    pub header_rows: u32,
+    pub totals_rows: u32,
+    /// Column names, left to right.
+    pub columns: Vec<String>,
+    /// The xl/tables/*.xml part backing this table (its `ref` is patched on
+    /// save when the range moved).
+    pub part: String,
+}
+
+impl Table {
+    /// The data region (between header and totals), if non-empty.
+    pub fn data_rows(&self) -> Option<(u32, u32)> {
+        let r1 = self.range.0 + self.header_rows;
+        let r2 = self.range.2.checked_sub(self.totals_rows)?;
+        (r1 <= r2).then_some((r1, r2))
+    }
+
+    /// 0-based sheet column of a named table column.
+    pub fn column_index(&self, name: &str) -> Option<u32> {
+        self.columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+            .map(|i| self.range.1 + i as u32)
+    }
+
+    pub fn contains(&self, sheet: usize, row: u32, col: u32) -> bool {
+        sheet == self.sheet
+            && row >= self.range.0
+            && row <= self.range.2
+            && col >= self.range.1
+            && col <= self.range.3
+    }
+}
+
 /// A workbook-level defined name: `TaxRate` → `0.21`, `Data` →
 /// `Sheet1!$A$1:$B$9`. `scope` restricts the name to one sheet
 /// (`localSheetId`); None = workbook-global.
@@ -304,6 +348,7 @@ pub struct Workbook {
     pub sheets: Vec<Sheet>,
     pub styles: Styles,
     pub defined_names: Vec<DefinedName>,
+    pub tables: Vec<Table>,
     /// True when the workbook uses the 1904 date system (Mac legacy).
     pub date1904: bool,
 }
@@ -314,6 +359,18 @@ impl Workbook {
         self.sheets
             .iter()
             .position(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    /// A table by displayName, case-insensitive.
+    pub fn table(&self, name: &str) -> Option<&Table> {
+        self.tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The table containing a cell, if any (for bare `[@Col]` references).
+    pub fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<&Table> {
+        self.tables.iter().find(|t| t.contains(sheet, row, col))
     }
 
     /// Resolve a defined name as seen from `current_sheet`: a name scoped to

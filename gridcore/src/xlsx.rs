@@ -24,7 +24,7 @@ use opccore::zipwrite::write_zip;
 
 use crate::formula::translate_formula;
 use crate::sheet::{
-    Cell, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Workbook, Xf, cell_name,
+    Cell, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf, cell_name,
     classify_builtin, classify_format_code, parse_cell_name, parse_range_name,
 };
 
@@ -167,6 +167,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
 
     let mut sheets = Vec::new();
     let mut sheet_parts = Vec::new();
+    let mut tables: Vec<Table> = Vec::new();
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
@@ -185,7 +186,27 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         };
         let mut sheet = parse_worksheet(&xml, &shared);
         sheet.name = name;
-        orig_to_model.push(Some(sheets.len()));
+        let sheet_idx = sheets.len();
+        orig_to_model.push(Some(sheet_idx));
+
+        // Excel Tables attached to this worksheet, via its own rels part.
+        let ws_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let ws_file = part.rsplit_once('/').map(|(_, f)| f).unwrap_or(&part);
+        let ws_rels_name = format!("{ws_dir}/_rels/{ws_file}.rels");
+        if let Some(rels_xml) = get_str(&ws_rels_name) {
+            for (_, ty, target) in parse_rels(&rels_xml) {
+                if !ty.ends_with("/table") {
+                    continue;
+                }
+                let table_part = resolve_relative(ws_dir, &target);
+                if let Some(txml) = get_str(&table_part) {
+                    if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
+                        tables.push(t);
+                    }
+                }
+            }
+        }
+
         sheets.push(sheet);
         sheet_parts.push(part);
     }
@@ -209,8 +230,70 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             sheets,
             styles,
             defined_names,
+            tables,
             date1904,
         },
+    })
+}
+
+/// Resolve a rels target relative to a directory ("../tables/table1.xml"
+/// against "xl/worksheets" → "xl/tables/table1.xml").
+fn resolve_relative(dir: &str, target: &str) -> String {
+    if let Some(abs) = target.strip_prefix('/') {
+        return abs.to_string();
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in target.split('/') {
+        match seg {
+            ".." => {
+                parts.pop();
+            }
+            "." | "" => {}
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Parse one xl/tables/*.xml part.
+fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
+    let mut p = XmlParser::new(xml);
+    let mut name = String::new();
+    let mut range = None;
+    let mut header_rows = 1u32;
+    let mut totals_rows = 0u32;
+    let mut columns = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "table" => {
+                    name = decode(p.attr("displayName"));
+                    if name.is_empty() {
+                        name = decode(p.attr("name"));
+                    }
+                    range = parse_range_name(p.attr("ref"));
+                    if let Ok(h) = p.attr("headerRowCount").parse::<u32>() {
+                        header_rows = h;
+                    }
+                    if let Ok(t) = p.attr("totalsRowCount").parse::<u32>() {
+                        totals_rows = t;
+                    }
+                }
+                "tableColumn" => columns.push(decode(p.attr("name"))),
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Some(Table {
+        name,
+        sheet: sheet_idx,
+        range: range?,
+        header_rows,
+        totals_rows,
+        columns,
+        part: part.to_string(),
     })
 }
 
@@ -825,6 +908,22 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         }
     }
 
+    // --- table geometry: row edits move table ranges; the part must follow --
+    for t in &wb.tables {
+        let Some(p) = parts.iter_mut().find(|(n, _)| n == &t.part) else {
+            continue;
+        };
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        let (r1, c1, r2, c2) = t.range;
+        let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+        let mut updated = patch_ref_attr(&xml, "<table", &full);
+        // autoFilter covers the table minus its totals row.
+        let af_r2 = r2.saturating_sub(t.totals_rows).max(r1);
+        let af = format!("{}:{}", cell_name(r1, c1), cell_name(af_r2, c2));
+        updated = patch_ref_attr(&updated, "<autoFilter", &af);
+        p.1 = updated.into_bytes();
+    }
+
     // --- sheet names: the model is authoritative ----------------------------
     // workbook.xml is otherwise preserved verbatim, so a rename in the model
     // must be patched into the <sheet name="…"> attributes (in order).
@@ -1049,6 +1148,23 @@ fn esc_attr(s: &str) -> String {
             _ => out.push(ch),
         }
     }
+    out
+}
+
+/// Replace the `ref="…"` attribute value of the first `prefix` element.
+fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
+    let Some(el) = xml.find(prefix) else {
+        return xml.to_string();
+    };
+    let Some(rel) = xml[el..].find("ref=\"") else {
+        return xml.to_string();
+    };
+    let vs = el + rel + 5;
+    let Some(ve) = xml[vs..].find('"') else {
+        return xml.to_string();
+    };
+    let mut out = xml.to_string();
+    out.replace_range(vs..vs + ve, new_ref);
     out
 }
 
@@ -1390,6 +1506,7 @@ pub fn new_xlsx() -> SheetPackage {
                 xfs: vec![Xf::default()],
             },
             defined_names: Vec::new(),
+            tables: Vec::new(),
             date1904: false,
         },
     }

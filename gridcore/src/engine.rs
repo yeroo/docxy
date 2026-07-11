@@ -73,7 +73,7 @@ impl Engine {
         match formula::parse(src) {
             Ok(ast) => {
                 let mut deps = Vec::new();
-                collect_deps(wb, key.0, &ast, &mut deps, 0);
+                collect_deps(wb, key, &ast, &mut deps, 0);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
@@ -252,9 +252,13 @@ impl Engine {
     }
 }
 
-/// Dependency rects of an AST, with sheet names resolved and defined names
-/// expanded through the workbook (depth-capped against name→name loops).
-fn collect_deps(wb: &Workbook, sheet: usize, ast: &Expr, out: &mut Vec<Rect>, depth: u32) {
+/// Dependency rects of an AST, with sheet names resolved, defined names
+/// expanded (depth-capped against name→name loops), and structured refs
+/// resolved through the workbook's table definitions. `key` is the formula's
+/// own cell — `[@Col]` depends on exactly that row, never the whole table
+/// (a whole-table dep would make calculated columns self-referential).
+fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth: u32) {
+    let (sheet, row, col) = key;
     let mut named = Vec::new();
     collect_refs(ast, &mut named);
     for (sheet_name, r1, c1, r2, c2) in named {
@@ -266,6 +270,20 @@ fn collect_deps(wb: &Workbook, sheet: usize, ast: &Expr, out: &mut Vec<Rect>, de
             out.push((s, r1, c1, r2, c2));
         }
     }
+    let mut structured = Vec::new();
+    formula::collect_structured(ast, &mut structured);
+    for (tname, item, col1, col2) in structured {
+        let t = match &tname {
+            Some(n) => wb.table(n),
+            None => wb.table_at(sheet, row, col),
+        };
+        if let Some(t) = t {
+            let info = to_table_info(t);
+            if let Some((r1, c1, r2, c2)) = info.resolve(item, &col1, &col2, row) {
+                out.push((t.sheet, r1, c1, r2, c2));
+            }
+        }
+    }
     if depth >= 8 {
         return;
     }
@@ -274,9 +292,19 @@ fn collect_deps(wb: &Workbook, sheet: usize, ast: &Expr, out: &mut Vec<Rect>, de
     for n in names {
         if let Some(def) = wb.defined_name(&n, sheet) {
             if let Ok(def_ast) = formula::parse(def) {
-                collect_deps(wb, sheet, &def_ast, out, depth + 1);
+                collect_deps(wb, key, &def_ast, out, depth + 1);
             }
         }
+    }
+}
+
+fn to_table_info(t: &crate::sheet::Table) -> crate::formula::TableInfo {
+    crate::formula::TableInfo {
+        sheet: t.sheet,
+        range: t.range,
+        header_rows: t.header_rows,
+        totals_rows: t.totals_rows,
+        columns: t.columns.clone(),
     }
 }
 
@@ -359,6 +387,14 @@ impl Resolver for WbResolver<'_> {
         self.wb
             .defined_name(name, current_sheet)
             .map(str::to_string)
+    }
+
+    fn table(&self, name: &str) -> Option<formula::TableInfo> {
+        self.wb.table(name).map(to_table_info)
+    }
+
+    fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<formula::TableInfo> {
+        self.wb.table_at(sheet, row, col).map(to_table_info)
     }
 
     fn rand(&self) -> Option<f64> {
@@ -589,6 +625,42 @@ mod tests {
         set(&mut eng, &mut wb, "A100", Cell::number(1.0));
         assert_eq!(value_at(&wb, "B1"), CellValue::Number(13.0));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(14.0));
+    }
+
+    #[test]
+    fn structured_refs_calc_without_cycles_and_propagate() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Amount")),
+            ("A2", Cell::text("pen")),
+            ("B2", Cell::number(3.0)),
+            ("C2", Cell::formula("[@Qty]*2")),
+            ("A3", Cell::text("pad")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::formula("[@Qty]*2")),
+            ("E1", Cell::formula("SUM(Sales[Amount])")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 0, 2, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Item".into(), "Qty".into(), "Amount".into()],
+            part: String::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Calculated column evaluates (no #CYCLE! from self-deps) and the
+        // aggregation sees it in topological order.
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(8.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(14.0));
+        // Editing a Qty propagates through the calculated column to the sum.
+        set(&mut eng, &mut wb, "B2", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(28.0));
     }
 
     #[test]

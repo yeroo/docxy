@@ -130,6 +130,39 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             dn.formula = updated;
         }
     }
+
+    // Table regions follow the grid. Row edits stretch/shift freely; column
+    // edits move a table only when they fall entirely to its left — resizing
+    // a table's column set would desync it from its tableColumns definition
+    // (a later refinement), so intersecting column edits leave it in place.
+    for t in &mut wb.tables {
+        if t.sheet != idx {
+            continue;
+        }
+        let (r1, c1, r2, c2) = t.range;
+        if shift.rows {
+            if let Some((lo, hi)) = span(r1, r2, &shift) {
+                // Keep at least the header row alive.
+                if hi >= lo {
+                    t.range = (lo, c1, hi, c2);
+                }
+            }
+        } else if shift.at <= c1 {
+            let edge = if shift.delta < 0 {
+                shift.at as i64 - shift.delta // first surviving column
+            } else {
+                shift.at as i64
+            };
+            if edge <= c1 as i64 {
+                let d = shift.delta;
+                let nc1 = (c1 as i64 + d).max(0) as u32;
+                let nc2 = (c2 as i64 + d).max(0) as u32;
+                if nc2 < MAX_COLS {
+                    t.range = (r1, nc1, r2, nc2);
+                }
+            }
+        }
+    }
 }
 
 /// One coordinate through the shift; None = deleted.

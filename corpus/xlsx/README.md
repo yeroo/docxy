@@ -9,7 +9,7 @@ workbook (or several — an aggregate is printed) with:
 xlsxy corpus/xlsx/*.xlsx --verify
 ```
 
-Current scoreboard: **415/415 formula cells (100%)** across 14 files.
+Current scoreboard: **427/427 formula cells (100%)** across 15 files.
 
 ## The test suite over this corpus (runs in CI)
 
@@ -36,7 +36,9 @@ Current scoreboard: **415/415 formula cells (100%)** across 14 files.
   text, logic, lookup, dates, financial, criteria (`*IF`/`*IFS` with
   wildcards), cross-sheet + whole-column + defined-name references, a
   realistic amortization table (exercises shared-formula groups as written
-  by LibreOffice), a gradebook (INDEX/MATCH, nested IF), and edge cases
+  by LibreOffice), a gradebook (INDEX/MATCH, nested IF), a real Excel Table
+  with calculated columns and structured references
+  (`shape-salestable.xlsx`), and edge cases
   (XML-hostile text, unicode, long dependency chains, error values, merged
   cells).
 
@@ -53,6 +55,10 @@ python3 corpus/tools/gen_xlsx_corpus.py
 - LibreOffice 24.2 predates `XLOOKUP` (added in 24.8), so it can't oracle
   those; XLOOKUP is covered by gridcore's unit tests until a real-Excel
   corpus file provides it.
+- LibreOffice does not evaluate the bare `[@Col]` sugar when authored via
+  openpyxl (it caches `#N/A`); the equivalent explicit
+  `Table[[#This Row],[Col]]` form works and is what the generator emits.
+  gridcore supports both (unit-tested).
 - Known LibreOffice-vs-Excel deviations in this corpus: none currently.
   Document any future ones here, with the corrected cell noted.
 

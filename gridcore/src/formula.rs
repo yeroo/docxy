@@ -127,6 +127,18 @@ pub enum BinOp {
     Ge,
 }
 
+/// Which region of a table a structured reference addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableItem {
+    /// The data region (between header and totals) — the default.
+    Data,
+    All,
+    Headers,
+    Totals,
+    /// `@` — the formula's own row.
+    ThisRow,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
@@ -162,6 +174,18 @@ pub enum Expr {
         abs1: bool,
         abs2: bool,
     },
+    /// A structured (table) reference: `Table1[Amount]`, `[@Price]`,
+    /// `Table1[[#Totals],[Amount]]`. Resolved through the workbook's table
+    /// definitions at evaluation time.
+    Structured {
+        /// None = the table enclosing the formula's cell (bare `[@Col]`).
+        table: Option<String>,
+        item: TableItem,
+        /// Column (or first column of a span).
+        col1: Option<String>,
+        /// Second column of a `[[A]:[B]]` span.
+        col2: Option<String>,
+    },
     /// A defined name, resolved through the workbook at evaluation time.
     Name(String),
     Func(String, Vec<Expr>),
@@ -181,6 +205,8 @@ enum Tok {
     Ident(String),
     /// `'Sheet name'` — always a sheet qualifier.
     Quoted(String),
+    /// `[...]` — a structured-reference spec, raw inner text (nesting kept).
+    Bracket(String),
     Err(ExcelError),
     LParen,
     RParen,
@@ -228,6 +254,41 @@ impl<'a> Lexer<'a> {
         Ok(match c {
             b'(' => Tok::LParen,
             b')' => Tok::RParen,
+            b'[' => {
+                // Scan to the matching ']' (structured refs nest one level:
+                // Table1[[#Totals],[My Col]]); a single quote escapes the
+                // next character inside the spec.
+                let start = self.pos;
+                let mut depth = 1usize;
+                while self.pos < self.src.len() {
+                    match self.src[self.pos] {
+                        b'\'' => {
+                            self.pos += 1; // escape: skip the next byte too
+                            if self.pos < self.src.len() {
+                                self.pos += 1;
+                            }
+                            continue;
+                        }
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                if depth != 0 {
+                    return Err("unterminated [ in structured reference".into());
+                }
+                let inner = std::str::from_utf8(&self.src[start..self.pos])
+                    .map_err(|_| "bad structured reference".to_string())?
+                    .to_string();
+                self.pos += 1; // consume ']'
+                Tok::Bracket(inner)
+            }
             b',' => Tok::Comma,
             b':' => Tok::Colon,
             b'!' => Tok::Bang,
@@ -561,12 +622,24 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 self.sheet_ref(Some(name))
             }
+            Tok::Bracket(spec) => {
+                // Bare `[@Col]` / `[Col]` — the enclosing table's reference.
+                self.bump()?;
+                parse_spec(None, &spec)
+            }
             Tok::Ident(id) => {
                 self.bump()?;
                 match self.tok {
                     Tok::Bang => {
                         self.bump()?;
                         self.sheet_ref(Some(id))
+                    }
+                    Tok::Bracket(_) => {
+                        let Tok::Bracket(spec) = std::mem::replace(&mut self.tok, Tok::Eof) else {
+                            unreachable!()
+                        };
+                        self.bump()?;
+                        parse_spec(Some(id), &spec)
                     }
                     Tok::LParen => {
                         self.bump()?;
@@ -769,6 +842,214 @@ fn parse_ref_text(s: &str) -> Option<CellRef> {
     })
 }
 
+/// Unescape a structured-ref name: a single quote escapes the next char
+/// (`'[`, `']`, `'#`, `'@`, `''`).
+fn unescape_spec(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Split a multi-part spec body on top-level commas: `[#Totals],[Amount]` →
+/// two bracketed parts. (The lexer already balanced the outer brackets.)
+fn split_spec_parts(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => i += 1, // escape: skip next
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// One part of a spec: `#Item`, `@`, `@Name`, a column name, or a bracketed
+/// version of any of those.
+enum SpecPart {
+    Item(TableItem),
+    ThisRow(Option<String>),
+    Col(String),
+    Span(String, String),
+}
+
+fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
+    let t = raw.trim();
+    // `[A]:[B]` — a column span.
+    if let Some((a, b)) = split_top_level_colon(t) {
+        let name = |x: &str| -> Result<String, String> {
+            let x = x.trim();
+            let inner = x
+                .strip_prefix('[')
+                .and_then(|y| y.strip_suffix(']'))
+                .unwrap_or(x);
+            Ok(unescape_spec(inner))
+        };
+        return Ok(SpecPart::Span(name(a)?, name(b)?));
+    }
+    // Strip one level of brackets: `[#Totals]` → `#Totals`.
+    let t = t
+        .strip_prefix('[')
+        .and_then(|y| y.strip_suffix(']'))
+        .unwrap_or(t)
+        .trim();
+    if let Some(rest) = t.strip_prefix('#') {
+        return match rest.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(SpecPart::Item(TableItem::All)),
+            "data" => Ok(SpecPart::Item(TableItem::Data)),
+            "headers" => Ok(SpecPart::Item(TableItem::Headers)),
+            "totals" => Ok(SpecPart::Item(TableItem::Totals)),
+            "this row" => Ok(SpecPart::Item(TableItem::ThisRow)),
+            other => Err(format!("unknown table item #{other}")),
+        };
+    }
+    if let Some(rest) = t.strip_prefix('@') {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(SpecPart::ThisRow(None));
+        }
+        let inner = rest
+            .strip_prefix('[')
+            .and_then(|y| y.strip_suffix(']'))
+            .unwrap_or(rest);
+        return Ok(SpecPart::ThisRow(Some(unescape_spec(inner))));
+    }
+    Ok(SpecPart::Col(unescape_spec(t)))
+}
+
+/// Split `X:Y` at a top-level colon (outside brackets/escapes).
+fn split_top_level_colon(s: &str) -> Option<(&str, &str)> {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => i += 1,
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a full bracket spec into a structured-reference expression.
+fn parse_spec(table: Option<String>, spec: &str) -> Result<Expr, String> {
+    let body = spec.trim();
+    if body.is_empty() {
+        // `Table1[]` — the whole data region.
+        return Ok(Expr::Structured {
+            table,
+            item: TableItem::Data,
+            col1: None,
+            col2: None,
+        });
+    }
+    let mut item: Option<TableItem> = None;
+    let mut col1: Option<String> = None;
+    let mut col2: Option<String> = None;
+    for part in split_spec_parts(body) {
+        match parse_spec_part(part)? {
+            SpecPart::Item(i) => {
+                if item.is_some() {
+                    // e.g. `[#Headers],[#Data]` — not modeled yet.
+                    return Err("unsupported multi-item structured reference".into());
+                }
+                item = Some(i);
+            }
+            SpecPart::ThisRow(name) => {
+                item = Some(TableItem::ThisRow);
+                if name.is_some() {
+                    col1 = name;
+                }
+            }
+            SpecPart::Col(name) => {
+                if col1.is_none() {
+                    col1 = Some(name);
+                } else {
+                    return Err("unsupported structured reference".into());
+                }
+            }
+            SpecPart::Span(a, b) => {
+                col1 = Some(a);
+                col2 = Some(b);
+            }
+        }
+    }
+    Ok(Expr::Structured {
+        table,
+        item: item.unwrap_or(TableItem::Data),
+        col1,
+        col2,
+    })
+}
+
+/// Escape a column name for printing inside a structured reference.
+fn escape_spec(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if matches!(ch, '[' | ']' | '\'' | '#' | '@') {
+            out.push('\'');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Print a structured reference back to canonical text.
+fn structured_to_string(
+    table: &Option<String>,
+    item: TableItem,
+    col1: &Option<String>,
+    col2: &Option<String>,
+) -> String {
+    let prefix = table.clone().unwrap_or_default();
+    let body = match (item, col1, col2) {
+        (TableItem::Data, None, _) => String::new(),
+        (TableItem::Data, Some(c), None) => escape_spec(c),
+        (TableItem::Data, Some(a), Some(b)) => {
+            format!("[{}]:[{}]", escape_spec(a), escape_spec(b))
+        }
+        (TableItem::ThisRow, None, _) => "@".to_string(),
+        (TableItem::ThisRow, Some(c), _) => format!("@{}", escape_spec(c)),
+        (TableItem::All, None, _) => "#All".to_string(),
+        (TableItem::Headers, None, _) => "#Headers".to_string(),
+        (TableItem::Totals, None, _) => "#Totals".to_string(),
+        (item, Some(c), _) => {
+            let tag = match item {
+                TableItem::All => "#All",
+                TableItem::Headers => "#Headers",
+                TableItem::Totals => "#Totals",
+                _ => "#Data",
+            };
+            format!("[{tag}],[{}]", escape_spec(c))
+        }
+    };
+    format!("{prefix}[{body}]")
+}
+
 // ---------------------------------------------------------------------------
 // Serializer
 // ---------------------------------------------------------------------------
@@ -890,6 +1171,12 @@ pub fn to_string(e: &Expr) -> String {
             ));
             s
         }
+        Expr::Structured {
+            table,
+            item,
+            col1,
+            col2,
+        } => structured_to_string(table, *item, col1, col2),
         Expr::Name(n) => n.clone(),
         Expr::Func(name, args) => {
             let list: Vec<String> = args.iter().map(to_string).collect();
@@ -1363,6 +1650,34 @@ pub fn collect_names(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// Collect every structured (table) reference in a formula. `None` table =
+/// the enclosing table of the formula's own cell.
+#[allow(clippy::type_complexity)]
+pub fn collect_structured(
+    e: &Expr,
+    out: &mut Vec<(Option<String>, TableItem, Option<String>, Option<String>)>,
+) {
+    match e {
+        Expr::Structured {
+            table,
+            item,
+            col1,
+            col2,
+        } => out.push((table.clone(), *item, col1.clone(), col2.clone())),
+        Expr::Func(_, args) => {
+            for a in args {
+                collect_structured(a, out);
+            }
+        }
+        Expr::Un(_, x) => collect_structured(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_structured(l, out);
+            collect_structured(r, out);
+        }
+        _ => {}
+    }
+}
+
 /// Does the formula call a volatile function (must recalc on every pass)?
 pub fn is_volatile(e: &Expr) -> bool {
     match e {
@@ -1423,6 +1738,91 @@ pub trait Resolver {
     fn defined_name(&self, name: &str, current_sheet: usize) -> Option<String> {
         let _ = (name, current_sheet);
         None
+    }
+    /// An Excel Table by displayName (for structured references).
+    fn table(&self, name: &str) -> Option<TableInfo> {
+        let _ = name;
+        None
+    }
+    /// The table containing a cell (for bare `[@Col]` references).
+    fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<TableInfo> {
+        let _ = (sheet, row, col);
+        None
+    }
+}
+
+/// A table's geometry, as the evaluator needs it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableInfo {
+    pub sheet: usize,
+    /// Full region incl. header/totals rows (r1, c1, r2, c2), 0-based.
+    pub range: (u32, u32, u32, u32),
+    pub header_rows: u32,
+    pub totals_rows: u32,
+    pub columns: Vec<String>,
+}
+
+impl TableInfo {
+    /// Resolve one structured reference against this table. `cur_row` is the
+    /// formula's own row (for `@`). Returns the rect, or None → `#REF!`.
+    pub fn resolve(
+        &self,
+        item: TableItem,
+        col1: &Option<String>,
+        col2: &Option<String>,
+        cur_row: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let (r1, c1, r2, c2) = self.range;
+        let col_of = |name: &str| -> Option<u32> {
+            self.columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+                .map(|i| c1 + i as u32)
+        };
+        let (cc1, cc2) = match (col1, col2) {
+            (None, _) => (c1, c2),
+            (Some(a), None) => {
+                let c = col_of(a)?;
+                (c, c)
+            }
+            (Some(a), Some(b)) => {
+                let x = col_of(a)?;
+                let y = col_of(b)?;
+                (x.min(y), x.max(y))
+            }
+        };
+        let (rr1, rr2) = match item {
+            TableItem::All => (r1, r2),
+            TableItem::Data => {
+                let lo = r1 + self.header_rows;
+                let hi = r2.checked_sub(self.totals_rows)?;
+                if lo > hi {
+                    return None;
+                }
+                (lo, hi)
+            }
+            TableItem::Headers => {
+                if self.header_rows == 0 {
+                    return None;
+                }
+                (r1, r1 + self.header_rows - 1)
+            }
+            TableItem::Totals => {
+                if self.totals_rows == 0 {
+                    return None;
+                }
+                (r2 + 1 - self.totals_rows, r2)
+            }
+            TableItem::ThisRow => {
+                let lo = r1 + self.header_rows;
+                let hi = r2.checked_sub(self.totals_rows)?;
+                if cur_row < lo || cur_row > hi {
+                    return None;
+                }
+                (cur_row, cur_row)
+            }
+        };
+        Some((rr1, cc1, rr2, cc2))
     }
 }
 
@@ -1489,6 +1889,27 @@ impl<'a> Eval<'a> {
             Expr::Bool(b) => Arg::Scalar(Value::Bool(*b)),
             Expr::Err(x) => Arg::Scalar(Value::Err(*x)),
             Expr::Missing => Arg::Scalar(Value::Empty),
+            Expr::Structured {
+                table,
+                item,
+                col1,
+                col2,
+            } => {
+                let info = match table {
+                    Some(name) => self.res.table(name),
+                    None => self.res.table_at(self.sheet, self.cell.0, self.cell.1),
+                };
+                let Some(info) = info else {
+                    // Table definitions we can't see (or a bare ref outside
+                    // any table) — don't guess.
+                    self.unsupported = true;
+                    return Arg::Scalar(Value::Err(ExcelError::Ref));
+                };
+                match info.resolve(*item, col1, col2, self.cell.0) {
+                    Some((r1, c1, r2, c2)) => Arg::Range(info.sheet, r1, c1, r2, c2),
+                    None => Arg::Scalar(Value::Err(ExcelError::Ref)),
+                }
+            }
             Expr::Name(n) => {
                 // A defined name expands to its definition formula. Depth cap
                 // guards name→name cycles (Excel rejects those at entry).
@@ -4085,6 +4506,7 @@ mod tests {
     struct Grid {
         cells: HashMap<(u32, u32), Value>,
         names: HashMap<String, String>,
+        table: Option<TableInfo>,
     }
 
     impl Grid {
@@ -4097,10 +4519,15 @@ mod tests {
             Grid {
                 cells: m,
                 names: HashMap::new(),
+                table: None,
             }
         }
         fn with_name(mut self, name: &str, def: &str) -> Grid {
             self.names.insert(name.to_uppercase(), def.to_string());
+            self
+        }
+        fn with_table(mut self, info: TableInfo) -> Grid {
+            self.table = Some(info);
             self
         }
     }
@@ -4143,6 +4570,20 @@ mod tests {
         }
         fn defined_name(&self, name: &str, _current_sheet: usize) -> Option<String> {
             self.names.get(&name.to_uppercase()).cloned()
+        }
+        fn table(&self, name: &str) -> Option<TableInfo> {
+            self.table
+                .clone()
+                .filter(|_| name.eq_ignore_ascii_case("Sales"))
+        }
+        fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<TableInfo> {
+            self.table.clone().filter(|t| {
+                sheet == t.sheet
+                    && row >= t.range.0
+                    && row <= t.range.2
+                    && col >= t.range.1
+                    && col <= t.range.3
+            })
         }
     }
 
@@ -4679,6 +5120,108 @@ mod tests {
         // use a truly opaque code instead.)
         let ast = parse("TEXT(1234,\"\"\"kg\"\"\")").unwrap();
         let mut ev = Eval::new(&g, 0, (0, 0));
+        let _ = ev.eval(&ast);
+        assert!(ev.unsupported);
+    }
+
+    fn sales_table() -> TableInfo {
+        // A1:C5 — header row 1, data rows 2-4, totals row 5.
+        TableInfo {
+            sheet: 0,
+            range: (0, 0, 4, 2),
+            header_rows: 1,
+            totals_rows: 1,
+            columns: vec!["Item".into(), "Qty".into(), "Price".into()],
+        }
+    }
+
+    fn sales_grid() -> Grid {
+        Grid::new(&[
+            ("A1", Value::Str("Item".into())),
+            ("B1", Value::Str("Qty".into())),
+            ("C1", Value::Str("Price".into())),
+            ("A2", Value::Str("pen".into())),
+            ("B2", Value::Num(3.0)),
+            ("C2", Value::Num(1.5)),
+            ("A3", Value::Str("pad".into())),
+            ("B3", Value::Num(2.0)),
+            ("C3", Value::Num(4.0)),
+            ("A4", Value::Str("ink".into())),
+            ("B4", Value::Num(5.0)),
+            ("C4", Value::Num(2.0)),
+            ("A5", Value::Str("Total".into())),
+            ("B5", Value::Num(10.0)),
+            ("C5", Value::Num(7.5)),
+        ])
+        .with_table(sales_table())
+    }
+
+    #[test]
+    fn structured_refs_parse_and_print() {
+        for (src, printed) in [
+            ("SUM(Sales[Qty])", "SUM(Sales[Qty])"),
+            ("Sales[]", "Sales[]"),
+            ("SUM(Sales[#All])", "SUM(Sales[#All])"),
+            ("COUNTA(Sales[#Headers])", "COUNTA(Sales[#Headers])"),
+            ("SUM(Sales[#Totals])", "SUM(Sales[#Totals])"),
+            ("[@Qty]*[@Price]", "[@Qty]*[@Price]"),
+            ("SUM(Sales[[#Totals],[Qty]])", "SUM(Sales[[#Totals],[Qty]])"),
+            ("SUM(Sales[[Qty]:[Price]])", "SUM(Sales[[Qty]:[Price]])"),
+            ("Sales[@Price]", "Sales[@Price]"),
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            assert_eq!(to_string(&ast), printed, "{src}");
+            let re = parse(&to_string(&ast)).unwrap();
+            assert_eq!(ast, re, "round-trip {src}");
+        }
+        // Escaped specials in column names survive.
+        let ast = parse("SUM(Sales['[odd'] col])").unwrap();
+        if let Expr::Func(_, args) = &ast {
+            assert_eq!(
+                args[0],
+                Expr::Structured {
+                    table: Some("Sales".into()),
+                    item: TableItem::Data,
+                    col1: Some("[odd] col".into()),
+                    col2: None,
+                }
+            );
+        } else {
+            panic!("not a func");
+        }
+        assert_eq!(parse(&to_string(&ast)).unwrap(), ast);
+    }
+
+    #[test]
+    fn structured_refs_evaluate() {
+        let g = sales_grid();
+        assert_eq!(n("SUM(Sales[Qty])", &g), 10.0); // data rows only
+        assert_eq!(n("SUM(Sales[#Totals])", &g), 17.5);
+        assert_eq!(n("COUNTA(Sales[#Headers])", &g), 3.0);
+        assert_eq!(n("COUNTA(Sales[])", &g), 9.0);
+        assert_eq!(n("SUM(Sales[[Qty]:[Price]])", &g), 17.5);
+        assert_eq!(n("SUM(Sales[#All])", &g), 35.0); // data + totals rows
+        // Bare @ refs resolve through the enclosing table, so the formula
+        // must live inside it (a calculated column). Row 3 → pad.
+        let ast = parse("[@Qty]*[@Price]").unwrap();
+        let mut ev = Eval::new(&g, 0, (2, 2));
+        assert_eq!(ev.eval(&ast), Value::Num(8.0));
+        // Outside the table the qualified form works…
+        let ast_q = parse("Sales[@Qty]*Sales[@Price]").unwrap();
+        let mut ev = Eval::new(&g, 0, (2, 4));
+        assert_eq!(ev.eval(&ast_q), Value::Num(8.0));
+        // …but the bare form has no enclosing table → #REF!.
+        let mut ev = Eval::new(&g, 0, (20, 20));
+        assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Ref));
+        // Unknown column → #REF!, still supported (the table was found).
+        let g2 = sales_grid();
+        let ast = parse("SUM(Sales[Nope])").unwrap();
+        let mut ev = Eval::new(&g2, 0, (0, 5));
+        assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Ref));
+        assert!(!ev.unsupported);
+        // Unknown table → unsupported (keep cached).
+        let ast = parse("SUM(Ghost[Qty])").unwrap();
+        let mut ev = Eval::new(&g2, 0, (0, 5));
         let _ = ev.eval(&ast);
         assert!(ev.unsupported);
     }
