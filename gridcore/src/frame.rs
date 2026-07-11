@@ -85,12 +85,13 @@ impl Frame {
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
     }
 
-    /// Parse CSV text (RFC 4180-ish: quoted fields, doubled quotes, CRLF)
-    /// into a Frame. The first record is the header row; fields are typed by
-    /// inference (number, TRUE/FALSE, empty, text). Ragged records are
-    /// padded with empties.
+    /// Parse delimited text (RFC 4180-ish: quoted fields, doubled quotes,
+    /// CRLF) into a Frame, sniffing the delimiter — comma, semicolon, or tab
+    /// — from the first record. The first record is the header row; fields
+    /// are typed by inference (number, TRUE/FALSE, empty, text). Ragged
+    /// records are padded with empties.
     pub fn from_csv(text: &str) -> Frame {
-        let records = parse_csv(text);
+        let records = parse_delimited(text, sniff_delimiter(text));
         let mut it = records.into_iter();
         let Some(header) = it.next() else {
             return Frame::default();
@@ -138,8 +139,36 @@ fn infer_value(field: &str) -> Value {
     Value::Str(field.to_string())
 }
 
+/// Pick the likeliest delimiter from the first record: the candidate
+/// (comma, semicolon, tab) occurring most often outside quotes.
+pub fn sniff_delimiter(text: &str) -> char {
+    let mut counts = [0usize; 3]; // , ; \t
+    let mut in_quotes = false;
+    for ch in text.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '\n' if !in_quotes => break,
+            ',' if !in_quotes => counts[0] += 1,
+            ';' if !in_quotes => counts[1] += 1,
+            '\t' if !in_quotes => counts[2] += 1,
+            _ => {}
+        }
+    }
+    let best = (0..3).max_by_key(|&i| counts[i]).unwrap_or(0);
+    if counts[best] == 0 {
+        ','
+    } else {
+        [',', ';', '\t'][best]
+    }
+}
+
 /// Split CSV text into records of raw string fields.
 pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    parse_delimited(text, ',')
+}
+
+/// Split delimiter-separated text into records of raw string fields.
+pub fn parse_delimited(text: &str, delim: char) -> Vec<Vec<String>> {
     let mut records = Vec::new();
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();
@@ -162,8 +191,8 @@ pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
             }
         } else {
             match ch {
-                '"' => in_quotes = true,
-                ',' => {
+                '\"' => in_quotes = true,
+                c if c == delim => {
                     record.push(std::mem::take(&mut field));
                     any = true;
                 }
@@ -863,5 +892,21 @@ mod tests {
         };
         let out = pivot(&f, &spec);
         assert_eq!(out.grid[1], vec![s("Total"), n(170.0)]);
+    }
+
+    #[test]
+    fn delimiter_sniffing() {
+        // Tab-separated.
+        let f = Frame::from_csv("A\tB\n1\t2\n");
+        assert_eq!(f.names, vec!["A", "B"]);
+        assert_eq!(f.cols[1][0], n(2.0));
+        // Semicolon-separated (European CSV).
+        let f = Frame::from_csv("A;B\n1;2,5\n");
+        assert_eq!(f.names, vec!["A", "B"]);
+        assert_eq!(f.cols[1][0], Value::Str("2,5".into()));
+        // Commas inside quotes don't confuse the sniffer.
+        let f = Frame::from_csv("\"a,a\";B\nx;1\n");
+        assert_eq!(f.names, vec!["a,a", "B"]);
+        assert_eq!(sniff_delimiter("plain header\nrow\n"), ',');
     }
 }

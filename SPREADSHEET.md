@@ -237,7 +237,8 @@ The strategic piece: **conformance is measured, not claimed.**
   `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`. Scalar functions lift
   elementwise over array arguments (`ABS(A1:A3)` spills;
   `IF(A1:A3>0,"y","n")` lifts while scalar `IF` stays lazily branched).
-  Remaining: optional lambda parameters (`ISOMITTED`), dynamic-array oracle
+  Optional lambda parameters shipped: `LAMBDA(x,[y],…)` with `ISOMITTED`
+  (omitted arguments bind as blank). Remaining: dynamic-array oracle
   coverage (needs LibreOffice 24.8+/real Excel — 24.2 predates these
   functions).* Spill semantics + `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`,
   `SEQUENCE`, `XLOOKUP`; `LET`/`LAMBDA` (closures).
@@ -295,8 +296,9 @@ The strategic piece: **conformance is measured, not claimed.**
   `MINX`/`COUNTX`/`COUNTAX` evaluate an expression once per table data row
   with bare `[@Col]` references bound to that row — in sheet formulas over
   Excel Tables (with whole-table dependency tracking) and in model
-  measures, where filter context restricts the iterated rows. Remaining:
-  more sources.* Multiple
+  measures, where filter context restricts the iterated rows. Delimited
+  imports sniff their separator (comma/semicolon/tab; `.tsv` opens
+  directly). Remaining: more sources (JSON, databases).* Multiple
   tables, relationships, measures over the phase-D query core; sources
   beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
   small BI engine that happens to have a terminal frontend.

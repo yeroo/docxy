@@ -108,16 +108,20 @@ fn main() -> ExitCode {
     }
 
     let (pkg, path) = match parsed.inputs.first() {
-        // CSV imports as a one-sheet workbook (Ctrl-S then writes .xlsx —
-        // the path is rebound so a spreadsheet never lands in a .csv file).
-        Some(input) if input.to_ascii_lowercase().ends_with(".csv") => {
+        // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
+        // .xlsx — the path is rebound so a spreadsheet never lands in a
+        // text file). The delimiter is sniffed.
+        Some(input)
+            if input.to_ascii_lowercase().ends_with(".csv")
+                || input.to_ascii_lowercase().ends_with(".tsv") =>
+        {
             match std::fs::read_to_string(input) {
                 Ok(text) => {
                     let stem = std::path::Path::new(input)
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "import".to_string());
-                    let base = &input[..input.len() - ".csv".len()];
+                    let base = &input[..input.len() - 4];
                     (csv_to_pkg(&text, &stem), format!("{base}.xlsx"))
                 }
                 Err(e) => {
@@ -195,6 +199,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Swap `items[sel]` with its neighbor. Returns false at the edges.
+fn swap_entry<T>(items: &mut [T], sel: usize, up: bool) -> bool {
+    if up {
+        if sel == 0 || sel >= items.len() {
+            return false;
+        }
+        items.swap(sel - 1, sel);
+    } else {
+        if sel + 1 >= items.len() {
+            return false;
+        }
+        items.swap(sel, sel + 1);
+    }
+    true
 }
 
 /// `Sales[ProductID]` → ("Sales", "ProductID").
@@ -287,7 +307,7 @@ fn print_usage() {
          USAGE:\n  \
            xlsxy                            new blank workbook\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
-           xlsxy <file.csv>                 import CSV as a new workbook\n  \
+           xlsxy <file.csv|.tsv>            import CSV/TSV as a new workbook\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
            xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
@@ -1027,7 +1047,7 @@ impl App {
 
     /// Key handling inside the pivot editor. Returns None when the editor
     /// closed.
-    fn pivot_editor_key(&mut self, code: KeyCode) {
+    fn pivot_editor_key(&mut self, code: KeyCode, shift: bool) {
         let Some(mut pe) = self.pivot_edit.take() else {
             return;
         };
@@ -1047,6 +1067,21 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => {
                 pe.pane = (pe.pane + 3) % 4;
                 pe.sel = 0;
+            }
+            // Shift-Up/Down reorders within an area — field order is
+            // nesting order (outer to inner), so it changes the layout.
+            KeyCode::Up | KeyCode::Down if shift && pe.pane > 0 => {
+                let p = &mut self.pkg.workbook.pivots[pe.pivot];
+                let up = code == KeyCode::Up;
+                let moved = match pe.pane {
+                    1 => swap_entry(&mut p.row_fields, pe.sel, up),
+                    2 => swap_entry(&mut p.col_fields, pe.sel, up),
+                    _ => swap_entry(&mut p.data_fields, pe.sel, up),
+                };
+                if moved {
+                    pe.sel = if up { pe.sel - 1 } else { pe.sel + 1 };
+                    changed = true;
+                }
             }
             KeyCode::Up => pe.sel = pe.sel.saturating_sub(1),
             KeyCode::Down => {
@@ -2080,7 +2115,7 @@ fn draw(app: &mut App, f: &mut Frame) {
         "Model: ←/→ pane · ↑/↓ select · r relate · m measure · p report · d delete · Esc close"
             .to_string()
     } else if app.pivot_edit.is_some() {
-        "Pivot: ←/→ pane · ↑/↓ select · r/c/v add to Rows/Cols/Values · d remove · a aggregation · Esc close"
+        "Pivot: ←/→ pane · ↑/↓ select · Shift-↑/↓ reorder · r/c/v add · d remove · a aggregation · Esc close"
             .to_string()
     } else if app.confirm_quit {
         "Unsaved changes — press Ctrl-Q again to quit without saving, Esc to stay".to_string()
@@ -2307,7 +2342,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // --- pivot editor ---------------------------------------------------------
     if app.pivot_edit.is_some() {
-        app.pivot_editor_key(key.code);
+        app.pivot_editor_key(key.code, shift);
         return false;
     }
 
@@ -3005,10 +3040,10 @@ mod tests {
         assert!(app.pivot_edit.is_some());
 
         // Cycle the value field's aggregation: Values pane, 'a' → Count.
-        app.pivot_editor_key(KeyCode::Tab); // rows
-        app.pivot_editor_key(KeyCode::Tab); // cols
-        app.pivot_editor_key(KeyCode::Tab); // values
-        app.pivot_editor_key(KeyCode::Char('a'));
+        app.pivot_editor_key(KeyCode::Tab, false); // rows
+        app.pivot_editor_key(KeyCode::Tab, false); // cols
+        app.pivot_editor_key(KeyCode::Tab, false); // values
+        app.pivot_editor_key(KeyCode::Char('a'), false);
         let piv = &app.pkg.workbook.pivots[0];
         assert_eq!(piv.data_fields[0].agg, gridcore::frame::Agg::Count);
         assert_eq!(piv.data_fields[0].name, "Count of Sales");
@@ -3026,15 +3061,15 @@ mod tests {
         assert_eq!(val(&app, 3, 4), CellValue::Number(3.0));
 
         // Remove the row field: Rows pane, 'd' → single Total row.
-        app.pivot_editor_key(KeyCode::BackTab);
-        app.pivot_editor_key(KeyCode::BackTab); // rows
-        app.pivot_editor_key(KeyCode::Char('d'));
+        app.pivot_editor_key(KeyCode::BackTab, false);
+        app.pivot_editor_key(KeyCode::BackTab, false); // rows
+        app.pivot_editor_key(KeyCode::Char('d'), false);
         assert!(app.pkg.workbook.pivots[0].row_fields.is_empty());
         assert_eq!(val(&app, 1, 3), CellValue::Text("Total".into()));
         assert_eq!(val(&app, 1, 4), CellValue::Number(3.0));
 
         // Esc closes.
-        app.pivot_editor_key(KeyCode::Esc);
+        app.pivot_editor_key(KeyCode::Esc, false);
         assert!(app.pivot_edit.is_none());
         assert!(app.modified);
     }
@@ -3257,7 +3292,7 @@ mod tests {
         assert_eq!(piv.data_fields[0].name, "Sum of Sales");
         assert!(piv.edited);
         // Add Region to rows through the editor: Fields pane, 'r'.
-        app.pivot_editor_key(KeyCode::Char('r'));
+        app.pivot_editor_key(KeyCode::Char('r'), false);
         let val = |app: &App, r: u32, c: u32| {
             app.pkg.workbook.sheets[1]
                 .cell(r, c)
@@ -3273,5 +3308,67 @@ mod tests {
         assert_eq!(pkg2.workbook.pivots.len(), 1);
         assert!(!pkg2.workbook.pivots[0].unsupported);
         assert_eq!(pkg2.workbook.pivots[0].row_fields, vec![0]);
+    }
+
+    #[test]
+    fn pivot_editor_reorders_fields() {
+        use gridcore::pivot::{DataField, Pivot, PivotSource};
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            for (c, h) in ["Region", "Product", "Sales"].iter().enumerate() {
+                sh.set_cell(0, c as u32, Cell::text(h));
+            }
+            for (i, (r, p, v)) in [("East", "Pen", 10.0), ("West", "Pad", 20.0)]
+                .iter()
+                .enumerate()
+            {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(r));
+                sh.set_cell(i as u32 + 1, 1, Cell::text(p));
+                sh.set_cell(i as u32 + 1, 2, Cell::number(*v));
+            }
+        }
+        pkg.workbook.pivots.push(Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 4, 0, 4),
+            source: PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 2),
+            },
+            fields: vec!["Region".into(), "Product".into(), "Sales".into()],
+            row_fields: vec![0, 1],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Sales".into(),
+                field: 2,
+                agg: Agg::Sum,
+            }],
+            grand_rows: false,
+            grand_cols: false,
+            subtotals: false,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        });
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app.open_pivot_editor();
+        // Rows pane: move Product above Region.
+        app.pivot_editor_key(KeyCode::Tab, false); // rows
+        app.pivot_editor_key(KeyCode::Down, false); // select Product
+        app.pivot_editor_key(KeyCode::Up, true); // Shift-Up: reorder
+        assert_eq!(app.pkg.workbook.pivots[0].row_fields, vec![1, 0]);
+        assert!(app.pkg.workbook.pivots[0].edited);
+        // The refreshed header shows Product as the outer label column.
+        let v = app.pkg.workbook.sheets[0]
+            .cell(0, 4)
+            .map(|cl| cl.value.clone());
+        assert_eq!(v, Some(CellValue::Text("Product".into())));
+        // Edges are no-ops.
+        app.pivot_editor_key(KeyCode::Up, true);
+        app.pivot_editor_key(KeyCode::Up, true);
+        assert_eq!(app.pkg.workbook.pivots[0].row_fields, vec![1, 0]);
     }
 }

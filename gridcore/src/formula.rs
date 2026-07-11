@@ -2267,6 +2267,8 @@ pub struct Eval<'a> {
     depth: u32,
     /// `LET` bindings currently in scope, innermost last.
     lets: Vec<(String, Arg)>,
+    /// Lambda parameters omitted at the current call site (`ISOMITTED`).
+    omitted: Vec<String>,
 }
 
 /// A matrix of computed values (a dynamic-array result). Always non-empty
@@ -2287,11 +2289,11 @@ enum Arg {
     Lambda(Box<LambdaVal>),
 }
 
-/// A `LAMBDA` value: parameters, unevaluated body, and the `LET` bindings
-/// visible where it was defined (lexical capture).
+/// A `LAMBDA` value: parameters (name, optional?), unevaluated body, and
+/// the `LET` bindings visible where it was defined (lexical capture).
 #[derive(Clone)]
 struct LambdaVal {
-    params: Vec<String>,
+    params: Vec<(String, bool)>,
     body: Expr,
     captured: Vec<(String, Arg)>,
 }
@@ -2312,6 +2314,7 @@ impl<'a> Eval<'a> {
             unsupported: false,
             depth: 0,
             lets: Vec::new(),
+            omitted: Vec::new(),
         }
     }
 
@@ -2518,7 +2521,9 @@ impl<'a> Eval<'a> {
                 match f {
                     Arg::Lambda(lam) => {
                         let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
-                        self.invoke_lambda(&lam, vals)
+                        let omitted: Vec<bool> =
+                            args.iter().map(|a| matches!(a, Expr::Missing)).collect();
+                        self.invoke_lambda(&lam, vals, &omitted)
                     }
                     Arg::Scalar(v) if v.is_err() => Arg::Scalar(v),
                     _ => Arg::Scalar(Value::Err(ExcelError::Value)),
@@ -2675,13 +2680,27 @@ impl<'a> Eval<'a> {
             // they resolve here where non-scalar results are expressible.
             Expr::Func(name, args) if name == "LET" => self.let_fn(args),
             Expr::Func(name, args) if name == "LAMBDA" => self.lambda_fn(args),
+            // ISOMITTED reflects the current lambda call's omitted params —
+            // it needs the argument's *name*, not its value.
+            Expr::Func(name, args) if name == "ISOMITTED" => {
+                if args.len() != 1 {
+                    return Arg::Scalar(Value::Err(ExcelError::Value));
+                }
+                let hit = match &args[0] {
+                    Expr::Name(n) => self.omitted.iter().any(|o| o.eq_ignore_ascii_case(n)),
+                    _ => false,
+                };
+                Arg::Scalar(Value::Bool(hit))
+            }
             Expr::Func(name, args) if is_higher_order_fn(name) => self.ho_fn(name, args),
             Expr::Func(name, args) => {
                 // A LET-bound or workbook-defined LAMBDA used as a custom
                 // function: f(3).
                 if let Some(lam) = self.lambda_named(name) {
                     let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
-                    return self.invoke_lambda(&lam, vals);
+                    let omitted: Vec<bool> =
+                        args.iter().map(|a| matches!(a, Expr::Missing)).collect();
+                    return self.invoke_lambda(&lam, vals, &omitted);
                 }
                 if is_array_fn(name) {
                     return self.array_fn(name, args);
@@ -2701,9 +2720,27 @@ impl<'a> Eval<'a> {
             return Arg::Scalar(Value::Err(ExcelError::Value));
         }
         let mut params = Vec::new();
+        let mut seen_optional = false;
         for p in &args[..args.len() - 1] {
             match p {
-                Expr::Name(n) => params.push(n.clone()),
+                Expr::Name(n) => {
+                    // Required parameters must precede optional ones.
+                    if seen_optional {
+                        return Arg::Scalar(Value::Err(ExcelError::Value));
+                    }
+                    params.push((n.clone(), false));
+                }
+                // `[y]` — Excel's optional-parameter syntax (lexes as a
+                // bare structured reference).
+                Expr::Structured {
+                    table: None,
+                    item: TableItem::Data,
+                    col1: Some(n),
+                    col2: None,
+                } => {
+                    seen_optional = true;
+                    params.push((n.clone(), true));
+                }
                 _ => return Arg::Scalar(Value::Err(ExcelError::Value)),
             }
         }
@@ -2716,9 +2753,11 @@ impl<'a> Eval<'a> {
 
     /// Call a lambda with pre-evaluated arguments. The body sees the
     /// lambda's captured environment plus its parameters — not the caller's
-    /// bindings (lexical scoping).
-    fn invoke_lambda(&mut self, lam: &LambdaVal, vals: Vec<Arg>) -> Arg {
-        if vals.len() != lam.params.len() {
+    /// bindings (lexical scoping). `omitted[i]` marks an argument written as
+    /// an empty slot (`f(,2)`); optional parameters may be left off entirely.
+    fn invoke_lambda(&mut self, lam: &LambdaVal, vals: Vec<Arg>, omitted: &[bool]) -> Arg {
+        let required = lam.params.iter().filter(|(_, opt)| !opt).count();
+        if vals.len() > lam.params.len() || vals.len() < required {
             return Arg::Scalar(Value::Err(ExcelError::Value));
         }
         if self.depth >= 32 {
@@ -2726,13 +2765,25 @@ impl<'a> Eval<'a> {
             return Arg::Scalar(Value::Err(ExcelError::Num));
         }
         let saved = std::mem::replace(&mut self.lets, lam.captured.clone());
-        for (p, v) in lam.params.iter().zip(vals) {
-            self.lets.push((p.clone(), v));
+        let saved_omitted = std::mem::take(&mut self.omitted);
+        let mut vals = vals.into_iter();
+        for (i, (p, _)) in lam.params.iter().enumerate() {
+            match vals.next() {
+                Some(v) if !omitted.get(i).copied().unwrap_or(false) => {
+                    self.lets.push((p.clone(), v));
+                }
+                _ => {
+                    // Omitted: binds as blank, visible to ISOMITTED.
+                    self.lets.push((p.clone(), Arg::Scalar(Value::Empty)));
+                    self.omitted.push(p.clone());
+                }
+            }
         }
         self.depth += 1;
         let out = self.eval_arg(&lam.body);
         self.depth -= 1;
         self.lets = saved;
+        self.omitted = saved_omitted;
         out
     }
 
@@ -2837,7 +2888,7 @@ impl<'a> Eval<'a> {
                         row.push(if oob {
                             Value::Err(ExcelError::NA)
                         } else {
-                            let r = self.invoke_lambda(&lam, vals);
+                            let r = self.invoke_lambda(&lam, vals, &[]);
                             self.collapse(r)
                         });
                     }
@@ -2866,6 +2917,7 @@ impl<'a> Eval<'a> {
                         let r = self.invoke_lambda(
                             &lam,
                             vec![Arg::Scalar(acc.clone()), Arg::Scalar(v.clone())],
+                            &[],
                         );
                         acc = self.collapse(r);
                         trow.push(acc.clone());
@@ -2893,7 +2945,7 @@ impl<'a> Eval<'a> {
                 if name == "BYROW" {
                     let mut out: Matrix = Vec::with_capacity(m.len());
                     for row in &m {
-                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(vec![row.clone()])]);
+                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(vec![row.clone()])], &[]);
                         out.push(vec![self.collapse(r)]);
                     }
                     Arg::Matrix(out)
@@ -2902,7 +2954,7 @@ impl<'a> Eval<'a> {
                     let mut out_row = Vec::with_capacity(cols);
                     for j in 0..cols {
                         let col: Matrix = m.iter().map(|r| vec![r[j].clone()]).collect();
-                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(col)]);
+                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(col)], &[]);
                         out_row.push(self.collapse(r));
                     }
                     Arg::Matrix(vec![out_row])
@@ -2937,6 +2989,7 @@ impl<'a> Eval<'a> {
                                 Arg::Scalar(Value::Num((i + 1) as f64)),
                                 Arg::Scalar(Value::Num((j + 1) as f64)),
                             ],
+                            &[],
                         );
                         row.push(self.collapse(r));
                     }
@@ -7604,5 +7657,43 @@ mod tests {
         let mut ev = Eval::new(&g, 0, (0, 0));
         assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Name));
         assert!(ev.unsupported);
+    }
+
+    #[test]
+    fn optional_lambda_params_and_isomitted() {
+        let g = empty();
+        // [y] is optional: callable with one or two arguments.
+        assert_eq!(n("LAMBDA(x,[y],x+IF(ISOMITTED(y),100,y))(1,5)", &g), 6.0);
+        assert_eq!(n("LAMBDA(x,[y],x+IF(ISOMITTED(y),100,y))(1)", &g), 101.0);
+        // An omitted parameter evaluates as blank (0 in arithmetic).
+        assert_eq!(n("LAMBDA(x,[y],x+y)(7)", &g), 7.0);
+        // An explicit empty slot counts as omitted too.
+        assert_eq!(
+            eval_str("LAMBDA(x,[y],ISOMITTED(y))(1,)", &g),
+            Value::Bool(true)
+        );
+        // Provided values are not omitted.
+        assert_eq!(
+            eval_str("LAMBDA(x,[y],ISOMITTED(y))(1,2)", &g),
+            Value::Bool(false)
+        );
+        // Too few required args still errors; required after optional is
+        // rejected at definition.
+        assert_eq!(
+            eval_str("LAMBDA(x,[y],x)()", &g),
+            Value::Err(ExcelError::Value)
+        );
+        assert_eq!(
+            eval_str("LAMBDA([x],y,x)(1,2)", &g),
+            Value::Err(ExcelError::Value)
+        );
+        // Through LET-bound names as well.
+        assert_eq!(
+            n(
+                "LET(f,LAMBDA(a,[b],a*IF(ISOMITTED(b),2,b)),f(10)+f(10,3))",
+                &g
+            ),
+            50.0
+        );
     }
 }
