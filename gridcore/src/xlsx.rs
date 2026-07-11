@@ -523,12 +523,27 @@ fn parse_styles(xml: &str) -> Styles {
     let mut numfmts: BTreeMap<u32, NumFmt> = BTreeMap::new();
     let mut codes: BTreeMap<u32, String> = BTreeMap::new();
     let mut fonts: Vec<Font> = Vec::new();
+    let mut fills: Vec<Option<(u8, u8, u8)>> = Vec::new();
     let mut xfs: Vec<Xf> = Vec::new();
 
     let mut p = XmlParser::new(xml);
     let mut in_fonts = false;
+    let mut in_fills = false;
     let mut in_cellxfs = false;
     let mut cur_font: Option<Font> = None;
+    let mut cur_fill: Option<Option<(u8, u8, u8)>> = None;
+    let parse_rgb = |rgb: &str| -> Option<(u8, u8, u8)> {
+        if rgb.len() == 8 && rgb.is_ascii() {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&rgb[2..4], 16),
+                u8::from_str_radix(&rgb[4..6], 16),
+                u8::from_str_radix(&rgb[6..8], 16),
+            ) {
+                return Some((r, g, b));
+            }
+        }
+        None
+    };
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -553,24 +568,21 @@ fn parse_styles(xml: &str) -> Styles {
                 }
                 "color" => {
                     if let Some(f) = &mut cur_font {
-                        let rgb = p.attr("rgb");
-                        // `len()` is bytes; only slice when it's 8 ASCII bytes,
-                        // or a multibyte char straddling an index would panic.
-                        if rgb.len() == 8 && rgb.is_ascii() {
-                            if let (Ok(r), Ok(g), Ok(b)) = (
-                                u8::from_str_radix(&rgb[2..4], 16),
-                                u8::from_str_radix(&rgb[4..6], 16),
-                                u8::from_str_radix(&rgb[6..8], 16),
-                            ) {
-                                f.color = Some((r, g, b));
-                            }
-                        }
+                        f.color = parse_rgb(p.attr("rgb"));
+                    }
+                }
+                "fills" => in_fills = true,
+                "fill" if in_fills => cur_fill = Some(None),
+                "fgColor" => {
+                    if let Some(fl) = &mut cur_fill {
+                        *fl = parse_rgb(p.attr("rgb"));
                     }
                 }
                 "cellXfs" => in_cellxfs = true,
                 "xf" if in_cellxfs => {
                     let numfmt_id: u32 = p.attr("numFmtId").parse().unwrap_or(0);
                     let font_id: usize = p.attr("fontId").parse().unwrap_or(0);
+                    let fill_id: usize = p.attr("fillId").parse().unwrap_or(0);
                     let numfmt = numfmts
                         .get(&numfmt_id)
                         .copied()
@@ -586,7 +598,14 @@ fn parse_styles(xml: &str) -> Styles {
                         bold: font.bold,
                         italic: font.italic,
                         color: font.color,
+                        fill: fills.get(fill_id).copied().flatten(),
+                        align: crate::sheet::Align::General,
                     });
+                }
+                "alignment" if in_cellxfs => {
+                    if let Some(x) = xfs.last_mut() {
+                        x.align = crate::sheet::Align::from_attr(p.attr("horizontal"));
+                    }
                 }
                 _ => {}
             },
@@ -595,6 +614,12 @@ fn parse_styles(xml: &str) -> Styles {
                 "font" => {
                     if let Some(f) = cur_font.take() {
                         fonts.push(f);
+                    }
+                }
+                "fills" => in_fills = false,
+                "fill" => {
+                    if let Some(fl) = cur_fill.take() {
+                        fills.push(fl);
                     }
                 }
                 "cellXfs" => in_cellxfs = false,
@@ -608,6 +633,152 @@ fn parse_styles(xml: &str) -> Styles {
         xfs.push(Xf::default());
     }
     Styles { xfs }
+}
+
+/// Read the `count="N"` attribute of the element starting at `prefix`.
+fn read_count(xml: &str, prefix: &str) -> u32 {
+    let Some(s) = xml.find(prefix) else { return 0 };
+    let Some(cp) = xml[s..].find("count=\"") else {
+        return 0;
+    };
+    let cs = s + cp + 7;
+    let ce = xml[cs..].find('"').map(|x| cs + x).unwrap_or(cs);
+    xml[cs..ce].parse().unwrap_or(0)
+}
+
+/// Add `delta` to the `count="N"` of the element at `prefix`.
+fn bump_count(xml: &str, prefix: &str, delta: u32) -> String {
+    if delta == 0 {
+        return xml.to_string();
+    }
+    let Some(s) = xml.find(prefix) else {
+        return xml.to_string();
+    };
+    let Some(cp) = xml[s..].find("count=\"") else {
+        return xml.to_string();
+    };
+    let cs = s + cp + 7;
+    let Some(ce) = xml[cs..].find('"').map(|x| cs + x) else {
+        return xml.to_string();
+    };
+    let Ok(n) = xml[cs..ce].parse::<u32>() else {
+        return xml.to_string();
+    };
+    let mut out = xml.to_string();
+    out.replace_range(cs..ce, &(n + delta).to_string());
+    out
+}
+
+/// The largest `numFmtId` used anywhere (custom ids start at 164).
+fn max_numfmt_id(xml: &str) -> u32 {
+    let mut max = 163u32;
+    let mut i = 0;
+    while let Some(p) = xml[i..].find("numFmtId=\"") {
+        let s = i + p + 10;
+        let e = xml[s..].find('"').map(|x| s + x).unwrap_or(s);
+        if let Ok(n) = xml[s..e].parse::<u32>() {
+            max = max.max(n);
+        }
+        i = e;
+    }
+    max
+}
+
+/// Append the authored `xfs` (with fresh fonts/fills/numFmts) to the original
+/// `styles.xml`, leaving every existing style byte-for-byte intact.
+fn splice_styles(orig: &str, authored: &[Xf]) -> String {
+    if authored.is_empty() {
+        return orig.to_string();
+    }
+    let font_base = read_count(orig, "<fonts");
+    let fill_base = read_count(orig, "<fills");
+    let mut next_numfmt = max_numfmt_id(orig) + 1;
+
+    let (mut new_fonts, mut new_fills, mut new_numfmts, mut new_xfs) =
+        (String::new(), String::new(), String::new(), String::new());
+    let (mut fonts_added, mut fills_added, mut numfmts_added) = (0u32, 0u32, 0u32);
+
+    for xf in authored {
+        // Font (always minted so the id is exact).
+        let mut font = String::from("<font>");
+        if xf.bold {
+            font.push_str("<b/>");
+        }
+        if xf.italic {
+            font.push_str("<i/>");
+        }
+        if let Some((r, g, b)) = xf.color {
+            font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
+        }
+        font.push_str("<sz val=\"11\"/><name val=\"Calibri\"/></font>");
+        let font_id = font_base + fonts_added;
+        new_fonts.push_str(&font);
+        fonts_added += 1;
+
+        // Fill (only when a background is set).
+        let (fill_id, apply_fill) = if let Some((r, g, b)) = xf.fill {
+            new_fills.push_str(&format!(
+                "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/><bgColor indexed=\"64\"/></patternFill></fill>"
+            ));
+            let id = fill_base + fills_added;
+            fills_added += 1;
+            (id, true)
+        } else {
+            (0, false)
+        };
+
+        // Number format (custom code only).
+        let (num_id, apply_num) = if let Some(code) = &xf.code {
+            let id = next_numfmt;
+            next_numfmt += 1;
+            numfmts_added += 1;
+            new_numfmts.push_str(&format!(
+                "<numFmt numFmtId=\"{id}\" formatCode=\"{}\"/>",
+                esc_attr(code)
+            ));
+            (id, true)
+        } else {
+            (0, false)
+        };
+
+        let mut x = format!(
+            "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"0\" xfId=\"0\" applyFont=\"1\""
+        );
+        if apply_num {
+            x.push_str(" applyNumberFormat=\"1\"");
+        }
+        if apply_fill {
+            x.push_str(" applyFill=\"1\"");
+        }
+        match xf.align.attr() {
+            Some(a) => x.push_str(&format!(
+                " applyAlignment=\"1\"><alignment horizontal=\"{a}\"/></xf>"
+            )),
+            None => x.push_str("/>"),
+        }
+        new_xfs.push_str(&x);
+    }
+
+    let mut xml = orig.to_string();
+    // numFmts (create the container if the file has none).
+    if numfmts_added > 0 {
+        if xml.contains("<numFmts") {
+            xml = bump_count(&xml, "<numFmts", numfmts_added);
+            xml = xml.replacen("</numFmts>", &format!("{new_numfmts}</numFmts>"), 1);
+        } else {
+            let block = format!("<numFmts count=\"{numfmts_added}\">{new_numfmts}</numFmts>");
+            xml = xml.replacen("<fonts", &format!("{block}<fonts"), 1);
+        }
+    }
+    xml = bump_count(&xml, "<fonts", fonts_added);
+    xml = xml.replacen("</fonts>", &format!("{new_fonts}</fonts>"), 1);
+    if fills_added > 0 {
+        xml = bump_count(&xml, "<fills", fills_added);
+        xml = xml.replacen("</fills>", &format!("{new_fills}</fills>"), 1);
+    }
+    xml = bump_count(&xml, "<cellXfs", authored.len() as u32);
+    xml = xml.replacen("</cellXfs>", &format!("{new_xfs}</cellXfs>"), 1);
+    xml
 }
 
 /// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
@@ -982,6 +1153,18 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         let updated = splice_worksheet(&source, sheet, &sheet_data);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == part_name) {
             p.1 = updated.into_bytes();
+        }
+    }
+
+    // --- authored cell styles: append new xfs to styles.xml ---------------
+    if let Some(orig) = pkg.part("xl/styles.xml") {
+        let orig = String::from_utf8_lossy(orig).into_owned();
+        let base = parse_styles(&orig).xfs.len();
+        if wb.styles.xfs.len() > base {
+            let updated = splice_styles(&orig, &wb.styles.xfs[base..]);
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+                p.1 = updated.into_bytes();
+            }
         }
     }
 
@@ -2156,6 +2339,45 @@ mod tests {
         assert_eq!(s.cell(0, 0).unwrap().value, CellValue::Text("title".into()));
         assert_eq!(s.cell(1, 0).unwrap().value, CellValue::Number(3.25));
         assert_eq!(s.cell(2, 0).unwrap().formula.as_deref(), Some("A2*2"));
+    }
+
+    #[test]
+    fn authored_styles_round_trip() {
+        use crate::sheet::{Align, Xf};
+        let mut pkg = new_xlsx();
+        // Bold red, right-aligned, with a custom number format and a fill.
+        let idx = pkg.workbook.styles.intern(Xf {
+            bold: true,
+            italic: true,
+            color: Some((255, 0, 0)),
+            fill: Some((255, 255, 0)),
+            align: Align::Right,
+            code: Some("0.00%".to_string()),
+            numfmt: crate::sheet::NumFmt::Percent { decimals: 2 },
+        });
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                value: CellValue::Number(0.5),
+                style: idx,
+                ..Cell::default()
+            },
+        );
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).expect("reload authored styles");
+        let s = &pkg2.workbook.sheets[0];
+        let cell = s.cell(0, 0).unwrap();
+        let xf = pkg2.workbook.styles.xf(cell.style);
+        assert!(xf.bold, "bold survived");
+        assert!(xf.italic, "italic survived");
+        assert_eq!(xf.color, Some((255, 0, 0)));
+        assert_eq!(xf.fill, Some((255, 255, 0)));
+        assert_eq!(xf.align, Align::Right);
+        assert_eq!(xf.code.as_deref(), Some("0.00%"));
+        // The original default xf is untouched (no bold/fill/align bleed).
+        let d = pkg2.workbook.styles.xf(0);
+        assert!(!d.bold && !d.italic && d.fill.is_none() && d.align == Align::General);
     }
 
     #[test]

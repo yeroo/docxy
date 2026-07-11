@@ -29,6 +29,15 @@ pub enum Act {
     RenameSheet,
     Save,
     SaveAs,
+    /// Cell formatting.
+    Bold,
+    Italic,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    NumberFormat,
+    FontColor,
+    FillColor,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -487,6 +496,36 @@ fn home_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Fill→", 5, FillRight, "Fill right (Ctrl+R)"),
                 ],
+            ],
+        },
+        Group {
+            title: "Font",
+            width: 17,
+            rows: [
+                vec![
+                    btn("B", 1, Bold, "Bold (Ctrl+B)"),
+                    Seg::Gap("  "),
+                    btn("I", 1, Italic, "Italic (Ctrl+I)"),
+                    Seg::Gap("  "),
+                    btn("A▾", 2, FontColor, "Font color"),
+                    Seg::Gap(" "),
+                    btn("▧▾", 2, FillColor, "Fill color"),
+                ],
+                vec![
+                    btn("Left", 4, AlignLeft, "Align left"),
+                    Seg::Gap(" "),
+                    btn("Center", 6, AlignCenter, "Align center"),
+                    Seg::Gap(" "),
+                    btn("Right", 5, AlignRight, "Align right"),
+                ],
+            ],
+        },
+        Group {
+            title: "Number",
+            width: 8,
+            rows: [
+                vec![btn("Format ▾", 8, NumberFormat, "Number format…")],
+                vec![],
             ],
         },
         Group {

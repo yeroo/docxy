@@ -426,6 +426,38 @@ pub enum NumFmt {
     Text,
 }
 
+/// Horizontal cell alignment (the subset xlsxy authors/renders).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    /// Excel's "General": numbers right, text left.
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    /// The `horizontal="…"` attribute value, or `None` for General.
+    pub fn attr(self) -> Option<&'static str> {
+        match self {
+            Align::General => None,
+            Align::Left => Some("left"),
+            Align::Center => Some("center"),
+            Align::Right => Some("right"),
+        }
+    }
+
+    pub fn from_attr(s: &str) -> Align {
+        match s {
+            "left" => Align::Left,
+            "center" => Align::Center,
+            "right" => Align::Right,
+            _ => Align::General,
+        }
+    }
+}
+
 /// One resolved cell format (`<xf>` joined with its font): everything the
 /// terminal renders.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -438,6 +470,9 @@ pub struct Xf {
     pub italic: bool,
     /// Font color as (r, g, b) when the file gives a concrete RGB.
     pub color: Option<(u8, u8, u8)>,
+    /// Solid fill (background) color as (r, g, b), when set.
+    pub fill: Option<(u8, u8, u8)>,
+    pub align: Align,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -450,6 +485,16 @@ pub struct Styles {
 impl Styles {
     pub fn xf(&self, idx: u32) -> Xf {
         self.xfs.get(idx as usize).cloned().unwrap_or_default()
+    }
+
+    /// Return the index of an `xf` equal to `xf`, appending it if new. Used by
+    /// the editor to author cell formatting without duplicating styles.
+    pub fn intern(&mut self, xf: Xf) -> u32 {
+        if let Some(i) = self.xfs.iter().position(|x| *x == xf) {
+            return i as u32;
+        }
+        self.xfs.push(xf);
+        (self.xfs.len() - 1) as u32
     }
 }
 

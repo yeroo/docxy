@@ -26,8 +26,8 @@ use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
 use gridcore::sheet::{
-    Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, cell_name, col_name, format_with,
-    sheet_to_csv,
+    Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
+    format_with, sheet_to_csv,
 };
 use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
 
@@ -655,6 +655,53 @@ struct Prompt {
     cursor: usize,
 }
 
+/// Which formatting popup is open.
+#[derive(Clone, Copy, PartialEq)]
+enum PickKind {
+    NumberFormat,
+    FontColor,
+    FillColor,
+}
+
+/// A formatting popup: a scrollable list applied to the selection.
+struct FormatPicker {
+    kind: PickKind,
+    sel: usize,
+}
+
+/// Number-format options offered by the picker: (label, format code).
+const NUMFMT_OPTIONS: &[(&str, Option<&str>)] = &[
+    ("General", None),
+    ("Number  0", Some("0")),
+    ("Number  0.00", Some("0.00")),
+    ("Thousands  #,##0", Some("#,##0")),
+    ("Thousands  #,##0.00", Some("#,##0.00")),
+    ("Percent  0%", Some("0%")),
+    ("Percent  0.00%", Some("0.00%")),
+    ("Currency  $#,##0.00", Some("$#,##0.00")),
+    ("Scientific  0.00E+00", Some("0.00E+00")),
+    ("Date  m/d/yyyy", Some("m/d/yyyy")),
+    ("Time  h:mm:ss", Some("h:mm:ss")),
+    ("Text  @", Some("@")),
+];
+
+/// An (r, g, b) color.
+type Rgb = (u8, u8, u8);
+
+/// Color palette offered by the font/fill pickers: (label, rgb).
+const COLOR_OPTIONS: &[(&str, Option<Rgb>)] = &[
+    ("Automatic", None),
+    ("Black", Some((0, 0, 0))),
+    ("White", Some((255, 255, 255))),
+    ("Red", Some((192, 0, 0))),
+    ("Orange", Some((237, 125, 49))),
+    ("Yellow", Some((255, 255, 0))),
+    ("Green", Some((0, 128, 0))),
+    ("Blue", Some((0, 112, 192))),
+    ("Purple", Some((112, 48, 160))),
+    ("Gray", Some((128, 128, 128))),
+];
+
 /// The pivot field editor's state: which pivot, which pane (0 = available
 /// fields, 1 = rows, 2 = columns, 3 = values), and the selected entry.
 struct PivotEdit {
@@ -709,6 +756,8 @@ struct App {
     // The welcome screen shown when launched with no file.
     start_screen: bool,
     start_sel: usize,
+    // The formatting popup (number format / font & fill color).
+    format_picker: Option<FormatPicker>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -760,6 +809,7 @@ impl App {
             backstage: None,
             start_screen: false,
             start_sel: 0,
+            format_picker: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -1853,6 +1903,106 @@ impl App {
         }
     }
 
+    // --- cell formatting -----------------------------------------------------
+
+    /// Apply `f` to the `Xf` of every cell in the selection (interning the
+    /// result so styles aren't duplicated), as one undoable edit.
+    fn apply_format(&mut self, f: impl Fn(&mut Xf)) {
+        let (r1, c1, r2, c2) = self.iter_selection();
+        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+            let sheet = self.sheet();
+            let mut v = Vec::new();
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    v.push((r, c, sheet.cell(r, c).cloned()));
+                }
+            }
+            v
+        };
+        let mut changes = Vec::new();
+        for (r, c, existing) in snapshot {
+            let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+            let mut xf = self.pkg.workbook.styles.xf(cur);
+            f(&mut xf);
+            let idx = self.pkg.workbook.styles.intern(xf);
+            // Preserve value/formula/spill; change only the style.
+            let mut cell = existing.unwrap_or_default();
+            cell.style = idx;
+            changes.push((r, c, cell));
+        }
+        self.apply(changes);
+    }
+
+    fn toggle_bold(&mut self) {
+        self.apply_format(|x| x.bold = !x.bold);
+        self.status = Some("Bold".to_string());
+    }
+
+    fn toggle_italic(&mut self) {
+        self.apply_format(|x| x.italic = !x.italic);
+        self.status = Some("Italic".to_string());
+    }
+
+    fn set_align(&mut self, a: Align) {
+        self.apply_format(move |x| x.align = a);
+    }
+
+    fn open_picker(&mut self, kind: PickKind) {
+        self.format_picker = Some(FormatPicker { kind, sel: 0 });
+    }
+
+    fn picker_len(kind: PickKind) -> usize {
+        match kind {
+            PickKind::NumberFormat => NUMFMT_OPTIONS.len(),
+            _ => COLOR_OPTIONS.len(),
+        }
+    }
+
+    /// Handle a key while the formatting popup is open.
+    fn picker_key(&mut self, code: KeyCode) {
+        let Some(p) = &mut self.format_picker else {
+            return;
+        };
+        let len = Self::picker_len(p.kind);
+        match code {
+            KeyCode::Esc => self.format_picker = None,
+            KeyCode::Up => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Down => p.sel = (p.sel + 1).min(len - 1),
+            KeyCode::Enter => self.apply_picker(),
+            _ => {}
+        }
+    }
+
+    fn apply_picker(&mut self) {
+        let Some(p) = self.format_picker.take() else {
+            return;
+        };
+        match p.kind {
+            PickKind::NumberFormat => {
+                let (label, code) = NUMFMT_OPTIONS[p.sel];
+                let code = code.map(str::to_string);
+                self.apply_format(move |x| {
+                    x.code = code.clone();
+                    x.numfmt = code
+                        .as_deref()
+                        .map(gridcore::sheet::classify_format_code)
+                        .unwrap_or(NumFmt::General);
+                });
+                self.status = Some(format!("Number format: {label}"));
+            }
+            PickKind::FontColor => {
+                let (label, rgb) = COLOR_OPTIONS[p.sel];
+                self.apply_format(move |x| x.color = rgb);
+                self.status = Some(format!("Font color: {label}"));
+            }
+            PickKind::FillColor => {
+                let (label, rgb) = COLOR_OPTIONS[p.sel];
+                self.apply_format(move |x| x.fill = rgb);
+                self.status = Some(format!("Fill color: {label}"));
+            }
+        }
+    }
+
     /// Dispatch a ribbon command to the matching editor operation.
     fn ribbon_act(&mut self, act: ribbon::Act) {
         use ribbon::Act::*;
@@ -1874,6 +2024,14 @@ impl App {
             RenameSheet => self.open_prompt(PromptKind::RenameSheet),
             Save => self.save(),
             SaveAs => self.open_prompt(PromptKind::SaveAs),
+            Bold => self.toggle_bold(),
+            Italic => self.toggle_italic(),
+            AlignLeft => self.set_align(Align::Left),
+            AlignCenter => self.set_align(Align::Center),
+            AlignRight => self.set_align(Align::Right),
+            NumberFormat => self.open_picker(PickKind::NumberFormat),
+            FontColor => self.open_picker(PickKind::FontColor),
+            FillColor => self.open_picker(PickKind::FillColor),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -2761,9 +2919,14 @@ fn draw(app: &mut App, f: &mut Frame) {
                 Some(cl) => format_with(&xf, &cl.value, date1904),
                 None => String::new(),
             };
-            let right = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))
+            let numeric = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))
                 && xf.numfmt != NumFmt::Text;
-            let display = fit(&text, w as usize, right);
+            let display = match xf.align {
+                Align::Left => fit(&text, w as usize, false),
+                Align::Right => fit(&text, w as usize, true),
+                Align::Center => center(&text, w as usize),
+                Align::General => fit(&text, w as usize, numeric),
+            };
             let mut style = Style::new();
             if xf.bold {
                 style = style.add_modifier(Modifier::BOLD);
@@ -2773,6 +2936,9 @@ fn draw(app: &mut App, f: &mut Frame) {
             }
             if let Some((cr, cg, cb)) = xf.color {
                 style = style.fg(Color::Rgb(cr, cg, cb));
+            }
+            if let Some((fr, fg, fb)) = xf.fill {
+                style = style.bg(Color::Rgb(fr, fg, fb));
             }
             let selected = row >= r1 && row <= r2 && col >= c1 && col <= c2;
             let is_cursor = (row, col) == (r, c);
@@ -2804,6 +2970,11 @@ fn draw(app: &mut App, f: &mut Frame) {
     // --- model view overlay -----------------------------------------------------
     if let Some((pane, sel)) = app.model_view {
         draw_model_view(app, pane, sel, f, grid);
+    }
+
+    // --- formatting popup -------------------------------------------------------
+    if let Some(p) = &app.format_picker {
+        draw_format_picker(p, f, grid);
     }
 
     // --- sheet tabs + stats ---------------------------------------------------
@@ -3208,6 +3379,73 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
     f.render_widget(Paragraph::new(plines), prev);
 }
 
+/// The formatting popup (number format / font & fill color).
+fn draw_format_picker(p: &FormatPicker, f: &mut Frame, grid: Rect) {
+    let (title, rows): (&str, Vec<(String, Option<Rgb>)>) = match p.kind {
+        PickKind::NumberFormat => (
+            "Number format",
+            NUMFMT_OPTIONS
+                .iter()
+                .map(|(l, _)| (l.to_string(), None))
+                .collect(),
+        ),
+        PickKind::FontColor => (
+            "Font color",
+            COLOR_OPTIONS
+                .iter()
+                .map(|(l, c)| (l.to_string(), *c))
+                .collect(),
+        ),
+        PickKind::FillColor => (
+            "Fill color",
+            COLOR_OPTIONS
+                .iter()
+                .map(|(l, c)| (l.to_string(), *c))
+                .collect(),
+        ),
+    };
+    let w = 30u16.min(grid.width.saturating_sub(2));
+    let h = (rows.len() as u16 + 3).min(grid.height);
+    if w < 12 || h < 4 {
+        return;
+    }
+    let x = grid.x + (grid.width - w) / 2;
+    let y = grid.y + (grid.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+    let mut lines: Vec<RLine> = vec![RLine::from(RSpan::styled(
+        fit(&format!(" {title}"), w as usize, false),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    ))];
+    for (i, (label, color)) in rows.iter().enumerate() {
+        let sel = i == p.sel;
+        let mut spans: Vec<RSpan> = Vec::new();
+        if let Some((r, g, b)) = color {
+            spans.push(RSpan::styled(
+                "  ██ ",
+                Style::new().fg(Color::Rgb(*r, *g, *b)),
+            ));
+        } else {
+            spans.push(RSpan::raw("     "));
+        }
+        let style = if sel {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        spans.push(RSpan::styled(label.clone(), style));
+        lines.push(RLine::from(spans));
+    }
+    lines.push(RLine::from(RSpan::styled(
+        " ↑↓ · Enter apply · Esc",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(Color::Black).fg(Color::White)),
+        area,
+    );
+}
+
 /// The data-model view: tables summary plus relationship/measure panes.
 fn draw_model_view(app: &App, pane: usize, sel: usize, f: &mut Frame, grid: Rect) {
     let w = grid.width.min(76);
@@ -3419,7 +3657,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     let overlay_open = app.pivot_edit.is_some()
         || app.model_view.is_some()
         || app.prompt.is_some()
-        || app.edit.is_some();
+        || app.edit.is_some()
+        || app.format_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -3431,6 +3670,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.ribbon_focus != ribbon::Focus::None && !overlay_open {
         app.ribbon_key(key.code);
+        return false;
+    }
+
+    // --- formatting popup -----------------------------------------------------
+    if app.format_picker.is_some() {
+        app.picker_key(key.code);
         return false;
     }
 
@@ -3606,6 +3851,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 bs.pane = backstage::Pane::Browser;
             }
         }
+        KeyCode::Char('b') | KeyCode::Char('B') if ctrl => app.toggle_bold(),
+        KeyCode::Char('i') | KeyCode::Char('I') if ctrl => app.toggle_italic(),
         KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
         KeyCode::Char('t') | KeyCode::Char('T') if ctrl => app.open_prompt(PromptKind::AddSheet),
         KeyCode::F(3) => {
@@ -3950,6 +4197,55 @@ mod tests {
         let cs = reloaded.comments();
         assert_eq!(cs.iter().filter(|c| c.threaded).count(), 2);
         assert_eq!(cs.iter().filter(|c| !c.threaded).count(), 1);
+    }
+
+    #[test]
+    fn cell_formatting_applies_and_round_trips() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        app.start_edit(Some('5'));
+        assert!(app.commit_edit());
+        app.cur = (0, 0);
+        app.anchor = None;
+        // Bold + right align + a percent format via the picker.
+        app.toggle_bold();
+        app.set_align(Align::Right);
+        app.open_picker(PickKind::NumberFormat);
+        // Select "Percent  0%".
+        let pct = NUMFMT_OPTIONS
+            .iter()
+            .position(|(l, _)| *l == "Percent  0%")
+            .unwrap();
+        app.format_picker.as_mut().unwrap().sel = pct;
+        app.apply_picker();
+
+        let xf = {
+            let cell = app.sheet().cell(0, 0).unwrap();
+            app.pkg.workbook.styles.xf(cell.style)
+        };
+        assert!(xf.bold);
+        assert_eq!(xf.align, Align::Right);
+        assert_eq!(xf.code.as_deref(), Some("0%"));
+
+        // Undo peels back the number format (last op).
+        app.undo();
+        let xf = {
+            let cell = app.sheet().cell(0, 0).unwrap();
+            app.pkg.workbook.styles.xf(cell.style)
+        };
+        assert_ne!(xf.code.as_deref(), Some("0%"));
+
+        // Reapply, save, reload: formatting persists.
+        app.open_picker(PickKind::NumberFormat);
+        app.format_picker.as_mut().unwrap().sel = pct;
+        app.apply_picker();
+        let reloaded = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let s = &reloaded.workbook.sheets[0];
+        let xf = reloaded.workbook.styles.xf(s.cell(0, 0).unwrap().style);
+        assert!(xf.bold);
+        assert_eq!(xf.align, Align::Right);
+        assert_eq!(xf.code.as_deref(), Some("0%"));
     }
 
     #[test]
