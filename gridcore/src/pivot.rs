@@ -51,6 +51,9 @@ pub struct Pivot {
     pub data_fields: Vec<DataField>,
     pub grand_rows: bool,
     pub grand_cols: bool,
+    /// Subtotal rows for outer row fields (Excel's default with two or
+    /// more row fields, unless every row field opts out).
+    pub subtotals: bool,
     /// Uses features refresh doesn't model — never refreshed.
     pub unsupported: bool,
     /// Field layout changed in the editor — save must rewrite the
@@ -76,6 +79,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         data_fields: Vec::new(),
         grand_rows: true,
         grand_cols: true,
+        subtotals: false,
         unsupported: false,
         edited: false,
         part: part.to_string(),
@@ -83,6 +87,8 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
     };
     let mut cache_id = None;
     let mut got_location = false;
+    let mut pivot_field_idx: i64 = -1;
+    let mut no_subtotal: Vec<usize> = Vec::new();
     #[derive(PartialEq)]
     enum Section {
         None,
@@ -111,6 +117,12 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                     if let Some(rect) = parse_range_name(p.attr("ref")) {
                         piv.location = rect;
                         got_location = true;
+                    }
+                }
+                "pivotField" => {
+                    pivot_field_idx += 1;
+                    if p.attr("defaultSubtotal") == "0" {
+                        no_subtotal.push(pivot_field_idx as usize);
                     }
                 }
                 "rowFields" => section = Section::Rows,
@@ -162,6 +174,10 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
     if !got_location || piv.data_fields.is_empty() {
         piv.unsupported = true;
     }
+    // Excel shows subtotals by default when row fields nest, unless every
+    // row field has them switched off.
+    piv.subtotals =
+        piv.row_fields.len() >= 2 && piv.row_fields.iter().any(|f| !no_subtotal.contains(f));
     Some((piv, cache_id?))
 }
 
@@ -285,6 +301,7 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             filters: Vec::new(),
             grand_rows: p.grand_rows,
             grand_cols: p.grand_cols,
+            subtotals: p.subtotals,
         };
         let result = crate::frame::pivot(&frame, &spec);
 
@@ -529,6 +546,35 @@ mod tests {
         });
         let out = rewrite_pivot_definition(xml, &piv);
         assert!(out.contains(r#"<colFields count="2"><field x="0"/><field x="-2"/></colFields>"#));
+    }
+
+    #[test]
+    fn subtotals_follow_default_subtotal_attrs() {
+        let two_rows = |fields: &str| {
+            format!(
+                r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A1:B2"/><pivotFields>{fields}</pivotFields><rowFields><field x="0"/><field x="1"/></rowFields><dataFields><dataField fld="2"/></dataFields></pivotTableDefinition>"#
+            )
+        };
+        // Two nested row fields, defaults on → subtotals.
+        let (p, _) = parse_pivot_table_xml(
+            &two_rows(r#"<pivotField axis="axisRow"/><pivotField axis="axisRow"/><pivotField dataField="1"/>"#),
+            0,
+            "p",
+        )
+        .unwrap();
+        assert!(p.subtotals);
+        // Every row field opted out → no subtotals.
+        let (p, _) = parse_pivot_table_xml(
+            &two_rows(r#"<pivotField axis="axisRow" defaultSubtotal="0"/><pivotField axis="axisRow" defaultSubtotal="0"/><pivotField dataField="1"/>"#),
+            0,
+            "p",
+        )
+        .unwrap();
+        assert!(!p.subtotals);
+        // A single row field never shows subtotals (grand total covers it).
+        let one_row = r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A1:B2"/><pivotFields><pivotField axis="axisRow"/><pivotField dataField="1"/></pivotFields><rowFields><field x="0"/></rowFields><dataFields><dataField fld="1"/></dataFields></pivotTableDefinition>"#;
+        let (p, _) = parse_pivot_table_xml(one_row, 0, "p").unwrap();
+        assert!(!p.subtotals);
     }
 
     #[test]

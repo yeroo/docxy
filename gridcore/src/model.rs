@@ -190,6 +190,74 @@ impl DataModel {
     }
 }
 
+/// The package part where model definitions persist across save/load.
+/// A gridcore extension — Excel ignores it (and may drop it on its own
+/// resave); our round-trip keeps it byte-for-byte like any other part.
+pub const MODEL_PART: &str = "xl/gridcoreModel.xml";
+
+/// Serialize a model's definitions (relationships + measures — tables come
+/// from the workbook) into the custom part's XML.
+pub fn model_part_xml(rels: &[Relationship], measures: &[Measure]) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<gridcoreModel xmlns=\"urn:gridcore:model\">",
+    );
+    for r in rels {
+        out.push_str(&format!(
+            "<relationship fromTable=\"{}\" fromCol=\"{}\" toTable=\"{}\" toCol=\"{}\"/>",
+            esc(&r.from.0),
+            esc(&r.from.1),
+            esc(&r.to.0),
+            esc(&r.to.1)
+        ));
+    }
+    for m in measures {
+        out.push_str(&format!(
+            "<measure name=\"{}\" formula=\"{}\"/>",
+            esc(&m.name),
+            esc(&m.formula)
+        ));
+    }
+    out.push_str("</gridcoreModel>");
+    out
+}
+
+/// Parse the custom part back into definitions.
+pub fn parse_model_part(xml: &str) -> (Vec<Relationship>, Vec<Measure>) {
+    use opccore::xml::{Event, XmlParser};
+    let mut rels = Vec::new();
+    let mut measures = Vec::new();
+    let mut p = XmlParser::new(xml);
+    let decode = |raw: &str| {
+        let mut s = String::new();
+        XmlParser::append_decoded(raw, &mut s);
+        s
+    };
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "relationship" => rels.push(Relationship {
+                    from: (decode(p.attr("fromTable")), decode(p.attr("fromCol"))),
+                    to: (decode(p.attr("toTable")), decode(p.attr("toCol"))),
+                }),
+                "measure" => measures.push(Measure {
+                    name: decode(p.attr("name")),
+                    formula: decode(p.attr("formula")),
+                }),
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    (rels, measures)
+}
+
 /// Evaluate one formula against a model (virtual sheets = tables).
 fn eval_over(model: &DataModel, src: &str) -> Value {
     let ast = match formula::parse(src) {
@@ -631,6 +699,23 @@ mod tests {
         // Grand Total row.
         assert_eq!(out.grid[4][1], v(10.0)); // Ink: 50/5
         assert_eq!(out.grid[4][4], v(115.0 / 11.0));
+    }
+
+    #[test]
+    fn model_part_round_trips_definitions() {
+        let rels = vec![Relationship {
+            from: ("Sales".into(), "ProductID".into()),
+            to: ("Products".into(), "ID".into()),
+        }];
+        let measures = vec![Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Amount])<>\"\"&\"x\"".into(), // XML-hostile
+        }];
+        let xml = model_part_xml(&rels, &measures);
+        let (r2, m2) = parse_model_part(&xml);
+        assert_eq!(r2, rels);
+        assert_eq!(m2[0].name, "Total");
+        assert_eq!(m2[0].formula, measures[0].formula);
     }
 
     #[test]

@@ -145,7 +145,9 @@ columnar group-by/aggregate engine recomputes pivots from current data —
 to rearrange rows/columns/values and aggregations), a **data model**
 (`gridcore::model`: multiple tables with relationships and Excel-formula
 measures, filter context through star schemas, CSV sources — `xlsxy
-data.csv` imports directly), and the same lossless
+data.csv` imports directly; `Ctrl-M` manages the model in the TUI and
+materializes reports, with definitions persisted in the file), and the
+same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
 Excel's cached results and are saved untouched.

@@ -259,8 +259,10 @@ The strategic piece: **conformance is measured, not claimed.**
   after every change; save rewrites the edited definition part
   (regenerated `pivotFields`/`rowFields`/`colFields`/`dataFields`, stale
   `rowItems`/`colItems` dropped, styles preserved) so the layout round-trips
-  and real Excel rebuilds from it. Remaining: subtotals, creating pivots
-  from scratch, real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
+  and real Excel rebuilds from it. Subtotal rows shipped: outer row-field
+  groups get "<value> Total" control-break rows (Excel's default with
+  nested row fields, honoring `defaultSubtotal="0"` opt-outs). Remaining:
+  creating pivots from scratch, real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
   XML — is the point: it is the aggregation core everything later builds on.
@@ -277,8 +279,14 @@ The strategic piece: **conformance is measured, not claimed.**
   keys); `model_pivot` groups by any related column and evaluates measures
   per group with **filter context** propagated through the relationships.
   xlsxy opens `.csv` files directly (imported as a workbook, saved as
-  `.xlsx`). Remaining: a TUI surface for the model (relationship/measure
-  editors), persistence of model definitions, more sources.* Multiple
+  `.xlsx`). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
+  relationships, measures) with prompt-driven editing — `r` relates
+  `Sales[PID] = Products[ID]` (validated against the live tables), `m`
+  defines `Total = SUM(Sales[Amount])`, `p` materializes a report
+  (`Base; rows; values[; cols]`) into a fresh sheet, `d` deletes.
+  Definitions persist across save/load in a custom `xl/gridcoreModel.xml`
+  part (a gridcore extension — Excel ignores it; our round-trip keeps it).
+  Remaining: more sources, DAX-style row-context iterators (SUMX).* Multiple
   tables, relationships, measures over the phase-D query core; sources
   beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
   small BI engine that happens to have a terminal frontend.

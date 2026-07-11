@@ -342,6 +342,10 @@ pub struct PivotSpec {
     /// Grand-total row / column.
     pub grand_rows: bool,
     pub grand_cols: bool,
+    /// Subtotal rows after each outer row-field group ("East Total"),
+    /// Excel's tabular-with-subtotals layout. Only meaningful with two or
+    /// more row fields.
+    pub subtotals: bool,
 }
 
 /// A computed pivot, laid out as a rectangular grid ready to render:
@@ -484,8 +488,60 @@ pub fn pivot(f: &Frame, spec: &PivotSpec) -> PivotOut {
         }
         grid.push(row);
     }
-    // Data rows.
+    // Data rows, with control-break subtotals for the non-innermost row
+    // fields when asked: after each level-l group, a "<value> Total" row
+    // aggregating the whole group (deepest level closes first).
+    let sub_levels = if spec.subtotals && spec.rows.len() >= 2 {
+        spec.rows.len() - 1
+    } else {
+        0
+    };
+    // group_start[l] = index of the first combo of the current level-l group.
+    let mut group_start = vec![0usize; sub_levels];
+    let emit_subtotal = |grid: &mut Vec<Vec<Value>>,
+                         buckets: &Vec<Vec<Vec<usize>>>,
+                         level: usize,
+                         from: usize,
+                         to: usize,
+                         label_of: &Value| {
+        let mut row = vec![Value::Empty; total_cols];
+        let label = to_text(label_of).unwrap_or_default();
+        row[level] = Value::Str(format!("{label} Total"));
+        for ci in 0..col_combos.len() {
+            let group: Vec<usize> = (from..to).flat_map(|rj| buckets[rj][ci].clone()).collect();
+            for (k, meas) in spec.measures.iter().enumerate() {
+                row[label_cols + ci * m + k] = agg_records(&group, meas);
+            }
+        }
+        if grand_col {
+            let all: Vec<usize> = (from..to)
+                .flat_map(|rj| buckets[rj].iter().flatten().copied().collect::<Vec<_>>())
+                .collect();
+            for (k, meas) in spec.measures.iter().enumerate() {
+                row[label_cols + col_combos.len() * m + k] = agg_records(&all, meas);
+            }
+        }
+        grid.push(row);
+    };
     for (ri, combo) in row_combos.iter().enumerate() {
+        // Close finished groups (deepest first) before starting a new one.
+        if ri > 0 {
+            for level in (0..sub_levels).rev() {
+                let changed =
+                    (0..=level).any(|l| key_of(&row_combos[ri - 1][l]) != key_of(&combo[l]));
+                if changed {
+                    emit_subtotal(
+                        &mut grid,
+                        &buckets,
+                        level,
+                        group_start[level],
+                        ri,
+                        &row_combos[ri - 1][level],
+                    );
+                    group_start[level] = ri;
+                }
+            }
+        }
         let mut row = vec![Value::Empty; total_cols];
         if combo.is_empty() {
             row[0] = Value::Str("Total".into());
@@ -505,6 +561,18 @@ pub fn pivot(f: &Frame, spec: &PivotSpec) -> PivotOut {
             }
         }
         grid.push(row);
+    }
+    if !row_combos.is_empty() {
+        for level in (0..sub_levels).rev() {
+            emit_subtotal(
+                &mut grid,
+                &buckets,
+                level,
+                group_start[level],
+                row_combos.len(),
+                &row_combos[row_combos.len() - 1][level],
+            );
+        }
     }
     // Grand-total row.
     if spec.grand_rows && !row_combos.is_empty() && !spec.rows.is_empty() {
@@ -724,6 +792,45 @@ mod tests {
         // Var of a single record is #DIV/0! (n-1 = 0).
         let out = pivot(&f, &mk(Agg::Var));
         assert_eq!(out.grid[2][1], Value::Err(ExcelError::Div0));
+    }
+
+    #[test]
+    fn subtotal_rows_for_outer_groups() {
+        let wb = sales_wb();
+        let f = Frame::from_range(&wb, 0, (0, 0, 6, 3));
+        let spec = PivotSpec {
+            rows: vec![0, 1],
+            measures: vec![Measure {
+                col: 3,
+                agg: Agg::Sum,
+                name: "Sum of Sales".into(),
+            }],
+            grand_rows: true,
+            subtotals: true,
+            ..PivotSpec::default()
+        };
+        let out = pivot(&f, &spec);
+        let rows: Vec<(String, Value)> = out
+            .grid
+            .iter()
+            .skip(1)
+            .map(|r| {
+                let label = match (&r[0], &r[1]) {
+                    (Value::Str(a), Value::Empty) => a.clone(),
+                    (Value::Str(a), Value::Str(b)) => format!("{a}/{b}"),
+                    (Value::Empty, Value::Str(b)) => format!("·/{b}"),
+                    _ => String::new(),
+                };
+                (label, r[2].clone())
+            })
+            .collect();
+        // East group, East Total, West group, West Total, Grand Total.
+        assert_eq!(rows[0].0, "East/Ink");
+        assert_eq!(rows[3], ("East Total".to_string(), n(80.0)));
+        assert_eq!(rows[4].0, "West/Pad");
+        assert_eq!(rows[6], ("West Total".to_string(), n(90.0)));
+        assert_eq!(rows[7], ("Grand Total".to_string(), n(170.0)));
+        assert_eq!(rows.len(), 8);
     }
 
     #[test]

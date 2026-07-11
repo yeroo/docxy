@@ -18,6 +18,9 @@ use std::time::SystemTime;
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
+use gridcore::model::{
+    DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
+};
 use gridcore::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, cell_name, col_name, format_with,
     sheet_to_csv,
@@ -192,6 +195,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `Sales[ProductID]` → ("Sales", "ProductID").
+fn parse_table_col(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let open = s.find('[')?;
+    let close = s.rfind(']')?;
+    if close != s.len() - 1 || open == 0 || close <= open + 1 {
+        return None;
+    }
+    Some((
+        s[..open].trim().to_string(),
+        s[open + 1..close].trim().to_string(),
+    ))
 }
 
 /// Import CSV text as a fresh one-sheet workbook.
@@ -495,6 +512,12 @@ enum PromptKind {
     SaveAs,
     RenameSheet,
     AddSheet,
+    /// `Sales[ProductID] = Products[ID]` — add a model relationship.
+    Relate,
+    /// `Total = SUM(Sales[Amount])` — add a model measure.
+    Measure,
+    /// `Sales; Groups[Category]; Total[; Products[Name]]` — build a report.
+    ModelPivot,
 }
 
 struct Prompt {
@@ -542,6 +565,10 @@ struct App {
     confirm_delete_sheet: bool,
     prompt: Option<Prompt>,
     pivot_edit: Option<PivotEdit>,
+    /// Ctrl-M overlay: pane 0 = relationships, 1 = measures.
+    model_view: Option<(usize, usize)>,
+    model_rels: Vec<Relationship>,
+    model_measures: Vec<gridcore::model::Measure>,
     last_find: Option<String>,
     quit: bool,
     // Geometry captured during draw, for mouse hit-testing.
@@ -556,6 +583,10 @@ impl App {
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
         engine.seed = entropy_seed();
+        let (model_rels, model_measures) = pkg
+            .part(MODEL_PART)
+            .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
+            .unwrap_or_default();
         App {
             pkg,
             engine,
@@ -577,6 +608,9 @@ impl App {
             confirm_delete_sheet: false,
             prompt: None,
             pivot_edit: None,
+            model_view: None,
+            model_rels,
+            model_measures,
             last_find: None,
             quit: false,
             grid_area: Rect::default(),
@@ -726,6 +760,113 @@ impl App {
         engine.seed = entropy_seed();
         engine.recalc_all(&mut self.pkg.workbook);
         self.engine = engine;
+    }
+
+    // --- data model ---------------------------------------------------------
+
+    /// The live model: workbook Tables + the session's definitions.
+    fn current_model(&self) -> DataModel {
+        let mut m = DataModel::from_workbook(&self.pkg.workbook);
+        m.relationships = self.model_rels.clone();
+        m.measures = self.model_measures.clone();
+        m
+    }
+
+    /// Ctrl-M — the model view (tables, relationships, measures).
+    fn open_model_view(&mut self) {
+        self.model_view = Some((0, 0));
+    }
+
+    fn model_view_key(&mut self, code: KeyCode) {
+        let Some((mut pane, mut sel)) = self.model_view.take() else {
+            return;
+        };
+        let pane_len = |app: &App, pane: usize| {
+            if pane == 0 {
+                app.model_rels.len()
+            } else {
+                app.model_measures.len()
+            }
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Enter => return,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                pane = 1 - pane;
+                sel = 0;
+            }
+            KeyCode::Up => sel = sel.saturating_sub(1),
+            KeyCode::Down => sel = (sel + 1).min(pane_len(self, pane).saturating_sub(1)),
+            KeyCode::Char('r') => {
+                self.open_prompt(PromptKind::Relate);
+            }
+            KeyCode::Char('m') => {
+                self.open_prompt(PromptKind::Measure);
+            }
+            KeyCode::Char('p') => {
+                self.open_prompt(PromptKind::ModelPivot);
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if pane == 0 && sel < self.model_rels.len() {
+                    self.model_rels.remove(sel);
+                    self.modified = true;
+                } else if pane == 1 && sel < self.model_measures.len() {
+                    self.model_measures.remove(sel);
+                    self.modified = true;
+                }
+                sel = sel.saturating_sub(1);
+            }
+            _ => {}
+        }
+        self.model_view = Some((pane, sel));
+    }
+
+    /// Materialize a model pivot into a fresh sheet and jump to it.
+    fn build_model_report(&mut self, base: &str, spec: &ModelSpec) {
+        let model = self.current_model();
+        let out = match model_pivot(&model, base, spec) {
+            Ok(o) => o,
+            Err(e) => {
+                self.status = Some(format!("model pivot: {e}"));
+                return;
+            }
+        };
+        let mut name = "Model Pivot".to_string();
+        let mut n = 1;
+        while self.pkg.workbook.sheet_index(&name).is_some() {
+            n += 1;
+            name = format!("Model Pivot {n}");
+        }
+        let idx = self.pkg.add_sheet(&name);
+        let sheet = &mut self.pkg.workbook.sheets[idx];
+        for (r, row) in out.grid.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let value = match v {
+                    gridcore::formula::Value::Empty => continue,
+                    gridcore::formula::Value::Num(x) => CellValue::Number(*x),
+                    gridcore::formula::Value::Str(t) => CellValue::Text(t.clone()),
+                    gridcore::formula::Value::Bool(b) => CellValue::Bool(*b),
+                    gridcore::formula::Value::Err(e) => CellValue::Error(e.code().to_string()),
+                };
+                sheet.set_cell(
+                    r as u32,
+                    c as u32,
+                    Cell {
+                        value,
+                        ..Cell::default()
+                    },
+                );
+            }
+        }
+        self.sheet = idx;
+        self.cur = (0, 0);
+        self.top = 0;
+        self.left = 0;
+        self.anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.rebuild_engine();
+        self.modified = true;
+        self.status = Some(format!("Built {name}"));
     }
 
     // --- pivot editor -------------------------------------------------------
@@ -1218,8 +1359,19 @@ impl App {
 
     // --- actions ---------------------------------------------------------------
 
+    /// Serialize the package, persisting model definitions in the custom
+    /// part (removed again when the model is empty).
+    fn package_bytes(&mut self) -> Vec<u8> {
+        self.pkg.remove_part(MODEL_PART);
+        if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
+            let xml = model_part_xml(&self.model_rels, &self.model_measures);
+            self.pkg.set_part(MODEL_PART, xml.into_bytes());
+        }
+        save_xlsx(&self.pkg)
+    }
+
     fn save(&mut self) {
-        let bytes = save_xlsx(&self.pkg);
+        let bytes = self.package_bytes();
         match std::fs::write(&self.path, &bytes) {
             Ok(()) => {
                 self.modified = false;
@@ -1401,6 +1553,9 @@ impl App {
                 "New sheet name: ",
                 format!("Sheet{}", self.pkg.workbook.sheets.len() + 1),
             ),
+            PromptKind::Relate => ("Relate  From[Col] = To[Col]: ", String::new()),
+            PromptKind::Measure => ("Measure  Name = FORMULA: ", String::new()),
+            PromptKind::ModelPivot => ("Report  Base; rows; values[; cols]: ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -1435,6 +1590,85 @@ impl App {
                 } else {
                     self.status = Some("Invalid sheet name".to_string());
                 }
+            }
+            PromptKind::Relate => {
+                let parts: Vec<&str> = if text.contains("->") {
+                    text.splitn(2, "->").collect()
+                } else {
+                    text.splitn(2, '=').collect()
+                };
+                let parsed = match parts.as_slice() {
+                    [a, b] => parse_table_col(a).zip(parse_table_col(b)),
+                    _ => None,
+                };
+                match parsed {
+                    Some(((ft, fc), (tt, tc))) => {
+                        let mut model = self.current_model();
+                        match model.relate(&ft, &fc, &tt, &tc) {
+                            Ok(()) => {
+                                self.model_rels
+                                    .push(model.relationships.pop().expect("just added"));
+                                self.modified = true;
+                                self.status = Some(format!("Related {ft}[{fc}] → {tt}[{tc}]"));
+                            }
+                            Err(e) => self.status = Some(format!("relate: {e}")),
+                        }
+                    }
+                    None => {
+                        self.status =
+                            Some("Expected  From[Col] = To[Col]  (tables must exist)".to_string());
+                    }
+                }
+            }
+            PromptKind::Measure => {
+                let Some((name, formula)) = text.split_once('=') else {
+                    self.status = Some("Expected  Name = FORMULA".to_string());
+                    return;
+                };
+                let (name, formula) = (name.trim(), formula.trim());
+                if name.is_empty() || name.contains(['[', ']', ' ']) {
+                    self.status = Some("Measure names are single words".to_string());
+                    return;
+                }
+                if let Err(e) = Engine::validate(formula) {
+                    self.status = Some(format!("measure formula: {e}"));
+                    return;
+                }
+                self.model_measures
+                    .retain(|m| !m.name.eq_ignore_ascii_case(name));
+                self.model_measures.push(gridcore::model::Measure {
+                    name: name.to_string(),
+                    formula: formula.to_string(),
+                });
+                self.modified = true;
+                self.status = Some(format!("Measure {name} defined"));
+            }
+            PromptKind::ModelPivot => {
+                let seg: Vec<&str> = text.split(';').map(str::trim).collect();
+                if seg.len() < 3 || seg[0].is_empty() {
+                    self.status = Some("Expected  Base; rows; values[; cols]".to_string());
+                    return;
+                }
+                let list = |s: &str| -> Vec<String> {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
+                let spec = ModelSpec {
+                    rows: list(seg[1]),
+                    cols: seg.get(3).map(|s| list(s)).unwrap_or_default(),
+                    measures: list(seg[2]).into_iter().map(|v| (v.clone(), v)).collect(),
+                    grand_rows: true,
+                    grand_cols: true,
+                };
+                if spec.measures.is_empty() {
+                    self.status = Some("A report needs at least one value".to_string());
+                    return;
+                }
+                let base = seg[0].to_string();
+                self.build_model_report(&base, &spec);
             }
             PromptKind::AddSheet => {
                 if text.is_empty() || self.pkg.workbook.sheet_index(&text).is_some() {
@@ -1695,6 +1929,11 @@ fn draw(app: &mut App, f: &mut Frame) {
         draw_pivot_editor(app, pe, f, grid);
     }
 
+    // --- model view overlay -----------------------------------------------------
+    if let Some((pane, sel)) = app.model_view {
+        draw_model_view(app, pane, sel, f, grid);
+    }
+
     // --- sheet tabs + stats ---------------------------------------------------
     app.tab_spans.clear();
     let mut tab_spans_ui: Vec<RSpan> = vec![RSpan::raw(" ")];
@@ -1746,7 +1985,10 @@ fn draw(app: &mut App, f: &mut Frame) {
         );
         return;
     }
-    let hint = if app.pivot_edit.is_some() {
+    let hint = if app.model_view.is_some() && app.prompt.is_none() {
+        "Model: ←/→ pane · ↑/↓ select · r relate · m measure · p report · d delete · Esc close"
+            .to_string()
+    } else if app.pivot_edit.is_some() {
         "Pivot: ←/→ pane · ↑/↓ select · r/c/v add to Rows/Cols/Values · d remove · a aggregation · Esc close"
             .to_string()
     } else if app.confirm_quit {
@@ -1838,6 +2080,83 @@ fn draw_pivot_editor(app: &App, pe: &PivotEdit, f: &mut Frame, grid: Rect) {
             let text = items.get(row).cloned().unwrap_or_default();
             let mut style = Style::new();
             if i == pe.pane && row == pe.sel && !text.is_empty() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(RSpan::styled(fit(&text, col_w, false), style));
+        }
+        lines.push(RLine::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(Color::Black).fg(Color::White)),
+        area,
+    );
+}
+
+/// The data-model view: tables summary plus relationship/measure panes.
+fn draw_model_view(app: &App, pane: usize, sel: usize, f: &mut Frame, grid: Rect) {
+    let w = grid.width.min(76);
+    let h = grid.height.min(14);
+    if w < 20 || h < 5 {
+        return;
+    }
+    let x = grid.x + (grid.width - w) / 2;
+    let y = grid.y + (grid.height - h) / 2;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+
+    let model = app.current_model();
+    let tables: Vec<String> = model
+        .tables
+        .iter()
+        .map(|(n, fr)| format!("{n}({})", fr.rows()))
+        .collect();
+    let mut lines: Vec<RLine> = Vec::new();
+    lines.push(RLine::from(RSpan::styled(
+        fit(" Data model", w as usize, false),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )));
+    lines.push(RLine::from(RSpan::styled(
+        fit(
+            &format!(
+                " Tables: {}",
+                if tables.is_empty() {
+                    "none — create Excel Tables or import CSV".to_string()
+                } else {
+                    tables.join("  ")
+                }
+            ),
+            w as usize,
+            false,
+        ),
+        Style::new().fg(Color::Gray),
+    )));
+    let col_w = (w as usize - 2) / 2;
+    let mut hdr: Vec<RSpan> = vec![RSpan::raw(" ")];
+    for (i, t) in ["Relationships", "Measures"].iter().enumerate() {
+        let style = if i == pane {
+            Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        } else {
+            Style::new().add_modifier(Modifier::BOLD)
+        };
+        hdr.push(RSpan::styled(fit(t, col_w, false), style));
+    }
+    lines.push(RLine::from(hdr));
+    let rels: Vec<String> = app
+        .model_rels
+        .iter()
+        .map(|r| format!("{}[{}] → {}[{}]", r.from.0, r.from.1, r.to.0, r.to.1))
+        .collect();
+    let measures: Vec<String> = app
+        .model_measures
+        .iter()
+        .map(|m| format!("{} = {}", m.name, m.formula))
+        .collect();
+    for row in 0..(h as usize - 4) {
+        let mut spans: Vec<RSpan> = vec![RSpan::raw(" ")];
+        for (i, items) in [&rels, &measures].iter().enumerate() {
+            let text = items.get(row).cloned().unwrap_or_default();
+            let mut style = Style::new();
+            if i == pane && row == sel && !text.is_empty() {
                 style = style.add_modifier(Modifier::REVERSED);
             }
             spans.push(RSpan::styled(fit(&text, col_w, false), style));
@@ -1957,6 +2276,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // --- model view -------------------------------------------------------------
+    if app.model_view.is_some() {
+        app.model_view_key(key.code);
+        return false;
+    }
+
     // --- edit mode -----------------------------------------------------------
     if app.edit.is_some() {
         let replace = app.edit.as_ref().is_some_and(|e| e.replace);
@@ -2065,6 +2390,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
+        KeyCode::Char('m') | KeyCode::Char('M') if ctrl => app.open_model_view(),
         KeyCode::F(12) => app.open_prompt(PromptKind::SaveAs),
         KeyCode::F(2) if shift => app.open_prompt(PromptKind::RenameSheet),
         KeyCode::F(5) if shift => app.row_op(false),
@@ -2576,6 +2902,7 @@ mod tests {
             }],
             grand_rows: true,
             grand_cols: true,
+            subtotals: false,
             unsupported: false,
             edited: false,
             part: String::new(),
@@ -2647,6 +2974,7 @@ mod tests {
             }],
             grand_rows: true,
             grand_cols: true,
+            subtotals: false,
             unsupported: false,
             edited: false,
             part: String::new(),
@@ -2691,5 +3019,119 @@ mod tests {
             pkg2.workbook.sheets[0].cell(2, 1).unwrap().value,
             CellValue::Number(20.5)
         );
+    }
+
+    #[test]
+    fn model_definitions_persist_and_build_reports() {
+        // Workbook with a Sales table and a Products table on one sheet.
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            for (c, h) in ["PID", "Amount"].iter().enumerate() {
+                sh.set_cell(0, c as u32, Cell::text(h));
+            }
+            for (i, (pid, amt)) in [(1.0, 10.0), (2.0, 20.0), (1.0, 30.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::number(*pid));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*amt));
+            }
+            for (c, h) in ["ID", "Cat"].iter().enumerate() {
+                sh.set_cell(0, c as u32 + 3, Cell::text(h));
+            }
+            for (i, (id, cat)) in [(1.0, "A"), (2.0, "B")].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 3, Cell::number(*id));
+                sh.set_cell(i as u32 + 1, 4, Cell::text(cat));
+            }
+        }
+        let table = |name: &str, range, cols: &[&str]| gridcore::sheet::Table {
+            name: name.into(),
+            sheet: 0,
+            range,
+            header_rows: 1,
+            totals_rows: 0,
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            part: String::new(),
+        };
+        pkg.workbook
+            .tables
+            .push(table("Sales", (0, 0, 3, 1), &["PID", "Amount"]));
+        pkg.workbook
+            .tables
+            .push(table("Products", (0, 3, 2, 4), &["ID", "Cat"]));
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+
+        // Add a relationship and a measure through the prompt handlers.
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Relate,
+            label: "",
+            text: "Sales[PID] = Products[ID]".into(),
+            cursor: 0,
+        });
+        app.commit_prompt();
+        assert_eq!(app.model_rels.len(), 1, "{:?}", app.status);
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Measure,
+            label: "",
+            text: "Total = SUM(Sales[Amount])".into(),
+            cursor: 0,
+        });
+        app.commit_prompt();
+        assert_eq!(app.model_measures.len(), 1);
+        // A bad relationship is rejected with a message.
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Relate,
+            label: "",
+            text: "Sales[Nope] = Products[ID]".into(),
+            cursor: 0,
+        });
+        app.commit_prompt();
+        assert_eq!(app.model_rels.len(), 1);
+
+        // Build a report grouped by the related dimension column.
+        app.prompt = Some(Prompt {
+            kind: PromptKind::ModelPivot,
+            label: "",
+            text: "Sales; Products[Cat]; Total".into(),
+            cursor: 0,
+        });
+        app.commit_prompt();
+        let idx = app
+            .pkg
+            .workbook
+            .sheet_index("Model Pivot")
+            .expect("report sheet");
+        let sh = &app.pkg.workbook.sheets[idx];
+        assert_eq!(
+            sh.cell(0, 1).unwrap().value,
+            CellValue::Text("Total".into())
+        );
+        assert_eq!(sh.cell(1, 0).unwrap().value, CellValue::Text("A".into()));
+        assert_eq!(sh.cell(1, 1).unwrap().value, CellValue::Number(40.0));
+        assert_eq!(sh.cell(2, 1).unwrap().value, CellValue::Number(20.0));
+        assert_eq!(
+            sh.cell(3, 0).unwrap().value,
+            CellValue::Text("Grand Total".into())
+        );
+        assert_eq!(sh.cell(3, 1).unwrap().value, CellValue::Number(60.0));
+
+        // Definitions survive save → load via the custom part. (The
+        // in-memory test Tables have no parts, so only the definitions —
+        // not the tables — are expected back.)
+        let bytes = app.package_bytes();
+        let pkg2 = load_xlsx(&bytes).unwrap();
+        let app2 = App::new(pkg2, "test.xlsx");
+        assert_eq!(app2.model_rels, app.model_rels);
+        assert_eq!(app2.model_measures.len(), 1);
+        assert_eq!(app2.model_measures[0].formula, "SUM(Sales[Amount])");
+
+        // The model view overlay renders.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        app.open_model_view();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Relationships"));
+        assert!(text.contains("Measures"));
     }
 }

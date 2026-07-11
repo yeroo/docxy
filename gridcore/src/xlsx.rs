@@ -77,6 +77,20 @@ impl SheetPackage {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()
     }
 
+    /// Insert or replace a custom part (e.g. the gridcore model part).
+    /// It rides along with save like any preserved part.
+    pub fn set_part(&mut self, name: &str, bytes: Vec<u8>) {
+        match self.parts.iter_mut().find(|(n, _)| n == name) {
+            Some(p) => p.1 = bytes,
+            None => self.parts.push((name.to_string(), bytes)),
+        }
+    }
+
+    /// Remove a part by name (no-op when absent).
+    pub fn remove_part(&mut self, name: &str) {
+        self.parts.retain(|(n, _)| n != name);
+    }
+
     /// The raw bytes of a part by name.
     pub fn part(&self, name: &str) -> Option<&[u8]> {
         self.parts
