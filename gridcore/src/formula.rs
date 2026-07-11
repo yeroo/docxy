@@ -4196,10 +4196,7 @@ impl<'a> Eval<'a> {
             match self.eval_arg(a) {
                 Arg::Scalar(Value::Err(e)) => return Err(e),
                 Arg::Scalar(Value::Empty) => {}
-                Arg::Scalar(v) => match to_num(&v) {
-                    Ok(n) => out.push(n),
-                    Err(e) => return Err(e),
-                },
+                Arg::Scalar(v) => out.push(to_num(&v)?),
                 Arg::Range(s, r1, c1, r2, c2) => {
                     for (_, v) in self.res.cells_in(s, r1, c1, r2, c2) {
                         match v {

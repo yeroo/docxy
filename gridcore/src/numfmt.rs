@@ -354,10 +354,8 @@ fn parse_condition(s: &str) -> Option<(CmpOp, f64)> {
         (CmpOp::Lt, r)
     } else if let Some(r) = s.strip_prefix('>') {
         (CmpOp::Gt, r)
-    } else if let Some(r) = s.strip_prefix('=') {
-        (CmpOp::Eq, r)
     } else {
-        return None;
+        (CmpOp::Eq, s.strip_prefix('=')?)
     };
     rest.trim().parse::<f64>().ok().map(|v| (op, v))
 }
