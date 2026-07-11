@@ -137,7 +137,9 @@ references, defined names, structured table references, 3D sheet spans,
 `INDIRECT`/`OFFSET`, `XLOOKUP` and the `*IFS` family, the full
 number-format runtime, **dynamic arrays** (`FILTER`/`SORT`/`UNIQUE`/
 `SEQUENCE` spill into neighboring cells, `A1#` spill references, `@`,
-`LET`, `#SPILL!` blocking and recovery), and the same lossless
+`LET`, `#SPILL!` blocking and recovery), **`LAMBDA`** (custom functions via
+defined names, `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`,
+elementwise lifting like `ABS(A1:A3)`), and the same lossless
 round-trip guarantee: anything it doesn't model (charts, pivots, conditional
 formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
 Excel's cached results and are saved untouched.

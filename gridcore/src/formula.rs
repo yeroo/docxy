@@ -205,6 +205,13 @@ pub enum Expr {
     /// `{1,2;3,4}` — an array constant (rows separated by `;`).
     ArrayLit(Vec<Vec<Expr>>),
     Func(String, Vec<Expr>),
+    /// Calling the result of an expression: `LAMBDA(x,x*2)(5)`. (Named calls
+    /// like `f(5)` parse as [`Expr::Func`] and resolve to a lambda at
+    /// evaluation time.)
+    Call(Box<Expr>, Vec<Expr>),
+    /// An already-evaluated scalar, injected when a scalar function is lifted
+    /// elementwise over an array. Never produced by the parser.
+    Lit(Value),
     Un(UnOp, Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
 }
@@ -616,10 +623,49 @@ impl<'a> Parser<'a> {
                     };
                     e = Expr::SpillRef(r);
                 }
+                // Immediate invocation: LAMBDA(x,x*2)(5).
+                Tok::LParen => {
+                    self.bump()?;
+                    let args = self.call_args()?;
+                    e = Expr::Call(Box::new(e), args);
+                }
                 _ => break,
             }
         }
         Ok(e)
+    }
+
+    /// An argument list after a consumed `(`, through the closing `)`.
+    fn call_args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+        if self.tok == Tok::RParen {
+            self.bump()?;
+            return Ok(args);
+        }
+        loop {
+            if self.tok == Tok::Comma {
+                args.push(Expr::Missing);
+                self.bump()?;
+                continue;
+            }
+            args.push(self.compare()?);
+            match self.tok {
+                Tok::Comma => {
+                    self.bump()?;
+                    if self.tok == Tok::RParen {
+                        args.push(Expr::Missing);
+                        self.bump()?;
+                        break;
+                    }
+                }
+                Tok::RParen => {
+                    self.bump()?;
+                    break;
+                }
+                _ => return Err("expected , or ) in arguments".into()),
+            }
+        }
+        Ok(args)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -732,34 +778,7 @@ impl<'a> Parser<'a> {
                     }
                     Tok::LParen => {
                         self.bump()?;
-                        let mut args = Vec::new();
-                        if self.tok == Tok::RParen {
-                            self.bump()?;
-                        } else {
-                            loop {
-                                if self.tok == Tok::Comma {
-                                    args.push(Expr::Missing);
-                                    self.bump()?;
-                                    continue;
-                                }
-                                args.push(self.compare()?);
-                                match self.tok {
-                                    Tok::Comma => {
-                                        self.bump()?;
-                                        if self.tok == Tok::RParen {
-                                            args.push(Expr::Missing);
-                                            self.bump()?;
-                                            break;
-                                        }
-                                    }
-                                    Tok::RParen => {
-                                        self.bump()?;
-                                        break;
-                                    }
-                                    _ => return Err("expected , or ) in arguments".into()),
-                                }
-                            }
-                        }
+                        let args = self.call_args()?;
                         // Excel writes post-2007 functions as _xlfn.NAME, and
                         // spells the dynamic-array operators as functions in
                         // stored formulas: `A1#` is `_xlfn.ANCHORARRAY(A1)`,
@@ -1376,6 +1395,21 @@ pub fn to_string(e: &Expr) -> String {
             let list: Vec<String> = args.iter().map(to_string).collect();
             format!("{}({})", name, list.join(","))
         }
+        Expr::Call(callee, args) => {
+            let list: Vec<String> = args.iter().map(to_string).collect();
+            let head = match callee.as_ref() {
+                Expr::Func(..) | Expr::Call(..) | Expr::Name(_) => to_string(callee),
+                other => format!("({})", to_string(other)),
+            };
+            format!("{}({})", head, list.join(","))
+        }
+        Expr::Lit(v) => match v {
+            Value::Num(n) => fmt_general(*n),
+            Value::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Err(x) => x.code().to_string(),
+            Value::Empty => String::new(),
+        },
         Expr::Un(op, x) => {
             let inner = if prec(x) < prec(e) {
                 format!("({})", to_string(x))
@@ -1497,6 +1531,10 @@ pub fn translate(e: &Expr, dr: i64, dc: i64) -> Expr {
         }
         Expr::Func(n, args) => Expr::Func(
             n.clone(),
+            args.iter().map(|a| translate(a, dr, dc)).collect(),
+        ),
+        Expr::Call(callee, args) => Expr::Call(
+            Box::new(translate(callee, dr, dc)),
             args.iter().map(|a| translate(a, dr, dc)).collect(),
         ),
         Expr::Un(op, x) => Expr::Un(*op, Box::new(translate(x, dr, dc))),
@@ -1695,6 +1733,9 @@ pub fn adjust_for_edit(e: &Expr, home_is_target: bool, target: &str, shift: &Edi
             }
         }
         Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(recur(callee)), args.iter().map(recur).collect())
+        }
         Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
         Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
         other => other.clone(),
@@ -1801,6 +1842,10 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
             Expr::Func(n, args) => {
                 Expr::Func(n.clone(), args.iter().map(|a| walk(a, old, new)).collect())
             }
+            Expr::Call(callee, args) => Expr::Call(
+                Box::new(walk(callee, old, new)),
+                args.iter().map(|a| walk(a, old, new)).collect(),
+            ),
             Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, old, new))),
             Expr::Bin(op, l, r) => Expr::Bin(
                 *op,
@@ -1865,6 +1910,12 @@ pub fn collect_refs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32, u32, u32)
                 collect_refs(a, out);
             }
         }
+        Expr::Call(callee, args) => {
+            collect_refs(callee, out);
+            for a in args {
+                collect_refs(a, out);
+            }
+        }
         Expr::ArrayLit(rows) => {
             for row in rows {
                 for x in row {
@@ -1895,6 +1946,12 @@ pub fn collect_spillrefs(e: &Expr, out: &mut Vec<(Option<String>, u32, u32)>) {
                 collect_spillrefs(a, out);
             }
         }
+        Expr::Call(callee, args) => {
+            collect_spillrefs(callee, out);
+            for a in args {
+                collect_spillrefs(a, out);
+            }
+        }
         Expr::ArrayLit(rows) => {
             for row in rows {
                 for x in row {
@@ -1917,6 +1974,12 @@ pub fn collect_names(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Name(n) => out.push(n.clone()),
         Expr::Func(_, args) => {
+            for a in args {
+                collect_names(a, out);
+            }
+        }
+        Expr::Call(callee, args) => {
+            collect_names(callee, out);
             for a in args {
                 collect_names(a, out);
             }
@@ -1951,6 +2014,12 @@ pub fn collect_ref3d(e: &Expr, out: &mut Vec<(String, String, u32, u32, u32, u32
                 collect_ref3d(a, out);
             }
         }
+        Expr::Call(callee, args) => {
+            collect_ref3d(callee, out);
+            for a in args {
+                collect_ref3d(a, out);
+            }
+        }
         Expr::Un(_, x) => collect_ref3d(x, out),
         Expr::Bin(_, l, r) => {
             collect_ref3d(l, out);
@@ -1979,10 +2048,49 @@ pub fn collect_structured(
                 collect_structured(a, out);
             }
         }
+        Expr::Call(callee, args) => {
+            collect_structured(callee, out);
+            for a in args {
+                collect_structured(a, out);
+            }
+        }
         Expr::Un(_, x) => collect_structured(x, out),
         Expr::Bin(_, l, r) => {
             collect_structured(l, out);
             collect_structured(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect every function-call name in a formula. The engine checks these
+/// against the workbook's defined names: a name defined as `LAMBDA(...)` is a
+/// custom function, and its body's references become dependencies.
+pub fn collect_called_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Func(name, args) => {
+            out.push(name.clone());
+            for a in args {
+                collect_called_names(a, out);
+            }
+        }
+        Expr::Call(callee, args) => {
+            collect_called_names(callee, out);
+            for a in args {
+                collect_called_names(a, out);
+            }
+        }
+        Expr::ArrayLit(rows) => {
+            for row in rows {
+                for x in row {
+                    collect_called_names(x, out);
+                }
+            }
+        }
+        Expr::Un(_, x) => collect_called_names(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_called_names(l, out);
+            collect_called_names(r, out);
         }
         _ => {}
     }
@@ -1998,6 +2106,7 @@ pub fn is_volatile(e: &Expr) -> bool {
             ) || args.iter().any(is_volatile)
         }
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
+        Expr::Call(callee, args) => is_volatile(callee) || args.iter().any(is_volatile),
         Expr::Un(_, x) => is_volatile(x),
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
@@ -2168,12 +2277,23 @@ pub type Matrix = Vec<Vec<Value>>;
 /// when an array result won't fit; we draw the line well before memory pain.
 const MAX_ARRAY_CELLS: u64 = 2_000_000;
 
-/// An evaluated argument: scalar, a still-lazy range, or a computed array.
+/// An evaluated argument: scalar, a still-lazy range, a computed array, or
+/// a lambda (a function value awaiting invocation).
 #[derive(Clone)]
 enum Arg {
     Scalar(Value),
     Range(usize, u32, u32, u32, u32),
     Matrix(Matrix),
+    Lambda(Box<LambdaVal>),
+}
+
+/// A `LAMBDA` value: parameters, unevaluated body, and the `LET` bindings
+/// visible where it was defined (lexical capture).
+#[derive(Clone)]
+struct LambdaVal {
+    params: Vec<String>,
+    body: Expr,
+    captured: Vec<(String, Arg)>,
 }
 
 /// A formula's overall result: a single value, or an array to be spilled
@@ -2214,6 +2334,8 @@ impl<'a> Eval<'a> {
                     Value::Err(ExcelError::Value)
                 }
             }
+            // A lambda that never got called (Excel shows #CALC!).
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
         }
     }
 
@@ -2238,6 +2360,7 @@ impl<'a> Eval<'a> {
                     DynResult::Array(m)
                 }
             }
+            Arg::Lambda(_) => DynResult::Scalar(Value::Err(ExcelError::Calc)),
         }
     }
 
@@ -2273,6 +2396,7 @@ impl<'a> Eval<'a> {
                 Ok(self.range_matrix(s, r1, c1, r2, c2))
             }
             Arg::Matrix(m) => Ok(m),
+            Arg::Lambda(_) => Err(ExcelError::Calc),
         }
     }
 
@@ -2366,6 +2490,7 @@ impl<'a> Eval<'a> {
                 }
             }
             Arg::Matrix(m) => m[0][0].clone(),
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
         })
     }
 
@@ -2386,6 +2511,19 @@ impl<'a> Eval<'a> {
             Expr::Bool(b) => Arg::Scalar(Value::Bool(*b)),
             Expr::Err(x) => Arg::Scalar(Value::Err(*x)),
             Expr::Missing => Arg::Scalar(Value::Empty),
+            Expr::Lit(v) => Arg::Scalar(v.clone()),
+            // Immediate invocation: LAMBDA(x,x*2)(5).
+            Expr::Call(callee, args) => {
+                let f = self.eval_arg(callee);
+                match f {
+                    Arg::Lambda(lam) => {
+                        let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
+                        self.invoke_lambda(&lam, vals)
+                    }
+                    Arg::Scalar(v) if v.is_err() => Arg::Scalar(v),
+                    _ => Arg::Scalar(Value::Err(ExcelError::Value)),
+                }
+            }
             // 3D spans only make sense in aggregate argument positions,
             // where the caller expands them via [`Self::resolve_3d`].
             Expr::Ref3D { .. } => Arg::Scalar(Value::Err(ExcelError::Value)),
@@ -2536,9 +2674,388 @@ impl<'a> Eval<'a> {
             // LET and the dynamic-array functions return arrays/ranges, so
             // they resolve here where non-scalar results are expressible.
             Expr::Func(name, args) if name == "LET" => self.let_fn(args),
-            Expr::Func(name, args) if is_array_fn(name) => self.array_fn(name, args),
-            Expr::Func(name, args) => Arg::Scalar(self.call(name, args)),
+            Expr::Func(name, args) if name == "LAMBDA" => self.lambda_fn(args),
+            Expr::Func(name, args) if is_higher_order_fn(name) => self.ho_fn(name, args),
+            Expr::Func(name, args) => {
+                // A LET-bound or workbook-defined LAMBDA used as a custom
+                // function: f(3).
+                if let Some(lam) = self.lambda_named(name) {
+                    let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
+                    return self.invoke_lambda(&lam, vals);
+                }
+                if is_array_fn(name) {
+                    return self.array_fn(name, args);
+                }
+                if is_liftable_fn(name) {
+                    return self.lift_call(name, args);
+                }
+                Arg::Scalar(self.call(name, args))
+            }
         }
+    }
+
+    /// `LAMBDA(param1, …, body)` — build a function value. The body stays
+    /// unevaluated; the current `LET` bindings are captured lexically.
+    fn lambda_fn(&mut self, args: &[Expr]) -> Arg {
+        if args.is_empty() {
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
+        let mut params = Vec::new();
+        for p in &args[..args.len() - 1] {
+            match p {
+                Expr::Name(n) => params.push(n.clone()),
+                _ => return Arg::Scalar(Value::Err(ExcelError::Value)),
+            }
+        }
+        Arg::Lambda(Box::new(LambdaVal {
+            params,
+            body: args[args.len() - 1].clone(),
+            captured: self.lets.clone(),
+        }))
+    }
+
+    /// Call a lambda with pre-evaluated arguments. The body sees the
+    /// lambda's captured environment plus its parameters — not the caller's
+    /// bindings (lexical scoping).
+    fn invoke_lambda(&mut self, lam: &LambdaVal, vals: Vec<Arg>) -> Arg {
+        if vals.len() != lam.params.len() {
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
+        if self.depth >= 32 {
+            // Runaway recursion through a named lambda.
+            return Arg::Scalar(Value::Err(ExcelError::Num));
+        }
+        let saved = std::mem::replace(&mut self.lets, lam.captured.clone());
+        for (p, v) in lam.params.iter().zip(vals) {
+            self.lets.push((p.clone(), v));
+        }
+        self.depth += 1;
+        let out = self.eval_arg(&lam.body);
+        self.depth -= 1;
+        self.lets = saved;
+        out
+    }
+
+    /// A lambda reachable by name: a `LET` binding holding one, or a
+    /// workbook defined name whose definition is `LAMBDA(…)` (Excel's named
+    /// custom functions).
+    fn lambda_named(&mut self, name: &str) -> Option<Box<LambdaVal>> {
+        if let Some(i) = self
+            .lets
+            .iter()
+            .rposition(|(n, v)| n.eq_ignore_ascii_case(name) && matches!(v, Arg::Lambda(_)))
+        {
+            if let Arg::Lambda(l) = &self.lets[i].1 {
+                return Some(l.clone());
+            }
+        }
+        let def = self.res.defined_name(name, self.sheet)?;
+        let ast = parse(&def).ok()?;
+        if let Expr::Func(n, _) = &ast {
+            if n == "LAMBDA" {
+                if let Arg::Lambda(l) = self.eval_arg(&ast) {
+                    return Some(l);
+                }
+            }
+        }
+        None
+    }
+
+    /// Collapse an argument to one value the way lambda-element results
+    /// must: 1×1 shapes flatten; anything bigger is a nested array → #CALC!.
+    fn collapse(&mut self, a: Arg) -> Value {
+        match a {
+            Arg::Scalar(v) => v,
+            Arg::Range(s, r1, c1, r2, c2) => {
+                if r1 == r2 && c1 == c2 {
+                    self.res.value(s, r1, c1)
+                } else {
+                    Value::Err(ExcelError::Calc)
+                }
+            }
+            Arg::Matrix(m) => {
+                if m.len() == 1 && m[0].len() == 1 {
+                    m[0][0].clone()
+                } else {
+                    Value::Err(ExcelError::Calc)
+                }
+            }
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
+        }
+    }
+
+    /// The lambda higher-order functions: MAP, REDUCE, SCAN, BYROW, BYCOL,
+    /// MAKEARRAY. The lambda always comes where Excel puts it.
+    fn ho_fn(&mut self, name: &str, args: &[Expr]) -> Arg {
+        let err = |e: ExcelError| Arg::Scalar(Value::Err(e));
+        // Fetch the lambda argument at `idx`.
+        macro_rules! lam_at {
+            ($idx:expr) => {
+                match self.eval_arg(&args[$idx]) {
+                    Arg::Lambda(l) => l,
+                    Arg::Scalar(v) if v.is_err() => return Arg::Scalar(v),
+                    _ => return err(ExcelError::Value),
+                }
+            };
+        }
+        match name {
+            "MAP" => {
+                if args.len() < 2 {
+                    return err(ExcelError::Value);
+                }
+                let lam = lam_at!(args.len() - 1);
+                let mut mats: Vec<Matrix> = Vec::new();
+                for a in &args[..args.len() - 1] {
+                    match self.arg_matrix(a) {
+                        Ok(m) => mats.push(m),
+                        Err(v) => return Arg::Scalar(v),
+                    }
+                }
+                if lam.params.len() != mats.len() {
+                    return err(ExcelError::Value);
+                }
+                let rows = mats.iter().map(|m| m.len()).max().unwrap();
+                let cols = mats.iter().map(|m| m[0].len()).max().unwrap();
+                let mut out: Matrix = Vec::with_capacity(rows);
+                for i in 0..rows {
+                    let mut row = Vec::with_capacity(cols);
+                    for j in 0..cols {
+                        // Broadcast 1-sized axes; non-conforming → #N/A.
+                        let mut vals = Vec::with_capacity(mats.len());
+                        let mut oob = false;
+                        for m in &mats {
+                            let ri = if m.len() == 1 { 0 } else { i };
+                            let ci = if m[0].len() == 1 { 0 } else { j };
+                            match m.get(ri).and_then(|r| r.get(ci)) {
+                                Some(v) => vals.push(Arg::Scalar(v.clone())),
+                                None => {
+                                    oob = true;
+                                    break;
+                                }
+                            }
+                        }
+                        row.push(if oob {
+                            Value::Err(ExcelError::NA)
+                        } else {
+                            let r = self.invoke_lambda(&lam, vals);
+                            self.collapse(r)
+                        });
+                    }
+                    out.push(row);
+                }
+                Arg::Matrix(out)
+            }
+            "REDUCE" | "SCAN" => {
+                if args.len() != 3 {
+                    return err(ExcelError::Value);
+                }
+                let init = self.eval(&args[0]);
+                let m = match self.arg_matrix(&args[1]) {
+                    Ok(m) => m,
+                    Err(v) => return Arg::Scalar(v),
+                };
+                let lam = lam_at!(2);
+                if lam.params.len() != 2 {
+                    return err(ExcelError::Value);
+                }
+                let mut acc = init;
+                let mut trace: Matrix = Vec::with_capacity(m.len());
+                for row in &m {
+                    let mut trow = Vec::with_capacity(row.len());
+                    for v in row {
+                        let r = self.invoke_lambda(
+                            &lam,
+                            vec![Arg::Scalar(acc.clone()), Arg::Scalar(v.clone())],
+                        );
+                        acc = self.collapse(r);
+                        trow.push(acc.clone());
+                    }
+                    trace.push(trow);
+                }
+                if name == "REDUCE" {
+                    Arg::Scalar(acc)
+                } else {
+                    Arg::Matrix(trace)
+                }
+            }
+            "BYROW" | "BYCOL" => {
+                if args.len() != 2 {
+                    return err(ExcelError::Value);
+                }
+                let m = match self.arg_matrix(&args[0]) {
+                    Ok(m) => m,
+                    Err(v) => return Arg::Scalar(v),
+                };
+                let lam = lam_at!(1);
+                if lam.params.len() != 1 {
+                    return err(ExcelError::Value);
+                }
+                if name == "BYROW" {
+                    let mut out: Matrix = Vec::with_capacity(m.len());
+                    for row in &m {
+                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(vec![row.clone()])]);
+                        out.push(vec![self.collapse(r)]);
+                    }
+                    Arg::Matrix(out)
+                } else {
+                    let cols = m[0].len();
+                    let mut out_row = Vec::with_capacity(cols);
+                    for j in 0..cols {
+                        let col: Matrix = m.iter().map(|r| vec![r[j].clone()]).collect();
+                        let r = self.invoke_lambda(&lam, vec![Arg::Matrix(col)]);
+                        out_row.push(self.collapse(r));
+                    }
+                    Arg::Matrix(vec![out_row])
+                }
+            }
+            "MAKEARRAY" => {
+                if args.len() != 3 {
+                    return err(ExcelError::Value);
+                }
+                let rows = match to_num(&self.eval(&args[0])) {
+                    Ok(n) => n.trunc() as i64,
+                    Err(e) => return err(e),
+                };
+                let cols = match to_num(&self.eval(&args[1])) {
+                    Ok(n) => n.trunc() as i64,
+                    Err(e) => return err(e),
+                };
+                let lam = lam_at!(2);
+                if rows < 1 || cols < 1 || lam.params.len() != 2 {
+                    return err(ExcelError::Value);
+                }
+                if rows as u64 * cols as u64 > MAX_ARRAY_CELLS {
+                    return err(ExcelError::Num);
+                }
+                let mut out: Matrix = Vec::with_capacity(rows as usize);
+                for i in 0..rows {
+                    let mut row = Vec::with_capacity(cols as usize);
+                    for j in 0..cols {
+                        let r = self.invoke_lambda(
+                            &lam,
+                            vec![
+                                Arg::Scalar(Value::Num((i + 1) as f64)),
+                                Arg::Scalar(Value::Num((j + 1) as f64)),
+                            ],
+                        );
+                        row.push(self.collapse(r));
+                    }
+                    out.push(row);
+                }
+                Arg::Matrix(out)
+            }
+            _ => err(ExcelError::Name),
+        }
+    }
+
+    /// Lift a scalar function elementwise over array arguments — the
+    /// dynamic-array behavior of `ABS(A1:A3)` or `IF(A1:A3>1,"y","n")`.
+    fn lift_call(&mut self, name: &str, args: &[Expr]) -> Arg {
+        fn is_multi(a: &Arg) -> bool {
+            match a {
+                Arg::Range(_, r1, c1, r2, c2) => !(r1 == r2 && c1 == c2),
+                Arg::Matrix(m) => !(m.len() == 1 && m[0].len() == 1),
+                _ => false,
+            }
+        }
+        // The branching functions must stay lazy when nothing lifts —
+        // their unselected branch is never meant to be evaluated. Probe
+        // only the selector; a scalar one takes the normal path.
+        if matches!(name, "IF" | "IFERROR") {
+            match args.first() {
+                Some(a) => {
+                    let sel = self.eval_arg(a);
+                    if !is_multi(&sel) {
+                        return Arg::Scalar(self.call(name, args));
+                    }
+                }
+                None => return Arg::Scalar(self.call(name, args)),
+            }
+        }
+        let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
+        if !vals.iter().any(is_multi) {
+            // All scalar: one plain call over the already-evaluated values.
+            let lit_args: Vec<Expr> = args
+                .iter()
+                .zip(vals)
+                .map(|(a, v)| match a {
+                    Expr::Missing => Expr::Missing,
+                    _ => Expr::Lit(self.collapse(v)),
+                })
+                .collect();
+            return Arg::Scalar(self.call(name, &lit_args));
+        }
+        // At least one array argument: broadcast and call per element.
+        enum Item {
+            S(Value),
+            M(Matrix),
+        }
+        let mut items = Vec::with_capacity(vals.len());
+        for v in vals {
+            if is_multi(&v) {
+                match self.materialize(v) {
+                    Ok(m) => items.push(Item::M(m)),
+                    Err(e) => return Arg::Scalar(Value::Err(e)),
+                }
+            } else {
+                let sv = self.collapse(v);
+                items.push(Item::S(sv));
+            }
+        }
+        let rows = items
+            .iter()
+            .map(|it| match it {
+                Item::M(m) => m.len(),
+                Item::S(_) => 1,
+            })
+            .max()
+            .unwrap_or(1);
+        let cols = items
+            .iter()
+            .map(|it| match it {
+                Item::M(m) => m[0].len(),
+                Item::S(_) => 1,
+            })
+            .max()
+            .unwrap_or(1);
+        if rows as u64 * cols as u64 > MAX_ARRAY_CELLS {
+            return Arg::Scalar(Value::Err(ExcelError::Num));
+        }
+        let mut out: Matrix = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut row = Vec::with_capacity(cols);
+            for j in 0..cols {
+                let mut cell_args = Vec::with_capacity(items.len());
+                let mut oob = false;
+                for (orig, it) in args.iter().zip(&items) {
+                    if matches!(orig, Expr::Missing) {
+                        cell_args.push(Expr::Missing);
+                        continue;
+                    }
+                    match it {
+                        Item::S(v) => cell_args.push(Expr::Lit(v.clone())),
+                        Item::M(m) => {
+                            let ri = if m.len() == 1 { 0 } else { i };
+                            let ci = if m[0].len() == 1 { 0 } else { j };
+                            match m.get(ri).and_then(|r| r.get(ci)) {
+                                Some(v) => cell_args.push(Expr::Lit(v.clone())),
+                                None => {
+                                    oob = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                row.push(if oob {
+                    Value::Err(ExcelError::NA)
+                } else {
+                    self.call(name, &cell_args)
+                });
+            }
+            out.push(row);
+        }
+        Arg::Matrix(out)
     }
 
     /// `LET(name1, value1, …, calculation)` — scoped bindings, evaluated
@@ -3081,6 +3598,7 @@ impl<'a> Eval<'a> {
                     });
                 }
                 Arg::Matrix(_) => return Arg::Scalar(Value::Err(ExcelError::Value)),
+                Arg::Lambda(_) => return Arg::Scalar(Value::Err(ExcelError::Calc)),
             },
         };
         let dr = match to_num(&self.eval(&args[1])) {
@@ -3259,6 +3777,71 @@ fn is_array_fn(name: &str) -> bool {
             | "EXPAND"
             | "WRAPROWS"
             | "WRAPCOLS"
+    )
+}
+
+/// The lambda-consuming higher-order functions (resolved in `eval_arg`).
+fn is_higher_order_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "MAP" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL" | "MAKEARRAY"
+    )
+}
+
+/// Scalar functions lifted elementwise over array arguments. Only pure
+/// scalar-in/scalar-out functions belong here (IF/IFERROR get special lazy
+/// handling for scalar selectors).
+fn is_liftable_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "ABS"
+            | "SIGN"
+            | "INT"
+            | "TRUNC"
+            | "SQRT"
+            | "EXP"
+            | "LN"
+            | "LOG"
+            | "LOG10"
+            | "SIN"
+            | "COS"
+            | "TAN"
+            | "ASIN"
+            | "ACOS"
+            | "ATAN"
+            | "DEGREES"
+            | "RADIANS"
+            | "ROUND"
+            | "ROUNDUP"
+            | "ROUNDDOWN"
+            | "MOD"
+            | "POWER"
+            | "LEN"
+            | "UPPER"
+            | "LOWER"
+            | "PROPER"
+            | "TRIM"
+            | "VALUE"
+            | "TEXT"
+            | "LEFT"
+            | "RIGHT"
+            | "MID"
+            | "SUBSTITUTE"
+            | "NOT"
+            | "ISBLANK"
+            | "ISNUMBER"
+            | "ISTEXT"
+            | "ISERROR"
+            | "IF"
+            | "IFERROR"
+            | "YEAR"
+            | "MONTH"
+            | "DAY"
+            | "HOUR"
+            | "MINUTE"
+            | "SECOND"
+            | "WEEKDAY"
+            | "DATE"
     )
 }
 
@@ -3519,6 +4102,7 @@ impl<'a> Eval<'a> {
                         }
                     }
                 }
+                Arg::Lambda(_) => return Err(ExcelError::Calc),
                 // Computed arrays aggregate by the same rules as ranges,
                 // e.g. SUM((A1:A3)*2) or SUM(SEQUENCE(5)).
                 Arg::Matrix(m) => {
@@ -3571,6 +4155,7 @@ impl<'a> Eval<'a> {
                 Value::Err(ExcelError::Value)
             }),
             Arg::Matrix(_) => Err(Value::Err(ExcelError::Value)),
+            Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
         }
     }
 
@@ -3585,6 +4170,7 @@ impl<'a> Eval<'a> {
             } else {
                 Value::Err(ExcelError::Value)
             }),
+            Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
         }
     }
 
@@ -4141,6 +4727,7 @@ impl<'a> Eval<'a> {
                                 .filter(|v| matches!(v, Value::Num(_)))
                                 .count();
                         }
+                        Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     }
                 }
                 Value::Num(n as f64)
@@ -4169,6 +4756,7 @@ impl<'a> Eval<'a> {
                                 .filter(|v| !matches!(v, Value::Empty))
                                 .count();
                         }
+                        Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     }
                 }
                 Value::Num(n as f64)
@@ -4195,6 +4783,7 @@ impl<'a> Eval<'a> {
                             .count() as f64,
                     ),
                     Arg::Scalar(_) => Value::Err(ExcelError::Value),
+                    Arg::Lambda(_) => Value::Err(ExcelError::Calc),
                 },
                 _ => Value::Err(ExcelError::Value),
             },
@@ -4281,6 +4870,7 @@ impl<'a> Eval<'a> {
                                 }
                             }
                         }
+                        Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                         // Array results contribute like ranges: bools and
                         // numbers count, text/empty skipped, errors propagate.
                         Arg::Matrix(m) => {
@@ -4449,6 +5039,7 @@ impl<'a> Eval<'a> {
                                 out.push_str(&try_text!(v));
                             }
                         }
+                        Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     }
                 }
                 Value::Str(out)
@@ -4475,6 +5066,7 @@ impl<'a> Eval<'a> {
                                 }
                             }
                         }
+                        Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     }
                 }
                 if skip_empty {
@@ -4808,6 +5400,7 @@ impl<'a> Eval<'a> {
                 let view = match self.eval_arg(&args[1]) {
                     Arg::Range(s, a, b, c, d) => TView::Range(s, a, b, c, d),
                     Arg::Matrix(m) => TView::Mat(m),
+                    Arg::Lambda(_) => return Value::Err(ExcelError::Calc),
                     Arg::Scalar(v) => {
                         return if v.is_err() {
                             v
@@ -6688,5 +7281,167 @@ mod tests {
         assert_eq!(n("VLOOKUP(2,{1,10;2,20;3,30},2,FALSE)", &g), 20.0);
         assert_eq!(n("XLOOKUP(\"b\",{\"a\";\"b\";\"c\"},{1;2;3})", &g), 2.0);
         assert_eq!(n("SUMPRODUCT({1;2;3},{4;5;6})", &g), 32.0);
+    }
+
+    // ---- LAMBDA & friends --------------------------------------------------
+
+    #[test]
+    fn lambda_basics() {
+        let g = empty();
+        // Immediate invocation.
+        assert_eq!(n("LAMBDA(x,x*2)(5)", &g), 10.0);
+        assert_eq!(n("LAMBDA(x,y,x^y)(2,10)", &g), 1024.0);
+        // Through LET, with lexical capture of earlier bindings.
+        assert_eq!(n("LET(f,LAMBDA(x,x+1),f(41))", &g), 42.0);
+        assert_eq!(n("LET(a,10,f,LAMBDA(x,x+a),f(5))", &g), 15.0);
+        // Lambdas are first-class: pass one to another.
+        assert_eq!(
+            n("LET(apply,LAMBDA(f,v,f(v)),apply(LAMBDA(x,x*3),7))", &g),
+            21.0
+        );
+        // Arity mismatch and uncalled lambdas error.
+        assert_eq!(
+            eval_str("LAMBDA(x,y,x+y)(1)", &g),
+            Value::Err(ExcelError::Value)
+        );
+        assert_eq!(eval_str("LAMBDA(x,x*2)", &g), Value::Err(ExcelError::Calc));
+        // Calling a non-lambda value.
+        assert_eq!(eval_str("(1+2)(3)", &g), Value::Err(ExcelError::Value));
+        // Round-trips through the serializer.
+        let ast = parse("LAMBDA(x,x*2)(5)").unwrap();
+        assert_eq!(to_string(&ast), "LAMBDA(x,x*2)(5)");
+    }
+
+    #[test]
+    fn named_lambda_is_a_custom_function() {
+        let g = Grid::new(&[("A1", Value::Num(5.0))])
+            .with_name("DOUBLE", "LAMBDA(x,x*2)")
+            .with_name("TAXED", "LAMBDA(x,x*Sheet1!$A$1)");
+        assert_eq!(n("DOUBLE(21)", &g), 42.0);
+        // The body can reference cells.
+        assert_eq!(n("TAXED(3)", &g), 15.0);
+        // Recursion is depth-capped, not a hang.
+        let g = empty().with_name("LOOP", "LAMBDA(x,LOOP(x))");
+        assert_eq!(eval_str("LOOP(1)", &g), Value::Err(ExcelError::Num));
+    }
+
+    #[test]
+    fn map_reduce_scan() {
+        let g = empty();
+        assert_eq!(
+            nums(&eval_array("MAP({1;2;3},LAMBDA(x,x*10))", &g)),
+            vec![vec![10.0], vec![20.0], vec![30.0]]
+        );
+        // Two arrays zip elementwise.
+        assert_eq!(
+            nums(&eval_array("MAP({1;2},{10;20},LAMBDA(a,b,a+b))", &g)),
+            vec![vec![11.0], vec![22.0]]
+        );
+        assert_eq!(n("REDUCE(0,{1;2;3;4},LAMBDA(a,v,a+v))", &g), 10.0);
+        assert_eq!(n("REDUCE(1,{2;3;4},LAMBDA(a,v,a*v))", &g), 24.0);
+        assert_eq!(
+            nums(&eval_array("SCAN(0,{1;2;3},LAMBDA(a,v,a+v))", &g)),
+            vec![vec![1.0], vec![3.0], vec![6.0]]
+        );
+        // Lambda arity must match the array count.
+        assert_eq!(
+            eval_str("MAP({1;2},LAMBDA(a,b,a+b))", &g),
+            Value::Err(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn byrow_bycol_makearray() {
+        let g = empty();
+        assert_eq!(
+            nums(&eval_array("BYROW({1,2;3,4},LAMBDA(r,SUM(r)))", &g)),
+            vec![vec![3.0], vec![7.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("BYCOL({1,2;3,4},LAMBDA(c,SUM(c)))", &g)),
+            vec![vec![4.0, 6.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("MAKEARRAY(2,3,LAMBDA(r,c,r*c))", &g)),
+            vec![vec![1.0, 2.0, 3.0], vec![2.0, 4.0, 6.0]]
+        );
+        // Composition with the shaping functions.
+        assert_eq!(
+            n(
+                "SUM(BYROW(MAKEARRAY(3,3,LAMBDA(r,c,r+c)),LAMBDA(r,MAX(r))))",
+                &g
+            ),
+            15.0 // rows max: 4,5,6
+        );
+    }
+
+    #[test]
+    fn scalar_functions_lift_over_arrays() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(-1.0)),
+            ("A2", Value::Num(2.0)),
+            ("A3", Value::Num(-3.0)),
+        ]);
+        assert_eq!(
+            nums(&eval_array("ABS(A1:A3)", &g)),
+            vec![vec![1.0], vec![2.0], vec![3.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("LEN({\"a\";\"bbb\"})", &g)),
+            vec![vec![1.0], vec![3.0]]
+        );
+        assert_eq!(
+            nums(&eval_array("ROUND({1.24;1.26},1)", &g)),
+            vec![vec![1.2], vec![1.3]]
+        );
+        // IF lifts over an array condition…
+        let m = eval_array("IF(A1:A3>0,\"pos\",\"neg\")", &g);
+        assert_eq!(
+            m,
+            vec![
+                vec![Value::Str("neg".into())],
+                vec![Value::Str("pos".into())],
+                vec![Value::Str("neg".into())]
+            ]
+        );
+        // …but stays lazy with a scalar condition (the unknown function in
+        // the untaken branch must not poison the cell).
+        let ast = parse("IF(TRUE,1,PIVOTBY(9))").unwrap();
+        let mut ev = Eval::new(&g, 0, (0, 0));
+        assert_eq!(ev.eval(&ast), Value::Num(1.0));
+        assert!(!ev.unsupported);
+        // TEXT over an array.
+        let m = eval_array("TEXT({1;2},\"0.0\")", &g);
+        assert_eq!(
+            m,
+            vec![
+                vec![Value::Str("1.0".into())],
+                vec![Value::Str("2.0".into())]
+            ]
+        );
+        // Errors stay per-element.
+        let m = eval_array("SQRT({4;-1;9})", &g);
+        assert_eq!(nums(&vec![m[0].clone()]), vec![vec![2.0]]);
+        assert_eq!(m[1][0], Value::Err(ExcelError::Num));
+        assert_eq!(nums(&vec![m[2].clone()]), vec![vec![3.0]]);
+        // Scalar calls through the lift path still behave (single eval).
+        assert_eq!(n("ABS(-7)", &g), 7.0);
+        assert_eq!(
+            eval_str("LEFT(\"hello\",2)&RIGHT(\"hello\",2)", &g),
+            Value::Str("helo".into())
+        );
+    }
+
+    #[test]
+    fn lambda_in_map_composes_with_lift_and_spill_fns() {
+        let g = empty();
+        // FILTER over MAP output, reduced — a full pipeline.
+        assert_eq!(
+            n(
+                "SUM(FILTER(MAP(SEQUENCE(6),LAMBDA(x,x*x)),MAP(SEQUENCE(6),LAMBDA(x,ISEVEN(x)))))",
+                &g
+            ),
+            56.0 // 4 + 16 + 36
+        );
     }
 }

@@ -536,6 +536,10 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     }
     let mut names = Vec::new();
     formula::collect_names(ast, &mut names);
+    // Function-call names too: `f(3)` may be a defined-name LAMBDA whose
+    // body references cells — those references are real dependencies.
+    // (Builtin names simply miss the defined-name lookup.)
+    formula::collect_called_names(ast, &mut names);
     for n in names {
         if let Some(def) = wb.defined_name(&n, sheet) {
             if let Ok(def_ast) = formula::parse(def) {
@@ -1152,5 +1156,51 @@ mod tests {
             value_at(&wb, &format!("A{last}")),
             CellValue::Error("#SPILL!".into())
         );
+    }
+
+    #[test]
+    fn map_spills_and_named_lambda_tracks_deps() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C1", Cell::formula("MAP(A1:A3,LAMBDA(x,x*10))")),
+            ("E1", Cell::formula("SCALE(4)")), // named lambda: x * B1
+            ("B1", Cell::number(100.0)),
+        ]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "SCALE".to_string(),
+            scope: None,
+            formula: "LAMBDA(x,x*Sheet1!$B$1)".to_string(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // MAP spilled.
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(30.0));
+        // Named lambda computed through the workbook name.
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(400.0));
+        // Editing a cell referenced only inside the lambda body recalcs
+        // the caller (dep tracking through called names).
+        set(&mut eng, &mut wb, "B1", Cell::number(1000.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(4000.0));
+        // Editing MAP's input reshapes its output.
+        set(&mut eng, &mut wb, "A2", Cell::number(7.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(70.0));
+    }
+
+    #[test]
+    fn lifted_function_spills_in_workbook() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(-4.0)),
+            ("A2", Cell::number(5.0)),
+            ("C1", Cell::formula("ABS(A1:A2)")),
+            ("D1", Cell::formula("SUM(C1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(5.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(9.0));
     }
 }

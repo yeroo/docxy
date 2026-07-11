@@ -230,12 +230,17 @@ The strategic piece: **conformance is measured, not claimed.**
   `HSTACK`/`VSTACK`, `TOCOL`/`TOROW`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`; lookups
   (`INDEX`/`MATCH`/`V·HLOOKUP`/`XLOOKUP`/`SUMPRODUCT`) accept computed arrays.
   Anchors save as `<f t="array" ref="…">` with cached spill values, so other
-  engines read the results. Remaining: `LAMBDA` + the functional battery
-  (`MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`), whole-function
-  elementwise lifting, dynamic-array oracle coverage (needs LibreOffice
-  24.8+/real Excel — 24.2 predates these functions).* Spill semantics +
-  `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`, `SEQUENCE`, `XLOOKUP`;
-  `LET`/`LAMBDA` (closures).
+  engines read the results. `LAMBDA` shipped too: first-class function values
+  with lexical `LET` capture, immediate invocation `LAMBDA(x,…)(v)`, named
+  custom functions through workbook defined names (with dependency tracking
+  into the lambda body), and the functional battery —
+  `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`. Scalar functions lift
+  elementwise over array arguments (`ABS(A1:A3)` spills;
+  `IF(A1:A3>0,"y","n")` lifts while scalar `IF` stays lazily branched).
+  Remaining: optional lambda parameters (`ISOMITTED`), dynamic-array oracle
+  coverage (needs LibreOffice 24.8+/real Excel — 24.2 predates these
+  functions).* Spill semantics + `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`,
+  `SEQUENCE`, `XLOOKUP`; `LET`/`LAMBDA` (closures).
 - **Phase D — Pivot engine.** Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
