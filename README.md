@@ -141,8 +141,8 @@ number-format runtime, **dynamic arrays** (`FILTER`/`SORT`/`UNIQUE`/
 defined names, `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`,
 elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh and editing** (a
 columnar group-by/aggregate engine recomputes pivots from current data —
-`F9` in the TUI, automatic under `--recalc`; `Ctrl-P` opens a field editor
-to rearrange rows/columns/values and aggregations), a **data model**
+`F9` in the TUI, automatic under `--recalc`; `Ctrl-P` edits a pivot's
+fields — or creates a new pivot from the selected data range), a **data model**
 (`gridcore::model`: multiple tables with relationships and Excel-formula
 measures, filter context through star schemas, CSV sources — `xlsxy
 data.csv` imports directly; `Ctrl-M` manages the model in the TUI and

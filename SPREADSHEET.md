@@ -261,8 +261,13 @@ The strategic piece: **conformance is measured, not claimed.**
   `rowItems`/`colItems` dropped, styles preserved) so the layout round-trips
   and real Excel rebuilds from it. Subtotal rows shipped: outer row-field
   groups get "<value> Total" control-break rows (Excel's default with
-  nested row fields, honoring `defaultSubtotal="0"` opt-outs). Remaining:
-  creating pivots from scratch, real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
+  nested row fields, honoring `defaultSubtotal="0"` opt-outs). Creating pivots
+  from scratch shipped: `Ctrl-P` on a data selection (or inside a Table)
+  writes real pivotCacheDefinition + pivotTableDefinition parts with full
+  OPC wiring, lands the pivot on a fresh sheet, and opens the field editor
+  — validated externally (openpyxl parses the created pivot; LibreOffice
+  opens it as a genuine pivot table and regenerates its own cache records).
+  Remaining: real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
   a **columnar snapshot + group-by/aggregate query layer**, deliberately
   format-independent; pivot refresh/edit in the TUI. The query layer — not the
   XML — is the point: it is the aggregation core everything later builds on.

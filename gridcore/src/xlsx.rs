@@ -1408,6 +1408,47 @@ fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, c
     }
 }
 
+/// Add a relationship to any rels part (created when missing). Returns the
+/// assigned rId ("" when the target is already related).
+fn add_rel(
+    parts: &mut Vec<(String, Vec<u8>)>,
+    rels_part: &str,
+    rel_type: &str,
+    target: &str,
+) -> String {
+    if !parts.iter().any(|(n, _)| n == rels_part) {
+        let empty = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+        parts.push((rels_part.to_string(), empty.as_bytes().to_vec()));
+    }
+    if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_part) {
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        if xml.contains(&format!("Target=\"{target}\"")) {
+            return String::new();
+        }
+        // Next free rIdN.
+        let mut max = 0u32;
+        let mut i = 0;
+        while let Some(pos) = xml[i..].find("Id=\"rId") {
+            let s = i + pos + "Id=\"rId".len();
+            let digits: String = xml[s..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                max = max.max(n);
+            }
+            i = s;
+        }
+        let rid = format!("rId{}", max + 1);
+        let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
+        p.1 = xml
+            .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+            .into_bytes();
+        return rid;
+    }
+    String::new()
+}
+
 fn add_workbook_rel(parts: &mut [(String, Vec<u8>)], rel_type: &str, target: &str) -> String {
     if let Some(p) = parts
         .iter_mut()
@@ -1504,6 +1545,180 @@ impl SheetPackage {
         });
         self.sheet_parts.push(part_name);
         self.workbook.sheets.len() - 1
+    }
+
+    /// Create a pivot table from scratch: writes a pivotCacheDefinition and
+    /// pivotTableDefinition part with full OPC wiring (content types,
+    /// workbook `<pivotCaches>`, workbook rels, destination-sheet rels) and
+    /// registers the pivot in the model with `edited = true`, so save
+    /// rewrites the field layout from whatever the editor sets up. Returns
+    /// the index into `workbook.pivots`.
+    pub fn add_pivot(
+        &mut self,
+        source: crate::pivot::PivotSource,
+        fields: Vec<String>,
+        default_measure: crate::pivot::DataField,
+        dest_sheet: usize,
+        location: (u32, u32),
+    ) -> Option<usize> {
+        if dest_sheet >= self.workbook.sheets.len() || fields.is_empty() {
+            return None;
+        }
+        // Unused part names + the next free cacheId.
+        let mut n = 1;
+        while self
+            .part(&format!("xl/pivotTables/pivotTable{n}.xml"))
+            .is_some()
+        {
+            n += 1;
+        }
+        let mut m = 1;
+        while self
+            .part(&format!("xl/pivotCache/pivotCacheDefinition{m}.xml"))
+            .is_some()
+        {
+            m += 1;
+        }
+        let table_part = format!("xl/pivotTables/pivotTable{n}.xml");
+        let cache_part = format!("xl/pivotCache/pivotCacheDefinition{m}.xml");
+        let mut cache_id = 1u32;
+        if let Some(bytes) = self.part("xl/workbook.xml") {
+            let xml = String::from_utf8_lossy(bytes);
+            let mut i = 0;
+            while let Some(pos) = xml[i..].find("cacheId=\"") {
+                let s = i + pos + "cacheId=\"".len();
+                let digits: String = xml[s..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(v) = digits.parse::<u32>() {
+                    cache_id = cache_id.max(v + 1);
+                }
+                i = s;
+            }
+        }
+
+        // The cache: source + field names. refreshOnLoad makes Excel build
+        // its own records; we never write a records part.
+        let source_xml = match &source {
+            crate::pivot::PivotSource::Range { sheet, rect } => {
+                let (r1, c1, r2, c2) = *rect;
+                format!(
+                    "<worksheetSource ref=\"{}:{}\" sheet=\"{}\"/>",
+                    cell_name(r1, c1),
+                    cell_name(r2, c2),
+                    esc_attr(sheet)
+                )
+            }
+            crate::pivot::PivotSource::Table(name) => {
+                format!("<worksheetSource name=\"{}\"/>", esc_attr(name))
+            }
+        };
+        let mut cache_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotCacheDefinition xmlns=\"{SPREADSHEET_NS}\" refreshOnLoad=\"1\" recordCount=\"0\"><cacheSource type=\"worksheet\">{source_xml}</cacheSource><cacheFields count=\"{}\">",
+            fields.len()
+        );
+        for f in &fields {
+            cache_xml.push_str(&format!(
+                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems/></cacheField>",
+                esc_attr(f)
+            ));
+        }
+        cache_xml.push_str("</cacheFields></pivotCacheDefinition>");
+        self.parts
+            .push((cache_part.clone(), cache_xml.into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{cache_part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
+        );
+        let cache_rid = add_workbook_rel(
+            &mut self.parts,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition",
+            &format!("pivotCache/pivotCacheDefinition{m}.xml"),
+        );
+
+        // workbook.xml: register the cache.
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(pn, _)| pn == "xl/workbook.xml")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let entry = format!("<pivotCache cacheId=\"{cache_id}\" r:id=\"{cache_rid}\"/>");
+            p.1 = if xml.contains("</pivotCaches>") {
+                xml.replacen("</pivotCaches>", &format!("{entry}</pivotCaches>"), 1)
+            } else {
+                xml.replacen(
+                    "</sheets>",
+                    &format!("</sheets><pivotCaches>{entry}</pivotCaches>"),
+                    1,
+                )
+            }
+            .into_bytes();
+        }
+
+        // The pivot definition. Save rewrites the field layout (the pivot is
+        // registered as edited), so this base only needs valid structure.
+        let (lr, lc) = location;
+        let loc_ref = format!("{}:{}", cell_name(lr, lc), cell_name(lr + 1, lc + 1));
+        let mut table_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"{SPREADSHEET_NS}\" name=\"PivotTable{n}\" cacheId=\"{cache_id}\" dataCaption=\"Values\" useAutoFormatting=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\"><location ref=\"{loc_ref}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"{}\">",
+            fields.len()
+        );
+        for (i, _) in fields.iter().enumerate() {
+            if i == default_measure.field {
+                table_xml.push_str("<pivotField dataField=\"1\" showAll=\"0\"/>");
+            } else {
+                table_xml.push_str("<pivotField showAll=\"0\"/>");
+            }
+        }
+        table_xml.push_str(&format!(
+            "</pivotFields><dataFields count=\"1\"><dataField name=\"{}\" fld=\"{}\" baseField=\"0\" baseItem=\"0\"/></dataFields><pivotTableStyleInfo name=\"PivotStyleLight16\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
+            esc_attr(&default_measure.name),
+            default_measure.field
+        ));
+        self.parts
+            .push((table_part.clone(), table_xml.into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{table_part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+        );
+
+        // Destination sheet's rels → the pivot part.
+        let sheet_part = &self.sheet_parts[dest_sheet];
+        let ws_dir = sheet_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let ws_file = sheet_part
+            .rsplit_once('/')
+            .map(|(_, f)| f)
+            .unwrap_or(sheet_part);
+        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+        add_rel(
+            &mut self.parts,
+            &rels_part,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+            &format!("../pivotTables/pivotTable{n}.xml"),
+        );
+
+        self.workbook.pivots.push(crate::pivot::Pivot {
+            name: format!("PivotTable{n}"),
+            sheet: dest_sheet,
+            location: (lr, lc, lr + 1, lc + 1),
+            source,
+            fields,
+            row_fields: Vec::new(),
+            col_fields: Vec::new(),
+            data_fields: vec![default_measure],
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            unsupported: false,
+            edited: true,
+            part: table_part,
+            cache_part,
+        });
+        Some(self.workbook.pivots.len() - 1)
     }
 
     /// Remove the sheet at `idx`. Returns false (and does nothing) when it
@@ -2148,5 +2363,97 @@ mod tests {
             pkg.workbook.sheets[1].cell(r, c).unwrap().value,
             CellValue::Number(999.0) // stale cache, untouched
         );
+    }
+
+    #[test]
+    fn created_pivot_round_trips_and_refreshes() {
+        use crate::frame::Agg;
+        use crate::pivot::{DataField, PivotSource, refresh_pivots};
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            for (c, h) in ["Region", "Sales"].iter().enumerate() {
+                sh.set_cell(0, c as u32, crate::sheet::Cell::text(h));
+            }
+            for (i, (r, v)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)]
+                .iter()
+                .enumerate()
+            {
+                sh.set_cell(i as u32 + 1, 0, crate::sheet::Cell::text(r));
+                sh.set_cell(i as u32 + 1, 1, crate::sheet::Cell::number(*v));
+            }
+        }
+        let dest = pkg.add_sheet("Report");
+        let idx = pkg
+            .add_pivot(
+                PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 3, 1),
+                },
+                vec!["Region".into(), "Sales".into()],
+                DataField {
+                    name: "Sum of Sales".into(),
+                    field: 1,
+                    agg: Agg::Sum,
+                },
+                dest,
+                (2, 0), // A3, Excel's convention
+            )
+            .unwrap();
+        // Configure like the editor would, then refresh.
+        pkg.workbook.pivots[idx].row_fields = vec![0];
+        let outcome = refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 1);
+        let val = |pkg: &SheetPackage, r: u32, c: u32| {
+            pkg.workbook.sheets[dest]
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(val(&pkg, 3, 1), CellValue::Number(40.0)); // East
+        assert_eq!(val(&pkg, 4, 1), CellValue::Number(20.0)); // West
+        assert_eq!(val(&pkg, 5, 1), CellValue::Number(60.0)); // Grand
+
+        // Save → reload: the created parts parse back into a supported,
+        // fully-wired pivot that refreshes to the same values.
+        let bytes = save_xlsx(&pkg);
+        let mut pkg2 = load_xlsx(&bytes).unwrap();
+        assert_eq!(pkg2.workbook.pivots.len(), 1);
+        let piv = &pkg2.workbook.pivots[0];
+        assert!(!piv.unsupported);
+        assert_eq!(piv.row_fields, vec![0]);
+        assert_eq!(piv.fields, vec!["Region", "Sales"]);
+        assert_eq!(piv.sheet, 1);
+        let outcome = refresh_pivots(&mut pkg2.workbook);
+        assert_eq!(outcome.refreshed, 1);
+        assert_eq!(
+            pkg2.workbook.sheets[1].cell(5, 1).unwrap().value,
+            CellValue::Number(60.0)
+        );
+        // Deterministic writer still holds with the new parts.
+        assert_eq!(save_xlsx(&pkg2), save_xlsx(&pkg2));
+        // Creating a second pivot picks fresh part names and cacheId.
+        let idx2 = pkg2
+            .add_pivot(
+                PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 3, 1),
+                },
+                vec!["Region".into(), "Sales".into()],
+                DataField {
+                    name: "Count of Sales".into(),
+                    field: 1,
+                    agg: Agg::Count,
+                },
+                0,
+                (5, 4),
+            )
+            .unwrap();
+        assert_eq!(
+            pkg2.workbook.pivots[idx2].part,
+            "xl/pivotTables/pivotTable2.xml"
+        );
+        let wb_xml = String::from_utf8_lossy(pkg2.part("xl/workbook.xml").unwrap()).into_owned();
+        assert!(wb_xml.contains("cacheId=\"2\""));
     }
 }

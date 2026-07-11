@@ -871,14 +871,10 @@ impl App {
 
     // --- pivot editor -------------------------------------------------------
 
-    /// Ctrl-P — open the field editor for the pivot under the cursor (or the
-    /// first pivot on this sheet / in the workbook).
+    /// Ctrl-P — open the field editor for the pivot under the cursor, or
+    /// create one from the selection / enclosing Table when there is none.
     fn open_pivot_editor(&mut self) {
         let wb = &self.pkg.workbook;
-        if wb.pivots.is_empty() {
-            self.status = Some("No pivot tables in this workbook".to_string());
-            return;
-        }
         let (r, c) = self.cur;
         let here = wb.pivots.iter().position(|p| {
             p.sheet == self.sheet
@@ -887,6 +883,30 @@ impl App {
                 && c >= p.location.1
                 && c <= p.location.3
         });
+        if here.is_none() {
+            // Not on a pivot: a data selection (or enclosing Table) creates
+            // one on a fresh sheet.
+            let (r1, c1, r2, c2) = self.selection();
+            if r2 > r1 && c2 >= c1 {
+                self.create_pivot_from(gridcore::pivot::PivotSource::Range {
+                    sheet: wb.sheets[self.sheet].name.clone(),
+                    rect: (r1, c1, r2, c2),
+                });
+                return;
+            }
+            if let Some(t) = wb.table_at(self.sheet, r, c) {
+                let name = t.name.clone();
+                self.create_pivot_from(gridcore::pivot::PivotSource::Table(name));
+                return;
+            }
+        }
+        if wb.pivots.is_empty() {
+            self.status = Some(
+                "No pivots — select a data range (headers + rows) or stand in a Table, then Ctrl-P"
+                    .to_string(),
+            );
+            return;
+        }
         let idx = here
             .or_else(|| wb.pivots.iter().position(|p| p.sheet == self.sheet))
             .unwrap_or(0);
@@ -897,6 +917,77 @@ impl App {
             ));
             return;
         }
+        self.pivot_edit = Some(PivotEdit {
+            pivot: idx,
+            pane: 0,
+            sel: 0,
+        });
+    }
+
+    /// Create a pivot from a source, land it on a new sheet, and open the
+    /// field editor with a default Sum over the last numeric column.
+    fn create_pivot_from(&mut self, source: gridcore::pivot::PivotSource) {
+        let frame = match &source {
+            gridcore::pivot::PivotSource::Range { sheet, rect } => {
+                match self.pkg.workbook.sheet_index(sheet) {
+                    Some(si) => gridcore::frame::Frame::from_range(&self.pkg.workbook, si, *rect),
+                    None => return,
+                }
+            }
+            gridcore::pivot::PivotSource::Table(name) => {
+                match gridcore::frame::Frame::from_table(&self.pkg.workbook, name) {
+                    Some(f) => f,
+                    None => return,
+                }
+            }
+        };
+        if frame.names.is_empty() || frame.rows() == 0 {
+            self.status = Some("The selection needs a header row and data rows".to_string());
+            return;
+        }
+        // Default measure: the last column holding numbers (else the last).
+        let field = (0..frame.cols.len())
+            .rev()
+            .find(|&i| {
+                frame.cols[i]
+                    .iter()
+                    .any(|v| matches!(v, gridcore::formula::Value::Num(_)))
+            })
+            .unwrap_or(frame.cols.len() - 1);
+        let measure = gridcore::pivot::DataField {
+            name: format!("Sum of {}", frame.names[field]),
+            field,
+            agg: Agg::Sum,
+        };
+        let mut sheet_name = "Pivot".to_string();
+        let mut n = 1;
+        while self.pkg.workbook.sheet_index(&sheet_name).is_some() {
+            n += 1;
+            sheet_name = format!("Pivot {n}");
+        }
+        let dest = self.pkg.add_sheet(&sheet_name);
+        let Some(idx) = self
+            .pkg
+            .add_pivot(source, frame.names.clone(), measure, dest, (2, 0))
+        else {
+            self.status = Some("Could not create the pivot".to_string());
+            return;
+        };
+        let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+        let _ = outcome;
+        self.sheet = dest;
+        self.cur = (2, 0);
+        self.top = 0;
+        self.left = 0;
+        self.anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.rebuild_engine();
+        self.modified = true;
+        self.status = Some(format!(
+            "Created {} on {sheet_name} — add fields",
+            self.pkg.workbook.pivots[idx].name
+        ));
         self.pivot_edit = Some(PivotEdit {
             pivot: idx,
             pane: 0,
@@ -3133,5 +3224,54 @@ mod tests {
         let text = format!("{:?}", term.backend().buffer());
         assert!(text.contains("Relationships"));
         assert!(text.contains("Measures"));
+    }
+
+    #[test]
+    fn ctrl_p_creates_pivot_from_selection() {
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            for (c, h) in ["Region", "Sales"].iter().enumerate() {
+                sh.set_cell(0, c as u32, Cell::text(h));
+            }
+            for (i, (r, v)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)]
+                .iter()
+                .enumerate()
+            {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(r));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+            }
+        }
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        // Select A1:B4 and hit Ctrl-P.
+        app.anchor = Some((0, 0));
+        app.cur = (3, 1);
+        app.open_pivot_editor();
+        // A pivot exists on a fresh sheet with the editor open.
+        assert_eq!(app.pkg.workbook.pivots.len(), 1);
+        assert!(app.pivot_edit.is_some());
+        assert_eq!(app.pkg.workbook.sheets[app.sheet].name, "Pivot");
+        let piv = &app.pkg.workbook.pivots[0];
+        assert_eq!(piv.fields, vec!["Region", "Sales"]);
+        assert_eq!(piv.data_fields[0].name, "Sum of Sales");
+        assert!(piv.edited);
+        // Add Region to rows through the editor: Fields pane, 'r'.
+        app.pivot_editor_key(KeyCode::Char('r'));
+        let val = |app: &App, r: u32, c: u32| {
+            app.pkg.workbook.sheets[1]
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(val(&app, 3, 0), CellValue::Text("East".into()));
+        assert_eq!(val(&app, 3, 1), CellValue::Number(40.0));
+        assert_eq!(val(&app, 5, 1), CellValue::Number(60.0));
+        // The created pivot survives a save/reload as a real pivot.
+        let bytes = app.package_bytes();
+        let pkg2 = load_xlsx(&bytes).unwrap();
+        assert_eq!(pkg2.workbook.pivots.len(), 1);
+        assert!(!pkg2.workbook.pivots[0].unsupported);
+        assert_eq!(pkg2.workbook.pivots[0].row_fields, vec![0]);
     }
 }
