@@ -338,6 +338,23 @@ The strategic piece: **conformance is measured, not claimed.**
   side panel. Commented cells are underlined in the grid (the terminal
   analogue of Excel's red triangle).*
 
+- **Phase H — UX parity with docxy** ✅ *shipped: xlsxy grew the editor
+  chrome docxy already had, translated to a grid. A **File backstage**
+  (New / Open / Info / Save As / Export CSV) with a folder browser + live
+  workbook preview, and a **welcome screen** on launch with no file.
+  **Cell-formatting authoring** — bold/italic, font & fill color,
+  horizontal alignment, and number format via the Home ribbon + pickers,
+  backed by a new gridcore `styles.xml` *append-writer* (`Styles::intern`
+  + `splice_styles`) that adds fonts/fills/numFmts/xfs without disturbing
+  a single existing style byte, so it round-trips. **View toggles**:
+  formula view (Ctrl+`), freeze panes, light/dark theme, ribbon
+  auto-hide, all persisted to `~/.config/xlsxy/view.conf`. **Navigation**:
+  Find & Replace (Ctrl+H, literal replace across formulas and values) and
+  Go To (Ctrl+G) for A1 refs, `Sheet!A1`, and defined names. And a
+  **`--vim` modal mode**: Normal/Visual/VisualLine with hjkl, `gg`/`G`/
+  `0`/`$`, `w`/`b`, `i`/`a`/`c`, `x`, `v`/`V`, `dd`/`yy`/`p`, `u`/Ctrl-R,
+  and a `:` command line (`:w :q :wq :x :q!`).*
+
 Each phase ships independently through the existing signed-release pipeline.
 
 ---
