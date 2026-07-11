@@ -3623,8 +3623,84 @@ impl<'a> Eval<'a> {
                 }
                 Ok(rows)
             }
+            "TEXTSPLIT" => {
+                // TEXTSPLIT(text, col_delim, [row_delim], [ignore_empty],
+                //           [match_mode], [pad_with]).
+                if args.len() < 2 || args.len() > 6 {
+                    return err(ExcelError::Value);
+                }
+                let text = to_text(&self.eval(&args[0])).map_err(Value::Err)?;
+                let col_delims = self.delim_list(args.get(1))?;
+                let row_delims = self.delim_list(args.get(2))?;
+                let ignore_empty = match args.get(3) {
+                    None | Some(Expr::Missing) => row_delims.is_empty(),
+                    Some(e) => to_bool(&self.eval(e)).map_err(Value::Err)?,
+                };
+                let case_insensitive = match args.get(4) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => to_num(&self.eval(e)).map_err(Value::Err)?.trunc() == 1.0,
+                };
+                let pad = match args.get(5) {
+                    None | Some(Expr::Missing) => Value::Err(ExcelError::NA),
+                    Some(e) => self.eval(e),
+                };
+                if col_delims.is_empty() && row_delims.is_empty() {
+                    return err(ExcelError::Value);
+                }
+                let split = |s: &str, delims: &[String]| -> Vec<String> {
+                    if delims.is_empty() {
+                        return vec![s.to_string()];
+                    }
+                    split_on_any(s, delims, case_insensitive)
+                };
+                let row_strs = split(&text, &row_delims);
+                let mut grid: Vec<Vec<String>> = row_strs
+                    .iter()
+                    .map(|r| split(r, &col_delims))
+                    .collect();
+                if ignore_empty {
+                    for r in &mut grid {
+                        r.retain(|c| !c.is_empty());
+                    }
+                    grid.retain(|r| !r.is_empty());
+                }
+                if grid.is_empty() {
+                    return err(ExcelError::Value);
+                }
+                // Rectangularize with the pad value.
+                let width = grid.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+                let out: Matrix = grid
+                    .iter()
+                    .map(|r| {
+                        (0..width)
+                            .map(|i| match r.get(i) {
+                                Some(s) => Value::Str(s.clone()),
+                                None => pad.clone(),
+                            })
+                            .collect()
+                    })
+                    .collect();
+                Ok(out)
+            }
             _ => err(ExcelError::Name),
         }
+    }
+
+    /// A TEXTSPLIT delimiter argument: a scalar or an array of strings, each
+    /// non-empty. `None`/`Missing` → no delimiters.
+    fn delim_list(&mut self, e: Option<&Expr>) -> Result<Vec<String>, Value> {
+        let e = match e {
+            None | Some(Expr::Missing) => return Ok(Vec::new()),
+            Some(e) => e,
+        };
+        let mut out = Vec::new();
+        for v in self.flat_dense(e)? {
+            let s = to_text(&v).map_err(Value::Err)?;
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        Ok(out)
     }
 
     /// `INDIRECT(ref_text)` — build a reference from a string at runtime.
@@ -3922,6 +3998,7 @@ fn is_array_fn(name: &str) -> bool {
             | "EXPAND"
             | "WRAPROWS"
             | "WRAPCOLS"
+            | "TEXTSPLIT"
     )
 }
 
@@ -7230,6 +7307,274 @@ impl<'a> Eval<'a> {
                 }
             }
 
+            // ---- more text -------------------------------------------------
+            "TEXTBEFORE" | "TEXTAFTER" => {
+                if args.len() < 2 || args.len() > 6 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let text = try_text!(self.eval(&args[0]));
+                let delims = match self.delim_list(args.get(1)) {
+                    Ok(d) => d,
+                    Err(v) => return v,
+                };
+                if delims.is_empty() {
+                    return Value::Err(ExcelError::Value);
+                }
+                let instance = match args.get(2) {
+                    None | Some(Expr::Missing) => 1i64,
+                    Some(e) => try_num!(self.eval(e)).trunc() as i64,
+                };
+                let ci = match args.get(3) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => try_num!(self.eval(e)).trunc() == 1.0,
+                };
+                let if_not_found = args.get(5);
+                let not_found = |ev: &mut Self| -> Value {
+                    match if_not_found {
+                        Some(e) if !matches!(e, Expr::Missing) => ev.eval(e),
+                        _ => Value::Err(ExcelError::NA),
+                    }
+                };
+                // Char-index (start, end) of every delimiter occurrence.
+                let chars: Vec<char> = text.chars().collect();
+                let mut hits: Vec<(usize, usize)> = Vec::new();
+                let mut i = 0;
+                while i < chars.len() {
+                    let m = delims
+                        .iter()
+                        .filter(|d| !d.is_empty())
+                        .filter_map(|d| {
+                            let dc: Vec<char> = d.chars().collect();
+                            let fits = i + dc.len() <= chars.len()
+                                && (0..dc.len()).all(|k| {
+                                    if ci {
+                                        chars[i + k].eq_ignore_ascii_case(&dc[k])
+                                            || chars[i + k].to_lowercase().eq(dc[k].to_lowercase())
+                                    } else {
+                                        chars[i + k] == dc[k]
+                                    }
+                                });
+                            fits.then_some(dc.len())
+                        })
+                        .max();
+                    if let Some(len) = m {
+                        hits.push((i, i + len));
+                        i += len;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if hits.is_empty() {
+                    return not_found(self);
+                }
+                let idx = if instance < 0 {
+                    hits.len() as i64 + instance
+                } else {
+                    instance - 1
+                };
+                if idx < 0 || idx as usize >= hits.len() {
+                    return not_found(self);
+                }
+                let (start, end) = hits[idx as usize];
+                let slice: String = if name == "TEXTBEFORE" {
+                    chars[..start].iter().collect()
+                } else {
+                    chars[end..].iter().collect()
+                };
+                Value::Str(slice)
+            }
+            "DOLLAR" | "FIXED" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0]));
+                let decimals = match args.get(1) {
+                    None | Some(Expr::Missing) => 2.0,
+                    Some(e) => try_num!(self.eval(e)),
+                }
+                .trunc() as i64;
+                if name == "FIXED" {
+                    let no_commas = match args.get(2) {
+                        None | Some(Expr::Missing) => false,
+                        Some(e) => try_bool!(self.eval(e)),
+                    };
+                    let mag = grouped_magnitude(n, decimals, !no_commas);
+                    Value::Str(if n < 0.0 { format!("-{mag}") } else { mag })
+                } else {
+                    let mag = grouped_magnitude(n, decimals, true);
+                    Value::Str(if n < 0.0 {
+                        format!("(${mag})")
+                    } else {
+                        format!("${mag}")
+                    })
+                }
+            }
+
+            // ---- more lookup & info ----------------------------------------
+            "XMATCH" => {
+                if args.len() < 2 || args.len() > 4 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let needle = self.eval(&args[0]);
+                let vals = match self.arg_vector(&args[1]) {
+                    Ok(v) => v,
+                    Err(v) => return v,
+                };
+                let match_mode = match args.get(2) {
+                    None | Some(Expr::Missing) => 0i64,
+                    Some(e) => try_num!(self.eval(e)).trunc() as i64,
+                };
+                let search_mode = match args.get(3) {
+                    None | Some(Expr::Missing) => 1i64,
+                    Some(e) => try_num!(self.eval(e)).trunc() as i64,
+                };
+                let n = vals.len();
+                let order: Vec<usize> = if search_mode < 0 {
+                    (0..n).rev().collect()
+                } else {
+                    (0..n).collect()
+                };
+                let mut exact: Option<usize> = None;
+                let mut alt: Option<usize> = None;
+                for &i in &order {
+                    let v = &vals[i];
+                    if matches!(v, Value::Empty) {
+                        continue;
+                    }
+                    if match_mode == 2 {
+                        if let (Value::Str(pat), Value::Str(t)) = (&needle, v) {
+                            if wildcard_match(pat, t) {
+                                exact = Some(i);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    match compare(v, &needle) {
+                        Ok(std::cmp::Ordering::Equal) => {
+                            exact = Some(i);
+                            break;
+                        }
+                        Ok(std::cmp::Ordering::Less) if match_mode == -1 => {
+                            // Largest value ≤ needle.
+                            if alt.is_none_or(|j| {
+                                matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Greater))
+                            }) {
+                                alt = Some(i);
+                            }
+                        }
+                        Ok(std::cmp::Ordering::Greater) if match_mode == 1 => {
+                            // Smallest value ≥ needle.
+                            if alt.is_none_or(|j| {
+                                matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Less))
+                            }) {
+                                alt = Some(i);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match exact.or(alt) {
+                    Some(i) => Value::Num(i as f64 + 1.0),
+                    None => Value::Err(ExcelError::NA),
+                }
+            }
+            "ADDRESS" => {
+                if args.len() < 2 || args.len() > 5 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let row = try_num!(self.eval(&args[0])).trunc() as i64;
+                let col = try_num!(self.eval(&args[1])).trunc() as i64;
+                let abs = match args.get(2) {
+                    None | Some(Expr::Missing) => 1i64,
+                    Some(e) => try_num!(self.eval(e)).trunc() as i64,
+                };
+                let a1 = match args.get(3) {
+                    None | Some(Expr::Missing) => true,
+                    Some(e) => try_bool!(self.eval(e)),
+                };
+                if row < 1 || col < 1 || !(1..=4).contains(&abs) {
+                    return Value::Err(ExcelError::Value);
+                }
+                let core = if a1 {
+                    let cn = col_name((col - 1) as u32);
+                    match abs {
+                        1 => format!("${cn}${row}"),
+                        2 => format!("{cn}${row}"),
+                        3 => format!("${cn}{row}"),
+                        _ => format!("{cn}{row}"),
+                    }
+                } else {
+                    match abs {
+                        1 => format!("R{row}C{col}"),
+                        2 => format!("R{row}C[{col}]"),
+                        3 => format!("R[{row}]C{col}"),
+                        _ => format!("R[{row}]C[{col}]"),
+                    }
+                };
+                match args.get(4) {
+                    None | Some(Expr::Missing) => Value::Str(core),
+                    Some(e) => {
+                        let sheet = try_text!(self.eval(e));
+                        if sheet.is_empty() {
+                            Value::Str(core)
+                        } else if sheet.contains([' ', '\'']) {
+                            Value::Str(format!("'{}'!{core}", sheet.replace('\'', "''")))
+                        } else {
+                            Value::Str(format!("{sheet}!{core}"))
+                        }
+                    }
+                }
+            }
+            "ERROR.TYPE" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                match self.eval(&args[0]) {
+                    Value::Err(e) => Value::Num(match e {
+                        ExcelError::Null => 1.0,
+                        ExcelError::Div0 => 2.0,
+                        ExcelError::Value => 3.0,
+                        ExcelError::Ref => 4.0,
+                        ExcelError::Name => 5.0,
+                        ExcelError::Num => 6.0,
+                        ExcelError::NA => 7.0,
+                        ExcelError::Spill => 9.0,
+                        ExcelError::Calc => 14.0,
+                        ExcelError::Cycle => 5.0,
+                    }),
+                    _ => Value::Err(ExcelError::NA),
+                }
+            }
+            "TYPE" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                // An array argument reports 64; a single reference reports its
+                // value's type.
+                let code = match self.eval_arg(&args[0]) {
+                    Arg::Matrix(_) => 64.0,
+                    Arg::Range(s, r1, c1, r2, c2) if r1 != r2 || c1 != c2 => {
+                        let _ = (s, c1, c2);
+                        64.0
+                    }
+                    other => {
+                        let v = match other {
+                            Arg::Scalar(v) => v,
+                            Arg::Range(s, r, c, ..) => self.res.value(s, r, c),
+                            _ => Value::Err(ExcelError::Value),
+                        };
+                        match v {
+                            Value::Num(_) | Value::Empty => 1.0,
+                            Value::Str(_) => 2.0,
+                            Value::Bool(_) => 4.0,
+                            Value::Err(_) => 16.0,
+                        }
+                    }
+                };
+                Value::Num(code)
+            }
+
             // ---- more math -------------------------------------------------
             "MROUND" => self.two_num(args, |n, m| {
                 if m == 0.0 {
@@ -7676,6 +8021,85 @@ fn base_to_dec(s: &str, radix: u32, digits: u32) -> Value {
     Value::Num(out as f64)
 }
 
+/// Split `s` at every occurrence of any delimiter in `delims` (longest match
+/// wins at each position). Used by TEXTSPLIT / TEXTBEFORE / TEXTAFTER.
+fn split_on_any(s: &str, delims: &[String], ci: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let bytes: Vec<char> = s.chars().collect();
+    let matches_at = |pos: usize, d: &str| -> bool {
+        let dc: Vec<char> = d.chars().collect();
+        if pos + dc.len() > bytes.len() {
+            return false;
+        }
+        (0..dc.len()).all(|k| {
+            let (a, b) = (bytes[pos + k], dc[k]);
+            if ci {
+                a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
+            } else {
+                a == b
+            }
+        })
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        // Prefer the longest delimiter that matches here.
+        let hit = delims
+            .iter()
+            .filter(|d| !d.is_empty() && matches_at(i, d))
+            .max_by_key(|d| d.chars().count());
+        if let Some(d) = hit {
+            out.push(std::mem::take(&mut cur));
+            i += d.chars().count();
+        } else {
+            cur.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Group an integer digit string with thousands commas: "1234567" → "1,234,567".
+fn group_thousands(digits: &str) -> String {
+    let bytes = digits.as_bytes();
+    let mut out = String::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// Magnitude of `n` rounded to `decimals` places (may be negative), optionally
+/// with thousands separators. Sign and currency are added by the caller.
+fn grouped_magnitude(n: f64, decimals: i64, commas: bool) -> String {
+    let x = n.abs();
+    let (rounded, frac_digits) = if decimals < 0 {
+        let f = 10f64.powi((-decimals) as i32);
+        ((x / f).round() * f, 0usize)
+    } else {
+        (x, decimals as usize)
+    };
+    let s = format!("{rounded:.frac_digits$}");
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s.as_str(), None),
+    };
+    let mut out = if commas {
+        group_thousands(int_part)
+    } else {
+        int_part.to_string()
+    };
+    if let Some(fp) = frac_part {
+        out.push('.');
+        out.push_str(fp);
+    }
+    out
+}
+
 /// Month index (1..=12) from a 3+ letter English name prefix.
 fn month_num(s: &str) -> Option<u32> {
     const M: [&str; 12] = [
@@ -7701,7 +8125,7 @@ fn norm_year(y: i64) -> i64 {
 fn parse_date_text(s: &str, d1904: bool) -> Option<f64> {
     let parts: Vec<&str> = s
         .trim()
-        .split(|c: char| c == '/' || c == '-' || c == ' ' || c == ',')
+        .split(['/', '-', ' ', ','])
         .filter(|p| !p.is_empty())
         .collect();
     if parts.len() < 2 || parts.len() > 3 {
@@ -9620,5 +10044,100 @@ mod tests {
             n("NETWORKDAYS.INTL(DATE(2024,1,15),DATE(2024,1,21),\"0000001\")", &g),
             6.0
         );
+    }
+
+    #[test]
+    fn text_info_lookup_coverage() {
+        let g = empty();
+        // TEXTBEFORE / TEXTAFTER.
+        assert_eq!(
+            eval_str("TEXTBEFORE(\"a-b-c\",\"-\")", &g),
+            Value::Str("a".into())
+        );
+        assert_eq!(
+            eval_str("TEXTAFTER(\"a-b-c\",\"-\")", &g),
+            Value::Str("b-c".into())
+        );
+        assert_eq!(
+            eval_str("TEXTBEFORE(\"a-b-c\",\"-\",2)", &g),
+            Value::Str("a-b".into())
+        );
+        assert_eq!(
+            eval_str("TEXTAFTER(\"a-b-c\",\"-\",-1)", &g),
+            Value::Str("c".into())
+        );
+        assert_eq!(
+            eval_str("TEXTBEFORE(\"abc\",\"-\",1,0,0,\"none\")", &g),
+            Value::Str("none".into())
+        );
+        // TEXTSPLIT into a spilled array.
+        assert_eq!(
+            eval_array("TEXTSPLIT(\"a,b,c\",\",\")", &g),
+            vec![vec![
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+                Value::Str("c".into())
+            ]]
+        );
+        assert_eq!(
+            eval_array("TEXTSPLIT(\"a,b;c,d\",\",\",\";\")", &g),
+            vec![
+                vec![Value::Str("a".into()), Value::Str("b".into())],
+                vec![Value::Str("c".into()), Value::Str("d".into())],
+            ]
+        );
+        // DOLLAR / FIXED.
+        assert_eq!(
+            eval_str("DOLLAR(1234.567)", &g),
+            Value::Str("$1,234.57".into())
+        );
+        assert_eq!(
+            eval_str("DOLLAR(-1234.567,2)", &g),
+            Value::Str("($1,234.57)".into())
+        );
+        assert_eq!(
+            eval_str("FIXED(1234.567,1)", &g),
+            Value::Str("1,234.6".into())
+        );
+        assert_eq!(
+            eval_str("FIXED(1234.567,1,TRUE)", &g),
+            Value::Str("1234.6".into())
+        );
+        assert_eq!(eval_str("FIXED(1234.5,-2)", &g), Value::Str("1,200".into()));
+        // XMATCH.
+        let x = Grid::new(&[
+            ("A1", Value::Num(10.0)),
+            ("A2", Value::Num(20.0)),
+            ("A3", Value::Num(30.0)),
+            ("A4", Value::Num(40.0)),
+        ]);
+        assert_eq!(n("XMATCH(30,A1:A4)", &x), 3.0);
+        assert_eq!(n("XMATCH(25,A1:A4,-1)", &x), 2.0); // next smaller
+        assert_eq!(n("XMATCH(25,A1:A4,1)", &x), 3.0); // next larger
+        assert_eq!(n("XMATCH(40,A1:A4,0,-1)", &x), 4.0); // last-to-first
+        assert_eq!(
+            eval_str("XMATCH(99,A1:A4)", &x),
+            Value::Err(ExcelError::NA)
+        );
+        // ADDRESS.
+        assert_eq!(eval_str("ADDRESS(1,1)", &g), Value::Str("$A$1".into()));
+        assert_eq!(eval_str("ADDRESS(2,3,4)", &g), Value::Str("C2".into()));
+        assert_eq!(
+            eval_str("ADDRESS(1,1,1,FALSE)", &g),
+            Value::Str("R1C1".into())
+        );
+        assert_eq!(
+            eval_str("ADDRESS(1,1,1,TRUE,\"Sheet1\")", &g),
+            Value::Str("Sheet1!$A$1".into())
+        );
+        // ERROR.TYPE / TYPE.
+        assert_eq!(n("ERROR.TYPE(1/0)", &g), 2.0);
+        assert_eq!(n("ERROR.TYPE(NA())", &g), 7.0);
+        assert_eq!(eval_str("ERROR.TYPE(5)", &g), Value::Err(ExcelError::NA));
+        assert_eq!(n("TYPE(42)", &g), 1.0);
+        assert_eq!(n("TYPE(\"hi\")", &g), 2.0);
+        assert_eq!(n("TYPE(TRUE)", &g), 4.0);
+        assert_eq!(n("TYPE(1/0)", &g), 16.0);
+        assert_eq!(n("TYPE(A1:A4)", &x), 64.0);
     }
 }
