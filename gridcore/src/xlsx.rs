@@ -62,9 +62,9 @@ impl std::error::Error for XlsxError {}
 /// isn't modeled.
 #[derive(Debug, Clone)]
 pub struct SheetPackage {
-    parts: Vec<(String, Vec<u8>)>,
+    pub(crate) parts: Vec<(String, Vec<u8>)>,
     /// Worksheet part name per `workbook.sheets` index.
-    sheet_parts: Vec<String>,
+    pub(crate) sheet_parts: Vec<String>,
     /// Shared strings as loaded (plain text per `<si>`).
     shared: Vec<String>,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
@@ -320,7 +320,7 @@ fn parse_pivot_cache_ids(wb_xml: &str) -> Vec<(u32, String)> {
 
 /// Resolve a rels target relative to a directory ("../tables/table1.xml"
 /// against "xl/worksheets" → "xl/tables/table1.xml").
-fn resolve_relative(dir: &str, target: &str) -> String {
+pub(crate) fn resolve_relative(dir: &str, target: &str) -> String {
     if let Some(abs) = target.strip_prefix('/') {
         return abs.to_string();
     }
@@ -380,7 +380,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
 }
 
 /// Parse a `.rels` stream into (id, type, target) triples.
-fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
+pub(crate) fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
     loop {
@@ -923,7 +923,7 @@ fn decode(raw: &str) -> String {
 // Save
 // ---------------------------------------------------------------------------
 
-fn esc_text(s: &str) -> String {
+pub(crate) fn esc_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -1336,7 +1336,7 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
     out
 }
 
-fn esc_attr(s: &str) -> String {
+pub(crate) fn esc_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -1447,7 +1447,7 @@ fn ensure_full_calc(xml: &str) -> String {
     }
 }
 
-fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, ct: &str) {
+pub(crate) fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, ct: &str) {
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         if xml.contains(part_name) {
@@ -1462,7 +1462,7 @@ fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, c
 
 /// Add a relationship to any rels part (created when missing). Returns the
 /// assigned rId ("" when the target is already related).
-fn add_rel(
+pub(crate) fn add_rel(
     parts: &mut Vec<(String, Vec<u8>)>,
     rels_part: &str,
     rel_type: &str,

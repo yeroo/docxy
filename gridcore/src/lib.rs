@@ -23,6 +23,7 @@
 //!   (powers `TEXT()` and cell display).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 
+pub mod comments;
 pub mod edit;
 pub mod engine;
 pub mod formula;
