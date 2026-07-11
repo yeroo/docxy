@@ -4343,6 +4343,15 @@ impl<'a> Eval<'a> {
         Ok(out)
     }
 
+    /// Floored serials of every holiday cell/scalar in `args` (bad values
+    /// simply drop out — WORKDAY/NETWORKDAYS ignore non-dates).
+    fn holiday_set(&mut self, args: &[Expr]) -> Vec<i64> {
+        match self.collect_values(args, true) {
+            Ok(v) => v.into_iter().map(|d| d.floor() as i64).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Paired-array moments: `(n, mean_x, mean_y, Sxx, Syy, Sxy)` for the
     /// numeric pairs the two arrays share. Empty → `#DIV/0!`.
     #[allow(clippy::type_complexity)]
@@ -6190,6 +6199,172 @@ impl<'a> Eval<'a> {
                 }
             }
 
+            // ---- more date/time ------------------------------------------------
+            "DATEVALUE" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let s = try_text!(self.eval(&args[0]));
+                match parse_date_text(&s, self.res.date1904()) {
+                    Some(serial) => num(serial.floor()),
+                    None => Value::Err(ExcelError::Value),
+                }
+            }
+            "TIMEVALUE" => self.one_text(args, |s| {
+                // Accept a leading date part (Excel ignores it), keep the time.
+                let frac = parse_time_text(&s).or_else(|| {
+                    s.rsplit_once(' ').and_then(|(_, t)| parse_time_text(t))
+                });
+                match frac {
+                    Some(f) => num(f),
+                    None => Value::Err(ExcelError::Value),
+                }
+            }),
+            "YEARFRAC" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let start = try_num!(self.eval(&args[0]));
+                let end = try_num!(self.eval(&args[1]));
+                let basis = match args.get(2) {
+                    None | Some(Expr::Missing) => 0.0,
+                    Some(e) => try_num!(self.eval(e)),
+                }
+                .trunc();
+                let d1904 = self.res.date1904();
+                let (mut s, mut e) = (start.floor(), end.floor());
+                if s > e {
+                    std::mem::swap(&mut s, &mut e);
+                }
+                let frac = match basis as i64 {
+                    0 | 4 => {
+                        let (Some(a), Some(b)) =
+                            (serial_to_parts(s, d1904), serial_to_parts(e, d1904))
+                        else {
+                            return Value::Err(ExcelError::Num);
+                        };
+                        let days =
+                            days_360(a.year, a.month, a.day, b.year, b.month, b.day, basis == 4.0);
+                        days as f64 / 360.0
+                    }
+                    1 => {
+                        let (Some(a), Some(b)) =
+                            (serial_to_parts(s, d1904), serial_to_parts(e, d1904))
+                        else {
+                            return Value::Err(ExcelError::Num);
+                        };
+                        let denom = if a.year == b.year {
+                            let leap = days_in_month(a.year, 2) == 29;
+                            if leap { 366.0 } else { 365.0 }
+                        } else {
+                            let years = (b.year - a.year + 1) as f64;
+                            let span = parts_to_serial(b.year + 1, 1, 1, 0, d1904)
+                                - parts_to_serial(a.year, 1, 1, 0, d1904);
+                            span / years
+                        };
+                        (e - s) / denom
+                    }
+                    2 => (e - s) / 360.0,
+                    3 => (e - s) / 365.0,
+                    _ => return Value::Err(ExcelError::Num),
+                };
+                num(frac)
+            }
+            "DAYS360" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let start = try_num!(self.eval(&args[0]));
+                let end = try_num!(self.eval(&args[1]));
+                let european = match args.get(2) {
+                    None | Some(Expr::Missing) => false,
+                    Some(e) => try_num!(self.eval(e)) != 0.0,
+                };
+                let d1904 = self.res.date1904();
+                let (Some(a), Some(b)) = (
+                    serial_to_parts(start.floor(), d1904),
+                    serial_to_parts(end.floor(), d1904),
+                ) else {
+                    return Value::Err(ExcelError::Num);
+                };
+                num(days_360(a.year, a.month, a.day, b.year, b.month, b.day, european) as f64)
+            }
+            "WORKDAY" | "WORKDAY.INTL" => {
+                if args.len() < 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let start = try_num!(self.eval(&args[0]));
+                let days = try_num!(self.eval(&args[1]));
+                let intl = name == "WORKDAY.INTL";
+                let (mask, hol_idx) = if intl {
+                    let m = match args.get(2) {
+                        None | Some(Expr::Missing) => [false, false, false, false, false, true, true],
+                        Some(e) => match weekend_mask(&self.eval(e)) {
+                            Some(m) => m,
+                            None => return Value::Err(ExcelError::Value),
+                        },
+                    };
+                    (m, 3)
+                } else {
+                    ([false, false, false, false, false, true, true], 2)
+                };
+                if mask.iter().all(|&b| b) {
+                    return Value::Err(ExcelError::Num);
+                }
+                let holidays = self.holiday_set(args.get(hol_idx..).unwrap_or(&[]));
+                let d1904 = self.res.date1904();
+                let mut serial = start.floor() as i64;
+                let step = if days >= 0.0 { 1 } else { -1 };
+                let mut remaining = days.trunc().abs() as i64;
+                let mut guard = 0;
+                while remaining > 0 {
+                    serial += step;
+                    guard += 1;
+                    if guard > 10_000_000 {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    if is_weekend(serial, d1904, &mask) || holidays.contains(&serial) {
+                        continue;
+                    }
+                    remaining -= 1;
+                }
+                num(serial as f64)
+            }
+            "NETWORKDAYS" | "NETWORKDAYS.INTL" => {
+                if args.len() < 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let start = try_num!(self.eval(&args[0]));
+                let end = try_num!(self.eval(&args[1]));
+                let intl = name == "NETWORKDAYS.INTL";
+                let (mask, hol_idx) = if intl {
+                    let m = match args.get(2) {
+                        None | Some(Expr::Missing) => [false, false, false, false, false, true, true],
+                        Some(e) => match weekend_mask(&self.eval(e)) {
+                            Some(m) => m,
+                            None => return Value::Err(ExcelError::Value),
+                        },
+                    };
+                    (m, 3)
+                } else {
+                    ([false, false, false, false, false, true, true], 2)
+                };
+                let holidays = self.holiday_set(args.get(hol_idx..).unwrap_or(&[]));
+                let d1904 = self.res.date1904();
+                let (a, b) = (start.floor() as i64, end.floor() as i64);
+                let (lo, hi, sign) = if a <= b { (a, b, 1) } else { (b, a, -1) };
+                if hi - lo > 10_000_000 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let mut count = 0i64;
+                for s in lo..=hi {
+                    if !is_weekend(s, d1904, &mask) && !holidays.contains(&s) {
+                        count += 1;
+                    }
+                }
+                num((count * sign) as f64)
+            }
+
             // ---- financial -----------------------------------------------------
             "PMT" | "PV" | "FV" | "NPER" => {
                 if args.len() < 3 || args.len() > 5 {
@@ -7499,6 +7674,194 @@ fn base_to_dec(s: &str, radix: u32, digits: u32) -> Value {
     let full = (radix as i128).pow(digits);
     let out = if acc >= full / 2 { acc - full } else { acc };
     Value::Num(out as f64)
+}
+
+/// Month index (1..=12) from a 3+ letter English name prefix.
+fn month_num(s: &str) -> Option<u32> {
+    const M: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let s = s.trim().to_ascii_lowercase();
+    M.iter().position(|m| s.starts_with(m)).map(|i| i as u32 + 1)
+}
+
+/// Two-digit year → four-digit, Excel's 0-29 → 2000s, 30-99 → 1900s rule.
+fn norm_year(y: i64) -> i64 {
+    if y < 30 {
+        2000 + y
+    } else if y < 100 {
+        1900 + y
+    } else {
+        y
+    }
+}
+
+/// Best-effort DATEVALUE: ISO, US M/D/Y, and month-name forms. Returns the
+/// date serial in the workbook's date system, or `None` if unrecognized.
+fn parse_date_text(s: &str, d1904: bool) -> Option<f64> {
+    let parts: Vec<&str> = s
+        .trim()
+        .split(|c: char| c == '/' || c == '-' || c == ' ' || c == ',')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let (mut y, mut d) = (None, None);
+    let mo;
+    if let Some(idx) = parts.iter().position(|p| month_num(p).is_some()) {
+        mo = month_num(parts[idx]);
+        for (i, p) in parts.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            let v: i64 = p.parse().ok()?;
+            if v > 31 || p.len() == 4 {
+                y = Some(v);
+            } else {
+                d = Some(v);
+            }
+        }
+        y?; // a year is required (no clock for "current year")
+        d = d.or(Some(1));
+    } else {
+        // All numeric.
+        let nums: Vec<i64> = parts.iter().map(|p| p.parse().ok()).collect::<Option<_>>()?;
+        if nums.len() != 3 {
+            return None;
+        }
+        if parts[0].len() == 4 {
+            y = Some(nums[0]);
+            mo = Some(nums[1] as u32);
+            d = Some(nums[2]);
+        } else {
+            mo = Some(nums[0] as u32);
+            d = Some(nums[1]);
+            y = Some(nums[2]);
+        }
+    }
+    let y = norm_year(y?);
+    let mo = mo?;
+    let d = d? as u32;
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    let serial = parts_to_serial(y, mo, d, 0, d1904);
+    if serial < 0.0 { None } else { Some(serial) }
+}
+
+/// Best-effort TIMEVALUE: "H:M", "H:M:S", optional AM/PM. Returns a day
+/// fraction in [0, 1), or `None`.
+fn parse_time_text(s: &str) -> Option<f64> {
+    let mut body = s.trim().to_ascii_lowercase();
+    let mut pm = None;
+    for (suf, is_pm) in [("am", false), ("pm", true), ("a", false), ("p", true)] {
+        if let Some(rest) = body.strip_suffix(suf) {
+            pm = Some(is_pm);
+            body = rest.trim().to_string();
+            break;
+        }
+    }
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut h: i64 = parts[0].trim().parse().ok()?;
+    let m: i64 = parts.get(1).map_or(Ok(0), |p| p.trim().parse()).ok()?;
+    let sec: f64 = parts.get(2).map_or(Ok(0.0), |p| p.trim().parse()).ok()?;
+    if let Some(is_pm) = pm {
+        if !(1..=12).contains(&h) {
+            return None;
+        }
+        h %= 12;
+        if is_pm {
+            h += 12;
+        }
+    }
+    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0.0..60.0).contains(&sec) {
+        return None;
+    }
+    Some((h as f64 * 3600.0 + m as f64 * 60.0 + sec) / 86_400.0)
+}
+
+/// Monday-indexed weekday (Mon=0 … Sun=6) of a workbook serial.
+fn weekday_mon0(serial: i64, d1904: bool) -> usize {
+    let s1900 = serial + if d1904 { 1462 } else { 0 };
+    ((s1900 + 5).rem_euclid(7)) as usize
+}
+
+/// Is `serial` a non-working day under `mask` (Mon..Sun weekend flags)?
+fn is_weekend(serial: i64, d1904: bool, mask: &[bool; 7]) -> bool {
+    mask[weekday_mon0(serial, d1904)]
+}
+
+/// Parse a WORKDAY.INTL/NETWORKDAYS.INTL weekend argument: a numeric code
+/// (1-7, 11-17) or a 7-char "0/1" string (Mon..Sun). `None` if invalid.
+fn weekend_mask(v: &Value) -> Option<[bool; 7]> {
+    if let Value::Str(s) = v {
+        if s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') {
+            let mut m = [false; 7];
+            for (i, c) in s.chars().enumerate() {
+                m[i] = c == '1';
+            }
+            return Some(m);
+        }
+    }
+    let code = to_num(v).ok()?.trunc() as i64;
+    let mut m = [false; 7];
+    match code {
+        1 => {
+            m[5] = true;
+            m[6] = true;
+        }
+        2 => {
+            m[6] = true;
+            m[0] = true;
+        }
+        3 => {
+            m[0] = true;
+            m[1] = true;
+        }
+        4 => {
+            m[1] = true;
+            m[2] = true;
+        }
+        5 => {
+            m[2] = true;
+            m[3] = true;
+        }
+        6 => {
+            m[3] = true;
+            m[4] = true;
+        }
+        7 => {
+            m[4] = true;
+            m[5] = true;
+        }
+        11..=17 => m[(code - 11) as usize] = true,
+        _ => return None,
+    }
+    Some(m)
+}
+
+/// 30/360 day count between two dates. `european` toggles the day-of-31 rule.
+fn days_360(y1: i64, m1: u32, mut d1: u32, y2: i64, m2: u32, mut d2: u32, european: bool) -> i64 {
+    if european {
+        if d1 == 31 {
+            d1 = 30;
+        }
+        if d2 == 31 {
+            d2 = 30;
+        }
+    } else {
+        if d1 == 31 {
+            d1 = 30;
+        }
+        if d2 == 31 && d1 == 30 {
+            d2 = 30;
+        }
+    }
+    (y2 - y1) * 360 + (m2 as i64 - m1 as i64) * 30 + (d2 as i64 - d1 as i64)
 }
 
 fn days_in_month(year: i64, month: u32) -> u32 {
@@ -9210,5 +9573,52 @@ mod tests {
         approx("AVERAGEA(A1:A4)", &a, 7.75); // (10+0+20+1)/4
         approx("MAXA(A1:A4)", &a, 20.0);
         approx("MINA(A1:A4)", &a, 0.0);
+    }
+
+    #[test]
+    fn date_coverage() {
+        let g = empty();
+        // DATEVALUE across formats (all → 2024-01-15 = serial 45306).
+        assert_eq!(n("DATEVALUE(\"2024-01-15\")", &g), 45306.0);
+        assert_eq!(n("DATEVALUE(\"1/15/2024\")", &g), 45306.0);
+        assert_eq!(n("DATEVALUE(\"15-Jan-2024\")", &g), 45306.0);
+        assert_eq!(n("DATEVALUE(\"January 15, 2024\")", &g), 45306.0);
+        assert_eq!(
+            eval_str("DATEVALUE(\"not a date\")", &g),
+            Value::Err(ExcelError::Value)
+        );
+        // TIMEVALUE.
+        approx("TIMEVALUE(\"12:00:00\")", &g, 0.5);
+        approx("TIMEVALUE(\"6:00 PM\")", &g, 0.75);
+        approx("TIMEVALUE(\"12:00 AM\")", &g, 0.0);
+        // YEARFRAC bases (2024-01-01 .. 2024-07-01).
+        approx("YEARFRAC(DATE(2024,1,1),DATE(2024,7,1),0)", &g, 0.5);
+        approx("YEARFRAC(DATE(2024,1,1),DATE(2024,7,1),1)", &g, 0.497268);
+        approx("YEARFRAC(DATE(2024,1,1),DATE(2024,7,1),2)", &g, 0.505556);
+        approx("YEARFRAC(DATE(2024,1,1),DATE(2024,7,1),3)", &g, 0.498630);
+        approx("YEARFRAC(DATE(2024,1,1),DATE(2024,7,1),4)", &g, 0.5);
+        // DAYS360.
+        assert_eq!(n("DAYS360(DATE(2024,1,31),DATE(2024,3,31))", &g), 60.0);
+        assert_eq!(n("DAYS360(DATE(2024,1,1),DATE(2024,12,31))", &g), 360.0);
+        // WORKDAY / NETWORKDAYS. 2024-01-15 is a Monday.
+        assert_eq!(n("WORKDAY(DATE(2024,1,15),5)", &g), n("DATE(2024,1,22)", &g));
+        assert_eq!(n("NETWORKDAYS(DATE(2024,1,15),DATE(2024,1,19))", &g), 5.0);
+        assert_eq!(n("NETWORKDAYS(DATE(2024,1,13),DATE(2024,1,14))", &g), 0.0);
+        // Holiday excluded.
+        let h = Grid::new(&[("Z1", eval_str("DATE(2024,1,17)", &g))]);
+        assert_eq!(
+            n("NETWORKDAYS(DATE(2024,1,15),DATE(2024,1,19),Z1)", &h),
+            4.0
+        );
+        // INTL: Fri/Sat weekend (code 7).
+        assert_eq!(
+            n("NETWORKDAYS.INTL(DATE(2024,1,15),DATE(2024,1,21),7)", &g),
+            5.0
+        );
+        // INTL: string mask, Sundays only off ("0000001").
+        assert_eq!(
+            n("NETWORKDAYS.INTL(DATE(2024,1,15),DATE(2024,1,21),\"0000001\")", &g),
+            6.0
+        );
     }
 }
