@@ -159,12 +159,14 @@ dynamic arrays, pivot engine) live in [SPREADSHEET.md](SPREADSHEET.md).
 ## Install
 
 ```sh
-cargo install docxy
+cargo install docxy   # the document editor
+cargo install xlsxy   # the spreadsheet editor
 ```
 
-Or grab a prebuilt binary (Linux / Windows / macOS) from the
-[latest release](https://github.com/yeroo/docxy/releases/latest) — each is
-checksummed, cosign-signed, and carries a build-provenance attestation.
+Or grab prebuilt binaries (Linux / Windows / macOS) from the
+[latest release](https://github.com/yeroo/docxy/releases/latest) — both apps
+ship with every release, each checksummed, cosign-signed, and carrying a
+build-provenance attestation.
 
 ## Image support
 
