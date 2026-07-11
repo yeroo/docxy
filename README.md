@@ -143,8 +143,9 @@ Excel's cached results and are saved untouched.
 xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
 xlsxy in.xlsx --csv out.csv       # headless: export the first sheet as CSV
-xlsxy in.xlsx --verify            # conformance scoreboard: recalc + diff
-                                  # against the file's cached Excel values
+xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
+                                  # against cached values (415/415 = 100%
+                                  # on the LibreOffice-oracle corpus)
 ```
 
 Type to replace, `F2` to edit, `=` starts a formula; copy/paste translates

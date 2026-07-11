@@ -53,8 +53,49 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if parsed.inputs.len() > 1 && !parsed.verify {
+        eprintln!("error: more than one input file (only --verify takes several)");
+        return ExitCode::from(2);
+    }
+
+    // --verify sweeps any number of workbooks and prints an aggregate.
+    if parsed.verify {
+        if parsed.inputs.is_empty() {
+            eprintln!("error: --verify requires at least one input file");
+            return ExitCode::from(2);
+        }
+        let mut agg = VerifyStats::default();
+        for input in &parsed.inputs {
+            let data = match std::fs::read(input) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: cannot read {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let pkg = match load_xlsx(&data) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let (report, stats) = verify_report(&pkg, input);
+            print!("{report}");
+            agg.add(&stats);
+        }
+        if parsed.inputs.len() > 1 {
+            print!("{}", agg.summary());
+        }
+        return if agg.mismatched == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // Friendly cross-suggestion for files that belong to the sibling app.
-    if let Some(input) = &parsed.input {
+    if let Some(input) = parsed.inputs.first() {
         let lower = input.to_ascii_lowercase();
         if lower.ends_with(".docx") || lower.ends_with(".md") || lower.ends_with(".markdown") {
             eprintln!("{input} is a document, not a spreadsheet — try: docxy {input}");
@@ -62,7 +103,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let (pkg, path) = match &parsed.input {
+    let (pkg, path) = match parsed.inputs.first() {
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
                 Ok(pkg) => (pkg, input.clone()),
@@ -79,23 +120,13 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() || parsed.verify {
-                eprintln!("error: headless modes (--recalc/--csv/--verify) require an input file");
+            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() {
+                eprintln!("error: headless modes (--recalc/--csv) require an input file");
                 return ExitCode::from(2);
             }
             (new_xlsx(), "untitled.xlsx".to_string())
         }
     };
-
-    if parsed.verify {
-        let (report, ok) = verify_report(&pkg, &path);
-        print!("{report}");
-        return if ok {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-    }
 
     if let Some(out) = parsed.recalc_out {
         let mut pkg = pkg;
@@ -133,7 +164,7 @@ fn main() -> ExitCode {
 }
 
 struct Parsed {
-    input: Option<String>,
+    inputs: Vec<String>,
     recalc_out: Option<String>,
     csv_out: Option<String>,
     verify: bool,
@@ -142,7 +173,7 @@ struct Parsed {
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut p = Parsed {
-        input: None,
+        inputs: Vec::new(),
         recalc_out: None,
         csv_out: None,
         verify: false,
@@ -162,12 +193,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 p.csv_out = Some(args.get(i).ok_or("--csv needs an output path")?.clone());
             }
             a if a.starts_with('-') => return Err(format!("unknown option {a}")),
-            a => {
-                if p.input.is_some() {
-                    return Err("more than one input file".to_string());
-                }
-                p.input = Some(a.to_string());
-            }
+            a => p.inputs.push(a.to_string()),
         }
         i += 1;
     }
@@ -217,7 +243,53 @@ fn entropy_seed() -> Option<u64> {
 /// value Excel last computed. Recalculate everything with our engine and
 /// diff — the resulting scoreboard measures calculation fidelity on real
 /// workbooks and catches semantic regressions.
-fn verify_report(pkg: &SheetPackage, path: &str) -> (String, bool) {
+/// Aggregate scoreboard counters across a multi-file `--verify` sweep.
+#[derive(Default)]
+struct VerifyStats {
+    files: usize,
+    total: usize,
+    compared: usize,
+    matched: usize,
+    mismatched: usize,
+    unsupported: usize,
+    volatile: usize,
+}
+
+impl VerifyStats {
+    fn add(&mut self, other: &VerifyStats) {
+        self.files += 1;
+        self.total += other.total;
+        self.compared += other.compared;
+        self.matched += other.matched;
+        self.mismatched += other.mismatched;
+        self.unsupported += other.unsupported;
+        self.volatile += other.volatile;
+    }
+
+    fn summary(&self) -> String {
+        let pct = if self.compared > 0 {
+            self.matched as f64 / self.compared as f64 * 100.0
+        } else {
+            100.0
+        };
+        format!(
+            "TOTAL: {} files, {} formula cells\n  \
+             matched      {}/{} ({pct:.1}%)\n  \
+             mismatched   {}\n  \
+             unsupported  {}\n  \
+             volatile     {}\n",
+            self.files,
+            self.total,
+            self.matched,
+            self.compared,
+            self.mismatched,
+            self.unsupported,
+            self.volatile
+        )
+    }
+}
+
+fn verify_report(pkg: &SheetPackage, path: &str) -> (String, VerifyStats) {
     use gridcore::formula::{is_volatile, parse};
     use gridcore::sheet::Workbook;
 
@@ -265,6 +337,15 @@ fn verify_report(pkg: &SheetPackage, path: &str) -> (String, bool) {
 
     let compared = total - unsupported - volatile;
     let mismatched = compared - matched;
+    let stats = VerifyStats {
+        files: 0,
+        total,
+        compared,
+        matched,
+        mismatched,
+        unsupported,
+        volatile,
+    };
     let pct = if compared > 0 {
         matched as f64 / compared as f64 * 100.0
     } else {
@@ -284,7 +365,7 @@ fn verify_report(pkg: &SheetPackage, path: &str) -> (String, bool) {
             out.push('\n');
         }
     }
-    (out, mismatched == 0)
+    (out, stats)
 }
 
 /// Cached-vs-recomputed comparison: numbers within 1e-9 relative tolerance
