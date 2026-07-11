@@ -829,6 +829,8 @@ struct App {
     replace_find: Option<String>,
     /// Vim-mode state (Some when launched with `--vim`).
     vim: Option<VimState>,
+    /// The sheet-picker popup: the highlighted sheet index while open.
+    sheet_picker: Option<usize>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -888,6 +890,7 @@ impl App {
             freeze: (0, 0),
             replace_find: None,
             vim: None,
+            sheet_picker: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -2541,11 +2544,46 @@ impl App {
     fn switch_sheet(&mut self, delta: i64) {
         let n = self.pkg.workbook.sheets.len() as i64;
         let cur = self.sheet as i64;
-        self.sheet = ((cur + delta).rem_euclid(n)) as usize;
+        self.goto_sheet(((cur + delta).rem_euclid(n)) as usize);
+    }
+
+    /// Jump to sheet `idx`, resetting the viewport.
+    fn goto_sheet(&mut self, idx: usize) {
+        if idx >= self.pkg.workbook.sheets.len() {
+            return;
+        }
+        self.sheet = idx;
         self.cur = (0, 0);
         self.top = 0;
         self.left = 0;
         self.anchor = None;
+    }
+
+    // --- sheet picker --------------------------------------------------------
+
+    fn open_sheet_picker(&mut self) {
+        if self.pkg.workbook.sheets.len() > 1 {
+            self.sheet_picker = Some(self.sheet);
+        } else {
+            self.status = Some("Only one sheet — Ctrl-T adds another".to_string());
+        }
+    }
+
+    fn sheet_picker_key(&mut self, code: KeyCode) {
+        let Some(sel) = self.sheet_picker else { return };
+        let n = self.pkg.workbook.sheets.len();
+        match code {
+            KeyCode::Esc => self.sheet_picker = None,
+            KeyCode::Up => self.sheet_picker = Some(sel.saturating_sub(1)),
+            KeyCode::Down => self.sheet_picker = Some((sel + 1).min(n - 1)),
+            KeyCode::Home => self.sheet_picker = Some(0),
+            KeyCode::End => self.sheet_picker = Some(n - 1),
+            KeyCode::Enter => {
+                self.sheet_picker = None;
+                self.goto_sheet(sel);
+            }
+            _ => {}
+        }
     }
 
     // --- editor sprint operations -------------------------------------------
@@ -2913,6 +2951,7 @@ impl App {
                 }
             }
             KeyCode::Char('p') => self.paste(),
+            KeyCode::F(4) => self.open_sheet_picker(),
             KeyCode::PageUp if ctrl => self.switch_sheet(-1),
             KeyCode::PageDown if ctrl => self.switch_sheet(1),
             KeyCode::Char('u') => self.undo(),
@@ -3538,15 +3577,36 @@ fn draw(app: &mut App, f: &mut Frame) {
         draw_format_picker(p, f, grid);
     }
 
+    // --- sheet picker -----------------------------------------------------------
+    if let Some(sel) = app.sheet_picker {
+        draw_sheet_picker(app, sel, f, grid);
+    }
+
     // --- sheet tabs + stats ---------------------------------------------------
     app.tab_spans.clear();
-    let mut tab_spans_ui: Vec<RSpan> = vec![RSpan::raw(" ")];
-    let mut x: u16 = 1;
+    // A leading marker doubles as a click target for the sheet picker.
+    let marker = format!(" ⊞ {}/{} ", app.sheet + 1, app.pkg.workbook.sheets.len());
+    let marker_w = marker.chars().count() as u16;
+    let mut tab_spans_ui: Vec<RSpan> = vec![RSpan::styled(
+        marker.clone(),
+        Style::new().fg(Color::Black).bg(Color::Cyan),
+    )];
+    app.tab_spans.push((usize::MAX, 0, marker_w)); // sentinel: opens the picker
+    let mut x: u16 = marker_w;
     for (i, s) in app.pkg.workbook.sheets.iter().enumerate() {
-        let label = format!(" {} ", s.name);
+        let active = i == app.sheet;
+        // Same width whether active or not, so tabs stay aligned.
+        let label = if active {
+            format!("[ {} ]", s.name)
+        } else {
+            format!("  {}  ", s.name)
+        };
         let w = label.chars().count() as u16;
-        let style = if i == app.sheet {
-            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        let style = if active {
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(Color::Gray)
         };
@@ -3955,6 +4015,55 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
     f.render_widget(Paragraph::new(plines), prev);
 }
 
+/// The sheet-picker popup: every sheet, the highlighted one selected.
+fn draw_sheet_picker(app: &App, sel: usize, f: &mut Frame, grid: Rect) {
+    let names: Vec<&str> = app
+        .pkg
+        .workbook
+        .sheets
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    let widest = names.iter().map(|n| n.chars().count()).max().unwrap_or(6);
+    let w = ((widest + 6) as u16).clamp(16, grid.width.saturating_sub(2));
+    let h = (names.len() as u16 + 3).min(grid.height);
+    if w < 12 || h < 4 {
+        return;
+    }
+    let x = grid.x + (grid.width - w) / 2;
+    let y = grid.y + (grid.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+    let mut lines: Vec<RLine> = vec![RLine::from(RSpan::styled(
+        fit(" Go to sheet", w as usize, false),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    ))];
+    // Keep the selected row visible if the list is long.
+    let vis = h.saturating_sub(3) as usize;
+    let top = sel.saturating_sub(vis.saturating_sub(1));
+    for (i, name) in names.iter().enumerate().skip(top).take(vis) {
+        let marker = if i == app.sheet { "●" } else { " " };
+        let label = format!(" {marker} {name}");
+        let style = if i == sel {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        lines.push(RLine::from(RSpan::styled(
+            fit(&label, w as usize, false),
+            style,
+        )));
+    }
+    lines.push(RLine::from(RSpan::styled(
+        " ↑↓ · Enter go · Esc",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(Color::Black).fg(Color::White)),
+        area,
+    );
+}
+
 /// The formatting popup (number format / font & fill color).
 fn draw_format_picker(p: &FormatPicker, f: &mut Frame, grid: Rect) {
     let (title, rows): (&str, Vec<(String, Option<Rgb>)>) = match p.kind {
@@ -4234,7 +4343,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.model_view.is_some()
         || app.prompt.is_some()
         || app.edit.is_some()
-        || app.format_picker.is_some();
+        || app.format_picker.is_some()
+        || app.sheet_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -4252,6 +4362,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- formatting popup -----------------------------------------------------
     if app.format_picker.is_some() {
         app.picker_key(key.code);
+        return false;
+    }
+
+    // --- sheet picker ---------------------------------------------------------
+    if app.sheet_picker.is_some() {
+        app.sheet_picker_key(key.code);
         return false;
     }
 
@@ -4446,6 +4562,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.open_prompt(PromptKind::Find);
             }
         }
+        KeyCode::F(4) => app.open_sheet_picker(),
         // Plain F9 opens the ribbon (handled earlier); Shift+F9 forces recalc.
         KeyCode::F(9) => app.recalc_and_refresh(),
         KeyCode::Char('p') | KeyCode::Char('P') if ctrl => app.open_pivot_editor(),
@@ -4591,12 +4708,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             if !drag && m.row == tabs_y {
                 for &(i, x1, x2) in &app.tab_spans {
                     if m.column >= x1 && m.column < x2 {
-                        if i != app.sheet {
-                            app.sheet = i;
-                            app.cur = (0, 0);
-                            app.top = 0;
-                            app.left = 0;
-                            app.anchor = None;
+                        if i == usize::MAX {
+                            app.open_sheet_picker(); // the ⊞ marker
+                        } else if i != app.sheet {
+                            app.goto_sheet(i);
                         }
                         return;
                     }
@@ -4947,6 +5062,23 @@ mod tests {
         app.vim_key(KeyCode::Char(':'), false, false);
         app.vim_key(KeyCode::Char('q'), false, false);
         assert!(app.vim_key(KeyCode::Enter, false, false));
+    }
+
+    #[test]
+    fn sheet_picker_jumps() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.add_sheet("Second");
+        app.pkg.add_sheet("Third");
+        assert_eq!(app.sheet, 0);
+        app.open_sheet_picker();
+        assert_eq!(app.sheet_picker, Some(0));
+        app.sheet_picker_key(KeyCode::Down);
+        app.sheet_picker_key(KeyCode::Down);
+        app.sheet_picker_key(KeyCode::Enter);
+        assert_eq!(app.sheet, 2);
+        assert!(app.sheet_picker.is_none());
+        assert_eq!(app.cur, (0, 0)); // viewport reset
     }
 
     #[test]
