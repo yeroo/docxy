@@ -4785,6 +4785,45 @@ impl<'a> Eval<'a> {
             "SINH" => self.one_num(args, |n| num(n.sinh())),
             "COSH" => self.one_num(args, |n| num(n.cosh())),
             "TANH" => self.one_num(args, |n| num(n.tanh())),
+            "ASINH" => self.one_num(args, |n| num(n.asinh())),
+            "ACOSH" => self.one_num(args, |n| {
+                if n < 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(n.acosh())
+            }),
+            "ATANH" => self.one_num(args, |n| {
+                if n <= -1.0 || n >= 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(n.atanh())
+            }),
+            "SEC" => self.one_num(args, |n| num(1.0 / n.cos())),
+            "CSC" => self.one_num(args, |n| num(1.0 / n.sin())),
+            "COT" => self.one_num(args, |n| {
+                if n == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(1.0 / n.tan())
+            }),
+            "SECH" => self.one_num(args, |n| num(1.0 / n.cosh())),
+            "CSCH" => self.one_num(args, |n| num(1.0 / n.sinh())),
+            "COTH" => self.one_num(args, |n| {
+                if n == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(1.0 / n.tanh())
+            }),
+            "ACOT" => self.one_num(args, |n| {
+                // Excel returns a principal value in (0, π).
+                num(std::f64::consts::FRAC_PI_2 - n.atan())
+            }),
+            "ACOTH" => self.one_num(args, |n| {
+                if n.abs() <= 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(0.5 * ((n + 1.0) / (n - 1.0)).ln())
+            }),
             "FLOOR" | "FLOOR.MATH" => self.two_num(args, |n, sig| {
                 if sig == 0.0 {
                     return Value::Err(ExcelError::Div0);
@@ -6977,6 +7016,43 @@ impl<'a> Eval<'a> {
                 Ok(v) => num(v.iter().map(|x| x * x).sum()),
                 Err(e) => Value::Err(e),
             },
+            "COMBINA" => self.two_num(args, |n, k| {
+                // Combinations with repetition = C(n+k-1, k).
+                let (n, k) = (n.trunc(), k.trunc());
+                if n < 0.0 || k < 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                if n == 0.0 {
+                    return num(if k == 0.0 { 1.0 } else { 0.0 });
+                }
+                let top = n + k - 1.0;
+                let kk = k.min(top - k);
+                let iters = (kk as u64).min(1_000_000);
+                let mut r = 1.0f64;
+                for i in 0..iters {
+                    r = r * (top - i as f64) / (i as f64 + 1.0);
+                    if !r.is_finite() {
+                        return Value::Err(ExcelError::Num);
+                    }
+                }
+                num(r.round())
+            }),
+            "FACTDOUBLE" => self.one_num(args, |n| {
+                let n = n.trunc();
+                if n < -1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let mut r = 1.0f64;
+                let mut i = n;
+                while i > 1.0 {
+                    r *= i;
+                    if !r.is_finite() {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    i -= 2.0;
+                }
+                num(r)
+            }),
 
             // ---- regression & correlation --------------------------------------
             "CORREL" | "PEARSON" => {
@@ -7749,6 +7825,12 @@ impl<'a> Eval<'a> {
             "BIN2DEC" => self.one_text(args, |s| base_to_dec(&s, 2, 10)),
             "OCT2DEC" => self.one_text(args, |s| base_to_dec(&s, 8, 10)),
             "HEX2DEC" => self.one_text(args, |s| base_to_dec(&s, 16, 10)),
+            "BIN2OCT" => self.cross_base_call(args, 2, 10, 8, -536_870_912.0, 536_870_911.0),
+            "BIN2HEX" => self.cross_base_call(args, 2, 10, 16, -549_755_813_888.0, 549_755_813_887.0),
+            "OCT2BIN" => self.cross_base_call(args, 8, 10, 2, -512.0, 511.0),
+            "OCT2HEX" => self.cross_base_call(args, 8, 10, 16, -549_755_813_888.0, 549_755_813_887.0),
+            "HEX2BIN" => self.cross_base_call(args, 16, 10, 2, -512.0, 511.0),
+            "HEX2OCT" => self.cross_base_call(args, 16, 10, 8, -536_870_912.0, 536_870_911.0),
             "DELTA" => {
                 if args.is_empty() || args.len() > 2 {
                     return Value::Err(ExcelError::Value);
@@ -7832,6 +7914,32 @@ impl<'a> Eval<'a> {
             Some(e) => Some(try_num!(self.eval(e))),
         };
         dec_to_base(n, radix, places, lo, hi)
+    }
+
+    /// BIN2HEX / OCT2BIN / … — parse in one base, re-render two's-complement in
+    /// another, honoring the destination's valid range and optional `places`.
+    fn cross_base_call(
+        &mut self,
+        args: &[Expr],
+        from_radix: u32,
+        from_digits: u32,
+        to_radix: u32,
+        lo: f64,
+        hi: f64,
+    ) -> Value {
+        if args.is_empty() || args.len() > 2 {
+            return Value::Err(ExcelError::Value);
+        }
+        let s = try_text!(self.eval(&args[0]));
+        let dec = match base_to_dec(&s, from_radix, from_digits) {
+            Value::Num(n) => n,
+            other => return other,
+        };
+        let places = match args.get(1) {
+            None | Some(Expr::Missing) => None,
+            Some(e) => Some(try_num!(self.eval(e))),
+        };
+        dec_to_base(dec, to_radix, places, lo, hi)
     }
 
     /// Flatten any argument to a dense, row-major `Vec<Value>` (blanks kept as
@@ -10139,5 +10247,30 @@ mod tests {
         assert_eq!(n("TYPE(TRUE)", &g), 4.0);
         assert_eq!(n("TYPE(1/0)", &g), 16.0);
         assert_eq!(n("TYPE(A1:A4)", &x), 64.0);
+    }
+
+    #[test]
+    fn trig_and_engineering_extras() {
+        let g = empty();
+        approx("ASINH(1)", &g, 0.881374);
+        approx("ACOSH(2)", &g, 1.316958);
+        approx("ATANH(0.5)", &g, 0.549306);
+        approx("SEC(1)", &g, 1.850816);
+        approx("CSC(1)", &g, 1.188395);
+        approx("COT(1)", &g, 0.642093);
+        approx("ACOT(1)", &g, 0.785398);
+        approx("ACOTH(2)", &g, 0.549306);
+        approx("SECH(1)", &g, 0.648054);
+        assert_eq!(eval_str("ATANH(1)", &g), Value::Err(ExcelError::Num));
+        // Counting.
+        assert_eq!(n("COMBINA(4,3)", &g), 20.0);
+        assert_eq!(n("FACTDOUBLE(7)", &g), 105.0);
+        assert_eq!(n("FACTDOUBLE(6)", &g), 48.0);
+        // Cross-base conversion.
+        assert_eq!(eval_str("BIN2HEX(\"1111\")", &g), Value::Str("F".into()));
+        assert_eq!(eval_str("HEX2BIN(\"F\")", &g), Value::Str("1111".into()));
+        assert_eq!(eval_str("OCT2HEX(\"17\")", &g), Value::Str("F".into()));
+        assert_eq!(eval_str("BIN2OCT(\"1000\")", &g), Value::Str("10".into()));
+        assert_eq!(n("HEX2DEC(BIN2HEX(\"1010\"))", &g), 10.0);
     }
 }
