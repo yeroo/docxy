@@ -3635,7 +3635,11 @@ impl<'a> Eval<'a> {
                     return err(ExcelError::Num);
                 }
                 Ok((0..n)
-                    .map(|i| (0..n).map(|j| num(if i == j { 1.0 } else { 0.0 })).collect())
+                    .map(|i| {
+                        (0..n)
+                            .map(|j| num(if i == j { 1.0 } else { 0.0 }))
+                            .collect()
+                    })
                     .collect())
             }
             "MINVERSE" => {
@@ -3704,10 +3708,8 @@ impl<'a> Eval<'a> {
                     split_on_any(s, delims, case_insensitive)
                 };
                 let row_strs = split(&text, &row_delims);
-                let mut grid: Vec<Vec<String>> = row_strs
-                    .iter()
-                    .map(|r| split(r, &col_delims))
-                    .collect();
+                let mut grid: Vec<Vec<String>> =
+                    row_strs.iter().map(|r| split(r, &col_delims)).collect();
                 if ignore_empty {
                     for r in &mut grid {
                         r.retain(|c| !c.is_empty());
@@ -6381,9 +6383,8 @@ impl<'a> Eval<'a> {
             }
             "TIMEVALUE" => self.one_text(args, |s| {
                 // Accept a leading date part (Excel ignores it), keep the time.
-                let frac = parse_time_text(&s).or_else(|| {
-                    s.rsplit_once(' ').and_then(|(_, t)| parse_time_text(t))
-                });
+                let frac = parse_time_text(&s)
+                    .or_else(|| s.rsplit_once(' ').and_then(|(_, t)| parse_time_text(t)));
                 match frac {
                     Some(f) => num(f),
                     None => Value::Err(ExcelError::Value),
@@ -6467,7 +6468,9 @@ impl<'a> Eval<'a> {
                 let intl = name == "WORKDAY.INTL";
                 let (mask, hol_idx) = if intl {
                     let m = match args.get(2) {
-                        None | Some(Expr::Missing) => [false, false, false, false, false, true, true],
+                        None | Some(Expr::Missing) => {
+                            [false, false, false, false, false, true, true]
+                        }
                         Some(e) => match weekend_mask(&self.eval(e)) {
                             Some(m) => m,
                             None => return Value::Err(ExcelError::Value),
@@ -6508,7 +6511,9 @@ impl<'a> Eval<'a> {
                 let intl = name == "NETWORKDAYS.INTL";
                 let (mask, hol_idx) = if intl {
                     let m = match args.get(2) {
-                        None | Some(Expr::Missing) => [false, false, false, false, false, true, true],
+                        None | Some(Expr::Missing) => {
+                            [false, false, false, false, false, true, true]
+                        }
                         Some(e) => match weekend_mask(&self.eval(e)) {
                             Some(m) => m,
                             None => return Value::Err(ExcelError::Value),
@@ -6749,7 +6754,11 @@ impl<'a> Eval<'a> {
                     None | Some(Expr::Missing) => 2.0,
                     Some(e) => try_num!(self.eval(e)),
                 };
-                if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period < 1.0 || period > life
+                if cost < 0.0
+                    || salvage < 0.0
+                    || life <= 0.0
+                    || period < 1.0
+                    || period > life
                     || factor <= 0.0
                 {
                     return Value::Err(ExcelError::Num);
@@ -6962,8 +6971,8 @@ impl<'a> Eval<'a> {
             }
 
             // ---- database functions --------------------------------------------
-            "DSUM" | "DAVERAGE" | "DMAX" | "DMIN" | "DPRODUCT" | "DCOUNT" | "DCOUNTA"
-            | "DGET" | "DVAR" | "DVARP" | "DSTDEV" | "DSTDEVP" => {
+            "DSUM" | "DAVERAGE" | "DMAX" | "DMIN" | "DPRODUCT" | "DCOUNT" | "DCOUNTA" | "DGET"
+            | "DVAR" | "DVARP" | "DSTDEV" | "DSTDEVP" => {
                 let cells = match self.db_query(args) {
                     Ok(c) => c,
                     Err(v) => return v,
@@ -6972,8 +6981,10 @@ impl<'a> Eval<'a> {
                     return num(cells.iter().filter(|v| !matches!(v, Value::Empty)).count() as f64);
                 }
                 if name == "DGET" {
-                    let non_blank: Vec<&Value> =
-                        cells.iter().filter(|v| !matches!(v, Value::Empty)).collect();
+                    let non_blank: Vec<&Value> = cells
+                        .iter()
+                        .filter(|v| !matches!(v, Value::Empty))
+                        .collect();
                     return match non_blank.len() {
                         0 => Value::Err(ExcelError::Value),
                         1 => non_blank[0].clone(),
@@ -7477,7 +7488,11 @@ impl<'a> Eval<'a> {
                     }
                     let m = v.iter().sum::<f64>() / v.len() as f64;
                     let ss: f64 = v.iter().map(|x| (x - m) * (x - m)).sum();
-                    let denom = if pop { v.len() as f64 } else { v.len() as f64 - 1.0 };
+                    let denom = if pop {
+                        v.len() as f64
+                    } else {
+                        v.len() as f64 - 1.0
+                    };
                     let var = ss / denom;
                     if name.starts_with("STDEV") {
                         num(var.sqrt())
@@ -7978,9 +7993,13 @@ impl<'a> Eval<'a> {
             "OCT2DEC" => self.one_text(args, |s| base_to_dec(&s, 8, 10)),
             "HEX2DEC" => self.one_text(args, |s| base_to_dec(&s, 16, 10)),
             "BIN2OCT" => self.cross_base_call(args, 2, 10, 8, -536_870_912.0, 536_870_911.0),
-            "BIN2HEX" => self.cross_base_call(args, 2, 10, 16, -549_755_813_888.0, 549_755_813_887.0),
+            "BIN2HEX" => {
+                self.cross_base_call(args, 2, 10, 16, -549_755_813_888.0, 549_755_813_887.0)
+            }
             "OCT2BIN" => self.cross_base_call(args, 8, 10, 2, -512.0, 511.0),
-            "OCT2HEX" => self.cross_base_call(args, 8, 10, 16, -549_755_813_888.0, 549_755_813_887.0),
+            "OCT2HEX" => {
+                self.cross_base_call(args, 8, 10, 16, -549_755_813_888.0, 549_755_813_887.0)
+            }
             "HEX2BIN" => self.cross_base_call(args, 16, 10, 2, -512.0, 511.0),
             "HEX2OCT" => self.cross_base_call(args, 16, 10, 8, -536_870_912.0, 536_870_911.0),
             "DELTA" => {
@@ -8147,7 +8166,9 @@ impl<'a> Eval<'a> {
         }
         let headers = &db[0];
         let text_eq = |a: &Value, b: &str| {
-            to_text(a).map(|t| t.eq_ignore_ascii_case(b)).unwrap_or(false)
+            to_text(a)
+                .map(|t| t.eq_ignore_ascii_case(b))
+                .unwrap_or(false)
         };
         // Resolve the field to a column index (1-based number, or header name).
         let col = match &field {
@@ -8460,7 +8481,9 @@ fn month_num(s: &str) -> Option<u32> {
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
     let s = s.trim().to_ascii_lowercase();
-    M.iter().position(|m| s.starts_with(m)).map(|i| i as u32 + 1)
+    M.iter()
+        .position(|m| s.starts_with(m))
+        .map(|i| i as u32 + 1)
 }
 
 /// Two-digit year → four-digit, Excel's 0-29 → 2000s, 30-99 → 1900s rule.
@@ -8504,7 +8527,10 @@ fn parse_date_text(s: &str, d1904: bool) -> Option<f64> {
         d = d.or(Some(1));
     } else {
         // All numeric.
-        let nums: Vec<i64> = parts.iter().map(|p| p.parse().ok()).collect::<Option<_>>()?;
+        let nums: Vec<i64> = parts
+            .iter()
+            .map(|p| p.parse().ok())
+            .collect::<Option<_>>()?;
         if nums.len() != 3 {
             return None;
         }
@@ -10289,7 +10315,10 @@ mod tests {
         assert_eq!(n("SUMX2MY2(A1:A2,B1:B2)", &gg), 11.0); // (4-1)+(9-1)
         assert_eq!(n("SUMX2PY2(A1:A2,B1:B2)", &gg), 15.0);
         assert_eq!(n("SUMXMY2(A1:A2,B1:B2)", &gg), 5.0); // 1+4
-        assert_eq!(eval_str("SUMXMY2(A1:A2,B1:B1)", &gg), Value::Err(ExcelError::NA));
+        assert_eq!(
+            eval_str("SUMXMY2(A1:A2,B1:B1)", &gg),
+            Value::Err(ExcelError::NA)
+        );
         assert_eq!(n("MULTINOMIAL(2,3,4)", &g), 1260.0);
         // Bit ops.
         assert_eq!(n("BITAND(12,10)", &g), 8.0);
@@ -10470,7 +10499,10 @@ mod tests {
         assert_eq!(n("DAYS360(DATE(2024,1,31),DATE(2024,3,31))", &g), 60.0);
         assert_eq!(n("DAYS360(DATE(2024,1,1),DATE(2024,12,31))", &g), 360.0);
         // WORKDAY / NETWORKDAYS. 2024-01-15 is a Monday.
-        assert_eq!(n("WORKDAY(DATE(2024,1,15),5)", &g), n("DATE(2024,1,22)", &g));
+        assert_eq!(
+            n("WORKDAY(DATE(2024,1,15),5)", &g),
+            n("DATE(2024,1,22)", &g)
+        );
         assert_eq!(n("NETWORKDAYS(DATE(2024,1,15),DATE(2024,1,19))", &g), 5.0);
         assert_eq!(n("NETWORKDAYS(DATE(2024,1,13),DATE(2024,1,14))", &g), 0.0);
         // Holiday excluded.
@@ -10486,7 +10518,10 @@ mod tests {
         );
         // INTL: string mask, Sundays only off ("0000001").
         assert_eq!(
-            n("NETWORKDAYS.INTL(DATE(2024,1,15),DATE(2024,1,21),\"0000001\")", &g),
+            n(
+                "NETWORKDAYS.INTL(DATE(2024,1,15),DATE(2024,1,21),\"0000001\")",
+                &g
+            ),
             6.0
         );
     }
@@ -10560,10 +10595,7 @@ mod tests {
         assert_eq!(n("XMATCH(25,A1:A4,-1)", &x), 2.0); // next smaller
         assert_eq!(n("XMATCH(25,A1:A4,1)", &x), 3.0); // next larger
         assert_eq!(n("XMATCH(40,A1:A4,0,-1)", &x), 4.0); // last-to-first
-        assert_eq!(
-            eval_str("XMATCH(99,A1:A4)", &x),
-            Value::Err(ExcelError::NA)
-        );
+        assert_eq!(eval_str("XMATCH(99,A1:A4)", &x), Value::Err(ExcelError::NA));
         // ADDRESS.
         assert_eq!(eval_str("ADDRESS(1,1)", &g), Value::Str("$A$1".into()));
         assert_eq!(eval_str("ADDRESS(2,3,4)", &g), Value::Str("C2".into()));

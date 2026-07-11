@@ -15,6 +15,9 @@ use std::io;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
+mod ribbon;
+
+use gridcore::comments::Comment;
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
@@ -355,6 +358,15 @@ fn entropy_seed() -> Option<u64> {
         .map(|d| d.as_nanos() as u64 | 1)
 }
 
+/// The author name stamped on new comments — the OS user, else "xlsxy".
+fn comment_author() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "xlsxy".to_string())
+}
+
 /// The conformance oracle: every formula cell in a real .xlsx carries the
 /// value Excel last computed. Recalculate everything with our engine and
 /// diff — the resulting scoreboard measures calculation fidelity on real
@@ -542,7 +554,7 @@ enum UndoAction {
 }
 
 /// What the minibuffer prompt is collecting.
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum PromptKind {
     Find,
     SaveAs,
@@ -554,6 +566,8 @@ enum PromptKind {
     Measure,
     /// `Sales; Groups[Category]; Total[; Products[Name]]` — build a report.
     ModelPivot,
+    /// The body text of a new comment on the current cell.
+    NewComment,
 }
 
 struct Prompt {
@@ -606,11 +620,18 @@ struct App {
     model_rels: Vec<Relationship>,
     model_measures: Vec<gridcore::model::Measure>,
     last_find: Option<String>,
+    // Review comments + the side panel that shows them.
+    ribbon: ribbon::Ribbon,
+    ribbon_focus: ribbon::Focus,
+    comments: Vec<Comment>,
+    show_comments: bool,
+    comment_sel: usize,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
     vis_cols: Vec<(u32, u16, u16)>, // (col, x, width)
     tab_spans: Vec<(usize, u16, u16)>,
+    ribbon_rows: u16,
 }
 
 impl App {
@@ -622,6 +643,7 @@ impl App {
             .part(MODEL_PART)
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
+        let comments = pkg.comments();
         App {
             pkg,
             engine,
@@ -647,10 +669,16 @@ impl App {
             model_rels,
             model_measures,
             last_find: None,
+            ribbon: ribbon::Ribbon::new(),
+            ribbon_focus: ribbon::Focus::None,
+            comments,
+            show_comments: false,
+            comment_sel: 0,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
             tab_spans: Vec::new(),
+            ribbon_rows: 1,
         }
     }
 
@@ -1558,6 +1586,181 @@ impl App {
         }
     }
 
+    // --- review comments -----------------------------------------------------
+
+    /// Re-read comments from the package (after an author/delete edit).
+    fn refresh_comments(&mut self) {
+        self.comments = self.pkg.comments();
+        if self.comment_sel >= self.comments.len() {
+            self.comment_sel = self.comments.len().saturating_sub(1);
+        }
+    }
+
+    /// The comment on `(row, col)` of the current sheet, if any.
+    fn comment_at(&self, row: u32, col: u32) -> Option<&Comment> {
+        self.comments
+            .iter()
+            .find(|c| c.sheet == self.sheet && c.row == row && c.col == col)
+    }
+
+    fn has_comment(&self, row: u32, col: u32) -> bool {
+        self.comment_at(row, col).is_some()
+    }
+
+    /// Start authoring a comment on the current cell (pre-filled when editing
+    /// an existing one).
+    fn start_comment(&mut self) {
+        let (r, c) = self.cur;
+        let existing = self
+            .comment_at(r, c)
+            .map(|cm| cm.text.clone())
+            .unwrap_or_default();
+        self.open_prompt(PromptKind::NewComment);
+        if let Some(p) = &mut self.prompt {
+            p.text = existing;
+            p.cursor = p.text.chars().count();
+        }
+        self.show_comments = true;
+    }
+
+    /// Commit the drafted comment text onto the current cell.
+    fn commit_comment(&mut self, text: &str) {
+        let (r, c) = self.cur;
+        let text = text.trim();
+        if text.is_empty() {
+            self.status = Some("Comment cancelled (empty)".to_string());
+            return;
+        }
+        let author = comment_author();
+        self.pkg.set_comment(self.sheet, r, c, &author, text);
+        self.modified = true;
+        self.refresh_comments();
+        self.status = Some(format!("Comment added on {}", cell_name(r, c)));
+    }
+
+    fn delete_comment(&mut self) {
+        let (r, c) = self.cur;
+        if !self.has_comment(r, c) {
+            self.status = Some("No comment on this cell".to_string());
+            return;
+        }
+        self.pkg.remove_comment(self.sheet, r, c);
+        self.modified = true;
+        self.refresh_comments();
+        self.status = Some(format!("Comment deleted from {}", cell_name(r, c)));
+    }
+
+    /// Jump the cursor to the previous/next comment (across sheets).
+    fn nav_comment(&mut self, delta: i32) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments in this workbook".to_string());
+            return;
+        }
+        self.show_comments = true;
+        let n = self.comments.len() as i32;
+        self.comment_sel = (((self.comment_sel as i32 + delta) % n + n) % n) as usize;
+        let c = &self.comments[self.comment_sel];
+        let (sheet, row, col) = (c.sheet, c.row, c.col);
+        if sheet < self.pkg.workbook.sheets.len() {
+            self.sheet = sheet;
+        }
+        self.cur = (row, col);
+        self.anchor = None;
+        self.ensure_visible();
+        self.status = Some(format!(
+            "Comment {}/{} on {}",
+            self.comment_sel + 1,
+            self.comments.len(),
+            cell_name(row, col)
+        ));
+    }
+
+    fn toggle_comments(&mut self) {
+        self.show_comments = !self.show_comments;
+        self.status = Some(if self.comments.is_empty() {
+            "No comments in this workbook".to_string()
+        } else if self.show_comments {
+            format!("Showing {} comment(s)", self.comments.len())
+        } else {
+            "Comments panel hidden".to_string()
+        });
+    }
+
+    /// Which ribbon toggle buttons are currently "on".
+    fn ribbon_toggles(&self) -> Vec<ribbon::Act> {
+        let mut v = Vec::new();
+        if self.show_comments {
+            v.push(ribbon::Act::ToggleComments);
+        }
+        v
+    }
+
+    /// Keyboard navigation while the ribbon is engaged.
+    fn ribbon_key(&mut self, code: KeyCode) {
+        use ribbon::{Dir, Focus};
+        match code {
+            KeyCode::Esc => self.ribbon_focus = Focus::None,
+            KeyCode::Left | KeyCode::BackTab => {
+                self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Left);
+                if let Focus::Tab(t) = self.ribbon_focus {
+                    self.ribbon.set_active(t);
+                }
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Right);
+                if let Focus::Tab(t) = self.ribbon_focus {
+                    self.ribbon.set_active(t);
+                }
+            }
+            KeyCode::Up => self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Up),
+            KeyCode::Down => self.ribbon_focus = self.ribbon.nav(self.ribbon_focus, Dir::Down),
+            KeyCode::Enter => match self.ribbon_focus {
+                Focus::Tab(t) => {
+                    self.ribbon.set_active(t);
+                    self.ribbon_focus = self.ribbon.enter_body();
+                }
+                Focus::Button(_) => {
+                    if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
+                        self.ribbon_focus = Focus::None; // apply, then collapse
+                        self.ribbon_act(act);
+                    }
+                }
+                Focus::None => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Dispatch a ribbon command to the matching editor operation.
+    fn ribbon_act(&mut self, act: ribbon::Act) {
+        use ribbon::Act::*;
+        match act {
+            Cut => self.copy(true),
+            Copy => self.copy(false),
+            Paste => self.paste(),
+            Undo => self.undo(),
+            Redo => self.redo(),
+            Find => self.open_prompt(PromptKind::Find),
+            ClearContents => self.clear_selection(),
+            FillDown => self.fill(true),
+            FillRight => self.fill(false),
+            InsertRow => self.row_op(true),
+            InsertCol => self.col_op(true),
+            DeleteRow => self.row_op(false),
+            DeleteCol => self.col_op(false),
+            AddSheet => self.open_prompt(PromptKind::AddSheet),
+            RenameSheet => self.open_prompt(PromptKind::RenameSheet),
+            Save => self.save(),
+            SaveAs => self.open_prompt(PromptKind::SaveAs),
+            NewComment => self.start_comment(),
+            DeleteComment => self.delete_comment(),
+            PrevComment => self.nav_comment(-1),
+            NextComment => self.nav_comment(1),
+            ToggleComments => self.toggle_comments(),
+            Todo(name) => self.status = Some(format!("{name}: not implemented yet")),
+        }
+    }
+
     fn clear_selection(&mut self) {
         let (r1, c1, r2, c2) = self.iter_selection();
         let mut changes = Vec::new();
@@ -1733,6 +1936,7 @@ impl App {
             PromptKind::Relate => ("Relate  From[Col] = To[Col]: ", String::new()),
             PromptKind::Measure => ("Measure  Name = FORMULA: ", String::new()),
             PromptKind::ModelPivot => ("Report  Base; rows; values[; cols]: ", String::new()),
+            PromptKind::NewComment => ("Comment: ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -1753,6 +1957,7 @@ impl App {
                     self.find_next(&text);
                 }
             }
+            PromptKind::NewComment => self.commit_comment(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -1982,14 +2187,52 @@ const HDR_CUR: Style = Style::new()
 
 fn draw(app: &mut App, f: &mut Frame) {
     let area = f.area();
-    if area.height < 5 || area.width < 12 {
+    if area.height < 8 || area.width < 12 {
         return;
     }
-    let formula_bar = Rect::new(area.x, area.y, area.width, 1);
-    let col_hdr = Rect::new(area.x, area.y + 1, area.width, 1);
-    let grid = Rect::new(area.x, area.y + 2, area.width, area.height - 4);
+    // --- ribbon (tab strip, plus body + hint when engaged) --------------------
+    let toggles = app.ribbon_toggles();
+    app.ribbon.set_toggles(toggles);
+    let engaged = app.ribbon_focus != ribbon::Focus::None;
+    let ribbon_h: u16 = if engaged { 7 } else { 1 };
+    app.ribbon_rows = ribbon_h;
+    let mut y = area.y;
+    f.render_widget(
+        Paragraph::new(app.ribbon.render_tabs(app.ribbon_focus)),
+        Rect::new(area.x, y, area.width, 1),
+    );
+    y += 1;
+    if engaged {
+        let body = app.ribbon.render_body(app.ribbon_focus);
+        f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 5));
+        y += 5;
+        f.render_widget(
+            Paragraph::new(app.ribbon.render_hint(app.ribbon_focus, area.width)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+
+    let formula_bar = Rect::new(area.x, y, area.width, 1);
+    let col_hdr = Rect::new(area.x, y + 1, area.width, 1);
+    let grid_h = area.height.saturating_sub(ribbon_h + 4);
+    let mut grid = Rect::new(area.x, y + 2, area.width, grid_h);
     let tabs_line = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
     let hint_line = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+
+    // --- comments side panel reserves space on the right ----------------------
+    let panel_w: u16 = if app.show_comments && !app.comments.is_empty() {
+        34u16.min(grid.width / 2)
+    } else {
+        0
+    };
+    let panel = if panel_w > 0 {
+        let p = Rect::new(grid.x + grid.width - panel_w, grid.y, panel_w, grid.height);
+        grid.width -= panel_w;
+        Some(p)
+    } else {
+        None
+    };
     app.grid_area = grid;
 
     // Row gutter sized for the largest visible row number.
@@ -2059,6 +2302,13 @@ fn draw(app: &mut App, f: &mut Frame) {
 
     // --- grid ---------------------------------------------------------------
     let (r1, c1, r2, c2) = app.selection();
+    let cur_sheet = app.sheet;
+    let commented: std::collections::HashSet<(u32, u32)> = app
+        .comments
+        .iter()
+        .filter(|c| c.sheet == cur_sheet)
+        .map(|c| (c.row, c.col))
+        .collect();
     let sheet = app.sheet();
     let styles = &app.pkg.workbook.styles;
     let date1904 = app.pkg.workbook.date1904;
@@ -2098,11 +2348,20 @@ fn draw(app: &mut App, f: &mut Frame) {
             } else if selected {
                 style = style.bg(Color::DarkGray).fg(Color::White);
             }
+            // A commented cell is underlined (Excel's red-triangle analogue).
+            if commented.contains(&(row, col)) {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
             spans.push(RSpan::styled(display, style));
         }
         lines.push(RLine::from(spans));
     }
     f.render_widget(Paragraph::new(lines), grid);
+
+    // --- comments side panel --------------------------------------------------
+    if let Some(rect) = panel {
+        draw_comments_panel(app, f, rect);
+    }
 
     // --- pivot editor overlay -------------------------------------------------
     if let Some(pe) = &app.pivot_edit {
@@ -2184,7 +2443,7 @@ fn draw(app: &mut App, f: &mut Frame) {
         "Enter commit ↓ · Tab commit → · Esc cancel".to_string()
     } else {
         format!(
-            "{}{}  ^S save  F12 save-as  ^Q quit  ^Z undo  ^F find  ^D/^R fill  F5/F6 +row/col  ^T sheet",
+            "{}{}  F9 ribbon  ^S save  ^Q quit  ^Z undo  ^F find  ^D/^R fill  ^T sheet",
             app.path,
             if app.modified { " *" } else { "" }
         )
@@ -2374,6 +2633,82 @@ fn draw_model_view(app: &App, pane: usize, sel: usize, f: &mut Frame, grid: Rect
     );
 }
 
+/// Word-wrap `text` to `width` columns (never zero); explicit newlines break.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.chars().count() + 1 + word.chars().count() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+            // A single word longer than the width is hard-split.
+            while line.chars().count() > width {
+                let cut: String = line.chars().take(width).collect();
+                out.push(cut);
+                line = line.chars().skip(width).collect();
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// The review-comments side panel: every comment in the workbook, the one on
+/// the cursor cell highlighted.
+fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<RLine> = Vec::new();
+    lines.push(RLine::from(RSpan::styled(
+        fit(
+            &format!(" Comments ({})", app.comments.len()),
+            area.width as usize,
+            false,
+        ),
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for c in &app.comments {
+        let here = c.sheet == app.sheet && (c.row, c.col) == app.cur;
+        let sheet_name = app
+            .pkg
+            .workbook
+            .sheets
+            .get(c.sheet)
+            .map(|s| s.name.as_str())
+            .unwrap_or("?");
+        let head = format!("{sheet_name}!{} · {}", cell_name(c.row, c.col), c.author);
+        let head_style = if here {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        lines.push(RLine::from(RSpan::styled(head, head_style)));
+        for wl in wrap_text(&c.text, inner_w) {
+            lines.push(RLine::from(RSpan::raw(format!("  {wl}"))));
+        }
+        if c.threaded {
+            lines.push(RLine::from(RSpan::styled(
+                "  (threaded)".to_string(),
+                Style::new().add_modifier(Modifier::DIM),
+            )));
+        }
+        lines.push(RLine::from(RSpan::raw(String::new())));
+    }
+    lines.truncate(area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -2416,6 +2751,24 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         } else {
             app.status = Some("Sheet deletion cancelled".to_string());
         }
+        return false;
+    }
+
+    // --- ribbon ---------------------------------------------------------------
+    let overlay_open = app.pivot_edit.is_some()
+        || app.model_view.is_some()
+        || app.prompt.is_some()
+        || app.edit.is_some();
+    if key.code == KeyCode::F(9) && !overlay_open {
+        app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
+            ribbon::Focus::Tab(app.ribbon.active_tab())
+        } else {
+            ribbon::Focus::None
+        };
+        return false;
+    }
+    if app.ribbon_focus != ribbon::Focus::None && !overlay_open {
+        app.ribbon_key(key.code);
         return false;
     }
 
@@ -2713,6 +3066,22 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             let drag = matches!(m.kind, MouseEventKind::Drag(_));
+            // The ribbon occupies the top rows.
+            if !drag && m.row < app.ribbon_rows {
+                let expanded = app.ribbon_focus != ribbon::Focus::None;
+                match app.ribbon.hit(m.column, m.row, expanded) {
+                    ribbon::Hit::Tab(t) => {
+                        app.ribbon.set_active(t);
+                        app.ribbon_focus = ribbon::Focus::Tab(t);
+                    }
+                    ribbon::Hit::Button(act) => {
+                        app.ribbon_focus = ribbon::Focus::None;
+                        app.ribbon_act(act);
+                    }
+                    ribbon::Hit::Outside => {}
+                }
+                return;
+            }
             // Sheet tabs live on the line right below the grid.
             let tabs_y = app.grid_area.y + app.grid_area.height;
             if !drag && m.row == tabs_y {
@@ -2847,6 +3216,49 @@ fn run_tui(pkg: SheetPackage, path: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_authoring_flow() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // Author a comment on the current cell (A1).
+        app.commit_comment("Please double-check");
+        assert_eq!(app.comments.len(), 1);
+        assert!(app.has_comment(0, 0));
+        assert_eq!(app.comment_at(0, 0).unwrap().text, "Please double-check");
+        assert!(app.modified);
+
+        // A second comment elsewhere, then navigate to it.
+        app.cur = (4, 2);
+        app.commit_comment("Second note");
+        assert_eq!(app.comments.len(), 2);
+        app.cur = (0, 0);
+        app.nav_comment(1); // from A1 → next comment
+        assert_eq!(app.cur, (4, 2));
+
+        // Deleting removes it and the marker.
+        app.delete_comment();
+        assert!(!app.has_comment(4, 2));
+        assert_eq!(app.comments.len(), 1);
+
+        // Survives a save/load round-trip.
+        let bytes = save_xlsx(&app.pkg);
+        let reloaded = load_xlsx(&bytes).unwrap();
+        let cs = reloaded.comments();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].text, "Please double-check");
+    }
+
+    #[test]
+    fn ribbon_new_comment_opens_the_prompt() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.ribbon_act(ribbon::Act::NewComment);
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::NewComment)
+        ));
+        assert!(app.show_comments);
+    }
 
     #[test]
     fn parse_input_kinds() {

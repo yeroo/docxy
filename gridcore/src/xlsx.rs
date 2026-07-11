@@ -1447,7 +1447,11 @@ fn ensure_full_calc(xml: &str) -> String {
     }
 }
 
-pub(crate) fn add_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, ct: &str) {
+pub(crate) fn add_content_type_override(
+    parts: &mut [(String, Vec<u8>)],
+    part_name: &str,
+    ct: &str,
+) {
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         if xml.contains(part_name) {

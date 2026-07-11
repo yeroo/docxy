@@ -8,9 +8,7 @@
 //! `<legacyDrawing>` hook, content types, and relationships.
 
 use crate::sheet::{cell_name, parse_col};
-use crate::xlsx::{
-    add_content_type_override, add_rel, parse_rels, resolve_relative, SheetPackage,
-};
+use crate::xlsx::{SheetPackage, add_content_type_override, add_rel, parse_rels, resolve_relative};
 
 const SS_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const COMMENTS_CT: &str =
@@ -202,7 +200,11 @@ fn parse_legacy(xml: &str, sheet: usize, out: &mut Vec<Comment>) {
         for_each_element(&xml[a0..a1], "author", |el| {
             let body = el
                 .find('>')
-                .and_then(|g| el[g + 1..].rfind("</author>").map(|e| &el[g + 1..g + 1 + e]))
+                .and_then(|g| {
+                    el[g + 1..]
+                        .rfind("</author>")
+                        .map(|e| &el[g + 1..g + 1 + e])
+                })
                 .unwrap_or("");
             authors.push(unescape(body));
         });
@@ -399,9 +401,7 @@ fn serialize_comments(notes: &[Note]) -> String {
             authors.push(&n.author);
         }
     }
-    let mut s = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
-    );
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     s.push_str(&format!("<comments xmlns=\"{SS_NS}\"><authors>"));
     for a in &authors {
         s.push_str(&format!("<author>{}</author>", esc_text(a)));
@@ -460,7 +460,11 @@ fn serialize_vml(notes: &[Note]) -> String {
 
 impl SheetPackage {
     fn ensure_vml_default(&mut self) {
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "[Content_Types].xml")
+        {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             if xml.contains("Extension=\"vml\"") {
                 return;
@@ -548,7 +552,11 @@ impl SheetPackage {
     }
 
     fn strip_content_type(&mut self, part_name: &str) {
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "[Content_Types].xml")
+        {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let key = format!("PartName=\"{part_name}\"");
             if let Some(s) = xml.find(&key) {
@@ -590,8 +598,14 @@ mod tests {
 
     #[test]
     fn attr_and_text_helpers() {
-        assert_eq!(attr("<comment ref=\"B2\" authorId=\"1\">", "ref"), Some("B2"));
-        assert_eq!(collect_t("<text><r><t>Hello</t></r><r><t> world</t></r></text>"), "Hello world");
+        assert_eq!(
+            attr("<comment ref=\"B2\" authorId=\"1\">", "ref"),
+            Some("B2")
+        );
+        assert_eq!(
+            collect_t("<text><r><t>Hello</t></r><r><t> world</t></r></text>"),
+            "Hello world"
+        );
         assert_eq!(ref_to_rc("C3"), Some((2, 2)));
     }
 
@@ -652,7 +666,8 @@ mod tests {
         let mut pkg = blank();
         pkg.set_part(
             "xl/persons/person1.xml",
-            b"<personList xmlns=\"x\"><person displayName=\"Jane Doe\" id=\"{ABC}\"/></personList>".to_vec(),
+            b"<personList xmlns=\"x\"><person displayName=\"Jane Doe\" id=\"{ABC}\"/></personList>"
+                .to_vec(),
         );
         pkg.set_part(
             "xl/threadedComments/threadedComment1.xml",
