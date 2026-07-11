@@ -4302,6 +4302,71 @@ impl<'a> Eval<'a> {
         Ok(out)
     }
 
+    /// Like `collect_values` but for the …A functions (AVERAGEA, MAXA, …):
+    /// text counts as 0 and logicals as 1/0, everywhere (ranges included).
+    fn collect_a(&mut self, args: &[Expr]) -> Result<Vec<f64>, ExcelError> {
+        let mut out = Vec::new();
+        let push = |out: &mut Vec<f64>, v: &Value| -> Result<(), ExcelError> {
+            match v {
+                Value::Num(n) => out.push(*n),
+                Value::Bool(b) => out.push(if *b { 1.0 } else { 0.0 }),
+                Value::Str(_) => out.push(0.0),
+                Value::Err(e) => return Err(*e),
+                Value::Empty => {}
+            }
+            Ok(())
+        };
+        for a in args {
+            if matches!(a, Expr::Ref3D { .. }) {
+                for (s, r1, c1, r2, c2) in self.resolve_3d(a)? {
+                    for (_, v) in self.res.cells_in(s, r1, c1, r2, c2) {
+                        push(&mut out, &v)?;
+                    }
+                }
+                continue;
+            }
+            match self.eval_arg(a) {
+                Arg::Scalar(v) => push(&mut out, &v)?,
+                Arg::Range(s, r1, c1, r2, c2) => {
+                    for (_, v) in self.res.cells_in(s, r1, c1, r2, c2) {
+                        push(&mut out, &v)?;
+                    }
+                }
+                Arg::Matrix(m) => {
+                    for v in m.iter().flatten() {
+                        push(&mut out, v)?;
+                    }
+                }
+                Arg::Lambda(_) => return Err(ExcelError::Calc),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Paired-array moments: `(n, mean_x, mean_y, Sxx, Syy, Sxy)` for the
+    /// numeric pairs the two arrays share. Empty → `#DIV/0!`.
+    #[allow(clippy::type_complexity)]
+    fn pair_stats(
+        &mut self,
+        xa: &Expr,
+        ya: &Expr,
+    ) -> Result<(usize, f64, f64, f64, f64, f64), Value> {
+        let (xs, ys) = self.two_arrays(xa, ya)?;
+        let n = xs.len();
+        if n == 0 {
+            return Err(Value::Err(ExcelError::Div0));
+        }
+        let mx = xs.iter().sum::<f64>() / n as f64;
+        let my = ys.iter().sum::<f64>() / n as f64;
+        let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            sxx += (x - mx) * (x - mx);
+            syy += (y - my) * (y - my);
+            sxy += (x - mx) * (y - my);
+        }
+        Ok((n, mx, my, sxx, syy, sxy))
+    }
+
     /// Expand a 3D span into one rect per sheet in the run (tab order).
     #[allow(clippy::type_complexity)]
     fn resolve_3d(&mut self, e: &Expr) -> Result<Vec<(usize, u32, u32, u32, u32)>, ExcelError> {
@@ -6661,6 +6726,304 @@ impl<'a> Eval<'a> {
                 Err(e) => Value::Err(e),
             },
 
+            // ---- regression & correlation --------------------------------------
+            "CORREL" | "PEARSON" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (_, _, _, sxx, syy, sxy) = match self.pair_stats(&args[0], &args[1]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if sxx == 0.0 || syy == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(sxy / (sxx * syy).sqrt())
+            }
+            "RSQ" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (_, _, _, sxx, syy, sxy) = match self.pair_stats(&args[0], &args[1]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if sxx == 0.0 || syy == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                let r = sxy / (sxx * syy).sqrt();
+                num(r * r)
+            }
+            "COVAR" | "COVARIANCE.P" | "COVARIANCE.S" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (n, _, _, _, _, sxy) = match self.pair_stats(&args[0], &args[1]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if name == "COVARIANCE.S" {
+                    if n < 2 {
+                        return Value::Err(ExcelError::Div0);
+                    }
+                    num(sxy / (n as f64 - 1.0))
+                } else {
+                    num(sxy / n as f64)
+                }
+            }
+            "SLOPE" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                // SLOPE(known_ys, known_xs): x is the second array.
+                let (_, _, _, sxx, _, sxy) = match self.pair_stats(&args[1], &args[0]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if sxx == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(sxy / sxx)
+            }
+            "INTERCEPT" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let (_, mx, my, sxx, _, sxy) = match self.pair_stats(&args[1], &args[0]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if sxx == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(my - (sxy / sxx) * mx)
+            }
+            "FORECAST" | "FORECAST.LINEAR" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let x = try_num!(self.eval(&args[0]));
+                let (_, mx, my, sxx, _, sxy) = match self.pair_stats(&args[2], &args[1]) {
+                    Ok(s) => s,
+                    Err(v) => return v,
+                };
+                if sxx == 0.0 {
+                    return Value::Err(ExcelError::Div0);
+                }
+                num(my + (sxy / sxx) * (x - mx))
+            }
+
+            // ---- distribution shape & spread -----------------------------------
+            "DEVSQ" => match self.collect_values(args, true) {
+                Ok(v) if !v.is_empty() => {
+                    let m = v.iter().sum::<f64>() / v.len() as f64;
+                    num(v.iter().map(|x| (x - m) * (x - m)).sum())
+                }
+                Ok(_) => Value::Num(0.0),
+                Err(e) => Value::Err(e),
+            },
+            "AVEDEV" => match self.collect_values(args, true) {
+                Ok(v) if !v.is_empty() => {
+                    let m = v.iter().sum::<f64>() / v.len() as f64;
+                    num(v.iter().map(|x| (x - m).abs()).sum::<f64>() / v.len() as f64)
+                }
+                Ok(_) => Value::Err(ExcelError::Num),
+                Err(e) => Value::Err(e),
+            },
+            "GEOMEAN" => match self.collect_values(args, true) {
+                Ok(v) if !v.is_empty() => {
+                    if v.iter().any(|&x| x <= 0.0) {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    num((v.iter().map(|x| x.ln()).sum::<f64>() / v.len() as f64).exp())
+                }
+                Ok(_) => Value::Err(ExcelError::Num),
+                Err(e) => Value::Err(e),
+            },
+            "HARMEAN" => match self.collect_values(args, true) {
+                Ok(v) if !v.is_empty() => {
+                    if v.iter().any(|&x| x <= 0.0) {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    num(v.len() as f64 / v.iter().map(|x| 1.0 / x).sum::<f64>())
+                }
+                Ok(_) => Value::Err(ExcelError::Num),
+                Err(e) => Value::Err(e),
+            },
+            "STANDARDIZE" => {
+                if args.len() != 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let x = try_num!(self.eval(&args[0]));
+                let mean = try_num!(self.eval(&args[1]));
+                let sd = try_num!(self.eval(&args[2]));
+                if sd <= 0.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num((x - mean) / sd)
+            }
+            "TRIMMEAN" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let pct = try_num!(self.eval(&args[1]));
+                if !(0.0..1.0).contains(&pct) {
+                    return Value::Err(ExcelError::Num);
+                }
+                match self.collect_values(&args[..1], true) {
+                    Ok(mut v) if !v.is_empty() => {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        // Trim floor(n*pct) values total, split evenly (even count) each end.
+                        let k = ((v.len() as f64 * pct) / 2.0).floor() as usize;
+                        let slice = &v[k..v.len() - k];
+                        if slice.is_empty() {
+                            return Value::Err(ExcelError::Num);
+                        }
+                        num(slice.iter().sum::<f64>() / slice.len() as f64)
+                    }
+                    Ok(_) => Value::Err(ExcelError::Num),
+                    Err(e) => Value::Err(e),
+                }
+            }
+            "SKEW" | "KURT" => match self.collect_values(args, true) {
+                Ok(v) => {
+                    let n = v.len();
+                    let min_n = if name == "SKEW" { 3 } else { 4 };
+                    if n < min_n {
+                        return Value::Err(ExcelError::Div0);
+                    }
+                    let nf = n as f64;
+                    let m = v.iter().sum::<f64>() / nf;
+                    let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (nf - 1.0);
+                    if var == 0.0 {
+                        return Value::Err(ExcelError::Div0);
+                    }
+                    let sd = var.sqrt();
+                    if name == "SKEW" {
+                        let s: f64 = v.iter().map(|x| ((x - m) / sd).powi(3)).sum();
+                        num(nf / ((nf - 1.0) * (nf - 2.0)) * s)
+                    } else {
+                        let s: f64 = v.iter().map(|x| ((x - m) / sd).powi(4)).sum();
+                        let a = nf * (nf + 1.0) / ((nf - 1.0) * (nf - 2.0) * (nf - 3.0));
+                        let b = 3.0 * (nf - 1.0) * (nf - 1.0) / ((nf - 2.0) * (nf - 3.0));
+                        num(a * s - b)
+                    }
+                }
+                Err(e) => Value::Err(e),
+            },
+            "FISHER" => self.one_num(args, |x| {
+                if x <= -1.0 || x >= 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(0.5 * ((1.0 + x) / (1.0 - x)).ln())
+            }),
+            "FISHERINV" => self.one_num(args, |y| {
+                let e = (2.0 * y).exp();
+                num((e - 1.0) / (e + 1.0))
+            }),
+            "PERCENTRANK" | "PERCENTRANK.INC" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let x = try_num!(self.eval(&args[1]));
+                let sig = match args.get(2) {
+                    None | Some(Expr::Missing) => 3.0,
+                    Some(e) => try_num!(self.eval(e)),
+                };
+                if sig < 1.0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                match self.collect_values(&args[..1], true) {
+                    Ok(mut v) if !v.is_empty() => {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let (lo, hi) = (v[0], v[v.len() - 1]);
+                        if x < lo || x > hi {
+                            return Value::Err(ExcelError::NA);
+                        }
+                        let nm1 = (v.len() - 1) as f64;
+                        let pr = if let Some(i) = v.iter().position(|&w| w == x) {
+                            i as f64 / nm1
+                        } else {
+                            let i = v.iter().rposition(|&w| w < x).unwrap();
+                            (i as f64 + (x - v[i]) / (v[i + 1] - v[i])) / nm1
+                        };
+                        let scale = 10f64.powi(sig as i32);
+                        num((pr * scale).trunc() / scale)
+                    }
+                    Ok(_) => Value::Err(ExcelError::Num),
+                    Err(e) => Value::Err(e),
+                }
+            }
+            "PERCENTILE.EXC" | "QUARTILE.EXC" => {
+                if args.len() != 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let k = try_num!(self.eval(&args[1]));
+                let k = if name == "QUARTILE.EXC" {
+                    if k.fract() != 0.0 || !(1.0..=3.0).contains(&k) {
+                        return Value::Err(ExcelError::Num);
+                    }
+                    k / 4.0
+                } else {
+                    k
+                };
+                match self.collect_values(&args[..1], true) {
+                    Ok(mut v) if !v.is_empty() => {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let n = v.len();
+                        let pos = k * (n as f64 + 1.0);
+                        if pos < 1.0 || pos > n as f64 {
+                            return Value::Err(ExcelError::Num);
+                        }
+                        let lo = pos.floor() as usize; // 1-based
+                        let frac = pos - lo as f64;
+                        if lo >= n {
+                            num(v[n - 1])
+                        } else {
+                            num(v[lo - 1] + frac * (v[lo] - v[lo - 1]))
+                        }
+                    }
+                    Ok(_) => Value::Err(ExcelError::Num),
+                    Err(e) => Value::Err(e),
+                }
+            }
+
+            // ---- …A variants (text counts as 0) --------------------------------
+            "AVERAGEA" => match self.collect_a(args) {
+                Ok(v) if !v.is_empty() => num(v.iter().sum::<f64>() / v.len() as f64),
+                Ok(_) => Value::Err(ExcelError::Div0),
+                Err(e) => Value::Err(e),
+            },
+            "MAXA" => match self.collect_a(args) {
+                Ok(v) if !v.is_empty() => num(v.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+                Ok(_) => Value::Num(0.0),
+                Err(e) => Value::Err(e),
+            },
+            "MINA" => match self.collect_a(args) {
+                Ok(v) if !v.is_empty() => num(v.iter().cloned().fold(f64::INFINITY, f64::min)),
+                Ok(_) => Value::Num(0.0),
+                Err(e) => Value::Err(e),
+            },
+            "VARA" | "STDEVA" | "VARPA" | "STDEVPA" => match self.collect_a(args) {
+                Ok(v) => {
+                    let pop = name == "VARPA" || name == "STDEVPA";
+                    let min_n = if pop { 1 } else { 2 };
+                    if v.len() < min_n {
+                        return Value::Err(ExcelError::Div0);
+                    }
+                    let m = v.iter().sum::<f64>() / v.len() as f64;
+                    let ss: f64 = v.iter().map(|x| (x - m) * (x - m)).sum();
+                    let denom = if pop { v.len() as f64 } else { v.len() as f64 - 1.0 };
+                    let var = ss / denom;
+                    if name.starts_with("STDEV") {
+                        num(var.sqrt())
+                    } else {
+                        num(var)
+                    }
+                }
+                Err(e) => Value::Err(e),
+            },
+
             // ---- TEXT (best-effort number-format rendering) ---------------------
             "TEXT" => {
                 if args.len() != 2 {
@@ -8773,5 +9136,79 @@ mod tests {
         // CUMIPMT/CUMPRINC — Microsoft's documented examples.
         approx("CUMIPMT(0.09/12,360,125000,13,24,0)", &g, -11135.23);
         approx("CUMPRINC(0.09/12,360,125000,1,1,0)", &g, -68.28);
+    }
+
+    #[test]
+    fn statistics_coverage() {
+        // Regression corpus (Microsoft's SLOPE/INTERCEPT example).
+        let g = Grid::new(&[
+            ("A1", Value::Num(2.0)),
+            ("A2", Value::Num(3.0)),
+            ("A3", Value::Num(9.0)),
+            ("A4", Value::Num(1.0)),
+            ("A5", Value::Num(8.0)),
+            ("B1", Value::Num(6.0)),
+            ("B2", Value::Num(5.0)),
+            ("B3", Value::Num(11.0)),
+            ("B4", Value::Num(7.0)),
+            ("B5", Value::Num(5.0)),
+        ]);
+        approx("SLOPE(A1:A5,B1:B5)", &g, 0.669355);
+        approx("INTERCEPT(A1:A5,B1:B5)", &g, 0.048387);
+        approx("CORREL(A1:A5,B1:B5)", &g, 0.457011);
+        approx("RSQ(A1:A5,B1:B5)", &g, 0.208859);
+        approx("FORECAST(10,A1:A5,B1:B5)", &g, 6.741935);
+        approx("PEARSON(A1:A5,B1:B5)", &g, 0.457011);
+        approx("COVARIANCE.P(A1:A5,B1:B5)", &g, 3.32);
+        approx("COVARIANCE.S(A1:A5,B1:B5)", &g, 4.15);
+
+        // Single-array shape/spread over 3,4,5,2,4.
+        let s = Grid::new(&[
+            ("A1", Value::Num(3.0)),
+            ("A2", Value::Num(4.0)),
+            ("A3", Value::Num(5.0)),
+            ("A4", Value::Num(2.0)),
+            ("A5", Value::Num(4.0)),
+        ]);
+        approx("DEVSQ(A1:A5)", &s, 5.2);
+        approx("AVEDEV(A1:A5)", &s, 0.88);
+        approx("GEOMEAN(A1:A5)", &s, 3.437544);
+        approx("HARMEAN(A1:A5)", &s, 3.260870);
+        approx("STANDARDIZE(4,3.6,1.140175)", &s, 0.350823);
+
+        // Skew/Kurtosis on Microsoft's documented series 3,4,5,2,3,4,5,6,4,7.
+        let k = Grid::new(&[
+            ("A1", Value::Num(3.0)),
+            ("A2", Value::Num(4.0)),
+            ("A3", Value::Num(5.0)),
+            ("A4", Value::Num(2.0)),
+            ("A5", Value::Num(3.0)),
+            ("A6", Value::Num(4.0)),
+            ("A7", Value::Num(5.0)),
+            ("A8", Value::Num(6.0)),
+            ("A9", Value::Num(4.0)),
+            ("A10", Value::Num(7.0)),
+        ]);
+        approx("SKEW(A1:A10)", &k, 0.359543);
+        approx("KURT(A1:A10)", &k, -0.151799);
+
+        let g2 = empty();
+        approx("FISHER(0.75)", &g2, 0.972955);
+        approx("FISHERINV(0.972955)", &g2, 0.75);
+        approx("TRIMMEAN(A1:A10,0.2)", &k, 4.25);
+        approx("PERCENTRANK(A1:A10,4)", &k, 0.333);
+        approx("PERCENTILE.EXC(A1:A10,0.25)", &k, 3.0);
+        approx("QUARTILE.EXC(A1:A10,1)", &k, 3.0);
+
+        // …A variants: text counts as 0.
+        let a = Grid::new(&[
+            ("A1", Value::Num(10.0)),
+            ("A2", Value::Str("x".into())),
+            ("A3", Value::Num(20.0)),
+            ("A4", Value::Bool(true)),
+        ]);
+        approx("AVERAGEA(A1:A4)", &a, 7.75); // (10+0+20+1)/4
+        approx("MAXA(A1:A4)", &a, 20.0);
+        approx("MINA(A1:A4)", &a, 0.0);
     }
 }
