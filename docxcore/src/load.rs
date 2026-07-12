@@ -400,7 +400,123 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
             return Inline::FootnoteRef { id, endnote, raw };
         }
     }
+    // A symbol run (`<w:sym w:font="Symbol" w:char="F0B7"/>`): map the font-code
+    // point to Unicode and surface it as inline text (the run is kept verbatim
+    // for lossless save). Reuses the Field variant (raw + display text).
+    if let Some(i) = raw.find("<w:sym") {
+        let font = raw_attr(&raw[i..], "w:font=\"").unwrap_or_default();
+        let ch = raw_attr(&raw[i..], "w:char=\"").unwrap_or_default();
+        return Inline::Field {
+            text: sym_glyph(&font, &ch).to_string(),
+            raw,
+        };
+    }
     Inline::Raw(raw)
+}
+
+/// Map a `w:sym` (symbol-font name + hex code point) to a Unicode glyph. The
+/// Symbol font uses the Adobe Symbol encoding (Greek + math), offset into the
+/// `0xF000` private-use range in OOXML. Unmapped code points fall back to `□`.
+fn sym_glyph(font: &str, char_hex: &str) -> char {
+    let code = u32::from_str_radix(char_hex.trim(), 16).unwrap_or(0);
+    let low = (code & 0xFF) as u8; // strip the 0xF000 PUA offset Word adds
+    if font.eq_ignore_ascii_case("Symbol") {
+        if let Some(c) = symbol_font_char(low) {
+            return c;
+        }
+    }
+    // Other symbol fonts (Wingdings/Webdings/…) need their own dingbat tables;
+    // until then, a visible placeholder beats an invisible dropped glyph.
+    '□'
+}
+
+/// Adobe Symbol encoding → Unicode for the printable range (uppercase & lowercase
+/// Greek, plus the common mathematical operators and punctuation).
+fn symbol_font_char(code: u8) -> Option<char> {
+    let u: u32 = match code {
+        // punctuation / operators sharing ASCII positions
+        0x22 => 0x2200, // ∀
+        0x24 => 0x2203, // ∃
+        0x27 => 0x220B, // ∋
+        0x2A => 0x2217, // ∗
+        0x2D => 0x2212, // − (minus)
+        0x40 => 0x2245, // ≅
+        // uppercase Greek (A..Z), with the Symbol font's irregular slots
+        0x41 => 0x0391,
+        0x42 => 0x0392,
+        0x43 => 0x03A7,
+        0x44 => 0x0394,
+        0x45 => 0x0395,
+        0x46 => 0x03A6,
+        0x47 => 0x0393,
+        0x48 => 0x0397,
+        0x49 => 0x0399,
+        0x4A => 0x03D1, // ϑ
+        0x4B => 0x039A,
+        0x4C => 0x039B,
+        0x4D => 0x039C,
+        0x4E => 0x039D,
+        0x4F => 0x039F,
+        0x50 => 0x03A0,
+        0x51 => 0x0398, // Θ
+        0x52 => 0x03A1,
+        0x53 => 0x03A3,
+        0x54 => 0x03A4,
+        0x55 => 0x03A5,
+        0x56 => 0x03C2, // ς
+        0x57 => 0x03A9, // Ω
+        0x58 => 0x039E,
+        0x59 => 0x03A8,
+        0x5A => 0x0396,
+        // lowercase Greek (a..z)
+        0x61 => 0x03B1,
+        0x62 => 0x03B2,
+        0x63 => 0x03C7,
+        0x64 => 0x03B4,
+        0x65 => 0x03B5,
+        0x66 => 0x03C6,
+        0x67 => 0x03B3,
+        0x68 => 0x03B7,
+        0x69 => 0x03B9,
+        0x6A => 0x03D5, // ϕ
+        0x6B => 0x03BA,
+        0x6C => 0x03BB,
+        0x6D => 0x03BC,
+        0x6E => 0x03BD,
+        0x6F => 0x03BF,
+        0x70 => 0x03C0,
+        0x71 => 0x03B8,
+        0x72 => 0x03C1,
+        0x73 => 0x03C3,
+        0x74 => 0x03C4,
+        0x75 => 0x03C5,
+        0x76 => 0x03D6, // ϖ
+        0x77 => 0x03C9,
+        0x78 => 0x03BE,
+        0x79 => 0x03C8,
+        0x7A => 0x03B6,
+        // high range: common math operators
+        0xA2 => 0x2032, // ′ prime
+        0xA3 => 0x2264, // ≤
+        0xB1 => 0x00B1, // ±
+        0xB3 => 0x2265, // ≥
+        0xB4 => 0x00D7, // ×
+        0xB7 => 0x2022, // •
+        0xB8 => 0x00F7, // ÷
+        0xB9 => 0x2260, // ≠
+        0xBB => 0x2248, // ≈
+        0xA5 => 0x221E, // ∞
+        0xB6 => 0x2202, // ∂
+        0xCE => 0x2208, // ∈
+        0xCF => 0x2209, // ∉
+        0xD1 => 0x2207, // ∇
+        0xD3 => 0x00AE, // ®
+        0xD6 => 0x221A, // √
+        0xE5 => 0x2211, // ∑
+        0xF2 => 0x222B, // ∫
+        _ => return None,
+    };
+    char::from_u32(u)
 }
 
 /// The quoted value of the first attribute whose text ends with `key` (e.g.

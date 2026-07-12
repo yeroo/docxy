@@ -572,6 +572,28 @@ mod tests {
     }
 
     #[test]
+    fn symbol_run_becomes_glyph_and_lossless() {
+        // A <w:sym> used to be preserved-but-invisible; now its font code point
+        // renders as a Unicode glyph while the run round-trips.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:sym w:font=\"Symbol\" w:char=\"F062\"/></w:r>\
+            <w:r><w:sym w:font=\"Symbol\" w:char=\"F0B7\"/></w:r>\
+            <w:r><w:sym w:font=\"Wingdings\" w:char=\"F04A\"/></w:r>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let text = d.plain_text();
+        assert!(text.contains('β'), "Symbol 'b' → beta; got {text:?}");
+        assert!(text.contains('•'), "Symbol 0xB7 → bullet; got {text:?}");
+        assert!(
+            text.contains('□'),
+            "unknown font → placeholder; got {text:?}"
+        );
+        let out = document_to_xml(&d);
+        assert_eq!(out.matches("<w:sym").count(), 3, "sym runs lost");
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
+    }
+
+    #[test]
     fn run_properties_roundtrip() {
         let props = RunProps {
             bold: true,
