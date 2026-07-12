@@ -681,6 +681,23 @@ impl Resolver for WbResolver<'_> {
     fn date1904(&self) -> bool {
         self.wb.date1904
     }
+
+    fn cell_formula(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        self.wb
+            .sheets
+            .get(sheet)
+            .and_then(|s| s.cell(row, col))
+            .and_then(|c| c.formula.clone())
+    }
+
+    fn row_hidden(&self, sheet: usize, row: u32) -> bool {
+        self.wb
+            .sheets
+            .get(sheet)
+            .and_then(|s| s.row_attrs.get(&row))
+            .map(|a| a.contains("hidden=\"1\"") || a.contains("hidden=\"true\""))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

@@ -2139,7 +2139,15 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::Func(name, args) => {
             matches!(
                 name.as_str(),
-                "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "INDIRECT" | "OFFSET"
+                "NOW"
+                    | "TODAY"
+                    | "RAND"
+                    | "RANDBETWEEN"
+                    | "RANDARRAY"
+                    | "INDIRECT"
+                    | "OFFSET"
+                    | "CELL"
+                    | "INFO"
             ) || args.iter().any(is_volatile)
         }
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
@@ -2212,6 +2220,19 @@ pub trait Resolver {
     fn spill_extent(&self, sheet: usize, row: u32, col: u32) -> Option<(u32, u32)> {
         let _ = (sheet, row, col);
         None
+    }
+    /// The source formula text of a cell (without the leading `=`), if it holds
+    /// one. Used by `FORMULATEXT` and by `SUBTOTAL`/`AGGREGATE` to exclude cells
+    /// that are themselves nested subtotals.
+    fn cell_formula(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        let _ = (sheet, row, col);
+        None
+    }
+    /// Whether a worksheet row is hidden (manually or by a filter). Used by the
+    /// `10x` `SUBTOTAL` codes and the hidden-ignoring `AGGREGATE` options.
+    fn row_hidden(&self, sheet: usize, row: u32) -> bool {
+        let _ = (sheet, row);
+        false
     }
 }
 
@@ -4879,7 +4900,7 @@ impl<'a> Eval<'a> {
                 }
                 num(0.5 * ((n + 1.0) / (n - 1.0)).ln())
             }),
-            "FLOOR" | "FLOOR.MATH" => self.two_num(args, |n, sig| {
+            "FLOOR" => self.two_num(args, |n, sig| {
                 if sig == 0.0 {
                     return Value::Err(ExcelError::Div0);
                 }
@@ -4889,7 +4910,7 @@ impl<'a> Eval<'a> {
                 }
                 num((n / sig).floor() * sig)
             }),
-            "CEILING" | "CEILING.MATH" => self.two_num(args, |n, sig| {
+            "CEILING" => self.two_num(args, |n, sig| {
                 if sig == 0.0 {
                     return Value::Num(0.0);
                 }
@@ -4898,6 +4919,141 @@ impl<'a> Eval<'a> {
                 }
                 num((n / sig).ceil() * sig)
             }),
+            // CEILING.MATH(number, [significance=1], [mode=0]) — significance
+            // sign is ignored; for negatives, mode 0 rounds toward zero, mode≠0
+            // rounds away from zero. FLOOR.MATH is the mirror.
+            "CEILING.MATH" | "FLOOR.MATH" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0]));
+                let sig = if args.len() >= 2 {
+                    let s = try_num!(self.eval(&args[1]));
+                    if s == 0.0 {
+                        return Value::Num(0.0);
+                    }
+                    s.abs()
+                } else {
+                    1.0
+                };
+                let mode = if args.len() == 3 {
+                    try_num!(self.eval(&args[2]))
+                } else {
+                    0.0
+                };
+                let q = n / sig;
+                let up = name == "CEILING.MATH";
+                // Default direction: ceiling→+dir, floor→−dir; the mode flag
+                // flips only the negative side.
+                let toward_pos = if up {
+                    !(n < 0.0 && mode != 0.0)
+                } else {
+                    n < 0.0 && mode != 0.0
+                };
+                num(if toward_pos { q.ceil() } else { q.floor() } * sig)
+            }
+            // CEILING.PRECISE / ISO.CEILING / FLOOR.PRECISE: round to a multiple
+            // of |significance| (default 1), toward +inf (ceiling) or -inf
+            // (floor) regardless of sign. Significance sign is ignored.
+            "CEILING.PRECISE" | "ISO.CEILING" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0]));
+                let sig = if args.len() == 2 {
+                    try_num!(self.eval(&args[1])).abs()
+                } else {
+                    1.0
+                };
+                if sig == 0.0 {
+                    return Value::Num(0.0);
+                }
+                num((n / sig).ceil() * sig)
+            }
+            "FLOOR.PRECISE" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let n = try_num!(self.eval(&args[0]));
+                let sig = if args.len() == 2 {
+                    try_num!(self.eval(&args[1])).abs()
+                } else {
+                    1.0
+                };
+                if sig == 0.0 {
+                    return Value::Num(0.0);
+                }
+                num((n / sig).floor() * sig)
+            }
+            // SUBTOTAL(code, ref1, …): aggregate ignoring nested subtotals, and
+            // (for 101–111) hidden rows.
+            "SUBTOTAL" => {
+                if args.len() < 2 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let code = try_num!(self.eval(&args[0])).trunc() as i64;
+                let base = match code {
+                    1..=11 => code,
+                    101..=111 => code - 100,
+                    _ => return Value::Err(ExcelError::Value),
+                };
+                // Excel: codes 1–11 already exclude *filter*-hidden rows (the
+                // common case); 101–111 additionally exclude *manually*-hidden
+                // rows. We can't always tell the two apart, and SUBTOTAL is
+                // almost always used over filtered data, so we exclude hidden
+                // rows for both — matching Excel-with-filter and our oracle.
+                match self.collect_subtotal(&args[1..], true, false) {
+                    Ok((nums, counta)) => self.apply_agg(base, &nums, counta),
+                    Err(e) => Value::Err(e),
+                }
+            }
+            // AGGREGATE(func, options, ref1, …) / AGGREGATE(14–19, options, array, k).
+            "AGGREGATE" => {
+                if args.len() < 3 {
+                    return Value::Err(ExcelError::Value);
+                }
+                let func = try_num!(self.eval(&args[0])).trunc() as i64;
+                let opts = try_num!(self.eval(&args[1])).trunc() as i64;
+                if !(1..=19).contains(&func) || !(0..=7).contains(&opts) {
+                    return Value::Err(ExcelError::Value);
+                }
+                let ignore_hidden = matches!(opts, 1 | 3 | 5 | 7);
+                let ignore_errors = matches!(opts, 2 | 3 | 6 | 7);
+                if func <= 13 {
+                    match self.collect_subtotal(&args[2..], ignore_hidden, ignore_errors) {
+                        Ok((nums, counta)) => self.apply_agg(func, &nums, counta),
+                        Err(e) => Value::Err(e),
+                    }
+                } else if args.len() != 4 {
+                    // 14–19 take exactly one array plus a k argument.
+                    Value::Err(ExcelError::Value)
+                } else {
+                    let nums =
+                        match self.collect_subtotal(&args[2..3], ignore_hidden, ignore_errors) {
+                            Ok((nums, _)) => nums,
+                            Err(e) => return Value::Err(e),
+                        };
+                    let k = try_num!(self.eval(&args[3]));
+                    self.apply_agg_k(func, &nums, k)
+                }
+            }
+            // FORMULATEXT(ref): the source formula of the reference's top-left
+            // cell, with a leading `=`; #N/A if it has none. Coordinates come
+            // from the reference *structurally* (not by evaluating it), so it
+            // works even when the target is an array/spill anchor.
+            "FORMULATEXT" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                match self.ref_coords(&args[0]) {
+                    Some((s, r, c)) => match self.res.cell_formula(s, r, c) {
+                        Some(f) => Value::Str(format!("={f}")),
+                        None => Value::Err(ExcelError::NA),
+                    },
+                    None => Value::Err(ExcelError::NA),
+                }
+            }
+            "CELL" => self.cell_info(args),
             "EVEN" => self.one_num(args, |n| {
                 let r = (n.abs() / 2.0).ceil() * 2.0;
                 num(r * if n < 0.0 { -1.0 } else { 1.0 })
@@ -7682,21 +7838,23 @@ impl<'a> Eval<'a> {
                             exact = Some(i);
                             break;
                         }
-                        Ok(std::cmp::Ordering::Less) if match_mode == -1 => {
-                            // Largest value ≤ needle.
-                            if alt.is_none_or(|j| {
-                                matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Greater))
-                            }) {
-                                alt = Some(i);
-                            }
+                        // Largest value ≤ needle.
+                        Ok(std::cmp::Ordering::Less)
+                            if match_mode == -1
+                                && alt.is_none_or(|j| {
+                                    matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Greater))
+                                }) =>
+                        {
+                            alt = Some(i);
                         }
-                        Ok(std::cmp::Ordering::Greater) if match_mode == 1 => {
-                            // Smallest value ≥ needle.
-                            if alt.is_none_or(|j| {
-                                matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Less))
-                            }) {
-                                alt = Some(i);
-                            }
+                        // Smallest value ≥ needle.
+                        Ok(std::cmp::Ordering::Greater)
+                            if match_mode == 1
+                                && alt.is_none_or(|j| {
+                                    matches!(compare(v, &vals[j]), Ok(std::cmp::Ordering::Less))
+                                }) =>
+                        {
+                            alt = Some(i);
                         }
                         _ => {}
                     }
@@ -8029,6 +8187,306 @@ impl<'a> Eval<'a> {
             _ => {
                 self.unsupported = true;
                 Value::Err(ExcelError::Name)
+            }
+        }
+    }
+
+    /// Collect numeric values (and a COUNTA count of non-empty entries) for
+    /// SUBTOTAL/AGGREGATE: skip cells that are themselves nested
+    /// SUBTOTAL/AGGREGATE, optionally skip hidden rows, and either propagate or
+    /// ignore error values.
+    fn collect_subtotal(
+        &mut self,
+        args: &[Expr],
+        ignore_hidden: bool,
+        ignore_errors: bool,
+    ) -> Result<(Vec<f64>, usize), ExcelError> {
+        let mut nums = Vec::new();
+        let mut counta = 0usize;
+        for a in args {
+            match self.eval_arg(a) {
+                Arg::Scalar(Value::Err(e)) => {
+                    if !ignore_errors {
+                        return Err(e);
+                    }
+                }
+                Arg::Scalar(Value::Empty) => {}
+                Arg::Scalar(v) => {
+                    counta += 1;
+                    if let Value::Num(n) = v {
+                        nums.push(n);
+                    }
+                }
+                Arg::Range(s, r1, c1, r2, c2) => {
+                    for ((r, c), v) in self.res.cells_in(s, r1, c1, r2, c2) {
+                        if ignore_hidden && self.res.row_hidden(s, r) {
+                            continue;
+                        }
+                        if self.is_nested_subtotal(s, r, c) {
+                            continue;
+                        }
+                        match v {
+                            Value::Err(e) => {
+                                if !ignore_errors {
+                                    return Err(e);
+                                }
+                            }
+                            Value::Num(n) => {
+                                counta += 1;
+                                nums.push(n);
+                            }
+                            Value::Empty => {}
+                            _ => counta += 1,
+                        }
+                    }
+                }
+                Arg::Matrix(m) => {
+                    for v in m.iter().flatten() {
+                        match v {
+                            Value::Err(e) => {
+                                if !ignore_errors {
+                                    return Err(*e);
+                                }
+                            }
+                            Value::Num(n) => {
+                                counta += 1;
+                                nums.push(*n);
+                            }
+                            Value::Empty => {}
+                            _ => counta += 1,
+                        }
+                    }
+                }
+                Arg::Lambda(_) => return Err(ExcelError::Calc),
+            }
+        }
+        Ok((nums, counta))
+    }
+
+    /// Does the cell hold a SUBTOTAL/AGGREGATE formula (which an enclosing
+    /// SUBTOTAL/AGGREGATE must skip)?
+    fn is_nested_subtotal(&self, sheet: usize, row: u32, col: u32) -> bool {
+        match self.res.cell_formula(sheet, row, col) {
+            Some(f) => {
+                let t = f.trim_start();
+                let t = t
+                    .strip_prefix("_xlfn.")
+                    .or_else(|| t.strip_prefix("_XLFN."))
+                    .unwrap_or(t);
+                let up = t.to_ascii_uppercase();
+                up.starts_with("SUBTOTAL(") || up.starts_with("AGGREGATE(")
+            }
+            None => false,
+        }
+    }
+
+    /// Apply a SUBTOTAL/AGGREGATE aggregate code (1–13) to collected values.
+    fn apply_agg(&self, code: i64, nums: &[f64], counta: usize) -> Value {
+        let n = nums.len();
+        let sum: f64 = nums.iter().sum();
+        let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+        let var = |ddof: usize| -> Option<f64> {
+            if n <= ddof {
+                return None;
+            }
+            let ss: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
+            Some(ss / (n - ddof) as f64)
+        };
+        match code {
+            1 => {
+                if n == 0 {
+                    Value::Err(ExcelError::Div0)
+                } else {
+                    num(mean)
+                }
+            }
+            2 => Value::Num(n as f64),
+            3 => Value::Num(counta as f64),
+            4 => {
+                if n == 0 {
+                    Value::Num(0.0)
+                } else {
+                    num(nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max))
+                }
+            }
+            5 => {
+                if n == 0 {
+                    Value::Num(0.0)
+                } else {
+                    num(nums.iter().cloned().fold(f64::INFINITY, f64::min))
+                }
+            }
+            6 => num(if n == 0 { 0.0 } else { nums.iter().product() }),
+            7 => match var(1) {
+                Some(v) => num(v.sqrt()),
+                None => Value::Err(ExcelError::Div0),
+            },
+            8 => match var(0) {
+                Some(v) => num(v.sqrt()),
+                None => Value::Err(ExcelError::Div0),
+            },
+            9 => num(sum),
+            10 => var(1).map(num).unwrap_or(Value::Err(ExcelError::Div0)),
+            11 => var(0).map(num).unwrap_or(Value::Err(ExcelError::Div0)),
+            12 => {
+                if n == 0 {
+                    return Value::Err(ExcelError::Num);
+                }
+                let mut s = nums.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mid = n / 2;
+                num(if n % 2 == 1 {
+                    s[mid]
+                } else {
+                    (s[mid - 1] + s[mid]) / 2.0
+                })
+            }
+            13 => {
+                // MODE.SNGL: most frequent value (first-seen wins ties); #N/A if
+                // every value is unique.
+                let mut counts: Vec<(f64, usize)> = Vec::new();
+                for &x in nums {
+                    if let Some(e) = counts.iter_mut().find(|(v, _)| *v == x) {
+                        e.1 += 1;
+                    } else {
+                        counts.push((x, 1));
+                    }
+                }
+                let mut chosen: Option<f64> = None;
+                let mut best_c = 1usize;
+                for (v, c) in &counts {
+                    if *c > best_c {
+                        best_c = *c;
+                        chosen = Some(*v);
+                    }
+                }
+                chosen.map(num).unwrap_or(Value::Err(ExcelError::NA))
+            }
+            _ => Value::Err(ExcelError::Value),
+        }
+    }
+
+    /// AGGREGATE functions 14–19 (LARGE/SMALL/PERCENTILE/QUARTILE) with a k arg.
+    fn apply_agg_k(&self, func: i64, nums: &[f64], k: f64) -> Value {
+        let n = nums.len();
+        if n == 0 {
+            return Value::Err(ExcelError::Num);
+        }
+        let mut s = nums.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pctl_inc = |p: f64| -> Value {
+            if !(0.0..=1.0).contains(&p) {
+                return Value::Err(ExcelError::Num);
+            }
+            let rank = p * (n as f64 - 1.0);
+            let lo = rank.floor() as usize;
+            let frac = rank - lo as f64;
+            if lo + 1 < n {
+                num(s[lo] + frac * (s[lo + 1] - s[lo]))
+            } else {
+                num(s[lo])
+            }
+        };
+        let pctl_exc = |p: f64| -> Value {
+            let rank = p * (n as f64 + 1.0) - 1.0;
+            if rank < 0.0 || rank > (n as f64 - 1.0) {
+                return Value::Err(ExcelError::Num);
+            }
+            let lo = rank.floor() as usize;
+            let frac = rank - lo as f64;
+            if lo + 1 < n {
+                num(s[lo] + frac * (s[lo + 1] - s[lo]))
+            } else {
+                num(s[lo])
+            }
+        };
+        match func {
+            14 => {
+                let kk = k.trunc() as i64;
+                if kk < 1 || kk as usize > n {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(s[n - kk as usize])
+            }
+            15 => {
+                let kk = k.trunc() as i64;
+                if kk < 1 || kk as usize > n {
+                    return Value::Err(ExcelError::Num);
+                }
+                num(s[kk as usize - 1])
+            }
+            16 => pctl_inc(k),
+            17 => {
+                let q = k.trunc() as i64;
+                if !(0..=4).contains(&q) {
+                    return Value::Err(ExcelError::Num);
+                }
+                pctl_inc(q as f64 / 4.0)
+            }
+            18 => pctl_exc(k),
+            19 => {
+                let q = k.trunc() as i64;
+                if !(1..=3).contains(&q) {
+                    return Value::Err(ExcelError::Num);
+                }
+                pctl_exc(q as f64 / 4.0)
+            }
+            _ => Value::Err(ExcelError::Value),
+        }
+    }
+
+    /// Resolve a reference expression to the (sheet, row, col) of its top-left
+    /// cell *structurally* — without evaluating the target, so it works on
+    /// array/spill anchors. `None` if it isn't a plain reference.
+    fn ref_coords(&self, e: &Expr) -> Option<(usize, u32, u32)> {
+        let (sheet_name, row, col) = match e {
+            Expr::Ref(r) | Expr::SpillRef(r) => (r.sheet.as_deref(), r.row, r.col),
+            Expr::Range(a, b) => (a.sheet.as_deref(), a.row.min(b.row), a.col.min(b.col)),
+            _ => return None,
+        };
+        if row < 0 || col < 0 {
+            return None;
+        }
+        let sheet = match sheet_name {
+            Some(n) => self.res.sheet_index(n)?,
+            None => self.sheet,
+        };
+        Some((sheet, row as u32, col as u32))
+    }
+
+    /// CELL(info_type, [reference]) — the common info types. Anything needing
+    /// styling or workbook metadata we don't model marks the result unsupported
+    /// so the engine keeps Excel's cached value.
+    fn cell_info(&mut self, args: &[Expr]) -> Value {
+        if args.is_empty() || args.len() > 2 {
+            return Value::Err(ExcelError::Value);
+        }
+        let info = try_text!(self.eval(&args[0])).to_ascii_lowercase();
+        let (s, r, c) = if args.len() == 2 {
+            match self.ref_coords(&args[1]) {
+                Some(rc) => rc,
+                None => return Value::Err(ExcelError::Value),
+            }
+        } else {
+            (self.sheet, self.cell.0, self.cell.1)
+        };
+        match info.as_str() {
+            "row" => Value::Num((r + 1) as f64),
+            "col" => Value::Num((c + 1) as f64),
+            "address" => Value::Str(format!("${}${}", col_name(c), r + 1)),
+            "contents" => self.res.value(s, r, c),
+            "type" => Value::Str(
+                match self.res.value(s, r, c) {
+                    Value::Empty => "b",
+                    Value::Str(_) => "l",
+                    _ => "v",
+                }
+                .to_string(),
+            ),
+            "prefix" => Value::Str(String::new()),
+            _ => {
+                self.unsupported = true;
+                Value::Err(ExcelError::NA)
             }
         }
     }
@@ -8989,6 +9447,8 @@ mod tests {
         cells: HashMap<(u32, u32), Value>,
         names: HashMap<String, String>,
         table: Option<TableInfo>,
+        formulas: HashMap<(u32, u32), String>,
+        hidden: std::collections::HashSet<u32>,
     }
 
     impl Grid {
@@ -9002,6 +9462,8 @@ mod tests {
                 cells: m,
                 names: HashMap::new(),
                 table: None,
+                formulas: HashMap::new(),
+                hidden: std::collections::HashSet::new(),
             }
         }
         fn with_name(mut self, name: &str, def: &str) -> Grid {
@@ -9010,6 +9472,17 @@ mod tests {
         }
         fn with_table(mut self, info: TableInfo) -> Grid {
             self.table = Some(info);
+            self
+        }
+        /// Record a cell's source formula text (without the leading `=`).
+        fn with_formula(mut self, name: &str, src: &str) -> Grid {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            self.formulas.insert((r, c), src.to_string());
+            self
+        }
+        /// Mark a 1-based worksheet row hidden.
+        fn with_hidden(mut self, row_1based: u32) -> Grid {
+            self.hidden.insert(row_1based - 1);
             self
         }
     }
@@ -9067,6 +9540,12 @@ mod tests {
                     && col <= t.range.3
             })
         }
+        fn cell_formula(&self, _sheet: usize, row: u32, col: u32) -> Option<String> {
+            self.formulas.get(&(row, col)).cloned()
+        }
+        fn row_hidden(&self, _sheet: usize, row: u32) -> bool {
+            self.hidden.contains(&row)
+        }
     }
 
     fn eval_str(src: &str, grid: &Grid) -> Value {
@@ -9097,6 +9576,99 @@ mod tests {
         assert_eq!(n("50%%", &g), 0.005);
         assert_eq!(eval_str("1/0", &g), Value::Err(ExcelError::Div0));
         assert_eq!(n("2+2%", &g), 2.02);
+    }
+
+    #[test]
+    fn ceiling_floor_precise_and_math() {
+        let g = empty();
+        // .PRECISE / ISO.CEILING: multiple of |sig|, toward ±inf, sign-agnostic.
+        assert_eq!(n("CEILING.PRECISE(4.1,2)", &g), 6.0);
+        assert_eq!(n("CEILING.PRECISE(-4.1,2)", &g), -4.0);
+        assert_eq!(n("CEILING.PRECISE(-4.1,-2)", &g), -4.0); // sig sign ignored
+        assert_eq!(n("ISO.CEILING(4.1)", &g), 5.0); // default sig 1
+        assert_eq!(n("FLOOR.PRECISE(4.1,2)", &g), 4.0);
+        assert_eq!(n("FLOOR.PRECISE(-4.1,2)", &g), -6.0);
+        // .MATH: optional significance (default 1) and mode.
+        assert_eq!(n("CEILING.MATH(24)", &g), 24.0);
+        assert_eq!(n("CEILING.MATH(23.1)", &g), 24.0);
+        assert_eq!(n("CEILING.MATH(-5.5,2)", &g), -4.0); // mode 0: toward zero
+        assert_eq!(n("CEILING.MATH(-5.5,2,-1)", &g), -6.0); // mode≠0: away
+        assert_eq!(n("FLOOR.MATH(-5.5,2)", &g), -6.0); // mode 0: away from zero
+        assert_eq!(n("FLOOR.MATH(-5.5,2,-1)", &g), -4.0); // mode≠0: toward zero
+    }
+
+    #[test]
+    fn subtotal_basic_nested_and_hidden() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("A2", Value::Num(2.0)),
+            ("A3", Value::Num(3.0)),
+            ("A4", Value::Num(4.0)),
+        ]);
+        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g), 10.0); // SUM
+        assert_eq!(n("SUBTOTAL(1,A1:A4)", &g), 2.5); // AVERAGE
+        assert_eq!(n("SUBTOTAL(2,A1:A4)", &g), 4.0); // COUNT
+        assert_eq!(n("SUBTOTAL(4,A1:A4)", &g), 4.0); // MAX
+        assert_eq!(n("SUBTOTAL(5,A1:A4)", &g), 1.0); // MIN
+
+        // A nested SUBTOTAL cell inside the range is excluded (A3 is itself one).
+        let g2 = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("A2", Value::Num(2.0)),
+            ("A3", Value::Num(3.0)),
+            ("A4", Value::Num(4.0)),
+        ])
+        .with_formula("A3", "SUBTOTAL(9,A1:A2)");
+        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g2), 7.0); // 1+2+4, A3 skipped
+
+        // Hidden rows are excluded (filter-hidden is the common case).
+        let g3 = Grid::new(&[
+            ("A1", Value::Num(1.0)),
+            ("A2", Value::Num(2.0)),
+            ("A3", Value::Num(3.0)),
+            ("A4", Value::Num(4.0)),
+        ])
+        .with_hidden(2)
+        .with_hidden(4);
+        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g3), 4.0); // 1+3
+    }
+
+    #[test]
+    fn aggregate_functions() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(10.0)),
+            ("A2", Value::Err(ExcelError::Div0)),
+            ("A3", Value::Num(30.0)),
+            ("A4", Value::Num(20.0)),
+        ]);
+        // Option 6 ignores errors → SUM = 60.
+        assert_eq!(n("AGGREGATE(9,6,A1:A4)", &g), 60.0);
+        // Option 0 does not ignore errors → the #DIV/0! propagates.
+        assert_eq!(
+            eval_str("AGGREGATE(9,0,A1:A4)", &g),
+            Value::Err(ExcelError::Div0)
+        );
+        assert_eq!(n("AGGREGATE(14,6,A1:A4,1)", &g), 30.0); // LARGE, k=1
+        assert_eq!(n("AGGREGATE(15,6,A1:A4,1)", &g), 10.0); // SMALL, k=1
+        assert_eq!(n("AGGREGATE(4,6,A1:A4)", &g), 30.0); // MAX
+        assert_eq!(n("AGGREGATE(1,6,A1:A4)", &g), 20.0); // AVERAGE (10+30+20)/3
+    }
+
+    #[test]
+    fn formulatext_and_cell() {
+        let g = Grid::new(&[("A1", Value::Num(42.0)), ("B2", Value::Str("hi".into()))])
+            .with_formula("A1", "1+2*3");
+        assert_eq!(eval_str("FORMULATEXT(A1)", &g), Value::Str("=1+2*3".into()));
+        assert_eq!(eval_str("FORMULATEXT(B2)", &g), Value::Err(ExcelError::NA));
+        assert_eq!(n("CELL(\"row\",B2)", &g), 2.0);
+        assert_eq!(n("CELL(\"col\",B2)", &g), 2.0);
+        assert_eq!(
+            eval_str("CELL(\"address\",B2)", &g),
+            Value::Str("$B$2".into())
+        );
+        assert_eq!(eval_str("CELL(\"contents\",A1)", &g), Value::Num(42.0));
+        assert_eq!(eval_str("CELL(\"type\",B2)", &g), Value::Str("l".into()));
+        assert_eq!(eval_str("CELL(\"type\",A1)", &g), Value::Str("v".into()));
     }
 
     #[test]
