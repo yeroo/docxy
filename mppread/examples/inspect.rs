@@ -3,18 +3,20 @@
 //! navigate its storage tree, then eyeball the bytes of a task/resource block.
 //!
 //! Usage:
-//!     cargo run -p mppread --example inspect -- some.mpp                 # list paths
-//!     cargo run -p mppread --example inspect -- some.mpp TBkndTask/FixedData  # hex-dump
+//!     cargo run -p mppread --example inspect -- some.mpp                        # list paths
+//!     cargo run -p mppread --example inspect -- some.mpp "   1/TBkndTask/Var2Data"        # hex-dump
+//!     cargo run -p mppread --example inspect -- some.mpp "   1/TBkndTask/Var2Data" strings # UTF-16 strings
 
-use mppread::Cfb;
+use mppread::{vardata, Cfb};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: inspect <file> [stream/path]");
+        eprintln!("usage: inspect <file> [stream/path] [strings]");
         std::process::exit(2);
     };
     let which = args.next();
+    let strings_mode = args.next().as_deref() == Some("strings");
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
@@ -33,6 +35,13 @@ fn main() {
             }
         }
         Some(stream) => match cfb.read_path(&stream) {
+            Some(data) if strings_mode => {
+                let names = vardata::strings(&data);
+                println!("{stream}: {} UTF-16 strings in {} bytes", names.len(), data.len());
+                for s in names {
+                    println!("  {s}");
+                }
+            }
             Some(data) => {
                 println!("{stream}: {} bytes", data.len());
                 hexdump(&data, 512); // first 512 bytes is plenty to eyeball a header

@@ -39,9 +39,36 @@ and the metadata property sets (MS-OLEPS).
    `mppread` and expose `.mpp → projcore::Project` so `yppxy file.mpp` opens
    the real schedule (today it opens the metadata only).
 
-## What works today without a corpus
+## Where to get sample files
+
+`raw.githubusercontent.com` downloads work here (the GitHub *API* is gated).
+Verified working sources (all real OLE2/CFB `.mpp`):
+
+- **MPXJ** (`github.com/joniles/mpxj`, Apache-2.0) — the richest source: a large
+  regression suite across every Project version, many paired with expected
+  values (an oracle). Its `doc/MPP8.xls` … `doc/MPP14.xls` document the binary
+  layout field-by-field — the reverse-engineering map.
+- Individual sample projects on GitHub, e.g. a Commercial-Construction plan
+  (ProjectLibre samples) and MS-Project software-project files.
+
+Fetch into this (git-ignored) folder, e.g.:
+```
+curl -sSL -o corpus/mpp/construction.mpp \
+  "https://raw.githubusercontent.com/cyclingzealot/projectlibre-jlam/master/openproj_build/resources/samples/Commercial%20construction%20project%20plan.mpp"
+```
+
+## What already works on a real .mpp
 
 ```
-cargo run -p mppread --example streams -- any.mpp   # metadata + stream map
-yppxy any.mpp                                        # opens with the .mpp title
+cargo run -p mppread --example streams  -- corpus/mpp/x.mpp                 # metadata + stream map
+cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp                 # full storage-tree paths
+cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp "   1/TBkndTask/Var2Data"          # hex
+cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp "   1/TBkndTask/Var2Data" strings  # task NAMES
+yppxy corpus/mpp/x.mpp                                                       # opens with the .mpp title
 ```
+
+The container (CFB), the storage tree, the metadata (property sets), and the
+**task names** (Var2Data UTF-16 blocks) already decode from real files. What
+remains is the numeric task data (dates, durations, links) in the Fixed/Var
+data blocks, keyed by `VarMeta` and the version-specific field ids from the
+MPP*.xls docs — validated against an MSPDI oracle export of the same project.
