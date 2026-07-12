@@ -119,14 +119,16 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   rename, and Project opens it — while giving us a container to grow.
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
-  addressable by path (`read_path("TBkndTask/FixedData")`), and the `inspect`
-  example hex-dumps any block. Its metadata streams are OLE **property sets**
-  (MS-OLEPS), also decoded exactly (title/author/company/dates), so
-  `yppxy legacy.mpp` opens with the right name. The task/resource **var-data
-  blocks inside are undocumented** and version-specific (MPP8/9/12/14) — decoding
-  them is the one genuinely reverse-engineering-only layer, and the container +
-  path navigation + `inspect` tooling is the scaffolding for doing it against a
-  real corpus.
+  addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
+  are OLE **property sets** (MS-OLEPS), decoded exactly. The **task names** now
+  decode too, from the `VarMeta`/`Var2Data` block container: VarMeta is scanned
+  for offsets that land on real Var2Data string blocks (self-validating), the
+  name field-type is auto-detected as the most-populated text field, and the
+  entry layout auto-detects across MPP9 and MPP12/14 — verified on real files
+  from both Microsoft Project and ProjectLibre. So `yppxy legacy.mpp` opens with
+  the real WBS. The **numeric fields** (dates, durations, links) in the
+  Fixed/Var data blocks are the remaining reverse-engineering layer; `inspect`
+  hex-dumps any block to work them out against an MSPDI oracle export.
 
 ## Roadmap
 
@@ -137,10 +139,11 @@ backstage, live Gantt, editing, undo/redo, find, vim mode, themes).
 
 Next, roughly in order:
 
-1. **`.mpp` task decoder** — the undocumented var-data blocks. Blocked on a real
-   `.mpp` corpus; the workflow (drop files in `corpus/mpp/`, map streams with the
-   `mppread` `streams` example, reverse each block against an MSPDI oracle export)
-   is documented in `corpus/mpp/README.md`.
+1. **`.mpp` numeric task decoder** — task **names** already decode from real
+   files (MPP9 + MPP12/14); the remaining fields are dates/durations/links in the
+   Fixed/Var data blocks. The workflow (sample files in `corpus/mpp/`, map with
+   `inspect`, reverse each block against an MSPDI oracle export) is documented in
+   `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,
    optional task splitting, and a "resource-critical" flag.
 3. **Assignment editing depth** — units/work per assignment, effort-driven

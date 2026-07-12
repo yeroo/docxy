@@ -48,6 +48,22 @@ pub struct MppInfo {
     pub streams: Vec<String>,
 }
 
+/// Decode the task **names** from a `.mpp`, in task order. Empty if the task
+/// tables aren't present or can't be decoded. This reads the documented
+/// VarMeta/Var2Data container (validated on real MPP9 and MPP14 files); the
+/// numeric fields (dates, durations, links) are a later layer.
+pub fn task_names(bytes: &[u8]) -> Vec<String> {
+    let Ok(cfb) = Cfb::open(bytes) else { return Vec::new() };
+    let Some(v2path) = cfb.paths().into_iter().find(|p| p.ends_with("TBkndTask/Var2Data")) else {
+        return Vec::new();
+    };
+    let vmpath = v2path.replace("Var2Data", "VarMeta");
+    let (Some(v2), Some(vm)) = (cfb.read_path(&v2path), cfb.read_path(&vmpath)) else {
+        return Vec::new();
+    };
+    crate::varmeta::names(&vm, &v2)
+}
+
 /// Open a `.mpp` (compound file) and extract its documented metadata.
 pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
     let cfb = Cfb::open(bytes)?;

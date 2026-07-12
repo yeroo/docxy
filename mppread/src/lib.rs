@@ -19,6 +19,7 @@ pub mod cfb;
 pub mod mpp;
 pub mod oleps;
 pub mod vardata;
+pub mod varmeta;
 
 pub use cfb::{write_cfb, write_cfb_tree, Cfb, Node};
 pub use mpp::{read_mpp, MppInfo};

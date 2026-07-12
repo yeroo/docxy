@@ -35,6 +35,27 @@ pub fn blocks(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// Like [`blocks`] but also returns each block's byte offset within the stream
+/// (the value a `VarMeta` entry points at). Useful for correlating the two.
+pub fn block_offsets(data: &[u8]) -> Vec<(usize, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let len = u32le(data, i) as usize;
+        let start = i;
+        i += 4;
+        if len == 0 {
+            continue;
+        }
+        if i + len > data.len() {
+            break;
+        }
+        out.push((start, &data[i..i + len]));
+        i += len;
+    }
+    out
+}
+
 /// Decode a block as a UTF-16LE string if it plausibly is one (even length,
 /// ≥80% printable, non-empty), stripping a trailing NUL terminator.
 pub fn utf16le_string(b: &[u8]) -> Option<String> {

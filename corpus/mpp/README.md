@@ -68,7 +68,13 @@ yppxy corpus/mpp/x.mpp                                                       # o
 ```
 
 The container (CFB), the storage tree, the metadata (property sets), and the
-**task names** (Var2Data UTF-16 blocks) already decode from real files. What
-remains is the numeric task data (dates, durations, links) in the Fixed/Var
-data blocks, keyed by `VarMeta` and the version-specific field ids from the
-MPP*.xls docs — validated against an MSPDI oracle export of the same project.
+**task names** decode from real files (MPP9 + MPP12/14, auto-detected):
+
+```
+cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp   # decoded task names
+```
+
+What remains is the numeric task data (dates, durations, links) in the
+Fixed/Var data blocks — validated against an MSPDI oracle export of the same
+project. `mppread/tests/real_mpp.rs` locks in the name decode against local
+sample files (and skips when they're absent).

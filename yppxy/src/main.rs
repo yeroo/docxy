@@ -155,21 +155,35 @@ fn load(path: &str) -> Result<Project, String> {
     }
 }
 
-/// Build a partial project from a legacy binary `.mpp`. Only the documented
-/// metadata (title/author/company/dates) is decoded today — the task/resource
-/// var-data blocks are undocumented and not yet parsed — so the returned
-/// project carries the name but no tasks. It still opens, and Save As converts
-/// it to `.yppx`/MSPDI.
+/// Build a partial project from a legacy binary `.mpp`. Decodes the documented
+/// metadata (title/author/…) and the **task names** (from the VarMeta/Var2Data
+/// container). The numeric fields — dates, durations, links — live in the
+/// undocumented Fixed/Var data blocks and aren't parsed yet, so each task gets a
+/// default 1-day duration and no dependencies. It opens with the real WBS, and
+/// Save As converts it to `.yppx`/MSPDI.
 fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = mppread::read_mpp(bytes)?;
     let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
         .into_iter()
         .find(|s| !s.is_empty())
         .unwrap_or_else(|| "Imported project".into());
+    let tasks = mppread::mpp::task_names(bytes)
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| Task {
+            uid: i as i32 + 1,
+            id: i as i32 + 1,
+            name: n,
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        })
+        .collect();
     Ok(Project {
         name,
         title: info.title,
         start_date: Some(next_monday()),
+        tasks,
         ..Project::default()
     })
 }
@@ -760,8 +774,11 @@ impl App {
                 self.backstage = None;
                 self.start = false;
                 self.reschedule();
-                self.status = if path.to_ascii_lowercase().ends_with(".mpp") && self.proj.tasks.is_empty() {
-                    format!("Opened {path} — .mpp metadata only; task decoding is not implemented yet")
+                let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
+                self.status = if is_mpp && !self.proj.tasks.is_empty() {
+                    format!("Opened {path} — {} task names decoded (.mpp dates/links pending)", self.proj.tasks.len())
+                } else if is_mpp {
+                    format!("Opened {path} — .mpp metadata only (no task table found)")
                 } else {
                     format!("Opened {path}")
                 };
