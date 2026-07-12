@@ -1083,12 +1083,47 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
     } else {
         rels.target(&rid).map(|t| t.to_string())
     };
-    if target.is_none() {
-        parse_inlines_into(p, rels, out);
-        return;
-    }
     let rel_id = (!rid.is_empty()).then_some(rid);
     let anchor = (!anchor_attr.is_empty()).then_some(anchor_attr);
+    if target.is_none() {
+        // An internal anchor link (a cross-reference, or a TOC entry). Make it
+        // navigable so a click can jump to the bookmark. Each maximal run of
+        // `Inline::Run` becomes a `Hyperlink`; tabs/breaks are emitted at top
+        // level so TOC leader-dot tab stops still render — the surrounding link
+        // segments keep the whole entry clickable.
+        if let Some(anchor) = anchor {
+            let mut inner = Vec::new();
+            parse_inlines_into(p, rels, &mut inner);
+            let mut runs: Vec<Run> = Vec::new();
+            for it in inner {
+                match it {
+                    Inline::Run(r) => runs.push(r),
+                    other => {
+                        if !runs.is_empty() {
+                            out.push(Inline::Hyperlink(Hyperlink {
+                                target: None,
+                                anchor: Some(anchor.clone()),
+                                rel_id: rel_id.clone(),
+                                runs: std::mem::take(&mut runs),
+                            }));
+                        }
+                        out.push(other);
+                    }
+                }
+            }
+            if !runs.is_empty() {
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs,
+                }));
+            }
+        } else {
+            parse_inlines_into(p, rels, out);
+        }
+        return;
+    }
 
     let mut runs = Vec::new();
     loop {

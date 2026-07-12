@@ -3769,6 +3769,34 @@ impl App {
         None
     }
 
+    /// Jump to the bookmark named `anchor` (the target of an internal link).
+    /// Scrolls so the paragraph holding its `<w:bookmarkStart w:name=…>` is at
+    /// the top of the view.
+    fn jump_to_anchor(&mut self, anchor: &str) {
+        let needle = format!("w:name=\"{anchor}\"");
+        let bi = self
+            .editor
+            .doc
+            .body
+            .iter()
+            .position(|b| block_has_bookmark(b, &needle));
+        if let Some(bi) = bi {
+            if let Some(line) = self
+                .maps
+                .iter()
+                .position(|m| m.segs.iter().any(|s| s.path.first() == Some(&bi)))
+            {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.follow_caret = false;
+                self.dirty = true;
+                self.status = Some(format!("Jumped to “{anchor}”."));
+                return;
+            }
+        }
+        self.status = Some(format!("Bookmark “{anchor}” not found."));
+        self.dirty = true;
+    }
+
     /// If `col` is in the scrollbar gutter (just past the rendered content) and
     /// the document overflows, jump the scroll to the indicated position and
     /// return true. Used so clicking/dragging the bar scrolls instead of selecting.
@@ -3951,10 +3979,12 @@ impl App {
                     self.drag_from = Some(c);
                     self.dirty = true;
                 }
-                // A clicked link is never opened directly: show the real URL and
-                // ask for confirmation, and refuse anything that isn't http/https.
+                // A clicked link: an internal `#anchor` jumps to its bookmark; an
+                // external link is never opened directly (confirm + http/https only).
                 if let Some(url) = self.link_at(doc_line, col) {
-                    if !url.is_empty() {
+                    if let Some(anchor) = url.strip_prefix('#') {
+                        self.jump_to_anchor(anchor);
+                    } else if !url.is_empty() {
                         if safe_url(&url) {
                             self.pending_link = Some(url);
                         } else {
@@ -5751,6 +5781,22 @@ fn wrap_str(s: &str, w: usize) -> Vec<String> {
     }
     out.push(line);
     out
+}
+
+/// Does a block (recursively, through table cells) hold a `<w:bookmarkStart>`
+/// whose raw XML contains `needle` (the `w:name="…"` attribute)?
+fn block_has_bookmark(b: &Block, needle: &str) -> bool {
+    match b {
+        Block::Paragraph(p) => p.content.iter().any(
+            |i| matches!(i, Inline::Raw(s) if s.contains("bookmarkStart") && s.contains(needle)),
+        ),
+        Block::Table(t) => t.rows.iter().any(|r| {
+            r.cells
+                .iter()
+                .any(|c| c.blocks.iter().any(|bb| block_has_bookmark(bb, needle)))
+        }),
+        Block::Raw(_) => false,
+    }
 }
 
 /// Truncate `s` to at most `w` columns, ending with `…` when clipped.

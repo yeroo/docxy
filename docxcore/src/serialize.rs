@@ -594,6 +594,62 @@ mod tests {
     }
 
     #[test]
+    fn internal_anchor_link_navigable_toc_keeps_tabs() {
+        // A plain internal link (a cross-reference) becomes a navigable Hyperlink.
+        let xr = "<w:document><w:body><w:p>\
+            <w:hyperlink w:anchor=\"_Ref1\"><w:r><w:t>see Section 3</w:t></w:r></w:hyperlink>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xr, &Relationships::default());
+        match &d.body[0] {
+            Block::Paragraph(p) => match &p.content[0] {
+                Inline::Hyperlink(h) => {
+                    assert_eq!(h.anchor.as_deref(), Some("_Ref1"));
+                    assert!(h.target.is_none());
+                }
+                other => panic!("expected navigable Hyperlink, got {other:?}"),
+            },
+            _ => panic!("no paragraph"),
+        }
+        // Round-trips (the w:anchor survives).
+        assert_eq!(
+            parse_document_xml(&document_to_xml(&d), &Relationships::default()),
+            d
+        );
+
+        // A TOC entry (internal link carrying a tab) keeps the tab at top level
+        // (so its leader dots still render) AND stays navigable: the text on each
+        // side of the tab becomes a Hyperlink segment carrying the anchor.
+        let toc = "<w:document><w:body><w:p>\
+            <w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r>\
+              <w:r><w:tab/></w:r><w:r><w:t>9</w:t></w:r></w:hyperlink>\
+            </w:p></w:body></w:document>";
+        let d2 = parse_document_xml(toc, &Relationships::default());
+        match &d2.body[0] {
+            Block::Paragraph(p) => {
+                assert!(
+                    p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+                    "TOC tab dropped"
+                );
+                let links = p
+                    .content
+                    .iter()
+                    .filter(|i| matches!(i, Inline::Hyperlink(h) if h.anchor.as_deref() == Some("_Toc1")))
+                    .count();
+                assert_eq!(
+                    links, 2,
+                    "TOC text should be navigable on both sides of the tab"
+                );
+            }
+            _ => panic!("no paragraph"),
+        }
+        // Round-trips within the model.
+        assert_eq!(
+            parse_document_xml(&document_to_xml(&d2), &Relationships::default()),
+            d2
+        );
+    }
+
+    #[test]
     fn run_properties_roundtrip() {
         let props = RunProps {
             bold: true,
