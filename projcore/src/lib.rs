@@ -12,14 +12,15 @@
 //! - [`schedule`] — the Critical Path Method engine (forward/backward passes
 //!   over working-time calendars).
 //! - [`gantt`] — export a scheduled project as a Markdown/Mermaid Gantt chart.
-//!
-//! The native `.yppx` package lands in a subsequent layer.
+//! - [`yppx`] — the native `.yppx` OPC package (ZIP container), the
+//!   project-scheduling analog of `.docx`/`.xlsx`.
 
 pub mod datetime;
 pub mod gantt;
 pub mod model;
 pub mod mspdi;
 pub mod schedule;
+pub mod yppx;
 
 pub use datetime::DateTime;
 pub use model::{

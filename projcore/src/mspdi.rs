@@ -423,6 +423,198 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
     minutes
 }
 
+// ---- writer -----------------------------------------------------------------
+
+/// Serialize a [`Project`] back to MSPDI XML.
+///
+/// Emits the fields projcore models — enough for MS Project to open the file
+/// and for our own reader to round-trip. Elements outside the model (custom
+/// fields, views, extended attributes) are not preserved: this is a
+/// model-faithful writer, not a byte-faithful one. Each task's stored
+/// `Start`/`Finish` are written when present (e.g. after scheduling and
+/// stamping them back), so a scheduled project exports with dates Project can
+/// display without recalculating.
+pub fn write_mspdi(proj: &Project) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
+    tag(&mut s, 1, "Name", &proj.name);
+    if !proj.title.is_empty() {
+        tag(&mut s, 1, "Title", &proj.title);
+    }
+    tag(&mut s, 1, "MinutesPerDay", &((proj.hours_per_day * 60.0).round() as i64).to_string());
+    tag(&mut s, 1, "MinutesPerWeek", &((proj.hours_per_week * 60.0).round() as i64).to_string());
+    tag(&mut s, 1, "CalendarUID", &proj.default_calendar_uid.to_string());
+    if let Some(d) = proj.start_date {
+        tag(&mut s, 1, "StartDate", &d.to_mspdi());
+    }
+
+    s.push_str("  <Tasks>\n");
+    for t in &proj.tasks {
+        write_task(&mut s, t);
+    }
+    s.push_str("  </Tasks>\n");
+
+    if !proj.resources.is_empty() {
+        s.push_str("  <Resources>\n");
+        for r in &proj.resources {
+            write_resource(&mut s, r);
+        }
+        s.push_str("  </Resources>\n");
+    }
+    if !proj.assignments.is_empty() {
+        s.push_str("  <Assignments>\n");
+        for a in &proj.assignments {
+            write_assignment(&mut s, a);
+        }
+        s.push_str("  </Assignments>\n");
+    }
+
+    s.push_str("  <Calendars>\n");
+    for c in &proj.calendars {
+        write_calendar(&mut s, c);
+    }
+    s.push_str("  </Calendars>\n");
+
+    s.push_str("</Project>\n");
+    s
+}
+
+fn write_task(s: &mut String, t: &Task) {
+    s.push_str("    <Task>\n");
+    tag(s, 3, "UID", &t.uid.to_string());
+    tag(s, 3, "ID", &t.id.to_string());
+    tag(s, 3, "Name", &t.name);
+    tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
+    tag(s, 3, "Summary", if t.summary { "1" } else { "0" });
+    tag(s, 3, "Milestone", if t.milestone { "1" } else { "0" });
+    tag(s, 3, "Duration", &min_to_iso(t.duration_min));
+    tag(s, 3, "DurationFormat", "7");
+    if let Some(d) = t.stored_start {
+        tag(s, 3, "Start", &d.to_mspdi());
+    }
+    if let Some(d) = t.stored_finish {
+        tag(s, 3, "Finish", &d.to_mspdi());
+    }
+    tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
+    if let Some(d) = t.constraint_date {
+        tag(s, 3, "ConstraintDate", &d.to_mspdi());
+    }
+    if let Some(c) = t.calendar_uid {
+        tag(s, 3, "CalendarUID", &c.to_string());
+    }
+    for p in &t.predecessors {
+        s.push_str("      <PredecessorLink>\n");
+        tag(s, 4, "PredecessorUID", &p.uid.to_string());
+        tag(s, 4, "Type", &p.link.code().to_string());
+        // model lag is minutes; MSPDI LinkLag is tenths of a minute.
+        tag(s, 4, "LinkLag", &(p.lag_min * 10).to_string());
+        tag(s, 4, "LagFormat", "7");
+        s.push_str("      </PredecessorLink>\n");
+    }
+    s.push_str("    </Task>\n");
+}
+
+fn write_resource(s: &mut String, r: &Resource) {
+    s.push_str("    <Resource>\n");
+    tag(s, 3, "UID", &r.uid.to_string());
+    tag(s, 3, "ID", &r.id.to_string());
+    tag(s, 3, "Name", &r.name);
+    tag(s, 3, "Type", if r.is_work { "1" } else { "0" });
+    tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
+    if let Some(c) = r.calendar_uid {
+        tag(s, 3, "CalendarUID", &c.to_string());
+    }
+    s.push_str("    </Resource>\n");
+}
+
+fn write_assignment(s: &mut String, a: &Assignment) {
+    s.push_str("    <Assignment>\n");
+    tag(s, 3, "UID", &a.uid.to_string());
+    tag(s, 3, "TaskUID", &a.task_uid.to_string());
+    tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
+    tag(s, 3, "Units", &fmt_f(a.units));
+    tag(s, 3, "Work", &min_to_iso(a.work_min));
+    s.push_str("    </Assignment>\n");
+}
+
+fn write_calendar(s: &mut String, c: &Calendar) {
+    s.push_str("    <Calendar>\n");
+    tag(s, 3, "UID", &c.uid.to_string());
+    tag(s, 3, "Name", &c.name);
+    tag(s, 3, "IsBaseCalendar", "1");
+    s.push_str("      <WeekDays>\n");
+    for (idx, day) in c.week.iter().enumerate() {
+        // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
+        s.push_str("        <WeekDay>\n");
+        tag(s, 5, "DayType", &(idx + 1).to_string());
+        tag(s, 5, "DayWorking", if day.working() { "1" } else { "0" });
+        if day.working() {
+            s.push_str("          <WorkingTimes>\n");
+            for w in &day.times {
+                s.push_str("            <WorkingTime>");
+                s.push_str(&format!(
+                    "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
+                    min_to_clock(w.from),
+                    min_to_clock(w.to)
+                ));
+                s.push_str("</WorkingTime>\n");
+            }
+            s.push_str("          </WorkingTimes>\n");
+        }
+        s.push_str("        </WeekDay>\n");
+    }
+    s.push_str("      </WeekDays>\n");
+    s.push_str("    </Calendar>\n");
+}
+
+/// Write `<Name>text</Name>` at the given indent depth (2 spaces each), with the
+/// text XML-escaped.
+fn tag(s: &mut String, depth: usize, name: &str, text: &str) {
+    for _ in 0..depth {
+        s.push_str("  ");
+    }
+    s.push('<');
+    s.push_str(name);
+    s.push('>');
+    esc_into(text, s);
+    s.push_str("</");
+    s.push_str(name);
+    s.push_str(">\n");
+}
+
+fn esc_into(text: &str, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn min_to_iso(min: i64) -> String {
+    let (h, m) = (min / 60, min % 60);
+    format!("PT{h}H{m}M0S")
+}
+
+/// Minute-of-day → `HH:MM:SS`. End-of-day (1440) is written as `00:00:00`
+/// (Project's midnight convention), which the reader maps back to 1440.
+fn min_to_clock(min: u32) -> String {
+    let m = if min >= 1440 { 0 } else { min };
+    format!("{:02}:{:02}:00", m / 60, m % 60)
+}
+
+/// Format a float without a trailing `.0` (so `1.0` → `1`, `0.5` → `0.5`).
+fn fmt_f(x: f64) -> String {
+    if x.fract() == 0.0 {
+        format!("{}", x as i64)
+    } else {
+        format!("{x}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +693,35 @@ mod tests {
         assert_eq!(cal.name, "Std");
         assert_eq!(cal.week[1].minutes(), 480); // Monday (DayType 2) = 8h
         assert!(!cal.week[0].working()); // Sunday (DayType 1) off
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let orig = read_mspdi(MINIMAL).unwrap();
+        let xml = write_mspdi(&orig);
+        let back = read_mspdi(&xml).unwrap();
+
+        assert_eq!(back.name, orig.name);
+        assert_eq!(back.hours_per_day, orig.hours_per_day);
+        assert_eq!(back.tasks.len(), orig.tasks.len());
+        for (a, b) in orig.tasks.iter().zip(&back.tasks) {
+            assert_eq!(a.uid, b.uid);
+            assert_eq!(a.name, b.name); // '&' survives escape round-trip
+            assert_eq!(a.duration_min, b.duration_min);
+            assert_eq!(a.stored_start, b.stored_start);
+            assert_eq!(a.predecessors, b.predecessors); // link type + lag preserved
+        }
+    }
+
+    #[test]
+    fn calendar_write_round_trips_working_times() {
+        let proj = Project::default(); // one Standard calendar
+        let xml = write_mspdi(&proj);
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.calendars.len(), 1);
+        let cal = &back.calendars[0];
+        assert_eq!(cal.week[1].minutes(), 480); // Monday still 8h
+        assert_eq!(cal.week[1].times.len(), 2); // two shifts preserved
+        assert!(!cal.week[0].working() && !cal.week[6].working()); // weekend off
     }
 }
