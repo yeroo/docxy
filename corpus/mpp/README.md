@@ -21,12 +21,18 @@ and the metadata property sets (MS-OLEPS).
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
    XML). The MSPDI export is the **oracle** — the known-good answer.
-2. Map each file's streams:
+2. Map each file's storage tree:
    ```
-   cargo run -p mppread --example streams -- corpus/mpp/yourfile.mpp
+   cargo run -p mppread --example streams  -- corpus/mpp/yourfile.mpp
+   cargo run -p mppread --example inspect  -- corpus/mpp/yourfile.mpp
    ```
-   This prints the metadata plus the stream directory (`Props`, `Var2Data`,
-   `Fixed2Data`, the task/resource/calendar blocks, …).
+   These print the metadata plus every stream's **full path** through the
+   storage hierarchy (`\x05SummaryInformation`, `TBkndTask/FixedData`,
+   `TBkndTask/Var2Data`, the resource/calendar blocks, …). Then hex-dump a
+   specific block to eyeball its header:
+   ```
+   cargo run -p mppread --example inspect  -- corpus/mpp/yourfile.mpp TBkndTask/FixedData
+   ```
 3. Reverse the fixed/var-data blocks field by field, checking each decoded task
    date/duration/link against the MSPDI oracle for the same file, until a
    `corpus/mpp` scoreboard reads green — then wire the decoder into

@@ -118,11 +118,15 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   `project.xml` part is MSPDI-compatible, so `.yppx` stays interoperable — unzip,
   rename, and Project opens it — while giving us a container to grow.
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
-  `mppread` reads exactly. Its metadata streams are OLE **property sets**
+  `mppread` reads exactly — including the **storage tree**, so nested blocks are
+  addressable by path (`read_path("TBkndTask/FixedData")`), and the `inspect`
+  example hex-dumps any block. Its metadata streams are OLE **property sets**
   (MS-OLEPS), also decoded exactly (title/author/company/dates), so
   `yppxy legacy.mpp` opens with the right name. The task/resource **var-data
   blocks inside are undocumented** and version-specific (MPP8/9/12/14) — decoding
-  them is the one genuinely reverse-engineering-only layer.
+  them is the one genuinely reverse-engineering-only layer, and the container +
+  path navigation + `inspect` tooling is the scaffolding for doing it against a
+  real corpus.
 
 ## Roadmap
 

@@ -51,19 +51,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("{path}: {} directory entries", cfb.entries().len());
-    for e in cfb.entries() {
-        let kind = match e.kind {
-            5 => "root",
-            1 => "storage",
-            2 => "stream",
-            _ => "?",
-        };
-        let size = cfb.read_stream(&e.name).map(|d| d.len()).unwrap_or(0);
-        if e.is_stream() {
-            println!("  {kind:<8} {:<32} {size} bytes", e.name);
-        } else {
-            println!("  {kind:<8} {}", e.name);
-        }
+    let paths = cfb.paths();
+    println!("{path}: {} streams across {} directory entries", paths.len(), cfb.entries().len());
+    for p in &paths {
+        let size = cfb.read_path(p).map(|d| d.len()).unwrap_or(0);
+        println!("  {p:<40} {size} bytes");
     }
 }
