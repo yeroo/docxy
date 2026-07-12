@@ -195,6 +195,10 @@ pub struct Sheet {
     /// Conditional-formatting blocks (`<conditionalFormatting>`), evaluated at
     /// render time to overlay a differential format on matching cells.
     pub cond_formats: Vec<CondFormat>,
+    /// Cell hyperlinks, keyed by 0-based (row, col). The value is an external URL
+    /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
+    /// opens the URL (external) or jumps (internal).
+    pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
 }
 
 impl Sheet {

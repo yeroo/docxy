@@ -809,6 +809,8 @@ struct App {
     clip_text: Option<String>,
     confirm_quit: bool,
     confirm_delete_sheet: bool,
+    /// An external hyperlink awaiting the user's confirmation to open.
+    pending_link: Option<String>,
     prompt: Option<Prompt>,
     pivot_edit: Option<PivotEdit>,
     /// Ctrl-M overlay: pane 0 = relationships, 1 = measures.
@@ -877,6 +879,7 @@ impl App {
             clip_text: None,
             confirm_quit: false,
             confirm_delete_sheet: false,
+            pending_link: None,
             prompt: None,
             pivot_edit: None,
             model_view: None,
@@ -2143,6 +2146,43 @@ impl App {
         } else {
             self.set_freeze((0, 0));
             self.status = Some("Unfroze panes".to_string());
+        }
+    }
+
+    /// Follow the hyperlink on cell (row, col), if any: an in-workbook
+    /// `#Sheet!A1` jumps immediately; an external URL is queued for confirmation.
+    fn follow_hyperlink(&mut self, row: u32, col: u32) {
+        let Some(target) = self.sheet().hyperlinks.get(&(row, col)).cloned() else {
+            return;
+        };
+        if let Some(loc) = target.strip_prefix('#') {
+            let (sheet_name, cell) = match loc.rsplit_once('!') {
+                Some((s, c)) => (Some(s.trim_matches('\'')), c),
+                None => (None, loc),
+            };
+            if let Some(sname) = sheet_name {
+                if let Some(idx) = self
+                    .pkg
+                    .workbook
+                    .sheets
+                    .iter()
+                    .position(|s| s.name == sname)
+                {
+                    if idx != self.sheet {
+                        self.goto_sheet(idx);
+                    }
+                }
+            }
+            if let Some((r, c)) = gridcore::sheet::parse_cell_name(&cell.replace('$', "")) {
+                self.cur = (r, c);
+                self.status = Some(format!("Jumped to {loc}"));
+            }
+        } else if safe_url(&target) {
+            // External link: never opened directly — confirm first.
+            self.status = Some(format!("Open link? {target}   (y = open)"));
+            self.pending_link = Some(target);
+        } else {
+            self.status = Some(format!("Blocked non-web link: {target}"));
         }
     }
 
@@ -3580,6 +3620,10 @@ fn draw(app: &mut App, f: &mut Frame) {
                     style = style.bg(Color::Rgb(fr, fg, fb));
                 }
             }
+            // A hyperlinked cell reads as a link (blue + underline).
+            if sheet.hyperlinks.contains_key(&(row, col)) {
+                style = style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+            }
             let selected = row >= r1 && row <= r2 && col >= c1 && col <= c2;
             let is_cursor = (row, col) == (r, c);
             if is_cursor {
@@ -4368,6 +4412,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
+    if let Some(url) = app.pending_link.take() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                open_url(&url);
+                app.status = Some(format!("Opening {url}"));
+            }
+            _ => app.status = Some("Link cancelled".to_string()),
+        }
+        return false;
+    }
+
     if app.confirm_delete_sheet {
         app.confirm_delete_sheet = false;
         if key.code == KeyCode::Delete && shift {
@@ -4793,9 +4848,37 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 app.anchor = None;
             }
             app.cur = (row, col);
+            if !drag {
+                app.follow_hyperlink(row, col);
+            }
         }
         _ => {}
     }
+}
+
+/// Only http/https links may be opened, and only via a direct process exec (no
+/// shell), so a hyperlink can never run an arbitrary command.
+fn safe_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.len() > 2048 || u.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let lower = u.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn open_url(url: &str) {
+    if !safe_url(url) {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 // ---------------------------------------------------------------------------

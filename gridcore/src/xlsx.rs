@@ -199,28 +199,36 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             orig_to_model.push(None);
             continue;
         };
-        let mut sheet = parse_worksheet(&xml, &shared);
+        // Read the sheet's own rels once — for hyperlink targets and tables/pivots.
+        let ws_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let ws_file = part.rsplit_once('/').map(|(_, f)| f).unwrap_or(&part);
+        let ws_rels_name = format!("{ws_dir}/_rels/{ws_file}.rels");
+        let ws_rels = get_str(&ws_rels_name)
+            .map(|xml| parse_rels(&xml))
+            .unwrap_or_default();
+        // External hyperlink URLs keyed by relationship id.
+        let hlink_targets: std::collections::HashMap<String, String> = ws_rels
+            .iter()
+            .filter(|(_, ty, _)| ty.ends_with("/hyperlink"))
+            .map(|(id, _, t)| (id.clone(), t.clone()))
+            .collect();
+
+        let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
         let sheet_idx = sheets.len();
         orig_to_model.push(Some(sheet_idx));
 
-        // Excel Tables and pivot tables attached to this worksheet, via its
-        // own rels part.
-        let ws_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let ws_file = part.rsplit_once('/').map(|(_, f)| f).unwrap_or(&part);
-        let ws_rels_name = format!("{ws_dir}/_rels/{ws_file}.rels");
-        if let Some(rels_xml) = get_str(&ws_rels_name) {
-            for (_, ty, target) in parse_rels(&rels_xml) {
-                if ty.ends_with("/table") {
-                    let table_part = resolve_relative(ws_dir, &target);
-                    if let Some(txml) = get_str(&table_part) {
-                        if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
-                            tables.push(t);
-                        }
+        // Excel Tables and pivot tables attached to this worksheet.
+        for (_, ty, target) in &ws_rels {
+            if ty.ends_with("/table") {
+                let table_part = resolve_relative(ws_dir, target);
+                if let Some(txml) = get_str(&table_part) {
+                    if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
+                        tables.push(t);
                     }
-                } else if ty.ends_with("/pivotTable") {
-                    pending_pivots.push((sheet_idx, resolve_relative(ws_dir, &target)));
                 }
+            } else if ty.ends_with("/pivotTable") {
+                pending_pivots.push((sheet_idx, resolve_relative(ws_dir, target)));
             }
         }
 
@@ -827,7 +835,11 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
 
 /// One worksheet: `<sheetData>`, `<cols>`, `<mergeCells>`; everything else is
 /// preserved through the source-splice on save.
-fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
+fn parse_worksheet(
+    xml: &str,
+    shared: &[String],
+    hlink_targets: &std::collections::HashMap<String, String>,
+) -> Sheet {
     let mut sheet = Sheet::default();
     let mut p = XmlParser::new(xml);
 
@@ -927,6 +939,37 @@ fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
                         let cols = p.attr("xSplit").parse::<u32>().unwrap_or(0);
                         let rows = p.attr("ySplit").parse::<u32>().unwrap_or(0);
                         sheet.freeze = (rows, cols);
+                    }
+                }
+                // A cell hyperlink: `ref` cell/range → external URL (via r:id) or
+                // an in-workbook `location`.
+                "hyperlink" => {
+                    let ref_attr = p.attr("ref").to_string();
+                    let rid = p.attr("r:id").to_string();
+                    let location = p.attr("location").to_string();
+                    if let Some((r1, c1, r2, c2)) = parse_range_name(&ref_attr)
+                        .or_else(|| parse_cell_name(&ref_attr).map(|(r, c)| (r, c, r, c)))
+                    {
+                        let target = if !rid.is_empty() {
+                            hlink_targets.get(&rid).cloned()
+                        } else if !location.is_empty() {
+                            Some(format!("#{location}"))
+                        } else {
+                            None
+                        };
+                        if let Some(t) = target {
+                            // A whole-column hyperlink applies only to its anchor.
+                            let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+                            if cells > 4096 {
+                                sheet.hyperlinks.insert((r1, c1), t);
+                            } else {
+                                for r in r1..=r2 {
+                                    for c in c1..=c2 {
+                                        sheet.hyperlinks.insert((r, c), t.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Conditional formatting: a block of rules over `sqref` ranges.
@@ -2286,7 +2329,10 @@ mod tests {
              <pane xSplit=\"2\" ySplit=\"3\" topLeftCell=\"C4\" state=\"frozen\"/>\
              </sheetView></sheetViews><sheetData/></worksheet>"
         );
-        assert_eq!(parse_worksheet(&frozen, &[]).freeze, (3, 2)); // (rows, cols)
+        assert_eq!(
+            parse_worksheet(&frozen, &[], &Default::default()).freeze,
+            (3, 2)
+        ); // (rows, cols)
 
         // A plain split pane (scrollbar split, not frozen) is ignored.
         let split = format!(
@@ -2294,7 +2340,32 @@ mod tests {
              <pane xSplit=\"1\" ySplit=\"1\" state=\"split\"/>\
              </sheetView></sheetViews><sheetData/></worksheet>"
         );
-        assert_eq!(parse_worksheet(&split, &[]).freeze, (0, 0));
+        assert_eq!(
+            parse_worksheet(&split, &[], &Default::default()).freeze,
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn parse_hyperlinks() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let xml = format!(
+            "<worksheet xmlns=\"{ns}\" xmlns:r=\"{rns}\"><sheetData/><hyperlinks>\
+             <hyperlink ref=\"A1\" r:id=\"rId1\"/>\
+             <hyperlink ref=\"B2\" location=\"Sheet2!C3\"/></hyperlinks></worksheet>"
+        );
+        let mut targets = std::collections::HashMap::new();
+        targets.insert("rId1".to_string(), "https://example.com".to_string());
+        let sheet = parse_worksheet(&xml, &[], &targets);
+        assert_eq!(
+            sheet.hyperlinks.get(&(0, 0)).map(String::as_str),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            sheet.hyperlinks.get(&(1, 1)).map(String::as_str),
+            Some("#Sheet2!C3")
+        );
     }
 
     /// Build a small real .xlsx in memory for load tests.
