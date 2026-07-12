@@ -97,7 +97,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run_tui(proj, parsed.input) {
+    match run_tui(proj, parsed.input, parsed.vim) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("yppxy: {e}");
@@ -111,14 +111,16 @@ struct Args {
     gantt_md: Option<String>,
     save: Option<String>,
     help: bool,
+    vim: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut out = Args { input: None, gantt_md: None, save: None, help: false };
+    let mut out = Args { input: None, gantt_md: None, save: None, help: false, vim: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => out.help = true,
+            "--vim" => out.vim = true,
             "--gantt-md" => {
                 i += 1;
                 out.gantt_md = Some(args.get(i).ok_or("--gantt-md needs a path")?.clone());
@@ -201,6 +203,33 @@ fn next_monday() -> DateTime {
     DateTime::from_ymd_hm(2026, 1, 5, 8, 0) // a Monday
 }
 
+/// Path to the view-prefs file: `$XDG_CONFIG_HOME/yppxy/prefs` (or `~/.config`).
+fn prefs_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("yppxy").join("prefs"))
+}
+
+/// Load the persisted theme preference (light/dark); defaults to dark.
+fn load_theme_pref() -> bool {
+    let Some(p) = prefs_path() else { return false };
+    let Ok(text) = std::fs::read_to_string(p) else { return false };
+    text.lines()
+        .find_map(|l| l.strip_prefix("theme="))
+        .map(|v| v.trim() == "light")
+        .unwrap_or(false)
+}
+
+/// Persist the theme preference. Best-effort — failures are ignored.
+fn save_theme_pref(light: bool) {
+    let Some(p) = prefs_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, format!("theme={}\n", if light { "light" } else { "dark" }));
+}
+
 fn window_title(path: &Option<String>, dirty: bool) -> String {
     let name = path
         .as_deref()
@@ -216,6 +245,8 @@ enum PromptKind {
     Duration,
     AddPredecessor,
     SaveAs,
+    Find,
+    VimCommand,
 }
 
 struct Prompt {
@@ -242,6 +273,11 @@ struct App {
     backstage: Option<Backstage>,
     light: bool,
     start: bool,
+    // undo/redo, find, vim
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+    find_query: String,
+    vim: bool,
     // geometry recorded during draw for mouse hit-testing
     list_y0: u16,   // absolute y of the first task row
     list_left_w: u16, // width of the task pane (left of the gantt)
@@ -251,7 +287,7 @@ struct App {
 const RIBBON_H: u16 = 6; // tab strip (1) + body (5: border, 2 rows, separator, titles)
 
 impl App {
-    fn new(proj: Project, path: Option<String>) -> App {
+    fn new(proj: Project, path: Option<String>, vim: bool) -> App {
         let start = path.is_none();
         let mut app = App {
             proj,
@@ -268,14 +304,53 @@ impl App {
             ribbon: Ribbon::new(),
             rfocus: ribbon::Focus::None,
             backstage: None,
-            light: false,
+            light: load_theme_pref(),
             start,
             list_y0: 0,
             list_left_w: 0,
             gantt_x0: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            find_query: String::new(),
+            vim,
         };
         app.reschedule();
         app
+    }
+
+    /// Push the current project onto the undo stack before a mutation.
+    fn snapshot(&mut self) {
+        self.undo.push(self.proj.clone());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.proj, prev));
+            self.after_history();
+            self.status = "Undo".into();
+        } else {
+            self.status = "Nothing to undo".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.proj, next));
+            self.after_history();
+            self.status = "Redo".into();
+        } else {
+            self.status = "Nothing to redo".into();
+        }
+    }
+
+    fn after_history(&mut self) {
+        self.dirty = true;
+        self.sel = self.sel.min(self.proj.tasks.len().saturating_sub(1));
+        self.reschedule();
     }
 
     fn open_backstage(&mut self) {
@@ -291,7 +366,9 @@ impl App {
     }
 
     fn toggle_milestone(&mut self) {
-        if let Some(t) = self.proj.tasks.get_mut(self.sel) {
+        if self.sel < self.proj.tasks.len() {
+            self.snapshot();
+            let t = &mut self.proj.tasks[self.sel];
             if t.duration_min == 0 {
                 t.duration_min = 480;
                 t.milestone = false;
@@ -306,6 +383,58 @@ impl App {
 
     fn theme_toggle(&mut self) {
         self.light = !self.light;
+        save_theme_pref(self.light);
+    }
+
+    /// Find the next task whose name contains `query` (case-insensitive),
+    /// searching from just after the current selection and wrapping around.
+    fn find(&mut self, query: &str) {
+        let q = query.trim().to_lowercase();
+        if !q.is_empty() {
+            self.find_query = q;
+        }
+        if self.find_query.is_empty() || self.proj.tasks.is_empty() {
+            return;
+        }
+        let n = self.proj.tasks.len();
+        for step in 1..=n {
+            let i = (self.sel + step) % n;
+            if self.proj.tasks[i].name.to_lowercase().contains(&self.find_query) {
+                self.sel = i;
+                self.status = format!("Found '{}'  (F3 next)", self.find_query);
+                return;
+            }
+        }
+        self.status = format!("No task matching '{}'", self.find_query);
+    }
+
+    /// Run a vim `:` command line (`w`, `q`, `wq`/`x`, `q!`, `e <path>`).
+    fn vim_run(&mut self, cmd: &str) {
+        match cmd.trim() {
+            "w" => self.save(),
+            "q" => {
+                if self.dirty {
+                    self.status = "Unsaved changes — :q! to force, or :wq to save".into();
+                } else {
+                    self.quit = true;
+                }
+            }
+            "q!" => self.quit = true,
+            "wq" | "x" => {
+                self.save();
+                if !self.dirty {
+                    self.quit = true;
+                }
+            }
+            other if other.starts_with("e ") => {
+                let path = other[2..].trim().to_string();
+                if !path.is_empty() {
+                    self.open_file(&path);
+                }
+            }
+            "" => {}
+            other => self.status = format!("Not a command: :{other}"),
+        }
     }
 
     /// Background for the selected row, theme-aware.
@@ -373,6 +502,7 @@ impl App {
     // ---- edits ----
 
     fn add_task(&mut self) {
+        self.snapshot();
         let level = self.proj.tasks.get(self.sel).map(|t| t.outline_level).unwrap_or(1);
         let uid = self.proj.tasks.iter().map(|t| t.uid).max().unwrap_or(0) + 1;
         let at = (self.sel + 1).min(self.proj.tasks.len());
@@ -389,6 +519,7 @@ impl App {
         if self.proj.tasks.is_empty() {
             return;
         }
+        self.snapshot();
         let uid = self.proj.tasks[self.sel].uid;
         self.proj.tasks.remove(self.sel);
         // Drop dangling predecessor links to the removed task.
@@ -403,9 +534,10 @@ impl App {
     }
 
     fn indent(&mut self, delta: i32) {
-        if let Some(t) = self.proj.tasks.get_mut(self.sel) {
-            let lvl = (t.outline_level as i32 + delta).clamp(1, 20) as u32;
-            t.outline_level = lvl;
+        if self.sel < self.proj.tasks.len() {
+            self.snapshot();
+            let t = &mut self.proj.tasks[self.sel];
+            t.outline_level = (t.outline_level as i32 + delta).clamp(1, 20) as u32;
             self.mark_dirty();
             self.reschedule();
         }
@@ -413,7 +545,9 @@ impl App {
 
     fn set_duration(&mut self, text: &str) {
         if let Some(min) = parse_duration(text, &self.proj) {
-            if let Some(t) = self.proj.tasks.get_mut(self.sel) {
+            if self.sel < self.proj.tasks.len() {
+                self.snapshot();
+                let t = &mut self.proj.tasks[self.sel];
                 t.duration_min = min;
                 t.milestone = min == 0;
                 self.mark_dirty();
@@ -425,8 +559,9 @@ impl App {
     }
 
     fn rename(&mut self, text: &str) {
-        if let Some(t) = self.proj.tasks.get_mut(self.sel) {
-            t.name = text.to_string();
+        if self.sel < self.proj.tasks.len() {
+            self.snapshot();
+            self.proj.tasks[self.sel].name = text.to_string();
             self.mark_dirty();
         }
     }
@@ -441,12 +576,12 @@ impl App {
             self.status = format!("No other task with ID {uid}");
             return;
         }
-        let t = &mut self.proj.tasks[self.sel];
-        if t.predecessors.iter().any(|p| p.uid == uid) {
+        if self.proj.tasks[self.sel].predecessors.iter().any(|p| p.uid == uid) {
             self.status = format!("Already depends on {uid}");
             return;
         }
-        t.predecessors.push(Predecessor { uid, link: LinkType::FinishStart, lag_min: 0 });
+        self.snapshot();
+        self.proj.tasks[self.sel].predecessors.push(Predecessor { uid, link: LinkType::FinishStart, lag_min: 0 });
         self.mark_dirty();
         self.reschedule();
     }
@@ -632,14 +767,14 @@ fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
 
 // ---- TUI loop ---------------------------------------------------------------
 
-fn run_tui(proj: Project, path: Option<String>) -> io::Result<()> {
+fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(proj, path);
+    let mut app = App::new(proj, path, vim);
     let mut title = String::new();
 
     let res = loop {
@@ -732,6 +867,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::Rename => app.rename(&text),
                     PromptKind::Duration => app.set_duration(&text),
                     PromptKind::AddPredecessor => app.add_predecessor(&text),
+                    PromptKind::Find => app.find(&text),
+                    PromptKind::VimCommand => app.vim_run(&text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
                             app.path = Some(text.trim().to_string());
@@ -782,6 +919,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
         match k.code {
             KeyCode::Char('s') => app.save(),
             KeyCode::Char('e') => app.export_md(),
+            KeyCode::Char('z') => app.undo(),
+            KeyCode::Char('y') | KeyCode::Char('r') => app.redo(),
+            KeyCode::Char('f') => {
+                app.prompt = Some(Prompt { kind: PromptKind::Find, label: "Find".into(), buf: String::new() });
+            }
             KeyCode::Char('q') => app.quit = true, // Ctrl+Q: quit even if dirty
             _ => {}
         }
@@ -821,7 +963,16 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('p') => {
             app.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
         }
+        KeyCode::F(3) => app.find(""), // repeat the last search
         KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
+        // Vim niceties (only when launched with --vim).
+        KeyCode::Char(':') if app.vim => {
+            app.prompt = Some(Prompt { kind: PromptKind::VimCommand, label: ":".into(), buf: String::new() });
+        }
+        KeyCode::Char('u') if app.vim => app.undo(),
+        KeyCode::Char('/') if app.vim => {
+            app.prompt = Some(Prompt { kind: PromptKind::Find, label: "/".into(), buf: String::new() });
+        }
         _ => {}
     }
 }
@@ -1308,12 +1459,14 @@ fn build_gantt_row(
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+S save · Ctrl+E export · q quit";
+    let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · q quit";
     let text = if app.status.is_empty() { help.to_string() } else { app.status.clone() };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(format!(" {text}"), Style::default().fg(Color::Gray)))),
-        area,
-    );
+    let mut spans = Vec::new();
+    if app.vim {
+        spans.push(Span::styled(" -- VIM -- ", Style::default().fg(Color::Black).bg(Color::Green)));
+    }
+    spans.push(Span::styled(format!(" {text}"), Style::default().fg(Color::Gray)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
@@ -1386,7 +1539,7 @@ mod tests {
 
     #[test]
     fn summaries_follow_outline() {
-        let mut app = App::new(new_project(), None);
+        let mut app = App::new(new_project(), None, false);
         app.add_task(); // second task at level 1
         // Make the second task a child of the first.
         app.sel = 1;
@@ -1402,7 +1555,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let path = std::env::var("YPPXY_PREVIEW").unwrap();
         let proj = load(&path).unwrap();
-        let mut app = App::new(proj, Some(path));
+        let mut app = App::new(proj, Some(path), false);
         let (w, h) = (110u16, 22u16);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1431,7 +1584,7 @@ mod tests {
             predecessors: vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 0 }],
             ..Task::default()
         });
-        let mut app = App::new(proj, Some("plan.yppx".into()));
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -1469,7 +1622,7 @@ mod tests {
     fn ribbon_renders_tabs_and_groups() {
         let mut proj = new_project();
         proj.tasks.push(Task { uid: 2, id: 2, name: "Build".into(), outline_level: 1, duration_min: 960, ..Task::default() });
-        let mut app = App::new(proj, Some("plan.yppx".into()));
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
         let s = buffer_text(&mut app, 110, 24);
         assert!(s.contains("File") && s.contains("Task") && s.contains("Schedule") && s.contains("View"));
         assert!(s.contains("Milestone"), "ribbon body missing");
@@ -1479,16 +1632,64 @@ mod tests {
     #[test]
     fn backstage_and_start_render() {
         // start screen
-        let mut app = App::new(new_project(), None);
+        let mut app = App::new(new_project(), None, false);
         assert!(app.start);
         let s = buffer_text(&mut app, 100, 22);
         assert!(s.contains("Welcome") && s.contains("New schedule"));
 
         // backstage
-        let mut app = App::new(new_project(), Some("plan.yppx".into()));
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.open_backstage();
         let s = buffer_text(&mut app, 100, 22);
         assert!(s.contains("File") && s.contains("Open") && s.contains("Export Gantt"));
+    }
+
+    #[test]
+    fn undo_redo_restores_tasks() {
+        let mut app = App::new(new_project(), None, false);
+        assert_eq!(app.proj.tasks.len(), 1);
+        app.add_task();
+        app.add_task();
+        assert_eq!(app.proj.tasks.len(), 3);
+        app.undo();
+        assert_eq!(app.proj.tasks.len(), 2);
+        app.undo();
+        assert_eq!(app.proj.tasks.len(), 1);
+        app.redo();
+        assert_eq!(app.proj.tasks.len(), 2);
+        // a fresh edit clears the redo stack
+        app.add_task();
+        app.redo();
+        assert_eq!(app.proj.tasks.len(), 3);
+    }
+
+    #[test]
+    fn find_selects_matching_task_and_wraps() {
+        let mut proj = new_project();
+        proj.tasks[0].name = "Alpha".into();
+        proj.tasks.push(Task { uid: 2, id: 2, name: "Bravo".into(), outline_level: 1, duration_min: 480, ..Task::default() });
+        proj.tasks.push(Task { uid: 3, id: 3, name: "Charlie".into(), outline_level: 1, duration_min: 480, ..Task::default() });
+        let mut app = App::new(proj, None, false);
+        app.find("charlie");
+        assert_eq!(app.sel, 2);
+        // F3-style repeat from the end wraps back to Alpha (no more Charlie)
+        app.find("");
+        assert_eq!(app.sel, 2); // only one Charlie → stays
+        app.find("a"); // matches Alpha/Bravo/Charlie — next after sel 2 wraps to 0
+        assert_eq!(app.sel, 0);
+    }
+
+    #[test]
+    fn vim_commands_save_and_quit() {
+        let mut app = App::new(new_project(), Some("/nonexistent/dir/plan.yppx".into()), true);
+        app.vim_run("q"); // dirty? no — fresh project isn't dirty
+        assert!(app.quit);
+        let mut app = App::new(new_project(), None, true);
+        app.add_task(); // now dirty
+        app.vim_run("q"); // should refuse
+        assert!(!app.quit);
+        app.vim_run("q!"); // force
+        assert!(app.quit);
     }
 
     #[test]
@@ -1498,7 +1699,7 @@ mod tests {
         let title = "Bridge Retrofit";
         let mut sval: Vec<u8> = title.bytes().collect();
         sval.push(0);
-        while sval.len() % 4 != 0 {
+        while !sval.len().is_multiple_of(4) {
             sval.push(0);
         }
         let mut values = Vec::new();
@@ -1535,7 +1736,7 @@ mod tests {
 
     #[test]
     fn add_and_delete_keep_schedule_consistent() {
-        let mut app = App::new(new_project(), None);
+        let mut app = App::new(new_project(), None, false);
         app.add_task();
         app.sel = 1;
         app.add_predecessor("1"); // depend on task 1
