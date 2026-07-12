@@ -171,11 +171,41 @@ Sum/Average/Count in the status bar. Try it: `cargo run -p gridcore --example ge
 xlsxy assets/sample.xlsx`. The design and roadmap (conformance scoreboard,
 dynamic arrays, pivot engine) live in [SPREADSHEET.md](SPREADSHEET.md).
 
+## Yppxy — project schedules too
+
+Completing the trilogy (`doc→docx`, `xls→xlsx`, **`mpp→yppx`**), the workspace
+ships **`yppxy`**, a terminal editor for **project schedules** built on
+`projcore`, a dependency-free scheduling engine. It reads Microsoft Project's
+open **MSPDI** XML (what Project produces via *Save As → XML*), schedules it with
+a real **Critical Path Method** engine — forward/backward passes over
+working-time calendars, computing early/late start & finish, total/free slack,
+and the critical path — and saves to a native **`.yppx`** package (an OPC
+ZIP container, the project analog of `.docx`/`.xlsx`). The TUI is a task outline
+beside a **live terminal Gantt chart** that reschedules on every edit; critical
+tasks show in amber, summaries roll up over their children, milestones as
+diamonds. Dependencies (FS/SS/FF/SF with lag/lead) and hard constraints
+(SNET/FNET/MSO/MFO…) are modeled; a schedule exports to a **Markdown/Mermaid
+Gantt** block that renders anywhere docxy's diagrams do.
+
+```sh
+yppxy plan.xml                    # open MSPDI XML (or a .yppx package)
+yppxy plan.yppx --gantt-md out.md # headless: export a Markdown Gantt chart
+yppxy plan.xml  --save out.yppx   # headless: convert to the native package
+```
+
+In the editor: `n` add task, `d` set duration (`3d`/`4h`/`2w`), `p` add a
+dependency, `Tab` indent (which auto-forms summary tasks), `Enter` rename,
+`Ctrl-S` save, `Ctrl-E` export. Try it:
+`yppxy corpus/mspdi/10-summary.xml`. A separate crate, **`mppread`**, reads the
+OLE2 Compound File container of legacy binary `.mpp` files (the documented
+foundation for importing them when MS Project isn't around to export MSPDI).
+
 ## Install
 
 ```sh
 cargo install docxy   # the document editor
 cargo install xlsxy   # the spreadsheet editor
+cargo install yppxy   # the project scheduler
 ```
 
 Or grab prebuilt binaries (Linux / Windows / macOS) from the
@@ -203,17 +233,24 @@ cargo build --release
 cargo test
 ```
 
-The workspace has five crates:
+The workspace has eight crates:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
-  DEFLATE, XML pull parser) shared by both engines.
+  DEFLATE, XML pull parser) shared by every engine.
 - **`docxcore`** — the WordprocessingML engine (document model, rendering,
   and the from-scratch PDF writer). No third-party dependencies.
 - **`gridcore`** — the SpreadsheetML engine (workbook model, formula
   parser/evaluator, dependency-graph recalculation, lossless xlsx I/O).
+- **`projcore`** — the project-scheduling engine (task/calendar model, MSPDI
+  read/write, Critical Path Method scheduler, Markdown/Mermaid Gantt export,
+  native `.yppx` OPC package). `std`-only, on top of `opccore`.
+- **`mppread`** — `std`-only reader for the OLE2 Compound File container of
+  legacy binary `.mpp`/`.doc`/`.xls` files (MS-CFB).
 - **`docxy`** — the document TUI (ratatui), clipboard (arboard), and image
   rendering (ratatui-image).
 - **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).
+- **`yppxy`** — the project-scheduler TUI with a live terminal Gantt chart
+  (ratatui).
 
 ### Examples
 
@@ -221,6 +258,9 @@ The workspace has five crates:
 cargo run -p docxcore --example gen_sample [out.docx]   # build the showcase doc
 cargo run -p docxcore --example dump_doc -- assets/sample.docx   # inspect a .docx
 cargo run -p gridcore --example gen_sample_xlsx   # build the showcase workbook
+cargo run -p projcore --example gantt_md -- corpus/mspdi/10-summary.xml  # Gantt → Markdown
+cargo run -p projcore --example convert  -- in.xml out.yppx   # MSPDI ⇄ .yppx
+cargo run -p mppread  --example streams  -- some.mpp   # list a .mpp's streams
 ```
 
 ## License
