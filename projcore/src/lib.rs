@@ -9,11 +9,14 @@
 //! - [`model`] — the pure domain model (tasks, links, resources, calendars).
 //! - [`mspdi`] — reader for MS Project's documented open XML interchange
 //!   format, the interop bridge that avoids the undocumented binary `.mpp`.
+//! - [`schedule`] — the Critical Path Method engine (forward/backward passes
+//!   over working-time calendars).
+//! - [`gantt`] — export a scheduled project as a Markdown/Mermaid Gantt chart.
 //!
-//! The scheduler (Critical Path Method) and the native `.yppx` package land in
-//! subsequent layers.
+//! The native `.yppx` package lands in a subsequent layer.
 
 pub mod datetime;
+pub mod gantt;
 pub mod model;
 pub mod mspdi;
 pub mod schedule;
