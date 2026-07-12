@@ -188,6 +188,10 @@ pub struct Sheet {
     /// Merged regions (r1, c1, r2, c2), 0-based inclusive. Rendered read-only
     /// and preserved on save.
     pub merges: Vec<(u32, u32, u32, u32)>,
+    /// Frozen panes as (rows, cols) from the sheet's `<pane state="frozen">`
+    /// (0 = not frozen in that axis). Preserved on save via the worksheet splice;
+    /// the viewer freezes the leading rows/cols on open.
+    pub freeze: (u32, u32),
 }
 
 impl Sheet {

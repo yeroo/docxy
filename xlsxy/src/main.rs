@@ -833,8 +833,6 @@ struct App {
     formula_view: bool,
     light_theme: bool,
     auto_hide_ribbon: bool,
-    /// Frozen (rows, cols) that stay pinned while scrolling.
-    freeze: (u32, u32),
     /// The pending Find text while the Replace-with prompt is open.
     replace_find: Option<String>,
     /// Vim-mode state (Some when launched with `--vim`).
@@ -897,7 +895,6 @@ impl App {
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
-            freeze: (0, 0),
             replace_find: None,
             vim: None,
             sheet_picker: None,
@@ -1943,7 +1940,7 @@ impl App {
         if self.formula_view {
             v.push(ribbon::Act::FormulaView);
         }
-        if self.freeze != (0, 0) {
+        if self.freeze() != (0, 0) {
             v.push(ribbon::Act::FreezePanes);
         }
         if self.light_theme {
@@ -2117,16 +2114,34 @@ impl App {
         );
     }
 
+    /// The current sheet's frozen panes as (rows, cols) — read from the file's
+    /// `<pane state="frozen">` on open, and updated by [`Self::toggle_freeze`].
+    fn freeze(&self) -> (u32, u32) {
+        self.pkg
+            .workbook
+            .sheets
+            .get(self.sheet)
+            .map(|s| s.freeze)
+            .unwrap_or((0, 0))
+    }
+
+    fn set_freeze(&mut self, f: (u32, u32)) {
+        if let Some(s) = self.pkg.workbook.sheets.get_mut(self.sheet) {
+            s.freeze = f;
+        }
+    }
+
     fn toggle_freeze(&mut self) {
-        if self.freeze == (0, 0) {
-            self.freeze = self.cur;
-            self.status = Some(if self.cur == (0, 0) {
+        if self.freeze() == (0, 0) {
+            let at = self.cur;
+            self.set_freeze(at);
+            self.status = Some(if at == (0, 0) {
                 "Nothing to freeze at A1".to_string()
             } else {
-                format!("Froze {} row(s), {} col(s)", self.cur.0, self.cur.1)
+                format!("Froze {} row(s), {} col(s)", at.0, at.1)
             });
         } else {
-            self.freeze = (0, 0);
+            self.set_freeze((0, 0));
             self.status = Some("Unfroze panes".to_string());
         }
     }
@@ -3394,7 +3409,7 @@ fn draw(app: &mut App, f: &mut Frame) {
     app.grid_area = grid;
 
     // Freeze: keep the scroll origin at or past the frozen region.
-    let (fr, fc) = app.freeze;
+    let (fr, fc) = app.freeze();
     if app.left < fc {
         app.left = fc;
     }
@@ -5122,9 +5137,9 @@ mod tests {
         assert!(app.formula_view);
         app.cur = (3, 2);
         app.toggle_freeze();
-        assert_eq!(app.freeze, (3, 2));
+        assert_eq!(app.freeze(), (3, 2));
         app.toggle_freeze();
-        assert_eq!(app.freeze, (0, 0));
+        assert_eq!(app.freeze(), (0, 0));
         app.toggle_theme();
         assert!(app.light_theme);
         let t = app.ribbon_toggles();

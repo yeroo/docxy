@@ -867,6 +867,14 @@ fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
                         sheet.merges.push(rect);
                     }
                 }
+                // A frozen pane: the leading `ySplit` rows / `xSplit` cols stay put.
+                "pane" => {
+                    if matches!(p.attr("state"), "frozen" | "frozenSplit") {
+                        let cols = p.attr("xSplit").parse::<u32>().unwrap_or(0);
+                        let rows = p.attr("ySplit").parse::<u32>().unwrap_or(0);
+                        sheet.freeze = (rows, cols);
+                    }
+                }
                 _ => {}
             },
             Event::End => {
@@ -2150,6 +2158,25 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_frozen_pane() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let frozen = format!(
+            "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView>\
+             <pane xSplit=\"2\" ySplit=\"3\" topLeftCell=\"C4\" state=\"frozen\"/>\
+             </sheetView></sheetViews><sheetData/></worksheet>"
+        );
+        assert_eq!(parse_worksheet(&frozen, &[]).freeze, (3, 2)); // (rows, cols)
+
+        // A plain split pane (scrollbar split, not frozen) is ignored.
+        let split = format!(
+            "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView>\
+             <pane xSplit=\"1\" ySplit=\"1\" state=\"split\"/>\
+             </sheetView></sheetViews><sheetData/></worksheet>"
+        );
+        assert_eq!(parse_worksheet(&split, &[]).freeze, (0, 0));
+    }
 
     /// Build a small real .xlsx in memory for load tests.
     fn fixture() -> Vec<u8> {
