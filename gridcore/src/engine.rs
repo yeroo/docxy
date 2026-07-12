@@ -700,6 +700,37 @@ impl Resolver for WbResolver<'_> {
     }
 }
 
+/// Evaluate a formula string in the context of cell (sheet, row, col) over the
+/// workbook — ad-hoc, for things like conditional-format rule conditions. Uses no
+/// clock/rand (CF conditions shouldn't be volatile). Returns the value, or
+/// `#NAME?` if the formula doesn't parse.
+pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &str) -> Value {
+    match formula::parse(src) {
+        Ok(ast) => {
+            let resolver = WbResolver {
+                wb,
+                clock: None,
+                rand_state: StdCell::new(0),
+                has_rand: false,
+            };
+            let mut ev = Eval::new(&resolver, sheet, (row, col));
+            ev.eval(&ast)
+        }
+        Err(_) => Value::Err(ExcelError::Name),
+    }
+}
+
+/// The (already recalculated) value of a cell as a [`Value`].
+pub fn cell_value_at(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Value {
+    let resolver = WbResolver {
+        wb,
+        clock: None,
+        rand_state: StdCell::new(0),
+        has_rand: false,
+    };
+    resolver.value(sheet, row, col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

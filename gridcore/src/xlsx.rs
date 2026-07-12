@@ -526,6 +526,11 @@ fn parse_styles(xml: &str) -> Styles {
     let mut fills: Vec<Option<(u8, u8, u8)>> = Vec::new();
     let mut xfs: Vec<Xf> = Vec::new();
 
+    let mut dxfs: Vec<crate::sheet::Dxf> = Vec::new();
+    let mut cur_dxf: Option<crate::sheet::Dxf> = None;
+    let mut dxf_in_font = false;
+    let mut dxf_in_fill = false;
+
     let mut p = XmlParser::new(xml);
     let mut in_fonts = false;
     let mut in_fills = false;
@@ -556,26 +561,58 @@ fn parse_styles(xml: &str) -> Styles {
                 }
                 "fonts" => in_fonts = true,
                 "font" if in_fonts => cur_font = Some(Font::default()),
+                // A `<dxf>` (differential format) for conditional formatting.
+                "dxf" => cur_dxf = Some(crate::sheet::Dxf::default()),
+                "font" if cur_dxf.is_some() => dxf_in_font = true,
+                "fill" if cur_dxf.is_some() => dxf_in_fill = true,
                 "b" => {
+                    let on = p.attr("val") != "0" && p.attr("val") != "false";
                     if let Some(f) = &mut cur_font {
-                        f.bold = p.attr("val") != "0" && p.attr("val") != "false";
+                        f.bold = on;
+                    } else if dxf_in_font {
+                        if let Some(d) = &mut cur_dxf {
+                            d.bold = Some(on);
+                        }
                     }
                 }
                 "i" => {
+                    let on = p.attr("val") != "0" && p.attr("val") != "false";
                     if let Some(f) = &mut cur_font {
-                        f.italic = p.attr("val") != "0" && p.attr("val") != "false";
+                        f.italic = on;
+                    } else if dxf_in_font {
+                        if let Some(d) = &mut cur_dxf {
+                            d.italic = Some(on);
+                        }
                     }
                 }
                 "color" => {
                     if let Some(f) = &mut cur_font {
                         f.color = parse_rgb(p.attr("rgb"));
+                    } else if dxf_in_font {
+                        if let Some(d) = &mut cur_dxf {
+                            d.color = parse_rgb(p.attr("rgb"));
+                        }
                     }
                 }
                 "fills" => in_fills = true,
                 "fill" if in_fills => cur_fill = Some(None),
-                "fgColor" => {
+                // dxf solid fills carry the colour in `<bgColor>` (or `<fgColor>`).
+                "bgColor" | "fgColor" => {
                     if let Some(fl) = &mut cur_fill {
-                        *fl = parse_rgb(p.attr("rgb"));
+                        if p.name().ends_with("fgColor") {
+                            *fl = parse_rgb(p.attr("rgb"));
+                        }
+                    } else if dxf_in_fill {
+                        let rgb = p.attr("rgb");
+                        // ARGB alpha "00" = fully transparent → no fill override.
+                        let transparent = rgb.len() == 8 && rgb.starts_with("00");
+                        if !transparent {
+                            if let Some(c) = parse_rgb(rgb) {
+                                if let Some(d) = &mut cur_dxf {
+                                    d.fill = Some(c);
+                                }
+                            }
+                        }
                     }
                 }
                 "cellXfs" => in_cellxfs = true,
@@ -612,14 +649,21 @@ fn parse_styles(xml: &str) -> Styles {
             Event::End => match local(p.name()) {
                 "fonts" => in_fonts = false,
                 "font" => {
+                    dxf_in_font = false;
                     if let Some(f) = cur_font.take() {
                         fonts.push(f);
                     }
                 }
                 "fills" => in_fills = false,
                 "fill" => {
+                    dxf_in_fill = false;
                     if let Some(fl) = cur_fill.take() {
                         fills.push(fl);
+                    }
+                }
+                "dxf" => {
+                    if let Some(d) = cur_dxf.take() {
+                        dxfs.push(d);
                     }
                 }
                 "cellXfs" => in_cellxfs = false,
@@ -632,7 +676,7 @@ fn parse_styles(xml: &str) -> Styles {
     if xfs.is_empty() {
         xfs.push(Xf::default());
     }
-    Styles { xfs }
+    Styles { xfs, dxfs }
 }
 
 /// Read the `count="N"` attribute of the element starting at `prefix`.
@@ -794,6 +838,16 @@ fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
 
     let mut cur_row: u32 = 0;
     let mut next_col: u32 = 0;
+
+    // Conditional-formatting parse state.
+    use crate::sheet::{CfKind, CfRule, CondFormat};
+    let mut cur_cf: Option<CondFormat> = None;
+    // (type, operator, dxfId, priority) of the rule being read.
+    let mut cf_rule: Option<(String, String, Option<usize>, i32)> = None;
+    let mut cf_formulas: Vec<String> = Vec::new();
+    let mut in_cf_formula = false;
+    let mut cf_formula_buf = String::new();
+
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -875,15 +929,79 @@ fn parse_worksheet(xml: &str, shared: &[String]) -> Sheet {
                         sheet.freeze = (rows, cols);
                     }
                 }
+                // Conditional formatting: a block of rules over `sqref` ranges.
+                "conditionalFormatting" => {
+                    let mut ranges = Vec::new();
+                    for tok in p.attr("sqref").split_whitespace() {
+                        if let Some(r) = parse_range_name(tok)
+                            .or_else(|| parse_cell_name(tok).map(|(r, c)| (r, c, r, c)))
+                        {
+                            ranges.push(r);
+                        }
+                    }
+                    cur_cf = Some(CondFormat {
+                        ranges,
+                        rules: Vec::new(),
+                    });
+                }
+                "cfRule" if cur_cf.is_some() => {
+                    cf_rule = Some((
+                        p.attr("type").to_string(),
+                        p.attr("operator").to_string(),
+                        p.attr("dxfId").parse::<usize>().ok(),
+                        p.attr("priority").parse::<i32>().unwrap_or(0),
+                    ));
+                    cf_formulas.clear();
+                }
+                "formula" if cf_rule.is_some() => {
+                    in_cf_formula = true;
+                    cf_formula_buf.clear();
+                }
                 _ => {}
             },
-            Event::End => {
-                if local(p.name()) == "row" {
-                    cur_row += 1;
+            Event::Text => {
+                if in_cf_formula {
+                    cf_formula_buf.push_str(p.text());
                 }
             }
+            Event::End => match local(p.name()) {
+                "row" => cur_row += 1,
+                "formula" if in_cf_formula => {
+                    in_cf_formula = false;
+                    cf_formulas.push(std::mem::take(&mut cf_formula_buf));
+                }
+                "cfRule" => {
+                    if let (Some((ty, op, dxf_id, priority)), Some(cf)) =
+                        (cf_rule.take(), cur_cf.as_mut())
+                    {
+                        let kind = match ty.as_str() {
+                            "cellIs" => CfKind::CellIs {
+                                op,
+                                formulas: std::mem::take(&mut cf_formulas),
+                            },
+                            "expression" => CfKind::Expression {
+                                formula: cf_formulas.first().cloned().unwrap_or_default(),
+                            },
+                            _ => CfKind::Other,
+                        };
+                        cf.rules.push(CfRule {
+                            kind,
+                            dxf_id,
+                            priority,
+                        });
+                    }
+                    cf_formulas.clear();
+                }
+                "conditionalFormatting" => {
+                    if let Some(cf) = cur_cf.take() {
+                        if !cf.rules.is_empty() {
+                            sheet.cond_formats.push(cf);
+                        }
+                    }
+                }
+                _ => {}
+            },
             Event::Eof => break,
-            _ => {}
         }
     }
 
@@ -2145,6 +2263,7 @@ pub fn new_xlsx() -> SheetPackage {
             }],
             styles: Styles {
                 xfs: vec![Xf::default()],
+                ..Default::default()
             },
             defined_names: Vec::new(),
             tables: Vec::new(),

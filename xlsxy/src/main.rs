@@ -3565,6 +3565,21 @@ fn draw(app: &mut App, f: &mut Frame) {
             if let Some((fr, fg, fb)) = xf.fill {
                 style = style.bg(Color::Rgb(fr, fg, fb));
             }
+            // Conditional formatting overlays a differential format on the cell.
+            if let Some(dxf) = gridcore::cf::cell_dxf(&app.pkg.workbook, app.sheet, row, col) {
+                if dxf.bold == Some(true) {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if dxf.italic == Some(true) {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if let Some((cr, cg, cb)) = dxf.color {
+                    style = style.fg(Color::Rgb(cr, cg, cb));
+                }
+                if let Some((fr, fg, fb)) = dxf.fill {
+                    style = style.bg(Color::Rgb(fr, fg, fb));
+                }
+            }
             let selected = row >= r1 && row <= r2 && col >= c1 && col <= c2;
             let is_cursor = (row, col) == (r, c);
             if is_cursor {

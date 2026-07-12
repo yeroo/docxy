@@ -192,6 +192,9 @@ pub struct Sheet {
     /// (0 = not frozen in that axis). Preserved on save via the worksheet splice;
     /// the viewer freezes the leading rows/cols on open.
     pub freeze: (u32, u32),
+    /// Conditional-formatting blocks (`<conditionalFormatting>`), evaluated at
+    /// render time to overlay a differential format on matching cells.
+    pub cond_formats: Vec<CondFormat>,
 }
 
 impl Sheet {
@@ -479,11 +482,51 @@ pub struct Xf {
     pub align: Align,
 }
 
+/// A differential format (`<dxf>`) referenced by a conditional-formatting rule.
+/// Only the properties the rule overrides are `Some`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dxf {
+    pub fill: Option<(u8, u8, u8)>,
+    pub color: Option<(u8, u8, u8)>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+}
+
+/// One conditional-formatting rule (`<cfRule>`).
+#[derive(Clone, Debug)]
+pub struct CfRule {
+    pub kind: CfKind,
+    /// Index into [`Styles::dxfs`], applied when the rule matches.
+    pub dxf_id: Option<usize>,
+    /// Excel `priority`: lower = higher precedence.
+    pub priority: i32,
+}
+
+/// The kind of a conditional-formatting rule that the engine can evaluate.
+#[derive(Clone, Debug)]
+pub enum CfKind {
+    /// `cellIs` with an operator and one or two operand formulas.
+    CellIs { op: String, formulas: Vec<String> },
+    /// `expression`: a formula truthy when the rule applies.
+    Expression { formula: String },
+    /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
+    Other,
+}
+
+/// A conditional-formatting block: its `rules` apply over `ranges` (`sqref`).
+#[derive(Clone, Debug, Default)]
+pub struct CondFormat {
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    pub rules: Vec<CfRule>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Styles {
     /// Indexed by a cell's `s=` attribute. Index 0 (default style) is always
     /// present after load.
     pub xfs: Vec<Xf>,
+    /// Differential formats (`<dxfs>`) referenced by conditional formatting.
+    pub dxfs: Vec<Dxf>,
 }
 
 impl Styles {
