@@ -1,0 +1,18 @@
+[package]
+name = "mppread"
+description = "Dependency-free reader for the OLE2 Compound File Binary (CFB) container used by legacy .doc/.xls/.mpp files; the first layer of MS Project .mpp import."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["cfb", "ole2", "mpp", "compound-file", "msproject"]
+categories = ["parser-implementations"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — the CFB container is a pure byte format.
