@@ -580,20 +580,34 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
 
 /// The attributes of the original `<w:document …>` element — all the `xmlns:*`
 /// declarations Word wrote — so the regenerated body's preserved raw slices stay
-/// namespace-bound. Ensures the `r`/`m` prefixes our serializer emits are present
-/// even if the original omitted them.
+/// namespace-bound. Ensures the `w`/`r`/`m` prefixes our serializer emits are
+/// present even if the original omitted them (e.g. a freshly created document's
+/// minimal template root).
 fn document_root_attrs(original: &str) -> Option<String> {
     let start = original.find("<w:document")?;
     let rest = &original[start + "<w:document".len()..];
     let end = rest.find('>')?;
     let mut attrs = rest[..end].trim().trim_end_matches('/').trim().to_string();
-    if !attrs.contains("xmlns:r") {
-        attrs.push_str(
-            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-        );
-    }
-    if !attrs.contains("xmlns:m") {
-        attrs.push_str(" xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"");
+    for (prefix, uri) in [
+        (
+            "xmlns:w",
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        ),
+        (
+            "xmlns:r",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        ),
+        (
+            "xmlns:m",
+            "http://schemas.openxmlformats.org/officeDocument/2006/math",
+        ),
+    ] {
+        if !attrs.contains(prefix) {
+            if !attrs.is_empty() {
+                attrs.push(' ');
+            }
+            attrs.push_str(&format!("{prefix}=\"{uri}\""));
+        }
     }
     Some(attrs)
 }
@@ -926,5 +940,12 @@ mod tests {
         let reloaded = load_package(&bytes).expect("reload new doc");
         assert_eq!(reloaded.document, document);
         assert!(reloaded.part_names().contains(&"word/styles.xml"));
+        // The saved document root must declare w/r/m or Word rejects it as
+        // "unbound prefix" — even for a freshly created doc whose template root
+        // is minimal (regression guard for document_root_attrs).
+        let doc_xml = String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap());
+        for ns in ["xmlns:w=", "xmlns:r=", "xmlns:m="] {
+            assert!(doc_xml.contains(ns), "new-doc root missing {ns}");
+        }
     }
 }
