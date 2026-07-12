@@ -14,6 +14,12 @@
 use std::io;
 use std::process::ExitCode;
 
+mod backstage;
+mod ribbon;
+
+use backstage::{Backstage, Item, Pane};
+use ribbon::{Act, Ribbon};
+
 use projcore::datetime::DateTime;
 use projcore::model::{LinkType, Predecessor, Project, Task};
 use projcore::schedule::{schedule, Schedule};
@@ -21,7 +27,8 @@ use projcore::{gantt, mspdi, yppx};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -204,10 +211,23 @@ struct App {
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
+    // ribbon + backstage + chrome
+    ribbon: Ribbon,
+    rfocus: ribbon::Focus,
+    backstage: Option<Backstage>,
+    light: bool,
+    start: bool,
+    // geometry recorded during draw for mouse hit-testing
+    list_y0: u16,   // absolute y of the first task row
+    list_left_w: u16, // width of the task pane (left of the gantt)
+    gantt_x0: u16,  // absolute x where the gantt inner area begins
 }
+
+const RIBBON_H: u16 = 6; // tab strip (1) + body (5: border, 2 rows, separator, titles)
 
 impl App {
     fn new(proj: Project, path: Option<String>) -> App {
+        let start = path.is_none();
         let mut app = App {
             proj,
             path,
@@ -220,9 +240,90 @@ impl App {
             prompt: None,
             status: String::new(),
             quit: false,
+            ribbon: Ribbon::new(),
+            rfocus: ribbon::Focus::None,
+            backstage: None,
+            light: false,
+            start,
+            list_y0: 0,
+            list_left_w: 0,
+            gantt_x0: 0,
         };
         app.reschedule();
         app
+    }
+
+    fn open_backstage(&mut self) {
+        let dir = self
+            .path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+            .filter(|d| !d.as_os_str().is_empty())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.backstage = Some(Backstage::open(dir));
+        self.rfocus = ribbon::Focus::None;
+    }
+
+    fn toggle_milestone(&mut self) {
+        if let Some(t) = self.proj.tasks.get_mut(self.sel) {
+            if t.duration_min == 0 {
+                t.duration_min = 480;
+                t.milestone = false;
+            } else {
+                t.duration_min = 0;
+                t.milestone = true;
+            }
+            self.mark_dirty();
+            self.reschedule();
+        }
+    }
+
+    fn theme_toggle(&mut self) {
+        self.light = !self.light;
+    }
+
+    /// Background for the selected row, theme-aware.
+    fn sel_bg(&self) -> Color {
+        if self.light {
+            Color::Rgb(208, 218, 230)
+        } else {
+            Color::Rgb(38, 48, 58)
+        }
+    }
+
+    /// Run a ribbon command.
+    fn apply_act(&mut self, act: Act) {
+        self.status.clear();
+        match act {
+            Act::AddTask => self.add_task(),
+            Act::DeleteTask => self.delete_task(),
+            Act::Milestone => self.toggle_milestone(),
+            Act::Indent => self.indent(1),
+            Act::Outdent => self.indent(-1),
+            Act::Rename => {
+                if let Some(t) = self.proj.tasks.get(self.sel) {
+                    self.prompt = Some(Prompt { kind: PromptKind::Rename, label: "Rename".into(), buf: t.name.clone() });
+                }
+            }
+            Act::Duration => {
+                self.prompt = Some(Prompt { kind: PromptKind::Duration, label: "Duration".into(), buf: String::new() });
+            }
+            Act::AddLink => {
+                self.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
+            }
+            Act::Constraint => self.status = "Date constraints — not implemented yet".into(),
+            Act::ExportGantt => self.export_md(),
+            Act::ScrollLeft => self.hscroll -= 1,
+            Act::ScrollRight => self.hscroll += 1,
+            Act::GoToStart => self.hscroll = 0,
+            Act::ThemeToggle => self.theme_toggle(),
+            Act::Save => self.save(),
+            Act::SaveAs => {
+                self.prompt = Some(Prompt { kind: PromptKind::SaveAs, label: "Save as".into(), buf: self.path.clone().unwrap_or_default() });
+            }
+            Act::Todo(name) => self.status = format!("{name} — not implemented yet"),
+        }
     }
 
     fn reschedule(&mut self) {
@@ -351,6 +452,132 @@ impl App {
             Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
+
+    /// Load a project from disk into the app, replacing the current one.
+    fn open_file(&mut self, path: &str) {
+        match load(path) {
+            Ok(p) => {
+                self.proj = p;
+                self.path = Some(path.to_string());
+                self.dirty = false;
+                self.sel = 0;
+                self.top = 0;
+                self.hscroll = 0;
+                self.backstage = None;
+                self.start = false;
+                self.reschedule();
+                self.status = format!("Opened {path}");
+            }
+            Err(e) => self.status = format!("Open failed: {e}"),
+        }
+    }
+
+    /// Refresh the backstage preview for the highlighted browser file.
+    fn bs_update_preview(&mut self) {
+        let Some(path) = self.backstage.as_ref().and_then(|b| b.selected_file()) else {
+            if let Some(b) = self.backstage.as_mut() {
+                b.preview.clear();
+                b.preview_path = None;
+            }
+            return;
+        };
+        let already = self
+            .backstage
+            .as_ref()
+            .map(|b| b.preview_path.as_deref() == Some(path.as_path()))
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let lines = match load(&path.to_string_lossy()) {
+            Ok(p) => {
+                let s = schedule(&p);
+                project_preview(&p, &s)
+            }
+            Err(e) => vec![format!("(cannot preview: {e})")],
+        };
+        if let Some(b) = self.backstage.as_mut() {
+            b.preview = lines;
+            b.preview_path = Some(path);
+            b.preview_scroll = 0;
+        }
+    }
+
+    /// Activate the highlighted backstage menu item.
+    fn bs_activate_item(&mut self) {
+        let Some(item) = self.backstage.as_ref().map(|b| b.item) else { return };
+        match item {
+            Item::New => {
+                self.proj = new_project();
+                self.path = None;
+                self.dirty = false;
+                self.sel = 0;
+                self.top = 0;
+                self.hscroll = 0;
+                self.backstage = None;
+                self.reschedule();
+                self.status = "New schedule".into();
+            }
+            Item::Open => {
+                if let Some(b) = self.backstage.as_mut() {
+                    b.pane = Pane::Browser;
+                }
+                self.bs_update_preview();
+            }
+            Item::Info => {
+                let lines = project_preview(&self.proj, &self.sched);
+                if let Some(b) = self.backstage.as_mut() {
+                    b.preview = lines;
+                    b.preview_path = None;
+                    b.pane = Pane::Preview;
+                }
+            }
+            Item::Save => {
+                self.backstage = None;
+                self.save();
+            }
+            Item::SaveAs => {
+                let cur = self
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                if let Some(b) = self.backstage.as_mut() {
+                    b.name_input = cur;
+                    b.pane = Pane::SaveAs;
+                }
+            }
+            Item::Export => {
+                self.backstage = None;
+                self.export_md();
+            }
+            Item::Exit => self.quit = true,
+        }
+    }
+}
+
+/// A few summary lines for the backstage preview / Info pane.
+fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
+    let fin = sched.project_finish.parts();
+    let start = sched.project_start.parts();
+    let leaves = proj.tasks.iter().filter(|t| !t.summary).count();
+    let crit = proj.tasks.iter().filter(|t| !t.summary && sched.get(t.uid).is_some_and(|r| r.critical)).count();
+    let mut out = vec![
+        format!("Project: {}", if proj.name.is_empty() { "Untitled" } else { &proj.name }),
+        format!("Start:   {:04}-{:02}-{:02}", start.year, start.month, start.day),
+        format!("Finish:  {:04}-{:02}-{:02}", fin.year, fin.month, fin.day),
+        format!("Tasks:   {} ({crit} critical)", leaves),
+        String::new(),
+    ];
+    for t in proj.tasks.iter().take(16) {
+        let indent = "  ".repeat(t.outline_level.saturating_sub(1) as usize);
+        let bullet = if t.summary { "▾" } else if t.is_milestone() { "◆" } else { "•" };
+        out.push(format!("{indent}{bullet} {}", t.name));
+    }
+    if proj.tasks.len() > 16 {
+        out.push(format!("  … {} more", proj.tasks.len() - 16));
+    }
+    out
 }
 
 fn empty_schedule() -> Schedule {
@@ -379,7 +606,7 @@ fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
 fn run_tui(proj: Project, path: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -398,6 +625,7 @@ fn run_tui(proj: Project, path: Option<String>) -> io::Result<()> {
         }
         match event::read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
+            Ok(Event::Mouse(m)) => on_mouse(&mut app, m),
             Ok(_) => {}
             Err(e) => break Err(e),
         }
@@ -407,9 +635,61 @@ fn run_tui(proj: Project, path: Option<String>) -> io::Result<()> {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     res
+}
+
+fn on_mouse(app: &mut App, m: MouseEvent) {
+    let (x, y) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::ScrollDown => {
+            if x >= app.gantt_x0 {
+                app.hscroll += 2;
+            } else if app.sel + 1 < app.proj.tasks.len() {
+                app.sel += 1;
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if x >= app.gantt_x0 {
+                app.hscroll -= 2;
+            } else {
+                app.sel = app.sel.saturating_sub(1);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if app.start || app.backstage.is_some() {
+                return; // modal surfaces are keyboard-driven for now
+            }
+            // Ribbon area (top RIBBON_H rows).
+            if y < RIBBON_H {
+                match app.ribbon.hit(x, y, true) {
+                    ribbon::Hit::Tab(i) => {
+                        if app.ribbon.tab_is_file(i) {
+                            app.open_backstage();
+                        } else {
+                            app.ribbon.set_active(i);
+                            app.rfocus = ribbon::Focus::Tab(i);
+                        }
+                    }
+                    ribbon::Hit::Button(act) => {
+                        app.apply_act(act);
+                        app.rfocus = ribbon::Focus::None;
+                    }
+                    ribbon::Hit::Outside => {}
+                }
+                return;
+            }
+            // Click a task row to select it.
+            if x < app.list_left_w && y >= app.list_y0 {
+                let idx = app.top + (y - app.list_y0) as usize;
+                if idx < app.proj.tasks.len() {
+                    app.sel = idx;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn on_key(app: &mut App, k: KeyEvent) {
@@ -444,8 +724,29 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
+    // Modal surfaces take keys before the editor.
+    if app.start {
+        start_key(app, k);
+        return;
+    }
+    if app.backstage.is_some() {
+        backstage_key(app, k);
+        return;
+    }
+    if app.rfocus != ribbon::Focus::None {
+        ribbon_key(app, k);
+        return;
+    }
+
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
     app.status.clear();
+
+    // Alt+F opens the File backstage (docxy/xlsxy parity).
+    if alt && matches!(k.code, KeyCode::Char('f') | KeyCode::Char('F')) {
+        app.open_backstage();
+        return;
+    }
 
     // Ctrl combinations first, so plain-letter shortcuts don't shadow them.
     if ctrl {
@@ -491,7 +792,149 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('p') => {
             app.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
         }
+        KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
         _ => {}
+    }
+}
+
+// ---- start screen, ribbon, backstage key handling ---------------------------
+
+fn start_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            app.start = false;
+            app.open_backstage();
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => app.quit = true,
+        _ => app.start = false, // Enter / N / any other key: start editing
+    }
+}
+
+fn ribbon_key(app: &mut App, k: KeyEvent) {
+    use ribbon::{Dir, Focus};
+    match k.code {
+        KeyCode::Esc => app.rfocus = Focus::None,
+        KeyCode::Left => step_ribbon(app, Dir::Left),
+        KeyCode::Right => step_ribbon(app, Dir::Right),
+        KeyCode::Up => step_ribbon(app, Dir::Up),
+        KeyCode::Down => step_ribbon(app, Dir::Down),
+        KeyCode::Enter => match app.rfocus {
+            Focus::Tab(t) => {
+                if app.ribbon.tab_is_file(t) {
+                    app.open_backstage();
+                } else {
+                    app.ribbon.set_active(t);
+                    app.rfocus = app.ribbon.enter_body();
+                }
+            }
+            Focus::Button(_) => {
+                if let Some((act, _)) = app.ribbon.focus_act(app.rfocus) {
+                    app.apply_act(act);
+                    app.rfocus = Focus::None;
+                }
+            }
+            Focus::None => {}
+        },
+        _ => {}
+    }
+}
+
+/// Move ribbon focus, keeping the active tab in sync when landing on a tab.
+fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
+    let nf = app.ribbon.nav(app.rfocus, dir);
+    if let ribbon::Focus::Tab(t) = nf {
+        if !app.ribbon.tab_is_file(t) {
+            app.ribbon.set_active(t);
+        }
+    }
+    app.rfocus = nf;
+}
+
+fn backstage_key(app: &mut App, k: KeyEvent) {
+    // Read pane/item without holding a borrow across app-method calls.
+    let Some((pane, item)) = app.backstage.as_ref().map(|b| (b.pane, b.item)) else { return };
+    match pane {
+        Pane::SaveAs => match k.code {
+            KeyCode::Esc => set_pane(app, Pane::Menu),
+            KeyCode::Enter => {
+                let name = app.backstage.as_ref().map(|b| b.name_input.trim().to_string()).unwrap_or_default();
+                if !name.is_empty() {
+                    let dir = app.backstage.as_ref().map(|b| b.dir.clone());
+                    if let Some(dir) = dir {
+                        app.path = Some(dir.join(&name).to_string_lossy().into_owned());
+                        app.backstage = None;
+                        app.save();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.name_input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.name_input.push(c);
+                }
+            }
+            _ => {}
+        },
+        Pane::Browser => match k.code {
+            KeyCode::Esc | KeyCode::Left => set_pane(app, Pane::Menu),
+            KeyCode::Up => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.move_sel(false);
+                }
+                app.bs_update_preview();
+            }
+            KeyCode::Down => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.move_sel(true);
+                }
+                app.bs_update_preview();
+            }
+            KeyCode::Backspace => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.go_up();
+                }
+                app.bs_update_preview();
+            }
+            KeyCode::Enter => {
+                let opened = app.backstage.as_mut().and_then(|b| b.enter());
+                match opened {
+                    Some(path) => app.open_file(&path.to_string_lossy()),
+                    None => app.bs_update_preview(),
+                }
+            }
+            _ => {}
+        },
+        Pane::Menu | Pane::Preview => match k.code {
+            KeyCode::Esc => app.backstage = None, // back to the schedule
+            KeyCode::Up => {
+                if let Some(b) = app.backstage.as_mut() {
+                    let i = backstage::ITEMS.iter().position(|&x| x == b.item).unwrap_or(0);
+                    b.item = backstage::ITEMS[i.saturating_sub(1)];
+                }
+            }
+            KeyCode::Down => {
+                if let Some(b) = app.backstage.as_mut() {
+                    let i = backstage::ITEMS.iter().position(|&x| x == b.item).unwrap_or(0);
+                    b.item = backstage::ITEMS[(i + 1).min(backstage::ITEMS.len() - 1)];
+                }
+            }
+            KeyCode::Right if item == Item::Open => {
+                set_pane(app, Pane::Browser);
+                app.bs_update_preview();
+            }
+            KeyCode::Enter => app.bs_activate_item(),
+            _ => {}
+        },
+    }
+}
+
+fn set_pane(app: &mut App, pane: Pane) {
+    if let Some(b) = app.backstage.as_mut() {
+        b.pane = pane;
     }
 }
 
@@ -499,16 +942,174 @@ fn on_key(app: &mut App, k: KeyEvent) {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if app.start {
+        draw_start(f, area);
+        return;
+    }
+    if app.backstage.is_some() {
+        draw_backstage(f, area, app);
+        if app.prompt.is_some() {
+            draw_prompt(f, area, app);
+        }
+        return;
+    }
+
+    // Reflect the theme toggle's on/off state in the ribbon.
+    app.ribbon.set_toggles(if app.light { vec![Act::ThemeToggle] } else { vec![] });
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // ribbon tab strip
+            Constraint::Length(5), // ribbon body (border, 2 rows, separator, titles)
+            Constraint::Length(1), // project header
+            Constraint::Min(3),    // tasks | gantt
+            Constraint::Length(1), // status / hint
+        ])
         .split(area);
-    draw_header(f, rows[0], app);
-    draw_body(f, rows[1], app);
-    draw_status(f, rows[2], app);
+    f.render_widget(Paragraph::new(app.ribbon.render_tabs(app.rfocus)), rows[0]);
+    f.render_widget(Paragraph::new(app.ribbon.render_body(app.rfocus)), rows[1]);
+    draw_header(f, rows[2], app);
+    draw_body(f, rows[3], app);
+    if app.rfocus != ribbon::Focus::None {
+        f.render_widget(Paragraph::new(app.ribbon.render_hint(app.rfocus, area.width)), rows[4]);
+    } else {
+        draw_status(f, rows[4], app);
+    }
     if app.prompt.is_some() {
         draw_prompt(f, area, app);
     }
+}
+
+fn draw_start(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("   yppxy", bold)),
+        Line::from(Span::styled("   terminal project scheduler — Critical Path Method + live Gantt", dim)),
+        Line::from(""),
+        Line::from("   [N] or Enter    New schedule"),
+        Line::from("   [O]             Open a project  (.xml · .yppx · .mpp)"),
+        Line::from("   [Q] or Esc      Quit"),
+        Line::from(""),
+        Line::from(Span::styled("   Tip: press F9 for the ribbon, Alt+F for the File menu.", dim)),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Welcome ")),
+        area,
+    );
+}
+
+fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
+    let Some(bs) = app.backstage.as_ref() else { return };
+    f.render_widget(Clear, area);
+    let outer = Block::default().borders(Borders::ALL).title(" File ");
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Min(20)])
+        .split(inner);
+
+    // Left: the vertical menu.
+    let mut menu: Vec<Line> = Vec::new();
+    for &it in backstage::ITEMS.iter() {
+        let selected = it == bs.item;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        menu.push(Line::from(Span::styled(format!(" {} ", it.label()), style)));
+    }
+    f.render_widget(Paragraph::new(menu), cols[0]);
+
+    // Right: content depends on the pane / item.
+    let body = cols[1];
+    match bs.pane {
+        Pane::Browser => draw_bs_browser(f, body, bs),
+        Pane::SaveAs => {
+            let dir = bs.dir.to_string_lossy();
+            let lines = vec![
+                Line::from(Span::styled("Save As", Style::default().add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(format!("Folder: {dir}")),
+                Line::from(vec![
+                    Span::raw("Name:   "),
+                    Span::raw(bs.name_input.clone()),
+                    Span::styled("▏", Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("Use .yppx (native) or .xml (MSPDI). Enter saves · Esc back", Style::default().add_modifier(Modifier::DIM))),
+            ];
+            f.render_widget(Paragraph::new(lines), body);
+        }
+        Pane::Menu | Pane::Preview => {
+            if bs.item == Item::Open {
+                draw_bs_browser(f, body, bs);
+            } else if bs.item == Item::Info || bs.pane == Pane::Preview {
+                let lines: Vec<Line> = bs.preview.iter().map(|s| Line::from(s.clone())).collect();
+                f.render_widget(Paragraph::new(lines), body);
+            } else {
+                let hint = match bs.item {
+                    Item::New => "Start a fresh schedule.",
+                    Item::Save => "Save to the current file.",
+                    Item::SaveAs => "Save under a new name.",
+                    Item::Export => "Export a Markdown/Mermaid Gantt chart.",
+                    Item::Exit => "Leave yppxy.",
+                    _ => "",
+                };
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(bs.item.label(), Style::default().add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from(hint),
+                        Line::from(""),
+                        Line::from(Span::styled("Enter to apply · Esc to close", Style::default().add_modifier(Modifier::DIM))),
+                    ]),
+                    body,
+                );
+            }
+        }
+    }
+}
+
+fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let focused = bs.pane == Pane::Browser;
+
+    // File list.
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!("Open — {}", bs.dir.to_string_lossy()),
+        Style::default().add_modifier(Modifier::DIM),
+    ))];
+    let h = cols[0].height.saturating_sub(1) as usize;
+    let start = bs.sel.saturating_sub(h.saturating_sub(1));
+    for (i, e) in bs.entries.iter().enumerate().skip(start).take(h) {
+        let icon = if e.is_parent { "⬑ " } else if e.is_dir { "▸ " } else { "  " };
+        let size = e.size_str();
+        let label = format!("{icon}{}", e.name);
+        let text = if size.is_empty() { label } else { format!("{label:<28} {size:>8}") };
+        let mut line = Line::from(text);
+        if i == bs.sel && focused {
+            line.style = Style::default().add_modifier(Modifier::REVERSED);
+        } else if e.locked {
+            line.style = Style::default().add_modifier(Modifier::DIM);
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), cols[0]);
+
+    // Preview of the highlighted project.
+    let mut prev: Vec<Line> = vec![Line::from(Span::styled("Preview", Style::default().add_modifier(Modifier::DIM)))];
+    prev.extend(bs.preview.iter().map(|s| Line::from(s.clone())));
+    f.render_widget(Paragraph::new(prev).block(Block::default().borders(Borders::LEFT)), cols[1]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -534,6 +1135,11 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         .split(area);
     let left = cols[0];
     let right = cols[1];
+
+    // Record geometry so mouse clicks can map to task rows / the gantt.
+    app.list_left_w = left.width;
+    app.list_y0 = left.y + 2; // border + column-header row
+    app.gantt_x0 = right.x + 1;
 
     // visible task rows (inner height minus borders and the column-header row)
     let inner_h = left.height.saturating_sub(3) as usize; // 2 border + 1 header
@@ -580,7 +1186,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!(" {slack:>6}"), Style::default().fg(Color::DarkGray)),
         ]);
         if i == app.sel {
-            line.style = Style::default().bg(Color::Rgb(38, 48, 58));
+            line.style = Style::default().bg(app.sel_bg());
         }
         left_lines.push(line);
     }
@@ -599,7 +1205,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         let r = app.sched.get(t.uid);
         let mut line = build_gantt_row(gw, app.hscroll, app.base_day, t, r);
         if i == app.sel {
-            line.style = Style::default().bg(Color::Rgb(38, 48, 58));
+            line.style = Style::default().bg(app.sel_bg());
         }
         right_lines.push(line);
     }
@@ -812,6 +1418,48 @@ mod tests {
         assert!(s.contains("Gantt"), "gantt pane missing");
         assert!(s.contains("Build"), "second task not rendered");
         assert!(s.contains('█'), "no gantt bar drawn");
+    }
+
+    fn buffer_text(app: &mut App, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut s = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                if let Some(c) = buf.cell((x, y)) {
+                    s.push_str(c.symbol());
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn ribbon_renders_tabs_and_groups() {
+        let mut proj = new_project();
+        proj.tasks.push(Task { uid: 2, id: 2, name: "Build".into(), outline_level: 1, duration_min: 960, ..Task::default() });
+        let mut app = App::new(proj, Some("plan.yppx".into()));
+        let s = buffer_text(&mut app, 110, 24);
+        assert!(s.contains("File") && s.contains("Task") && s.contains("Schedule") && s.contains("View"));
+        assert!(s.contains("Milestone"), "ribbon body missing");
+        assert!(s.contains("Gantt"), "gantt pane missing");
+    }
+
+    #[test]
+    fn backstage_and_start_render() {
+        // start screen
+        let mut app = App::new(new_project(), None);
+        assert!(app.start);
+        let s = buffer_text(&mut app, 100, 22);
+        assert!(s.contains("Welcome") && s.contains("New schedule"));
+
+        // backstage
+        let mut app = App::new(new_project(), Some("plan.yppx".into()));
+        app.open_backstage();
+        let s = buffer_text(&mut app, 100, 22);
+        assert!(s.contains("File") && s.contains("Open") && s.contains("Export Gantt"));
     }
 
     #[test]
