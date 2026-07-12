@@ -129,6 +129,7 @@ fn parse_task(p: &mut XmlParser) -> Task {
                             t.predecessors.push(pred);
                         }
                     }
+                    "Baseline" => parse_baseline(p, &mut t),
                     _ => p.skip_element(),
                 }
             }
@@ -137,6 +138,24 @@ fn parse_task(p: &mut XmlParser) -> Task {
         }
     }
     t
+}
+
+/// Parse a task `<Baseline>` element (we keep only Start/Finish).
+fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "Start" => t.baseline_start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => t.baseline_finish = DateTime::parse_mspdi(&text_of(p)),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
 }
 
 fn parse_predecessor(p: &mut XmlParser) -> Option<Predecessor> {
@@ -512,6 +531,14 @@ fn write_task(s: &mut String, t: &Task) {
         tag(s, 4, "LagFormat", "7");
         s.push_str("      </PredecessorLink>\n");
     }
+    if let (Some(bs), Some(bf)) = (t.baseline_start, t.baseline_finish) {
+        s.push_str("      <Baseline>\n");
+        tag(s, 4, "Number", "0");
+        tag(s, 4, "Start", &bs.to_mspdi());
+        tag(s, 4, "Finish", &bf.to_mspdi());
+        tag(s, 4, "Duration", &min_to_iso(t.duration_min));
+        s.push_str("      </Baseline>\n");
+    }
     s.push_str("    </Task>\n");
 }
 
@@ -711,6 +738,24 @@ mod tests {
             assert_eq!(a.stored_start, b.stored_start);
             assert_eq!(a.predecessors, b.predecessors); // link type + lag preserved
         }
+    }
+
+    #[test]
+    fn baseline_round_trips() {
+        let mut proj = Project { calendars: vec![Calendar::standard(1)], ..Project::default() };
+        proj.tasks.push(Task {
+            uid: 1,
+            id: 1,
+            name: "A".into(),
+            outline_level: 1,
+            duration_min: 960,
+            baseline_start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            baseline_finish: Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0)),
+            ..Task::default()
+        });
+        let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(back.tasks[0].baseline_start, proj.tasks[0].baseline_start);
+        assert_eq!(back.tasks[0].baseline_finish, proj.tasks[0].baseline_finish);
     }
 
     #[test]

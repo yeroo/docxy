@@ -120,6 +120,10 @@ pub struct Task {
     /// elsewhere.
     pub stored_start: Option<DateTime>,
     pub stored_finish: Option<DateTime>,
+    /// Baseline (the saved plan) start/finish, for planned-vs-current variance.
+    /// Set by "Set Baseline"; round-trips through MSPDI's `<Baseline>` element.
+    pub baseline_start: Option<DateTime>,
+    pub baseline_finish: Option<DateTime>,
 }
 
 impl Task {

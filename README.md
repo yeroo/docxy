@@ -211,10 +211,17 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | Enter · F2 | rename the task |
 | d | set duration (`3d` / `4h` / `2w`) |
 | p | add a predecessor by task ID |
+| c | set a date constraint (`SNET 2026-03-05`, `MSO …`, `none`) |
+| b | set the baseline (planned-vs-current variance in the header) |
+| Ctrl-F · F3 | find task by name · repeat |
+| Ctrl-Z · Ctrl-Y | undo · redo |
 | F9 · Alt-F | engage the ribbon · open the File menu |
 | Ctrl-S · Ctrl-E | save · export a Markdown Gantt |
 | Ctrl-Q · q | quit (q warns on unsaved changes) |
 | mouse | click a tab/button, click a task row, wheel to scroll/pan |
+
+Launch with `--vim` for a modal mode (`:w`/`:q`/`:wq`/`:q!`, `u` undo, `/`
+search). The light/dark theme persists between sessions.
 
 A separate crate, **`mppread`**, reads the OLE2 Compound File container of
 legacy binary `.mpp` files — today it decodes the documented metadata

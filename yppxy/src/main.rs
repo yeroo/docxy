@@ -24,7 +24,7 @@ use backstage::{Backstage, Item, Pane};
 use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
-use projcore::model::{LinkType, Predecessor, Project, Task};
+use projcore::model::{ConstraintType, LinkType, Predecessor, Project, Task};
 use projcore::schedule::{schedule, Schedule};
 use projcore::{gantt, mspdi, yppx};
 
@@ -247,6 +247,7 @@ enum PromptKind {
     SaveAs,
     Find,
     VimCommand,
+    Constraint,
 }
 
 struct Prompt {
@@ -408,6 +409,57 @@ impl App {
         self.status = format!("No task matching '{}'", self.find_query);
     }
 
+    /// Set a date constraint on the selected task from text like
+    /// `SNET 2026-03-05`, `MSO 2026-03-05`, or `none` / `asap`.
+    fn set_constraint(&mut self, text: &str) {
+        if self.sel >= self.proj.tasks.len() {
+            return;
+        }
+        let mut it = text.split_whitespace();
+        let kind = it.next().unwrap_or("").to_ascii_lowercase();
+        let ctype = match kind.as_str() {
+            "none" | "asap" => ConstraintType::AsSoonAsPossible,
+            "alap" => ConstraintType::AsLateAsPossible,
+            "snet" => ConstraintType::StartNoEarlierThan,
+            "snlt" => ConstraintType::StartNoLaterThan,
+            "fnet" => ConstraintType::FinishNoEarlierThan,
+            "fnlt" => ConstraintType::FinishNoLaterThan,
+            "mso" => ConstraintType::MustStartOn,
+            "mfo" => ConstraintType::MustFinishOn,
+            _ => {
+                self.status = "Constraint: TYPE [date] — SNET/SNLT/FNET/FNLT/MSO/MFO/ALAP/none".into();
+                return;
+            }
+        };
+        // Constraints other than ASAP/ALAP need a date.
+        let needs_date = !matches!(ctype, ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible);
+        let date = it.next().and_then(DateTime::parse_mspdi);
+        if needs_date && date.is_none() {
+            self.status = format!("{} needs a date, e.g. {kind} 2026-03-05", kind.to_uppercase());
+            return;
+        }
+        self.snapshot();
+        let t = &mut self.proj.tasks[self.sel];
+        t.constraint = ctype;
+        t.constraint_date = if needs_date { date } else { None };
+        self.mark_dirty();
+        self.reschedule();
+        self.status = format!("Constraint set: {}", kind.to_uppercase());
+    }
+
+    /// Snapshot the current computed schedule as the baseline (the saved plan).
+    fn set_baseline(&mut self) {
+        self.snapshot();
+        for t in &mut self.proj.tasks {
+            if let Some(r) = self.sched.get(t.uid) {
+                t.baseline_start = Some(r.early_start);
+                t.baseline_finish = Some(r.early_finish);
+            }
+        }
+        self.mark_dirty();
+        self.status = "Baseline set — variance now shows in the header".into();
+    }
+
     /// Run a vim `:` command line (`w`, `q`, `wq`/`x`, `q!`, `e <path>`).
     fn vim_run(&mut self, cmd: &str) {
         match cmd.trim() {
@@ -466,7 +518,11 @@ impl App {
             Act::AddLink => {
                 self.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
             }
-            Act::Constraint => self.status = "Date constraints — not implemented yet".into(),
+            Act::Constraint => {
+                let cur = self.proj.tasks.get(self.sel).map(constraint_hint).unwrap_or_default();
+                self.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
+            }
+            Act::Baseline => self.set_baseline(),
             Act::ExportGantt => self.export_md(),
             Act::ScrollLeft => self.hscroll -= 1,
             Act::ScrollRight => self.hscroll += 1,
@@ -869,6 +925,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::AddPredecessor => app.add_predecessor(&text),
                     PromptKind::Find => app.find(&text),
                     PromptKind::VimCommand => app.vim_run(&text),
+                    PromptKind::Constraint => app.set_constraint(&text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
                             app.path = Some(text.trim().to_string());
@@ -963,6 +1020,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('p') => {
             app.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
         }
+        KeyCode::Char('c') => {
+            let cur = app.proj.tasks.get(app.sel).map(constraint_hint).unwrap_or_default();
+            app.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
+        }
+        KeyCode::Char('b') => app.set_baseline(),
         KeyCode::F(3) => app.find(""), // repeat the last search
         KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
         // Vim niceties (only when launched with --vim).
@@ -1302,10 +1364,20 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         fin.year, fin.month, fin.day,
         app.proj.tasks.len(),
     );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))),
-        area,
-    );
+    let mut spans = vec![Span::styled(title, Style::default().add_modifier(Modifier::BOLD))];
+    // Baseline variance for the selected task.
+    if let Some(t) = app.proj.tasks.get(app.sel) {
+        if let (Some(bf), Some(r)) = (t.baseline_finish, app.sched.get(t.uid)) {
+            let delta = r.early_finish.day_number() - bf.day_number();
+            let (label, color) = match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => (format!("▲ {delta}d late"), CRIT),
+                std::cmp::Ordering::Less => (format!("▼ {}d early", -delta), ONTRACK),
+                std::cmp::Ordering::Equal => ("on baseline".to_string(), Color::Gray),
+            };
+            spans.push(Span::styled(format!("· {}: {label} ", truncate(&t.name, 16)), Style::default().fg(color)));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
@@ -1488,6 +1560,27 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // ---- small helpers ----------------------------------------------------------
+
+/// Prefill text for the constraint prompt from a task's current constraint.
+fn constraint_hint(t: &Task) -> String {
+    let code = match t.constraint {
+        ConstraintType::AsSoonAsPossible => return String::new(),
+        ConstraintType::AsLateAsPossible => "ALAP",
+        ConstraintType::StartNoEarlierThan => "SNET",
+        ConstraintType::StartNoLaterThan => "SNLT",
+        ConstraintType::FinishNoEarlierThan => "FNET",
+        ConstraintType::FinishNoLaterThan => "FNLT",
+        ConstraintType::MustStartOn => "MSO",
+        ConstraintType::MustFinishOn => "MFO",
+    };
+    match t.constraint_date {
+        Some(d) => {
+            let p = d.parts();
+            format!("{code} {:04}-{:02}-{:02}", p.year, p.month, p.day)
+        }
+        None => code.to_string(),
+    }
+}
 
 fn fmt_days(days: f64) -> String {
     if (days.round() - days).abs() < 1e-9 {
@@ -1690,6 +1783,24 @@ mod tests {
         assert!(!app.quit);
         app.vim_run("q!"); // force
         assert!(app.quit);
+    }
+
+    #[test]
+    fn constraint_snet_delays_start() {
+        let mut app = App::new(new_project(), None, false); // anchor Mon 2026-01-05
+        app.set_constraint("SNET 2026-01-08"); // Thursday
+        let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
+        assert_eq!(r.early_start.parts().day, 8);
+    }
+
+    #[test]
+    fn baseline_captures_plan_and_variance_shows() {
+        let mut app = App::new(new_project(), None, false);
+        app.set_baseline();
+        let bf = app.proj.tasks[0].baseline_finish.expect("baseline captured");
+        app.set_duration("5d"); // extend past the baseline
+        let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
+        assert!(r.early_finish.day_number() > bf.day_number(), "finish should slip past baseline");
     }
 
     #[test]

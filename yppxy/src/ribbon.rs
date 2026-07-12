@@ -21,6 +21,7 @@ pub enum Act {
     // Schedule
     AddLink,
     Constraint,
+    Baseline,
     // View
     ExportGantt,
     ScrollLeft,
@@ -464,14 +465,14 @@ fn schedule_groups() -> Vec<Group> {
             width: 22,
             rows: [
                 vec![btn("🔗 Link", 6, AddLink, "Add a predecessor by task ID (p)")],
-                vec![btn("⛓ Constraint", 12, Constraint, "Set a date constraint (SNET/MSO…)")],
+                vec![btn("⛓ Constraint", 12, Constraint, "Set a date constraint — SNET/MSO/… (c)")],
             ],
         },
         Group {
-            title: "Info",
+            title: "Baseline",
             width: 16,
             rows: [
-                vec![btn("◆ Critical path", 15, Todo("Critical path"), "Highlight only the critical path")],
+                vec![btn("⚑ Set baseline", 14, Baseline, "Snapshot the current plan as the baseline (b)")],
                 vec![btn("⟳ Reschedule", 12, Todo("Reschedule"), "Recompute (automatic on every edit)")],
             ],
         },
