@@ -93,7 +93,8 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.borders.top.is_some()
         || props.borders.bottom.is_some()
         || props.indent != 0
-        || !props.tabs.is_empty();
+        || !props.tabs.is_empty()
+        || !props.raw_props.is_empty();
     if !has_any {
         return;
     }
@@ -211,6 +212,13 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     if props.rtl {
         s.push_str("<w:bidi/>");
     }
+    // Preserved unmodeled pPr children (the paragraph-mark `w:rPr`, `outlineLvl`,
+    // shading, spacing, …). Emitted here, near the end of pPr — where the most
+    // structurally-sensitive of them, the paragraph-mark `w:rPr`, belongs (just
+    // before sectPr) so Word accepts the ordering.
+    for raw in &props.raw_props {
+        s.push_str(raw);
+    }
     // A section break (`<w:sectPr>`) is the last pPr child.
     if let Some(sect) = &props.section_break {
         s.push_str(sect);
@@ -292,7 +300,8 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.highlight.is_some()
         || p.size_half_pts.is_some()
         || p.font.is_some()
-        || p.style_id.is_some();
+        || p.style_id.is_some()
+        || !p.raw_props.is_empty();
     if !has_any {
         return;
     }
@@ -352,11 +361,19 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         VertAlign::Superscript => s.push_str("<w:vertAlign w:val=\"superscript\"/>"),
         VertAlign::Subscript => s.push_str("<w:vertAlign w:val=\"subscript\"/>"),
     }
+    // Preserved unmodeled rPr children (character spacing, kern, lang, shd, …).
+    for raw in &p.raw_props {
+        s.push_str(raw);
+    }
     s.push_str("</w:rPr>");
 }
 
 fn write_table(s: &mut String, t: &Table) {
     s.push_str("<w:tbl>");
+    // tblPr is the first tbl child; preserved verbatim when present.
+    if let Some(raw) = &t.raw_tblpr {
+        s.push_str(raw);
+    }
     if !t.grid.is_empty() {
         s.push_str("<w:tblGrid>");
         for w in &t.grid {
@@ -366,6 +383,10 @@ fn write_table(s: &mut String, t: &Table) {
     }
     for row in &t.rows {
         s.push_str("<w:tr>");
+        // trPr / tblPrEx precede the cells; preserved verbatim.
+        for raw in &row.raw_props {
+            s.push_str(raw);
+        }
         for cell in &row.cells {
             write_cell(s, cell);
         }
@@ -376,7 +397,12 @@ fn write_table(s: &mut String, t: &Table) {
 
 fn write_cell(s: &mut String, cell: &Cell) {
     s.push_str("<w:tc>");
-    if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+    if let Some(raw) = &cell.raw_tcpr {
+        // The original tcPr (already carries gridSpan/vMerge) — re-emit as-is so
+        // borders/shading/width/vAlign survive.
+        s.push_str(raw);
+    } else if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+        // A cell created in-editor: synthesize tcPr from the model.
         s.push_str("<w:tcPr>");
         if cell.grid_span > 1 {
             s.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", cell.grid_span));
@@ -431,6 +457,58 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unmodeled_para_table_and_cell_props() {
+        // A paragraph carrying shading + spacing (both unmodeled), and a table
+        // whose tblPr / trPr / tcPr carry borders + shading — none of which the
+        // model represents — must all survive a save round-trip instead of being
+        // silently dropped (docxy gap D-1).
+        let ppr = ParProps {
+            raw_props: vec![
+                "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FFFF00\"/>".to_string(),
+                "<w:spacing w:before=\"120\" w:after=\"120\"/>".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cell = Cell {
+            blocks: vec![para(ParProps::default(), vec![])],
+            raw_tcpr: Some(
+                "<w:tcPr><w:tcBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tcBorders>\
+                 <w:shd w:val=\"clear\" w:fill=\"D9D9D9\"/></w:tcPr>"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let table = Table {
+            grid: vec![100],
+            rows: vec![Row {
+                cells: vec![cell],
+                raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
+            }],
+            raw_tblpr: Some(
+                "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
+                    .to_string(),
+            ),
+        };
+        let d = Document {
+            body: vec![para(ppr, vec![]), Block::Table(table)],
+        };
+        let xml = document_to_xml(&d);
+        assert!(
+            xml.contains("w:fill=\"FFFF00\""),
+            "paragraph shading dropped"
+        );
+        assert!(
+            xml.contains("<w:spacing w:before=\"120\""),
+            "paragraph spacing dropped"
+        );
+        assert!(xml.contains("<w:tblBorders>"), "table borders dropped");
+        assert!(xml.contains("w:fill=\"D9D9D9\""), "cell shading dropped");
+        assert!(xml.contains("<w:trPr>"), "row properties dropped");
+        // And the whole thing round-trips to an identical model.
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
     fn run_properties_roundtrip() {
         let props = RunProps {
             bold: true,
@@ -447,6 +525,7 @@ mod tests {
             size_half_pts: Some(28),
             font: Some("Calibri".to_string()),
             style_id: Some("Emphasis".to_string()),
+            ..Default::default()
         };
         let d = Document {
             body: vec![para(ParProps::default(), vec![run("styled", props)])],
@@ -511,6 +590,7 @@ mod tests {
             },
             indent: 720,
             first_line: -360,
+            ..Default::default()
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],
@@ -703,12 +783,14 @@ mod tests {
             grid_span: span,
             v_merge: VMerge::None,
             blocks: vec![para(ParProps::default(), vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 200],
             rows: vec![
                 Row {
                     cells: vec![cell("wide", 2)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![
@@ -718,8 +800,10 @@ mod tests {
                         },
                         cell("b", 1),
                     ],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = Document {
             body: vec![Block::Table(t)],

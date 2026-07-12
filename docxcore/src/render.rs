@@ -3612,12 +3612,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("Apple"), cell("Banana")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![
             Block::Table(t),
@@ -3646,12 +3649,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let mut o = opts(30);
@@ -3671,17 +3677,21 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("A"), cell("B")],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("c"), cell("d")],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(30));
@@ -3704,13 +3714,16 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let mkrow = || Row {
             cells: (0..10).map(|i| cell(&format!("c{i}"))).collect(),
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100; 10],
             rows: vec![mkrow(), mkrow()],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let o = RenderOptions {
@@ -3742,15 +3755,18 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let rows: Vec<Row> = (0..400)
             .map(|i| Row {
                 cells: vec![cell(&format!("a{i}")), cell(&format!("b{i}"))],
+                ..Default::default()
             })
             .collect();
         let t = Table {
             grid: vec![3000, 3000],
             rows,
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let o = RenderOptions {
@@ -3778,23 +3794,29 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let nested = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("a"), cell("b")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let nested_cell = Cell {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![Block::Table(nested)],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100, 100],
             rows: vec![Row {
                 cells: vec![cell("X"), nested_cell, cell("Y")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(40));
@@ -3812,6 +3834,7 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100, 100, 100],
@@ -3823,6 +3846,7 @@ mod tests {
                         cell("Media"),
                         cell("Product"),
                     ],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![
@@ -3831,8 +3855,10 @@ mod tests {
                         cell("1.44mb"),
                         cell("Office"),
                     ],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(24));
@@ -3848,17 +3874,21 @@ mod tests {
             grid_span: span,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("A", 1), cell("B", 1)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("wide", 2)],
+                    ..Default::default()
                 }, // spans both columns
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (lines, maps) = render_mapped(&d, &opts(30));
@@ -3884,12 +3914,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let mut o = opts(30);
@@ -3913,8 +3946,11 @@ mod tests {
                     grid_span: 2,
                     v_merge: VMerge::None,
                     blocks: vec![para(vec![run("wide", RunProps::default())])],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let joined: String = render(&d, &opts(30))
@@ -3935,17 +3971,21 @@ mod tests {
             grid_span: 1,
             v_merge: vm,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("M", VMerge::Restart), cell("a", VMerge::None)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("", VMerge::Continue), cell("b", VMerge::None)],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (lines, maps) = render_mapped(&d, &opts(30));
@@ -4226,12 +4266,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (_lines, maps) = render_mapped(&d, &opts(30));

@@ -2403,6 +2403,7 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(s)],
+            ..Default::default()
         };
         Document {
             body: vec![
@@ -2412,11 +2413,14 @@ mod tests {
                     rows: vec![
                         Row {
                             cells: vec![cell("A"), cell("B")],
+                            ..Default::default()
                         },
                         Row {
                             cells: vec![cell("C"), cell("D")],
+                            ..Default::default()
                         },
                     ],
+                    ..Default::default()
                 }),
                 para("after"),
             ],

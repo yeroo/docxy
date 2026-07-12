@@ -610,13 +610,18 @@ fn parse_table(rows: &[&str]) -> Block {
                     }
                     .into(),
                 ],
+                ..Default::default()
             });
         }
-        out_rows.push(Row { cells });
+        out_rows.push(Row {
+            cells,
+            ..Default::default()
+        });
     }
     Block::Table(Table {
         grid: vec![col_w; ncols],
         rows: out_rows,
+        ..Default::default()
     })
 }
 

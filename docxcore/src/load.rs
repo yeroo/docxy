@@ -689,12 +689,22 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     });
                     p.skip_element();
                 }
-                _ => p.skip_element(),
+                // Any pPr child we don't model (shading, spacing, keepNext,
+                // outlineLvl, …) is preserved verbatim so save doesn't drop it.
+                _ => capture_element(p, &mut props.raw_props),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// Capture the verbatim XML of the element the parser is positioned at (its
+/// Start event), consuming it, and append it to `out`.
+fn capture_element(p: &mut XmlParser, out: &mut Vec<String>) {
+    let start = p.start_pos();
+    p.skip_element();
+    out.push(p.raw_slice(start, p.pos()).to_string());
 }
 
 fn frame_int(p: &XmlParser, name: &str) -> Option<i32> {
@@ -817,6 +827,8 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
             Event::Start => {
                 let name = p.name();
                 let val = p.attr("w:val");
+                let start = p.start_pos();
+                let mut modeled = true;
                 match name {
                     "w:b" | "w:bCs" => props.bold = toggle_on(val),
                     "w:i" | "w:iCs" => props.italic = toggle_on(val),
@@ -861,9 +873,18 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                             props.code = true;
                         }
                     }
-                    _ => {}
+                    // `w:rStyle` with an empty val, or anything else we don't
+                    // model, is preserved verbatim (character spacing, kern,
+                    // lang, shd, effect, …) so save doesn't drop it.
+                    "w:rStyle" => {}
+                    _ => modeled = false,
                 }
                 p.skip_element();
+                if !modeled {
+                    props
+                        .raw_props
+                        .push(p.raw_slice(start, p.pos()).to_string());
+                }
             }
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -924,6 +945,12 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             Event::Start => match p.name() {
                 "w:tblGrid" => parse_tblgrid(p, &mut table.grid),
                 "w:tr" => table.rows.push(parse_row(p, rels)),
+                // Whole table properties (borders/shading/width/style) preserved.
+                "w:tblPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    table.raw_tblpr = Some(p.raw_slice(start, p.pos()).to_string());
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
@@ -951,21 +978,28 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
     let mut row = Row::default();
-    parse_cells_into(p, rels, &mut row.cells);
+    parse_cells_into(p, rels, &mut row.cells, &mut row.raw_props);
     row
 }
 
 /// Collect the cells of a row (or a `<w:sdtContent>` within it), unwrapping
-/// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`).
-fn parse_cells_into(p: &mut XmlParser, rels: &Relationships, cells: &mut Vec<Cell>) {
+/// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`). Row-level
+/// properties (`w:trPr`/`w:tblPrEx`) are captured verbatim into `raw`.
+fn parse_cells_into(
+    p: &mut XmlParser,
+    rels: &Relationships,
+    cells: &mut Vec<Cell>,
+    raw: &mut Vec<String>,
+) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
                 "w:tc" => cells.push(parse_cell(p, rels)),
+                "w:trPr" | "w:tblPrEx" => capture_element(p, raw),
                 "w:sdt" => loop {
                     match p.next() {
                         Event::Start if p.name() == "w:sdtContent" => {
-                            parse_cells_into(p, rels, cells)
+                            parse_cells_into(p, rels, cells, raw)
                         }
                         Event::Start => p.skip_element(),
                         Event::End | Event::Eof => break,
@@ -985,7 +1019,17 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:tcPr" => parse_tcpr(p, &mut cell),
+                // Parse gridSpan/vMerge for rendering. Keep the whole tcPr
+                // verbatim (borders/shading/width/vAlign) ONLY when it carries
+                // more than gridSpan/vMerge — so a cell the model can fully
+                // describe still round-trips exactly (no spurious raw).
+                "w:tcPr" => {
+                    let start = p.start_pos();
+                    let has_extra = parse_tcpr(p, &mut cell);
+                    if has_extra {
+                        cell.raw_tcpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    }
+                }
                 "w:p" => cell.blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => cell.blocks.push(Block::Table(parse_table(p, rels))),
                 // Unwrap content controls nested in a cell (cover-page titles etc.).
@@ -1004,7 +1048,11 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
     cell
 }
 
-fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
+/// Parse `gridSpan`/`vMerge` into the model. Returns `true` if the `tcPr` holds
+/// any other child (borders/shading/width/vAlign/…) — the signal to preserve the
+/// whole `tcPr` verbatim for lossless save.
+fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) -> bool {
+    let mut has_extra = false;
     loop {
         match p.next() {
             Event::Start => {
@@ -1022,7 +1070,7 @@ fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
                             VMerge::Continue
                         };
                     }
-                    _ => {}
+                    _ => has_extra = true,
                 }
                 p.skip_element();
             }
@@ -1030,6 +1078,7 @@ fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
             Event::Text => {}
         }
     }
+    has_extra
 }
 
 /// Reads character data up to the matching End (used for `w:t`).

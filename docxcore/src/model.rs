@@ -46,6 +46,10 @@ pub struct RunProps {
     pub font: Option<String>,
     /// Character style id (`w:rStyle`).
     pub style_id: Option<String>,
+    /// Verbatim XML of `w:rPr` children we don't model (character spacing
+    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), preserved so save
+    /// doesn't drop them. Re-emitted at the end of `w:rPr`.
+    pub raw_props: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -183,6 +187,10 @@ pub struct ParProps {
     /// (first line pulled left of the rest, as in lists/bibliographies). Zero =
     /// every line shares `indent`.
     pub first_line: i32,
+    /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`, spacing
+    /// `w:spacing`, `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
+    /// silently drop them. Re-emitted in `w:pPr` in document order.
+    pub raw_props: Vec<String>,
 }
 
 /// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
@@ -379,6 +387,11 @@ pub struct Cell {
     pub grid_span: u32,
     pub v_merge: VMerge,
     pub blocks: Vec<Block>,
+    /// The cell's entire `w:tcPr` verbatim (borders, shading, width, vAlign, …),
+    /// preserved so save round-trips cell formatting. `grid_span`/`v_merge` are
+    /// also parsed out of it for rendering; when present it is re-emitted as-is
+    /// instead of regenerating tcPr from the model. `None` for a new cell.
+    pub raw_tcpr: Option<String>,
 }
 
 impl Default for Cell {
@@ -387,6 +400,7 @@ impl Default for Cell {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: Vec::new(),
+            raw_tcpr: None,
         }
     }
 }
@@ -394,6 +408,9 @@ impl Default for Cell {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row {
     pub cells: Vec<Cell>,
+    /// Verbatim `w:trPr` / `w:tblPrEx` XML (row height, header flag, exceptions),
+    /// preserved so save doesn't drop row formatting. Re-emitted in document order.
+    pub raw_props: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -401,6 +418,9 @@ pub struct Table {
     /// Column widths in twips (`w:tblGrid`/`w:gridCol`).
     pub grid: Vec<u32>,
     pub rows: Vec<Row>,
+    /// The table's entire `w:tblPr` verbatim (borders, shading, width, style,
+    /// look, layout), preserved so save round-trips table formatting.
+    pub raw_tblpr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

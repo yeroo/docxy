@@ -554,12 +554,48 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
         }
     }
 
+    // The original `<w:document …>` element declares every namespace the file
+    // uses (w14, mc, v, o, wp, …). Preserved raw property slices may reference
+    // those prefixes, so re-emit the original declarations rather than our
+    // minimal three — otherwise Word rejects the file with "unbound prefix".
+    let original_doc = String::from_utf8_lossy(&parts[pkg.doc_index].1).into_owned();
     let mut xml = document_to_xml(&document);
+    if let (Some(attrs), Some(doc_pos), Some(body_pos)) = (
+        document_root_attrs(&original_doc),
+        xml.find("<w:document"),
+        xml.find("<w:body>"),
+    ) {
+        xml = format!(
+            "{}<w:document {attrs}>{}",
+            &xml[..doc_pos],
+            &xml[body_pos..]
+        );
+    }
     if !pkg.sect_pr.is_empty() {
         xml = xml.replacen("</w:body>", &format!("{}</w:body>", pkg.sect_pr), 1);
     }
     parts[pkg.doc_index].1 = xml.into_bytes();
     write_zip(&parts)
+}
+
+/// The attributes of the original `<w:document …>` element — all the `xmlns:*`
+/// declarations Word wrote — so the regenerated body's preserved raw slices stay
+/// namespace-bound. Ensures the `r`/`m` prefixes our serializer emits are present
+/// even if the original omitted them.
+fn document_root_attrs(original: &str) -> Option<String> {
+    let start = original.find("<w:document")?;
+    let rest = &original[start + "<w:document".len()..];
+    let end = rest.find('>')?;
+    let mut attrs = rest[..end].trim().trim_end_matches('/').trim().to_string();
+    if !attrs.contains("xmlns:r") {
+        attrs.push_str(
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+        );
+    }
+    if !attrs.contains("xmlns:m") {
+        attrs.push_str(" xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"");
+    }
+    Some(attrs)
 }
 
 /// Highest `rIdN` number in a `.rels` string, plus one (the next free id).

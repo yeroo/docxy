@@ -107,6 +107,7 @@ fn cell(span: u32, content: Vec<Inline>) -> Cell {
         grid_span: span,
         v_merge: VMerge::None,
         blocks: vec![para(ParProps::default(), content)],
+        ..Default::default()
     }
 }
 
@@ -219,6 +220,7 @@ fn build() -> Document {
             // A single merged cell spanning all three columns.
             Row {
                 cells: vec![cell(3, vec![styled("Format support", bold.clone())])],
+                ..Default::default()
             },
             Row {
                 cells: vec![
@@ -226,6 +228,7 @@ fn build() -> Document {
                     cell(1, vec![styled("docxy", bold.clone())]),
                     cell(1, vec![styled("plain editors", bold.clone())]),
                 ],
+                ..Default::default()
             },
             Row {
                 cells: vec![
@@ -233,6 +236,7 @@ fn build() -> Document {
                     cell(1, vec![styled("yes", props!(color: "1F7A1F"))]),
                     cell(1, vec![styled("no", props!(color: "C00000"))]),
                 ],
+                ..Default::default()
             },
             Row {
                 cells: vec![
@@ -240,8 +244,10 @@ fn build() -> Document {
                     cell(1, vec![styled("yes", props!(color: "1F7A1F"))]),
                     cell(1, vec![styled("no", props!(color: "C00000"))]),
                 ],
+                ..Default::default()
             },
         ],
+        ..Default::default()
     };
     body.push(Block::Table(table));
 
