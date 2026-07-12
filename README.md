@@ -193,12 +193,33 @@ yppxy plan.yppx --gantt-md out.md # headless: export a Markdown Gantt chart
 yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 ```
 
-In the editor: `n` add task, `d` set duration (`3d`/`4h`/`2w`), `p` add a
-dependency, `Tab` indent (which auto-forms summary tasks), `Enter` rename,
-`Ctrl-S` save, `Ctrl-E` export. Try it:
-`yppxy corpus/mspdi/10-summary.xml`. A separate crate, **`mppread`**, reads the
-OLE2 Compound File container of legacy binary `.mpp` files (the documented
-foundation for importing them when MS Project isn't around to export MSPDI).
+Like docxy and xlsxy, yppxy has the same **ribbon** (File · Task · Schedule ·
+View — `F9` to engage), the same **File backstage** (`Alt-F`: New / Open / Info
+/ Save / Save As / Export / Exit with a folder browser and live preview), a
+start screen, a light/dark theme toggle, and mouse support. Try it:
+`yppxy corpus/mspdi/10-summary.xml`.
+
+### Keys
+
+| Keys | Action |
+|------|--------|
+| ↑ ↓ · j / k · g / G | move the selection (top / bottom) |
+| ← → · h / l | scroll the Gantt timeline |
+| n · Insert | add a task below |
+| x · Delete | delete the task |
+| Tab · Shift-Tab | indent / outdent (auto-forms summary tasks) |
+| Enter · F2 | rename the task |
+| d | set duration (`3d` / `4h` / `2w`) |
+| p | add a predecessor by task ID |
+| F9 · Alt-F | engage the ribbon · open the File menu |
+| Ctrl-S · Ctrl-E | save · export a Markdown Gantt |
+| Ctrl-Q · q | quit (q warns on unsaved changes) |
+| mouse | click a tab/button, click a task row, wheel to scroll/pan |
+
+A separate crate, **`mppread`**, reads the OLE2 Compound File container of
+legacy binary `.mpp` files — today it decodes the documented metadata
+(title/author/company/dates via OLE property sets), so `yppxy legacy.mpp` opens
+with the right name; the undocumented task/resource blocks are a later layer.
 
 ## Install
 

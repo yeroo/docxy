@@ -5,9 +5,12 @@
 //! — a task outline on the left, a live terminal Gantt chart on the right, and a
 //! Critical Path Method reschedule after every edit.
 //!
+//! It has the same ribbon + File backstage UX as docxy/xlsxy.
+//!
 //! Usage:
 //!   yppxy                              start a new schedule
-//!   yppxy <file.(xml|yppx)>            open MSPDI XML or a native .yppx package
+//!   yppxy <file.(xml|yppx|mpp)>        open MSPDI XML, a .yppx package, or a
+//!                                      legacy .mpp (metadata only for now)
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 
@@ -56,12 +59,12 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(m) => {
             eprintln!("{m}");
-            eprintln!("usage: yppxy [file.(xml|yppx)] [--gantt-md <out>] [--save <out>]");
+            eprintln!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx)] [--gantt-md <out>] [--save <out>]");
+        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
         return ExitCode::SUCCESS;
     }
 
@@ -139,12 +142,34 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 
 fn load(path: &str) -> Result<Project, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if path.ends_with(".yppx") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".yppx") {
         yppx::read_yppx(&bytes)
+    } else if lower.ends_with(".mpp") {
+        project_from_mpp(&bytes)
     } else {
         let xml = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
         mspdi::read_mspdi(&xml)
     }
+}
+
+/// Build a partial project from a legacy binary `.mpp`. Only the documented
+/// metadata (title/author/company/dates) is decoded today — the task/resource
+/// var-data blocks are undocumented and not yet parsed — so the returned
+/// project carries the name but no tasks. It still opens, and Save As converts
+/// it to `.yppx`/MSPDI.
+fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
+    let info = mppread::read_mpp(bytes)?;
+    let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "Imported project".into());
+    Ok(Project {
+        name,
+        title: info.title,
+        start_date: Some(next_monday()),
+        ..Project::default()
+    })
 }
 
 fn save_to(proj: &Project, path: &str) -> Result<(), String> {
@@ -466,7 +491,11 @@ impl App {
                 self.backstage = None;
                 self.start = false;
                 self.reschedule();
-                self.status = format!("Opened {path}");
+                self.status = if path.to_ascii_lowercase().ends_with(".mpp") && self.proj.tasks.is_empty() {
+                    format!("Opened {path} — .mpp metadata only; task decoding is not implemented yet")
+                } else {
+                    format!("Opened {path}")
+                };
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
@@ -1460,6 +1489,48 @@ mod tests {
         app.open_backstage();
         let s = buffer_text(&mut app, 100, 22);
         assert!(s.contains("File") && s.contains("Open") && s.contains("Export Gantt"));
+    }
+
+    #[test]
+    fn opens_mpp_metadata_as_partial_project() {
+        // Build a minimal .mpp: a SummaryInformation property set with a title,
+        // plus a stub task-data stream, wrapped in the CFB container.
+        let title = "Bridge Retrofit";
+        let mut sval: Vec<u8> = title.bytes().collect();
+        sval.push(0);
+        while sval.len() % 4 != 0 {
+            sval.push(0);
+        }
+        let mut values = Vec::new();
+        values.extend_from_slice(&30u32.to_le_bytes()); // VT_LPSTR
+        values.extend_from_slice(&((title.len() + 1) as u32).to_le_bytes());
+        values.extend_from_slice(&sval);
+        let mut index = Vec::new();
+        index.extend_from_slice(&2u32.to_le_bytes()); // PID_TITLE
+        index.extend_from_slice(&16u32.to_le_bytes()); // value offset within section
+        let cb = 8 + index.len() + values.len();
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(cb as u32).to_le_bytes());
+        sec.extend_from_slice(&1u32.to_le_bytes());
+        sec.extend_from_slice(&index);
+        sec.extend_from_slice(&values);
+        let mut summary = Vec::new();
+        summary.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        summary.extend_from_slice(&0u16.to_le_bytes());
+        summary.extend_from_slice(&0u32.to_le_bytes());
+        summary.extend_from_slice(&[0u8; 16]);
+        summary.extend_from_slice(&1u32.to_le_bytes());
+        summary.extend_from_slice(&[0u8; 16]);
+        summary.extend_from_slice(&48u32.to_le_bytes());
+        summary.extend_from_slice(&sec);
+
+        let mpp = mppread::write_cfb(&[
+            ("\u{5}SummaryInformation", summary),
+            ("Props", vec![0u8; 12]),
+        ]);
+        let proj = project_from_mpp(&mpp).unwrap();
+        assert_eq!(proj.name, "Bridge Retrofit");
+        assert!(proj.tasks.is_empty()); // task decoding not implemented yet
     }
 
     #[test]

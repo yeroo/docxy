@@ -22,6 +22,8 @@ workspace = true
 [dependencies]
 # Path + version so `yppxy` can be published once `projcore` is on crates.io.
 projcore = { version = "0.1.0", path = "../projcore" }
+# Reads the OLE2 container of legacy binary .mpp files (metadata for now).
+mppread = { version = "0.1.0", path = "../mppread" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
 ratatui = "0.29"
 # Display-column widths for correct alignment + truncation with wide glyphs.

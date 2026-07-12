@@ -1451,6 +1451,7 @@ dependencies = [
 name = "yppxy"
 version = "0.1.0"
 dependencies = [
+ "mppread",
  "projcore",
  "ratatui",
  "unicode-width 0.2.0",

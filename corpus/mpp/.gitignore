@@ -1,0 +1,5 @@
+# Real .mpp files are third-party binaries — keep them local, never commit them.
+*.mpp
+# MSPDI oracle exports paired with the above may be large too; keep local.
+*.xml
+!README.md
