@@ -285,62 +285,72 @@ def main():
     ap.add_argument("--src", default=None, help="external tree of .xlsx to import")
     args = ap.parse_args()
 
+    entries = []
+    tag_counts = {}
+    cat_counts = {}
+
+    def scan(root, walk_src, dest_base, copy):
+        """Classify every .xlsx under walk_src, labelling its manifest path with
+        ``root`` (``xlsx`` or ``xlsx-ext``). When copy, mirror each file into
+        dest_base first (preserving structure)."""
+        for r, _dirs, fnames in os.walk(walk_src):
+            for fn in fnames:
+                if not fn.lower().endswith(".xlsx") or fn.startswith("~$"):
+                    continue
+                spath = os.path.join(r, fn)
+                rel = os.path.relpath(spath, walk_src).replace("\\", "/")
+                rel_dir = os.path.dirname(rel)
+                # Category: first folder, else the filename stem prefix (calc-*, feat-*).
+                if "/" in rel:
+                    category = rel.split("/")[0]
+                else:
+                    category = fn.split("-", 1)[0] if "-" in fn else "misc"
+
+                if copy:
+                    dpath = os.path.join(dest_base, rel.replace("/", os.sep))
+                    os.makedirs(os.path.dirname(dpath), exist_ok=True)
+                    shutil.copy2(spath, dpath)
+
+                result = classify(spath)
+                tags = result[0] if isinstance(result, tuple) else result
+                fns = result[1] if isinstance(result, tuple) else []
+                entries.append(
+                    {
+                        "name": fn,
+                        "path": root + "/" + rel,
+                        "folder": rel_dir,
+                        "category": category,
+                        "tags": tags,
+                        "functions": fns,
+                        "size": os.path.getsize(spath),
+                    }
+                )
+                cat_counts[category] = cat_counts.get(category, 0) + 1
+                for t in tags:
+                    tag_counts[t] = tag_counts.get(t, 0) + 1
+
+    # Always include the built-in synthetic oracle corpus (corpus/xlsx/) if present,
+    # so the launcher browses the CI oracle workbooks alongside any imported real ones.
+    builtin = os.path.join(CORPUS, "xlsx")
+    if os.path.isdir(builtin):
+        scan("xlsx", builtin, builtin, False)
+
+    # With --src, mirror an external tree of real workbooks into corpus/xlsx-ext/
+    # and fold it into the same manifest.
     if args.src:
         src = os.path.abspath(args.src)
         if not os.path.isdir(src):
             raise SystemExit(f"source not found: {src}")
-        root = "xlsx-ext"
-        base = os.path.join(CORPUS, root)
+        base = os.path.join(CORPUS, "xlsx-ext")
         if os.path.isdir(base):
             shutil.rmtree(base)
         os.makedirs(base, exist_ok=True)
-        copy = True
-    else:
-        src = os.path.join(CORPUS, "xlsx")
-        root = "xlsx"
-        base = src
-        copy = False
-        if not os.path.isdir(src):
-            raise SystemExit(f"no corpus/xlsx directory; pass --src DIR")
+        scan("xlsx-ext", src, base, True)
 
-    entries = []
-    tag_counts = {}
-    cat_counts = {}
-    for r, _dirs, fnames in os.walk(src):
-        for fn in fnames:
-            if not fn.lower().endswith(".xlsx") or fn.startswith("~$"):
-                continue
-            spath = os.path.join(r, fn)
-            rel = os.path.relpath(spath, src).replace("\\", "/")
-            rel_dir = os.path.dirname(rel)
-            # Category: first folder, else the filename stem prefix (calc-*, feat-*).
-            if "/" in rel:
-                category = rel.split("/")[0]
-            else:
-                category = fn.split("-", 1)[0] if "-" in fn else "misc"
+    if not entries:
+        raise SystemExit("no workbooks found: no corpus/xlsx directory and no --src DIR")
 
-            if copy:
-                dpath = os.path.join(base, rel.replace("/", os.sep))
-                os.makedirs(os.path.dirname(dpath), exist_ok=True)
-                shutil.copy2(spath, dpath)
-
-            result = classify(spath)
-            tags = result[0] if isinstance(result, tuple) else result
-            fns = result[1] if isinstance(result, tuple) else []
-            entries.append(
-                {
-                    "name": fn,
-                    "path": root + "/" + rel,
-                    "folder": rel_dir,
-                    "category": category,
-                    "tags": tags,
-                    "functions": fns,
-                    "size": os.path.getsize(spath),
-                }
-            )
-            cat_counts[category] = cat_counts.get(category, 0) + 1
-            for t in tags:
-                tag_counts[t] = tag_counts.get(t, 0) + 1
+    root = "xlsx-ext" if args.src else "xlsx"
 
     entries.sort(key=lambda e: (e["category"], e["folder"], e["name"]))
     manifest = {
