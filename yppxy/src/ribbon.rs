@@ -22,6 +22,8 @@ pub enum Act {
     AddLink,
     Constraint,
     Baseline,
+    Assign,
+    ClearResources,
     // View
     ExportGantt,
     ScrollLeft,
@@ -469,11 +471,19 @@ fn schedule_groups() -> Vec<Group> {
             ],
         },
         Group {
-            title: "Baseline",
+            title: "Resources",
             width: 16,
             rows: [
-                vec![btn("⚑ Set baseline", 14, Baseline, "Snapshot the current plan as the baseline (b)")],
-                vec![btn("⟳ Reschedule", 12, Todo("Reschedule"), "Recompute (automatic on every edit)")],
+                vec![btn("👤 Assign", 8, Assign, "Assign a resource to the task (a)")],
+                vec![btn("✗ Clear", 7, ClearResources, "Remove the task's resources")],
+            ],
+        },
+        Group {
+            title: "Baseline",
+            width: 14,
+            rows: [
+                vec![btn("⚑ Baseline", 10, Baseline, "Snapshot the current plan as the baseline (b)")],
+                vec![btn("⟳ Recalc", 8, Todo("Reschedule"), "Recompute (automatic on every edit)")],
             ],
         },
     ]

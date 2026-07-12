@@ -212,6 +212,7 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | d | set duration (`3d` / `4h` / `2w`) |
 | p | add a predecessor by task ID |
 | c | set a date constraint (`SNET 2026-03-05`, `MSO …`, `none`) |
+| a | assign a resource to the task (created on first use; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
 | Ctrl-F · F3 | find task by name · repeat |
 | Ctrl-Z · Ctrl-Y | undo · redo |

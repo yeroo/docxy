@@ -24,7 +24,7 @@ use backstage::{Backstage, Item, Pane};
 use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
-use projcore::model::{ConstraintType, LinkType, Predecessor, Project, Task};
+use projcore::model::{Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, Task};
 use projcore::schedule::{schedule, Schedule};
 use projcore::{gantt, mspdi, yppx};
 
@@ -248,6 +248,7 @@ enum PromptKind {
     Find,
     VimCommand,
     Constraint,
+    Assign,
 }
 
 struct Prompt {
@@ -447,6 +448,47 @@ impl App {
         self.status = format!("Constraint set: {}", kind.to_uppercase());
     }
 
+    /// Assign a resource (by name, created on first use) to the selected task.
+    /// An empty name clears the task's assignments.
+    fn assign_resource(&mut self, name: &str) {
+        if self.sel >= self.proj.tasks.len() {
+            return;
+        }
+        let name = name.trim().to_string();
+        let task_uid = self.proj.tasks[self.sel].uid;
+
+        if name.is_empty() {
+            if self.proj.assignments.iter().any(|a| a.task_uid == task_uid) {
+                self.snapshot();
+                self.proj.assignments.retain(|a| a.task_uid != task_uid);
+                self.mark_dirty();
+                self.status = "Cleared the task's resources".into();
+            }
+            return;
+        }
+
+        let existing = self.proj.resources.iter().find(|r| r.name.eq_ignore_ascii_case(&name)).map(|r| r.uid);
+        if let Some(rid) = existing {
+            if self.proj.assignments.iter().any(|a| a.task_uid == task_uid && a.resource_uid == rid) {
+                self.status = format!("{name} is already assigned");
+                return;
+            }
+        }
+        // A real change will happen — take a single snapshot.
+        self.snapshot();
+        let rid = existing.unwrap_or_else(|| {
+            let uid = self.proj.resources.iter().map(|r| r.uid).max().unwrap_or(0) + 1;
+            let id = self.proj.resources.len() as i32 + 1;
+            self.proj.resources.push(Resource { uid, id, name: name.clone(), is_work: true, max_units: 1.0, calendar_uid: None });
+            uid
+        });
+        let auid = self.proj.assignments.iter().map(|a| a.uid).max().unwrap_or(0) + 1;
+        let work = self.proj.tasks[self.sel].duration_min;
+        self.proj.assignments.push(Assignment { uid: auid, task_uid, resource_uid: rid, units: 1.0, work_min: work });
+        self.mark_dirty();
+        self.status = format!("Assigned {name}");
+    }
+
     /// Snapshot the current computed schedule as the baseline (the saved plan).
     fn set_baseline(&mut self) {
         self.snapshot();
@@ -523,6 +565,10 @@ impl App {
                 self.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
             }
             Act::Baseline => self.set_baseline(),
+            Act::Assign => {
+                self.prompt = Some(Prompt { kind: PromptKind::Assign, label: "Assign resource".into(), buf: String::new() });
+            }
+            Act::ClearResources => self.assign_resource(""),
             Act::ExportGantt => self.export_md(),
             Act::ScrollLeft => self.hscroll -= 1,
             Act::ScrollRight => self.hscroll += 1,
@@ -926,6 +972,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::Find => app.find(&text),
                     PromptKind::VimCommand => app.vim_run(&text),
                     PromptKind::Constraint => app.set_constraint(&text),
+                    PromptKind::Assign => app.assign_resource(&text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
                             app.path = Some(text.trim().to_string());
@@ -1025,6 +1072,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
         }
         KeyCode::Char('b') => app.set_baseline(),
+        KeyCode::Char('a') => {
+            app.prompt = Some(Prompt { kind: PromptKind::Assign, label: "Assign resource".into(), buf: String::new() });
+        }
         KeyCode::F(3) => app.find(""), // repeat the last search
         KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
         // Vim niceties (only when launched with --vim).
@@ -1376,6 +1426,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             };
             spans.push(Span::styled(format!("· {}: {label} ", truncate(&t.name, 16)), Style::default().fg(color)));
         }
+        // Resources assigned to the selected task.
+        let res = task_resources(&app.proj, t.uid);
+        if !res.is_empty() {
+            spans.push(Span::styled(format!("· 👤 {} ", res.join(", ")), Style::default().add_modifier(Modifier::DIM)));
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1414,7 +1469,16 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         let r = app.sched.get(t.uid);
         let indent = "  ".repeat((t.outline_level.saturating_sub(1)) as usize);
         let bullet = if t.summary { "▾ " } else if t.is_milestone() { "◆ " } else { "• " };
-        let namecol = truncate(&format!("{indent}{bullet}{}", t.name), 26);
+        let res = task_resources(&app.proj, t.uid);
+        let base = format!("{indent}{bullet}{}", t.name);
+        let full = if res.is_empty() {
+            base
+        } else {
+            // compact resource initials, e.g. "·AB"
+            let inits: String = res.iter().filter_map(|r| r.chars().next()).collect();
+            format!("{base} ·{inits}")
+        };
+        let namecol = truncate(&full, 26);
         let dur = if t.summary {
             String::new()
         } else if t.is_milestone() {
@@ -1560,6 +1624,15 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // ---- small helpers ----------------------------------------------------------
+
+/// Names of the resources assigned to task `uid`, in assignment order.
+fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
+    proj.assignments
+        .iter()
+        .filter(|a| a.task_uid == uid)
+        .filter_map(|a| proj.resources.iter().find(|r| r.uid == a.resource_uid).map(|r| r.name.clone()))
+        .collect()
+}
 
 /// Prefill text for the constraint prompt from a task's current constraint.
 fn constraint_hint(t: &Task) -> String {
@@ -1801,6 +1874,31 @@ mod tests {
         app.set_duration("5d"); // extend past the baseline
         let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
         assert!(r.early_finish.day_number() > bf.day_number(), "finish should slip past baseline");
+    }
+
+    #[test]
+    fn assign_resource_creates_and_round_trips() {
+        let mut app = App::new(new_project(), None, false);
+        app.assign_resource("Alice");
+        assert_eq!(app.proj.resources.len(), 1);
+        assert_eq!(app.proj.assignments.len(), 1);
+        // assigning the same resource again is a no-op
+        app.assign_resource("alice");
+        assert_eq!(app.proj.assignments.len(), 1);
+        app.assign_resource("Bob");
+        assert_eq!(app.proj.resources.len(), 2);
+        let names = task_resources(&app.proj, app.proj.tasks[0].uid);
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+
+        // resources/assignments survive a MSPDI round-trip
+        let xml = mspdi::write_mspdi(&app.proj);
+        let back = mspdi::read_mspdi(&xml).unwrap();
+        assert_eq!(task_resources(&back, back.tasks[0].uid), names);
+
+        // clearing removes the task's assignments (resources remain defined)
+        app.assign_resource("");
+        assert!(app.proj.assignments.is_empty());
+        assert_eq!(app.proj.resources.len(), 2);
     }
 
     #[test]
