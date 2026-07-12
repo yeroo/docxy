@@ -230,6 +230,9 @@ legacy binary `.mpp` files — today it decodes the documented metadata
 (title/author/company/dates via OLE property sets), so `yppxy legacy.mpp` opens
 with the right name; the undocumented task/resource blocks are a later layer.
 
+The design, the CPM engine, resource leveling, and the format landscape are
+written up in [PROJECT.md](PROJECT.md).
+
 ## Install
 
 ```sh
