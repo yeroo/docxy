@@ -33,6 +33,7 @@ pub mod markdown;
 pub mod mathbox;
 pub mod mermaid;
 pub mod model;
+pub mod notes;
 pub mod numbering;
 pub mod omath;
 pub mod package;

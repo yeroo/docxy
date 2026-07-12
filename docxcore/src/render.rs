@@ -818,6 +818,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             Inline::Revision { content, .. } => {
                 w += content.iter().map(|i| str_width(&i.text())).sum::<usize>()
             }
+            Inline::FootnoteRef { id, .. } => w += str_width(&superscript(*id)),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
@@ -826,6 +827,28 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
         }
     }
     w
+}
+
+/// A note reference's display marker: the id in Unicode superscript digits, so a
+/// footnote/endnote anchor reads as a superscript number in the terminal.
+fn superscript(n: i32) -> String {
+    n.to_string()
+        .chars()
+        .map(|c| match c {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '-' => '⁻',
+            other => other,
+        })
+        .collect()
 }
 
 fn flatten_para(
@@ -1118,6 +1141,20 @@ fn flatten_para(
                             });
                         }
                     }
+                }
+            }
+            // A footnote/endnote reference: a superscript number marker inline.
+            Inline::FootnoteRef { id, .. } => {
+                let st = Style::default();
+                for ch in superscript(*id).chars() {
+                    segs.last_mut().unwrap().glyphs.push(Glyph {
+                        ch,
+                        disp: None,
+                        style: st.clone(),
+                        link: None,
+                        src: None,
+                        img: None,
+                    });
                 }
             }
             // Rendered as a box/block in source order, not in the inline flow

@@ -139,6 +139,17 @@ pub enum Inline {
         raw: String,
         content: Vec<Inline>,
     },
+    /// A footnote / endnote reference (`<w:footnoteReference>` /
+    /// `<w:endnoteReference>`). `id` is the note id (also its display number for
+    /// normal documents, whose notes are numbered 1, 2, 3…); `raw` is the whole
+    /// reference run, preserved verbatim so save keeps the anchor (otherwise the
+    /// notes part is orphaned). Rendered as a superscript marker; the note body
+    /// lives in `word/footnotes.xml` / `endnotes.xml` (see [`crate::notes`]).
+    FootnoteRef {
+        id: i32,
+        endnote: bool,
+        raw: String,
+    },
     /// Verbatim XML for inline content we don't model (images/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
@@ -171,6 +182,7 @@ impl Inline {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Inline::Revision { content, .. } => content.iter().map(|i| i.text()).collect(),
+            Inline::FootnoteRef { id, .. } => id.to_string(),
             Inline::Raw(_) => String::new(),
         }
     }

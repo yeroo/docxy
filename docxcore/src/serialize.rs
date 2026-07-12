@@ -264,6 +264,8 @@ fn write_inline(s: &mut String, item: &Inline) {
         // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
         // display `content` is not serialized).
         Inline::Revision { raw, .. } => s.push_str(raw),
+        // Footnote/endnote reference: re-emit the original reference run verbatim.
+        Inline::FootnoteRef { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
             // Splice the (possibly edited) content back into the shape's
             // `txbxContent`, preserving the surrounding VML/drawing markup.
@@ -529,6 +531,43 @@ mod tests {
         assert!(out.contains("<w:del w:id=\"2\""), "del markup lost");
         assert!(out.contains("<w:delText>gone</w:delText>"), "delText lost");
         // Save is lossless: re-parsing the output yields the same model.
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn footnote_reference_visible_and_lossless() {
+        // A footnote/endnote reference used to be dropped (empty run → orphaned
+        // notes part). Now it is modeled as a FootnoteRef, shown as a marker, and
+        // the reference run survives a save.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:t>See note</w:t></w:r>\
+            <w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr>\
+              <w:footnoteReference w:id=\"1\"/></w:r>\
+            <w:r><w:t> and end</w:t></w:r>\
+            <w:r><w:endnoteReference w:id=\"2\"/></w:r>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let refs: Vec<_> = match &d.body[0] {
+            Block::Paragraph(p) => p
+                .content
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::FootnoteRef { id, endnote, .. } => Some((*id, *endnote)),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        assert_eq!(refs, vec![(1, false), (2, true)]);
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains("<w:footnoteReference w:id=\"1\"/>"),
+            "footnote ref lost"
+        );
+        assert!(
+            out.contains("<w:endnoteReference w:id=\"2\"/>"),
+            "endnote ref lost"
+        );
         assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
     }
 

@@ -1379,6 +1379,7 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::Field { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
+        | Inline::FootnoteRef { .. }
         | Inline::Raw(_) => 0,
     }
 }
@@ -1457,6 +1458,11 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 kind: *kind,
                 raw: raw.clone(),
                 content: content.clone(),
+            }),
+            Inline::FootnoteRef { id, endnote, raw } => out.push(Inline::FootnoteRef {
+                id: *id,
+                endnote: *endnote,
+                raw: raw.clone(),
             }),
             Inline::Raw(s) => out.push(Inline::Raw(s.clone())),
         }
@@ -1543,6 +1549,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
@@ -1619,6 +1626,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
                 }
@@ -1695,6 +1703,7 @@ fn range_all_have(
             | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
+            | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => {} // zero-length
         }
     }

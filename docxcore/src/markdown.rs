@@ -286,6 +286,11 @@ fn inlines_to_md(content: &[Inline]) -> String {
                     crate::model::RevisionKind::Insert => s.push_str(&escape_inline(&text)),
                 }
             }
+            // A footnote/endnote reference → a Markdown footnote marker.
+            Inline::FootnoteRef { id, endnote, .. } => {
+                let p = if *endnote { "e" } else { "" };
+                s.push_str(&format!("[^{p}{id}]"))
+            }
             Inline::Chart { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
         }
     }

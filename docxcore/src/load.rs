@@ -390,6 +390,16 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
             }
         }
     }
+    // A footnote / endnote reference: keep the run verbatim (so the anchor
+    // survives save) but surface a superscript marker with the note id.
+    for (needle, endnote) in [("w:footnoteReference", false), ("w:endnoteReference", true)] {
+        if let Some(i) = raw.find(needle) {
+            let id = raw_attr(&raw[i..], "w:id=\"")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return Inline::FootnoteRef { id, endnote, raw };
+        }
+    }
     Inline::Raw(raw)
 }
 
@@ -859,6 +869,8 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 | "w:instrText"
                 | "w:sym"
                 | "w:commentReference"
+                | "w:footnoteReference"
+                | "w:endnoteReference"
                 | "mc:AlternateContent" => {
                     had_raw = true;
                     p.skip_element();
