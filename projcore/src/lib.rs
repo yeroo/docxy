@@ -16,6 +16,7 @@
 pub mod datetime;
 pub mod model;
 pub mod mspdi;
+pub mod schedule;
 
 pub use datetime::DateTime;
 pub use model::{
