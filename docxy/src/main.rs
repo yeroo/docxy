@@ -741,6 +741,12 @@ struct App {
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
     comments_rect: Rect,
+    /// Footnotes/endnotes parsed from the package, shown in a side panel.
+    notes: Vec<docxcore::notes::Note>,
+    show_notes: bool,
+    notes_scroll: usize,
+    /// The notes panel rect (set by draw() for wheel hit-testing).
+    notes_rect: Rect,
     /// In page view, how far the canvas is scrolled right to reveal the comments
     /// that sit beside the (un-shrunk) page. 0 = comments off-screen.
     comments_hscroll: usize,
@@ -858,6 +864,7 @@ impl App {
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
+        let notes = docxcore::notes::parse_notes(&pkg);
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
         // rather than the value last cached in the file.
@@ -910,6 +917,10 @@ impl App {
             comment_input: None,
             comments_scroll: 0,
             comments_rect: Rect::default(),
+            notes,
+            show_notes: false,
+            notes_scroll: 0,
+            notes_rect: Rect::default(),
             comments_hscroll: 0,
             doc_hscroll: 0,
             // Set each frame by draw(); 0 until then so mouse rows map directly.
@@ -1017,6 +1028,7 @@ impl App {
             show_ruler: self.show_ruler,
             show_nav: self.show_nav,
             show_comments: self.show_comments,
+            show_notes: self.show_notes,
             auto_hide_ribbon: self.auto_hide_ribbon,
         }
         .save();
@@ -1086,6 +1098,23 @@ impl App {
             format!("Showing {} comment(s).", self.comments.len())
         } else {
             "Comments panel hidden.".to_string()
+        });
+        self.dirty = true;
+    }
+
+    /// Toggle the footnotes/endnotes side panel.
+    fn toggle_notes(&mut self) {
+        self.show_notes = !self.show_notes;
+        self.notes_scroll = 0;
+        self.save_view_prefs();
+        self.status = Some(if self.notes.is_empty() {
+            "No footnotes or endnotes in this document.".to_string()
+        } else if self.show_notes {
+            let f = self.notes.iter().filter(|n| !n.endnote).count();
+            let e = self.notes.len() - f;
+            format!("Showing {f} footnote(s), {e} endnote(s).")
+        } else {
+            "Notes panel hidden.".to_string()
         });
         self.dirty = true;
     }
@@ -1205,6 +1234,7 @@ impl App {
                 self.dirty = true;
             }
             ToggleComments => self.toggle_comments(),
+            ToggleNotes => self.toggle_notes(),
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
             NewComment => self.start_comment(),
@@ -2044,6 +2074,8 @@ impl App {
         self.header_part = hf_part_name(&pkg, &rels, "headerReference");
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
+        self.notes = docxcore::notes::parse_notes(&pkg);
+        self.notes_scroll = 0;
         self.comments_scroll = 0;
         self.comment_sel = 0;
         self.comment_active = false;
@@ -2524,6 +2556,64 @@ impl App {
         let scroll = self.comments_scroll.min(total.saturating_sub(inner_h));
         let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
         let title = format!(" Comments ({}) ", self.comments.len());
+        f.render_widget(
+            Paragraph::new(shown).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            ),
+            area,
+        );
+        if total > inner_h {
+            let mut sb = ScrollbarState::new(total)
+                .position(scroll)
+                .viewport_content_length(inner_h);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area.inner(ratatui::layout::Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut sb,
+            );
+        }
+    }
+
+    /// Build the notes side-panel content (footnotes then endnotes) wrapped to
+    /// `inner_w`.
+    fn note_panel_lines(&self, inner_w: usize) -> Vec<RLine<'static>> {
+        let head = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let mut lines: Vec<RLine> = Vec::new();
+        for (i, n) in self.notes.iter().enumerate() {
+            if i > 0 {
+                lines.push(RLine::raw(""));
+            }
+            let kind = if n.endnote { "Endnote" } else { "Footnote" };
+            lines.push(RLine::styled(format!("{kind} {}", n.id), head));
+            for para in n.text.split('\n') {
+                for w in wrap_str(para, inner_w) {
+                    lines.push(RLine::raw(w));
+                }
+            }
+        }
+        lines
+    }
+
+    fn draw_notes_panel(&self, f: &mut Frame, area: Rect) {
+        let inner_w = area.width.saturating_sub(2).max(4) as usize;
+        let inner_h = area.height.saturating_sub(2).max(1) as usize;
+        let lines = self.note_panel_lines(inner_w);
+        let total = lines.len();
+        let scroll = self.notes_scroll.min(total.saturating_sub(inner_h));
+        let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
+        let f_count = self.notes.iter().filter(|n| !n.endnote).count();
+        let e_count = self.notes.len() - f_count;
+        let title = format!(" Notes ({f_count} fn / {e_count} en) ");
         f.render_widget(
             Paragraph::new(shown).block(
                 RBlock::default()
@@ -3932,6 +4022,15 @@ impl App {
                     self.dirty = true;
                     return;
                 }
+                if self.notes_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    let cap = self.notes.len() * 12;
+                    self.notes_scroll = (self.notes_scroll + 3).min(cap);
+                    self.dirty = true;
+                    return;
+                }
                 // Scrolling changes only the visible slice, not the document, so
                 // don't mark dirty (that would re-render the whole doc per tick).
                 self.follow_caret = false;
@@ -3944,6 +4043,14 @@ impl App {
                     y: m.row,
                 }) {
                     self.comments_scroll = self.comments_scroll.saturating_sub(3);
+                    self.dirty = true;
+                    return;
+                }
+                if self.notes_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    self.notes_scroll = self.notes_scroll.saturating_sub(3);
                     self.dirty = true;
                     return;
                 }
@@ -4816,6 +4923,9 @@ impl App {
         if self.show_comments {
             toggles.push(ribbon::Act::ToggleComments);
         }
+        if self.show_notes {
+            toggles.push(ribbon::Act::ToggleNotes);
+        }
         // Read/Print layout applies to `.docx` only; Markdown has no such group.
         if self.format != DocFormat::Markdown {
             toggles.push(if self.page_view {
@@ -4899,6 +5009,17 @@ impl App {
             full = cols[0];
             self.comments_rect = cols[1];
             self.draw_comments_panel(f, cols[1]);
+        }
+
+        // The footnotes/endnotes panel docks on the right, like comments.
+        self.notes_rect = Rect::default();
+        if self.show_notes && !self.notes.is_empty() && full.width > 50 {
+            let pw = 40.min(full.width / 2);
+            let cols =
+                Layout::horizontal([Constraint::Min(10), Constraint::Length(pw)]).split(full);
+            full = cols[0];
+            self.notes_rect = cols[1];
+            self.draw_notes_panel(f, cols[1]);
         }
 
         // Navigation (outline) pane on the left.
@@ -5657,6 +5778,7 @@ struct ViewPrefs {
     show_ruler: bool,
     show_nav: bool,
     show_comments: bool,
+    show_notes: bool,
     auto_hide_ribbon: bool,
 }
 
@@ -5687,6 +5809,7 @@ impl ViewPrefs {
                     "show_ruler" => p.show_ruler = on,
                     "show_nav" => p.show_nav = on,
                     "show_comments" => p.show_comments = on,
+                    "show_notes" => p.show_notes = on,
                     "auto_hide_ribbon" => p.auto_hide_ribbon = on,
                     _ => {}
                 }
@@ -5697,7 +5820,7 @@ impl ViewPrefs {
 
     fn to_conf(self) -> String {
         format!(
-            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\nauto_hide_ribbon={}\n",
+            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\nshow_notes={}\nauto_hide_ribbon={}\n",
             self.page_view as u8,
             self.invisibles as u8,
             self.borderless as u8,
@@ -5705,6 +5828,7 @@ impl ViewPrefs {
             self.show_ruler as u8,
             self.show_nav as u8,
             self.show_comments as u8,
+            self.show_notes as u8,
             self.auto_hide_ribbon as u8,
         )
     }
@@ -6127,6 +6251,7 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
     app.show_ruler = prefs.show_ruler;
     app.show_nav = prefs.show_nav;
     app.show_comments = prefs.show_comments;
+    app.show_notes = prefs.show_notes;
     app.auto_hide_ribbon = prefs.auto_hide_ribbon;
     // With auto-hide off the ribbon is pinned, so start it expanded (focus stays
     // in the document); with auto-hide on it starts collapsed to the tab strip.
@@ -6259,6 +6384,7 @@ mod tests {
             show_ruler: false,
             show_nav: true,
             show_comments: true,
+            show_notes: true,
             auto_hide_ribbon: true,
         };
         let back = ViewPrefs::parse(&p.to_conf());
@@ -6269,6 +6395,7 @@ mod tests {
         assert_eq!(back.show_ruler, p.show_ruler);
         assert_eq!(back.show_nav, p.show_nav);
         assert_eq!(back.show_comments, p.show_comments);
+        assert_eq!(back.show_notes, p.show_notes);
         assert_eq!(back.auto_hide_ribbon, p.auto_hide_ribbon);
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
