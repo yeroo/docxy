@@ -1,0 +1,20 @@
+[package]
+name = "projcore"
+description = "Dependency-free project-scheduling engine: task/resource model, Critical Path Method scheduler, and MS Project MSPDI (XML) I/O."
+# Versioned independently of the docxy/docxcore release train, like gridcore.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["project", "gantt", "scheduling", "mspdi", "cpm"]
+categories = ["parser-implementations", "science"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — the one dependency is our own shared OPC/XML layer.
+opccore = { version = "0.1.0", path = "../opccore" }
