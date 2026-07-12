@@ -130,9 +130,27 @@ pub enum Inline {
         raw: String,
         text: String,
     },
+    /// A tracked change: `<w:ins>` (insertion) or `<w:del>` (deletion). `raw` is
+    /// the original element preserved verbatim for lossless save; `content` is the
+    /// inner inline content with a display style baked in (deletions struck
+    /// through) so it renders visibly instead of vanishing into opaque `Raw`.
+    Revision {
+        kind: RevisionKind,
+        raw: String,
+        content: Vec<Inline>,
+    },
     /// Verbatim XML for inline content we don't model (images/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
+}
+
+/// The kind of a tracked change ([`Inline::Revision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionKind {
+    /// `<w:ins>` — inserted content.
+    Insert,
+    /// `<w:del>` — deleted content (shown struck through).
+    Delete,
 }
 
 impl Inline {
@@ -152,6 +170,7 @@ impl Inline {
                 .map(|b| b.plain_text())
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Inline::Revision { content, .. } => content.iter().map(|i| i.text()).collect(),
             Inline::Raw(_) => String::new(),
         }
     }

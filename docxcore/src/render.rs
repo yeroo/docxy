@@ -815,6 +815,9 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             Inline::Tab(_) | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
+            Inline::Revision { content, .. } => {
+                w += content.iter().map(|i| str_width(&i.text())).sum::<usize>()
+            }
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
@@ -1091,6 +1094,30 @@ fn flatten_para(
                         src: None,
                         img: None,
                     });
+                }
+            }
+            // A tracked change flows inline as (non-editable) text; the insert /
+            // delete cue (underline / strikethrough) is baked into its runs.
+            Inline::Revision { content, .. } => {
+                for inner in content {
+                    if let Inline::Run(r) = inner {
+                        let eff = opts.styles.effective_run(
+                            para.props.style_id.as_deref(),
+                            r.props.style_id.as_deref(),
+                            &r.props,
+                        );
+                        let st = style_from_run(&eff);
+                        for ch in r.text.chars() {
+                            segs.last_mut().unwrap().glyphs.push(Glyph {
+                                ch,
+                                disp: None,
+                                style: st.clone(),
+                                link: None,
+                                src: None,
+                                img: None,
+                            });
+                        }
+                    }
                 }
             }
             // Rendered as a box/block in source order, not in the inline flow

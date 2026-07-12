@@ -514,6 +514,14 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
+                // Tracked change: show the inserted/deleted text (instead of
+                // hiding it as opaque raw) while preserving the revision markup.
+                "w:ins" => para
+                    .content
+                    .push(parse_revision(p, rels, RevisionKind::Insert)),
+                "w:del" => para
+                    .content
+                    .push(parse_revision(p, rels, RevisionKind::Delete)),
                 // A simple field: keep its XML verbatim (lossless save) but surface
                 // its cached result text so the value is visible.
                 "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
@@ -603,6 +611,8 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, out),
+                "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
+                "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
                 "w:fldSimple" => parse_fld_simple(p, rels, out),
                 "w:smartTag" => parse_inlines_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
@@ -615,6 +625,45 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+}
+
+/// Parse a `<w:ins>` / `<w:del>` tracked change: capture the whole element raw
+/// (for lossless save) and parse its inner inlines for display. Deleted content
+/// is marked struck-through and inserted content underlined, so both are visible
+/// and distinguishable. The `content` is display-only — save re-emits `raw`.
+fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
+    let start = p.start_pos();
+    let mut content = Vec::new();
+    parse_inlines_into(p, rels, &mut content);
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    for inl in &mut content {
+        mark_revision(inl, kind);
+    }
+    Inline::Revision { kind, raw, content }
+}
+
+/// Bake a tracked-change display cue into a run tree: strikethrough for a
+/// deletion, underline for an insertion (Word's markup convention).
+fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
+    let apply = |props: &mut RunProps| match kind {
+        RevisionKind::Delete => props.strike = true,
+        RevisionKind::Insert => props.underline = true,
+    };
+    match inl {
+        Inline::Run(r) => apply(&mut r.props),
+        Inline::Tab(props) => apply(props),
+        Inline::Hyperlink(h) => {
+            for r in &mut h.runs {
+                apply(&mut r.props);
+            }
+        }
+        Inline::Revision { content, .. } => {
+            for c in content {
+                mark_revision(c, kind);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -777,7 +826,9 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPr" => parse_rpr(p, &mut props),
-                "w:t" => {
+                // `w:delText` carries the text of a run inside a `<w:del>`; read it
+                // like `w:t` so deleted content is visible (a normal run has none).
+                "w:t" | "w:delText" => {
                     let text = read_text(p);
                     out.push(Inline::Run(Run {
                         text,

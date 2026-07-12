@@ -1378,6 +1378,7 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::Equation { .. }
         | Inline::Field { .. }
         | Inline::TextBox { .. }
+        | Inline::Revision { .. }
         | Inline::Raw(_) => 0,
     }
 }
@@ -1451,6 +1452,11 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             Inline::TextBox { raw, blocks } => out.push(Inline::TextBox {
                 raw: raw.clone(),
                 blocks: blocks.clone(),
+            }),
+            Inline::Revision { kind, raw, content } => out.push(Inline::Revision {
+                kind: *kind,
+                raw: raw.clone(),
+                content: content.clone(),
             }),
             Inline::Raw(s) => out.push(Inline::Raw(s.clone())),
         }
@@ -1536,6 +1542,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Equation { .. }
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
+                | Inline::Revision { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
@@ -1611,6 +1618,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Equation { .. }
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
+                | Inline::Revision { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
                 }
@@ -1686,6 +1694,7 @@ fn range_all_have(
             | Inline::Equation { .. }
             | Inline::Field { .. }
             | Inline::TextBox { .. }
+            | Inline::Revision { .. }
             | Inline::Raw(_) => {} // zero-length
         }
     }

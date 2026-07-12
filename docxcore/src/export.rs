@@ -345,6 +345,15 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.last_mut().unwrap().push(plain_cell(ch));
                 }
             }
+            // A tracked change: lay its inner text out inline.
+            Inline::Revision { content, .. } => {
+                for ch in content
+                    .iter()
+                    .flat_map(|i| i.text().chars().collect::<Vec<_>>())
+                {
+                    segs.last_mut().unwrap().push(plain_cell(ch));
+                }
+            }
             // A text box: lay its text out on its own lines.
             Inline::TextBox { blocks, .. } => {
                 for line in blocks.iter().flat_map(|b| {

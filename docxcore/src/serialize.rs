@@ -261,6 +261,9 @@ fn write_inline(s: &mut String, item: &Inline) {
         Inline::Chart { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
         Inline::Field { raw, .. } => s.push_str(raw),
+        // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
+        // display `content` is not serialized).
+        Inline::Revision { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
             // Splice the (possibly edited) content back into the shape's
             // `txbxContent`, preserving the surrounding VML/drawing markup.
@@ -506,6 +509,27 @@ mod tests {
         assert!(xml.contains("<w:trPr>"), "row properties dropped");
         // And the whole thing round-trips to an identical model.
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn tracked_changes_visible_and_lossless() {
+        // <w:ins>/<w:del> used to vanish into opaque Raw (invisible). Now the
+        // inserted/deleted text is visible and the revision markup round-trips.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:t>keep </w:t></w:r>\
+            <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>added</w:t></w:r></w:ins>\
+            <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText>gone</w:delText></w:r></w:del>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let text = d.plain_text();
+        assert!(text.contains("added"), "inserted text lost: {text:?}");
+        assert!(text.contains("gone"), "deleted text lost: {text:?}");
+        let out = document_to_xml(&d);
+        assert!(out.contains("<w:ins w:id=\"1\""), "ins markup lost");
+        assert!(out.contains("<w:del w:id=\"2\""), "del markup lost");
+        assert!(out.contains("<w:delText>gone</w:delText>"), "delText lost");
+        // Save is lossless: re-parsing the output yields the same model.
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
     }
 
     #[test]

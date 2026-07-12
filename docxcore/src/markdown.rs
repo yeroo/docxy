@@ -276,6 +276,16 @@ fn inlines_to_md(content: &[Inline]) -> String {
             },
             Inline::Field { text, .. } => s.push_str(&escape_inline(text)),
             Inline::SmartArt { text, .. } => s.push_str(&escape_inline(&text.join(" "))),
+            // Tracked change: emit the inner text (deletions as ~~struck~~).
+            Inline::Revision { kind, content, .. } => {
+                let text: String = content.iter().map(|i| i.text()).collect();
+                match kind {
+                    crate::model::RevisionKind::Delete => {
+                        s.push_str(&format!("~~{}~~", escape_inline(&text)))
+                    }
+                    crate::model::RevisionKind::Insert => s.push_str(&escape_inline(&text)),
+                }
+            }
             Inline::Chart { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
         }
     }
