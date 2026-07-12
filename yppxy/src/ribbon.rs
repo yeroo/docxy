@@ -30,6 +30,7 @@ pub enum Act {
     ScrollRight,
     GoToStart,
     ThemeToggle,
+    Level,
     // File group (on the Task tab too)
     Save,
     SaveAs,
@@ -508,10 +509,10 @@ fn view_groups() -> Vec<Group> {
         },
         Group {
             title: "Window",
-            width: 10,
+            width: 16,
             rows: [
                 vec![btn("◐ Theme", 7, ThemeToggle, "Toggle light / dark theme")],
-                vec![],
+                vec![btn("⚖ Level", 7, Level, "Toggle resource leveling (L)")],
             ],
         },
     ]

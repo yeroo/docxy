@@ -25,7 +25,7 @@ use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
 use projcore::model::{Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, Task};
-use projcore::schedule::{schedule, Schedule};
+use projcore::schedule::{level, schedule, Leveled, Schedule};
 use projcore::{gantt, mspdi, yppx};
 
 use ratatui::backend::CrosstermBackend;
@@ -280,6 +280,9 @@ struct App {
     redo: Vec<Project>,
     find_query: String,
     vim: bool,
+    // resource leveling overlay
+    leveled: bool,
+    level: Option<Leveled>,
     // geometry recorded during draw for mouse hit-testing
     list_y0: u16,   // absolute y of the first task row
     list_left_w: u16, // width of the task pane (left of the gantt)
@@ -315,6 +318,8 @@ impl App {
             redo: Vec::new(),
             find_query: String::new(),
             vim,
+            leveled: false,
+            level: None,
         };
         app.reschedule();
         app
@@ -574,6 +579,7 @@ impl App {
             Act::ScrollRight => self.hscroll += 1,
             Act::GoToStart => self.hscroll = 0,
             Act::ThemeToggle => self.theme_toggle(),
+            Act::Level => self.toggle_level(),
             Act::Save => self.save(),
             Act::SaveAs => {
                 self.prompt = Some(Prompt { kind: PromptKind::SaveAs, label: "Save as".into(), buf: self.path.clone().unwrap_or_default() });
@@ -586,6 +592,32 @@ impl App {
         self.recompute_summaries();
         self.sched = schedule(&self.proj);
         self.base_day = self.sched.project_start.day_number();
+        self.level = if self.leveled { Some(level(&self.proj)) } else { None };
+    }
+
+    fn toggle_level(&mut self) {
+        self.leveled = !self.leveled;
+        self.reschedule();
+        self.status = if self.leveled {
+            "Resource leveling ON — bars delayed to fit resource capacity".into()
+        } else {
+            "Resource leveling OFF".into()
+        };
+    }
+
+    /// Displayed start of a task: leveled if leveling is on, else CPM early start.
+    fn disp_start(&self, uid: i32) -> Option<DateTime> {
+        match &self.level {
+            Some(lv) => lv.start(uid),
+            None => self.sched.get(uid).map(|r| r.early_start),
+        }
+    }
+
+    fn disp_finish(&self, uid: i32) -> Option<DateTime> {
+        match &self.level {
+            Some(lv) => lv.finish(uid),
+            None => self.sched.get(uid).map(|r| r.early_finish),
+        }
     }
 
     /// A task is a summary when the row directly below it is deeper in the
@@ -1072,6 +1104,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
         }
         KeyCode::Char('b') => app.set_baseline(),
+        KeyCode::Char('L') => app.toggle_level(),
         KeyCode::Char('a') => {
             app.prompt = Some(Prompt { kind: PromptKind::Assign, label: "Assign resource".into(), buf: String::new() });
         }
@@ -1246,8 +1279,15 @@ fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Reflect the theme toggle's on/off state in the ribbon.
-    app.ribbon.set_toggles(if app.light { vec![Act::ThemeToggle] } else { vec![] });
+    // Reflect toggle state (theme, leveling) in the ribbon.
+    let mut toggles = Vec::new();
+    if app.light {
+        toggles.push(Act::ThemeToggle);
+    }
+    if app.leveled {
+        toggles.push(Act::Level);
+    }
+    app.ribbon.set_toggles(toggles);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1518,14 +1558,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     right_lines.push(build_scale(gw, app.hscroll, app.base_day));
     for i in app.top..end {
         let t = &app.proj.tasks[i];
-        let r = app.sched.get(t.uid);
-        let mut line = build_gantt_row(gw, app.hscroll, app.base_day, t, r);
+        let crit = app.sched.get(t.uid).is_some_and(|r| r.critical);
+        let s_day = app.disp_start(t.uid).map(|d| d.day_number() - app.base_day).unwrap_or(i64::MAX);
+        let e_day = app.disp_finish(t.uid).map(|d| d.day_number() - app.base_day).unwrap_or(i64::MIN);
+        let mut line = build_gantt_row(gw, app.hscroll, app.base_day, s_day, e_day, crit, t.summary, t.is_milestone());
         if i == app.sel {
             line.style = Style::default().bg(app.sel_bg());
         }
         right_lines.push(line);
     }
-    let gtitle = format!(" Gantt — from {:04}-{:02}-{:02} (◀ ▶ scroll) ", start.year, start.month, start.day);
+    let lev = if app.leveled { " · leveled" } else { "" };
+    let gtitle = format!(" Gantt — from {:04}-{:02}-{:02} (◀ ▶ scroll){lev} ", start.year, start.month, start.day);
     f.render_widget(
         Paragraph::new(right_lines).block(Block::default().borders(Borders::ALL).title(gtitle)),
         right,
@@ -1552,25 +1595,21 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
     Line::from(Span::styled(buf.into_iter().collect::<String>(), Style::default().fg(WEEKEND)))
 }
 
-/// One task's bar across the visible day columns.
+/// One task's bar across the visible day columns. `s_day`/`e_day` are day
+/// offsets from the gantt origin (the project start day).
+#[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
     width: usize,
     hscroll: i64,
     base_day: i64,
-    task: &Task,
-    r: Option<&projcore::schedule::TaskResult>,
+    s_day: i64,
+    e_day: i64,
+    crit: bool,
+    is_summary: bool,
+    milestone: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(width);
-    let is_summary = task.summary;
-    let milestone = task.is_milestone() && !is_summary;
-    let (s_day, e_day, crit) = match r {
-        Some(r) => (
-            r.early_start.day_number() - base_day,
-            r.early_finish.day_number() - base_day,
-            r.critical,
-        ),
-        None => (i64::MAX, i64::MIN, false),
-    };
+    let milestone = milestone && !is_summary;
     let bar_color = if crit { CRIT } else { ONTRACK };
     for col in 0..width {
         let day = hscroll + col as i64;
@@ -1899,6 +1938,22 @@ mod tests {
         app.assign_resource("");
         assert!(app.proj.assignments.is_empty());
         assert_eq!(app.proj.resources.len(), 2);
+    }
+
+    #[test]
+    fn level_toggle_delays_shared_resource() {
+        let mut proj = new_project(); // task 1 (1d)
+        proj.tasks.push(Task { uid: 2, id: 2, name: "B".into(), outline_level: 1, duration_min: 480, ..Task::default() });
+        let mut app = App::new(proj, None, false);
+        app.sel = 0;
+        app.assign_resource("Alice");
+        app.sel = 1;
+        app.assign_resource("Alice");
+        // unleveled: both start the same day
+        assert_eq!(app.disp_start(1).unwrap().day_number(), app.disp_start(2).unwrap().day_number());
+        // leveled: task 2 waits for Alice to free up
+        app.toggle_level();
+        assert!(app.disp_start(2).unwrap().day_number() > app.disp_start(1).unwrap().day_number());
     }
 
     #[test]

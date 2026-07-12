@@ -556,6 +556,198 @@ pub fn schedule(proj: &Project) -> Schedule {
     Scheduler::new(proj).run()
 }
 
+// ---- resource leveling ------------------------------------------------------
+
+/// The result of a resource-leveling pass: each task's leveled start/finish.
+#[derive(Clone, Debug)]
+pub struct Leveled {
+    start: HashMap<i32, DateTime>,
+    finish: HashMap<i32, DateTime>,
+    pub project_finish: DateTime,
+}
+
+impl Leveled {
+    pub fn start(&self, uid: i32) -> Option<DateTime> {
+        self.start.get(&uid).copied()
+    }
+    pub fn finish(&self, uid: i32) -> Option<DateTime> {
+        self.finish.get(&uid).copied()
+    }
+}
+
+/// Resource-level a project: run CPM, then delay tasks so that no work resource
+/// is booked beyond its capacity, never scheduling a task before its CPM early
+/// start and never breaking a dependency (a predecessor's leveling delay is
+/// propagated to its successors, preserving every link's gap).
+///
+/// v1 scope: a single-pass, topological-order serial leveler operating in the
+/// default calendar's working-minute space; resource occupation is the task's
+/// wall-clock span. It only ever moves tasks *later*. Multi-calendar leveling
+/// and task splitting are out of scope.
+pub fn level(proj: &Project) -> Leveled {
+    Scheduler::new(proj).level()
+}
+
+/// Peak concurrent booked load over `[start, end)` (a sweep over interval ends).
+fn max_load_in(bookings: &[(i64, i64, f64)], start: i64, end: i64) -> f64 {
+    let mut events: Vec<(i64, f64)> = Vec::new();
+    for &(s, e, u) in bookings {
+        if s < end && e > start {
+            events.push((s.max(start), u));
+            events.push((e.min(end), -u));
+        }
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0));
+    let (mut load, mut peak) = (0.0f64, 0.0f64);
+    for (_, d) in events {
+        load += d;
+        if load > peak {
+            peak = load;
+        }
+    }
+    peak
+}
+
+/// Earliest index ≥ `start` where adding `units` for `dur` keeps one resource
+/// within `cap`.
+fn earliest_feasible(bookings: &[(i64, i64, f64)], cap: f64, units: f64, start: i64, dur: i64) -> i64 {
+    if dur <= 0 {
+        return start;
+    }
+    let mut cand = start;
+    loop {
+        let end = cand + dur;
+        if max_load_in(bookings, cand, end) + units <= cap + 1e-9 {
+            return cand;
+        }
+        // jump to the earliest time a blocking interval frees, then retry
+        let next = bookings
+            .iter()
+            .filter(|&&(s, e, _)| s < end && e > cand)
+            .map(|&(_, e, _)| e)
+            .filter(|&e| e > cand)
+            .min();
+        match next {
+            Some(n) => cand = n,
+            None => return cand,
+        }
+    }
+}
+
+/// Earliest index ≥ `start` feasible for *all* of a task's resources at once.
+fn place_all(
+    res: &[(i32, f64)],
+    bookings: &HashMap<i32, Vec<(i64, i64, f64)>>,
+    caps: &HashMap<i32, f64>,
+    start: i64,
+    dur: i64,
+) -> i64 {
+    let mut cand = start;
+    loop {
+        let mut next: Option<i64> = None;
+        for &(rid, units) in res {
+            let bk = bookings.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]);
+            let cap = caps.get(&rid).copied().unwrap_or(1.0);
+            let c = earliest_feasible(bk, cap, units, cand, dur);
+            if c > cand {
+                next = Some(next.map_or(c, |n: i64| n.min(c)));
+            }
+        }
+        match next {
+            None => return cand,
+            Some(n) => cand = n,
+        }
+    }
+}
+
+impl Scheduler<'_> {
+    fn level(&self) -> Leveled {
+        let base = self.run();
+        let tl = self
+            .timelines
+            .get(&self.default_cal)
+            .expect("default timeline present");
+
+        let leaves: Vec<usize> = (0..self.proj.tasks.len())
+            .filter(|&i| !self.proj.tasks[i].summary)
+            .collect();
+        let leaf_uids: std::collections::HashSet<i32> =
+            leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
+        let idx_of: HashMap<i32, usize> =
+            self.proj.tasks.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
+        let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
+
+        // Work-resource capacities and per-task assignments.
+        let mut caps: HashMap<i32, f64> = HashMap::new();
+        for r in &self.proj.resources {
+            if r.is_work {
+                caps.insert(r.uid, if r.max_units > 0.0 { r.max_units } else { 1.0 });
+            }
+        }
+        let mut assign: HashMap<i32, Vec<(i32, f64)>> = HashMap::new();
+        for a in &self.proj.assignments {
+            if caps.contains_key(&a.resource_uid) {
+                assign
+                    .entry(a.task_uid)
+                    .or_default()
+                    .push((a.resource_uid, if a.units > 0.0 { a.units } else { 1.0 }));
+            }
+        }
+
+        let mut delay: HashMap<i32, i64> = HashMap::new();
+        let mut bookings: HashMap<i32, Vec<(i64, i64, f64)>> = HashMap::new();
+        let mut start: HashMap<i32, DateTime> = HashMap::new();
+        let mut finish: HashMap<i32, DateTime> = HashMap::new();
+
+        for &i in &order {
+            let t = &self.proj.tasks[i];
+            let cpm = base.get(t.uid).expect("leaf scheduled");
+            let cpm_start_idx = tl.to_index(cpm.early_start.minutes());
+            // Preserve every link's gap by inheriting the largest predecessor delay.
+            let floor = t
+                .predecessors
+                .iter()
+                .filter_map(|p| delay.get(&p.uid).copied())
+                .max()
+                .unwrap_or(0);
+            let earliest = cpm_start_idx + floor;
+            let res = assign.get(&t.uid).cloned().unwrap_or_default();
+            let placed = place_all(&res, &bookings, &caps, earliest, t.duration_min);
+            delay.insert(t.uid, placed - cpm_start_idx);
+            for (rid, units) in &res {
+                bookings.entry(*rid).or_default().push((placed, placed + t.duration_min, *units));
+            }
+            let s_abs = tl.abs_start(placed);
+            let f_abs = if t.duration_min == 0 { s_abs } else { tl.abs_finish(placed + t.duration_min) };
+            start.insert(t.uid, DateTime::from_minutes(s_abs));
+            finish.insert(t.uid, DateTime::from_minutes(f_abs));
+        }
+
+        // Roll leveled dates up into summary tasks.
+        for (i, t) in self.proj.tasks.iter().enumerate() {
+            if !t.summary {
+                continue;
+            }
+            let kids = descendant_leaves(self.proj, i);
+            let cs: Vec<DateTime> = kids.iter().filter_map(|u| start.get(u).copied()).collect();
+            let cf: Vec<DateTime> = kids.iter().filter_map(|u| finish.get(u).copied()).collect();
+            if let (Some(&s), Some(&f)) = (cs.iter().min(), cf.iter().max()) {
+                start.insert(t.uid, s);
+                finish.insert(t.uid, f);
+            }
+        }
+
+        let project_finish = finish
+            .values()
+            .map(|d| d.minutes())
+            .max()
+            .map(DateTime::from_minutes)
+            .unwrap_or(base.project_finish);
+
+        Leveled { start, finish, project_finish }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +775,60 @@ mod tests {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)), // a Monday
             tasks: vec![a, b, c, d],
             ..Project::default()
+        }
+    }
+
+    fn worker(uid: i32, name: &str, units: f64) -> Resource {
+        Resource { uid, id: uid, name: name.into(), is_work: true, max_units: units, calendar_uid: None }
+    }
+    fn assign(uid: i32, task: i32, res: i32, units: f64) -> Assignment {
+        Assignment { uid, task_uid: task, resource_uid: res, units, work_min: 0 }
+    }
+
+    #[test]
+    fn leveling_serializes_a_shared_resource() {
+        // Two independent 2-day tasks, both staffed by Alice (capacity 1).
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "A", 960), task(2, "B", 960)],
+            resources: vec![worker(1, "Alice", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..Project::default()
+        };
+        // Unleveled, both start Monday (they'd overlap).
+        let s = schedule(&proj);
+        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(s.get(2).unwrap().early_start.to_mspdi(), "2026-03-02T08:00:00");
+        // Leveled, B waits until A frees Alice: A Mon–Tue, B Wed–Thu.
+        let lv = level(&proj);
+        assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-04T08:00:00");
+        assert_eq!(lv.project_finish.to_mspdi(), "2026-03-05T17:00:00");
+    }
+
+    #[test]
+    fn leveling_allows_overlap_within_capacity() {
+        // A resource with capacity 2 can run both unit-1 tasks at once.
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "A", 960), task(2, "B", 960)],
+            resources: vec![worker(1, "Team", 2.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..Project::default()
+        };
+        let lv = level(&proj);
+        assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-02T08:00:00"); // no delay
+    }
+
+    #[test]
+    fn leveling_without_resources_matches_cpm() {
+        let proj = diamond();
+        let s = schedule(&proj);
+        let lv = level(&proj);
+        for uid in 1..=4 {
+            assert_eq!(lv.start(uid), Some(s.get(uid).unwrap().early_start));
+            assert_eq!(lv.finish(uid), Some(s.get(uid).unwrap().early_finish));
         }
     }
 

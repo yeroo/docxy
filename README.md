@@ -214,6 +214,7 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | c | set a date constraint (`SNET 2026-03-05`, `MSO …`, `none`) |
 | a | assign a resource to the task (created on first use; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
+| L | toggle resource leveling (delay bars to fit resource capacity) |
 | Ctrl-F · F3 | find task by name · repeat |
 | Ctrl-Z · Ctrl-Y | undo · redo |
 | F9 · Alt-F | engage the ribbon · open the File menu |
