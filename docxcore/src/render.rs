@@ -2601,14 +2601,20 @@ fn paginate(
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
     let lead = pad(m.center);
+    // A section with `w:pgBorders` draws its page frame in double lines.
+    let (v, h): (char, char) = if geom.page_border {
+        ('║', '═')
+    } else {
+        ('│', '─')
+    };
     // Frame a header/footer/content line into a page row (left margin + content
     // + right margin, between the borders). Non-editable (no caret map).
     let frame_line = |ln: &Line| -> (Line, LineMap) {
         let (clipped, w) = clip_to_cols(ln.spans.clone(), m.content_cols);
         let rpad = m.content_cols - w;
-        let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+        let mut spans = vec![Line::dim_span(format!("{lead}{v}{}", pad(m.ml)))];
         spans.extend(clipped);
-        spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+        spans.push(Line::dim_span(format!("{}{v}", pad(rpad + m.mr))));
         (Line { spans }, LineMap::default())
     };
     let border = |l: char, r: char| -> (Line, LineMap) {
@@ -2616,7 +2622,7 @@ fn paginate(
             Line {
                 spans: vec![Line::dim_span(format!(
                     "{lead}{l}{}{r}",
-                    "─".repeat(inner_w)
+                    h.to_string().repeat(inner_w)
                 ))],
             },
             LineMap::default(),
@@ -2633,7 +2639,7 @@ fn paginate(
         };
         (
             Line {
-                spans: vec![Line::dim_span(format!("{lead}│{inner}│"))],
+                spans: vec![Line::dim_span(format!("{lead}{v}{inner}{v}"))],
             },
             LineMap::default(),
         )
@@ -2704,8 +2710,13 @@ fn paginate(
     // A table border carried over from the previous page (the table was split):
     // reopen the grid at the top of this page's content.
     let mut pending_top: Option<Rc<(String, String)>> = None;
+    let (tl, tr, bl, br) = if geom.page_border {
+        ('╔', '╗', '╚', '╝')
+    } else {
+        ('┌', '┐', '└', '┘')
+    };
     for page in 0..total_pages {
-        out.push(border('┌', '┐'));
+        out.push(border(tl, tr));
         // Top margin, with this page's header drawn into it.
         let header = pl.header(page);
         for r in 0..m.mt {
@@ -2722,7 +2733,7 @@ fn paginate(
         while it.peek().map(|t| t.3) == Some(page) {
             let (idx, ln, mut map, _) = it.next().unwrap();
             last_edge = map.table_edge.clone();
-            let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+            let mut spans = vec![Line::dim_span(format!("{lead}{v}{}", pad(m.ml)))];
             if map.overflow {
                 // A wide table line: keep it whole and let it run past the right
                 // border (no clip, no right frame) — the page extends rightward.
@@ -2731,7 +2742,7 @@ fn paginate(
                 let (clipped, w) = clip_to_cols(ln.spans, m.content_cols);
                 let rpad = m.content_cols - w;
                 spans.extend(clipped);
-                spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+                spans.push(Line::dim_span(format!("{}{v}", pad(rpad + m.mr))));
             }
             for seg in &mut map.segs {
                 seg.col0 += col_off;
@@ -2769,7 +2780,7 @@ fn paginate(
                 out.push(margin_row(None));
             }
         }
-        out.push(border('└', '┘'));
+        out.push(border(bl, br));
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
     }
 
@@ -3841,6 +3852,46 @@ mod tests {
         for i in 0..10 {
             assert!(joined.contains(&format!("c{i}")), "missing c{i}");
         }
+    }
+
+    #[test]
+    fn page_borders_render_a_double_line_frame() {
+        let d = doc(vec![para(vec![run("hi", RunProps::default())])]);
+        // Without page borders the frame is single-line.
+        let plain = RenderOptions {
+            width: 60,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+        let single: String = render(&d, &plain).iter().map(|l| l.plain()).collect();
+        assert!(single.contains('┌') && single.contains('│') && !single.contains('╔'));
+        // With w:pgBorders the section switches to a double-line frame.
+        let bordered = RenderOptions {
+            width: 60,
+            page_view: true,
+            page: PageGeom {
+                page_border: true,
+                ..PageGeom::default()
+            },
+            ..RenderOptions::default()
+        };
+        let double: String = render(&d, &bordered).iter().map(|l| l.plain()).collect();
+        assert!(
+            double.contains('╔') && double.contains('║') && double.contains('╝'),
+            "expected a double-line page frame"
+        );
+        assert!(!double.contains('┌'), "single-line corners should be gone");
+    }
+
+    #[test]
+    fn from_sect_pr_detects_page_borders() {
+        assert!(
+            crate::model::PageGeom::from_sect_pr(
+                "<w:sectPr><w:pgBorders><w:top w:val=\"single\"/></w:pgBorders></w:sectPr>"
+            )
+            .page_border
+        );
+        assert!(!crate::model::PageGeom::from_sect_pr("<w:sectPr/>").page_border);
     }
 
     #[test]

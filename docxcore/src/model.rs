@@ -340,6 +340,9 @@ pub struct PageGeom {
     pub cols: i32,
     /// Space between columns, in twips (`w:cols w:space`).
     pub col_space: i32,
+    /// The section declares decorative page borders (`w:pgBorders`), drawn in the
+    /// page view as a double-line frame.
+    pub page_border: bool,
 }
 
 impl Default for PageGeom {
@@ -354,6 +357,7 @@ impl Default for PageGeom {
             mb: 1440,
             cols: 1,
             col_space: 720,
+            page_border: false,
         }
     }
 }
@@ -386,6 +390,7 @@ impl PageGeom {
             mb: attr("<w:pgMar", "w:bottom", d.mb),
             cols: attr("<w:cols", "w:num", d.cols).max(1),
             col_space: attr("<w:cols", "w:space", d.col_space).max(0),
+            page_border: sect.contains("<w:pgBorders"),
         }
     }
 }
