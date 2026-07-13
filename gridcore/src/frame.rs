@@ -378,6 +378,10 @@ pub struct PivotSpec {
     /// Excel's tabular-with-subtotals layout. Only meaningful with two or
     /// more row fields.
     pub subtotals: bool,
+    /// Excel's "values on rows" (`dataOnRows`): stack the measures down the row
+    /// axis (each row group gets one sub-row per measure) rather than across
+    /// columns. Handled for the common case of no column fields.
+    pub data_on_rows: bool,
 }
 
 /// A computed pivot, laid out as a rectangular grid ready to render:
@@ -504,6 +508,58 @@ pub fn pivot(f: &Frame, spec: &PivotSpec) -> PivotOut {
             .collect();
         meas.agg.apply(&vals)
     };
+
+    // "Values on rows" with more than one measure and no column fields: stack the
+    // measures down the rows, with the measure name in an extra inner label column.
+    if spec.data_on_rows && spec.measures.len() > 1 && spec.cols.is_empty() {
+        let label_cols = spec.rows.len().max(1) + 1;
+        let mname_col = label_cols - 1;
+        let val_col = label_cols;
+        let total_cols = label_cols + 1;
+        let mut grid: Vec<Vec<Value>> = Vec::new();
+        // Header: row-field names in the corner, "Total" over the value column.
+        let mut hdr = vec![Value::Empty; total_cols];
+        for (i, &rf) in spec.rows.iter().enumerate() {
+            hdr[i] = Value::Str(f.names[rf].clone());
+        }
+        hdr[val_col] = Value::Str("Total".into());
+        grid.push(hdr);
+        // Each row group → one sub-row per measure (labels only on the first).
+        for (ri, combo) in row_combos.iter().enumerate() {
+            let recs: Vec<usize> = buckets[ri].iter().flatten().copied().collect();
+            for (k, meas) in spec.measures.iter().enumerate() {
+                let mut row = vec![Value::Empty; total_cols];
+                if k == 0 {
+                    if combo.is_empty() {
+                        row[0] = Value::Str("Total".into());
+                    }
+                    for (i, v) in combo.iter().enumerate() {
+                        row[i] = v.clone();
+                    }
+                }
+                row[mname_col] = Value::Str(meas.name.clone());
+                row[val_col] = agg_records(&recs, meas);
+                grid.push(row);
+            }
+        }
+        if spec.grand_rows && !row_combos.is_empty() && !spec.rows.is_empty() {
+            let all: Vec<usize> = buckets.iter().flatten().flatten().copied().collect();
+            for (k, meas) in spec.measures.iter().enumerate() {
+                let mut row = vec![Value::Empty; total_cols];
+                if k == 0 {
+                    row[0] = Value::Str("Grand Total".into());
+                }
+                row[mname_col] = Value::Str(meas.name.clone());
+                row[val_col] = agg_records(&all, meas);
+                grid.push(row);
+            }
+        }
+        return PivotOut {
+            grid,
+            header_rows: 1,
+            label_cols,
+        };
+    }
 
     let mut grid: Vec<Vec<Value>> = Vec::new();
     // Column-field header rows.
@@ -768,6 +824,45 @@ mod tests {
             out.grid[6],
             vec![s("Grand Total"), Value::Empty, n(170.0), n(6.0)]
         );
+    }
+
+    #[test]
+    fn measures_on_rows_stacks_them_vertically() {
+        let wb = sales_wb();
+        let f = Frame::from_range(&wb, 0, (0, 0, 6, 3));
+        let spec = PivotSpec {
+            rows: vec![0], // Region
+            measures: vec![
+                Measure {
+                    col: 3,
+                    agg: Agg::Sum,
+                    name: "Sum of Sales".into(),
+                    calc: None,
+                },
+                Measure {
+                    col: 2,
+                    agg: Agg::Sum,
+                    name: "Sum of Qty".into(),
+                    calc: None,
+                },
+            ],
+            grand_rows: true,
+            data_on_rows: true,
+            ..PivotSpec::default()
+        };
+        let out = pivot(&f, &spec);
+        // A measure-name column is added; each region gets one row per measure.
+        assert_eq!(out.label_cols, 2);
+        assert_eq!(out.grid[0], vec![s("Region"), Value::Empty, s("Total")]);
+        // East (incl. "east"): Sales 30+20+20+10 = 80, Qty 3+1+2+4 = 10.
+        assert_eq!(out.grid[1], vec![s("East"), s("Sum of Sales"), n(80.0)]);
+        assert_eq!(out.grid[2], vec![Value::Empty, s("Sum of Qty"), n(10.0)]);
+        // West: Sales 40+50 = 90, Qty 2+5 = 7.
+        assert_eq!(out.grid[3], vec![s("West"), s("Sum of Sales"), n(90.0)]);
+        assert_eq!(out.grid[4], vec![Value::Empty, s("Sum of Qty"), n(7.0)]);
+        // Grand total, one row per measure.
+        assert_eq!(out.grid[5], vec![s("Grand Total"), s("Sum of Sales"), n(170.0)]);
+        assert_eq!(out.grid[6], vec![Value::Empty, s("Sum of Qty"), n(17.0)]);
     }
 
     #[test]

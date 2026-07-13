@@ -69,6 +69,8 @@ pub struct Pivot {
     /// Subtotal rows for outer row fields (Excel's default with two or
     /// more row fields, unless every row field opts out).
     pub subtotals: bool,
+    /// Measures stacked on the row axis (`dataOnRows` / the Values field on rows).
+    pub data_on_rows: bool,
     /// Uses features refresh doesn't model — never refreshed.
     pub unsupported: bool,
     /// Field layout changed in the editor — save must rewrite the
@@ -100,6 +102,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         grand_rows: true,
         grand_cols: true,
         subtotals: false,
+        data_on_rows: false,
         unsupported: false,
         edited: false,
         part: part.to_string(),
@@ -132,9 +135,8 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                     if p.attr("colGrandTotals") == "0" {
                         piv.grand_cols = false;
                     }
-                    // Measures on rows would need a transposed layout.
                     if p.attr("dataOnRows") == "1" {
-                        piv.unsupported = true;
+                        piv.data_on_rows = true;
                     }
                 }
                 "location" => {
@@ -155,9 +157,9 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                 "field" => {
                     if let Ok(x) = p.attr("x").parse::<i64>() {
                         match section {
-                            // x = -2 is the "Values" pseudo-field: fine on
-                            // columns (our layout), unsupported on rows.
-                            Section::Rows if x == -2 => piv.unsupported = true,
+                            // x = -2 is the "Values" pseudo-field: on columns it's
+                            // our default layout; on rows it means measures-on-rows.
+                            Section::Rows if x == -2 => piv.data_on_rows = true,
                             Section::Rows if x >= 0 => piv.row_fields.push(x as usize),
                             Section::Cols if x >= 0 => piv.col_fields.push(x as usize),
                             _ => {}
@@ -212,6 +214,11 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
     }
     flush_pivot_field(&mut piv, pivot_field_idx, &mut cur_items, &mut cur_hidden);
     if !got_location || piv.data_fields.is_empty() {
+        piv.unsupported = true;
+    }
+    // Measures-on-rows is handled for the common case (no column fields); with
+    // column fields the transposed layout gets involved, so leave it cached.
+    if piv.data_on_rows && piv.data_fields.len() > 1 && !piv.col_fields.is_empty() {
         piv.unsupported = true;
     }
     // Excel shows subtotals by default when row fields nest, unless every
@@ -508,6 +515,7 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             grand_rows: p.grand_rows,
             grand_cols: p.grand_cols,
             subtotals: p.subtotals,
+            data_on_rows: p.data_on_rows,
         };
         let result = crate::frame::pivot(&frame, &spec);
 
@@ -853,6 +861,7 @@ mod tests {
             grand_rows: true,
             grand_cols: true,
             subtotals: false,
+            data_on_rows: false,
             unsupported: false,
             edited: false,
             part: String::new(),
@@ -963,6 +972,7 @@ mod tests {
             grand_rows: true,
             grand_cols: true,
             subtotals: false,
+            data_on_rows: false,
             unsupported: false,
             edited: false,
             part: String::new(),

@@ -2205,6 +2205,7 @@ impl SheetPackage {
             grand_rows: true,
             grand_cols: true,
             subtotals: false,
+            data_on_rows: false,
             unsupported: false,
             edited: true,
             part: table_part,
