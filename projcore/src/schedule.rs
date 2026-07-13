@@ -556,6 +556,23 @@ pub fn schedule(proj: &Project) -> Schedule {
     Scheduler::new(proj).run()
 }
 
+/// Working minutes between two wall-clock instants under the project's default
+/// calendar. Used when importing a file that stores computed wall-clock
+/// start/finish (a `.mpp`) but not an explicit working-minute duration: the
+/// duration is `working_minutes_between(start, finish)`.
+pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
+    let cal = proj
+        .calendars
+        .iter()
+        .find(|c| c.uid == proj.default_calendar_uid)
+        .cloned()
+        .unwrap_or_else(|| crate::model::Calendar::standard(proj.default_calendar_uid));
+    let a = start.minutes().min(finish.minutes());
+    let b = start.minutes().max(finish.minutes());
+    let tl = Timeline::build(&week_pairs(&cal), a, (b - a) + 480, b + 1440);
+    (tl.to_index(b) - tl.to_index(a)).max(0)
+}
+
 // ---- resource leveling ------------------------------------------------------
 
 /// The result of a resource-leveling pass: each task's leveled start/finish.
@@ -804,6 +821,36 @@ mod tests {
         assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-02T08:00:00");
         assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-04T08:00:00");
         assert_eq!(lv.project_finish.to_mspdi(), "2026-03-05T17:00:00");
+    }
+
+    #[test]
+    fn working_minutes_span_skips_weekends() {
+        let proj = Project::default(); // default (standard Mon–Fri 8h) calendar
+        // Mon 08:00 → Tue 17:00 is two full 8h working days.
+        let mon = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let tue = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+        assert_eq!(working_minutes_between(&proj, mon, tue), 960);
+        // Fri 08:00 → Mon 17:00 is also two working days (the weekend is skipped).
+        let fri = DateTime::from_ymd_hm(2026, 3, 6, 8, 0);
+        let nextmon = DateTime::from_ymd_hm(2026, 3, 9, 17, 0);
+        assert_eq!(working_minutes_between(&proj, fri, nextmon), 960);
+    }
+
+    #[test]
+    fn must_start_on_reproduces_imported_dates() {
+        // An imported .mpp task: pinned start + a duration derived from the
+        // stored start/finish must reschedule back to the same wall-clock dates.
+        let start = DateTime::from_ymd_hm(2026, 3, 6, 8, 0); // Friday
+        let finish = DateTime::from_ymd_hm(2026, 3, 9, 17, 0); // next Monday
+        let proj = Project::default();
+        let dur = working_minutes_between(&proj, start, finish);
+        let mut t = task(1, "Imported", dur);
+        t.constraint = ConstraintType::MustStartOn;
+        t.constraint_date = Some(start);
+        let proj = Project { start_date: Some(start), tasks: vec![t], ..Project::default() };
+        let s = schedule(&proj);
+        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-06T08:00:00");
+        assert_eq!(s.get(1).unwrap().early_finish.to_mspdi(), "2026-03-09T17:00:00");
     }
 
     #[test]

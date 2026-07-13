@@ -156,36 +156,60 @@ fn load(path: &str) -> Result<Project, String> {
 }
 
 /// Build a partial project from a legacy binary `.mpp`. Decodes the documented
-/// metadata (title/author/…) and the **task names** (from the VarMeta/Var2Data
-/// container). The numeric fields — dates, durations, links — live in the
-/// undocumented Fixed/Var data blocks and aren't parsed yet, so each task gets a
-/// default 1-day duration and no dependencies. It opens with the real WBS, and
-/// Save As converts it to `.yppx`/MSPDI.
+/// metadata (title/author/…), the **task names** (from the VarMeta/Var2Data
+/// container), and — when the fixed-record layout is recognized — each task's
+/// **start/finish** dates from the FixedData records. A decoded task is pinned
+/// with a Must-Start-On constraint at its start and given a duration equal to
+/// the working minutes between its start and finish, so the scheduler reproduces
+/// the real dates; tasks without decoded dates keep a default 1-day duration.
+/// Task **links and outline levels** aren't parsed yet, so the WBS is flat. Save
+/// As converts it to `.yppx`/MSPDI.
 fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = mppread::read_mpp(bytes)?;
     let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
         .into_iter()
         .find(|s| !s.is_empty())
         .unwrap_or_else(|| "Imported project".into());
-    let tasks = mppread::mpp::task_names(bytes)
+    let cal_ref = Project::default();
+    let tasks: Vec<Task> = mppread::mpp::tasks(bytes)
         .into_iter()
         .enumerate()
-        .map(|(i, n)| Task {
-            uid: i as i32 + 1,
-            id: i as i32 + 1,
-            name: n,
-            outline_level: 1,
-            duration_min: 480,
-            ..Task::default()
+        .map(|(i, t)| {
+            let mut task = Task {
+                uid: i as i32 + 1,
+                id: i as i32 + 1,
+                name: t.name,
+                outline_level: 1,
+                duration_min: 480,
+                ..Task::default()
+            };
+            if let (Some(s), Some(f)) = (t.start.as_deref().and_then(parse_mpp_dt), t.finish.as_deref().and_then(parse_mpp_dt)) {
+                task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
+                task.constraint = ConstraintType::MustStartOn;
+                task.constraint_date = Some(s);
+                task.stored_start = Some(s);
+                task.stored_finish = Some(f);
+            }
+            task
         })
         .collect();
+    let start = tasks.iter().filter_map(|t| t.stored_start).min().unwrap_or_else(next_monday);
     Ok(Project {
         name,
         title: info.title,
-        start_date: Some(next_monday()),
+        start_date: Some(start),
         tasks,
         ..Project::default()
     })
+}
+
+/// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
+fn parse_mpp_dt(s: &str) -> Option<DateTime> {
+    let (date, time) = s.split_once(' ')?;
+    let mut d = date.split('-');
+    let (y, mo, da) = (d.next()?.parse().ok()?, d.next()?.parse().ok()?, d.next()?.parse().ok()?);
+    let (hh, mm) = time.split_once(':')?;
+    Some(DateTime::from_ymd_hm(y, mo, da, hh.parse().ok()?, mm.parse().ok()?))
 }
 
 fn save_to(proj: &Project, path: &str) -> Result<(), String> {
@@ -2012,7 +2036,7 @@ mod tests {
         ]);
         let proj = project_from_mpp(&mpp).unwrap();
         assert_eq!(proj.name, "Bridge Retrofit");
-        assert!(proj.tasks.is_empty()); // task decoding not implemented yet
+        assert!(proj.tasks.is_empty()); // this stub has no TBkndTask streams to decode
     }
 
     #[test]

@@ -67,14 +67,20 @@ cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp "   1/TBkndTask/Var2
 yppxy corpus/mpp/x.mpp                                                       # opens with the .mpp title
 ```
 
-The container (CFB), the storage tree, the metadata (property sets), and the
-**task names** decode from real files (MPP9 + MPP12/14, auto-detected):
+The container (CFB), the storage tree, the metadata (property sets), the
+**task names**, and each task's **start/finish dates** decode from real files
+(MPP9 + MPP12/14, auto-detected):
 
 ```
-cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp   # decoded task names
+cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp   # names + start/finish
 ```
 
-What remains is the numeric task data (dates, durations, links) in the
+Dates come from the per-task `FixedData` records: the record size and date-field
+offset are auto-detected as the layout under which every task's `start ≤ finish`
+and the starts vary — the same self-validating approach as the name decode. So
+`yppxy corpus/mpp/x.mpp` now opens with the real schedule, not just the metadata.
+
+What remains is the rest of the numeric task data (durations, links) in the
 Fixed/Var data blocks — validated against an MSPDI oracle export of the same
-project. `mppread/tests/real_mpp.rs` locks in the name decode against local
-sample files (and skips when they're absent).
+project. `mppread/tests/real_mpp.rs` locks in the name and date decode against
+local sample files (and skips when they're absent).

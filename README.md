@@ -226,9 +226,12 @@ Launch with `--vim` for a modal mode (`:w`/`:q`/`:wq`/`:q!`, `u` undo, `/`
 search). The light/dark theme persists between sessions.
 
 A separate crate, **`mppread`**, reads the OLE2 Compound File container of
-legacy binary `.mpp` files — today it decodes the documented metadata
-(title/author/company/dates via OLE property sets), so `yppxy legacy.mpp` opens
-with the right name; the undocumented task/resource blocks are a later layer.
+legacy binary `.mpp` files. It decodes the documented metadata (title/author/
+company/dates via OLE property sets) plus each task's **name and start/finish
+dates** from the version-specific var-data and fixed-record blocks (auto-detected
+across MPP9 and MPP12/14, verified on real Microsoft Project and ProjectLibre
+files), so `yppxy legacy.mpp` opens with the real WBS and schedule. Durations and
+links in those blocks are a later layer.
 
 The design, the CPM engine, resource leveling, and the format landscape are
 written up in [PROJECT.md](PROJECT.md).
@@ -294,6 +297,7 @@ cargo run -p gridcore --example gen_sample_xlsx   # build the showcase workbook
 cargo run -p projcore --example gantt_md -- corpus/mspdi/10-summary.xml  # Gantt → Markdown
 cargo run -p projcore --example convert  -- in.xml out.yppx   # MSPDI ⇄ .yppx
 cargo run -p mppread  --example streams  -- some.mpp   # list a .mpp's streams
+cargo run -p mppread  --example tasknames -- some.mpp  # decode a .mpp's tasks + dates
 ```
 
 ## License
