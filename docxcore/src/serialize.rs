@@ -78,6 +78,70 @@ fn write_paragraph(s: &mut String, p: &Paragraph) {
     s.push_str("</w:p>");
 }
 
+/// Ordinal of a `CT_PPr` child element (local name, no `w:` prefix) in the
+/// WordprocessingML schema's fixed child order. Unknown elements sort last but
+/// keep their relative order. Word (and strict validators) reject `<w:pPr>`
+/// children out of this order, so both modeled and preserved (`raw_props`)
+/// children are emitted through this rank.
+fn ppr_rank(local: &str) -> u32 {
+    const ORDER: [&str; 36] = [
+        "pStyle",
+        "keepNext",
+        "keepLines",
+        "pageBreakBefore",
+        "framePr",
+        "widowControl",
+        "numPr",
+        "suppressLineNumbers",
+        "pBdr",
+        "shd",
+        "tabs",
+        "suppressAutoHyphens",
+        "kinsoku",
+        "wordWrap",
+        "overflowPunct",
+        "topLinePunct",
+        "autoSpaceDE",
+        "autoSpaceDN",
+        "bidi",
+        "adjustRightInd",
+        "snapToGrid",
+        "spacing",
+        "ind",
+        "contextualSpacing",
+        "mirrorIndents",
+        "suppressOverlap",
+        "jc",
+        "textDirection",
+        "textAlignment",
+        "textboxTightWrap",
+        "outlineLvl",
+        "divId",
+        "cnfStyle",
+        "rPr",
+        "sectPr",
+        "pPrChange",
+    ];
+    ORDER
+        .iter()
+        .position(|&e| e == local)
+        .map_or(u32::MAX, |i| i as u32)
+}
+
+/// The local element name of a serialized child (`"<w:spacing …/>"` → `spacing`),
+/// used to rank preserved `raw_props` against the modeled children.
+fn local_name(raw: &str) -> &str {
+    let t = raw.trim_start();
+    let Some(rest) = t.strip_prefix('<') else {
+        return "";
+    };
+    let end = rest
+        .find([' ', '/', '>', '\t', '\n', '\r'])
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    name.rsplit(':').next().unwrap_or(name)
+}
+
 fn write_ppr(s: &mut String, props: &ParProps) {
     // Effective paragraph style: explicit style, else a synthesized heading style.
     let style = props
@@ -98,80 +162,90 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     if !has_any {
         return;
     }
-    s.push_str("<w:pPr>");
+
+    // Assemble children as (schema rank, xml) then stable-sort, so modeled and
+    // preserved children interleave in the order `CT_PPr` requires (e.g. a
+    // preserved `w:spacing`/`w:shd`/`w:bidi` lands before the modeled
+    // `w:ind`/`w:jc`, and a paragraph-mark `w:rPr` stays just before `sectPr`).
+    let mut parts: Vec<(u32, String)> = Vec::new();
+
     if let Some(st) = &style {
-        s.push_str("<w:pStyle w:val=\"");
-        esc_attr(st, s);
-        s.push_str("\"/>");
+        let mut x = String::from("<w:pStyle w:val=\"");
+        esc_attr(st, &mut x);
+        x.push_str("\"/>");
+        parts.push((ppr_rank("pStyle"), x));
     }
-    // framePr must precede numPr/jc in the schema order.
     if let Some(f) = &props.frame {
-        s.push_str("<w:framePr");
+        let mut x = String::from("<w:framePr");
         if let Some(v) = f.w {
-            s.push_str(&format!(" w:w=\"{v}\""));
+            x.push_str(&format!(" w:w=\"{v}\""));
         }
         if let Some(v) = f.h {
-            s.push_str(&format!(" w:h=\"{v}\""));
+            x.push_str(&format!(" w:h=\"{v}\""));
         }
         if let Some(a) = &f.h_anchor {
-            s.push_str(" w:hAnchor=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:hAnchor=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.v_anchor {
-            s.push_str(" w:vAnchor=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:vAnchor=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.x_align {
-            s.push_str(" w:xAlign=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:xAlign=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.y_align {
-            s.push_str(" w:yAlign=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:yAlign=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(v) = f.x {
-            s.push_str(&format!(" w:x=\"{v}\""));
+            x.push_str(&format!(" w:x=\"{v}\""));
         }
         if let Some(v) = f.y {
-            s.push_str(&format!(" w:y=\"{v}\""));
+            x.push_str(&format!(" w:y=\"{v}\""));
         }
-        s.push_str("/>");
+        x.push_str("/>");
+        parts.push((ppr_rank("framePr"), x));
     }
     if let Some(num) = props.num_id {
-        s.push_str(&format!(
-            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-            props.ilvl, num
+        parts.push((
+            ppr_rank("numPr"),
+            format!(
+                "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+                props.ilvl, num
+            ),
         ));
     }
-    // pBdr precedes tabs in the schema order.
     if props.borders.top.is_some() || props.borders.bottom.is_some() {
-        s.push_str("<w:pBdr>");
+        let mut x = String::from("<w:pBdr>");
         for (tag, side) in [
             ("w:top", props.borders.top),
             ("w:bottom", props.borders.bottom),
         ] {
             if let Some(k) = side {
-                s.push_str(&format!(
+                x.push_str(&format!(
                     "<{tag} w:val=\"{}\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/>",
                     k.to_val()
                 ));
             }
         }
-        s.push_str("</w:pBdr>");
+        x.push_str("</w:pBdr>");
+        parts.push((ppr_rank("pBdr"), x));
     }
     if !props.tabs.is_empty() {
-        s.push_str("<w:tabs>");
+        let mut x = String::from("<w:tabs>");
         for t in &props.tabs {
             let val = match t.align {
                 TabAlign::Center => "center",
                 TabAlign::Right => "right",
                 TabAlign::Left => "left",
             };
-            s.push_str(&format!("<w:tab w:val=\"{val}\""));
+            x.push_str(&format!("<w:tab w:val=\"{val}\""));
             let leader = match t.leader {
                 TabLeader::Dot => Some("dot"),
                 TabLeader::Hyphen => Some("hyphen"),
@@ -179,49 +253,53 @@ fn write_ppr(s: &mut String, props: &ParProps) {
                 TabLeader::None => None,
             };
             if let Some(l) = leader {
-                s.push_str(&format!(" w:leader=\"{l}\""));
+                x.push_str(&format!(" w:leader=\"{l}\""));
             }
-            s.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
+            x.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
         }
-        s.push_str("</w:tabs>");
+        x.push_str("</w:tabs>");
+        parts.push((ppr_rank("tabs"), x));
     }
-    // w:ind precedes w:jc in the schema order.
     if props.indent != 0 || props.first_line != 0 {
-        s.push_str("<w:ind");
+        let mut x = String::from("<w:ind");
         if props.indent != 0 {
-            s.push_str(&format!(" w:left=\"{}\"", props.indent));
+            x.push_str(&format!(" w:left=\"{}\"", props.indent));
         }
         // firstLine and hanging are mutually exclusive; both are non-negative.
         match props.first_line.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                s.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
+                x.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
             }
             std::cmp::Ordering::Less => {
-                s.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
+                x.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
             }
             std::cmp::Ordering::Equal => {}
         }
-        s.push_str("/>");
+        x.push_str("/>");
+        parts.push((ppr_rank("ind"), x));
     }
     match props.align {
         Align::Left => {}
-        Align::Center => s.push_str("<w:jc w:val=\"center\"/>"),
-        Align::Right => s.push_str("<w:jc w:val=\"right\"/>"),
-        Align::Justify => s.push_str("<w:jc w:val=\"both\"/>"),
+        Align::Center => parts.push((ppr_rank("jc"), "<w:jc w:val=\"center\"/>".into())),
+        Align::Right => parts.push((ppr_rank("jc"), "<w:jc w:val=\"right\"/>".into())),
+        Align::Justify => parts.push((ppr_rank("jc"), "<w:jc w:val=\"both\"/>".into())),
     }
     if props.rtl {
-        s.push_str("<w:bidi/>");
+        parts.push((ppr_rank("bidi"), "<w:bidi/>".into()));
     }
-    // Preserved unmodeled pPr children (the paragraph-mark `w:rPr`, `outlineLvl`,
-    // shading, spacing, …). Emitted here, near the end of pPr — where the most
-    // structurally-sensitive of them, the paragraph-mark `w:rPr`, belongs (just
-    // before sectPr) so Word accepts the ordering.
+    // Preserved unmodeled pPr children (paragraph-mark `w:rPr`, `outlineLvl`,
+    // shading, spacing, …), each ranked by its own element name.
     for raw in &props.raw_props {
-        s.push_str(raw);
+        parts.push((ppr_rank(local_name(raw)), raw.clone()));
     }
-    // A section break (`<w:sectPr>`) is the last pPr child.
     if let Some(sect) = &props.section_break {
-        s.push_str(sect);
+        parts.push((ppr_rank("sectPr"), sect.clone()));
+    }
+
+    parts.sort_by_key(|(rank, _)| *rank);
+    s.push_str("<w:pPr>");
+    for (_, x) in &parts {
+        s.push_str(x);
     }
     s.push_str("</w:pPr>");
 }
@@ -511,6 +589,45 @@ mod tests {
         assert!(xml.contains("<w:trPr>"), "row properties dropped");
         // And the whole thing round-trips to an identical model.
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn ppr_children_emitted_in_schema_order() {
+        // Modeled ind/jc/bidi and preserved shd/spacing must interleave in the
+        // CT_PPr order: shd(9) < bidi(18) < spacing(21) < ind(22) < jc(26) — even
+        // though the raw_props are supplied out of order.
+        let ppr = ParProps {
+            indent: 100,
+            align: Align::Center,
+            rtl: true,
+            raw_props: vec![
+                "<w:spacing w:before=\"120\"/>".to_string(),
+                "<w:shd w:val=\"clear\" w:fill=\"FFFF00\"/>".to_string(),
+            ],
+            ..Default::default()
+        };
+        let d = Document {
+            body: vec![para(ppr, vec![])],
+        };
+        let xml = document_to_xml(&d);
+        let at = |needle: &str| {
+            xml.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        let (shd, bidi, spacing, ind, jc) = (
+            at("<w:shd"),
+            at("<w:bidi/>"),
+            at("<w:spacing"),
+            at("<w:ind"),
+            at("<w:jc"),
+        );
+        assert!(
+            shd < bidi && bidi < spacing && spacing < ind && ind < jc,
+            "pPr children out of schema order: shd={shd} bidi={bidi} spacing={spacing} ind={ind} jc={jc}"
+        );
+        // Reordering is a normalization: re-parsing then re-serializing is stable.
+        let d2 = roundtrip(&d, &Relationships::default());
+        assert_eq!(document_to_xml(&d2), xml);
     }
 
     #[test]

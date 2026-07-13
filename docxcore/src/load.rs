@@ -573,6 +573,7 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
 /// transparently.
 fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>) {
     let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
+    let mut saw_content = false;
     loop {
         match p.next() {
             Event::Start => match p.name() {
@@ -582,6 +583,7 @@ fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>
                     props.push_str(p.raw_slice(start, p.pos()));
                 }
                 "w:sdtContent" => {
+                    saw_content = true;
                     out.push(Block::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
                     out.extend(parse_blocks_until_end(p, rels));
                     out.push(Block::Raw(SDT_BLOCK_CLOSE.to_string()));
@@ -591,6 +593,11 @@ fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+    // A content control with no `<w:sdtContent>` (just `sdtPr`) still round-trips:
+    // emit the wrapper as one self-contained boundary so its props aren't lost.
+    if !saw_content {
+        out.push(Block::Raw(format!("<w:sdt>{props}</w:sdt>")));
     }
 }
 
@@ -739,6 +746,7 @@ fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
 /// bookmarks — serialize verbatim yet render as nothing.
 fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
     let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
+    let mut saw_content = false;
     loop {
         match p.next() {
             Event::Start => match p.name() {
@@ -748,6 +756,7 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
                     props.push_str(p.raw_slice(start, p.pos()));
                 }
                 "w:sdtContent" => {
+                    saw_content = true;
                     out.push(Inline::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
                     parse_inlines_into(p, rels, out);
                     out.push(Inline::Raw(SDT_BLOCK_CLOSE.to_string()));
@@ -757,6 +766,11 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+    // A content control with no `<w:sdtContent>` still round-trips (see
+    // `parse_sdt_block`): keep the wrapper as one self-contained boundary.
+    if !saw_content {
+        out.push(Inline::Raw(format!("<w:sdt>{props}</w:sdt>")));
     }
 }
 
@@ -1199,6 +1213,10 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             Event::Start => match p.name() {
                 "w:tblGrid" => parse_tblgrid(p, &mut table.grid),
                 "w:tr" => table.rows.push(parse_row(p, rels)),
+                // A row-level content control (Repeating Section) wraps its
+                // `<w:tr>` rows in `<w:sdt><w:sdtContent>`. Unwrap it so the
+                // rows survive round-trip.
+                "w:sdt" => parse_sdt_rows(p, rels, &mut table.rows),
                 // Whole table properties (borders/shading/width/style) preserved.
                 "w:tblPr" => {
                     let start = p.start_pos();
@@ -1212,6 +1230,32 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
         }
     }
     table
+}
+
+/// Unwrap a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows — a
+/// "Repeating Section") into `rows`. The `Table` model has no Raw-boundary
+/// facility for rows the way blocks do, so the control wrapper itself isn't
+/// preserved — but the row data (the important content) always is, rather than
+/// being dropped as an unrecognized element.
+fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, rows: &mut Vec<Row>) {
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:sdtContent" => loop {
+                match p.next() {
+                    Event::Start => match p.name() {
+                        "w:tr" => rows.push(parse_row(p, rels)),
+                        "w:sdt" => parse_sdt_rows(p, rels, rows), // nested section
+                        _ => p.skip_element(),
+                    },
+                    Event::End | Event::Eof => break,
+                    Event::Text => {}
+                }
+            },
+            Event::Start => p.skip_element(), // w:sdtPr, w:sdtEndPr
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
 }
 
 fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
@@ -1728,6 +1772,50 @@ mod tests {
         assert!(out.contains("<w:sdt>"), "inline sdt wrapper lost");
         assert!(out.contains("<w:alias w:val=\"nm\"/>"), "sdtPr lost");
         assert!(out.contains("<w:sdtContent>"), "inline sdtContent lost");
+    }
+
+    #[test]
+    fn row_level_content_control_keeps_rows() {
+        // A Repeating Section wraps table rows in <w:sdt><w:sdtContent>. The rows
+        // must survive rather than being dropped as an unknown element.
+        let xml = "<w:document><w:body><w:tbl>\
+                   <w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid>\
+                   <w:tr><w:tc><w:p><w:r><w:t>plain</w:t></w:r></w:p></w:tc></w:tr>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Repeat\"/></w:sdtPr><w:sdtContent>\
+                   <w:tr><w:tc><w:p><w:r><w:t>r1</w:t></w:r></w:p></w:tc></w:tr>\
+                   <w:tr><w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc></w:tr>\
+                   </w:sdtContent></w:sdt>\
+                   </w:tbl></w:body></w:document>";
+        let d = doc(xml);
+        let t = match &d.body[0] {
+            Block::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+        assert_eq!(t.rows.len(), 3, "rows inside the sdt were dropped");
+        assert_eq!(t.rows[0].cells[0].blocks[0].plain_text(), "plain");
+        assert_eq!(t.rows[1].cells[0].blocks[0].plain_text(), "r1");
+        assert_eq!(t.rows[2].cells[0].blocks[0].plain_text(), "r2");
+    }
+
+    #[test]
+    fn empty_content_control_wrapper_survives() {
+        // A control with no <w:sdtContent> (just sdtPr) must still round-trip its
+        // wrapper + props instead of vanishing entirely.
+        let xml = "<w:document><w:body>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Empty\"/></w:sdtPr></w:sdt>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(d.body.len(), 1);
+        assert!(matches!(d.body[0], Block::Raw(_)));
+        if let Block::Raw(raw) = &d.body[0] {
+            assert!(is_sdt_boundary(raw), "empty sdt should render as nothing");
+        }
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>"), "empty sdt wrapper lost");
+        assert!(
+            out.contains("<w:alias w:val=\"Empty\"/>"),
+            "empty sdt props lost"
+        );
     }
 
     #[test]
