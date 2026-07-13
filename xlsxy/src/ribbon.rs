@@ -50,6 +50,7 @@ pub enum Act {
     /// View toggles.
     FormulaView,
     FreezePanes,
+    ShowHidden,
     ThemeToggle,
     AutoHideRibbon,
     Todo(&'static str),
@@ -637,14 +638,22 @@ fn view_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Show",
-            width: 20,
+            width: 22,
             rows: [
-                vec![btn(
-                    "ƒ Formulas",
-                    10,
-                    FormulaView,
-                    "Show formulas instead of values (Ctrl+`)",
-                )],
+                vec![
+                    btn(
+                        "ƒ Formulas",
+                        10,
+                        FormulaView,
+                        "Show formulas instead of values (Ctrl+`)",
+                    ),
+                    btn(
+                        "⤢ Hidden",
+                        9,
+                        ShowHidden,
+                        "Reveal rows/columns hidden by a filter or manual hide",
+                    ),
+                ],
                 vec![btn(
                     "❄ Freeze",
                     8,

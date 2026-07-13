@@ -175,6 +175,11 @@ pub struct ColDef {
 /// Excel's default column width in character units.
 pub const DEFAULT_COL_WIDTH: f64 = 8.43;
 
+/// Whether a raw attribute string carries a truthy `hidden` flag.
+fn attr_hidden(attrs: &str) -> bool {
+    attrs.contains("hidden=\"1\"") || attrs.contains("hidden=\"true\"")
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
     pub name: String,
@@ -338,6 +343,21 @@ impl Sheet {
             }
         }
         DEFAULT_COL_WIDTH
+    }
+
+    /// Whether a row is hidden — by a manual hide, an outline group, or an
+    /// applied auto-filter (Excel persists all three as `hidden="1"`).
+    pub fn row_hidden(&self, row: u32) -> bool {
+        self.row_attrs
+            .get(&row)
+            .is_some_and(|a| attr_hidden(a))
+    }
+
+    /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).
+    pub fn col_hidden(&self, col: u32) -> bool {
+        self.col_defs
+            .iter()
+            .any(|d| col >= d.min && col <= d.max && attr_hidden(&d.attrs))
     }
 
     /// Set one column's width, splitting any range definition that covers it.
@@ -1081,6 +1101,27 @@ mod tests {
         assert_eq!(s.col_width(2), 20.0);
         assert_eq!(s.col_width(3), 12.0);
         assert_eq!(s.col_width(9), DEFAULT_COL_WIDTH);
+    }
+
+    #[test]
+    fn row_and_col_hidden_flags() {
+        let mut s = Sheet::default();
+        s.row_attrs.insert(3, "ht=\"15\" hidden=\"1\"".into());
+        s.row_attrs.insert(4, "hidden=\"0\"".into());
+        s.row_attrs.insert(5, "customHeight=\"1\"".into());
+        assert!(s.row_hidden(3));
+        assert!(!s.row_hidden(4)); // hidden="0" is not hidden
+        assert!(!s.row_hidden(5));
+        assert!(!s.row_hidden(99)); // no attrs at all
+
+        s.col_defs.push(ColDef {
+            min: 2,
+            max: 4,
+            width: None,
+            attrs: "hidden=\"1\"".into(),
+        });
+        assert!(s.col_hidden(2) && s.col_hidden(4));
+        assert!(!s.col_hidden(1) && !s.col_hidden(5));
     }
 
     #[test]

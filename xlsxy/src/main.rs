@@ -841,6 +841,8 @@ struct App {
     formula_view: bool,
     light_theme: bool,
     auto_hide_ribbon: bool,
+    /// Reveal rows/columns hidden by a filter or manual hide (off = Excel view).
+    show_hidden: bool,
     /// The pending Find text while the Replace-with prompt is open.
     replace_find: Option<String>,
     /// Vim-mode state (Some when launched with `--vim`).
@@ -906,6 +908,7 @@ impl App {
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
+            show_hidden: false,
             replace_find: None,
             vim: None,
             sheet_picker: None,
@@ -1674,6 +1677,55 @@ impl App {
 
     // --- movement ------------------------------------------------------------
 
+    fn toggle_show_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.status = Some(
+            if self.show_hidden {
+                "Showing hidden rows/columns"
+            } else {
+                "Hiding filtered / hidden rows/columns"
+            }
+            .to_string(),
+        );
+    }
+
+    /// Nudge a row index onto the nearest non-hidden row, preferring direction
+    /// `dir`. With `show_hidden` on, or no hidden rows in the way, returns `from`.
+    fn visible_row(&self, from: u32, dir: i64) -> u32 {
+        if self.show_hidden || !self.sheet().row_hidden(from) {
+            return from;
+        }
+        let step = if dir < 0 { -1 } else { 1 };
+        for &s in &[step, -step] {
+            let mut r = from as i64;
+            while r >= 0 && r < MAX_ROWS as i64 {
+                if !self.sheet().row_hidden(r as u32) {
+                    return r as u32;
+                }
+                r += s;
+            }
+        }
+        from
+    }
+
+    /// Column counterpart to [`Self::visible_row`].
+    fn visible_col(&self, from: u32, dir: i64) -> u32 {
+        if self.show_hidden || !self.sheet().col_hidden(from) {
+            return from;
+        }
+        let step = if dir < 0 { -1 } else { 1 };
+        for &s in &[step, -step] {
+            let mut c = from as i64;
+            while c >= 0 && c < MAX_COLS as i64 {
+                if !self.sheet().col_hidden(c as u32) {
+                    return c as u32;
+                }
+                c += s;
+            }
+        }
+        from
+    }
+
     fn move_cur(&mut self, dr: i64, dc: i64, select: bool) {
         if select {
             if self.anchor.is_none() {
@@ -1685,7 +1737,8 @@ impl App {
         let (r, c) = self.cur;
         let nr = (r as i64 + dr).clamp(0, MAX_ROWS as i64 - 1) as u32;
         let nc = (c as i64 + dc).clamp(0, MAX_COLS as i64 - 1) as u32;
-        self.cur = (nr, nc);
+        // Skip over rows/columns hidden by a filter or manual hide.
+        self.cur = (self.visible_row(nr, dr), self.visible_col(nc, dc));
         self.ensure_visible();
     }
 
@@ -1736,7 +1789,7 @@ impl App {
             }
             let _ = moved;
         }
-        self.cur = (r, c);
+        self.cur = (self.visible_row(r, dr), self.visible_col(c, dc));
         self.ensure_visible();
     }
 
@@ -1960,6 +2013,9 @@ impl App {
         }
         if self.auto_hide_ribbon {
             v.push(ribbon::Act::AutoHideRibbon);
+        }
+        if self.show_hidden {
+            v.push(ribbon::Act::ShowHidden);
         }
         v
     }
@@ -2392,6 +2448,7 @@ impl App {
             ToggleComments => self.toggle_comments(),
             FormulaView => self.toggle_formula_view(),
             FreezePanes => self.toggle_freeze(),
+            ShowHidden => self.toggle_show_hidden(),
             ThemeToggle => self.toggle_theme(),
             AutoHideRibbon => {
                 self.auto_hide_ribbon = !self.auto_hide_ribbon;
@@ -3584,15 +3641,19 @@ fn draw(app: &mut App, f: &mut Frame) {
     app.vis_cols.clear();
     {
         let mut x = app.gutter_w;
+        let show_hidden = app.show_hidden;
         let push = |app: &mut App, col: u32, x: &mut u16| {
-            if *x < grid.width && col < MAX_COLS {
-                let w = app.col_disp_width(col).min(grid.width - *x);
-                app.vis_cols.push((col, *x, w));
-                *x += w;
-                true
-            } else {
-                false
+            if *x >= grid.width || col >= MAX_COLS {
+                return false;
             }
+            // A hidden column takes no space but keeps the scan going.
+            if !show_hidden && app.sheet().col_hidden(col) {
+                return true;
+            }
+            let w = app.col_disp_width(col).min(grid.width - *x);
+            app.vis_cols.push((col, *x, w));
+            *x += w;
+            true
         };
         for col in 0..fc {
             push(app, col, &mut x);
@@ -3604,16 +3665,21 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
 
     // Visible rows: frozen rows (0..fr) pinned, then scrollable from top.
+    // Rows hidden by a filter or manual hide are skipped unless `show_hidden`.
     app.vis_rows.clear();
     for row in 0..fr {
         if app.vis_rows.len() >= grid.height as usize {
             break;
         }
-        app.vis_rows.push(row);
+        if app.show_hidden || !app.sheet().row_hidden(row) {
+            app.vis_rows.push(row);
+        }
     }
     let mut row = app.top.max(fr);
     while app.vis_rows.len() < grid.height as usize && row < MAX_ROWS {
-        app.vis_rows.push(row);
+        if app.show_hidden || !app.sheet().row_hidden(row) {
+            app.vis_rows.push(row);
+        }
         row += 1;
     }
 
@@ -5267,6 +5333,25 @@ mod tests {
         assert!(app.current_validation().is_none());
         app.open_dv_dropdown();
         assert!(app.dv_picker.is_none());
+    }
+
+    #[test]
+    fn cursor_skips_hidden_rows() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // Hide rows 2 and 3 (0-based), as an applied filter would.
+        let s = &mut app.pkg.workbook.sheets[0];
+        s.row_attrs.insert(1, "hidden=\"1\"".into());
+        s.row_attrs.insert(2, "hidden=\"1\"".into());
+        app.cur = (0, 0);
+        // Down from row 0 lands past the two hidden rows, on row 3.
+        app.move_cur(1, 0, false);
+        assert_eq!(app.cur.0, 3);
+        // With hidden shown, the very next row is reachable again.
+        app.cur = (0, 0);
+        app.toggle_show_hidden();
+        app.move_cur(1, 0, false);
+        assert_eq!(app.cur.0, 1);
     }
 
     #[test]

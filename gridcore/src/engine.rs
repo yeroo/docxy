@@ -694,9 +694,7 @@ impl Resolver for WbResolver<'_> {
         self.wb
             .sheets
             .get(sheet)
-            .and_then(|s| s.row_attrs.get(&row))
-            .map(|a| a.contains("hidden=\"1\"") || a.contains("hidden=\"true\""))
-            .unwrap_or(false)
+            .is_some_and(|s| s.row_hidden(row))
     }
 }
 
