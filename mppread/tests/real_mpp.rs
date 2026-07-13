@@ -8,15 +8,18 @@ fn corpus(path: &str) -> std::path::PathBuf {
 
 #[test]
 fn decodes_real_mpp_task_names_when_present() {
-    // (path, first task name, min count, first task's start prefix) for samples.
+    // (path, first task name, min count, first start prefix, links decode?).
+    // The Azure plan is the newest MPP generation: names + dates decode, but its
+    // link/outline tables use a layout not yet reversed, so links stay off.
     let cases = [
-        ("corpus/mpp/projectlibre-construction.mpp", "Commercial Construction", 100usize, "2000-01-04"),
-        ("corpus/mpp/saswat-part1.mpp", "Project1", 10usize, "2020-01-02"),
-        ("corpus/mpp/msproject2003-deployment.mpp", "Microsoft Office Project 2003 Deployment", 300, "2003-09-16"),
-        ("corpus/mpp/new-product.mpp", "Product #23 Development", 40, "2004-07-20"),
+        ("corpus/mpp/projectlibre-construction.mpp", "Commercial Construction", 100usize, "2000-01-04", true),
+        ("corpus/mpp/saswat-part1.mpp", "Project1", 10, "2020-01-02", true),
+        ("corpus/mpp/msproject2003-deployment.mpp", "Microsoft Office Project 2003 Deployment", 300, "2003-09-16", true),
+        ("corpus/mpp/new-product.mpp", "Product #23 Development", 40, "2004-07-20", true),
+        ("corpus/mpp/azure-analytics.mpp", "Advanced Analytics Project", 20, "2017-08-17", false),
     ];
     let mut checked = 0;
-    for (path, first, min, first_start) in cases {
+    for (path, first, min, first_start, has_links) in cases {
         let Ok(bytes) = std::fs::read(corpus(path)) else { continue };
         // container + metadata must parse
         let info = mppread::read_mpp(&bytes).expect("read_mpp");
@@ -54,7 +57,7 @@ fn decodes_real_mpp_task_names_when_present() {
         // the oracle the decoder fits to (≥90%; a few genuine outliers exist in
         // real plans from manual date edits or constraints).
         let links: usize = tasks.iter().map(|t| t.predecessors.len()).sum();
-        assert!(links > 0, "{path}: no links decoded");
+        assert_eq!(links > 0, has_links, "{path}: link decode expectation");
         let (mut fs, mut fs_ok) = (0usize, 0usize);
         for (i, t) in tasks.iter().enumerate() {
             for p in &t.predecessors {

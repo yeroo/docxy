@@ -36,9 +36,10 @@ fn u16le(b: &[u8], o: usize) -> u16 {
 /// One known VarMeta entry shape: where the field-type `u16` sits relative to
 /// the `u32` Var2Data offset. The name field-type is not hard-coded — it's
 /// discovered as the most-populated non-zero text field.
-const FIELD_RELS: [isize; 2] = [
-    -2, // MPP9 (Project 2000/2002/2003): [uid:u16][field:u16][offset:u32]
-    6,  // MPP12/14 (Project 2007+):      [offset:u32][…][field:u16]
+const FIELD_RELS: [isize; 3] = [
+    -2, // MPP9 (Project 2000/2002/2003):  [uid:u16][field:u16][offset:u32]
+    6,  // MPP12/14 (Project 2007+):       [offset:u32][…][field:u16]
+    -8, // newest MPP14:  [field:u16][0x0b40][item:u32][offset:u32]
 ];
 
 fn u16_at(b: &[u8], p: isize) -> u16 {
@@ -64,12 +65,21 @@ pub fn names(varmeta: &[u8], var2data: &[u8]) -> Vec<String> {
     if u32le(varmeta, 0) != MAGIC {
         return Vec::new();
     }
-    let blocks: HashMap<usize, String> = vardata::block_offsets(var2data)
-        .into_iter()
-        .filter_map(|(off, b)| vardata::utf16le_string(b).map(|s| (off, s)))
-        .collect();
+    // Read each block *at* the offset its VarMeta entry points at (robust to the
+    // non-contiguous Var2Data of newer files, where a sequential walk stalls).
+    let blocks: HashMap<usize, String> = {
+        let mut m = HashMap::new();
+        let mut p = 0usize;
+        while p + 4 <= varmeta.len() {
+            let off = u32le(varmeta, p) as usize;
+            m.entry(off).or_insert_with(|| vardata::string_at(var2data, off));
+            p += 2;
+        }
+        m.into_iter().filter_map(|(o, s)| s.map(|s| (o, s))).collect()
+    };
 
     let mut best: Vec<String> = Vec::new();
+    let mut best_score = 0usize;
     for &field_rel in &FIELD_RELS {
         let mut by_field: HashMap<u16, (std::collections::HashSet<usize>, Vec<String>)> =
             HashMap::new();
@@ -87,8 +97,17 @@ pub fn names(varmeta: &[u8], var2data: &[u8]) -> Vec<String> {
             }
             p += 2; // offsets are 2-byte aligned
         }
-        if let Some((_, list)) = by_field.into_values().max_by_key(|(s, _)| s.len()) {
-            if list.len() > best.len() {
+        // The name field is the one with the most multi-character strings — but
+        // only among *pure* fields (mostly multi-char). A wrong entry layout
+        // reads a bogus field-type that merges the real names with a stray
+        // 1-char marker field ('); that merged group has the same multi-char
+        // count but is only ~half multi-char, so the purity gate rejects it and
+        // lets the correctly-separated name field win.
+        let mc = |l: &Vec<String>| l.iter().filter(|s| s.chars().count() >= 2).count();
+        for (_, list) in by_field.into_values() {
+            let score = mc(&list);
+            if score * 5 >= list.len() * 4 && score > best_score {
+                best_score = score;
                 best = list;
             }
         }
@@ -144,6 +163,29 @@ mod tests {
         }
         let got = names(&vm, &v2);
         assert_eq!(got, vec!["One".to_string(), "Two".into()]);
+    }
+
+    #[test]
+    fn decodes_newest_layout_over_marker_field() {
+        // Newest MPP14: 12-byte entries [field:u16][0x0B40][item:u32][offset:u32]
+        // (field at offset−8). A stray 1-char marker field ('), one per task,
+        // shares the constant 0x0B40 marker position — so a wrong entry layout
+        // merges names+markers into one impure group. The correct field split
+        // plus the purity gate must recover the names alone.
+        let (v2, offs) = build_var2(&["Business Understanding", "'", "Modeling", "'", "Deployment", "'"]);
+        let mut vm = Vec::new();
+        vm.extend_from_slice(&MAGIC.to_le_bytes());
+        vm.resize(32, 0); // header
+        // field 0x0006 = names (even offsets), 0x00AA = the ' marker (odd offsets)
+        for (i, off) in offs.iter().enumerate() {
+            let field: u16 = if i % 2 == 0 { 0x0006 } else { 0x00AA };
+            vm.extend_from_slice(&field.to_le_bytes());
+            vm.extend_from_slice(&0x0B40u16.to_le_bytes());
+            vm.extend_from_slice(&(i as u32).to_le_bytes());
+            vm.extend_from_slice(&(*off as u32).to_le_bytes());
+        }
+        let got = names(&vm, &v2);
+        assert_eq!(got, vec!["Business Understanding".to_string(), "Modeling".into(), "Deployment".into()]);
     }
 
     #[test]

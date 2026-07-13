@@ -229,10 +229,11 @@ A separate crate, **`mppread`**, reads the OLE2 Compound File container of
 legacy binary `.mpp` files. It decodes the documented metadata (title/author/
 company/dates via OLE property sets) plus each task's **name, start/finish dates,
 outline level, and predecessor links** from the version-specific var-data,
-fixed-record, and constraint blocks (auto-detected across MPP9 and MPP12/14,
-verified on real Microsoft Project and ProjectLibre files), so `yppxy legacy.mpp`
-opens with the real WBS tree, schedule, and dependency network. Only link lag
-remains (0 throughout the sample corpus, so still unvalidated).
+fixed-record, and constraint blocks (auto-detected across MPP9, MPP12/14, and the
+newest generation, verified on real Microsoft Project, ProjectLibre, and
+Project-98 files), so `yppxy legacy.mpp` opens with the real WBS tree, schedule,
+and dependency network. The newest generation decodes names and dates; its
+outline/link tables and link lag remain to be reversed.
 
 The design, the CPM engine, resource leveling, and the format landscape are
 written up in [PROJECT.md](PROJECT.md).

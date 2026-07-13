@@ -121,10 +121,12 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
   are OLE **property sets** (MS-OLEPS), decoded exactly. The **task names** now
-  decode too, from the `VarMeta`/`Var2Data` block container: VarMeta is scanned
-  for offsets that land on real Var2Data string blocks (self-validating), the
-  name field-type is auto-detected as the most-populated text field, and the
-  entry layout auto-detects across MPP9 and MPP12/14 — verified on real files
+  decode too, from the `VarMeta`/`Var2Data` block container: each name block is
+  read directly at the offset its VarMeta entry points at (robust to the
+  non-contiguous Var2Data of newer files), the name field-type is auto-detected
+  as the purest mostly-multi-char field (so a stray one-char marker field can't
+  merge into it), and the entry layout auto-detects across MPP9, MPP12/14, and
+  the newest generation — verified on real files
   from both Microsoft Project and ProjectLibre. Each task's **start/finish**
   dates decode too, from the per-task `FixedData` records: the record size and
   date-field offset are auto-detected as the layout under which every task's

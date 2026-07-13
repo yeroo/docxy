@@ -74,12 +74,21 @@ curl -sSL -o corpus/mpp/construction.mpp \
 ### Known decode gaps (good reverse-engineering targets)
 
 The current decoder handles MPP9 and MPP12/14 (names, dates, outline, links) —
-including files a *New Product* template that Project 98 wrote and a later
-version re-saved as MPP9, which the link oracle (below) now dates correctly.
+including a *New Product* template that Project 98 wrote and a later version
+re-saved as MPP9, which the link oracle (below) now dates correctly, and the
+newest MPP generation (the Azure "Advanced Analytics" plan) for **names and
+dates**. That newest file needed two `VarMeta`/`Var2Data` fixes:
 
-- **Newest MPP** (e.g. the Azure "Advanced Analytics" plan): the task-name
-  var-data field isn't found (only one name decodes), so nothing downstream
-  runs. Needs that generation's name field-type / block layout.
+- Its `Var2Data` isn't one contiguous run of length-prefixed blocks (gaps +
+  reordering), so the sequential walk stalled at ~1 name. Name blocks are now
+  read *directly at each `VarMeta` offset* — the authoritative index.
+- Its `VarMeta` entry is a third shape (`[field:u16][0x0B40][item:u32]
+  [offset:u32]`, field at offset−8), and a stray one-char marker field shares
+  the constant `0x0B40` slot. The name field is now chosen as the *purest*
+  mostly-multi-char field, so the marker can't merge into it.
+
+Still open on that newest file: its **outline and link tables** use layouts not
+yet reversed (the decoder declines both rather than guessing).
 
 The **link oracle**: a `.mpp` record holds several date-like field pairs
 (Start/Finish, but also baseline/actual/early/late/constraint dates), and more

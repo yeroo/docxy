@@ -56,6 +56,25 @@ pub fn block_offsets(data: &[u8]) -> Vec<(usize, &[u8])> {
     out
 }
 
+/// Read the length-prefixed block at an explicit byte `offset` (the value a
+/// `VarMeta` entry points at) and decode it as a UTF-16 string if it is one.
+///
+/// Unlike [`block_offsets`], this doesn't assume the stream is one contiguous
+/// run of blocks: newer `.mpp` `Var2Data` streams have gaps and reordering, so a
+/// sequential walk stalls and misses most blocks. The `VarMeta` offsets are the
+/// authoritative index, so reading each block *at* its offset finds them all.
+pub fn string_at(data: &[u8], offset: usize) -> Option<String> {
+    if offset + 4 > data.len() {
+        return None;
+    }
+    let len = u32le(data, offset) as usize;
+    let start = offset + 4;
+    if len < 2 || start + len > data.len() {
+        return None;
+    }
+    utf16le_string(&data[start..start + len])
+}
+
 /// Decode a block as a UTF-16LE string if it plausibly is one (even length,
 /// ≥80% printable, non-empty), stripping a trailing NUL terminator.
 pub fn utf16le_string(b: &[u8]) -> Option<String> {
@@ -127,6 +146,18 @@ mod tests {
                 "General Conditions".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn reads_block_at_explicit_offset() {
+        // A non-contiguous stream: a gap, then a block at a known offset that a
+        // sequential walk would never reach cleanly.
+        let mut data = vec![0xAAu8; 10]; // junk gap
+        let off = data.len();
+        data.extend_from_slice(&block(&utf16("Modeling")));
+        assert_eq!(string_at(&data, off).as_deref(), Some("Modeling"));
+        assert_eq!(string_at(&data, 0), None); // gap isn't a valid string block
+        assert_eq!(string_at(&data, data.len()), None); // past the end
     }
 
     #[test]
