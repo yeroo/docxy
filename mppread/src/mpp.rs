@@ -10,6 +10,7 @@
 
 use crate::cfb::Cfb;
 use crate::oleps;
+use std::collections::HashMap;
 
 const SUMMARY: &str = "\u{5}SummaryInformation";
 const DOC_SUMMARY: &str = "\u{5}DocumentSummaryInformation";
@@ -49,14 +50,25 @@ pub struct MppInfo {
 }
 
 /// A task decoded from a `.mpp`: its name, and — when the fixed-record layout is
-/// recognized — its start and finish (`YYYY-MM-DD HH:MM`) and 1-based outline
-/// level (the WBS depth; 1 = top level).
+/// recognized — its start and finish (`YYYY-MM-DD HH:MM`), 1-based outline level
+/// (the WBS depth; 1 = top level), and predecessor links.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
     pub outline_level: Option<u32>,
+    /// Predecessor links onto this task, when the link table decodes.
+    pub predecessors: Vec<MppPred>,
+}
+
+/// A predecessor link: the 0-based **index** of the predecessor task in the same
+/// [`tasks`] slice, and the link kind (MSPDI's code: 0 = FF, 1 = FS, 2 = SF,
+/// 3 = SS). Lag isn't decoded yet (0 in both corpus files); it's always `0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MppPred {
+    pub pred: usize,
+    pub kind: u8,
 }
 
 /// Decode the task **names** from a `.mpp`, in task order. Empty if the task
@@ -87,7 +99,8 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
 
     // Add dates from FixedData if a record layout fits the task count. Once the
     // record size is known, look for the outline-level column in the same
-    // records (the WBS depth), so summaries and rollup come through too.
+    // records (the WBS depth), so summaries and rollup come through too, and
+    // decode the task links from the sibling `TBkndCons` table.
     let fdpath = v2path.replace("Var2Data", "FixedData");
     if let Some(fd) = cfb.read_path(&fdpath) {
         if let Some((rs, off)) = detect_date_layout(&fd, out.len()) {
@@ -100,9 +113,106 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
                     t.outline_level = Some(fd[i * rs + oc] as u32 + 1);
                 }
             }
+            let conspath = v2path.replace("TBkndTask/Var2Data", "TBkndCons/FixedData");
+            if let Some(cons) = cfb.read_path(&conspath) {
+                decode_links(&cons, &fd, rs, &mut out);
+            }
         }
     }
     out
+}
+
+fn u32le(b: &[u8], o: usize) -> u32 {
+    if o + 4 <= b.len() {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    } else {
+        u32::MAX
+    }
+}
+
+/// A raw `TBkndCons` link record: two task **unique ids** and the link kind.
+struct RawLink {
+    pred_uid: u32,
+    succ_uid: u32,
+    kind: u16,
+}
+
+/// Parse the fixed 20-byte `TBkndCons` records: `[uid][pred_uid][succ_uid]
+/// [kind:u16][…lag]`. The kind is read as a 16-bit low word, which matches both
+/// the MPP9 layout (kind at `+12` as `u16`) and the MPP12/14 layout (kind at
+/// `+12` as `u32`, same low word). Lag isn't decoded (0 in the corpus).
+fn parse_cons(cons: &[u8]) -> Vec<RawLink> {
+    (0..cons.len() / 20)
+        .map(|i| {
+            let o = i * 20;
+            RawLink { pred_uid: u32le(cons, o + 4), succ_uid: u32le(cons, o + 8), kind: u16le(cons, o + 12) }
+        })
+        .collect()
+}
+
+/// True if a Finish-to-Start link is consistent with the decoded dates: the
+/// successor starts on or after the predecessor finishes (compared by date, so
+/// same-day boundaries pass). Missing dates don't count against the fit.
+fn fs_consistent(pred: &MppTask, succ: &MppTask) -> bool {
+    match (&pred.finish, &succ.start) {
+        (Some(f), Some(s)) => s[..s.len().min(10)] >= f[..f.len().min(10)],
+        _ => true,
+    }
+}
+
+/// Decode task links from a `TBkndCons` table and attach them as predecessors.
+///
+/// The link records reference tasks by **unique id**, which is *not* always the
+/// task's position (MPP9 numbers them 0,1,2,…, but MPP12/14 can be sparse, e.g.
+/// 0,2,4,5,…). So the per-task uid column in the FixedData records is found the
+/// self-validating way: the u32 column under which the most Finish-to-Start
+/// links satisfy the date ordering (`fs_consistent`) is the uid map. Links are
+/// attached only if a strong (≥90%) fit is found — otherwise the table is left
+/// undecoded rather than inventing dependencies.
+fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
+    let count = tasks.len();
+    let links = parse_cons(cons);
+    let fs: Vec<&RawLink> = links.iter().filter(|l| l.kind == 1).collect();
+    if fs.is_empty() || count < 2 {
+        return;
+    }
+    // Find the uid column: the u32 offset maximizing FS date-consistency.
+    let build = |off: usize| -> HashMap<u32, usize> {
+        let mut m = HashMap::new();
+        for i in 0..count {
+            m.entry(u32le(fd, i * rs + off)).or_insert(i);
+        }
+        m
+    };
+    let mut best: Option<(usize, usize)> = None; // (offset, valid FS count)
+    for off in 0..rs.saturating_sub(3) {
+        if (count - 1) * rs + off + 4 > fd.len() {
+            continue;
+        }
+        let map = build(off);
+        if map.len() * 10 < count * 9 {
+            continue; // uids must be (near-)distinct
+        }
+        let ok = fs
+            .iter()
+            .filter_map(|l| Some((*map.get(&l.pred_uid)?, *map.get(&l.succ_uid)?)))
+            .filter(|&(p, s)| fs_consistent(&tasks[p], &tasks[s]))
+            .count();
+        if best.is_none_or(|(_, b)| ok > b) {
+            best = Some((off, ok));
+        }
+    }
+    let Some((off, ok)) = best else { return };
+    if ok * 10 < fs.len() * 9 {
+        return; // no column reproduces the schedule → don't guess
+    }
+    let map = build(off);
+    for l in &links {
+        let (Some(&p), Some(&s)) = (map.get(&l.pred_uid), map.get(&l.succ_uid)) else { continue };
+        if p != s && l.kind <= 3 {
+            tasks[s].predecessors.push(MppPred { pred: p, kind: l.kind as u8 });
+        }
+    }
 }
 
 /// A timestamp's ordinal (minutes since the MPP epoch) if it's a plausible
@@ -414,6 +524,57 @@ mod tests {
         let rs = 40usize;
         let fd = vec![0u8; rs * 5]; // all zero everywhere
         assert_eq!(detect_outline_column(&fd, rs, 5), None);
+    }
+
+    #[test]
+    fn decodes_links_with_sparse_uids() {
+        // Three tasks, sparse uids [10, 20, 30] at record offset 0 in 8-byte
+        // records; A→B and B→C finish-to-start links (kind 1).
+        let rs = 8usize;
+        let uids = [10u32, 20, 30];
+        let mut fd = vec![0u8; rs * uids.len()];
+        for (i, &u) in uids.iter().enumerate() {
+            fd[i * rs..i * rs + 4].copy_from_slice(&u.to_le_bytes());
+        }
+        let mut cons = Vec::new();
+        for &(p, s) in &[(10u32, 20u32), (20, 30)] {
+            cons.extend_from_slice(&1u32.to_le_bytes()); // link uid
+            cons.extend_from_slice(&p.to_le_bytes());
+            cons.extend_from_slice(&s.to_le_bytes());
+            cons.extend_from_slice(&1u16.to_le_bytes()); // kind = FS
+            cons.extend_from_slice(&[0u8; 6]); // flag + lag
+        }
+        let mut tasks = vec![
+            MppTask { name: "A".into(), start: Some("2020-01-01 08:00".into()), finish: Some("2020-01-02 17:00".into()), ..Default::default() },
+            MppTask { name: "B".into(), start: Some("2020-01-03 08:00".into()), finish: Some("2020-01-04 17:00".into()), ..Default::default() },
+            MppTask { name: "C".into(), start: Some("2020-01-05 08:00".into()), finish: Some("2020-01-06 17:00".into()), ..Default::default() },
+        ];
+        decode_links(&cons, &fd, rs, &mut tasks);
+        assert_eq!(tasks[0].predecessors, vec![]);
+        assert_eq!(tasks[1].predecessors, vec![MppPred { pred: 0, kind: 1 }]);
+        assert_eq!(tasks[2].predecessors, vec![MppPred { pred: 1, kind: 1 }]);
+    }
+
+    #[test]
+    fn rejects_links_that_contradict_dates() {
+        // A link whose "successor" starts before its "predecessor" finishes has
+        // no uid column that fits → left undecoded.
+        let rs = 8usize;
+        let mut fd = vec![0u8; rs * 2];
+        fd[0..4].copy_from_slice(&0u32.to_le_bytes());
+        fd[rs..rs + 4].copy_from_slice(&1u32.to_le_bytes());
+        let mut cons = Vec::new();
+        cons.extend_from_slice(&1u32.to_le_bytes());
+        cons.extend_from_slice(&0u32.to_le_bytes()); // pred uid 0
+        cons.extend_from_slice(&1u32.to_le_bytes()); // succ uid 1
+        cons.extend_from_slice(&1u16.to_le_bytes());
+        cons.extend_from_slice(&[0u8; 6]);
+        let mut tasks = vec![
+            MppTask { name: "late".into(), start: Some("2020-02-01 08:00".into()), finish: Some("2020-02-10 17:00".into()), ..Default::default() },
+            MppTask { name: "early".into(), start: Some("2020-01-01 08:00".into()), finish: Some("2020-01-02 17:00".into()), ..Default::default() },
+        ];
+        decode_links(&cons, &fd, rs, &mut tasks);
+        assert!(tasks.iter().all(|t| t.predecessors.is_empty()));
     }
 
     #[test]

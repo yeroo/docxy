@@ -139,9 +139,16 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   the real WBS **and** the real dates: each decoded *leaf* task is pinned with a
   Must-Start-On constraint and a duration of the working minutes between its
   start and finish; summary tasks roll their dates up from their children, so
-  the scheduler reproduces Project's own dates. **Task links** in the Fixed/Var
-  data blocks are the remaining reverse-engineering layer; `inspect` hex-dumps
-  any block to work them out against an MSPDI oracle export.
+  the scheduler reproduces Project's own dates. The **predecessor links** decode
+  too, from the sibling `TBkndCons` table (20-byte records of `[link-uid]
+  [pred-uid][succ-uid][kind]`): tasks are referenced by unique id, which isn't
+  always the row position (MPP12/14 uid columns can be sparse), so the per-task
+  uid column is found the self-validating way — the column under which the most
+  Finish-to-Start links satisfy *successor-starts-after-predecessor-finishes*
+  against the already-decoded dates. Links attach only on a strong (≥90%) fit,
+  else the table is left undecoded rather than inventing dependencies. So an
+  imported `.mpp` opens with the real dependency network as well; the only field
+  still on the bench is **link lag** (0 throughout the corpus, so unvalidated).
 
 ## Roadmap
 
@@ -152,11 +159,12 @@ backstage, live Gantt, editing, undo/redo, find, vim mode, themes).
 
 Next, roughly in order:
 
-1. **`.mpp` numeric task decoder** — task **names**, **start/finish dates**, and
-   **outline levels** already decode from real files (MPP9 + MPP12/14); the
-   remaining field is task **links** in the Fixed/Var data blocks. The workflow
-   (sample files in `corpus/mpp/`, map with `inspect`, reverse each block against
-   an MSPDI oracle export) is documented in `corpus/mpp/README.md`.
+1. **`.mpp` numeric task decoder** — task **names**, **start/finish dates**,
+   **outline levels**, and **predecessor links** already decode from real files
+   (MPP9 + MPP12/14); the remaining field is link **lag** (unvalidated — 0
+   throughout the corpus). The workflow (sample files in `corpus/mpp/`, map with
+   `inspect`, reverse each block against an MSPDI oracle export) is documented in
+   `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,
    optional task splitting, and a "resource-critical" flag.
 3. **Assignment editing depth** — units/work per assignment, effort-driven

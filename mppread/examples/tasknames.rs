@@ -18,11 +18,14 @@ fn main() {
     let tasks = mppread::mpp::tasks(&bytes);
     let dated = tasks.iter().filter(|t| t.start.is_some()).count();
     let leveled = tasks.iter().filter(|t| t.outline_level.is_some()).count();
-    println!("{file}: {} tasks ({dated} with dates, {leveled} with outline)", tasks.len());
+    let links: usize = tasks.iter().map(|t| t.predecessors.len()).sum();
+    println!("{file}: {} tasks ({dated} dated, {leveled} outlined, {links} links)", tasks.len());
     for (i, t) in tasks.iter().enumerate() {
         let start = t.start.as_deref().unwrap_or("");
         let finish = t.finish.as_deref().unwrap_or("");
         let indent = "  ".repeat(t.outline_level.unwrap_or(1).saturating_sub(1) as usize);
-        println!("  {:>4}  {:<19}  {:<19}  {indent}{}", i + 1, start, finish, t.name);
+        let preds: Vec<String> = t.predecessors.iter().map(|p| (p.pred + 1).to_string()).collect();
+        let dep = if preds.is_empty() { String::new() } else { format!("  ← {}", preds.join(",")) };
+        println!("  {:>4}  {:<19}  {:<19}  {indent}{}{dep}", i + 1, start, finish, t.name);
     }
 }

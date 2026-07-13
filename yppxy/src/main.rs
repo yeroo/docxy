@@ -163,8 +163,8 @@ fn load(path: &str) -> Result<Project, String> {
 /// the working minutes between its start and finish, so the scheduler reproduces
 /// the real dates; tasks without decoded dates keep a default 1-day duration.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
-/// rollup come through; task **links** aren't parsed yet. Save As converts it to
-/// `.yppx`/MSPDI.
+/// rollup come through, and the **predecessor links** decode from the `TBkndCons`
+/// table. Save As converts it to `.yppx`/MSPDI.
 fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = mppread::read_mpp(bytes)?;
     let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
@@ -189,13 +189,27 @@ fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 duration_min: 480,
                 ..Task::default()
             };
+            // Predecessor links (indices → uids); lag isn't decoded yet.
+            task.predecessors = t
+                .predecessors
+                .iter()
+                .filter_map(|p| {
+                    Some(Predecessor {
+                        uid: p.pred as i32 + 1,
+                        link: LinkType::from_code(p.kind as i64)?,
+                        lag_min: 0,
+                    })
+                })
+                .collect();
             let s = t.start.as_deref().and_then(parse_mpp_dt);
             let f = t.finish.as_deref().and_then(parse_mpp_dt);
             if let (Some(s), Some(f)) = (s, f) {
                 task.stored_start = Some(s);
                 task.stored_finish = Some(f);
                 // Pin only leaf tasks; a summary's dates roll up from its
-                // children, so a constraint on it would fight the rollup.
+                // children, so a constraint on it would fight the rollup. The
+                // Must-Start-On keeps dates exact; the decoded links (validated
+                // against these dates) add the dependency structure.
                 if is_summary {
                     task.duration_min = 0;
                 } else {

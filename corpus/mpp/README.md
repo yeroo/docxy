@@ -75,15 +75,18 @@ The container (CFB), the storage tree, the metadata (property sets), the
 cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp   # names + start/finish
 ```
 
-Dates and **outline levels** come from the per-task `FixedData` records: the
-record size and date-field offset are auto-detected as the layout under which
-every task's `start ≤ finish` and the starts vary; the outline column is found
-by MS Project's tree rule (depth deepens by ≤1 per row and pops back up at
-hierarchy boundaries) — the same self-validating approach as the name decode. So
-`yppxy corpus/mpp/x.mpp` now opens with the real WBS tree and schedule, not just
-the metadata.
+Dates, **outline levels**, and **predecessor links** come from the per-task
+`FixedData` records and the sibling `TBkndCons` table: the record size and
+date-field offset are auto-detected as the layout under which every task's
+`start ≤ finish` and the starts vary; the outline column is found by MS
+Project's tree rule (depth deepens by ≤1 per row and pops back up at hierarchy
+boundaries); links map task unique-ids to rows via the uid column under which
+the most Finish-to-Start links respect the decoded dates — the same
+self-validating approach as the name decode throughout. So `yppxy
+corpus/mpp/x.mpp` now opens with the real WBS tree, schedule, **and** dependency
+network, not just the metadata.
 
-What remains is the rest of the numeric task data (task links/dependencies) in
-the Fixed/Var data blocks — validated against an MSPDI oracle export of the same
-project. `mppread/tests/real_mpp.rs` locks in the name, date, and outline decode
+What remains is link **lag** (0 throughout the corpus, so unvalidated) — best
+reversed against an MSPDI oracle export of a project that uses lead/lag.
+`mppread/tests/real_mpp.rs` locks in the name, date, outline, and link decode
 against local sample files (and skips when they're absent).

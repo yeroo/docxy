@@ -47,6 +47,20 @@ fn decodes_real_mpp_task_names_when_present() {
                 }
             }
         }
+        // Links decode and are self-consistent: every FS link's successor starts
+        // on or after its predecessor finishes (the oracle the decoder uses).
+        let links: usize = tasks.iter().map(|t| t.predecessors.len()).sum();
+        assert!(links > 0, "{path}: no links decoded");
+        for (i, t) in tasks.iter().enumerate() {
+            for p in &t.predecessors {
+                assert!(p.pred < tasks.len() && p.pred != i, "{path}: bad link index");
+                if p.kind == 1 {
+                    if let (Some(pf), Some(ss)) = (&tasks[p.pred].finish, &t.start) {
+                        assert!(ss[..10] >= pf[..10], "{path}: FS link {}->{} violates dates", p.pred, i);
+                    }
+                }
+            }
+        }
         checked += 1;
     }
     eprintln!("real .mpp files validated: {checked}");
