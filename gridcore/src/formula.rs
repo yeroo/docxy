@@ -3920,6 +3920,192 @@ pub fn to_num(v: &Value) -> Result<f64, ExcelError> {
     }
 }
 
+/// Wrap a distribution result: a finite value → number, anything else → `#NUM!`.
+fn domo(x: Option<f64>) -> Value {
+    match x {
+        Some(v) if v.is_finite() => num(v),
+        _ => Value::Err(ExcelError::Num),
+    }
+}
+
+/// Whether `name` is one of the statistical-distribution functions.
+fn is_stat_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "NORM.DIST"
+            | "NORMDIST"
+            | "NORM.S.DIST"
+            | "NORMSDIST"
+            | "NORM.INV"
+            | "NORMINV"
+            | "NORM.S.INV"
+            | "NORMSINV"
+            | "PHI"
+            | "GAUSS"
+            | "STANDARDIZE"
+            | "FISHER"
+            | "FISHERINV"
+            | "CONFIDENCE"
+            | "CONFIDENCE.NORM"
+            | "CONFIDENCE.T"
+            | "GAMMALN"
+            | "GAMMALN.PRECISE"
+            | "GAMMA"
+            | "GAMMA.DIST"
+            | "GAMMADIST"
+            | "GAMMA.INV"
+            | "GAMMAINV"
+            | "CHISQ.DIST"
+            | "CHISQ.DIST.RT"
+            | "CHIDIST"
+            | "CHISQ.INV"
+            | "CHISQ.INV.RT"
+            | "CHIINV"
+            | "EXPON.DIST"
+            | "EXPONDIST"
+            | "POISSON.DIST"
+            | "POISSON"
+            | "WEIBULL.DIST"
+            | "WEIBULL"
+            | "LOGNORM.DIST"
+            | "LOGNORMDIST"
+            | "LOGNORM.INV"
+            | "LOGINV"
+            | "BINOM.DIST"
+            | "BINOMDIST"
+            | "BINOM.INV"
+            | "CRITBINOM"
+            | "NEGBINOM.DIST"
+            | "NEGBINOMDIST"
+            | "HYPGEOM.DIST"
+            | "HYPGEOMDIST"
+            | "BETA.DIST"
+            | "BETADIST"
+            | "BETA.INV"
+            | "BETAINV"
+            | "F.DIST"
+            | "F.DIST.RT"
+            | "FDIST"
+            | "F.INV"
+            | "F.INV.RT"
+            | "FINV"
+            | "T.DIST"
+            | "T.DIST.RT"
+            | "T.DIST.2T"
+            | "TDIST"
+            | "T.INV"
+            | "T.INV.2T"
+            | "TINV"
+    )
+}
+
+/// Log of the binomial coefficient C(n, k) (−∞ outside 0 ≤ k ≤ n → probability 0).
+fn lcomb(n: f64, k: f64) -> f64 {
+    if k < 0.0 || k > n {
+        return f64::NEG_INFINITY;
+    }
+    crate::stats::lgamma(n + 1.0) - crate::stats::lgamma(k + 1.0) - crate::stats::lgamma(n - k + 1.0)
+}
+
+/// Lognormal PDF/CDF.
+fn lognorm(x: f64, mean: f64, sd: f64, cumulative: bool) -> Option<f64> {
+    if x <= 0.0 || sd <= 0.0 {
+        return None;
+    }
+    let z = (x.ln() - mean) / sd;
+    Some(if cumulative {
+        crate::stats::norm_cdf(z)
+    } else {
+        crate::stats::norm_pdf(z) / (x * sd)
+    })
+}
+
+/// Binomial PMF/CDF at `k` successes in `n_` trials with probability `p`.
+fn binom(k: f64, n_: f64, p: f64, cumulative: bool) -> Option<f64> {
+    let (k, n_) = (k.floor(), n_.floor());
+    if k < 0.0 || k > n_ || !(0.0..=1.0).contains(&p) {
+        return None;
+    }
+    if cumulative {
+        if k >= n_ {
+            return Some(1.0);
+        }
+        return Some(crate::stats::betai(n_ - k, k + 1.0, 1.0 - p));
+    }
+    if p == 0.0 {
+        return Some(if k == 0.0 { 1.0 } else { 0.0 });
+    }
+    if p == 1.0 {
+        return Some(if k == n_ { 1.0 } else { 0.0 });
+    }
+    Some((lcomb(n_, k) + k * p.ln() + (n_ - k) * (1.0 - p).ln()).exp())
+}
+
+/// Hypergeometric PMF/CDF: `x` successes in a sample of `n`, drawn from a
+/// population of `pop` with `succ` successes.
+fn hypgeom(x: f64, n: f64, succ: f64, pop: f64, cumulative: bool) -> Option<f64> {
+    let (x, n, succ, pop) = (x.floor(), n.floor(), succ.floor(), pop.floor());
+    if x < 0.0 || n < 0.0 || succ < 0.0 || pop < 0.0 || n > pop || succ > pop || x > n || x > succ {
+        return None;
+    }
+    let pmf = |i: f64| (lcomb(succ, i) + lcomb(pop - succ, n - i) - lcomb(pop, n)).exp();
+    if cumulative {
+        let lo = (n - (pop - succ)).max(0.0);
+        let mut s = 0.0;
+        let mut i = lo;
+        while i <= x {
+            s += pmf(i);
+            i += 1.0;
+        }
+        Some(s)
+    } else if n - x > pop - succ {
+        Some(0.0)
+    } else {
+        Some(pmf(x))
+    }
+}
+
+/// F distribution PDF/CDF.
+fn f_dist(x: f64, d1: f64, d2: f64, cumulative: bool) -> Option<f64> {
+    if x < 0.0 || d1 < 1.0 || d2 < 1.0 {
+        return None;
+    }
+    if cumulative {
+        return Some(crate::stats::f_cdf(x, d1, d2));
+    }
+    if x == 0.0 {
+        return Some(if d1 < 2.0 {
+            f64::INFINITY
+        } else if d1 == 2.0 {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    let lb =
+        crate::stats::lgamma(d1 / 2.0) + crate::stats::lgamma(d2 / 2.0) - crate::stats::lgamma((d1 + d2) / 2.0);
+    let logpdf = 0.5 * (d1 * (d1 * x).ln() + d2 * d2.ln() - (d1 + d2) * (d1 * x + d2).ln())
+        - x.ln()
+        - lb;
+    Some(logpdf.exp())
+}
+
+/// Student-t distribution PDF/CDF.
+fn t_dist(x: f64, df: f64, cumulative: bool) -> Option<f64> {
+    if df < 1.0 {
+        return None;
+    }
+    if cumulative {
+        return Some(crate::stats::t_cdf(x, df));
+    }
+    let pi = std::f64::consts::PI;
+    let logpdf = crate::stats::lgamma((df + 1.0) / 2.0)
+        - crate::stats::lgamma(df / 2.0)
+        - 0.5 * (df * pi).ln()
+        - ((df + 1.0) / 2.0) * (1.0 + x * x / df).ln();
+    Some(logpdf.exp())
+}
+
 /// Text coercion: numbers via General format, TRUE/FALSE, empty → "".
 pub fn to_text(v: &Value) -> Result<String, ExcelError> {
     match v {
@@ -8184,11 +8370,375 @@ impl<'a> Eval<'a> {
             }
 
             // ---- unknown ---------------------------------------------------
-            _ => {
-                self.unsupported = true;
-                Value::Err(ExcelError::Name)
-            }
+            _ => match self.stat_call(name, args) {
+                Some(v) => v,
+                None => {
+                    self.unsupported = true;
+                    Value::Err(ExcelError::Name)
+                }
+            },
         }
+    }
+
+    /// Evaluate every argument to a number (bools coerce: TRUE→1, FALSE→0).
+    fn stat_nums(&mut self, args: &[Expr]) -> Result<Vec<f64>, ExcelError> {
+        let mut v = Vec::with_capacity(args.len());
+        for a in args {
+            if matches!(a, Expr::Missing) {
+                return Err(ExcelError::Value);
+            }
+            v.push(to_num(&self.eval(a))?);
+        }
+        Ok(v)
+    }
+
+    /// The Excel statistical-distribution family (NORM/GAMMA/CHISQ/BETA/F/T/
+    /// BINOM/POISSON/…, plus the legacy pre-2010 spellings). Returns `None` when
+    /// `name` isn't one of them, so the caller can report `#NAME?`.
+    fn stat_call(&mut self, name: &str, args: &[Expr]) -> Option<Value> {
+        use crate::stats as st;
+        if !is_stat_fn(name) {
+            return None;
+        }
+        let n = match self.stat_nums(args) {
+            Ok(v) => v,
+            Err(e) => return Some(Value::Err(e)),
+        };
+        // Arity guard: `[lo, hi]` inclusive count of numeric args.
+        macro_rules! arity {
+            ($lo:expr, $hi:expr) => {
+                if n.len() < $lo || n.len() > $hi {
+                    return Some(Value::Err(ExcelError::Value));
+                }
+            };
+        }
+        let cum = |i: usize| n.get(i).map(|x| *x != 0.0).unwrap_or(false);
+        // Positive standard-t quantile for q ≥ 0.5.
+        let inv_t = |p: f64, df: f64| -> Option<f64> {
+            if p <= 0.0 || p >= 1.0 {
+                None
+            } else if p == 0.5 {
+                Some(0.0)
+            } else if p > 0.5 {
+                st::invert_cdf(p, 0.0, 1.0, |x| st::t_cdf(x, df))
+            } else {
+                st::invert_cdf(1.0 - p, 0.0, 1.0, |x| st::t_cdf(x, df)).map(|x| -x)
+            }
+        };
+        let r: Value = match name {
+            // ---- normal ----
+            "NORM.DIST" | "NORMDIST" => {
+                arity!(4, 4);
+                if n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                let z = (n[0] - n[1]) / n[2];
+                domo(Some(if cum(3) {
+                    st::norm_cdf(z)
+                } else {
+                    st::norm_pdf(z) / n[2]
+                }))
+            }
+            "NORM.S.DIST" => {
+                arity!(2, 2);
+                domo(Some(if cum(1) {
+                    st::norm_cdf(n[0])
+                } else {
+                    st::norm_pdf(n[0])
+                }))
+            }
+            "NORMSDIST" => {
+                arity!(1, 1);
+                domo(Some(st::norm_cdf(n[0])))
+            }
+            "NORM.INV" | "NORMINV" => {
+                arity!(3, 3);
+                if n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(st::norm_inv(n[0]).map(|z| n[1] + n[2] * z))
+            }
+            "NORM.S.INV" | "NORMSINV" => {
+                arity!(1, 1);
+                domo(st::norm_inv(n[0]))
+            }
+            "PHI" => {
+                arity!(1, 1);
+                domo(Some(st::norm_pdf(n[0])))
+            }
+            "GAUSS" => {
+                arity!(1, 1);
+                domo(Some(st::norm_cdf(n[0]) - 0.5))
+            }
+            "STANDARDIZE" => {
+                arity!(3, 3);
+                if n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some((n[0] - n[1]) / n[2]))
+            }
+            "FISHER" => {
+                arity!(1, 1);
+                if n[0] <= -1.0 || n[0] >= 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(n[0].atanh()))
+            }
+            "FISHERINV" => {
+                arity!(1, 1);
+                domo(Some(n[0].tanh()))
+            }
+            "CONFIDENCE" | "CONFIDENCE.NORM" => {
+                arity!(3, 3);
+                if n[0] <= 0.0 || n[0] >= 1.0 || n[1] <= 0.0 || n[2] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(st::norm_inv(1.0 - n[0] / 2.0).map(|z| z * n[1] / n[2].sqrt()))
+            }
+            "CONFIDENCE.T" => {
+                arity!(3, 3);
+                if n[0] <= 0.0 || n[0] >= 1.0 || n[1] <= 0.0 || n[2] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(inv_t(1.0 - n[0] / 2.0, n[2] - 1.0).map(|t| t * n[1] / n[2].sqrt()))
+            }
+
+            // ---- gamma / chi-square ----
+            "GAMMALN" | "GAMMALN.PRECISE" => {
+                arity!(1, 1);
+                if n[0] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(st::lgamma(n[0])))
+            }
+            "GAMMA" => {
+                arity!(1, 1);
+                domo(st::gamma(n[0]))
+            }
+            "GAMMA.DIST" | "GAMMADIST" => {
+                arity!(4, 4);
+                domo(st::gamma_dist(n[0], n[1], n[2], cum(3)))
+            }
+            "GAMMA.INV" | "GAMMAINV" => {
+                arity!(3, 3);
+                if n[1] <= 0.0 || n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| st::gammp(n[1], x / n[2])))
+            }
+            "CHISQ.DIST" => {
+                arity!(3, 3);
+                domo(st::gamma_dist(n[0], n[1] / 2.0, 2.0, cum(2)))
+            }
+            "CHISQ.DIST.RT" | "CHIDIST" => {
+                arity!(2, 2);
+                if n[0] < 0.0 || n[1] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(st::gammq(n[1] / 2.0, n[0] / 2.0)))
+            }
+            "CHISQ.INV" => {
+                arity!(2, 2);
+                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| st::gammp(n[1] / 2.0, x / 2.0)))
+            }
+            "CHISQ.INV.RT" | "CHIINV" => {
+                arity!(2, 2);
+                domo(st::invert_cdf(1.0 - n[0], 0.0, 1.0, |x| {
+                    st::gammp(n[1] / 2.0, x / 2.0)
+                }))
+            }
+
+            // ---- exponential / poisson / weibull ----
+            "EXPON.DIST" | "EXPONDIST" => {
+                arity!(3, 3);
+                if n[0] < 0.0 || n[1] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(if cum(2) {
+                    1.0 - (-n[1] * n[0]).exp()
+                } else {
+                    n[1] * (-n[1] * n[0]).exp()
+                }))
+            }
+            "POISSON.DIST" | "POISSON" => {
+                arity!(3, 3);
+                let k = n[0].floor();
+                if k < 0.0 || n[1] < 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(if cum(2) {
+                    st::gammq(k + 1.0, n[1])
+                } else {
+                    (-n[1] + k * n[1].ln() - st::lgamma(k + 1.0)).exp()
+                }))
+            }
+            "WEIBULL.DIST" | "WEIBULL" => {
+                arity!(4, 4);
+                if n[0] < 0.0 || n[1] <= 0.0 || n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                let (x, a, b) = (n[0], n[1], n[2]);
+                domo(Some(if cum(3) {
+                    1.0 - (-(x / b).powf(a)).exp()
+                } else {
+                    (a / b) * (x / b).powf(a - 1.0) * (-(x / b).powf(a)).exp()
+                }))
+            }
+
+            // ---- lognormal ----
+            "LOGNORM.DIST" => {
+                arity!(4, 4);
+                domo(lognorm(n[0], n[1], n[2], cum(3)))
+            }
+            "LOGNORMDIST" => {
+                arity!(3, 3);
+                domo(lognorm(n[0], n[1], n[2], true))
+            }
+            "LOGNORM.INV" | "LOGINV" => {
+                arity!(3, 3);
+                if n[2] <= 0.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(st::norm_inv(n[0]).map(|z| (n[1] + n[2] * z).exp()))
+            }
+
+            // ---- binomial / negative binomial / hypergeometric ----
+            "BINOM.DIST" | "BINOMDIST" => {
+                arity!(4, 4);
+                domo(binom(n[0], n[1], n[2], cum(3)))
+            }
+            "BINOM.INV" | "CRITBINOM" => {
+                arity!(3, 3);
+                let (trials, p, alpha) = (n[0].floor(), n[1], n[2]);
+                if trials < 0.0 || !(0.0..=1.0).contains(&p) || !(0.0..=1.0).contains(&alpha) {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                let mut cumv = 0.0;
+                let mut out = trials;
+                let mut k = 0.0;
+                while k <= trials {
+                    cumv += binom(k, trials, p, false).unwrap_or(0.0);
+                    if cumv >= alpha {
+                        out = k;
+                        break;
+                    }
+                    k += 1.0;
+                }
+                num(out)
+            }
+            "NEGBINOM.DIST" | "NEGBINOMDIST" => {
+                arity!(3, 4);
+                let (f, s, p) = (n[0].floor(), n[1].floor(), n[2]);
+                if f < 0.0 || s < 1.0 || !(0.0..=1.0).contains(&p) {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                let cumulative = n.len() == 4 && cum(3);
+                domo(Some(if cumulative {
+                    st::betai(s, f + 1.0, p)
+                } else {
+                    (st::lgamma(f + s) - st::lgamma(f + 1.0) - st::lgamma(s)
+                        + s * p.ln()
+                        + f * (1.0 - p).ln())
+                    .exp()
+                }))
+            }
+            "HYPGEOM.DIST" => {
+                arity!(5, 5);
+                domo(hypgeom(n[0], n[1], n[2], n[3], cum(4)))
+            }
+            "HYPGEOMDIST" => {
+                arity!(4, 4);
+                domo(hypgeom(n[0], n[1], n[2], n[3], false))
+            }
+
+            // ---- beta ----
+            "BETA.DIST" => {
+                arity!(4, 6);
+                let (lo, hi) = (n.get(4).copied().unwrap_or(0.0), n.get(5).copied().unwrap_or(1.0));
+                domo(st::beta_dist(n[0], n[1], n[2], cum(3), lo, hi))
+            }
+            "BETADIST" => {
+                arity!(3, 5);
+                let (lo, hi) = (n.get(3).copied().unwrap_or(0.0), n.get(4).copied().unwrap_or(1.0));
+                domo(st::beta_dist(n[0], n[1], n[2], true, lo, hi))
+            }
+            "BETA.INV" | "BETAINV" => {
+                arity!(3, 5);
+                let (lo, hi) = (n.get(3).copied().unwrap_or(0.0), n.get(4).copied().unwrap_or(1.0));
+                if n[1] <= 0.0 || n[2] <= 0.0 || hi <= lo {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(
+                    st::invert_cdf(n[0], 0.0, 1.0, |z| st::betai(n[1], n[2], z))
+                        .map(|z| lo + z * (hi - lo)),
+                )
+            }
+
+            // ---- F ----
+            "F.DIST" => {
+                arity!(4, 4);
+                domo(f_dist(n[0], n[1], n[2], cum(3)))
+            }
+            "F.DIST.RT" | "FDIST" => {
+                arity!(3, 3);
+                if n[0] < 0.0 || n[1] < 1.0 || n[2] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(1.0 - st::f_cdf(n[0], n[1], n[2])))
+            }
+            "F.INV" => {
+                arity!(3, 3);
+                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| st::f_cdf(x, n[1], n[2])))
+            }
+            "F.INV.RT" | "FINV" => {
+                arity!(3, 3);
+                domo(st::invert_cdf(1.0 - n[0], 0.0, 1.0, |x| st::f_cdf(x, n[1], n[2])))
+            }
+
+            // ---- Student t ----
+            "T.DIST" => {
+                arity!(3, 3);
+                domo(t_dist(n[0], n[1], cum(2)))
+            }
+            "T.DIST.RT" => {
+                arity!(2, 2);
+                if n[1] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(1.0 - st::t_cdf(n[0], n[1])))
+            }
+            "T.DIST.2T" => {
+                arity!(2, 2);
+                if n[0] < 0.0 || n[1] < 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(Some(2.0 * (1.0 - st::t_cdf(n[0], n[1]))))
+            }
+            "TDIST" => {
+                arity!(3, 3);
+                let tails = n[2];
+                if n[0] < 0.0 || n[1] < 1.0 || (tails != 1.0 && tails != 2.0) {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                let rt = 1.0 - st::t_cdf(n[0], n[1]);
+                domo(Some(if tails == 2.0 { 2.0 * rt } else { rt }))
+            }
+            "T.INV" => {
+                arity!(2, 2);
+                domo(inv_t(n[0], n[1]))
+            }
+            "T.INV.2T" | "TINV" => {
+                arity!(2, 2);
+                // Two-tailed: the positive x with 2·(1−F(x)) = p.
+                if n[0] <= 0.0 || n[0] > 1.0 {
+                    return Some(Value::Err(ExcelError::Num));
+                }
+                domo(inv_t(1.0 - n[0] / 2.0, n[1]))
+            }
+
+            _ => return None,
+        };
+        Some(r)
     }
 
     /// Collect numeric values (and a COUNTA count of non-empty entries) for
@@ -9563,6 +10113,45 @@ mod tests {
 
     fn empty() -> Grid {
         Grid::new(&[])
+    }
+
+    #[test]
+    fn statistical_distributions_match_excel() {
+        let g = empty();
+        let close = |src: &str, want: f64| {
+            let got = n(src, &g);
+            assert!(
+                (got - want).abs() <= 1e-6 * (1.0 + want.abs()),
+                "{src} = {got}, want {want}"
+            );
+        };
+        // Normal.
+        close("NORM.S.DIST(1.96,TRUE)", 0.975_002_104_851_780);
+        close("NORM.DIST(0,0,1,TRUE)", 0.5);
+        close("NORM.INV(0.975,0,1)", 1.959_963_984_540_054);
+        close("NORMSDIST(0)", 0.5);
+        close("STANDARDIZE(12,10,2)", 1.0);
+        // Gamma / chi-square (3.8415 is the 1-df 5% χ² critical value).
+        close("GAMMALN(5)", 24.0f64.ln());
+        close("CHISQ.DIST.RT(3.8414588,1)", 0.05);
+        close("CHISQ.INV.RT(0.05,1)", 3.841_458_8);
+        close("GAMMA.DIST(2,1,1,TRUE)", 1.0 - (-2.0f64).exp());
+        // Binomial (n=10, p=0.5): P(X≤3)=176/1024, P(X=3)=120/1024.
+        close("BINOM.DIST(3,10,0.5,TRUE)", 176.0 / 1024.0);
+        close("BINOM.DIST(3,10,0.5,FALSE)", 120.0 / 1024.0);
+        close("BINOM.INV(10,0.5,0.5)", 5.0);
+        // Poisson, exponential, Weibull.
+        close("POISSON.DIST(2,3,TRUE)", 0.423_190_081);
+        close("EXPON.DIST(1,1,TRUE)", 1.0 - (-1.0f64).exp());
+        close("WEIBULL.DIST(1,1,1,TRUE)", 1.0 - (-1.0f64).exp());
+        // Student-t.
+        close("T.INV.2T(0.05,10)", 2.228_138_852);
+        close("T.DIST.2T(2.228138852,10)", 0.05);
+        // Confidence + lognormal round-trip.
+        close("CONFIDENCE.NORM(0.05,1,100)", 0.195_996_398);
+        close("LOGNORM.INV(0.5,0,1)", 1.0);
+        // F distribution inverse round-trips its right tail.
+        close("F.DIST.RT(F.INV.RT(0.1,5,10),5,10)", 0.1);
     }
 
     #[test]

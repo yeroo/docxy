@@ -34,4 +34,5 @@ pub mod model;
 pub mod numfmt;
 pub mod pivot;
 pub mod sheet;
+pub mod stats;
 pub mod xlsx;
