@@ -2973,7 +2973,10 @@ mod tests {
         let l_ltr = render(&doc(vec![ltr]), &o)[0].plain();
         let l_rtl = render(&doc(vec![rtl]), &o)[0].plain();
         // LTR anchors left; the bidi paragraph anchors to the right edge.
-        assert!(l_ltr.starts_with("hi"), "LTR should start at col 0: {l_ltr:?}");
+        assert!(
+            l_ltr.starts_with("hi"),
+            "LTR should start at col 0: {l_ltr:?}"
+        );
         assert!(
             l_rtl.starts_with(' ') && l_rtl.trim_end().ends_with("hi"),
             "RTL paragraph should be right-aligned: {l_rtl:?}"

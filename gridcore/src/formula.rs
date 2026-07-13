@@ -4294,7 +4294,9 @@ fn lcomb(n: f64, k: f64) -> f64 {
     if k < 0.0 || k > n {
         return f64::NEG_INFINITY;
     }
-    crate::stats::lgamma(n + 1.0) - crate::stats::lgamma(k + 1.0) - crate::stats::lgamma(n - k + 1.0)
+    crate::stats::lgamma(n + 1.0)
+        - crate::stats::lgamma(k + 1.0)
+        - crate::stats::lgamma(n - k + 1.0)
 }
 
 /// Lognormal PDF/CDF.
@@ -4372,11 +4374,10 @@ fn f_dist(x: f64, d1: f64, d2: f64, cumulative: bool) -> Option<f64> {
             0.0
         });
     }
-    let lb =
-        crate::stats::lgamma(d1 / 2.0) + crate::stats::lgamma(d2 / 2.0) - crate::stats::lgamma((d1 + d2) / 2.0);
-    let logpdf = 0.5 * (d1 * (d1 * x).ln() + d2 * d2.ln() - (d1 + d2) * (d1 * x + d2).ln())
-        - x.ln()
-        - lb;
+    let lb = crate::stats::lgamma(d1 / 2.0) + crate::stats::lgamma(d2 / 2.0)
+        - crate::stats::lgamma((d1 + d2) / 2.0);
+    let logpdf =
+        0.5 * (d1 * (d1 * x).ln() + d2 * d2.ln() - (d1 + d2) * (d1 * x + d2).ln()) - x.ln() - lb;
     Some(logpdf.exp())
 }
 
@@ -8780,7 +8781,9 @@ impl<'a> Eval<'a> {
                 if n[1] <= 0.0 || n[2] <= 0.0 {
                     return Some(Value::Err(ExcelError::Num));
                 }
-                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| st::gammp(n[1], x / n[2])))
+                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| {
+                    st::gammp(n[1], x / n[2])
+                }))
             }
             "CHISQ.DIST" => {
                 arity!(3, 3);
@@ -8795,7 +8798,9 @@ impl<'a> Eval<'a> {
             }
             "CHISQ.INV" => {
                 arity!(2, 2);
-                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| st::gammp(n[1] / 2.0, x / 2.0)))
+                domo(st::invert_cdf(n[0], 0.0, 1.0, |x| {
+                    st::gammp(n[1] / 2.0, x / 2.0)
+                }))
             }
             "CHISQ.INV.RT" | "CHIINV" => {
                 arity!(2, 2);
@@ -8910,17 +8915,26 @@ impl<'a> Eval<'a> {
             // ---- beta ----
             "BETA.DIST" => {
                 arity!(4, 6);
-                let (lo, hi) = (n.get(4).copied().unwrap_or(0.0), n.get(5).copied().unwrap_or(1.0));
+                let (lo, hi) = (
+                    n.get(4).copied().unwrap_or(0.0),
+                    n.get(5).copied().unwrap_or(1.0),
+                );
                 domo(st::beta_dist(n[0], n[1], n[2], cum(3), lo, hi))
             }
             "BETADIST" => {
                 arity!(3, 5);
-                let (lo, hi) = (n.get(3).copied().unwrap_or(0.0), n.get(4).copied().unwrap_or(1.0));
+                let (lo, hi) = (
+                    n.get(3).copied().unwrap_or(0.0),
+                    n.get(4).copied().unwrap_or(1.0),
+                );
                 domo(st::beta_dist(n[0], n[1], n[2], true, lo, hi))
             }
             "BETA.INV" | "BETAINV" => {
                 arity!(3, 5);
-                let (lo, hi) = (n.get(3).copied().unwrap_or(0.0), n.get(4).copied().unwrap_or(1.0));
+                let (lo, hi) = (
+                    n.get(3).copied().unwrap_or(0.0),
+                    n.get(4).copied().unwrap_or(1.0),
+                );
                 if n[1] <= 0.0 || n[2] <= 0.0 || hi <= lo {
                     return Some(Value::Err(ExcelError::Num));
                 }
@@ -8948,7 +8962,9 @@ impl<'a> Eval<'a> {
             }
             "F.INV.RT" | "FINV" => {
                 arity!(3, 3);
-                domo(st::invert_cdf(1.0 - n[0], 0.0, 1.0, |x| st::f_cdf(x, n[1], n[2])))
+                domo(st::invert_cdf(1.0 - n[0], 0.0, 1.0, |x| {
+                    st::f_cdf(x, n[1], n[2])
+                }))
             }
 
             // ---- Student t ----
@@ -10396,7 +10412,14 @@ mod tests {
             fn value(&self, _: usize, _: u32, _: u32) -> Value {
                 Value::Empty
             }
-            fn cells_in(&self, _: usize, _: u32, _: u32, _: u32, _: u32) -> Vec<((u32, u32), Value)> {
+            fn cells_in(
+                &self,
+                _: usize,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+            ) -> Vec<((u32, u32), Value)> {
                 Vec::new()
             }
             fn sheet_index(&self, _: &str) -> Option<usize> {

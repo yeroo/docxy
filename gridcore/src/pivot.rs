@@ -329,7 +329,9 @@ fn shared_item_value(tag: &str, v: &str, date1904: bool) -> Value {
         "s" => Value::Str(decode(v)),
         "n" => Value::Num(v.parse().unwrap_or(0.0)),
         "b" => Value::Bool(matches!(v, "1" | "true" | "True")),
-        "d" => date_to_serial(v, date1904).map(Value::Num).unwrap_or(Value::Empty),
+        "d" => date_to_serial(v, date1904)
+            .map(Value::Num)
+            .unwrap_or(Value::Empty),
         "e" => Value::Str(decode(v)),
         _ => Value::Empty, // "m" = missing/blank
     }
@@ -345,8 +347,17 @@ fn date_to_serial(s: &str, date1904: bool) -> Option<f64> {
     let mut tp = time.split(':');
     let hh: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
     let mm: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let ss: u32 = tp.next().and_then(|x| x.trim_end_matches('Z').parse().ok()).unwrap_or(0);
-    Some(crate::sheet::parts_to_serial(y, m, d, hh * 3600 + mm * 60 + ss, date1904))
+    let ss: u32 = tp
+        .next()
+        .and_then(|x| x.trim_end_matches('Z').parse().ok())
+        .unwrap_or(0);
+    Some(crate::sheet::parts_to_serial(
+        y,
+        m,
+        d,
+        hh * 3600 + mm * 60 + ss,
+        date1904,
+    ))
 }
 
 /// What a refresh pass did.
@@ -494,7 +505,10 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
                 if shared < 0 {
                     continue; // default / "(All)" slot
                 }
-                match (col_of(*fld), p.field_items.get(*fld).and_then(|v| v.get(shared as usize))) {
+                match (
+                    col_of(*fld),
+                    p.field_items.get(*fld).and_then(|v| v.get(shared as usize)),
+                ) {
                     (Some(col), Some(val)) => filters.push((col, vec![val.clone()])),
                     _ => {
                         resolvable = false;
@@ -828,52 +842,63 @@ mod tests {
             };
             data.set_cell(0, 0, Cell::text("Region"));
             data.set_cell(0, 1, Cell::text("Amount"));
-            for (i, (reg, amt)) in [("East", 10.0), ("West", 20.0), ("East", 30.0), ("West", 40.0)]
-                .iter()
-                .enumerate()
+            for (i, (reg, amt)) in [
+                ("East", 10.0),
+                ("West", 20.0),
+                ("East", 30.0),
+                ("West", 40.0),
+            ]
+            .iter()
+            .enumerate()
             {
                 data.set_cell(i as u32 + 1, 0, Cell::text(reg));
                 data.set_cell(i as u32 + 1, 1, Cell::number(*amt));
             }
             data
         };
-        let base_pivot = |hidden: Vec<(usize, Vec<usize>)>, page: Vec<(usize, Option<usize>)>| Pivot {
-            name: "P".into(),
-            sheet: 1,
-            location: (0, 0, 2, 1),
-            source: PivotSource::Range {
-                sheet: "Data".into(),
-                rect: (0, 0, 4, 1),
-            },
-            fields: vec!["Region".into(), "Amount".into()],
-            row_fields: vec![0],
-            col_fields: vec![],
-            data_fields: vec![DataField {
-                name: "Sum of Amount".into(),
-                field: 1,
-                agg: Agg::Sum,
-            }],
-            field_items: vec![vec![Value::Str("East".into()), Value::Str("West".into())], vec![]],
-            hidden,
-            page,
-            items_order: vec![],
-            calc_formulas: vec![],
-            grand_rows: true,
-            grand_cols: true,
-            subtotals: false,
-            data_on_rows: false,
-            unsupported: false,
-            edited: false,
-            part: String::new(),
-            cache_part: String::new(),
-        };
+        let base_pivot =
+            |hidden: Vec<(usize, Vec<usize>)>, page: Vec<(usize, Option<usize>)>| Pivot {
+                name: "P".into(),
+                sheet: 1,
+                location: (0, 0, 2, 1),
+                source: PivotSource::Range {
+                    sheet: "Data".into(),
+                    rect: (0, 0, 4, 1),
+                },
+                fields: vec!["Region".into(), "Amount".into()],
+                row_fields: vec![0],
+                col_fields: vec![],
+                data_fields: vec![DataField {
+                    name: "Sum of Amount".into(),
+                    field: 1,
+                    agg: Agg::Sum,
+                }],
+                field_items: vec![
+                    vec![Value::Str("East".into()), Value::Str("West".into())],
+                    vec![],
+                ],
+                hidden,
+                page,
+                items_order: vec![],
+                calc_formulas: vec![],
+                grand_rows: true,
+                grand_cols: true,
+                subtotals: false,
+                data_on_rows: false,
+                unsupported: false,
+                edited: false,
+                part: String::new(),
+                cache_part: String::new(),
+            };
         let nums = |wb: &Workbook| -> Vec<f64> {
             (0..3)
                 .flat_map(|r| (0..2).map(move |c| (r, c)))
-                .filter_map(|(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
-                    Some(CellValue::Number(n)) => Some(n),
-                    _ => None,
-                })
+                .filter_map(
+                    |(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
+                        Some(CellValue::Number(n)) => Some(n),
+                        _ => None,
+                    },
+                )
                 .collect()
         };
 
@@ -886,7 +911,10 @@ mod tests {
         assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
         let v = nums(&wb);
         assert!(v.contains(&40.0), "East 40 missing: {v:?}");
-        assert!(!v.contains(&20.0) && !v.contains(&60.0), "West leaked: {v:?}");
+        assert!(
+            !v.contains(&20.0) && !v.contains(&60.0),
+            "West leaked: {v:?}"
+        );
 
         // A page filter selecting item 0 ("East") gives the same result.
         let mut wb = Workbook {
@@ -910,9 +938,13 @@ mod tests {
         for (c, h) in ["Region", "Sales", "Cost"].iter().enumerate() {
             data.set_cell(0, c as u32, Cell::text(h));
         }
-        for (i, (reg, s, c)) in [("East", 100.0, 60.0), ("West", 50.0, 20.0), ("East", 30.0, 10.0)]
-            .iter()
-            .enumerate()
+        for (i, (reg, s, c)) in [
+            ("East", 100.0, 60.0),
+            ("West", 50.0, 20.0),
+            ("East", 30.0, 10.0),
+        ]
+        .iter()
+        .enumerate()
         {
             data.set_cell(i as u32 + 1, 0, Cell::text(reg));
             data.set_cell(i as u32 + 1, 1, Cell::number(*s));
@@ -930,7 +962,12 @@ mod tests {
             rect: (0, 0, 3, 2),
         };
         // "Margin" (field 3) is a calculated field = Sales - Cost.
-        piv.fields = vec!["Region".into(), "Sales".into(), "Cost".into(), "Margin".into()];
+        piv.fields = vec![
+            "Region".into(),
+            "Sales".into(),
+            "Cost".into(),
+            "Margin".into(),
+        ];
         piv.calc_formulas = vec![(3, "Sales - Cost".into())];
         piv.row_fields = vec![0];
         piv.data_fields = vec![DataField {
@@ -943,10 +980,12 @@ mod tests {
         // East Margin = 130 - 70 = 60; West = 50 - 20 = 30; Grand = 180 - 90 = 90.
         let nums: Vec<f64> = (0..5)
             .flat_map(|r| (0..2).map(move |c| (r, c)))
-            .filter_map(|(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
-                Some(CellValue::Number(n)) => Some(n),
-                _ => None,
-            })
+            .filter_map(
+                |(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
+                    Some(CellValue::Number(n)) => Some(n),
+                    _ => None,
+                },
+            )
             .collect();
         assert!(nums.contains(&60.0), "East margin 60 missing: {nums:?}");
         assert!(nums.contains(&30.0), "West margin 30 missing: {nums:?}");
@@ -989,7 +1028,10 @@ mod tests {
             </cacheFields></pivotCacheDefinition>"#;
         let (_, fields, items, _, _) = parse_pivot_cache_xml(xml, false).unwrap();
         assert_eq!(fields, vec!["Region", "Flag", "Amount"]);
-        assert_eq!(items[0], vec![Value::Str("East".into()), Value::Str("West".into())]);
+        assert_eq!(
+            items[0],
+            vec![Value::Str("East".into()), Value::Str("West".into())]
+        );
         assert_eq!(items[1], vec![Value::Bool(true), Value::Bool(false)]);
         assert!(items[2].is_empty()); // numeric range → no enumerated items
     }

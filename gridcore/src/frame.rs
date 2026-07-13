@@ -861,7 +861,10 @@ mod tests {
         assert_eq!(out.grid[3], vec![s("West"), s("Sum of Sales"), n(90.0)]);
         assert_eq!(out.grid[4], vec![Value::Empty, s("Sum of Qty"), n(7.0)]);
         // Grand total, one row per measure.
-        assert_eq!(out.grid[5], vec![s("Grand Total"), s("Sum of Sales"), n(170.0)]);
+        assert_eq!(
+            out.grid[5],
+            vec![s("Grand Total"), s("Sum of Sales"), n(170.0)]
+        );
         assert_eq!(out.grid[6], vec![Value::Empty, s("Sum of Qty"), n(17.0)]);
     }
 

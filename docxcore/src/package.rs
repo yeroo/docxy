@@ -92,8 +92,7 @@ impl Package {
                     Some("comments") => Some("comments only"),
                     Some("trackedChanges") => Some("tracked changes only"),
                     Some("forms") => Some("form fields only"),
-                    _ if attr_in(xml, "<w:documentProtection", "w:formatting=\"")
-                        .as_deref()
+                    _ if attr_in(xml, "<w:documentProtection", "w:formatting=\"").as_deref()
                         == Some("1") =>
                     {
                         Some("formatting locked")

@@ -90,10 +90,12 @@ pub fn parse_drawings(
                     "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
                 ) {
                     if let (Some(f), Some(k)) = (from, kind.take()) {
-                        let t = to
-                            .or_else(|| ext.map(|e| estimate_to(f, e)))
-                            .unwrap_or(f);
-                        out.push(Drawing { from: f, to: t, kind: k });
+                        let t = to.or_else(|| ext.map(|e| estimate_to(f, e))).unwrap_or(f);
+                        out.push(Drawing {
+                            from: f,
+                            to: t,
+                            kind: k,
+                        });
                     }
                     from = None;
                     to = None;
@@ -259,8 +261,9 @@ mod tests {
                 <c:val><c:numRef><c:numCache><c:pt><c:v>10</c:v></c:pt><c:pt><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:val>
               </c:ser>
             </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
-        let resolve =
-            |rid: &str| (rid == "rId2").then(|| ("chart".to_string(), "xl/charts/chart1.xml".to_string()));
+        let resolve = |rid: &str| {
+            (rid == "rId2").then(|| ("chart".to_string(), "xl/charts/chart1.xml".to_string()))
+        };
         let get = |part: &str| (part == "xl/charts/chart1.xml").then(|| chart.to_string());
         let ds = parse_drawings(drawing, &resolve, &get);
         assert_eq!(ds.len(), 1);

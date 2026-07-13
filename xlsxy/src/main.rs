@@ -4460,7 +4460,11 @@ fn draw_drawings(app: &mut App, f: &mut Frame, grid: Rect) {
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(border)
-                        .title(fit(&format!(" \u{1f5bc} {name} "), rect.width as usize, false));
+                        .title(fit(
+                            &format!(" \u{1f5bc} {name} "),
+                            rect.width as usize,
+                            false,
+                        ));
                     let inner = block.inner(rect);
                     f.render_widget(block, rect);
                     if inner.height > 0 {
@@ -4488,7 +4492,10 @@ fn draw_drawings(app: &mut App, f: &mut Frame, grid: Rect) {
                 let inner = block.inner(rect);
                 f.render_widget(block, rect);
                 if inner.width > 2 && inner.height > 0 {
-                    f.render_widget(Paragraph::new(chart_bar_lines(cd, inner.width, inner.height)), inner);
+                    f.render_widget(
+                        Paragraph::new(chart_bar_lines(cd, inner.width, inner.height)),
+                        inner,
+                    );
                 }
             }
         }
@@ -4517,7 +4524,12 @@ fn chart_bar_lines(cd: &gridcore::sheet::ChartData, w: u16, h: u16) -> Vec<RLine
         let label = cd.categories.get(i).map(String::as_str).unwrap_or("");
         let filled = ((v / maxv) * bar_max as f64).round().max(0.0) as usize;
         let bar = "\u{2588}".repeat(filled.min(bar_max));
-        let s = format!("{:>lw$} {bar} {}", ellipsize(label, label_w), num_short(v), lw = label_w);
+        let s = format!(
+            "{:>lw$} {bar} {}",
+            ellipsize(label, label_w),
+            num_short(v),
+            lw = label_w
+        );
         lines.push(RLine::from(RSpan::styled(
             fit(&s, w, false),
             Style::new().fg(Color::Cyan),
@@ -5381,7 +5393,8 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
     app.start_screen = welcome;
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
     // a half-block renderer so embedded pictures still show something.
-    app.picker = Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
+    app.picker =
+        Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
     let mut last_title = String::new();
     let result = loop {
         // Reflect the file + dirty state in the terminal window title.
@@ -6314,7 +6327,12 @@ mod tests {
         };
         let lines = chart_bar_lines(&cd, 40, 6);
         assert_eq!(lines.len(), 2);
-        let render = |l: &RLine| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let render = |l: &RLine| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
         let (r0, r1) = (render(&lines[0]), render(&lines[1]));
         assert!(r0.contains("North") && r0.contains('5'));
         assert!(r1.contains("South") && r1.contains("10"));

@@ -390,9 +390,7 @@ impl Sheet {
     /// Whether a row is hidden — by a manual hide, an outline group, or an
     /// applied auto-filter (Excel persists all three as `hidden="1"`).
     pub fn row_hidden(&self, row: u32) -> bool {
-        self.row_attrs
-            .get(&row)
-            .is_some_and(|a| attr_hidden(a))
+        self.row_attrs.get(&row).is_some_and(|a| attr_hidden(a))
     }
 
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).

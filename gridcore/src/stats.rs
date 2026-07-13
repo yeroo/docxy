@@ -299,7 +299,13 @@ pub fn gamma_dist(x: f64, a: f64, b: f64, cumulative: bool) -> Option<f64> {
     if cumulative {
         Some(gammp(a, x / b))
     } else if x == 0.0 {
-        Some(if a < 1.0 { f64::INFINITY } else if a == 1.0 { 1.0 / b } else { 0.0 })
+        Some(if a < 1.0 {
+            f64::INFINITY
+        } else if a == 1.0 {
+            1.0 / b
+        } else {
+            0.0
+        })
     } else {
         Some(((a - 1.0) * x.ln() - x / b - a * b.ln() - lgamma(a)).exp())
     }
@@ -329,11 +335,7 @@ pub fn beta_dist(x: f64, a: f64, b: f64, cumulative: bool, lo: f64, hi: f64) -> 
 pub fn t_cdf(t: f64, df: f64) -> f64 {
     let x = df / (df + t * t);
     let ib = 0.5 * betai(df / 2.0, 0.5, x);
-    if t >= 0.0 {
-        1.0 - ib
-    } else {
-        ib
-    }
+    if t >= 0.0 { 1.0 - ib } else { ib }
 }
 
 /// F CDF at `x` with `d1`, `d2` degrees of freedom.

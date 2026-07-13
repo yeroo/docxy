@@ -100,7 +100,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
             while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
                 i += 1;
             }
-            out.push(Tok::Num(cs[start..i].iter().collect::<String>().parse().ok()?));
+            out.push(Tok::Num(
+                cs[start..i].iter().collect::<String>().parse().ok()?,
+            ));
         } else if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_' || cs[i] == '.') {
@@ -116,7 +118,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 '>' | '<' | '=' => {
                     // Two-char comparisons: >=, <=, <>.
                     let mut op = c.to_string();
-                    if (c == '>' || c == '<') && i + 1 < cs.len() && (cs[i + 1] == '=' || cs[i + 1] == '>')
+                    if (c == '>' || c == '<')
+                        && i + 1 < cs.len()
+                        && (cs[i + 1] == '=' || cs[i + 1] == '>')
                     {
                         op.push(cs[i + 1]);
                         i += 1;
@@ -372,7 +376,10 @@ mod tests {
         let no_calc = |_: &str| None;
         let e = parse("'Field A' * 20", &cols, &no_calc).unwrap();
         // Group sum of A = 5 → 5*20 = 100.
-        assert_eq!(eval(&e, &|c| if c == 0 { 5.0 } else { 0.0 }), Value::Num(100.0));
+        assert_eq!(
+            eval(&e, &|c| if c == 0 { 5.0 } else { 0.0 }),
+            Value::Num(100.0)
+        );
 
         let e = parse("SUM(A, B)", &cols, &no_calc).unwrap();
         assert_eq!(eval(&e, &|c| [3.0, 4.0][c]), Value::Num(7.0));

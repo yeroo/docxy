@@ -702,10 +702,7 @@ impl Resolver for WbResolver<'_> {
     }
 
     fn row_hidden(&self, sheet: usize, row: u32) -> bool {
-        self.wb
-            .sheets
-            .get(sheet)
-            .is_some_and(|s| s.row_hidden(row))
+        self.wb.sheets.get(sheet).is_some_and(|s| s.row_hidden(row))
     }
 }
 
