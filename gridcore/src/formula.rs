@@ -3106,6 +3106,34 @@ impl<'a> Eval<'a> {
 
     /// Lift a scalar function elementwise over array arguments — the
     /// dynamic-array behavior of `ABS(A1:A3)` or `IF(A1:A3>1,"y","n")`.
+    /// `IF` with an already-evaluated scalar selector: return the chosen branch
+    /// as an `Arg`, preserving an array branch (so it can spill) rather than
+    /// collapsing it to a scalar.
+    fn if_scalar_branch(&mut self, sel: Arg, args: &[Expr]) -> Arg {
+        if args.is_empty() || args.len() > 3 {
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
+        let cond = match to_bool(&self.collapse(sel)) {
+            Ok(b) => b,
+            Err(e) => return Arg::Scalar(Value::Err(e)),
+        };
+        if cond {
+            match args.get(1) {
+                Some(Expr::Missing) | None => Arg::Scalar(Value::Num(0.0)),
+                Some(e) => self.eval_arg(e),
+            }
+        } else {
+            match args.get(2) {
+                Some(Expr::Missing) | None => Arg::Scalar(if args.len() < 3 {
+                    Value::Bool(false)
+                } else {
+                    Value::Num(0.0)
+                }),
+                Some(e) => self.eval_arg(e),
+            }
+        }
+    }
+
     fn lift_call(&mut self, name: &str, args: &[Expr]) -> Arg {
         fn is_multi(a: &Arg) -> bool {
             match a {
@@ -3122,6 +3150,12 @@ impl<'a> Eval<'a> {
                 Some(a) => {
                     let sel = self.eval_arg(a);
                     if !is_multi(&sel) {
+                        // A scalar selector picks one branch. For IF, return that
+                        // branch as an Arg so an array branch (IF(TRUE, F5:F8, …))
+                        // stays an array to spill, rather than collapsing.
+                        if name == "IF" {
+                            return self.if_scalar_branch(sel, args);
+                        }
                         return Arg::Scalar(self.call(name, args));
                     }
                 }
@@ -10382,6 +10416,29 @@ mod tests {
         assert_eq!(ev.eval(&parse("SUM(1,2,3)").unwrap()), Value::Num(6.0));
         // A non-builtin defined lambda is still callable.
         assert_eq!(ev.eval(&parse("PLUS2(5)").unwrap()), Value::Num(7.0));
+    }
+
+    #[test]
+    fn if_with_scalar_selector_keeps_array_branch() {
+        let g = Grid::new(&[
+            ("A1", Value::Num(2.0)),
+            ("A2", Value::Num(4.0)),
+            ("A3", Value::Num(6.0)),
+        ]);
+        // IF(TRUE, A1:A3, …) returns the array branch (spills), not a collapse.
+        let ast = parse("IF(TRUE, A1:A3, A1:A1)").unwrap();
+        let mut ev = Eval::new(&g, 0, (10, 0));
+        match ev.eval_dynamic_as(&ast, true) {
+            DynResult::Array(m) => {
+                assert_eq!(m.len(), 3);
+                assert_eq!(m[0][0], Value::Num(2.0));
+            }
+            DynResult::Scalar(v) => panic!("expected a 3-row array, got scalar {v:?}"),
+        }
+        // The false branch is chosen likewise.
+        let ast = parse("IF(FALSE, A1:A1, A1:A3)").unwrap();
+        let mut ev = Eval::new(&g, 0, (10, 0));
+        assert!(matches!(ev.eval_dynamic_as(&ast, true), DynResult::Array(m) if m.len() == 3));
     }
 
     #[test]
