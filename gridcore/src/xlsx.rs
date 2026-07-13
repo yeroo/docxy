@@ -229,6 +229,23 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
                 }
             } else if ty.ends_with("/pivotTable") {
                 pending_pivots.push((sheet_idx, resolve_relative(ws_dir, target)));
+            } else if ty.ends_with("/drawing") {
+                // Floating pictures/charts anchored to this worksheet.
+                let dpart = resolve_relative(ws_dir, target);
+                if let Some(dxml) = get_str(&dpart) {
+                    let ddir = dpart.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    let dfile = dpart.rsplit_once('/').map(|(_, f)| f).unwrap_or(&dpart);
+                    let drels = get_str(&format!("{ddir}/_rels/{dfile}.rels"))
+                        .map(|x| parse_rels(&x))
+                        .unwrap_or_default();
+                    let resolve_rid = |rid: &str| -> Option<(String, String)> {
+                        drels
+                            .iter()
+                            .find(|(id, _, _)| id == rid)
+                            .map(|(_, ty, t)| (ty.to_ascii_lowercase(), resolve_relative(ddir, t)))
+                    };
+                    sheet.drawings = crate::drawing::parse_drawings(&dxml, &resolve_rid, &get_str);
+                }
             }
         }
 

@@ -43,7 +43,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 fn main() -> ExitCode {
@@ -843,6 +843,8 @@ struct App {
     auto_hide_ribbon: bool,
     /// Reveal rows/columns hidden by a filter or manual hide (off = Excel view).
     show_hidden: bool,
+    /// Paint floating pictures/charts over the grid (on by default).
+    show_drawings: bool,
     /// The pending Find text while the Replace-with prompt is open.
     replace_find: Option<String>,
     /// Vim-mode state (Some when launched with `--vim`).
@@ -909,6 +911,7 @@ impl App {
             light_theme: false,
             auto_hide_ribbon: false,
             show_hidden: false,
+            show_drawings: true,
             replace_find: None,
             vim: None,
             sheet_picker: None,
@@ -2017,6 +2020,9 @@ impl App {
         if self.show_hidden {
             v.push(ribbon::Act::ShowHidden);
         }
+        if self.show_drawings {
+            v.push(ribbon::Act::ShowObjects);
+        }
         v
     }
 
@@ -2449,6 +2455,17 @@ impl App {
             FormulaView => self.toggle_formula_view(),
             FreezePanes => self.toggle_freeze(),
             ShowHidden => self.toggle_show_hidden(),
+            ShowObjects => {
+                self.show_drawings = !self.show_drawings;
+                self.status = Some(
+                    if self.show_drawings {
+                        "Showing pictures & charts"
+                    } else {
+                        "Hiding pictures & charts"
+                    }
+                    .to_string(),
+                );
+            }
             ThemeToggle => self.toggle_theme(),
             AutoHideRibbon => {
                 self.auto_hide_ribbon = !self.auto_hide_ribbon;
@@ -3826,6 +3843,11 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     f.render_widget(Paragraph::new(lines), grid);
 
+    // --- floating drawings (pictures / charts) --------------------------------
+    if app.show_drawings {
+        draw_drawings(app, f, grid);
+    }
+
     // --- comments side panel --------------------------------------------------
     if let Some(rect) = panel {
         draw_comments_panel(app, f, rect);
@@ -4345,6 +4367,148 @@ fn draw_sheet_picker(app: &App, sel: usize, f: &mut Frame, grid: Rect) {
 }
 
 /// The list-validation dropdown, anchored just below the cursor cell.
+/// Paint the sheet's floating drawings (pictures + charts) over the grid, each
+/// clipped to the on-screen slice of its anchor rectangle. Pictures show a
+/// labelled box (real pixels are a later enhancement); charts render a compact
+/// bar view of their cached data.
+fn draw_drawings(app: &App, f: &mut Frame, grid: Rect) {
+    let sheet = app.sheet();
+    if sheet.drawings.is_empty() {
+        return;
+    }
+    for d in &sheet.drawings {
+        // Horizontal extent from the visible columns inside [from.col, to.col].
+        let (mut x0, mut x1) = (u16::MAX, 0u16);
+        for &(c, x, w) in &app.vis_cols {
+            if c >= d.from.1 && c <= d.to.1 {
+                x0 = x0.min(x);
+                x1 = x1.max(x + w);
+            }
+        }
+        if x0 == u16::MAX {
+            continue; // no anchored column on screen
+        }
+        // Vertical extent from the visible rows inside [from.row, to.row].
+        let (mut y0, mut y1) = (u16::MAX, 0u16);
+        for (i, &r) in app.vis_rows.iter().enumerate() {
+            if r >= d.from.0 && r <= d.to.0 {
+                let y = grid.y + i as u16;
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+        if y0 == u16::MAX {
+            continue;
+        }
+        // Clip to the grid area.
+        let x0 = x0.max(grid.x);
+        let x1 = x1.min(grid.x + grid.width);
+        let y1 = y1.min(grid.y + grid.height.saturating_sub(1));
+        if x1 <= x0 || y1 < y0 {
+            continue;
+        }
+        let rect = Rect::new(x0, y0, x1 - x0, y1 - y0 + 1);
+        if rect.width < 3 || rect.height < 1 {
+            continue;
+        }
+        f.render_widget(Clear, rect);
+        let border = Style::new().fg(Color::DarkGray);
+        match &d.kind {
+            gridcore::sheet::DrawingKind::Image { name, .. } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title(fit(&format!(" \u{1f5bc} {name} "), rect.width as usize, false));
+                let inner = block.inner(rect);
+                f.render_widget(block, rect);
+                if inner.height > 0 {
+                    let mid = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
+                    f.render_widget(
+                        Paragraph::new(RLine::from(RSpan::styled(
+                            center("(picture)", inner.width as usize),
+                            Style::new().add_modifier(Modifier::DIM),
+                        ))),
+                        mid,
+                    );
+                }
+            }
+            gridcore::sheet::DrawingKind::Chart(cd) => {
+                let title = if cd.title.is_empty() {
+                    format!(" \u{1f4ca} {} chart ", cd.kind)
+                } else {
+                    format!(" \u{1f4ca} {} ", cd.title)
+                };
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title(fit(&title, rect.width as usize, false));
+                let inner = block.inner(rect);
+                f.render_widget(block, rect);
+                if inner.width > 2 && inner.height > 0 {
+                    f.render_widget(Paragraph::new(chart_bar_lines(cd, inner.width, inner.height)), inner);
+                }
+            }
+        }
+    }
+}
+
+/// A compact horizontal-bar view of a chart's first series, one category per row.
+fn chart_bar_lines(cd: &gridcore::sheet::ChartData, w: u16, h: u16) -> Vec<RLine<'static>> {
+    let mut lines: Vec<RLine> = Vec::new();
+    let w = w as usize;
+    // A header noting the shape of the data when several series are present.
+    if cd.series.len() > 1 && h as usize > cd.series.first().map_or(0, |s| s.values.len()) {
+        lines.push(RLine::from(RSpan::styled(
+            fit(&format!("{} series", cd.series.len()), w, false),
+            Style::new().add_modifier(Modifier::DIM),
+        )));
+    }
+    let Some(series) = cd.series.first() else {
+        return lines;
+    };
+    let maxv = series.values.iter().cloned().fold(0f64, f64::max).max(1e-9);
+    let label_w = 8usize.min(w / 3);
+    let bar_max = w.saturating_sub(label_w + 8).max(1);
+    let rows = (h as usize).saturating_sub(lines.len());
+    for (i, &v) in series.values.iter().take(rows).enumerate() {
+        let label = cd.categories.get(i).map(String::as_str).unwrap_or("");
+        let filled = ((v / maxv) * bar_max as f64).round().max(0.0) as usize;
+        let bar = "\u{2588}".repeat(filled.min(bar_max));
+        let s = format!("{:>lw$} {bar} {}", ellipsize(label, label_w), num_short(v), lw = label_w);
+        lines.push(RLine::from(RSpan::styled(
+            fit(&s, w, false),
+            Style::new().fg(Color::Cyan),
+        )));
+    }
+    lines
+}
+
+/// Trim a label to `n` columns with an ellipsis.
+fn ellipsize(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else if n <= 1 {
+        "\u{2026}".to_string()
+    } else {
+        let keep: String = s.chars().take(n - 1).collect();
+        format!("{keep}\u{2026}")
+    }
+}
+
+/// Format a number compactly for a chart bar (no trailing zeros, k/M suffixes).
+fn num_short(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e6 {
+        format!("{:.1}M", v / 1e6)
+    } else if a >= 1e3 {
+        format!("{:.1}k", v / 1e3)
+    } else if v.fract() == 0.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
     if p.values.is_empty() {
         return;
@@ -6076,6 +6240,72 @@ mod tests {
         let text = format!("{:?}", term.backend().buffer());
         assert!(text.contains("Relationships"));
         assert!(text.contains("Measures"));
+    }
+
+    #[test]
+    fn chart_bar_lines_scales_bars() {
+        use gridcore::sheet::{ChartData, ChartSeries};
+        let cd = ChartData {
+            title: "T".into(),
+            kind: "bar".into(),
+            categories: vec!["North".into(), "South".into()],
+            series: vec![ChartSeries {
+                name: "s".into(),
+                values: vec![5.0, 10.0],
+            }],
+        };
+        let lines = chart_bar_lines(&cd, 40, 6);
+        assert_eq!(lines.len(), 2);
+        let render = |l: &RLine| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let (r0, r1) = (render(&lines[0]), render(&lines[1]));
+        assert!(r0.contains("North") && r0.contains('5'));
+        assert!(r1.contains("South") && r1.contains("10"));
+        // The larger value gets the longer bar.
+        let bars = |s: &str| s.chars().filter(|&c| c == '\u{2588}').count();
+        assert!(bars(&r1) > bars(&r0), "10 should outbar 5: {r0:?} {r1:?}");
+    }
+
+    #[test]
+    fn num_short_is_compact() {
+        assert_eq!(num_short(42.0), "42");
+        assert_eq!(num_short(1500.0), "1.5k");
+        assert_eq!(num_short(2_000_000.0), "2.0M");
+        assert_eq!(num_short(3.25), "3.25");
+    }
+
+    #[test]
+    fn drawings_render_and_toggle() {
+        use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].drawings.push(Drawing {
+            from: (1, 1),
+            to: (14, 8),
+            kind: DrawingKind::Chart(ChartData {
+                title: "Revenue".into(),
+                kind: "bar".into(),
+                categories: vec!["North".into()],
+                series: vec![ChartSeries {
+                    name: "y".into(),
+                    values: vec![10.0],
+                }],
+            }),
+        });
+        let mut app = App::new(pkg, "t.xlsx");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        assert!(
+            format!("{:?}", term.backend().buffer()).contains("Revenue"),
+            "chart title should be drawn"
+        );
+        // The Objects toggle hides them.
+        app.show_drawings = false;
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        assert!(
+            !format!("{:?}", term.backend().buffer()).contains("Revenue"),
+            "chart should be hidden when Objects is off"
+        );
     }
 
     #[test]

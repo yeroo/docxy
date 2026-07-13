@@ -25,6 +25,7 @@
 
 pub mod cf;
 pub mod comments;
+pub mod drawing;
 pub mod edit;
 pub mod engine;
 pub mod formula;

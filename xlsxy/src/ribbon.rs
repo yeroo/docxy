@@ -51,6 +51,7 @@ pub enum Act {
     FormulaView,
     FreezePanes,
     ShowHidden,
+    ShowObjects,
     ThemeToggle,
     AutoHideRibbon,
     Todo(&'static str),
@@ -654,12 +655,20 @@ fn view_groups() -> Vec<Group> {
                         "Reveal rows/columns hidden by a filter or manual hide",
                     ),
                 ],
-                vec![btn(
-                    "❄ Freeze",
-                    8,
-                    FreezePanes,
-                    "Freeze panes at the cursor (toggle)",
-                )],
+                vec![
+                    btn(
+                        "❄ Freeze",
+                        8,
+                        FreezePanes,
+                        "Freeze panes at the cursor (toggle)",
+                    ),
+                    btn(
+                        "🖼 Objects",
+                        10,
+                        ShowObjects,
+                        "Show/hide floating pictures and charts",
+                    ),
+                ],
             ],
         },
         Group {

@@ -208,6 +208,48 @@ pub struct Sheet {
     /// value (a dropdown list, a number range, …). Surfaced in the UI, not
     /// enforced on edit.
     pub validations: Vec<DataValidation>,
+    /// Floating drawings anchored to the grid (`xl/drawings/*`): pictures and
+    /// charts. Rendered as an overlay; not editable.
+    pub drawings: Vec<Drawing>,
+}
+
+/// A floating drawing anchored over a cell rectangle (a picture or a chart).
+#[derive(Clone, Debug)]
+pub struct Drawing {
+    /// Top-left anchor cell `(row, col)`, 0-based.
+    pub from: (u32, u32),
+    /// Bottom-right extent `(row, col)`, 0-based, inclusive-ish. For a
+    /// `oneCellAnchor` it's estimated from the drawing's EMU size.
+    pub to: (u32, u32),
+    pub kind: DrawingKind,
+}
+
+/// What a [`Drawing`] holds.
+#[derive(Clone, Debug)]
+pub enum DrawingKind {
+    /// A picture: the package part path of its media and a display name. The
+    /// bytes are read from the package on demand (the model stays light).
+    Image { part: String, name: String },
+    /// A chart, with the cached category/series data needed to draw it.
+    Chart(ChartData),
+}
+
+/// The cached data of a chart (`xl/charts/chartN.xml`), enough to draw a simple
+/// bar/pie/line representation without re-running the plot area.
+#[derive(Clone, Debug, Default)]
+pub struct ChartData {
+    pub title: String,
+    /// `bar` / `pie` / `line` / `area` / `scatter` … (the plot element's local name).
+    pub kind: String,
+    pub categories: Vec<String>,
+    pub series: Vec<ChartSeries>,
+}
+
+/// One data series of a [`ChartData`].
+#[derive(Clone, Debug, Default)]
+pub struct ChartSeries {
+    pub name: String,
+    pub values: Vec<f64>,
 }
 
 /// One data-validation rule over a set of cell ranges.
