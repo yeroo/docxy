@@ -902,10 +902,12 @@ mod tests {
         let docx = make_docx(body);
         let pkg1 = load_package(&docx).expect("load");
 
-        // Bookmarks/drawings stay Raw; the block-level sdt is unwrapped so its
-        // content (the "ctrl" paragraph) is visible.
-        assert_eq!(pkg1.document.body.len(), 3);
-        assert_eq!(pkg1.document.body[2].plain_text(), "ctrl");
+        // Bookmarks/drawings stay Raw. The block-level sdt keeps its content (the
+        // "ctrl" paragraph) visible, now wrapped between two Raw wrapper
+        // boundaries so the control survives the round-trip:
+        // [bm para, drawing para, <w:sdt>…<w:sdtContent>, ctrl para, </…></w:sdt>].
+        assert_eq!(pkg1.document.body.len(), 5);
+        assert_eq!(pkg1.document.body[3].plain_text(), "ctrl");
         if let Block::Paragraph(p) = &pkg1.document.body[1] {
             assert!(matches!(p.content[0], Inline::Raw(_))); // the drawing run
         } else {
@@ -917,8 +919,10 @@ mod tests {
         assert!(text.contains("w:bookmarkStart"), "bookmark lost");
         assert!(text.contains("<w:drawing>"), "drawing lost");
         assert!(text.contains("ctrl"), "sdt content lost");
+        assert!(text.contains("<w:sdt>"), "content-control wrapper lost");
+        assert!(text.contains("<w:sdtContent>"), "sdtContent wrapper lost");
 
-        // And a full round-trip is stable (the unwrapped content stays unwrapped).
+        // And a full round-trip is stable (the preserved wrapper stays put).
         let pkg2 = load_package(&saved).expect("reload");
         assert_eq!(pkg1.document, pkg2.document);
     }

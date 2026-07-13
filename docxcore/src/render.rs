@@ -678,6 +678,9 @@ fn render_blocks(
                 absorb(&mut out, sub, sub_imgs, images);
             }
             Block::Table(t) => out.extend(render_table(t, &path, width, opts)),
+            // Content-control wrapper boundaries carry no visible payload; only
+            // real embedded content (drawings, objects, …) gets a placeholder.
+            Block::Raw(raw) if crate::load::is_sdt_boundary(raw) => {}
             Block::Raw(_) => out.push((
                 Line {
                     spans: vec![Line::dim_span("⟨embedded content⟩".to_string())],

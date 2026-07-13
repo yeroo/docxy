@@ -563,19 +563,46 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     Vec::new()
 }
 
-/// Unwrap a block-level `<w:sdt>` (content control), appending the block content
-/// of its `<w:sdtContent>` to `out`. `sdtPr`/`sdtEndPr` are ignored.
+/// Parse a block-level `<w:sdt>` (content control: cover pages, TOC, …) while
+/// **preserving its wrapper**. The `<w:sdtPr>`/`<w:sdtEndPr>` are captured
+/// verbatim and re-emitted, together with the `<w:sdt>`/`<w:sdtContent>` tags
+/// (both attribute-free per the schema), as two `Raw` boundary blocks around the
+/// normally-parsed — and therefore visible/editable — content. This keeps the
+/// control lossless on save instead of degrading it to plain paragraphs, without
+/// needing a nesting model node: every consumer already treats `Raw` blocks
+/// transparently.
 fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>) {
+    let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:sdtContent" => out.extend(parse_blocks_until_end(p, rels)),
+                "w:sdtPr" | "w:sdtEndPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    props.push_str(p.raw_slice(start, p.pos()));
+                }
+                "w:sdtContent" => {
+                    out.push(Block::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
+                    out.extend(parse_blocks_until_end(p, rels));
+                    out.push(Block::Raw(SDT_BLOCK_CLOSE.to_string()));
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// The closing boundary for a preserved block-level content control.
+const SDT_BLOCK_CLOSE: &str = "</w:sdtContent></w:sdt>";
+
+/// Whether a `Block::Raw` is a content-control wrapper boundary (produced by
+/// [`parse_sdt_block`]) rather than real embedded content — such boundaries
+/// carry no visible payload and must render as nothing.
+pub(crate) fn is_sdt_boundary(raw: &str) -> bool {
+    let t = raw.trim_start();
+    t.starts_with("<w:sdt>") || t.starts_with("</w:sdtContent>")
 }
 
 /// Parse a sequence of block-level children up to the enclosing End event.
@@ -705,13 +732,26 @@ fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
     out.push(Inline::Field { raw, text });
 }
 
-/// Unwrap an inline `<w:sdt>` (content control inside a paragraph), parsing the
-/// inline content of its `<w:sdtContent>` into `out`.
+/// Parse an inline `<w:sdt>` (content control inside a paragraph), preserving its
+/// wrapper the same way [`parse_sdt_block`] does: the `<w:sdtPr>`/`<w:sdtEndPr>`
+/// plus the attribute-free `<w:sdt>`/`<w:sdtContent>` tags bracket the parsed
+/// (visible/editable) runs as two `Inline::Raw` boundaries, which — like inline
+/// bookmarks — serialize verbatim yet render as nothing.
 fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:sdtContent" => parse_inlines_into(p, rels, out),
+                "w:sdtPr" | "w:sdtEndPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    props.push_str(p.raw_slice(start, p.pos()));
+                }
+                "w:sdtContent" => {
+                    out.push(Inline::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
+                    parse_inlines_into(p, rels, out);
+                    out.push(Inline::Raw(SDT_BLOCK_CLOSE.to_string()));
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
@@ -1651,13 +1691,43 @@ mod tests {
     }
 
     #[test]
-    fn inline_sdt_is_unwrapped() {
-        // A content control wrapping runs inside a paragraph must show its text.
+    fn block_sdt_shown_and_preserved() {
+        // A block-level content control (with sdtPr) keeps its body visible and
+        // rebuilds the wrapper — incl. sdtPr — around it on save.
+        let xml = "<w:document><w:body>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Cover\"/></w:sdtPr>\
+                   <w:sdtContent><w:p><w:r><w:t>Title</w:t></w:r></w:p></w:sdtContent></w:sdt>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        // Body = [<w:sdt>…<w:sdtContent>, Title para, </…></w:sdt>].
+        assert_eq!(d.body.len(), 3);
+        assert!(matches!(d.body[0], Block::Raw(_)));
+        assert_eq!(d.body[1].plain_text(), "Title");
+        assert!(matches!(d.body[2], Block::Raw(_)));
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>") && out.contains("<w:sdtContent>"));
+        assert!(out.contains("<w:alias w:val=\"Cover\"/>"), "sdtPr lost");
+        assert!(out.contains(">Title<"), "control body lost");
+        // The wrapper boundaries are recognised as such (render as nothing).
+        if let Block::Raw(open) = &d.body[0] {
+            assert!(is_sdt_boundary(open));
+        }
+    }
+
+    #[test]
+    fn inline_sdt_shown_and_preserved() {
+        // A content control wrapping runs inside a paragraph must show its text …
         let xml = "<w:document><w:body><w:p>\
                    <w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
-                   <w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>inner</w:t></w:r></w:sdtContent></w:sdt>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"nm\"/></w:sdtPr><w:sdtContent><w:r><w:t>inner</w:t></w:r></w:sdtContent></w:sdt>\
                    <w:r><w:t xml:space=\"preserve\"> b</w:t></w:r></w:p></w:body></w:document>";
-        assert_eq!(first_para(&doc(xml)).plain_text(), "a inner b");
+        let d = doc(xml);
+        assert_eq!(first_para(&d).plain_text(), "a inner b");
+        // … and the wrapper (incl. sdtPr) round-trips on save.
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>"), "inline sdt wrapper lost");
+        assert!(out.contains("<w:alias w:val=\"nm\"/>"), "sdtPr lost");
+        assert!(out.contains("<w:sdtContent>"), "inline sdtContent lost");
     }
 
     #[test]
