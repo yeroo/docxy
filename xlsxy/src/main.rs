@@ -45,6 +45,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -845,6 +848,12 @@ struct App {
     show_hidden: bool,
     /// Paint floating pictures/charts over the grid (on by default).
     show_drawings: bool,
+    /// Terminal graphics capability (kitty/iTerm2/Sixel/half-block); None until the
+    /// TUI starts (and in headless tests) — pictures then fall back to a box.
+    picker: Option<Picker>,
+    /// Encoded picture protocols, keyed by `"{media part}#{cols}x{rows}"`. `None`
+    /// is cached for undecodable media (WMF/EMF/missing) so the box stays.
+    img_cache: std::collections::HashMap<String, Option<Protocol>>,
     /// The pending Find text while the Replace-with prompt is open.
     replace_find: Option<String>,
     /// Vim-mode state (Some when launched with `--vim`).
@@ -912,6 +921,8 @@ impl App {
             auto_hide_ribbon: false,
             show_hidden: false,
             show_drawings: true,
+            picker: None,
+            img_cache: std::collections::HashMap::new(),
             replace_find: None,
             vim: None,
             sheet_picker: None,
@@ -1679,6 +1690,26 @@ impl App {
     }
 
     // --- movement ------------------------------------------------------------
+
+    /// A picture protocol encoded to fill a `cols`×`rows` cell box, cached by
+    /// media part + size. Returns `None` (and caches it) when there's no graphics
+    /// terminal or the media can't be decoded, so the caller draws a box instead.
+    fn image_proto(&mut self, part: &str, cols: u16, rows: u16) -> Option<&Protocol> {
+        let key = format!("{part}#{cols}x{rows}");
+        if !self.img_cache.contains_key(&key) {
+            let proto = self.encode_image(part, cols, rows);
+            self.img_cache.insert(key.clone(), proto);
+        }
+        self.img_cache.get(&key).and_then(|o| o.as_ref())
+    }
+
+    fn encode_image(&self, part: &str, cols: u16, rows: u16) -> Option<Protocol> {
+        let picker = self.picker.as_ref()?;
+        let bytes = self.pkg.part(part)?;
+        let img = image::load_from_memory(bytes).ok()?;
+        let size = Rect::new(0, 0, cols, rows);
+        picker.new_protocol(img, size, Resize::Fit(None)).ok()
+    }
 
     fn toggle_show_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
@@ -4371,12 +4402,13 @@ fn draw_sheet_picker(app: &App, sel: usize, f: &mut Frame, grid: Rect) {
 /// clipped to the on-screen slice of its anchor rectangle. Pictures show a
 /// labelled box (real pixels are a later enhancement); charts render a compact
 /// bar view of their cached data.
-fn draw_drawings(app: &App, f: &mut Frame, grid: Rect) {
-    let sheet = app.sheet();
-    if sheet.drawings.is_empty() {
+fn draw_drawings(app: &mut App, f: &mut Frame, grid: Rect) {
+    let drawings = app.sheet().drawings.clone();
+    if drawings.is_empty() {
         return;
     }
-    for d in &sheet.drawings {
+    let has_picker = app.picker.is_some();
+    for d in &drawings {
         // Horizontal extent from the visible columns inside [from.col, to.col].
         let (mut x0, mut x1) = (u16::MAX, 0u16);
         for &(c, x, w) in &app.vis_cols {
@@ -4414,22 +4446,33 @@ fn draw_drawings(app: &App, f: &mut Frame, grid: Rect) {
         f.render_widget(Clear, rect);
         let border = Style::new().fg(Color::DarkGray);
         match &d.kind {
-            gridcore::sheet::DrawingKind::Image { name, .. } => {
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border)
-                    .title(fit(&format!(" \u{1f5bc} {name} "), rect.width as usize, false));
-                let inner = block.inner(rect);
-                f.render_widget(block, rect);
-                if inner.height > 0 {
-                    let mid = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
-                    f.render_widget(
-                        Paragraph::new(RLine::from(RSpan::styled(
-                            center("(picture)", inner.width as usize),
-                            Style::new().add_modifier(Modifier::DIM),
-                        ))),
-                        mid,
-                    );
+            gridcore::sheet::DrawingKind::Image { part, name } => {
+                // Real pixels when the terminal supports graphics and the media
+                // decodes; otherwise a labelled box.
+                let mut drawn = false;
+                if has_picker {
+                    if let Some(proto) = app.image_proto(part, rect.width, rect.height) {
+                        f.render_widget(Image::new(proto), rect);
+                        drawn = true;
+                    }
+                }
+                if !drawn {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border)
+                        .title(fit(&format!(" \u{1f5bc} {name} "), rect.width as usize, false));
+                    let inner = block.inner(rect);
+                    f.render_widget(block, rect);
+                    if inner.height > 0 {
+                        let mid = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
+                        f.render_widget(
+                            Paragraph::new(RLine::from(RSpan::styled(
+                                center("(picture)", inner.width as usize),
+                                Style::new().add_modifier(Modifier::DIM),
+                            ))),
+                            mid,
+                        );
+                    }
                 }
             }
             gridcore::sheet::DrawingKind::Chart(cd) => {
@@ -5336,6 +5379,9 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
         });
     }
     app.start_screen = welcome;
+    // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
+    // a half-block renderer so embedded pictures still show something.
+    app.picker = Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
     let mut last_title = String::new();
     let result = loop {
         // Reflect the file + dirty state in the terminal window title.
@@ -6306,6 +6352,30 @@ mod tests {
             !format!("{:?}", term.backend().buffer()).contains("Revenue"),
             "chart should be hidden when Objects is off"
         );
+    }
+
+    #[test]
+    fn image_drawing_falls_back_to_box() {
+        use gridcore::sheet::{Drawing, DrawingKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].drawings.push(Drawing {
+            from: (1, 1),
+            to: (6, 5),
+            kind: DrawingKind::Image {
+                part: "xl/media/image1.png".into(),
+                name: "Logo".into(),
+            },
+        });
+        // No picker is set in tests, so a picture renders its labelled box.
+        let mut app = App::new(pkg, "t.xlsx");
+        assert!(app.picker.is_none());
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Logo"), "picture label missing");
+        assert!(text.contains("picture"), "picture caption missing");
     }
 
     #[test]

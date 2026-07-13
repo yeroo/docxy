@@ -1158,7 +1158,9 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "gridcore",
+ "image",
  "ratatui",
+ "ratatui-image",
  "unicode-width 0.2.0",
 ]
 
