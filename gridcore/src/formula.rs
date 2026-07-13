@@ -2321,6 +2321,11 @@ pub struct Eval<'a> {
     /// unresolvable name, missing clock…). The engine then keeps the cached
     /// value.
     pub unsupported: bool,
+    /// Set by `call` iff the *function name* itself was unrecognized (vs. a
+    /// known builtin that returned `#NAME?` from its arguments). Gates the
+    /// defined-LAMBDA fallback so a builtin is never shadowed by a same-named
+    /// defined name just because its args happened to be `#NAME?`.
+    name_unknown: bool,
     /// Defined-name expansion depth (guards against name→name cycles).
     depth: u32,
     /// `LET` bindings currently in scope, innermost last.
@@ -2370,6 +2375,7 @@ impl<'a> Eval<'a> {
             sheet,
             cell,
             unsupported: false,
+            name_unknown: false,
             depth: 0,
             lets: Vec::new(),
             omitted: Vec::new(),
@@ -2806,8 +2812,11 @@ impl<'a> Eval<'a> {
                 let v = self.call(name, args);
                 // A workbook-defined LAMBDA (custom function) applies only when
                 // the name isn't a builtin — Excel keeps builtins even if a
-                // same-named defined name exists.
-                if matches!(v, Value::Err(ExcelError::Name)) {
+                // same-named defined name exists. Gate on `name_unknown` (the
+                // name wasn't a builtin) rather than the `#NAME?` *result*, so a
+                // builtin erroring on `#NAME?` args isn't hijacked by a
+                // same-named defined name.
+                if self.name_unknown && matches!(v, Value::Err(ExcelError::Name)) {
                     if let Some(lam) = self.defined_lambda(name) {
                         self.unsupported = saved;
                         return invoke(self, &lam);
@@ -4168,7 +4177,42 @@ fn match_key(v: &Value) -> Option<String> {
 /// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
 /// `SINGLE(x)` → `@x`. Used by `FORMULATEXT`.
 pub fn display_formula(src: &str) -> String {
-    let s = src
+    // Rewrite only outside string literals, so a literal such as "_xlfn." or
+    // "SINGLE(x)" survives verbatim. `"` opens a literal; `""` escapes a quote.
+    let mut out = String::new();
+    let mut seg_start = 0usize;
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'"' {
+            out.push_str(&transform_segment(&src[seg_start..i]));
+            let lit_start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if i + 1 < b.len() && b[i + 1] == b'"' {
+                        i += 2; // escaped quote inside the literal
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&src[lit_start..i]);
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&transform_segment(&src[seg_start..]));
+    out
+}
+
+/// Strip Excel's internal name prefixes and rewrite the spill/implicit operators
+/// on a run of formula text that contains no string literal.
+fn transform_segment(s: &str) -> String {
+    let s = s
         .replace("_xlfn._xlws.", "")
         .replace("_xlfn.", "")
         .replace("_xlws.", "")
@@ -4177,14 +4221,35 @@ pub fn display_formula(src: &str) -> String {
     rewrite_call(&s, "SINGLE", |arg| format!("@{arg}"))
 }
 
-/// Replace every `name(arg)` (balanced parens) with `f(arg)`.
+/// Replace every whole-word `name(arg)` (balanced parens) with `f(arg)`. A match
+/// preceded by an identifier character is ignored — `NOTSINGLE(A1)` is left
+/// alone rather than becoming `NOT@A1`.
 fn rewrite_call(s: &str, name: &str, f: impl Fn(&str) -> String) -> String {
     let pat = format!("{name}(");
+    let b = s.as_bytes();
     let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find(&pat) {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + pat.len()..];
+    let mut pos = 0usize;
+    while pos < s.len() {
+        let Some(rel) = s[pos..].find(&pat) else {
+            out.push_str(&s[pos..]);
+            return out;
+        };
+        let i = pos + rel;
+        // Left word boundary: the char before `name` must not continue an
+        // identifier (ASCII letter/digit/underscore). A UTF-8 lead/continuation
+        // byte before it counts as a boundary.
+        let left_ok = i == 0 || {
+            let pc = b[i - 1];
+            !(pc.is_ascii_alphanumeric() || pc == b'_')
+        };
+        if !left_ok {
+            // Not a whole-word match; emit through this occurrence and continue.
+            out.push_str(&s[pos..i + 1]);
+            pos = i + 1;
+            continue;
+        }
+        out.push_str(&s[pos..i]);
+        let after = &s[i + pat.len()..];
         let mut depth = 1usize;
         let mut end = None;
         for (j, ch) in after.char_indices() {
@@ -4203,16 +4268,15 @@ fn rewrite_call(s: &str, name: &str, f: impl Fn(&str) -> String) -> String {
         match end {
             Some(e) => {
                 out.push_str(&f(&after[..e]));
-                rest = &after[e + 1..];
+                pos = i + pat.len() + e + 1;
             }
             None => {
                 // Unbalanced — leave the rest verbatim.
-                out.push_str(&rest[i..]);
+                out.push_str(&s[i..]);
                 return out;
             }
         }
     }
-    out.push_str(rest);
     out
 }
 
@@ -5212,6 +5276,7 @@ impl<'a> Eval<'a> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr]) -> Value {
+        self.name_unknown = false;
         match name {
             // ---- math -------------------------------------------------
             "SUM" => match self.collect_values(args, true) {
@@ -8637,6 +8702,7 @@ impl<'a> Eval<'a> {
                 Some(v) => v,
                 None => {
                     self.unsupported = true;
+                    self.name_unknown = true;
                     Value::Err(ExcelError::Name)
                 }
             },
@@ -10433,7 +10499,9 @@ mod tests {
             }
             fn defined_name(&self, name: &str, _: usize) -> Option<String> {
                 match name {
-                    "SUM" => Some("LAMBDA(x, x+10)".into()),
+                    // A constant-returning lambda makes "builtin wins" observable
+                    // by value: if the builtin were shadowed we'd see 999.
+                    "SUM" => Some("LAMBDA(x, 999)".into()),
                     "PLUS2" => Some("LAMBDA(x, x+2)".into()),
                     _ => None,
                 }
@@ -10441,8 +10509,14 @@ mod tests {
         }
         let r = R;
         let mut ev = Eval::new(&r, 0, (0, 0));
-        // Builtin SUM aggregates, not the defined lambda (which would give 6+10).
+        // Builtin SUM aggregates, not the defined lambda (which would give 999).
         assert_eq!(ev.eval(&parse("SUM(1,2,3)").unwrap()), Value::Num(6.0));
+        // A builtin that errors to #NAME? on its *arguments* must still be the
+        // builtin — not hijacked by the same-named lambda (which would give 999).
+        assert_eq!(
+            ev.eval(&parse("SUM(MISSINGNAME)").unwrap()),
+            Value::Err(ExcelError::Name)
+        );
         // A non-builtin defined lambda is still callable.
         assert_eq!(ev.eval(&parse("PLUS2(5)").unwrap()), Value::Num(7.0));
     }
@@ -10485,6 +10559,17 @@ mod tests {
             "LAMBDA(a, 2)(1)"
         );
         assert_eq!(display_formula("_xlfn.SINGLE(A1:A3)"), "@A1:A3");
+        // A longer identifier that merely ends in SINGLE/ANCHORARRAY is left
+        // alone (left word boundary), not rewritten mid-word.
+        assert_eq!(display_formula("NOTSINGLE(A1)"), "NOTSINGLE(A1)");
+        assert_eq!(display_formula("MYANCHORARRAY(A1)"), "MYANCHORARRAY(A1)");
+        // Rewrites inside a string literal must not happen; the literal — even
+        // one containing `SINGLE(` or `_xlfn.` — is preserved verbatim.
+        assert_eq!(
+            display_formula("CONCAT(\"SINGLE(x) _xlfn.\",_xlfn.SINGLE(A1))"),
+            "CONCAT(\"SINGLE(x) _xlfn.\",@A1)"
+        );
+        assert_eq!(display_formula("\"ANCHORARRAY(z)\""), "\"ANCHORARRAY(z)\"");
     }
 
     #[test]

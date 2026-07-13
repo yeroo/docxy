@@ -67,6 +67,11 @@ pub struct SheetPackage {
     pub(crate) sheet_parts: Vec<String>,
     /// Shared strings as loaded (plain text per `<si>`).
     shared: Vec<String>,
+    /// Resolved part name of the workbook's shared-strings table, if it has one
+    /// (it need not be the conventional `xl/sharedStrings.xml`). Save appends to
+    /// this exact part instead of assuming the standard path — otherwise an
+    /// unconventional original would be left orphaned beside a fresh duplicate.
+    shared_part: Option<String>,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
 }
@@ -165,13 +170,18 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     // Workbook: sheet list + date system + defined names.
     let (sheet_meta, date1904, iterate, raw_names) = parse_workbook_xml(&wb_xml);
 
-    // Shared strings + styles (relative to the workbook dir).
-    let shared = rels
+    // Shared strings + styles (relative to the workbook dir). Keep the resolved
+    // shared-strings part name so save can append to it in place.
+    let shared_part = rels
         .iter()
         .find(|(_, ty, _)| ty.ends_with("/sharedStrings"))
-        .and_then(|(_, _, t)| get_str(&resolve(t)))
-        .map(|xml| parse_shared_strings(&xml))
-        .unwrap_or_default();
+        .map(|(_, _, t)| resolve(t));
+    let shared = match &shared_part {
+        Some(p) => get_str(p)
+            .map(|xml| parse_shared_strings(&xml))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     let styles = rels
         .iter()
         .find(|(_, ty, _)| ty.ends_with("/styles"))
@@ -308,6 +318,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         parts,
         sheet_parts,
         shared,
+        shared_part,
         workbook: Workbook {
             sheets,
             styles,
@@ -1414,7 +1425,9 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 
     // --- shared strings part ----------------------------------------------
     let total = pkg.shared.len() + new_list.len();
-    let sst_name = "xl/sharedStrings.xml";
+    // Append to the workbook's own shared-strings part wherever it lives; only
+    // fall back to the conventional path when the workbook has none yet.
+    let sst_name = pkg.shared_part.as_deref().unwrap_or("xl/sharedStrings.xml");
     if !new_list.is_empty() || (total > 0 && pkg.part(sst_name).is_none()) {
         let mut additions = String::new();
         for s in &new_list {
@@ -2380,6 +2393,7 @@ pub fn new_xlsx() -> SheetPackage {
         parts,
         sheet_parts: vec!["xl/worksheets/sheet1.xml".to_string()],
         shared: Vec::new(),
+        shared_part: Some("xl/sharedStrings.xml".to_string()),
         workbook: Workbook {
             sheets: vec![Sheet {
                 name: "Sheet1".to_string(),
@@ -2730,6 +2744,58 @@ mod tests {
         assert_eq!(
             s.cell(2, 0).unwrap().value,
             CellValue::Text("  padded  ".into())
+        );
+    }
+
+    #[test]
+    fn shared_strings_at_nonstandard_path_update_in_place() {
+        // A workbook whose shared-strings part lives at an unconventional path
+        // (referenced via the workbook rel) must be appended to *there* — not
+        // duplicated at the standard xl/sharedStrings.xml, which would leave the
+        // real (stale) part orphaned and the new string unreadable.
+        let ct = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/strings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#;
+        let root_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let workbook = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        // sharedStrings target is the non-standard "strings.xml".
+        let wb_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="strings.xml"/></Relationships>"#;
+        let sheet1 = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>"#;
+        let strings = r#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>orig</t></si></sst>"#;
+        let styles = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs></styleSheet>"#;
+        let data = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
+            ("xl/strings.xml".into(), strings.into()),
+            ("xl/styles.xml".into(), styles.into()),
+        ]);
+
+        let mut pkg = load_xlsx(&data).expect("load nonstandard-sst workbook");
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("orig".into())
+        );
+        // Add a new string, forcing an append to the shared-strings table.
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("added"));
+        let bytes = save_xlsx(&pkg);
+
+        let pkg2 = load_xlsx(&bytes).expect("reload after save");
+        assert_eq!(
+            pkg2.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("orig".into())
+        );
+        assert_eq!(
+            pkg2.workbook.sheets[0].cell(1, 0).unwrap().value,
+            CellValue::Text("added".into())
+        );
+        // The custom part was updated in place; no duplicate standard part was made.
+        let names = pkg2.part_names();
+        assert!(names.contains(&"xl/strings.xml"), "custom sst part missing");
+        assert!(
+            !names.contains(&"xl/sharedStrings.xml"),
+            "a duplicate standard sharedStrings part was created"
         );
     }
 
