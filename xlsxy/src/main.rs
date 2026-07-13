@@ -790,6 +790,12 @@ struct ClipData {
     cut: bool,
 }
 
+/// The list-validation dropdown: the allowed values and the highlighted row.
+struct DvPicker {
+    values: Vec<String>,
+    sel: usize,
+}
+
 struct App {
     pkg: SheetPackage,
     engine: Engine,
@@ -841,6 +847,8 @@ struct App {
     vim: Option<VimState>,
     /// The sheet-picker popup: the highlighted sheet index while open.
     sheet_picker: Option<usize>,
+    /// The list-validation dropdown, open on a `list`-validated cell.
+    dv_picker: Option<DvPicker>,
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
@@ -901,6 +909,7 @@ impl App {
             replace_find: None,
             vim: None,
             sheet_picker: None,
+            dv_picker: None,
             grid_area: Rect::default(),
             gutter_w: 4,
             vis_cols: Vec::new(),
@@ -2183,6 +2192,116 @@ impl App {
             self.pending_link = Some(target);
         } else {
             self.status = Some(format!("Blocked non-web link: {target}"));
+        }
+    }
+
+    /// The data-validation rule covering the cursor cell, if any.
+    fn current_validation(&self) -> Option<&gridcore::sheet::DataValidation> {
+        let (r, c) = self.cur;
+        self.sheet().validations.iter().find(|v| v.covers(r, c))
+    }
+
+    /// The allowed values for a `list` validation: the inline CSV, or the cells
+    /// of the range / named range its `formula1` points at.
+    fn resolve_list_values(&self, dv: &gridcore::sheet::DataValidation) -> Vec<String> {
+        if let Some(v) = dv.list_values() {
+            return v;
+        }
+        let refstr = dv.formula1.trim();
+        if refstr.is_empty() {
+            return Vec::new();
+        }
+        // A named range resolves to its own reference formula first.
+        let resolved = self
+            .pkg
+            .workbook
+            .defined_names
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(refstr))
+            .map(|d| d.formula.clone());
+        let refstr = resolved.as_deref().unwrap_or(refstr);
+        // Optional Sheet! prefix; the range itself may carry `$` anchors.
+        let (sheet_name, rng) = match refstr.rsplit_once('!') {
+            Some((s, r)) => (Some(s.trim_matches(['\'', ' ', '='])), r),
+            None => (None, refstr),
+        };
+        let sidx = match sheet_name {
+            Some(n) => self
+                .pkg
+                .workbook
+                .sheets
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(n))
+                .unwrap_or(self.sheet),
+            None => self.sheet,
+        };
+        let clean = rng.replace('$', "");
+        let Some((r1, c1, r2, c2)) = gridcore::sheet::parse_range_name(&clean)
+            .or_else(|| gridcore::sheet::parse_cell_name(&clean).map(|(r, c)| (r, c, r, c)))
+        else {
+            return Vec::new();
+        };
+        let sheet = &self.pkg.workbook.sheets[sidx];
+        let styles = &self.pkg.workbook.styles;
+        let date1904 = self.pkg.workbook.date1904;
+        let mut out = Vec::new();
+        // Bound the scan: dropdowns are small, and a whole-column ref is huge.
+        for r in r1..=r2.min(r1.saturating_add(1024)) {
+            for c in c1..=c2 {
+                if let Some(cell) = sheet.cell(r, c) {
+                    let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
+                    if !text.is_empty() {
+                        out.push(text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Open the dropdown for the `list` validation on the cursor cell, if there
+    /// is one. Preselects the current cell value when it is among the choices.
+    fn open_dv_dropdown(&mut self) {
+        let Some(dv) = self.current_validation() else {
+            return;
+        };
+        if dv.kind != "list" {
+            self.status = Some(format!("Data validation — {}", dv.describe()));
+            return;
+        }
+        let dv = dv.clone();
+        let values = self.resolve_list_values(&dv);
+        if values.is_empty() {
+            self.status = Some(format!("List: {} (no resolvable values)", dv.formula1));
+            return;
+        }
+        let current = self.current_input_text();
+        let sel = values.iter().position(|v| *v == current).unwrap_or(0);
+        self.dv_picker = Some(DvPicker { values, sel });
+    }
+
+    fn dv_picker_key(&mut self, code: KeyCode) {
+        let Some(p) = self.dv_picker.as_mut() else {
+            return;
+        };
+        let n = p.values.len();
+        match code {
+            KeyCode::Esc => self.dv_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => p.sel = (p.sel + 1).min(n - 1),
+            KeyCode::Home => p.sel = 0,
+            KeyCode::End => p.sel = n - 1,
+            KeyCode::Enter | KeyCode::Tab => {
+                let value = p.values[p.sel].clone();
+                self.dv_picker = None;
+                let (r, c) = self.cur;
+                let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+                let mut cell = parse_input(&value);
+                cell.style = style;
+                self.apply(vec![(r, c, cell)]);
+                self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+            }
+            _ => {}
         }
     }
 
@@ -3666,6 +3785,11 @@ fn draw(app: &mut App, f: &mut Frame) {
         draw_sheet_picker(app, sel, f, grid);
     }
 
+    // --- data-validation dropdown ----------------------------------------------
+    if let Some(p) = &app.dv_picker {
+        draw_dv_picker(app, p, f, grid);
+    }
+
     // --- sheet tabs + stats ---------------------------------------------------
     app.tab_spans.clear();
     // A leading marker doubles as a click target for the sheet picker.
@@ -3765,6 +3889,12 @@ fn draw(app: &mut App, f: &mut Frame) {
         s.clone()
     } else if app.edit.is_some() {
         "Enter commit ↓ · Tab commit → · Esc cancel".to_string()
+    } else if let Some(dv) = app.current_validation() {
+        if dv.kind == "list" {
+            format!("✔ {}   ·   Alt-↓ dropdown", dv.describe())
+        } else {
+            format!("✔ Data validation — {}", dv.describe())
+        }
     } else {
         format!(
             "{}{}  F9 ribbon  ^S save  ^Q quit  ^Z undo  ^F find  ^D/^R fill  ^T sheet",
@@ -4148,6 +4278,64 @@ fn draw_sheet_picker(app: &App, sel: usize, f: &mut Frame, grid: Rect) {
     );
 }
 
+/// The list-validation dropdown, anchored just below the cursor cell.
+fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
+    if p.values.is_empty() {
+        return;
+    }
+    let widest = p
+        .values
+        .iter()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(6)
+        .max(8);
+    let w = ((widest + 4) as u16).clamp(10, grid.width.saturating_sub(2));
+    let h = (p.values.len() as u16 + 2).min(grid.height.max(3));
+    // Anchor under the cursor cell when it's on screen, else the grid's corner.
+    let cell_x = app
+        .vis_cols
+        .iter()
+        .find(|&&(col, ..)| col == app.cur.1)
+        .map(|&(_, x, _)| x)
+        .unwrap_or(grid.x);
+    let cell_y = app
+        .vis_rows
+        .iter()
+        .position(|&r| r == app.cur.0)
+        .map(|i| grid.y + i as u16)
+        .unwrap_or(grid.y);
+    let x = cell_x.min(grid.x + grid.width.saturating_sub(w));
+    let y = if cell_y + 1 + h <= grid.y + grid.height {
+        cell_y + 1
+    } else {
+        cell_y.saturating_sub(h).max(grid.y)
+    };
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+    let mut lines: Vec<RLine> = vec![RLine::from(RSpan::styled(
+        fit(" Choose value", w as usize, false),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    ))];
+    let vis = h.saturating_sub(2) as usize;
+    let top = p.sel.saturating_sub(vis.saturating_sub(1));
+    for (i, v) in p.values.iter().enumerate().skip(top).take(vis) {
+        let style = if i == p.sel {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        lines.push(RLine::from(RSpan::styled(
+            fit(&format!(" {v}"), w as usize, false),
+            style,
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(Color::Black).fg(Color::White)),
+        area,
+    );
+}
+
 /// The formatting popup (number format / font & fill color).
 fn draw_format_picker(p: &FormatPicker, f: &mut Frame, grid: Rect) {
     let (title, rows): (&str, Vec<(String, Option<Rgb>)>) = match p.kind {
@@ -4439,7 +4627,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.prompt.is_some()
         || app.edit.is_some()
         || app.format_picker.is_some()
-        || app.sheet_picker.is_some();
+        || app.sheet_picker.is_some()
+        || app.dv_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
     if key.code == KeyCode::F(9) && !overlay_open && !shift && !ctrl {
         app.ribbon_focus = if app.ribbon_focus == ribbon::Focus::None {
@@ -4463,6 +4652,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- sheet picker ---------------------------------------------------------
     if app.sheet_picker.is_some() {
         app.sheet_picker_key(key.code);
+        return false;
+    }
+
+    // --- data-validation dropdown ---------------------------------------------
+    if app.dv_picker.is_some() {
+        app.dv_picker_key(key.code);
         return false;
     }
 
@@ -4679,6 +4874,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.cur = (rows - 1, cols.max(1) - 1);
             }
         }
+        // Alt-↓ on a validated cell opens its dropdown (Excel parity).
+        KeyCode::Down if alt => app.open_dv_dropdown(),
         KeyCode::Up if ctrl => app.jump(-1, 0, shift),
         KeyCode::Down if ctrl => app.jump(1, 0, shift),
         KeyCode::Left if ctrl => app.jump(0, -1, shift),
@@ -5039,6 +5236,37 @@ mod tests {
         let cs = reloaded.comments();
         assert_eq!(cs.iter().filter(|c| c.threaded).count(), 2);
         assert_eq!(cs.iter().filter(|c| !c.threaded).count(), 1);
+    }
+
+    #[test]
+    fn list_validation_dropdown_sets_cell() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0]
+            .validations
+            .push(gridcore::sheet::DataValidation {
+                ranges: vec![(0, 0, 4, 0)], // A1:A5
+                kind: "list".into(),
+                formula1: "\"Yes,No,Maybe\"".into(),
+                ..Default::default()
+            });
+        // On a covered cell the dropdown opens with the parsed values.
+        app.cur = (0, 0);
+        assert!(app.current_validation().is_some());
+        app.open_dv_dropdown();
+        let p = app.dv_picker.as_ref().expect("dropdown opened");
+        assert_eq!(p.values, vec!["Yes", "No", "Maybe"]);
+        // Move to "No" and commit → the cell takes that value.
+        app.dv_picker_key(KeyCode::Down);
+        app.dv_picker_key(KeyCode::Enter);
+        assert!(app.dv_picker.is_none());
+        assert_eq!(app.current_input_text(), "No");
+
+        // A cell outside every range has no validation.
+        app.cur = (9, 0);
+        assert!(app.current_validation().is_none());
+        app.open_dv_dropdown();
+        assert!(app.dv_picker.is_none());
     }
 
     #[test]

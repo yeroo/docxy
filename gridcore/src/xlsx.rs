@@ -860,6 +860,11 @@ fn parse_worksheet(
     let mut in_cf_formula = false;
     let mut cf_formula_buf = String::new();
 
+    // Data-validation parse state.
+    let mut cur_dv: Option<crate::sheet::DataValidation> = None;
+    let mut dv_formula: u8 = 0; // 0 = none, 1 = formula1, 2 = formula2
+    let mut dv_buf = String::new();
+
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -1000,11 +1005,43 @@ fn parse_worksheet(
                     in_cf_formula = true;
                     cf_formula_buf.clear();
                 }
+                // Data validation: a constraint (list/number/date/…) over `sqref`.
+                "dataValidation" => {
+                    let mut ranges = Vec::new();
+                    for tok in p.attr("sqref").split_whitespace() {
+                        if let Some(r) = parse_range_name(tok)
+                            .or_else(|| parse_cell_name(tok).map(|(r, c)| (r, c, r, c)))
+                        {
+                            ranges.push(r);
+                        }
+                    }
+                    let pr = p.attr("prompt");
+                    let prompt = (!pr.is_empty()).then(|| decode(pr));
+                    cur_dv = Some(crate::sheet::DataValidation {
+                        ranges,
+                        kind: p.attr("type").to_string(),
+                        operator: p.attr("operator").to_string(),
+                        formula1: String::new(),
+                        formula2: String::new(),
+                        prompt,
+                    });
+                }
+                "formula1" if cur_dv.is_some() => {
+                    dv_formula = 1;
+                    dv_buf.clear();
+                }
+                "formula2" if cur_dv.is_some() => {
+                    dv_formula = 2;
+                    dv_buf.clear();
+                }
                 _ => {}
             },
             Event::Text => {
                 if in_cf_formula {
                     cf_formula_buf.push_str(p.text());
+                }
+                if dv_formula > 0 {
+                    dv_buf.push_str(p.text());
                 }
             }
             Event::End => match local(p.name()) {
@@ -1039,6 +1076,25 @@ fn parse_worksheet(
                     if let Some(cf) = cur_cf.take() {
                         if !cf.rules.is_empty() {
                             sheet.cond_formats.push(cf);
+                        }
+                    }
+                }
+                "formula1" if dv_formula == 1 => {
+                    dv_formula = 0;
+                    if let Some(dv) = cur_dv.as_mut() {
+                        dv.formula1 = decode(&std::mem::take(&mut dv_buf));
+                    }
+                }
+                "formula2" if dv_formula == 2 => {
+                    dv_formula = 0;
+                    if let Some(dv) = cur_dv.as_mut() {
+                        dv.formula2 = decode(&std::mem::take(&mut dv_buf));
+                    }
+                }
+                "dataValidation" => {
+                    if let Some(dv) = cur_dv.take() {
+                        if !dv.ranges.is_empty() && dv.is_meaningful() {
+                            sheet.validations.push(dv);
                         }
                     }
                 }
@@ -2366,6 +2422,32 @@ mod tests {
             sheet.hyperlinks.get(&(1, 1)).map(String::as_str),
             Some("#Sheet2!C3")
         );
+    }
+
+    #[test]
+    fn parse_data_validations() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let xml = format!(
+            "<worksheet xmlns=\"{ns}\"><sheetData/><dataValidations count=\"2\">\
+             <dataValidation type=\"list\" sqref=\"A1:A10\" prompt=\"Pick one\">\
+             <formula1>\"Yes,No,Maybe\"</formula1></dataValidation>\
+             <dataValidation type=\"whole\" operator=\"between\" sqref=\"B1 B2\">\
+             <formula1>1</formula1><formula2>10</formula2></dataValidation>\
+             </dataValidations></worksheet>"
+        );
+        let sheet = parse_worksheet(&xml, &[], &std::collections::HashMap::new());
+        assert_eq!(sheet.validations.len(), 2);
+        let list = &sheet.validations[0];
+        assert!(list.covers(0, 0) && list.covers(9, 0) && !list.covers(10, 0));
+        assert_eq!(list.prompt.as_deref(), Some("Pick one"));
+        assert_eq!(
+            list.list_values(),
+            Some(vec!["Yes".into(), "No".into(), "Maybe".into()])
+        );
+        assert_eq!(list.describe(), "List: Yes, No, Maybe");
+        let whole = &sheet.validations[1];
+        assert!(whole.covers(0, 1) && whole.covers(1, 1) && !whole.covers(2, 1));
+        assert_eq!(whole.describe(), "Whole number between 1 and 10");
     }
 
     /// Build a small real .xlsx in memory for load tests.

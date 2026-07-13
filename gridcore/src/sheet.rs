@@ -199,6 +199,97 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
+    /// Data-validation rules (`<dataValidation>`): the constraint on a cell's
+    /// value (a dropdown list, a number range, …). Surfaced in the UI, not
+    /// enforced on edit.
+    pub validations: Vec<DataValidation>,
+}
+
+/// One data-validation rule over a set of cell ranges.
+#[derive(Clone, Debug, Default)]
+pub struct DataValidation {
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    /// `list` / `whole` / `decimal` / `date` / `time` / `textLength` / `custom`.
+    pub kind: String,
+    /// `between` / `greaterThan` / … (for the numeric/date kinds).
+    pub operator: String,
+    pub formula1: String,
+    pub formula2: String,
+    /// The input-message prompt, if the file supplies one.
+    pub prompt: Option<String>,
+}
+
+impl DataValidation {
+    /// Whether any of this rule's ranges covers cell (row, col).
+    pub fn covers(&self, row: u32, col: u32) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(r1, c1, r2, c2)| row >= r1 && row <= r2 && col >= c1 && col <= c2)
+    }
+
+    /// For a `list` validation, the allowed values when they're given inline as a
+    /// quoted CSV (`"Yes,No,Maybe"`). `None` when the list is a range reference.
+    pub fn list_values(&self) -> Option<Vec<String>> {
+        if self.kind != "list" {
+            return None;
+        }
+        let f = self.formula1.trim();
+        let inner = f.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
+        Some(inner.split(',').map(|s| s.trim().to_string()).collect())
+    }
+
+    /// Whether this rule imposes anything worth surfacing (a real constraint or
+    /// an input message). A bare `type="none"` with no prompt is inert.
+    pub fn is_meaningful(&self) -> bool {
+        !matches!(self.kind.as_str(), "" | "none") || self.prompt.is_some()
+    }
+
+    /// A short human description of the constraint, for the status bar. The
+    /// `list`/`custom` kinds ignore the (often-boilerplate) `operator`; the
+    /// numeric/date kinds render it.
+    pub fn describe(&self) -> String {
+        match self.kind.as_str() {
+            "list" => {
+                let body = self
+                    .list_values()
+                    .map(|v| v.join(", "))
+                    .unwrap_or_else(|| self.formula1.clone());
+                format!("List: {body}")
+            }
+            "custom" => format!("Custom: {}", self.formula1),
+            "" | "none" => self.prompt.clone().unwrap_or_default(),
+            _ => {
+                let name = match self.kind.as_str() {
+                    "whole" => "Whole number",
+                    "decimal" => "Decimal",
+                    "date" => "Date",
+                    "time" => "Time",
+                    "textLength" => "Text length",
+                    other => other,
+                };
+                let op = match self.operator.as_str() {
+                    "notBetween" => format!("not between {} and {}", self.formula1, self.formula2),
+                    "greaterThan" => format!("> {}", self.formula1),
+                    "lessThan" => format!("< {}", self.formula1),
+                    "greaterThanOrEqual" => format!(">= {}", self.formula1),
+                    "lessThanOrEqual" => format!("<= {}", self.formula1),
+                    "equal" => format!("= {}", self.formula1),
+                    "notEqual" => format!("<> {}", self.formula1),
+                    // "between" is also the default when the operator is omitted.
+                    _ if !self.formula2.is_empty() => {
+                        format!("between {} and {}", self.formula1, self.formula2)
+                    }
+                    _ if !self.formula1.is_empty() => self.formula1.clone(),
+                    _ => String::new(),
+                };
+                if op.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {op}")
+                }
+            }
+        }
+    }
 }
 
 impl Sheet {
