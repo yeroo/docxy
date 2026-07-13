@@ -2780,13 +2780,15 @@ impl<'a> Eval<'a> {
             }
             Expr::Func(name, args) if is_higher_order_fn(name) => self.ho_fn(name, args),
             Expr::Func(name, args) => {
-                // A LET-bound or workbook-defined LAMBDA used as a custom
-                // function: f(3).
-                if let Some(lam) = self.lambda_named(name) {
-                    let vals: Vec<Arg> = args.iter().map(|a| self.eval_arg(a)).collect();
+                let invoke = |ev: &mut Self, lam: &LambdaVal| {
+                    let vals: Vec<Arg> = args.iter().map(|a| ev.eval_arg(a)).collect();
                     let omitted: Vec<bool> =
                         args.iter().map(|a| matches!(a, Expr::Missing)).collect();
-                    return self.invoke_lambda(&lam, vals, &omitted);
+                    ev.invoke_lambda(lam, vals, &omitted)
+                };
+                // An explicit LET-bound lambda overrides even a builtin.
+                if let Some(lam) = self.let_lambda(name) {
+                    return invoke(self, &lam);
                 }
                 if is_array_fn(name) {
                     return self.array_fn(name, args);
@@ -2794,7 +2796,18 @@ impl<'a> Eval<'a> {
                 if is_liftable_fn(name) {
                     return self.lift_call(name, args);
                 }
-                Arg::Scalar(self.call(name, args))
+                let saved = self.unsupported;
+                let v = self.call(name, args);
+                // A workbook-defined LAMBDA (custom function) applies only when
+                // the name isn't a builtin — Excel keeps builtins even if a
+                // same-named defined name exists.
+                if matches!(v, Value::Err(ExcelError::Name)) {
+                    if let Some(lam) = self.defined_lambda(name) {
+                        self.unsupported = saved;
+                        return invoke(self, &lam);
+                    }
+                }
+                Arg::Scalar(v)
             }
         }
     }
@@ -2873,19 +2886,23 @@ impl<'a> Eval<'a> {
         out
     }
 
-    /// A lambda reachable by name: a `LET` binding holding one, or a
-    /// workbook defined name whose definition is `LAMBDA(…)` (Excel's named
-    /// custom functions).
-    fn lambda_named(&mut self, name: &str) -> Option<Box<LambdaVal>> {
-        if let Some(i) = self
+    /// A `LET`-bound lambda used as a function — an explicit local override that
+    /// wins even over a builtin of the same name.
+    fn let_lambda(&self, name: &str) -> Option<Box<LambdaVal>> {
+        let i = self
             .lets
             .iter()
-            .rposition(|(n, v)| n.eq_ignore_ascii_case(name) && matches!(v, Arg::Lambda(_)))
-        {
-            if let Arg::Lambda(l) = &self.lets[i].1 {
-                return Some(l.clone());
-            }
+            .rposition(|(n, v)| n.eq_ignore_ascii_case(name) && matches!(v, Arg::Lambda(_)))?;
+        match &self.lets[i].1 {
+            Arg::Lambda(l) => Some(l.clone()),
+            _ => None,
         }
+    }
+
+    /// A workbook defined name whose definition is `LAMBDA(…)` — Excel's named
+    /// custom functions. Applied only when the name is *not* a builtin, so a
+    /// stray defined name (e.g. `SUM`) can't shadow the real function.
+    fn defined_lambda(&mut self, name: &str) -> Option<Box<LambdaVal>> {
         let def = self.res.defined_name(name, self.sheet)?;
         let ast = parse(&def).ok()?;
         if let Expr::Func(n, _) = &ast {
@@ -10333,6 +10350,38 @@ mod tests {
         assert_eq!(n("INDEX(MATCH(A1:A3,A1:A3,0),3)", &g), 1.0);
         // A scalar first argument still returns a scalar (unchanged path).
         assert_eq!(n("MATCH(\"y\",A1:A3,0)", &g), 2.0);
+    }
+
+    #[test]
+    fn builtin_wins_over_same_named_defined_lambda() {
+        // A workbook defined name `SUM = LAMBDA(x, x+10)` must NOT shadow the
+        // builtin SUM (Excel keeps builtins); a non-builtin name still resolves
+        // to its defined lambda.
+        struct R;
+        impl Resolver for R {
+            fn value(&self, _: usize, _: u32, _: u32) -> Value {
+                Value::Empty
+            }
+            fn cells_in(&self, _: usize, _: u32, _: u32, _: u32, _: u32) -> Vec<((u32, u32), Value)> {
+                Vec::new()
+            }
+            fn sheet_index(&self, _: &str) -> Option<usize> {
+                None
+            }
+            fn defined_name(&self, name: &str, _: usize) -> Option<String> {
+                match name {
+                    "SUM" => Some("LAMBDA(x, x+10)".into()),
+                    "PLUS2" => Some("LAMBDA(x, x+2)".into()),
+                    _ => None,
+                }
+            }
+        }
+        let r = R;
+        let mut ev = Eval::new(&r, 0, (0, 0));
+        // Builtin SUM aggregates, not the defined lambda (which would give 6+10).
+        assert_eq!(ev.eval(&parse("SUM(1,2,3)").unwrap()), Value::Num(6.0));
+        // A non-builtin defined lambda is still callable.
+        assert_eq!(ev.eval(&parse("PLUS2(5)").unwrap()), Value::Num(7.0));
     }
 
     #[test]
