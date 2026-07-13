@@ -189,14 +189,27 @@ impl Engine {
                 info.deps = deps;
             }
         }
-        let mut dirty: HashSet<Key> = HashSet::new();
-        // Sources whose dependents still need discovering. Edited cells seed
-        // the walk whether or not they hold formulas.
-        let mut frontier: VecDeque<Key> = changed.iter().copied().collect();
+        // Reverse dependency edges among formulas (source cell → the formulas
+        // that read it), built once so the transitive walk follows edges
+        // instead of rescanning every formula for each cell it touches —
+        // O(edges) rather than O(dirty × formulas).
+        let all: Vec<Key> = self.formulas.keys().copied().collect();
+        let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in self.dependency_edges(&all) {
+            for g in srcs {
+                rev.entry(g).or_default().push(f);
+            }
+        }
 
+        let mut dirty: HashSet<Key> = HashSet::new();
+        let mut frontier: VecDeque<Key> = VecDeque::new();
+
+        // Seed with the edited formulas, every volatile, and blocked anchors (a
+        // cleared blockage isn't otherwise visible to the walk). These are all
+        // formula cells, so their dependents are reached through `rev`.
         for &k in changed {
-            if self.formulas.contains_key(&k) {
-                dirty.insert(k);
+            if self.formulas.contains_key(&k) && dirty.insert(k) {
+                frontier.push_back(k);
             }
         }
         for (&k, info) in &self.formulas {
@@ -204,29 +217,94 @@ impl Engine {
                 frontier.push_back(k);
             }
         }
-        // Blocked anchors retry every pass — a cleared blockage isn't
-        // otherwise visible to the dependency walk.
-        let blocked: Vec<Key> = self.spill_blocked.iter().copied().collect();
-        for k in blocked {
+        for k in self.spill_blocked.iter().copied().collect::<Vec<_>>() {
             if self.formulas.contains_key(&k) && dirty.insert(k) {
                 frontier.push_back(k);
             }
         }
-        while let Some((s, r, c)) = frontier.pop_front() {
+
+        // An edited *data* cell (or a spill write in a recursive pass) isn't a
+        // formula key, so `rev` can't reach its dependents. Find those first-
+        // level dependents with a single scan over the (few) such seed cells;
+        // everything reachable from them is a formula and expands via `rev`.
+        let data_seeds: Vec<Key> = changed
+            .iter()
+            .copied()
+            .filter(|k| !self.formulas.contains_key(k))
+            .collect();
+        if !data_seeds.is_empty() {
             for (&fk, info) in &self.formulas {
                 if dirty.contains(&fk) {
                     continue;
                 }
-                let hit = info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
-                    ds == s && r >= r1 && r <= r2 && c >= c1 && c <= c2
+                let hit = data_seeds.iter().any(|&(s, r, c)| {
+                    info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
+                        ds == s && r >= r1 && r <= r2 && c >= c1 && c <= c2
+                    })
                 });
-                if hit {
-                    dirty.insert(fk);
+                if hit && dirty.insert(fk) {
                     frontier.push_back(fk);
                 }
             }
         }
+
+        // Transitive dependents via the precomputed reverse edges.
+        while let Some(src) = frontier.pop_front() {
+            if let Some(deps) = rev.get(&src) {
+                for &fk in deps {
+                    if dirty.insert(fk) {
+                        frontier.push_back(fk);
+                    }
+                }
+            }
+        }
         self.evaluate(wb, dirty, depth);
+    }
+
+    /// For each formula in `scope`, the deduped list of formulas *also in
+    /// `scope`* that it directly depends on (their cell lies inside one of its
+    /// reference rectangles).
+    ///
+    /// The naive form is O(n²) — every formula tested against every other. This
+    /// indexes the scope's cells per sheet, sorted by (row, col), so each
+    /// dependency rectangle is answered by a binary search for its first row
+    /// plus a walk over only the cells actually inside it. That turns a full
+    /// recalc of an `n`-cell dependency chain from O(n²) into ~O(n log n).
+    fn dependency_edges(&self, scope: &[Key]) -> Vec<(Key, Vec<Key>)> {
+        let mut by_sheet: HashMap<usize, Vec<(u32, u32, Key)>> = HashMap::new();
+        for &k in scope {
+            by_sheet.entry(k.0).or_default().push((k.1, k.2, k));
+        }
+        for cells in by_sheet.values_mut() {
+            cells.sort_unstable_by_key(|&(r, c, _)| (r, c));
+        }
+        let mut out: Vec<(Key, Vec<Key>)> = Vec::with_capacity(scope.len());
+        let mut srcs: Vec<Key> = Vec::new();
+        for &f in scope {
+            let info = &self.formulas[&f];
+            srcs.clear();
+            for &(ds, r1, c1, r2, c2) in &info.deps {
+                let Some(cells) = by_sheet.get(&ds) else {
+                    continue;
+                };
+                // Cells are (row, col)-ordered, so the rect's rows are the
+                // contiguous slice from the first row ≥ r1 up to the last ≤ r2.
+                let start = cells.partition_point(|&(r, _, _)| r < r1);
+                for &(r, c, g) in &cells[start..] {
+                    if r > r2 {
+                        break;
+                    }
+                    if c >= c1 && c <= c2 {
+                        srcs.push(g);
+                    }
+                }
+            }
+            // One edge per (dependent, source) even if several rects overlap it.
+            srcs.sort_unstable();
+            srcs.dedup();
+            out.push((f, srcs.clone()));
+        }
+        out
     }
 
     /// Kahn's algorithm over the dirty subgraph, then evaluation in order.
@@ -240,25 +318,16 @@ impl Engine {
         if dirty.is_empty() {
             return;
         }
-        let dirty_set: HashSet<Key> = dirty.iter().copied().collect();
-
         // in-degree of F = dirty formulas F depends on; edges G → dependents.
+        // (A self-reference — F's own cell inside its rect — counts here, so it
+        // never reaches in-degree 0 and lands in the cycle remainder below,
+        // exactly like any other circularity.)
         let mut indeg: HashMap<Key, usize> = dirty.iter().map(|&k| (k, 0)).collect();
         let mut edges: HashMap<Key, Vec<Key>> = HashMap::new();
-        for &f in &dirty {
-            let info = &self.formulas[&f];
-            for &g in &dirty_set {
-                // Note g == f is NOT skipped: a formula whose own cell falls
-                // inside its dependency rect is a self-reference, and must
-                // land in the cycle remainder like any other circularity.
-                let (gs, gr, gc) = g;
-                let depends = info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
-                    ds == gs && gr >= r1 && gr <= r2 && gc >= c1 && gc <= c2
-                });
-                if depends {
-                    *indeg.get_mut(&f).unwrap() += 1;
-                    edges.entry(g).or_default().push(f);
-                }
+        for (f, srcs) in self.dependency_edges(&dirty) {
+            *indeg.get_mut(&f).unwrap() = srcs.len();
+            for g in srcs {
+                edges.entry(g).or_default().push(f);
             }
         }
 
@@ -776,6 +845,51 @@ mod tests {
         let mut c = Cell::formula(src);
         c.f_attrs = Some("t=\"array\"".to_string());
         c
+    }
+
+    #[test]
+    fn large_chain_and_whole_column_recalc_correctly() {
+        // Stresses the sorted-index dependency builder at scale: a long
+        // running-sum chain (tiny per-formula rects) plus a whole-column SUM
+        // (one huge rect), then a head edit that must ripple the entire chain
+        // through the data-seed scan + reverse-edge walk.
+        const N: u32 = 400;
+        let mut sheet = Sheet {
+            name: "Sheet1".to_string(),
+            ..Sheet::default()
+        };
+        // A_i = 1; B1 = A1; B_i = B_{i-1} + A_i, so B_i == i.
+        for i in 0..N {
+            sheet.set_cell(i, 0, Cell::number(1.0));
+            let f = if i == 0 {
+                "A1".to_string()
+            } else {
+                format!("B{}+A{}", i, i + 1)
+            };
+            sheet.set_cell(i, 1, Cell::formula(&f));
+        }
+        sheet.set_cell(0, 3, Cell::formula("SUM(B:B)")); // whole-column rect
+        let mut wb = Workbook {
+            sheets: vec![sheet],
+            ..Workbook::default()
+        };
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "B400"), CellValue::Number(400.0));
+        assert_eq!(
+            value_at(&wb, "D1"),
+            CellValue::Number((N * (N + 1) / 2) as f64)
+        );
+
+        // Editing the head data cell (+10) must propagate down the whole chain
+        // and into the whole-column aggregate: every B_i rises by 10.
+        set(&mut eng, &mut wb, "A1", Cell::number(11.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(11.0));
+        assert_eq!(value_at(&wb, "B400"), CellValue::Number(410.0));
+        assert_eq!(
+            value_at(&wb, "D1"),
+            CellValue::Number((N * (N + 1) / 2 + 10 * N) as f64)
+        );
     }
 
     #[test]
