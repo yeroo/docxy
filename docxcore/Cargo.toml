@@ -18,3 +18,17 @@ workspace = true
 # Intentionally std-only — keep this crate pure and auditable. The one
 # dependency is our own shared OPC container layer (also std-only).
 opccore = { version = "0.1.0", path = "../opccore" }
+
+[dev-dependencies]
+# Dev-only, and gated behind the `bench` feature (see [[bench]] below) so
+# normal + MSRV `--all-targets` builds never pull criterion's tree.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[features]
+# Enable to compile/run the benchmarks: `cargo bench -p docxcore --features bench`.
+bench = []
+
+[[bench]]
+name = "docx"
+harness = false
+required-features = ["bench"]
