@@ -42,8 +42,8 @@ means. The full run is the "broad MS Project tour" (~46 steps).
 
 ## Deliverables & repo layout
 
-Everything lives in a **new corpus repository** (working name `mpp-corpus`),
-separate from docxy:
+Everything lives in a **new private corpus repository** (working name
+`mpp-corpus`), separate from docxy:
 
 ```
 mpp-corpus/
@@ -56,6 +56,10 @@ mpp-corpus/
 Distribution: GitHub releases ship a zip of `snapshots/` + `manifest.json`.
 In docxy, `corpus/mpp/README.md` gains a pointer and a small fetch script that
 downloads the latest release into the (still gitignored) `corpus/mpp/`.
+Because the repo is **private**, the fetch script authenticates via `gh
+release download` (or a `GITHUB_TOKEN`), and any session that needs the corpus
+— including the cloud session — must hold a token with access to the repo;
+anonymous `curl` won't work.
 
 ## The AddIn
 
@@ -184,8 +188,9 @@ After a full generation run, before publishing a release:
 
 ## Decisions log
 
-- Distribution: **separate corpus repo + release zips** (user choice; keeps
-  docxy lean, files still one `curl` away).
+- Distribution: **separate private corpus repo + release zips** (user choice;
+  keeps docxy lean; private means fetching requires an authenticated `gh` /
+  token rather than anonymous `curl`).
 - Scope: **broad MS Project tour** (~46 steps), not just decoder-driven
   (user choice).
 - Vehicle: **real VSTO AddIn** with ribbon button (user choice over external
