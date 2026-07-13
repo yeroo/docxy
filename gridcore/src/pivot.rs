@@ -49,6 +49,18 @@ pub struct Pivot {
     pub row_fields: Vec<usize>,
     pub col_fields: Vec<usize>,
     pub data_fields: Vec<DataField>,
+    /// Per cache field, the enumerated shared-item values (empty for numeric
+    /// range fields). Filled from the cache; used to resolve item indices.
+    pub field_items: Vec<Vec<Value>>,
+    /// Active row/column filters: per pivot field, the shared-item indices that
+    /// are hidden (`<item h="1" x="…"/>`). Those records are excluded on refresh.
+    pub hidden: Vec<(usize, Vec<usize>)>,
+    /// Report (page) filters: per `<pageField>`, the selected shared-item index,
+    /// or `None` for "(All)". A selected item keeps only matching records.
+    pub page: Vec<(usize, Option<usize>)>,
+    /// Per pivot field, the shared index (`x`) of each `<item>` in order — maps a
+    /// page field's `item` position to a shared index. Empty = identity.
+    pub items_order: Vec<Vec<i64>>,
     pub grand_rows: bool,
     pub grand_cols: bool,
     /// Subtotal rows for outer row fields (Excel's default with two or
@@ -77,6 +89,10 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         row_fields: Vec::new(),
         col_fields: Vec::new(),
         data_fields: Vec::new(),
+        field_items: Vec::new(),
+        hidden: Vec::new(),
+        page: Vec::new(),
+        items_order: Vec::new(),
         grand_rows: true,
         grand_cols: true,
         subtotals: false,
@@ -89,6 +105,10 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
     let mut got_location = false;
     let mut pivot_field_idx: i64 = -1;
     let mut no_subtotal: Vec<usize> = Vec::new();
+    // The current pivot field's items (`x` per position) and hidden shared
+    // indices, flushed onto `piv` when the next field starts / at the end.
+    let mut cur_items: Vec<i64> = Vec::new();
+    let mut cur_hidden: Vec<usize> = Vec::new();
     #[derive(PartialEq)]
     enum Section {
         None,
@@ -120,6 +140,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                     }
                 }
                 "pivotField" => {
+                    flush_pivot_field(&mut piv, pivot_field_idx, &mut cur_items, &mut cur_hidden);
                     pivot_field_idx += 1;
                     if p.attr("defaultSubtotal") == "0" {
                         no_subtotal.push(pivot_field_idx as usize);
@@ -139,14 +160,28 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                         }
                     }
                 }
-                "pageFields" | "pageField" => {
-                    // Report filters can hide records; refresh would be wrong.
-                    piv.unsupported = true;
+                // A report filter: keep records matching the selected item (a
+                // real item index) or, for "(All)", don't filter.
+                "pageField" => {
+                    if let Ok(fld) = p.attr("fld").parse::<usize>() {
+                        let sel = p
+                            .attr("item")
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|&i| (0..32767).contains(&i))
+                            .map(|i| i as usize);
+                        piv.page.push((fld, sel));
+                    }
                 }
+                // One `<item>` of the current pivot field. `t` (e.g. "default")
+                // marks the subtotal placeholder — a slot but not a data value.
                 "item" => {
-                    // A hidden item is an active row/column filter.
-                    if p.attr("h") == "1" {
-                        piv.unsupported = true;
+                    let pos = cur_items.len();
+                    let is_special = !p.attr("t").is_empty();
+                    let x = p.attr("x").parse::<i64>().unwrap_or(pos as i64);
+                    cur_items.push(if is_special { -1 } else { x });
+                    if !is_special && x >= 0 && p.attr("h") == "1" {
+                        cur_hidden.push(x as usize);
                     }
                 }
                 "dataField" => {
@@ -171,6 +206,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
             _ => {}
         }
     }
+    flush_pivot_field(&mut piv, pivot_field_idx, &mut cur_items, &mut cur_hidden);
     if !got_location || piv.data_fields.is_empty() {
         piv.unsupported = true;
     }
@@ -181,11 +217,38 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
     Some((piv, cache_id?))
 }
 
-/// Parse a pivotCacheDefinition part → (source, field names, unsupported).
-pub(crate) fn parse_pivot_cache_xml(xml: &str) -> Option<(PivotSource, Vec<String>, bool)> {
+/// Record the just-parsed pivot field's item order (`x` per position) at its
+/// field index, and any hidden shared indices, then reset the scratch buffers.
+fn flush_pivot_field(piv: &mut Pivot, idx: i64, items: &mut Vec<i64>, hidden: &mut Vec<usize>) {
+    if idx < 0 {
+        items.clear();
+        hidden.clear();
+        return;
+    }
+    let idx = idx as usize;
+    while piv.items_order.len() <= idx {
+        piv.items_order.push(Vec::new());
+    }
+    piv.items_order[idx] = std::mem::take(items);
+    let h = std::mem::take(hidden);
+    if !h.is_empty() {
+        piv.hidden.push((idx, h));
+    }
+}
+
+/// The parsed pieces of a pivotCacheDefinition: source, field names, per-field
+/// shared-item values, and whether it uses something refresh can't model.
+pub(crate) type CacheInfo = (PivotSource, Vec<String>, Vec<Vec<Value>>, bool);
+
+/// Parse a pivotCacheDefinition part. `date1904` sets the epoch for `<d>` items.
+pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheInfo> {
     let mut p = XmlParser::new(xml);
     let mut source = None;
     let mut fields = Vec::new();
+    let mut field_items: Vec<Vec<Value>> = Vec::new();
+    let mut cur: Vec<Value> = Vec::new();
+    let mut in_shared = false;
+    let mut started = false;
     let mut unsupported = false;
     loop {
         match p.next() {
@@ -208,19 +271,62 @@ pub(crate) fn parse_pivot_cache_xml(xml: &str) -> Option<(PivotSource, Vec<Strin
                     }
                 }
                 "cacheField" => {
+                    // Flush the previous field's items, then start this one.
+                    if started {
+                        field_items.push(std::mem::take(&mut cur));
+                    }
+                    started = true;
                     fields.push(decode(p.attr("name")));
                     // A calculated field has its formula on the cache field.
                     if !p.attr("formula").is_empty() {
                         unsupported = true;
                     }
                 }
+                "sharedItems" => in_shared = true,
+                t @ ("s" | "n" | "b" | "d" | "e" | "m") if in_shared => {
+                    cur.push(shared_item_value(t, p.attr("v"), date1904));
+                }
                 _ => {}
             },
+            Event::End => {
+                if local_name(p.name()) == "sharedItems" {
+                    in_shared = false;
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
     }
-    Some((source?, fields, unsupported))
+    if started {
+        field_items.push(cur);
+    }
+    Some((source?, fields, field_items, unsupported))
+}
+
+/// One `<sharedItems>` value element → a cell value (dates → serial).
+fn shared_item_value(tag: &str, v: &str, date1904: bool) -> Value {
+    match tag {
+        "s" => Value::Str(decode(v)),
+        "n" => Value::Num(v.parse().unwrap_or(0.0)),
+        "b" => Value::Bool(matches!(v, "1" | "true" | "True")),
+        "d" => date_to_serial(v, date1904).map(Value::Num).unwrap_or(Value::Empty),
+        "e" => Value::Str(decode(v)),
+        _ => Value::Empty, // "m" = missing/blank
+    }
+}
+
+/// Parse an ISO `YYYY-MM-DDThh:mm:ss` (time optional) into an Excel serial.
+fn date_to_serial(s: &str, date1904: bool) -> Option<f64> {
+    let (date, time) = s.split_once('T').unwrap_or((s, "00:00:00"));
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let m: u32 = dp.next()?.parse().ok()?;
+    let d: u32 = dp.next()?.parse().ok()?;
+    let mut tp = time.split(':');
+    let hh: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let mm: u32 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let ss: u32 = tp.next().and_then(|x| x.trim_end_matches('Z').parse().ok()).unwrap_or(0);
+    Some(crate::sheet::parts_to_serial(y, m, d, hh * 3600 + mm * 60 + ss, date1904))
 }
 
 /// What a refresh pass did.
@@ -294,11 +400,61 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             out.skipped += 1;
             continue;
         };
+        // Build record filters from hidden items (keep the non-hidden values) and
+        // page fields (keep the selected item). If any index can't be resolved to
+        // a value/column, fall back to skipping (keep the cached cells).
+        let mut filters: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut resolvable = true;
+        for (fld, hidden_idx) in &p.hidden {
+            match (col_of(*fld), p.field_items.get(*fld)) {
+                (Some(col), Some(vals)) if !vals.is_empty() => {
+                    let hidden: std::collections::HashSet<usize> =
+                        hidden_idx.iter().copied().collect();
+                    let allowed: Vec<Value> = vals
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !hidden.contains(i))
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    filters.push((col, allowed));
+                }
+                _ => {
+                    resolvable = false;
+                    break;
+                }
+            }
+        }
+        if resolvable {
+            for (fld, sel) in &p.page {
+                let Some(item) = sel else { continue }; // "(All)"
+                // A page field's `item` indexes the field's item order → shared idx.
+                let shared = p
+                    .items_order
+                    .get(*fld)
+                    .and_then(|order| order.get(*item))
+                    .copied()
+                    .unwrap_or(*item as i64);
+                if shared < 0 {
+                    continue; // default / "(All)" slot
+                }
+                match (col_of(*fld), p.field_items.get(*fld).and_then(|v| v.get(shared as usize))) {
+                    (Some(col), Some(val)) => filters.push((col, vec![val.clone()])),
+                    _ => {
+                        resolvable = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !resolvable {
+            out.skipped += 1;
+            continue;
+        }
         let spec = PivotSpec {
             rows,
             cols,
             measures,
-            filters: Vec::new(),
+            filters,
             grand_rows: p.grand_rows,
             grand_cols: p.grand_cols,
             subtotals: p.subtotals,
@@ -474,13 +630,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_items_and_page_fields_mark_unsupported() {
+    fn hidden_items_and_page_fields_are_parsed() {
         let base = |extra: &str| {
             format!(
                 r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A1:B2"/><pivotFields>{extra}</pivotFields><rowFields><field x="0"/></rowFields><dataFields><dataField fld="1"/></dataFields></pivotTableDefinition>"#
             )
         };
-        // Plain items: supported.
+        // Plain items: supported, no filter.
         let (p, id) = parse_pivot_table_xml(
             &base(r#"<pivotField axis="axisRow"><items><item x="0"/></items></pivotField>"#),
             0,
@@ -488,20 +644,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, 1);
-        assert!(!p.unsupported);
+        assert!(!p.unsupported && p.hidden.is_empty());
         assert_eq!(p.data_fields[0].agg, Agg::Sum); // subtotal default
-        // A hidden item is an active filter → unsupported.
+        // A hidden item records the field + hidden shared index (still supported).
         let (p, _) = parse_pivot_table_xml(
-            &base(r#"<pivotField axis="axisRow"><items><item x="0" h="1"/></items></pivotField>"#),
+            &base(
+                r#"<pivotField axis="axisRow"><items><item x="0" h="1"/><item x="1"/></items></pivotField>"#,
+            ),
             0,
             "p",
         )
         .unwrap();
-        assert!(p.unsupported);
-        // Page (report-filter) fields → unsupported.
-        let with_page = r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A1:B2"/><pageFields count="1"><pageField fld="2"/></pageFields><rowFields><field x="0"/></rowFields><dataFields><dataField fld="1" subtotal="average"/></dataFields></pivotTableDefinition>"#;
+        assert!(!p.unsupported);
+        assert_eq!(p.hidden, vec![(0, vec![0])]);
+        // A page field records the selected item (absent = "(All)").
+        let with_page = r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A1:B2"/><pageFields count="1"><pageField fld="2" item="3"/></pageFields><rowFields><field x="0"/></rowFields><dataFields><dataField fld="1" subtotal="average"/></dataFields></pivotTableDefinition>"#;
         let (p, _) = parse_pivot_table_xml(with_page, 0, "p").unwrap();
-        assert!(p.unsupported);
+        assert!(!p.unsupported);
+        assert_eq!(p.page, vec![(2, Some(3))]);
         assert_eq!(p.data_fields[0].agg, Agg::Average);
     }
 
@@ -580,7 +740,7 @@ mod tests {
     #[test]
     fn cache_parses_table_and_range_sources() {
         let range = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields><cacheField name="A"/><cacheField name="B"/></cacheFields></pivotCacheDefinition>"#;
-        let (src, fields, unsupported) = parse_pivot_cache_xml(range).unwrap();
+        let (src, fields, _, unsupported) = parse_pivot_cache_xml(range, false).unwrap();
         assert_eq!(
             src,
             PivotSource::Range {
@@ -591,11 +751,105 @@ mod tests {
         assert_eq!(fields, vec!["A", "B"]);
         assert!(!unsupported);
         let table = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource name="Sales"/></cacheSource><cacheFields><cacheField name="A"/></cacheFields></pivotCacheDefinition>"#;
-        let (src, _, _) = parse_pivot_cache_xml(table).unwrap();
+        let (src, _, _, _) = parse_pivot_cache_xml(table, false).unwrap();
         assert_eq!(src, PivotSource::Table("Sales".into()));
         // Calculated fields poison refresh.
         let calc = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:B2" sheet="D"/></cacheSource><cacheFields><cacheField name="A" formula="B*2"/></cacheFields></pivotCacheDefinition>"#;
-        let (_, _, unsupported) = parse_pivot_cache_xml(calc).unwrap();
+        let (_, _, _, unsupported) = parse_pivot_cache_xml(calc, false).unwrap();
         assert!(unsupported);
+    }
+
+    #[test]
+    fn refresh_applies_hidden_and_page_filters() {
+        use crate::sheet::{Cell, CellValue, Sheet};
+        let make_data = || {
+            let mut data = Sheet {
+                name: "Data".into(),
+                ..Sheet::default()
+            };
+            data.set_cell(0, 0, Cell::text("Region"));
+            data.set_cell(0, 1, Cell::text("Amount"));
+            for (i, (reg, amt)) in [("East", 10.0), ("West", 20.0), ("East", 30.0), ("West", 40.0)]
+                .iter()
+                .enumerate()
+            {
+                data.set_cell(i as u32 + 1, 0, Cell::text(reg));
+                data.set_cell(i as u32 + 1, 1, Cell::number(*amt));
+            }
+            data
+        };
+        let base_pivot = |hidden: Vec<(usize, Vec<usize>)>, page: Vec<(usize, Option<usize>)>| Pivot {
+            name: "P".into(),
+            sheet: 1,
+            location: (0, 0, 2, 1),
+            source: PivotSource::Range {
+                sheet: "Data".into(),
+                rect: (0, 0, 4, 1),
+            },
+            fields: vec!["Region".into(), "Amount".into()],
+            row_fields: vec![0],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Amount".into(),
+                field: 1,
+                agg: Agg::Sum,
+            }],
+            field_items: vec![vec![Value::Str("East".into()), Value::Str("West".into())], vec![]],
+            hidden,
+            page,
+            items_order: vec![],
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        };
+        let nums = |wb: &Workbook| -> Vec<f64> {
+            (0..3)
+                .flat_map(|r| (0..2).map(move |c| (r, c)))
+                .filter_map(|(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
+                    Some(CellValue::Number(n)) => Some(n),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Hide "West" (shared index 1): only East's 10+30 = 40 aggregates.
+        let mut wb = Workbook {
+            sheets: vec![make_data(), Sheet::default()],
+            ..Workbook::default()
+        };
+        wb.pivots.push(base_pivot(vec![(0, vec![1])], vec![]));
+        assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
+        let v = nums(&wb);
+        assert!(v.contains(&40.0), "East 40 missing: {v:?}");
+        assert!(!v.contains(&20.0) && !v.contains(&60.0), "West leaked: {v:?}");
+
+        // A page filter selecting item 0 ("East") gives the same result.
+        let mut wb = Workbook {
+            sheets: vec![make_data(), Sheet::default()],
+            ..Workbook::default()
+        };
+        wb.pivots.push(base_pivot(vec![], vec![(0, Some(0))]));
+        assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
+        let v = nums(&wb);
+        assert!(v.contains(&40.0), "page-filtered East 40 missing: {v:?}");
+        assert!(!v.contains(&60.0), "page filter leaked West: {v:?}");
+    }
+
+    #[test]
+    fn cache_parses_shared_items() {
+        let xml = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="D"/></cacheSource><cacheFields>
+            <cacheField name="Region"><sharedItems><s v="East"/><s v="West"/></sharedItems></cacheField>
+            <cacheField name="Flag"><sharedItems count="2"><b v="1"/><b v="0"/></sharedItems></cacheField>
+            <cacheField name="Amount"><sharedItems containsNumber="1" minValue="1" maxValue="9"/></cacheField>
+            </cacheFields></pivotCacheDefinition>"#;
+        let (_, fields, items, _) = parse_pivot_cache_xml(xml, false).unwrap();
+        assert_eq!(fields, vec!["Region", "Flag", "Amount"]);
+        assert_eq!(items[0], vec![Value::Str("East".into()), Value::Str("West".into())]);
+        assert_eq!(items[1], vec![Value::Bool(true), Value::Bool(false)]);
+        assert!(items[2].is_empty()); // numeric range → no enumerated items
     }
 }

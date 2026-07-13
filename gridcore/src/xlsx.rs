@@ -288,13 +288,14 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             .iter()
             .find(|(id, _)| *id == cache_id)
             .and_then(|(_, part)| get_str(part).map(|xml| (part.clone(), xml)));
-        match cache
-            .and_then(|(part, xml)| crate::pivot::parse_pivot_cache_xml(&xml).map(|c| (part, c)))
-        {
-            Some((cache_part, (source, fields, cache_unsupported))) => {
+        match cache.and_then(|(part, xml)| {
+            crate::pivot::parse_pivot_cache_xml(&xml, date1904).map(|c| (part, c))
+        }) {
+            Some((cache_part, (source, fields, field_items, cache_unsupported))) => {
                 piv.cache_part = cache_part;
                 piv.source = source;
                 piv.fields = fields;
+                piv.field_items = field_items;
                 piv.unsupported |= cache_unsupported;
             }
             None => piv.unsupported = true,
@@ -2195,6 +2196,10 @@ impl SheetPackage {
             row_fields: Vec::new(),
             col_fields: Vec::new(),
             data_fields: vec![default_measure],
+            field_items: Vec::new(),
+            hidden: Vec::new(),
+            page: Vec::new(),
+            items_order: Vec::new(),
             grand_rows: true,
             grand_cols: true,
             subtotals: false,
