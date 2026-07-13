@@ -20,6 +20,29 @@ use crate::zipwrite::write_zip;
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
+/// Read the value of attribute `attr` (given as `name="`) on the first `elem`
+/// element (given as its opening `<w:tag` prefix). Scoped to that one tag so an
+/// attribute of a later element can't be picked up by mistake.
+fn attr_in(hay: &str, elem: &str, attr: &str) -> Option<String> {
+    let start = hay.find(elem)?;
+    let tag = &hay[start..];
+    let end = tag.find('>').unwrap_or(tag.len());
+    let tag = &tag[..end];
+    let a = tag.find(attr)? + attr.len();
+    let rest = &tag[a..];
+    let q = rest.find('"')?;
+    Some(rest[..q].to_string())
+}
+
+/// Decode the handful of XML entities a watermark phrase might carry.
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 /// A loaded `.docx`: the editable [`Document`] plus all original parts so save
 /// can preserve what isn't modeled.
 #[derive(Debug, Clone)]
@@ -46,6 +69,86 @@ impl Package {
     /// Replace the trailing section properties (e.g. to change page orientation).
     pub fn set_sect_pr(&mut self, xml: String) {
         self.sect_pr = xml;
+    }
+
+    /// The document's protection state from `word/settings.xml`, as a short human
+    /// label (`read-only`, `comments only`, `tracked changes only`, `form fields
+    /// only`), or `None` when the document isn't protected. Surfaced so the reader
+    /// knows Word would restrict editing; docxy doesn't itself enforce it.
+    pub fn protection(&self) -> Option<String> {
+        let xml = self
+            .part("word/settings.xml")
+            .and_then(|b| std::str::from_utf8(b).ok())?;
+        // An enforced restriction (`w:documentProtection`). `w:edit` limits editing;
+        // `w:formatting="1"` (which can appear alone) locks styles/formatting.
+        if xml.contains("<w:documentProtection") {
+            let enforced = attr_in(xml, "<w:documentProtection", "w:enforcement=\"")
+                .map(|e| matches!(e.as_str(), "1" | "on" | "true"))
+                .unwrap_or(true);
+            if enforced {
+                let edit = attr_in(xml, "<w:documentProtection", "w:edit=\"");
+                let label = match edit.as_deref() {
+                    Some("readOnly") => Some("read-only"),
+                    Some("comments") => Some("comments only"),
+                    Some("trackedChanges") => Some("tracked changes only"),
+                    Some("forms") => Some("form fields only"),
+                    _ if attr_in(xml, "<w:documentProtection", "w:formatting=\"")
+                        .as_deref()
+                        == Some("1") =>
+                    {
+                        Some("formatting locked")
+                    }
+                    _ => None,
+                };
+                if let Some(l) = label {
+                    return Some(l.to_string());
+                }
+            }
+        }
+        // A "recommend read-only on open" flag (`w:writeProtection`).
+        if xml.contains("<w:writeProtection") {
+            return Some("read-only (recommended)".to_string());
+        }
+        None
+    }
+
+    /// The watermark text, if a header carries a VML WordArt watermark (Word's
+    /// text watermarks store the phrase in `<v:textpath string="…">`). Picture
+    /// watermarks return `None` (no text). Surfaced by docxy as an indicator.
+    pub fn watermark(&self) -> Option<String> {
+        for (name, bytes) in &self.parts {
+            if !name.contains("/header") {
+                continue;
+            }
+            let Ok(xml) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            // A header can hold several <v:textpath> (the shapetype's template one
+            // has no `string`); return the first that carries the watermark text.
+            let mut rest = xml;
+            while let Some(i) = rest.find("<v:textpath") {
+                rest = &rest[i..];
+                let end = rest.find('>').unwrap_or(rest.len());
+                if let Some(s) = attr_in(&rest[..end], "<v:textpath", "string=\"") {
+                    let t = decode_xml_entities(&s);
+                    if !t.trim().is_empty() {
+                        return Some(t);
+                    }
+                }
+                rest = &rest[end..];
+            }
+        }
+        None
+    }
+
+    /// Whether the document defines page borders (`w:pgBorders` in any section).
+    /// Surfaced as an indicator; a terminal doesn't draw the page frame itself.
+    pub fn has_page_borders(&self) -> bool {
+        self.sect_pr.contains("<w:pgBorders")
+            || self.document.body.iter().any(|b| {
+                matches!(b, crate::model::Block::Paragraph(p)
+                    if p.props.section_break.as_deref().is_some_and(|s| s.contains("<w:pgBorders")))
+            })
     }
 
     /// The raw bytes of a part by name.
@@ -721,6 +824,39 @@ mod tests {
         <w:p><w:r><w:t>World</w:t></w:r></w:p>\
         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
         </w:body></w:document>";
+
+    #[test]
+    fn surfaces_protection_watermark_and_page_borders() {
+        let document = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:r><w:t>Body</w:t></w:r></w:p>\
+            <w:sectPr><w:pgBorders w:offsetFrom=\"page\"><w:top w:val=\"single\"/></w:pgBorders>\
+            <w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>";
+        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\">\
+            <w:documentProtection w:edit=\"readOnly\" w:enforcement=\"1\"/></w:settings>";
+        let header = "<?xml version=\"1.0\"?><w:hdr xmlns:w=\"x\" xmlns:v=\"y\"><w:p><w:r><w:pict>\
+            <v:shape id=\"PowerPlusWaterMarkObject\"><v:textpath string=\"CONFIDENTIAL &amp; DRAFT\"/>\
+            </v:shape></w:pict></w:r></w:p></w:hdr>";
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/settings.xml".into(), settings.into()),
+            ("word/header1.xml".into(), header.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        assert_eq!(pkg.protection().as_deref(), Some("read-only"));
+        assert_eq!(pkg.watermark().as_deref(), Some("CONFIDENTIAL & DRAFT"));
+        assert!(pkg.has_page_borders());
+
+        // An unprotected, plain doc surfaces nothing.
+        let plain = load_package(&make_docx(BODY)).expect("load");
+        assert!(plain.protection().is_none());
+        assert!(plain.watermark().is_none());
+        assert!(!plain.has_page_borders());
+    }
 
     #[test]
     fn create_header_from_scratch_wires_everything() {

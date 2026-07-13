@@ -698,6 +698,11 @@ struct App {
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
+    /// Document-level notices surfaced on open (protection state, watermark text,
+    /// page borders) — Word features docxy shows but doesn't render/enforce.
+    doc_protection: Option<String>,
+    doc_watermark: Option<String>,
+    doc_page_borders: bool,
     scroll: usize,
     viewport_h: usize,
     page_view: bool,
@@ -880,6 +885,9 @@ impl App {
                 .unwrap_or_default(),
         };
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
+        let doc_protection = pkg.protection();
+        let doc_watermark = pkg.watermark();
+        let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -893,6 +901,9 @@ impl App {
             start_btns: [Rect::default(); START_ITEMS.len()],
             quit_requested: false,
             status: None,
+            doc_protection,
+            doc_watermark,
+            doc_page_borders,
             scroll: 0,
             viewport_h: 1,
             page_view: false,
@@ -2079,6 +2090,9 @@ impl App {
         self.comments_scroll = 0;
         self.comment_sel = 0;
         self.comment_active = false;
+        self.doc_protection = pkg.protection();
+        self.doc_watermark = pkg.watermark();
+        self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
         self.editor = Editor::new(doc);
@@ -2097,6 +2111,26 @@ impl App {
         self.find = None;
         self.img_cache.clear();
         self.dirty = true;
+    }
+
+    /// A compact status-line suffix for document-level notices (protection,
+    /// watermark, page borders) — empty when the document has none.
+    fn doc_notice(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = &self.doc_protection {
+            parts.push(format!("Protected: {p}"));
+        }
+        if let Some(w) = &self.doc_watermark {
+            parts.push(format!("Watermark: {w}"));
+        }
+        if self.doc_page_borders {
+            parts.push("Page border".to_string());
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  ·  {}", parts.join(" · "))
+        }
     }
 
     fn draw_backstage(&self, f: &mut Frame, area: Rect) {
@@ -5281,15 +5315,19 @@ impl App {
                 match &self.status {
                     Some(msg) => format!(" {m} {dirty_mark}{}  │ {msg}", self.path),
                     None => format!(
-                        " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}",
-                        self.path
+                        " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}{}",
+                        self.path,
+                        self.doc_notice()
                     ),
                 }
             }
         } else {
             match &self.status {
                 Some(msg) => format!("{left} │ {msg}"),
-                None => format!("{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit"),
+                None => format!(
+                    "{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit{}",
+                    self.doc_notice()
+                ),
             }
         };
         let status_widget =
@@ -6600,6 +6638,22 @@ mod tests {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         app.load_package_state(new_package(Document { body }), "x.md".to_string());
         assert!(!app.page_view);
+    }
+
+    #[test]
+    fn doc_notice_reports_surfaced_features() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        // A plain document shows nothing.
+        assert_eq!(app.doc_notice(), "");
+        // Each surfaced feature appears in the notice.
+        app.doc_protection = Some("read-only".to_string());
+        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        app.doc_page_borders = true;
+        let n = app.doc_notice();
+        assert!(n.contains("Protected: read-only"), "{n}");
+        assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
+        assert!(n.contains("Page border"), "{n}");
     }
 
     #[test]
