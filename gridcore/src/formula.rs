@@ -2738,6 +2738,8 @@ impl<'a> Eval<'a> {
             // they resolve here where non-scalar results are expressible.
             Expr::Func(name, args) if name == "LET" => self.let_fn(args),
             Expr::Func(name, args) if name == "LAMBDA" => self.lambda_fn(args),
+            // MATCH lifts over an array first argument (returns positions).
+            Expr::Func(name, args) if name == "MATCH" => self.match_call(args),
             // ISOMITTED reflects the current lambda call's omitted params —
             // it needs the argument's *name*, not its value.
             Expr::Func(name, args) if name == "ISOMITTED" => {
@@ -3195,6 +3197,77 @@ impl<'a> Eval<'a> {
         self.materialize(a).map_err(Value::Err)
     }
 
+    /// `MATCH`, lifted over its first argument only: with an array of lookup
+    /// values it returns an array of positions against the (whole) lookup lane —
+    /// the array-formula idiom `MATCH(range, range, 0)`. A scalar first argument
+    /// takes the ordinary scalar path unchanged.
+    fn match_call(&mut self, args: &[Expr]) -> Arg {
+        if args.len() < 2 || args.len() > 3 {
+            return Arg::Scalar(Value::Err(ExcelError::Value));
+        }
+        let first = self.eval_arg(&args[0]);
+        let multi = match &first {
+            Arg::Range(_, r1, c1, r2, c2) => !(r1 == r2 && c1 == c2),
+            Arg::Matrix(m) => !(m.len() == 1 && m[0].len() == 1),
+            _ => false,
+        };
+        if !multi {
+            return Arg::Scalar(self.call("MATCH", args));
+        }
+        let lookup = match self.arg_matrix(&args[1]) {
+            Ok(m) => m,
+            Err(v) => return Arg::Scalar(v),
+        };
+        if lookup.len() != 1 && lookup[0].len() != 1 {
+            return Arg::Scalar(Value::Err(ExcelError::NA));
+        }
+        let vals: Vec<Value> = lookup.into_iter().flatten().collect();
+        let mode = match args.get(2) {
+            None | Some(Expr::Missing) => 1.0,
+            Some(e) => match to_num(&self.eval(e)) {
+                Ok(n) => n,
+                Err(er) => return Arg::Scalar(Value::Err(er)),
+            },
+        };
+        let needles = match self.materialize(first) {
+            Ok(m) => m,
+            Err(e) => return Arg::Scalar(Value::Err(e)),
+        };
+        // Exact mode over many needles: a first-occurrence map makes it O(n+m).
+        let index: Option<std::collections::HashMap<String, usize>> = (mode == 0.0).then(|| {
+            let mut map = std::collections::HashMap::new();
+            for (i, v) in vals.iter().enumerate() {
+                if let Some(k) = match_key(v) {
+                    map.entry(k).or_insert(i);
+                }
+            }
+            map
+        });
+        let out: Matrix = needles
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|needle| {
+                        if let Value::Err(e) = needle {
+                            return Value::Err(*e);
+                        }
+                        if let Some(map) = &index {
+                            if let Some(k) = match_key(needle) {
+                                if let Some(&i) = map.get(&k) {
+                                    return Value::Num(i as f64 + 1.0);
+                                }
+                            }
+                            match_scan(&vals, needle, 0.0)
+                        } else {
+                            match_scan(&vals, needle, mode)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        Arg::Matrix(out)
+    }
+
     /// Optional numeric argument with a default.
     fn opt_num(&mut self, args: &[Expr], i: usize, default: f64) -> Result<f64, Value> {
         match args.get(i) {
@@ -3221,6 +3294,40 @@ impl<'a> Eval<'a> {
     fn array_fn_inner(&mut self, name: &str, args: &[Expr]) -> Result<Matrix, Value> {
         let err = |e: ExcelError| -> Result<Matrix, Value> { Err(Value::Err(e)) };
         match name {
+            // FREQUENCY(data, bins): a column of len(bins)+1 counts. count[0] =
+            // #data ≤ bins[0]; count[i] = #data in (bins[i-1], bins[i]]; the last =
+            // #data > bins[last]. Non-numbers in either array are ignored.
+            "FREQUENCY" => {
+                if args.len() != 2 {
+                    return err(ExcelError::Value);
+                }
+                let dm = {
+                    let a = self.eval_arg(&args[0]);
+                    self.materialize(a).map_err(Value::Err)?
+                };
+                let bm = {
+                    let a = self.eval_arg(&args[1]);
+                    self.materialize(a).map_err(Value::Err)?
+                };
+                let nums = |m: &Matrix| -> Vec<f64> {
+                    m.iter()
+                        .flatten()
+                        .filter_map(|v| match v {
+                            Value::Num(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let (data, bins) = (nums(&dm), nums(&bm));
+                let mut counts = vec![0.0f64; bins.len() + 1];
+                for x in data {
+                    // First bin ≥ x (bins are used in the order given); anything
+                    // past the last bin falls in the overflow bucket.
+                    let idx = bins.iter().position(|&b| x <= b).unwrap_or(bins.len());
+                    counts[idx] += 1.0;
+                }
+                Ok(counts.into_iter().map(|c| vec![num(c)]).collect())
+            }
             "SEQUENCE" => {
                 if args.is_empty() || args.len() > 4 {
                     return err(ExcelError::Value);
@@ -3920,6 +4027,59 @@ pub fn to_num(v: &Value) -> Result<f64, ExcelError> {
     }
 }
 
+/// Scan a 1-D lookup lane for `MATCH`: `mode` 0 = exact (with wildcards), 1 =
+/// largest ≤ needle (assumes ascending), −1 = smallest ≥ needle (descending).
+/// Returns the 1-based position or `#N/A`.
+fn match_scan(vals: &[Value], needle: &Value, mode: f64) -> Value {
+    use std::cmp::Ordering;
+    let mut best: Option<usize> = None;
+    for (i, v) in vals.iter().enumerate() {
+        if matches!(v, Value::Empty) {
+            continue;
+        }
+        match compare(v, needle) {
+            Ok(Ordering::Equal) => {
+                best = Some(i);
+                if mode == 0.0 {
+                    break;
+                }
+            }
+            Ok(Ordering::Less) if mode > 0.0 => best = Some(i),
+            Ok(Ordering::Greater) if mode < 0.0 => best = Some(i),
+            _ => {}
+        }
+    }
+    if best.is_none() && mode == 0.0 {
+        if let Value::Str(pat) = needle {
+            if pat.contains(['*', '?']) {
+                for (i, v) in vals.iter().enumerate() {
+                    if let Value::Str(t) = v {
+                        if wildcard_match(pat, t) {
+                            best = Some(i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match best {
+        Some(i) => Value::Num(i as f64 + 1.0),
+        None => Value::Err(ExcelError::NA),
+    }
+}
+
+/// A hashable key mirroring `compare`'s equality (numbers exact, text
+/// case-insensitive), for building a first-occurrence index in exact `MATCH`.
+fn match_key(v: &Value) -> Option<String> {
+    match v {
+        Value::Num(n) => Some(format!("n{}", n.to_bits())),
+        Value::Str(s) => Some(format!("s{}", s.to_lowercase())),
+        Value::Bool(b) => Some(format!("b{}", *b as u8)),
+        _ => None,
+    }
+}
+
 /// Wrap a distribution result: a finite value → number, anything else → `#NUM!`.
 fn domo(x: Option<f64>) -> Value {
     match x {
@@ -4241,6 +4401,7 @@ fn is_array_fn(name: &str) -> bool {
         name,
         "SEQUENCE"
             | "RANDARRAY"
+            | "FREQUENCY"
             | "TRANSPOSE"
             | "SORT"
             | "SORTBY"
@@ -6292,42 +6453,7 @@ impl<'a> Eval<'a> {
                     Some(e) => try_num!(self.eval(e)),
                     None => 1.0,
                 };
-                let mut best: Option<usize> = None;
-                for (i, v) in vals.iter().enumerate() {
-                    if matches!(v, Value::Empty) {
-                        continue;
-                    }
-                    match compare(v, &needle) {
-                        Ok(std::cmp::Ordering::Equal) => {
-                            best = Some(i);
-                            if mode == 0.0 {
-                                break;
-                            }
-                        }
-                        Ok(std::cmp::Ordering::Less) if mode > 0.0 => best = Some(i),
-                        Ok(std::cmp::Ordering::Greater) if mode < 0.0 => best = Some(i),
-                        _ => {}
-                    }
-                }
-                // Wildcards with exact match mode.
-                if best.is_none() && mode == 0.0 {
-                    if let Value::Str(pat) = &needle {
-                        if pat.contains(['*', '?']) {
-                            for (i, v) in vals.iter().enumerate() {
-                                if let Value::Str(t) = v {
-                                    if wildcard_match(pat, t) {
-                                        best = Some(i);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                match best {
-                    Some(i) => Value::Num(i as f64 + 1.0),
-                    None => Value::Err(ExcelError::NA),
-                }
+                match_scan(&vals, &needle, mode)
             }
             "INDEX" => {
                 if args.len() < 2 || args.len() > 3 {
@@ -10113,6 +10239,42 @@ mod tests {
 
     fn empty() -> Grid {
         Grid::new(&[])
+    }
+
+    #[test]
+    fn match_lifts_over_array_first_arg() {
+        let g = Grid::new(&[
+            ("A1", Value::Str("x".into())),
+            ("A2", Value::Str("y".into())),
+            ("A3", Value::Str("x".into())),
+        ]);
+        // MATCH(range, range, 0) → each value's first-occurrence position {1;2;1}.
+        assert_eq!(n("SUM(MATCH(A1:A3,A1:A3,0))", &g), 4.0);
+        assert_eq!(n("INDEX(MATCH(A1:A3,A1:A3,0),2)", &g), 2.0);
+        assert_eq!(n("INDEX(MATCH(A1:A3,A1:A3,0),3)", &g), 1.0);
+        // A scalar first argument still returns a scalar (unchanged path).
+        assert_eq!(n("MATCH(\"y\",A1:A3,0)", &g), 2.0);
+    }
+
+    #[test]
+    fn frequency_counts_into_bins() {
+        let mut cells: Vec<(&str, Value)> = Vec::new();
+        let names: Vec<String> = (1..=10).map(|i| format!("A{i}")).collect();
+        for (i, nm) in names.iter().enumerate() {
+            cells.push((nm.as_str(), Value::Num((i + 1) as f64)));
+        }
+        cells.push(("B1", Value::Num(3.0)));
+        cells.push(("B2", Value::Num(6.0)));
+        cells.push(("B3", Value::Num(9.0)));
+        let g = Grid::new(&cells);
+        // Bins {3,6,9} split 1..10 into {≤3, (3,6], (6,9], >9} = {3,3,3,1}.
+        assert_eq!(n("SUM(FREQUENCY(A1:A10,B1:B3))", &g), 10.0);
+        assert_eq!(n("INDEX(FREQUENCY(A1:A10,B1:B3),1)", &g), 3.0);
+        assert_eq!(n("INDEX(FREQUENCY(A1:A10,B1:B3),2)", &g), 3.0);
+        assert_eq!(n("INDEX(FREQUENCY(A1:A10,B1:B3),4)", &g), 1.0);
+        // A whole-column data array clamps to the used range (same answer).
+        assert_eq!(n("SUM(FREQUENCY(A:A,B1:B3))", &g), 10.0);
+        assert_eq!(n("INDEX(FREQUENCY(A:A,B1:B3),4)", &g), 1.0);
     }
 
     #[test]
