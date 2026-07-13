@@ -82,9 +82,12 @@ pub fn task_names(bytes: &[u8]) -> Vec<String> {
 /// Names come from the VarMeta/Var2Data container. Start/Finish come from the
 /// per-task **FixedData** records: the record size and the date field offset are
 /// auto-detected as the layout under which every task's start ≤ finish and the
-/// starts vary — a strong self-validating fit that generalizes across MPP9 and
-/// MPP12/14 (verified on real Microsoft Project and ProjectLibre files). If no
-/// layout fits, dates are left `None`. Timestamps use MPXJ's epoch/encoding.
+/// starts vary — and, when a link table is present, under which the
+/// Finish-to-Start links hold (the tie-breaker that distinguishes the true
+/// Start/Finish pair from a look-alike baseline/actual date field). A strong
+/// self-validating fit that generalizes across MPP9 and MPP12/14 (verified on
+/// real Microsoft Project and ProjectLibre files). If no layout fits, dates are
+/// left `None`. Timestamps use MPXJ's epoch/encoding.
 pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     let Ok(cfb) = Cfb::open(bytes) else { return Vec::new() };
     let Some(v2path) = cfb.paths().into_iter().find(|p| p.ends_with("TBkndTask/Var2Data")) else {
@@ -102,8 +105,16 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     // records (the WBS depth), so summaries and rollup come through too, and
     // decode the task links from the sibling `TBkndCons` table.
     let fdpath = v2path.replace("Var2Data", "FixedData");
+    let conspath = v2path.replace("TBkndTask/Var2Data", "TBkndCons/FixedData");
+    let cons = cfb.read_path(&conspath);
+    // Predecessor→successor index pairs (uid==position assumption) — the oracle
+    // that disambiguates which date field is Start/Finish.
+    let naive_links: Vec<(usize, usize)> = cons
+        .as_deref()
+        .map(|c| parse_cons(c).iter().map(|l| (l.pred_uid as usize, l.succ_uid as usize)).collect())
+        .unwrap_or_default();
     if let Some(fd) = cfb.read_path(&fdpath) {
-        if let Some((rs, off)) = detect_date_layout(&fd, out.len()) {
+        if let Some((rs, off)) = detect_date_layout(&fd, out.len(), &naive_links) {
             for (i, t) in out.iter_mut().enumerate() {
                 t.start = decode_timestamp(&fd, i * rs + off);
                 t.finish = decode_timestamp(&fd, i * rs + off + 4);
@@ -113,8 +124,7 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
                     t.outline_level = Some(fd[i * rs + oc] as u32 + 1);
                 }
             }
-            let conspath = v2path.replace("TBkndTask/Var2Data", "TBkndCons/FixedData");
-            if let Some(cons) = cfb.read_path(&conspath) {
+            if let Some(cons) = cons {
                 decode_links(&cons, &fd, rs, &mut out);
             }
         }
@@ -229,11 +239,23 @@ fn ts_ord(fd: &[u8], o: usize) -> Option<u32> {
 
 /// Find the `(record_size, date_offset)` under which the most tasks have a valid
 /// `start ≤ finish` and starts are varied. Accepts only a strong (≥80%) fit.
-fn detect_date_layout(fd: &[u8], count: usize) -> Option<(usize, usize)> {
+///
+/// A `.mpp` record can carry several date-like field pairs (Start/Finish, but
+/// also baseline, actual, early/late, constraint dates), and more than one can
+/// satisfy `start ≤ finish` — so `start ≤ finish` alone sometimes locks onto the
+/// wrong pair (e.g. one whose finishes are years off). When the link table is
+/// available, `links` (predecessor→successor **index** pairs, under the cheap
+/// uid==position assumption) breaks the tie: the true Start/Finish pair is the
+/// one under which the Finish-to-Start links hold. The link oracle is trusted
+/// only when it clearly applies — at least half the links map in range and ≥90%
+/// are consistent — otherwise this falls back to the plain most-valid pair (so
+/// files with sparse uids, where uid≠position, are unaffected).
+fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Option<(usize, usize)> {
     if count < 3 {
         return None;
     }
-    let mut best = (0usize, 0usize, 0usize);
+    let mut val_best = (0usize, 0usize, 0usize); // (rs, off, valid count)
+    let mut lnk_best: Option<(usize, usize, usize)> = None; // (rs, off, FS-consistent count)
     for rs in 80..320usize {
         if rs * (count - 1) + 8 > fd.len() {
             break;
@@ -249,12 +271,33 @@ fn detect_date_layout(fd: &[u8], count: usize) -> Option<(usize, usize)> {
                     }
                 }
             }
-            if ok > best.2 && distinct.len() >= 3 {
-                best = (rs, off, ok);
+            if ok * 5 < count * 4 || distinct.len() < 3 {
+                continue; // only strong-validity offsets are candidates
+            }
+            if ok > val_best.2 {
+                val_best = (rs, off, ok);
+            }
+            // Link-consistency score for this offset (successor start ≥ predecessor finish).
+            let (mut fo, mut ft) = (0usize, 0usize);
+            for &(p, s) in links {
+                if p < count && s < count {
+                    if let (Some(pf), Some(ss)) = (ts_ord(fd, p * rs + off + 4), ts_ord(fd, s * rs + off)) {
+                        ft += 1;
+                        if ss >= pf {
+                            fo += 1;
+                        }
+                    }
+                }
+            }
+            if ft >= 3 && ft * 2 >= links.len() && fo * 10 >= ft * 9 && lnk_best.is_none_or(|(_, _, b)| fo > b) {
+                lnk_best = Some((rs, off, fo));
             }
         }
     }
-    (best.2 * 5 >= count * 4).then_some((best.0, best.1))
+    if let Some((rs, off, _)) = lnk_best {
+        return Some((rs, off));
+    }
+    (val_best.2 * 5 >= count * 4).then_some((val_best.0, val_best.1))
 }
 
 /// Find the byte column in `record_size`-byte FixedData records that holds the
@@ -499,7 +542,7 @@ mod tests {
             fd[i * rs + off..i * rs + off + 4].copy_from_slice(&ts(s, 8 * 60));
             fd[i * rs + off + 4..i * rs + off + 8].copy_from_slice(&ts(s + 2, 17 * 60));
         }
-        assert_eq!(detect_date_layout(&fd, starts.len()), Some((rs, off)));
+        assert_eq!(detect_date_layout(&fd, starts.len(), &[]), Some((rs, off)));
         // Decode round-trips the first task's dates.
         assert_eq!(decode_timestamp(&fd, off).as_deref(), Some("1989-06-23 08:00"));
     }
@@ -578,10 +621,36 @@ mod tests {
     }
 
     #[test]
+    fn link_oracle_breaks_date_field_tie() {
+        // Two date-pair fields both satisfy start ≤ finish, but only the real
+        // one is consistent with the links. The decoy sits at a *lower* offset,
+        // so plain validity would wrongly pick it; the link oracle must override.
+        let rs = 96usize; // within the detector's 80..320 record-size scan
+        let (decoy, real) = (0x08usize, 0x30usize);
+        let count = 5;
+        let mut fd = vec![0u8; rs * count];
+        for i in 0..count {
+            let base = i * rs;
+            let i = i as u16;
+            // decoy: descending starts (chain links go backwards → inconsistent)
+            fd[base + decoy..base + decoy + 4].copy_from_slice(&ts(13000 + (5 - i) * 30, 480));
+            fd[base + decoy + 4..base + decoy + 8].copy_from_slice(&ts(13010 + (5 - i) * 30, 480));
+            // real: ascending starts (chain links go forward → consistent)
+            fd[base + real..base + real + 4].copy_from_slice(&ts(13000 + i * 30, 480));
+            fd[base + real + 4..base + real + 8].copy_from_slice(&ts(13010 + i * 30, 480));
+        }
+        let links = [(0usize, 1usize), (1, 2), (2, 3), (3, 4)];
+        // Without links, validity alone picks the lower (decoy) offset.
+        assert_eq!(detect_date_layout(&fd, count, &[]), Some((rs, decoy)));
+        // With links, the oracle selects the real Start/Finish field.
+        assert_eq!(detect_date_layout(&fd, count, &links), Some((rs, real)));
+    }
+
+    #[test]
     fn rejects_when_no_layout_fits() {
         // All-0xFF is the NA date marker everywhere → no valid start/finish.
         let fd = vec![0xFFu8; 2000];
-        assert_eq!(detect_date_layout(&fd, 5), None);
+        assert_eq!(detect_date_layout(&fd, 5, &[]), None);
     }
 
     #[test]

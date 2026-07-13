@@ -73,15 +73,23 @@ curl -sSL -o corpus/mpp/construction.mpp \
 
 ### Known decode gaps (good reverse-engineering targets)
 
-The current decoder handles MPP9 and MPP12/14 (names, dates, outline, links).
-Two sampled files sit outside that and are useful test material:
+The current decoder handles MPP9 and MPP12/14 (names, dates, outline, links) —
+including files a *New Product* template that Project 98 wrote and a later
+version re-saved as MPP9, which the link oracle (below) now dates correctly.
 
-- **Project 98 / MPP8** (e.g. *New Product.mpp*): the date field the detector
-  locks onto is the wrong one (a 1997 plan decodes 2011 finishes), so its links
-  self-invalidate and drop. Needs the MPP8 fixed-record date offset.
-- **Newest MPP** (e.g. the Azure plan): the task-name var-data field isn't found
-  (only one name decodes), so nothing downstream runs. Needs that generation's
-  name field-type / block layout.
+- **Newest MPP** (e.g. the Azure "Advanced Analytics" plan): the task-name
+  var-data field isn't found (only one name decodes), so nothing downstream
+  runs. Needs that generation's name field-type / block layout.
+
+The **link oracle**: a `.mpp` record holds several date-like field pairs
+(Start/Finish, but also baseline/actual/early/late/constraint dates), and more
+than one can satisfy `start ≤ finish`, so that test alone occasionally locks
+onto the wrong pair (the *New Product* file decoded 2011 finishes for a 2004
+plan). When the `TBkndCons` links are present, the decoder now uses them to
+break the tie: the real Start/Finish pair is the one under which the
+Finish-to-Start links hold. It's trusted only when it clearly applies (≥half the
+links map in range, ≥90% consistent), else it falls back to the plain most-valid
+pair — so sparse-uid files (where uid≠row) are unaffected.
 
 ## What already works on a real .mpp
 

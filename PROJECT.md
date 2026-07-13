@@ -129,8 +129,10 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   dates decode too, from the per-task `FixedData` records: the record size and
   date-field offset are auto-detected as the layout under which every task's
   `start ≤ finish` and the starts vary (a self-validating fit, like the name
-  decode), then the two-byte time / two-byte days-since-1984 fields are read at
-  that offset. The **outline level** (WBS depth) decodes from the same records:
+  decode) — with the link table, when present, breaking ties by which date pair
+  makes the Finish-to-Start links hold, so a look-alike baseline/actual field
+  can't win — then the two-byte time / two-byte days-since-1984 fields are read
+  at that offset. The **outline level** (WBS depth) decodes from the same records:
   its byte column is found by MS Project's tree rule — depth deepens by at most
   one per row and pops back up at real hierarchy boundaries — a self-validating
   signature that also rejects look-alike id columns and leaves the WBS flat when
