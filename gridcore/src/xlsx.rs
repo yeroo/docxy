@@ -291,11 +291,12 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         match cache.and_then(|(part, xml)| {
             crate::pivot::parse_pivot_cache_xml(&xml, date1904).map(|c| (part, c))
         }) {
-            Some((cache_part, (source, fields, field_items, cache_unsupported))) => {
+            Some((cache_part, (source, fields, field_items, calc_formulas, cache_unsupported))) => {
                 piv.cache_part = cache_part;
                 piv.source = source;
                 piv.fields = fields;
                 piv.field_items = field_items;
+                piv.calc_formulas = calc_formulas;
                 piv.unsupported |= cache_unsupported;
             }
             None => piv.unsupported = true,
@@ -2200,6 +2201,7 @@ impl SheetPackage {
             hidden: Vec::new(),
             page: Vec::new(),
             items_order: Vec::new(),
+            calc_formulas: Vec::new(),
             grand_rows: true,
             grand_cols: true,
             subtotals: false,

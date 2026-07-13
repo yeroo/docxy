@@ -33,6 +33,7 @@ pub mod frame;
 pub mod model;
 pub mod numfmt;
 pub mod pivot;
+pub mod pivotcalc;
 pub mod sheet;
 pub mod stats;
 pub mod xlsx;

@@ -355,6 +355,9 @@ pub struct Measure {
     pub col: usize,
     pub agg: Agg,
     pub name: String,
+    /// A calculated field: when set, the cell value is this expression evaluated
+    /// over the group's per-field sums (ignoring `col`/`agg`).
+    pub calc: Option<crate::pivotcalc::CalcExpr>,
 }
 
 /// A pivot query over a [`Frame`].
@@ -480,7 +483,21 @@ pub fn pivot(f: &Frame, spec: &PivotSpec) -> PivotOut {
     let data_cols = col_combos.len() * m + if grand_col { m } else { 0 };
     let total_cols = label_cols + data_cols;
 
+    // Group sum of a base column (numbers + booleans), for calculated fields.
+    let sum_col = |records: &[usize], col: usize| -> f64 {
+        records
+            .iter()
+            .map(|&r| match &f.cols[col][r] {
+                Value::Num(n) => *n,
+                Value::Bool(b) => *b as u8 as f64,
+                _ => 0.0,
+            })
+            .sum()
+    };
     let agg_records = |records: &[usize], meas: &Measure| -> Value {
+        if let Some(calc) = &meas.calc {
+            return crate::pivotcalc::eval(calc, &|col| sum_col(records, col));
+        }
         let vals: Vec<Value> = records
             .iter()
             .map(|&r| f.cols[meas.col][r].clone())
@@ -691,6 +708,7 @@ mod tests {
                 col: 3,
                 agg: Agg::Sum,
                 name: "Sum of Sales".into(),
+                calc: None,
             }],
             grand_rows: true,
             ..PivotSpec::default()
@@ -717,11 +735,13 @@ mod tests {
                     col: 3,
                     agg: Agg::Sum,
                     name: "Sum of Sales".into(),
+                    calc: None,
                 },
                 Measure {
                     col: 2,
                     agg: Agg::Count,
                     name: "Count of Qty".into(),
+                    calc: None,
                 },
             ],
             grand_rows: true,
@@ -761,6 +781,7 @@ mod tests {
                 col: 3,
                 agg: Agg::Sum,
                 name: "Sum of Sales".into(),
+                calc: None,
             }],
             grand_rows: true,
             grand_cols: true,
@@ -795,6 +816,7 @@ mod tests {
                 col: 2,
                 agg,
                 name: "m".into(),
+                calc: None,
             }],
             filters: vec![(1, vec![s("pen")])], // case-insensitive
             ..PivotSpec::default()
@@ -833,6 +855,7 @@ mod tests {
                 col: 3,
                 agg: Agg::Sum,
                 name: "Sum of Sales".into(),
+                calc: None,
             }],
             grand_rows: true,
             subtotals: true,
@@ -887,6 +910,7 @@ mod tests {
                 col: 3,
                 agg: Agg::Sum,
                 name: "Sum of Sales".into(),
+                calc: None,
             }],
             ..PivotSpec::default()
         };

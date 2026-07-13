@@ -61,6 +61,9 @@ pub struct Pivot {
     /// Per pivot field, the shared index (`x`) of each `<item>` in order — maps a
     /// page field's `item` position to a shared index. Empty = identity.
     pub items_order: Vec<Vec<i64>>,
+    /// Calculated fields: `(cache field index, formula)` — evaluated at refresh
+    /// over each pivot cell's group sums.
+    pub calc_formulas: Vec<(usize, String)>,
     pub grand_rows: bool,
     pub grand_cols: bool,
     /// Subtotal rows for outer row fields (Excel's default with two or
@@ -93,6 +96,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         hidden: Vec::new(),
         page: Vec::new(),
         items_order: Vec::new(),
+        calc_formulas: Vec::new(),
         grand_rows: true,
         grand_cols: true,
         subtotals: false,
@@ -237,8 +241,15 @@ fn flush_pivot_field(piv: &mut Pivot, idx: i64, items: &mut Vec<i64>, hidden: &m
 }
 
 /// The parsed pieces of a pivotCacheDefinition: source, field names, per-field
-/// shared-item values, and whether it uses something refresh can't model.
-pub(crate) type CacheInfo = (PivotSource, Vec<String>, Vec<Vec<Value>>, bool);
+/// shared-item values, calculated-field formulas, and whether it uses something
+/// refresh can't model.
+pub(crate) type CacheInfo = (
+    PivotSource,
+    Vec<String>,
+    Vec<Vec<Value>>,
+    Vec<(usize, String)>,
+    bool,
+);
 
 /// Parse a pivotCacheDefinition part. `date1904` sets the epoch for `<d>` items.
 pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheInfo> {
@@ -246,6 +257,7 @@ pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheIn
     let mut source = None;
     let mut fields = Vec::new();
     let mut field_items: Vec<Vec<Value>> = Vec::new();
+    let mut calc_formulas: Vec<(usize, String)> = Vec::new();
     let mut cur: Vec<Value> = Vec::new();
     let mut in_shared = false;
     let mut started = false;
@@ -277,9 +289,10 @@ pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheIn
                     }
                     started = true;
                     fields.push(decode(p.attr("name")));
-                    // A calculated field has its formula on the cache field.
-                    if !p.attr("formula").is_empty() {
-                        unsupported = true;
+                    // A calculated field carries its formula (evaluated on refresh).
+                    let formula = p.attr("formula");
+                    if !formula.is_empty() {
+                        calc_formulas.push((fields.len() - 1, decode(formula)));
                     }
                 }
                 "sharedItems" => in_shared = true,
@@ -300,7 +313,7 @@ pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheIn
     if started {
         field_items.push(cur);
     }
-    Some((source?, fields, field_items, unsupported))
+    Some((source?, fields, field_items, calc_formulas, unsupported))
 }
 
 /// One `<sharedItems>` value element → a cell value (dates → serial).
@@ -381,25 +394,62 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
             out.skipped += 1;
             continue;
         };
-        let measures: Option<Vec<Measure>> = p
-            .data_fields
-            .iter()
-            .map(|df| {
-                col_of(df.field).map(|col| Measure {
-                    col,
-                    agg: df.agg,
-                    name: if df.name.is_empty() {
-                        format!("{} of {}", df.agg.label(), frame.names[col])
-                    } else {
-                        df.name.clone()
-                    },
-                })
+        // Calculated-field formula lookups for the calc parser.
+        let calc_of = |name: &str| -> Option<String> {
+            p.calc_formulas.iter().find_map(|(fi, f)| {
+                (p.fields.get(*fi).map(|n| n.eq_ignore_ascii_case(name)) == Some(true))
+                    .then(|| f.clone())
             })
-            .collect();
-        let Some(measures) = measures else {
+        };
+        let base_of = |name: &str| frame.col_index(name);
+        let mut measures: Vec<Measure> = Vec::new();
+        let mut ok = true;
+        for df in &p.data_fields {
+            let calc = p.calc_formulas.iter().find(|(fi, _)| *fi == df.field);
+            let name = || {
+                if df.name.is_empty() {
+                    p.fields.get(df.field).cloned().unwrap_or_default()
+                } else {
+                    df.name.clone()
+                }
+            };
+            if let Some((_, formula)) = calc {
+                // A calculated field: parse its expression over base fields.
+                match crate::pivotcalc::parse(formula, &base_of, &calc_of) {
+                    Some(expr) => measures.push(Measure {
+                        col: 0,
+                        agg: df.agg,
+                        name: name(),
+                        calc: Some(expr),
+                    }),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                match col_of(df.field) {
+                    Some(col) => measures.push(Measure {
+                        col,
+                        agg: df.agg,
+                        name: if df.name.is_empty() {
+                            format!("{} of {}", df.agg.label(), frame.names[col])
+                        } else {
+                            df.name.clone()
+                        },
+                        calc: None,
+                    }),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
             out.skipped += 1;
             continue;
-        };
+        }
         // Build record filters from hidden items (keep the non-hidden values) and
         // page fields (keep the selected item). If any index can't be resolved to
         // a value/column, fall back to skipping (keep the cached cells).
@@ -740,7 +790,7 @@ mod tests {
     #[test]
     fn cache_parses_table_and_range_sources() {
         let range = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data"/></cacheSource><cacheFields><cacheField name="A"/><cacheField name="B"/></cacheFields></pivotCacheDefinition>"#;
-        let (src, fields, _, unsupported) = parse_pivot_cache_xml(range, false).unwrap();
+        let (src, fields, _, _, unsupported) = parse_pivot_cache_xml(range, false).unwrap();
         assert_eq!(
             src,
             PivotSource::Range {
@@ -751,12 +801,13 @@ mod tests {
         assert_eq!(fields, vec!["A", "B"]);
         assert!(!unsupported);
         let table = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource name="Sales"/></cacheSource><cacheFields><cacheField name="A"/></cacheFields></pivotCacheDefinition>"#;
-        let (src, _, _, _) = parse_pivot_cache_xml(table, false).unwrap();
+        let (src, _, _, _, _) = parse_pivot_cache_xml(table, false).unwrap();
         assert_eq!(src, PivotSource::Table("Sales".into()));
-        // Calculated fields poison refresh.
-        let calc = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:B2" sheet="D"/></cacheSource><cacheFields><cacheField name="A" formula="B*2"/></cacheFields></pivotCacheDefinition>"#;
-        let (_, _, _, unsupported) = parse_pivot_cache_xml(calc, false).unwrap();
-        assert!(unsupported);
+        // A calculated field is captured (its formula) rather than poisoning refresh.
+        let calc = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:B2" sheet="D"/></cacheSource><cacheFields><cacheField name="A"/><cacheField name="C" formula="A*2"/></cacheFields></pivotCacheDefinition>"#;
+        let (_, _, _, calc_formulas, unsupported) = parse_pivot_cache_xml(calc, false).unwrap();
+        assert!(!unsupported);
+        assert_eq!(calc_formulas, vec![(1, "A*2".to_string())]);
     }
 
     #[test]
@@ -798,6 +849,7 @@ mod tests {
             hidden,
             page,
             items_order: vec![],
+            calc_formulas: vec![],
             grand_rows: true,
             grand_cols: true,
             subtotals: false,
@@ -840,13 +892,92 @@ mod tests {
     }
 
     #[test]
+    fn refresh_evaluates_calculated_field() {
+        use crate::sheet::{Cell, CellValue, Sheet};
+        let mut data = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (c, h) in ["Region", "Sales", "Cost"].iter().enumerate() {
+            data.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (i, (reg, s, c)) in [("East", 100.0, 60.0), ("West", 50.0, 20.0), ("East", 30.0, 10.0)]
+            .iter()
+            .enumerate()
+        {
+            data.set_cell(i as u32 + 1, 0, Cell::text(reg));
+            data.set_cell(i as u32 + 1, 1, Cell::number(*s));
+            data.set_cell(i as u32 + 1, 2, Cell::number(*c));
+        }
+        let mut wb = Workbook {
+            sheets: vec![data, Sheet::default()],
+            ..Workbook::default()
+        };
+        let mut piv = new_pivot();
+        piv.sheet = 1;
+        piv.location = (0, 0, 2, 1);
+        piv.source = PivotSource::Range {
+            sheet: "Data".into(),
+            rect: (0, 0, 3, 2),
+        };
+        // "Margin" (field 3) is a calculated field = Sales - Cost.
+        piv.fields = vec!["Region".into(), "Sales".into(), "Cost".into(), "Margin".into()];
+        piv.calc_formulas = vec![(3, "Sales - Cost".into())];
+        piv.row_fields = vec![0];
+        piv.data_fields = vec![DataField {
+            name: "Margin".into(),
+            field: 3,
+            agg: Agg::Sum,
+        }];
+        wb.pivots.push(piv);
+        assert_eq!(refresh_pivots(&mut wb).refreshed, 1);
+        // East Margin = 130 - 70 = 60; West = 50 - 20 = 30; Grand = 180 - 90 = 90.
+        let nums: Vec<f64> = (0..5)
+            .flat_map(|r| (0..2).map(move |c| (r, c)))
+            .filter_map(|(r, c)| match wb.sheets[1].cell(r, c).map(|cl| cl.value.clone()) {
+                Some(CellValue::Number(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(nums.contains(&60.0), "East margin 60 missing: {nums:?}");
+        assert!(nums.contains(&30.0), "West margin 30 missing: {nums:?}");
+        assert!(nums.contains(&90.0), "grand margin 90 missing: {nums:?}");
+    }
+
+    /// A minimal supported pivot for tests (fill in what each needs).
+    fn new_pivot() -> Pivot {
+        Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 0, 0, 0),
+            source: PivotSource::Table(String::new()),
+            fields: Vec::new(),
+            row_fields: Vec::new(),
+            col_fields: Vec::new(),
+            data_fields: Vec::new(),
+            field_items: Vec::new(),
+            hidden: Vec::new(),
+            page: Vec::new(),
+            items_order: Vec::new(),
+            calc_formulas: Vec::new(),
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        }
+    }
+
+    #[test]
     fn cache_parses_shared_items() {
         let xml = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="D"/></cacheSource><cacheFields>
             <cacheField name="Region"><sharedItems><s v="East"/><s v="West"/></sharedItems></cacheField>
             <cacheField name="Flag"><sharedItems count="2"><b v="1"/><b v="0"/></sharedItems></cacheField>
             <cacheField name="Amount"><sharedItems containsNumber="1" minValue="1" maxValue="9"/></cacheField>
             </cacheFields></pivotCacheDefinition>"#;
-        let (_, fields, items, _) = parse_pivot_cache_xml(xml, false).unwrap();
+        let (_, fields, items, _, _) = parse_pivot_cache_xml(xml, false).unwrap();
         assert_eq!(fields, vec!["Region", "Flag", "Amount"]);
         assert_eq!(items[0], vec![Value::Str("East".into()), Value::Str("West".into())]);
         assert_eq!(items[1], vec![Value::Bool(true), Value::Bool(false)]);
