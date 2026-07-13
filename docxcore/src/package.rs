@@ -777,23 +777,58 @@ fn esc_xml_attr(s: &str) -> String {
     out
 }
 
-/// Capture the last (body-level) `w:sectPr` element verbatim, if any.
+/// Capture the last body-level `w:sectPr` element verbatim, if any.
+///
+/// A depth-tracking scan, not `rfind`, because a section edited with tracked
+/// changes nests the *previous* properties in `<w:sectPrChange><w:sectPr>…` — a
+/// naive last-match would capture that stale inner element and drop the current
+/// page setup on save. Only the outermost (depth-0) `<w:sectPr>` is a real body
+/// section; `<w:sectPrChange>` is skipped (it isn't a `<w:sectPr>` element).
 fn extract_sectpr(xml: &str) -> String {
-    let Some(start) = xml.rfind("<w:sectPr") else {
-        return String::new();
-    };
-    let tail = &xml[start..];
-    if let Some(close) = tail.find("</w:sectPr>") {
-        return tail[..close + "</w:sectPr>".len()].to_string();
-    }
-    // self-closing <w:sectPr .../>
-    if let Some(gt) = tail.find('>') {
-        let seg = &tail[..gt + 1];
-        if seg.ends_with("/>") {
-            return seg.to_string();
+    const OPEN: &str = "<w:sectPr";
+    const CLOSE: &str = "</w:sectPr>";
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < xml.len() {
+        let rest = &xml[i..];
+        if rest.starts_with(CLOSE) {
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    best = Some((start, i + CLOSE.len()));
+                }
+            }
+            i += CLOSE.len();
+        } else if rest.starts_with(OPEN)
+            // Distinguish `<w:sectPr` from `<w:sectPrChange`.
+            && matches!(
+                rest[OPEN.len()..].chars().next(),
+                Some('>' | ' ' | '/' | '\t' | '\r' | '\n')
+            )
+        {
+            let gt = match rest.find('>') {
+                Some(g) => g,
+                None => break, // malformed
+            };
+            if rest[..gt + 1].ends_with("/>") {
+                // Self-closing empty section (rare) at body level.
+                if depth == 0 {
+                    best = Some((i, i + gt + 1));
+                }
+            } else {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            i += gt + 1;
+        } else {
+            i += rest.chars().next().map_or(1, char::len_utf8);
         }
     }
-    String::new()
+    best.map_or_else(String::new, |(s, e)| xml[s..e].to_string())
 }
 
 #[cfg(test)]
@@ -1025,6 +1060,35 @@ mod tests {
             .expect("a hyperlink");
         assert_eq!(h.target.as_deref(), Some("https://example.com/a?x=1&y=2"));
         assert!(h.rel_id.is_some(), "should have been assigned a rel id");
+    }
+
+    #[test]
+    fn extract_sectpr_ignores_tracked_change_revision() {
+        // A plain trailing sectPr is captured whole.
+        let plain = "<w:body><w:p/><w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr></w:body>";
+        assert_eq!(
+            extract_sectpr(plain),
+            "<w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr>"
+        );
+        // With a <w:sectPrChange> revision nesting the OLD props, the current
+        // (outer) sectPr must be captured — not the stale inner one.
+        let revised = "<w:body><w:p/><w:sectPr><w:pgSz w:w=\"16838\" w:h=\"11906\" w:orient=\"landscape\"/>\
+            <w:sectPrChange w:id=\"1\"><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:sectPrChange>\
+            </w:sectPr></w:body>";
+        let got = extract_sectpr(revised);
+        assert!(got.contains("landscape"), "captured stale props: {got}");
+        assert!(
+            got.contains("<w:sectPrChange"),
+            "outer sectPr truncated: {got}"
+        );
+        assert!(got.ends_with("</w:sectPr>"));
+        // A self-closing empty section still works.
+        assert_eq!(
+            extract_sectpr("<w:body><w:sectPr/></w:body>"),
+            "<w:sectPr/>"
+        );
+        // No section → empty.
+        assert_eq!(extract_sectpr("<w:body><w:p/></w:body>"), "");
     }
 
     #[test]

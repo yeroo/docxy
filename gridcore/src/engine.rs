@@ -770,6 +770,14 @@ mod tests {
         engine.set_cell(wb, (0, r, c), cell);
     }
 
+    /// A dynamic-array formula as Excel stores it: `t="array"` so it spills. (A
+    /// plain loaded formula is legacy and implicit-intersects instead.)
+    fn array_formula(src: &str) -> Cell {
+        let mut c = Cell::formula(src);
+        c.f_attrs = Some("t=\"array\"".to_string());
+        c
+    }
+
     #[test]
     fn edit_propagates_through_chain() {
         let mut wb = wb_one_sheet(&[
@@ -1074,7 +1082,7 @@ mod tests {
     #[test]
     fn sequence_spills_and_resizes() {
         let mut wb = wb_one_sheet(&[
-            ("A1", Cell::formula("SEQUENCE(3)")),
+            ("A1", array_formula("SEQUENCE(3)")),
             ("C1", Cell::formula("SUM(A1#)")),
         ]);
         let mut eng = Engine::new(&wb);
@@ -1104,7 +1112,7 @@ mod tests {
     fn blocked_spill_errors_and_recovers() {
         let mut wb = wb_one_sheet(&[
             ("A3", Cell::number(99.0)),
-            ("A1", Cell::formula("SEQUENCE(3)")),
+            ("A1", array_formula("SEQUENCE(3)")),
         ]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -1120,7 +1128,7 @@ mod tests {
 
     #[test]
     fn typing_into_a_spill_breaks_it() {
-        let mut wb = wb_one_sheet(&[("A1", Cell::formula("SEQUENCE(3)"))]);
+        let mut wb = wb_one_sheet(&[("A1", array_formula("SEQUENCE(3)"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
@@ -1139,7 +1147,7 @@ mod tests {
     #[test]
     fn clearing_an_anchor_clears_its_spill() {
         let mut wb = wb_one_sheet(&[
-            ("A1", Cell::formula("SEQUENCE(3)")),
+            ("A1", array_formula("SEQUENCE(3)")),
             ("C1", Cell::formula("A2*10")), // direct dependent of a spill cell
         ]);
         let mut eng = Engine::new(&wb);
@@ -1155,7 +1163,7 @@ mod tests {
     #[test]
     fn dependents_of_spilled_cells_update() {
         let mut wb = wb_one_sheet(&[
-            ("A1", Cell::formula("SEQUENCE(3,1,10,10)")),
+            ("A1", array_formula("SEQUENCE(3,1,10,10)")),
             ("C1", Cell::formula("A2+1")), // A2 is a spilled cell, not a formula
         ]);
         let mut eng = Engine::new(&wb);
@@ -1172,7 +1180,7 @@ mod tests {
             ("A2", Cell::number(15.0)),
             ("A3", Cell::number(25.0)),
             ("A4", Cell::number(8.0)),
-            ("C1", Cell::formula("FILTER(A1:A4,A1:A4>9)")),
+            ("C1", array_formula("FILTER(A1:A4,A1:A4>9)")),
             ("E1", Cell::formula("COUNT(C1#)")),
         ]);
         let mut eng = Engine::new(&wb);
@@ -1213,6 +1221,19 @@ mod tests {
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
         assert!(wb.sheets[0].cell(1, 2).unwrap().spill.is_none());
+        // A legacy formula whose result is a *computed* array (not a bare range)
+        // also reduces (top-left) rather than spilling — no #SPILL! cascade.
+        let mut wb2 = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C1", Cell::formula("A1:A3*10")),
+            ("C2", Cell::text("blocker")), // would block a spill
+        ]);
+        let mut eng2 = Engine::new(&wb2);
+        eng2.recalc_all(&mut wb2);
+        assert_eq!(value_at(&wb2, "C1"), CellValue::Number(10.0)); // top-left, not #SPILL!
+        assert!(wb2.sheets[0].cell(0, 2).unwrap().spill.is_none());
         // A row outside the range → #VALUE!.
         set(&mut eng, &mut wb, "A1", Cell::number(1.0)); // trigger a recalc
         let mut wb2 = wb_one_sheet(&[("A1", Cell::number(1.0)), ("E9", Cell::formula("A1:A3"))]);
@@ -1232,7 +1253,7 @@ mod tests {
     #[test]
     fn spill_off_grid_is_blocked() {
         let last = crate::sheet::MAX_ROWS; // 1-based name of the last row
-        let mut wb = wb_one_sheet(&[(format!("A{last}").as_str(), Cell::formula("SEQUENCE(2)"))]);
+        let mut wb = wb_one_sheet(&[(format!("A{last}").as_str(), array_formula("SEQUENCE(2)"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         assert_eq!(
@@ -1247,7 +1268,7 @@ mod tests {
             ("A1", Cell::number(1.0)),
             ("A2", Cell::number(2.0)),
             ("A3", Cell::number(3.0)),
-            ("C1", Cell::formula("MAP(A1:A3,LAMBDA(x,x*10))")),
+            ("C1", array_formula("MAP(A1:A3,LAMBDA(x,x*10))")),
             ("E1", Cell::formula("SCALE(4)")), // named lambda: x * B1
             ("B1", Cell::number(100.0)),
         ]);
@@ -1277,7 +1298,7 @@ mod tests {
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::number(-4.0)),
             ("A2", Cell::number(5.0)),
-            ("C1", Cell::formula("ABS(A1:A2)")),
+            ("C1", array_formula("ABS(A1:A2)")),
             ("D1", Cell::formula("SUM(C1#)")),
         ]);
         let mut eng = Engine::new(&wb);

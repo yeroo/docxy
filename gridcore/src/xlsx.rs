@@ -2793,9 +2793,14 @@ mod tests {
         // A workbook with a spilling anchor saves as <f t="array" ref="…">
         // and loads back with the extent on Cell::spill.
         let mut pkg = new_xlsx();
-        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::formula("SEQUENCE(3)"));
+        // Enter the spill through the app path (eng.set_cell → modern formula),
+        // as a user would; a plain sheet.set_cell would load back as legacy.
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
-        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(
+            &mut pkg.workbook,
+            (0, 0, 0),
+            crate::sheet::Cell::formula("SEQUENCE(3)"),
+        );
         assert_eq!(
             pkg.workbook.sheets[0].cell(0, 0).unwrap().spill,
             Some((3, 1))

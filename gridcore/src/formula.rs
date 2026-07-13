@@ -2428,6 +2428,12 @@ impl<'a> Eval<'a> {
             Arg::Matrix(m) => {
                 if m.len() == 1 && m[0].len() == 1 {
                     DynResult::Scalar(m[0][0].clone())
+                } else if !spill {
+                    // A legacy formula whose result is a *computed* array (e.g.
+                    // `A1:A3*2`) reduces by implicit intersection like a range.
+                    // The materialized matrix has lost its source coordinates, so
+                    // take the top-left element — Excel's `@` fallback.
+                    DynResult::Scalar(m[0][0].clone())
                 } else {
                     DynResult::Array(m)
                 }
