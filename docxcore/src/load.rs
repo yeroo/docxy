@@ -1731,6 +1731,20 @@ mod tests {
     }
 
     #[test]
+    fn rtl_flags_round_trip() {
+        // Paragraph bidi + run-level rtl (the latter via rPr raw_props) survive.
+        let xml = "<w:document><w:body>\
+                   <w:p><w:pPr><w:bidi/></w:pPr>\
+                   <w:r><w:rPr><w:rtl/></w:rPr><w:t>שלום</w:t></w:r></w:p>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        assert!(first_para(&d).props.rtl, "paragraph bidi not modeled");
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:bidi/>"), "paragraph bidi lost on save");
+        assert!(out.contains("<w:rtl/>"), "run-level rtl lost on save");
+    }
+
+    #[test]
     fn textbox_blocks_parsed() {
         let raw = "<w:pict><v:shape><v:textbox><w:txbxContent>\
                    <w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>";

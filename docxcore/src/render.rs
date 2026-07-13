@@ -1427,6 +1427,15 @@ fn render_paragraph(
             let align = opts
                 .styles
                 .effective_align(para.props.style_id.as_deref(), para.props.align);
+            // A right-to-left (`w:bidi`) paragraph anchors to the right, as Word
+            // does: with no explicit `w:jc`, the paragraph "start" is the right
+            // edge. (Terminal cells can't shape/reorder the script itself, so this
+            // right-alignment is the visual cue; explicit centre/justify are kept.)
+            let align = if para.props.rtl && align == Align::Left {
+                Align::Right
+            } else {
+                align
+            };
             let lead = match align {
                 Align::Center => width.saturating_sub(total) / 2,
                 Align::Right => width.saturating_sub(total),
@@ -2936,6 +2945,27 @@ mod tests {
         assert!(
             plain.iter().any(|l| l.starts_with('─')),
             "expected a rule line, got {plain:?}"
+        );
+    }
+
+    #[test]
+    fn rtl_paragraph_is_right_aligned() {
+        let o = opts(20);
+        let ltr = para(vec![run("hi", RunProps::default())]);
+        let rtl = Block::Paragraph(Paragraph {
+            props: ParProps {
+                rtl: true,
+                ..Default::default()
+            },
+            content: vec![run("hi", RunProps::default())],
+        });
+        let l_ltr = render(&doc(vec![ltr]), &o)[0].plain();
+        let l_rtl = render(&doc(vec![rtl]), &o)[0].plain();
+        // LTR anchors left; the bidi paragraph anchors to the right edge.
+        assert!(l_ltr.starts_with("hi"), "LTR should start at col 0: {l_ltr:?}");
+        assert!(
+            l_rtl.starts_with(' ') && l_rtl.trim_end().ends_with("hi"),
+            "RTL paragraph should be right-aligned: {l_rtl:?}"
         );
     }
 
