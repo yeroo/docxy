@@ -2404,12 +2404,23 @@ impl<'a> Eval<'a> {
     /// range or computed array becomes an [`DynResult::Array`] for the engine
     /// to spill; everything else stays scalar.
     pub fn eval_dynamic(&mut self, e: &Expr) -> DynResult {
+        self.eval_dynamic_as(e, true)
+    }
+
+    /// As [`Self::eval_dynamic`], but `spill = false` for a **legacy** formula
+    /// (one not saved as a dynamic array, `t="array"`): a multi-cell *range* it
+    /// produces (e.g. from `INDIRECT`, `OFFSET`, or a table column) is reduced by
+    /// **implicit intersection** to the value on the formula's own row/column,
+    /// exactly as pre-dynamic-array Excel does, instead of spilling.
+    pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
         match self.eval_arg(e) {
             Arg::Scalar(v) => DynResult::Scalar(v),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
                 if r1 == r2 && c1 == c2 {
                     DynResult::Scalar(self.res.value(s, r1, c1))
+                } else if !spill {
+                    DynResult::Scalar(self.implicit_intersect_range(s, r1, c1, r2, c2))
                 } else {
                     DynResult::Array(self.range_matrix(s, r1, c1, r2, c2))
                 }
@@ -2423,6 +2434,21 @@ impl<'a> Eval<'a> {
             }
             Arg::Lambda(_) => DynResult::Scalar(Value::Err(ExcelError::Calc)),
         }
+    }
+
+    /// Implicit intersection of a range against the formula's cell: a single
+    /// column picks the formula's row, a single row picks its column (both must
+    /// fall inside the range, else `#VALUE!`); a 2-D range has no intersection.
+    fn implicit_intersect_range(&self, s: usize, r1: u32, c1: u32, r2: u32, c2: u32) -> Value {
+        let (row, col) = self.cell;
+        if c1 == c2 {
+            if row >= r1 && row <= r2 {
+                return self.res.value(s, row, c1);
+            }
+        } else if r1 == r2 && col >= c1 && col <= c2 {
+            return self.res.value(s, r1, col);
+        }
+        Value::Err(ExcelError::Value)
     }
 
     /// Materialize a rect as a matrix (dense, empties included).

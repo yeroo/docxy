@@ -29,6 +29,10 @@ type Rect = (usize, u32, u32, u32, u32);
 struct FormulaInfo {
     ast: Expr,
     volatile: bool,
+    /// A legacy formula (loaded, not saved as a dynamic array): a multi-cell
+    /// range result implicit-intersects to the cell's row/column rather than
+    /// spilling. User-entered formulas are modern (spill).
+    legacy: bool,
     /// Contains a spill reference (`A1#`) — its dep rects must be refreshed
     /// whenever spill extents may have changed.
     spillref: bool,
@@ -66,11 +70,14 @@ impl Engine {
                     // Array formulas (`t="array"`) are ours to evaluate — the
                     // dynamic-array engine recomputes their spill. Other
                     // preserved `<f>` attributes stay frozen.
-                    let preserved = cell
+                    let is_array = cell
                         .f_attrs
                         .as_deref()
-                        .is_some_and(|a| !a.contains("t=\"array\""));
-                    eng.index_formula(wb, (s, r, c), src, preserved);
+                        .is_some_and(|a| a.contains("t=\"array\""));
+                    let preserved = cell.f_attrs.is_some() && !is_array;
+                    // A plain loaded formula is legacy (implicit intersection);
+                    // a dynamic-array (`t="array"`) one spills.
+                    eng.index_formula(wb, (s, r, c), src, preserved, !is_array);
                 }
             }
         }
@@ -84,7 +91,7 @@ impl Engine {
 
     /// Parse and register one formula; preserved-`<f>` cells and parse
     /// failures are marked unsupported.
-    fn index_formula(&mut self, wb: &Workbook, key: Key, src: &str, preserved: bool) {
+    fn index_formula(&mut self, wb: &Workbook, key: Key, src: &str, preserved: bool, legacy: bool) {
         if preserved {
             self.unsupported.insert(key);
             return;
@@ -99,6 +106,7 @@ impl Engine {
                     key,
                     FormulaInfo {
                         volatile: is_volatile(&ast),
+                        legacy,
                         spillref: !spills.is_empty(),
                         ast,
                         deps,
@@ -141,8 +149,8 @@ impl Engine {
             }
         }
         if let Some(src) = cell.formula.clone() {
-            cell.f_attrs = None; // an edited formula is ours now
-            self.index_formula(wb, key, &src, false);
+            cell.f_attrs = None; // an edited formula is ours now — modern (spills)
+            self.index_formula(wb, key, &src, false, false);
         }
         if s < wb.sheets.len() {
             wb.sheets[s].set_cell(r, c, cell);
@@ -344,6 +352,9 @@ impl Engine {
             Some(i) => i,
             None => return Vec::new(),
         };
+        // Legacy formulas implicit-intersect a range result; modern (user-entered
+        // or `t="array"`) ones spill.
+        let spill = !info.legacy;
         let resolver = WbResolver {
             wb,
             clock: self.clock,
@@ -351,7 +362,7 @@ impl Engine {
             has_rand: self.seed.is_some(),
         };
         let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
-        let result = ev.eval_dynamic(&info.ast);
+        let result = ev.eval_dynamic_as(&info.ast, spill);
         let unsupported = ev.unsupported;
         if self.seed.is_some() {
             self.seed = Some(resolver.rand_state.get());
@@ -1179,17 +1190,38 @@ mod tests {
     }
 
     #[test]
-    fn plain_range_formula_spills() {
-        let mut wb = wb_one_sheet(&[
-            ("A1", Cell::number(1.0)),
-            ("A2", Cell::number(2.0)),
-            ("C1", Cell::formula("A1:A2")),
-        ]);
+    fn user_entered_range_formula_spills() {
+        // A user-entered (modern) range formula spills, like current Excel.
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
         let mut eng = Engine::new(&wb);
-        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("A1:A2"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
         assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((2, 1)));
+    }
+
+    #[test]
+    fn loaded_legacy_range_formula_implicit_intersects() {
+        // A plain formula loaded from a file (no `t="array"`) is legacy: a
+        // range result reduces by implicit intersection to the formula's row,
+        // matching pre-dynamic-array Excel — it does not spill.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            // C2 references the whole column A1:A3; its own row (2) → A2.
+            ("C2", Cell::formula("A1:A3")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        assert!(wb.sheets[0].cell(1, 2).unwrap().spill.is_none());
+        // A row outside the range → #VALUE!.
+        set(&mut eng, &mut wb, "A1", Cell::number(1.0)); // trigger a recalc
+        let mut wb2 = wb_one_sheet(&[("A1", Cell::number(1.0)), ("E9", Cell::formula("A1:A3"))]);
+        let mut eng2 = Engine::new(&wb2);
+        eng2.recalc_all(&mut wb2);
+        assert_eq!(value_at(&wb2, "E9"), CellValue::Error("#VALUE!".into()));
     }
 
     #[test]
