@@ -4106,6 +4106,59 @@ fn match_key(v: &Value) -> Option<String> {
     }
 }
 
+/// Turn a stored formula into the text Excel *shows*: strip the future-function
+/// (`_xlfn.`), worksheet (`_xlws.`) and lambda-parameter (`_xlpm.`) prefixes, and
+/// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
+/// `SINGLE(x)` → `@x`. Used by `FORMULATEXT`.
+pub fn display_formula(src: &str) -> String {
+    let s = src
+        .replace("_xlfn._xlws.", "")
+        .replace("_xlfn.", "")
+        .replace("_xlws.", "")
+        .replace("_xlpm.", "");
+    let s = rewrite_call(&s, "ANCHORARRAY", |arg| format!("{arg}#"));
+    rewrite_call(&s, "SINGLE", |arg| format!("@{arg}"))
+}
+
+/// Replace every `name(arg)` (balanced parens) with `f(arg)`.
+fn rewrite_call(s: &str, name: &str, f: impl Fn(&str) -> String) -> String {
+    let pat = format!("{name}(");
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(&pat) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + pat.len()..];
+        let mut depth = 1usize;
+        let mut end = None;
+        for (j, ch) in after.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => {
+                out.push_str(&f(&after[..e]));
+                rest = &after[e + 1..];
+            }
+            None => {
+                // Unbalanced — leave the rest verbatim.
+                out.push_str(&rest[i..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Wrap a distribution result: a finite value → number, anything else → `#NUM!`.
 fn domo(x: Option<f64>) -> Value {
     match x {
@@ -5420,7 +5473,7 @@ impl<'a> Eval<'a> {
                 }
                 match self.ref_coords(&args[0]) {
                     Some((s, r, c)) => match self.res.cell_formula(s, r, c) {
-                        Some(f) => Value::Str(format!("={f}")),
+                        Some(f) => Value::Str(format!("={}", display_formula(&f))),
                         None => Value::Err(ExcelError::NA),
                     },
                     None => Value::Err(ExcelError::NA),
@@ -10280,6 +10333,23 @@ mod tests {
         assert_eq!(n("INDEX(MATCH(A1:A3,A1:A3,0),3)", &g), 1.0);
         // A scalar first argument still returns a scalar (unchanged path).
         assert_eq!(n("MATCH(\"y\",A1:A3,0)", &g), 2.0);
+    }
+
+    #[test]
+    fn formulatext_strips_internal_prefixes() {
+        // FORMULATEXT shows the display form Excel does.
+        assert_eq!(display_formula("_xlfn._xlws.SORT(A2:A5)"), "SORT(A2:A5)");
+        assert_eq!(display_formula("_xlfn.ANCHORARRAY(B2)"), "B2#");
+        assert_eq!(
+            display_formula("_xlfn.UNIQUE(_xlfn.ANCHORARRAY(B2))"),
+            "UNIQUE(B2#)"
+        );
+        assert_eq!(display_formula("SUM(_xlfn.ANCHORARRAY(B2))"), "SUM(B2#)");
+        assert_eq!(
+            display_formula("_xlfn.LAMBDA(_xlpm.a, 2)(1)"),
+            "LAMBDA(a, 2)(1)"
+        );
+        assert_eq!(display_formula("_xlfn.SINGLE(A1:A3)"), "@A1:A3");
     }
 
     #[test]
