@@ -12,6 +12,7 @@ fn decodes_real_mpp_task_names_when_present() {
     let cases = [
         ("corpus/mpp/projectlibre-construction.mpp", "Commercial Construction", 100usize, "2000-01-04"),
         ("corpus/mpp/saswat-part1.mpp", "Project1", 10usize, "2020-01-02"),
+        ("corpus/mpp/msproject2003-deployment.mpp", "Microsoft Office Project 2003 Deployment", 300, "2003-09-16"),
     ];
     let mut checked = 0;
     for (path, first, min, first_start) in cases {

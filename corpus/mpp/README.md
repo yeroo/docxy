@@ -41,21 +41,47 @@ and the metadata property sets (MS-OLEPS).
 
 ## Where to get sample files
 
-`raw.githubusercontent.com` downloads work here (the GitHub *API* is gated).
-Verified working sources (all real OLE2/CFB `.mpp`):
+Both `git clone` and `raw.githubusercontent.com` downloads work here (only the
+GitHub *API* and `gh` are gated). Because the API is gated there's no directory
+listing over HTTP, so the reliable way to discover `.mpp` files in a repo is a
+blobless clone and a tree walk:
+```
+git clone --depth 1 --filter=blob:none --no-checkout https://github.com/<owner>/<repo>.git r
+git -C r ls-tree -r --name-only HEAD | grep -i '\.mpp$'
+```
+then fetch the ones you want with `raw.githubusercontent.com` (URL-encode
+spaces as `%20`).
 
-- **MPXJ** (`github.com/joniles/mpxj`, Apache-2.0) — the richest source: a large
-  regression suite across every Project version, many paired with expected
-  values (an oracle). Its `doc/MPP8.xls` … `doc/MPP14.xls` document the binary
-  layout field-by-field — the reverse-engineering map.
-- Individual sample projects on GitHub, e.g. a Commercial-Construction plan
-  (ProjectLibre samples) and MS-Project software-project files.
+Verified working sources (all real OLE2/CFB `.mpp`), spanning Project versions:
 
-Fetch into this (git-ignored) folder, e.g.:
+- **ProjectLibre samples** (`cyclingzealot/projectlibre-jlam`) — a
+  Commercial-Construction plan (MPP9), an MS-Project-2003 deployment plan (MPP9,
+  323 tasks), and the classic *New Product* template (Project 98 / MPP8).
+- **Software-project coursework** (`saswat3348/Project-Management`) — MPP14.
+- **Azure ML Data Science** (`Azure-Samples/Azure-MachineLearning-DataScience`)
+  — an "Advanced Analytics" plan in a newer MPP format.
+- **MPXJ** (`github.com/joniles/mpxj`, Apache-2.0) — the docs (`doc/MPP8.xls` …
+  `doc/MPP14.xls`) map the binary layout field-by-field. Note its regression
+  `.mpp` corpus is **not** in the repo — the build takes it from an external
+  `-Dmpxj.junit.datadir` — so those files aren't fetchable from the repo.
+
+Fetch a single file into this (git-ignored) folder, e.g.:
 ```
 curl -sSL -o corpus/mpp/construction.mpp \
   "https://raw.githubusercontent.com/cyclingzealot/projectlibre-jlam/master/openproj_build/resources/samples/Commercial%20construction%20project%20plan.mpp"
 ```
+
+### Known decode gaps (good reverse-engineering targets)
+
+The current decoder handles MPP9 and MPP12/14 (names, dates, outline, links).
+Two sampled files sit outside that and are useful test material:
+
+- **Project 98 / MPP8** (e.g. *New Product.mpp*): the date field the detector
+  locks onto is the wrong one (a 1997 plan decodes 2011 finishes), so its links
+  self-invalidate and drop. Needs the MPP8 fixed-record date offset.
+- **Newest MPP** (e.g. the Azure plan): the task-name var-data field isn't found
+  (only one name decodes), so nothing downstream runs. Needs that generation's
+  name field-type / block layout.
 
 ## What already works on a real .mpp
 
