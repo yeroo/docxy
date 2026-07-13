@@ -383,4 +383,180 @@ mod tests {
         let x = invert_cdf(0.95, 0.0, 10.0, |x| gamma_dist(x, 0.5, 2.0, true).unwrap()).unwrap();
         assert!(close(x, 3.841_458_820_694_124, 1e-6));
     }
+
+    #[test]
+    fn lgamma_and_gamma_edge_cases() {
+        // Γ(1)=Γ(2)=1 → lgamma = 0 at both integers.
+        assert!(close(lgamma(1.0), 0.0, 1e-12));
+        assert!(close(lgamma(2.0), 0.0, 1e-12));
+        // Reflection branch (x < 0.5): Γ(¼) = 3.625_609_908_221_908.
+        assert!(close(lgamma(0.25), 3.625_609_908_221_908_f64.ln(), 1e-11));
+        // Factorials: Γ(n) = (n-1)!.
+        assert!(close(gamma(5.0).unwrap(), 24.0, 1e-9)); // 4!
+        assert!(close(gamma(6.0).unwrap(), 120.0, 1e-9)); // 5!
+        assert!(close(gamma(1.0).unwrap(), 1.0, 1e-12));
+        // Negative non-integer via reflection: Γ(-½) = -2√π.
+        assert!(close(gamma(-0.5).unwrap(), -2.0 * PI.sqrt(), 1e-10));
+        // Poles at 0 and negative integers → None.
+        assert!(gamma(0.0).is_none());
+        assert!(gamma(-1.0).is_none());
+        assert!(gamma(-3.0).is_none());
+    }
+
+    #[test]
+    fn incomplete_gamma_complementary_and_domain() {
+        // P(a,x) + Q(a,x) = 1 for valid arguments.
+        assert!(close(gammp(2.5, 3.0) + gammq(2.5, 3.0), 1.0, 1e-12));
+        // Both series (x < a+1) and continued-fraction (x ≥ a+1) branches.
+        assert!(close(gammp(2.0, 1.0) + gammq(2.0, 1.0), 1.0, 1e-12));
+        assert!(close(gammp(2.0, 8.0) + gammq(2.0, 8.0), 1.0, 1e-12));
+        // P(2, x) = 1 - (1+x)e^-x (Erlang-2 CDF).
+        let x = 3.0;
+        assert!(close(gammp(2.0, x), 1.0 - (1.0 + x) * (-x).exp(), 1e-12));
+        // x == 0 → 0; domain errors → NaN.
+        assert!(close(gammp(3.0, 0.0), 0.0, 1e-15));
+        assert!(gammp(3.0, -1.0).is_nan());
+        assert!(gammp(0.0, 1.0).is_nan());
+    }
+
+    #[test]
+    fn incomplete_beta_symmetry_and_bounds() {
+        // Symmetry: I_x(a,b) = 1 - I_{1-x}(b,a).
+        assert!(close(
+            betai(2.0, 3.0, 0.4),
+            1.0 - betai(3.0, 2.0, 0.6),
+            1e-12
+        ));
+        // I_x(2,2) = 3x² - 2x³ closed form.
+        let x = 0.35;
+        assert!(close(
+            betai(2.0, 2.0, x),
+            3.0 * x * x - 2.0 * x * x * x,
+            1e-12
+        ));
+        // Boundaries return x exactly; out-of-domain → NaN.
+        assert!(close(betai(2.0, 5.0, 0.0), 0.0, 1e-15));
+        assert!(close(betai(2.0, 5.0, 1.0), 1.0, 1e-15));
+        assert!(betai(2.0, 5.0, 1.5).is_nan());
+        assert!(betai(0.0, 5.0, 0.5).is_nan());
+    }
+
+    #[test]
+    fn erf_erfc_and_normal_symmetry() {
+        // erf is odd, erf(0)=0, erfc(0)=1.
+        assert!(close(erf(0.0), 0.0, 1e-15));
+        assert!(close(erf(-1.0), -erf(1.0), 1e-12));
+        assert!(close(erfc(0.0), 1.0, 1e-12));
+        assert!(close(erf(1.0) + erfc(1.0), 1.0, 1e-12));
+        // Normal PDF peak and symmetry.
+        assert!(close(norm_pdf(0.0), 1.0 / (2.0 * PI).sqrt(), 1e-15));
+        assert!(close(norm_pdf(1.0), 0.241_970_724_519_143, 1e-12));
+        assert!(close(norm_pdf(-2.3), norm_pdf(2.3), 1e-15));
+        // CDF reflection: Φ(z) + Φ(-z) = 1.
+        assert!(close(norm_cdf(1.3) + norm_cdf(-1.3), 1.0, 1e-12));
+    }
+
+    #[test]
+    fn norm_inv_edges_and_round_trip() {
+        // Out of the open interval → None.
+        assert!(norm_inv(0.0).is_none());
+        assert!(norm_inv(1.0).is_none());
+        assert!(norm_inv(-0.1).is_none());
+        // Median is 0.
+        assert!(close(norm_inv(0.5).unwrap(), 0.0, 1e-12));
+        // Round-trip through the CDF across all three approximation branches.
+        for &p in &[0.001_f64, 0.02, 0.25, 0.5, 0.8, 0.98, 0.999] {
+            let z = norm_inv(p).unwrap();
+            assert!(close(norm_cdf(z), p, 1e-9));
+        }
+    }
+
+    #[test]
+    fn invert_cdf_bounds_and_bracket_expansion() {
+        // Target outside [0,1] → None.
+        assert!(invert_cdf(-0.1, 0.0, 1.0, |_| 0.5).is_none());
+        assert!(invert_cdf(1.1, 0.0, 1.0, |_| 0.5).is_none());
+        // Exponential CDF 1 - e^-x: invert 0.5 → ln 2. The upper bound (1.0)
+        // starts below the target's x, forcing the doubling expansion.
+        let x = invert_cdf(0.5, 0.0, 1.0, |x: f64| 1.0 - (-x).exp()).unwrap();
+        assert!(close(x, 2.0_f64.ln(), 1e-9));
+    }
+
+    #[test]
+    fn gamma_dist_pdf_cdf_and_domain() {
+        // a=1 is the exponential: CDF = 1 - e^{-x/b}, PDF = e^{-x/b}/b.
+        assert!(close(
+            gamma_dist(2.0, 1.0, 1.0, true).unwrap(),
+            1.0 - (-2.0_f64).exp(),
+            1e-12
+        ));
+        assert!(close(
+            gamma_dist(2.0, 1.0, 3.0, false).unwrap(),
+            (-2.0_f64 / 3.0).exp() / 3.0,
+            1e-12
+        ));
+        // PDF at x=0 depends on the shape.
+        assert!(gamma_dist(0.0, 0.5, 2.0, false).unwrap().is_infinite()); // a<1
+        assert!(close(
+            gamma_dist(0.0, 1.0, 4.0, false).unwrap(),
+            0.25,
+            1e-15
+        )); // a=1 → 1/b
+        assert!(close(gamma_dist(0.0, 2.0, 4.0, false).unwrap(), 0.0, 1e-15)); // a>1
+        // Domain errors → None.
+        assert!(gamma_dist(-1.0, 2.0, 2.0, true).is_none());
+        assert!(gamma_dist(1.0, 0.0, 2.0, true).is_none());
+        assert!(gamma_dist(1.0, 2.0, 0.0, true).is_none());
+    }
+
+    #[test]
+    fn beta_dist_uniform_and_general_interval() {
+        // a=b=1 on [0,1] is uniform: CDF = z, PDF = 1.
+        assert!(close(
+            beta_dist(0.3, 1.0, 1.0, true, 0.0, 1.0).unwrap(),
+            0.3,
+            1e-12
+        ));
+        assert!(close(
+            beta_dist(0.5, 1.0, 1.0, false, 0.0, 1.0).unwrap(),
+            1.0,
+            1e-12
+        ));
+        // General interval rescales: uniform on [2,4], CDF at x=3 is 0.5.
+        assert!(close(
+            beta_dist(3.0, 1.0, 1.0, true, 2.0, 4.0).unwrap(),
+            0.5,
+            1e-12
+        ));
+        // On [2,4] the uniform PDF is 1/(4-2) = 0.5.
+        assert!(close(
+            beta_dist(3.0, 1.0, 1.0, false, 2.0, 4.0).unwrap(),
+            0.5,
+            1e-12
+        ));
+        // Matches the plain incomplete beta on the unit interval.
+        assert!(close(
+            beta_dist(0.4, 2.0, 3.0, true, 0.0, 1.0).unwrap(),
+            betai(2.0, 3.0, 0.4),
+            1e-12
+        ));
+        // Domain errors → None.
+        assert!(beta_dist(0.5, 0.0, 3.0, true, 0.0, 1.0).is_none());
+        assert!(beta_dist(0.5, 2.0, 3.0, true, 1.0, 1.0).is_none()); // hi <= lo
+        assert!(beta_dist(5.0, 2.0, 3.0, true, 0.0, 1.0).is_none()); // x > hi
+    }
+
+    #[test]
+    fn t_and_f_cdf_symmetry_and_known_values() {
+        // Student-t is symmetric: T(t) + T(-t) = 1.
+        assert!(close(t_cdf(1.3, 7.0) + t_cdf(-1.3, 7.0), 1.0, 1e-12));
+        // df=1 is the standard Cauchy: CDF(1) = 0.5 + arctan(1)/π = 0.75.
+        assert!(close(t_cdf(1.0, 1.0), 0.75, 1e-12));
+        // F(d,d) has median 1 by symmetry.
+        assert!(close(f_cdf(1.0, 5.0, 5.0), 0.5, 1e-12));
+        assert!(close(f_cdf(1.0, 3.0, 3.0), 0.5, 1e-12));
+        // Non-positive x → 0.
+        assert!(close(f_cdf(0.0, 4.0, 6.0), 0.0, 1e-15));
+        assert!(close(f_cdf(-2.0, 4.0, 6.0), 0.0, 1e-15));
+    }
 }

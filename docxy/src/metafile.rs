@@ -145,7 +145,7 @@ pub fn render(_bytes: &[u8], _w: u32, _h: u32) -> Option<image::RgbaImage> {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::key_page;
+    use super::{key_page, render, to_emf};
 
     #[test]
     fn keys_page_to_transparent_and_inverts_ink() {
@@ -159,5 +159,135 @@ mod tests {
         let red = key_page(200, 10, 10);
         assert_eq!([red[0], red[1], red[2]], [200, 10, 10]);
         assert_eq!(red[3], 255);
+    }
+
+    #[test]
+    fn key_page_mid_gray_is_partially_transparent() {
+        // A mid gray (low saturation) is treated as ink: opacity tracks darkness
+        // and the pixel is recoloured to the light glyph ramp (not the source gray).
+        let px = key_page(128, 128, 128);
+        assert_eq!(px[3], 255 - 128, "alpha == coverage == 255-luma");
+        // Recoloured onto the ~220 ceiling, premultiplied by coverage.
+        let v = (220u32 * px[3] as u32 / 255) as u8;
+        assert_eq!([px[0], px[1], px[2]], [v, v, v]);
+    }
+
+    #[test]
+    fn key_page_near_white_colour_page_drops_out() {
+        // A pixel that clears the saturation gate (>= 24) yet has every channel
+        // > 230 is the coloured page: keyed fully transparent, colour preserved.
+        let px = key_page(255, 231, 231);
+        assert_eq!(px[3], 0);
+        assert_eq!([px[0], px[1], px[2]], [255, 231, 231]);
+    }
+
+    // --- render() dimension guards (no GDI / no metafile bytes needed) ---
+
+    #[test]
+    fn render_rejects_degenerate_and_oversize_dimensions() {
+        // A trivially non-metafile byte buffer; the guard fires before parsing.
+        let junk = [0u8; 8];
+        assert!(render(&junk, 0, 10).is_none(), "zero width");
+        assert!(render(&junk, 10, 0).is_none(), "zero height");
+        assert!(render(&junk, 4097, 10).is_none(), "width over 4096");
+        assert!(render(&junk, 10, 4097).is_none(), "height over 4096");
+    }
+
+    #[test]
+    fn render_returns_none_on_unrecognizable_bytes() {
+        // Valid dimensions, but the bytes are not a metafile: to_emf() fails and
+        // render() must surface None rather than panic.
+        let junk = [0xABu8; 64];
+        assert!(render(&junk, 16, 16).is_none());
+    }
+
+    // --- to_emf() format detection & length guards ---
+
+    /// A buffer whose bytes[40..44] hold the EMF signature " EMF" (0x464D4520,
+    /// little-endian), padded to `len` with `fill` elsewhere.
+    fn emf_with_signature(len: usize, fill: u8) -> Vec<u8> {
+        assert!(len >= 44);
+        let mut v = vec![fill; len];
+        v[40..44].copy_from_slice(&[0x20, 0x45, 0x4D, 0x46]);
+        v
+    }
+
+    /// A 22-byte WMF placeable header (magic 0x9AC6CDD7) followed by `body`.
+    fn wmf_placeable(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xD7, 0xCD, 0xC6, 0x9A];
+        v.resize(22, 0);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn to_emf_none_on_empty_and_truncated() {
+        // Empty and short buffers can't hold even a bare WMF body (< 18 bytes)
+        // and must return None without touching GDI.
+        unsafe {
+            assert!(to_emf(&[]).is_none(), "empty");
+            assert!(to_emf(&[0u8; 10]).is_none(), "10 bytes");
+            assert!(
+                to_emf(&[0u8; 17]).is_none(),
+                "17 bytes (one under the floor)"
+            );
+        }
+    }
+
+    #[test]
+    fn to_emf_strips_wmf_placeable_but_rejects_too_short_body() {
+        // Magic present, so the 22-byte placeable header is dropped; the 10-byte
+        // remainder is under the 18-byte WMF floor -> None (exercises the
+        // magic-match branch without invoking GDI).
+        let buf = wmf_placeable(&[0u8; 10]);
+        assert_eq!(buf.len(), 32);
+        unsafe {
+            assert!(to_emf(&buf).is_none());
+        }
+    }
+
+    #[test]
+    fn to_emf_none_on_garbage_emf() {
+        // Correct EMF signature at offset 40 but the rest is garbage: GDI's
+        // SetEnhMetaFileBits rejects it and to_emf yields None (no leaked handle,
+        // no panic). Exercises the EMF-detection branch.
+        let buf = emf_with_signature(128, 0);
+        unsafe {
+            assert!(to_emf(&buf).is_none());
+        }
+    }
+
+    #[test]
+    fn to_emf_none_on_garbage_wmf_body() {
+        // Placeable magic + a body long enough to clear the 18-byte floor but not
+        // a valid metafile: SetWinMetaFileBits rejects it -> None. Exercises the
+        // WMF conversion path.
+        let buf = wmf_placeable(&[0xEEu8; 64]);
+        unsafe {
+            assert!(to_emf(&buf).is_none());
+        }
+    }
+
+    #[test]
+    fn to_emf_emf_signature_only_recognized_at_offset_40() {
+        // The same signature bytes at offset 0 (not 40) must NOT be taken as EMF;
+        // they fall through to the WMF path, which rejects the garbage -> None.
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&[0x20, 0x45, 0x4D, 0x46]);
+        unsafe {
+            assert!(to_emf(&buf).is_none());
+        }
+    }
+
+    #[test]
+    fn to_emf_wmf_magic_must_match_exactly() {
+        // One byte off the placeable magic: the header is NOT stripped and the
+        // whole buffer is treated as a raw WMF body. Still garbage -> None, but
+        // this pins the exact-magic requirement.
+        let mut buf = wmf_placeable(&[0u8; 64]);
+        buf[0] = 0xD6; // was 0xD7
+        unsafe {
+            assert!(to_emf(&buf).is_none());
+        }
     }
 }

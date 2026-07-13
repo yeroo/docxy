@@ -1032,4 +1032,179 @@ mod tests {
         let q = "x=\\frac{-b\\pm \\sqrt{b^{2}-4ac}}{2a}";
         assert_eq!(roundtrip(q), q);
     }
+
+    // ---- more LaTeX → OMML ------------------------------------------------
+
+    #[test]
+    fn subscript_to_omml() {
+        let x = omml("x_i");
+        assert!(
+            x.contains("<m:sSub><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sub><m:r><m:t>i</m:t></m:r></m:sub></m:sSub>"),
+            "{x}"
+        );
+    }
+
+    #[test]
+    fn sub_and_superscript_to_omml() {
+        let x = omml("x_i^2");
+        assert!(x.contains("<m:sSubSup>"), "{x}");
+        assert!(x.contains("<m:sub><m:r><m:t>i</m:t></m:r></m:sub>"), "{x}");
+        assert!(x.contains("<m:sup><m:r><m:t>2</m:t></m:r></m:sup>"), "{x}");
+    }
+
+    #[test]
+    fn bare_parentheses_become_delimiters() {
+        let x = omml("(a+b)");
+        assert!(x.contains("<m:d>"), "{x}");
+        assert!(x.contains("<m:begChr m:val=\"(\"/>"), "{x}");
+        assert!(x.contains("<m:endChr m:val=\")\"/>"), "{x}");
+    }
+
+    #[test]
+    fn left_right_with_bracket_delims() {
+        let x = omml("\\left[ x \\right]");
+        assert!(x.contains("<m:begChr m:val=\"[\"/>"), "{x}");
+        assert!(x.contains("<m:endChr m:val=\"]\"/>"), "{x}");
+    }
+
+    #[test]
+    fn left_right_with_named_delims() {
+        // \langle / \rangle map to angle brackets.
+        let x = omml("\\left\\langle x \\right\\rangle");
+        assert!(x.contains("<m:begChr m:val=\"⟨\"/>"), "{x}");
+        assert!(x.contains("<m:endChr m:val=\"⟩\"/>"), "{x}");
+    }
+
+    #[test]
+    fn left_dot_gives_a_null_open_delim() {
+        // \left. suppresses the opening delimiter (empty begChr).
+        let x = omml("\\left. x \\right|");
+        assert!(x.contains("<m:begChr m:val=\"\"/>"), "{x}");
+        assert!(x.contains("<m:endChr m:val=\"|\"/>"), "{x}");
+    }
+
+    #[test]
+    fn function_wraps_its_body() {
+        let x = omml("\\sin x");
+        assert!(
+            x.contains("<m:func><m:fName><m:r><m:t>sin</m:t></m:r></m:fName>"),
+            "{x}"
+        );
+        assert!(
+            x.contains("<m:e><m:r><m:t>x</m:t></m:r></m:e></m:func>"),
+            "{x}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_passes_through_as_text() {
+        // An unmodelled command degrades to its bare name.
+        let x = omml("\\foo");
+        assert!(x.contains("<m:t>foo</m:t>"), "{x}");
+    }
+
+    #[test]
+    fn spacing_commands_emit_a_space() {
+        assert!(
+            omml("a\\,b").contains("<m:t>a b</m:t>"),
+            "{}",
+            omml("a\\,b")
+        );
+        assert!(omml("a\\quad b").contains("a b"), "{}", omml("a\\quad b"));
+    }
+
+    #[test]
+    fn negative_thin_space_emits_nothing() {
+        // `\!` is negative space: it contributes no glyph.
+        assert_eq!(omml("a\\!b"), omml("ab"));
+    }
+
+    #[test]
+    fn special_chars_are_xml_escaped() {
+        let x = omml("a<b>c&d");
+        assert!(x.contains("&lt;"), "{x}");
+        assert!(x.contains("&gt;"), "{x}");
+        assert!(x.contains("&amp;"), "{x}");
+    }
+
+    #[test]
+    fn nary_without_limits_to_omml() {
+        let x = omml("\\int x");
+        assert!(x.contains("<m:chr m:val=\"∫\"/>"), "{x}");
+        assert!(x.contains("<m:sub></m:sub>"), "{x}");
+        assert!(x.contains("<m:sup></m:sup>"), "{x}");
+    }
+
+    // ---- more OMML → LaTeX ------------------------------------------------
+
+    #[test]
+    fn omml_empty_returns_empty() {
+        assert_eq!(omml_to_latex("<w:p><w:r><w:t>hi</w:t></w:r></w:p>"), "");
+        assert_eq!(omml_to_latex(""), "");
+    }
+
+    #[test]
+    fn omml_subscript_to_latex() {
+        let xml = "<m:oMath><m:sSub><m:e><m:r><m:t>x</m:t></m:r></m:e>\
+                   <m:sub><m:r><m:t>i</m:t></m:r></m:sub></m:sSub></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "x_{i}");
+    }
+
+    #[test]
+    fn omml_subsuperscript_to_latex() {
+        let xml = "<m:oMath><m:sSubSup><m:e><m:r><m:t>x</m:t></m:r></m:e>\
+                   <m:sub><m:r><m:t>i</m:t></m:r></m:sub>\
+                   <m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSubSup></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "x_{i}^{2}");
+    }
+
+    #[test]
+    fn omml_rad_with_degree_to_latex() {
+        let xml = "<m:oMath><m:rad><m:deg><m:r><m:t>3</m:t></m:r></m:deg>\
+                   <m:e><m:r><m:t>x</m:t></m:r></m:e></m:rad></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "\\sqrt[3]{x}");
+    }
+
+    #[test]
+    fn omml_delimiter_to_latex() {
+        let xml = "<m:oMath><m:d><m:dPr><m:begChr m:val=\"[\"/><m:endChr m:val=\"]\"/></m:dPr>\
+                   <m:e><m:r><m:t>x</m:t></m:r></m:e></m:d></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "[x]");
+    }
+
+    #[test]
+    fn omml_func_to_latex() {
+        let xml = "<m:oMath><m:func><m:fName><m:r><m:t>sin</m:t></m:r></m:fName>\
+                   <m:e><m:r><m:t>x</m:t></m:r></m:e></m:func></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "sin x");
+    }
+
+    #[test]
+    fn omml_nary_to_latex() {
+        let xml = "<m:oMath><m:nary><m:naryPr><m:chr m:val=\"∫\"/></m:naryPr>\
+                   <m:sub></m:sub><m:sup></m:sup><m:e><m:r><m:t>x</m:t></m:r></m:e></m:nary></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "\\int x");
+    }
+
+    #[test]
+    fn omml_strips_invisible_math_operators() {
+        // U+2062 (invisible times) must not leak into the LaTeX text.
+        let xml = "<m:oMath><m:r><m:t>a\u{2062}b</m:t></m:r></m:oMath>";
+        assert_eq!(omml_to_latex(xml), "ab");
+    }
+
+    // ---- more round-trips -------------------------------------------------
+
+    #[test]
+    fn more_roundtrips_are_stable() {
+        assert_eq!(roundtrip("x_{i}"), "x_{i}");
+        assert_eq!(roundtrip("x_{i}^{2}"), "x_{i}^{2}");
+        assert_eq!(roundtrip("\\sqrt[3]{x}"), "\\sqrt[3]{x}");
+        assert_eq!(roundtrip("(a+b)"), "(a+b)");
+        assert_eq!(roundtrip("\\int x"), "\\int x");
+        assert_eq!(
+            roundtrip("\\frac{\\alpha }{\\beta }"),
+            "\\frac{\\alpha }{\\beta }"
+        );
+    }
 }

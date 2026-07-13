@@ -210,4 +210,275 @@ mod tests {
         assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(hi));
         assert_eq!(cell_dxf(&wb, 0, 1, 0), None);
     }
+
+    /// Build a workbook whose sheet holds arbitrary cells (numbers *and* text),
+    /// plus one conditional-formatting block and its dxf table.
+    fn wb_with_cells(cells: &[(&str, Cell)], cf: CondFormat, dxfs: Vec<Dxf>) -> Workbook {
+        let mut sheet = Sheet {
+            name: "S".into(),
+            ..Sheet::default()
+        };
+        for (name, cell) in cells {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            sheet.set_cell(r, c, cell.clone());
+        }
+        sheet.cond_formats.push(cf);
+        let mut wb = Workbook {
+            sheets: vec![sheet],
+            ..Workbook::default()
+        };
+        wb.styles.dxfs = dxfs;
+        wb
+    }
+
+    /// A single-rule `cellIs` block over A1:A10, dxf 0, priority 1.
+    fn cell_is(op: &str, formulas: &[&str]) -> CondFormat {
+        CondFormat {
+            ranges: vec![(0, 0, 9, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::CellIs {
+                    op: op.into(),
+                    formulas: formulas.iter().map(|s| (*s).to_string()).collect(),
+                },
+                dxf_id: Some(0),
+                priority: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn cell_is_numeric_operators() {
+        let d = Dxf {
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        // lessThan.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(3.0))],
+            cell_is("lessThan", &["5"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d.clone()));
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(9.0))],
+            cell_is("lessThan", &["5"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+
+        // greaterThanOrEqual: boundary (equal) matches.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(5.0))],
+            cell_is("greaterThanOrEqual", &["5"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d.clone()));
+        // lessThanOrEqual: boundary matches.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(5.0))],
+            cell_is("lessThanOrEqual", &["5"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d.clone()));
+
+        // equal / notEqual.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(7.0))],
+            cell_is("equal", &["7"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d.clone()));
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(7.0))],
+            cell_is("notEqual", &["7"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(8.0))],
+            cell_is("notEqual", &["7"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d));
+    }
+
+    #[test]
+    fn cell_is_between_and_not_between() {
+        let d = Dxf {
+            italic: Some(true),
+            ..Dxf::default()
+        };
+        // between is inclusive on both ends.
+        for (v, hit) in [
+            (2.0, false),
+            (3.0, true),
+            (6.0, true),
+            (7.0, true),
+            (8.0, false),
+        ] {
+            let wb = wb_with_cells(
+                &[("A1", Cell::number(v))],
+                cell_is("between", &["3", "7"]),
+                vec![d.clone()],
+            );
+            let got = cell_dxf(&wb, 0, 0, 0);
+            assert_eq!(got.is_some(), hit, "between value {v}");
+        }
+        // notBetween is the negation.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(10.0))],
+            cell_is("notBetween", &["3", "7"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(d.clone()));
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(5.0))],
+            cell_is("notBetween", &["3", "7"]),
+            vec![d],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn cell_is_text_operators() {
+        let d = Dxf {
+            color: Some((0, 0, 255)),
+            ..Dxf::default()
+        };
+        // The operand formula is a quoted string literal.
+        let cases: [(&str, &str, &str, bool); 6] = [
+            ("containsText", "\"ell\"", "hello", true),
+            ("containsText", "\"xyz\"", "hello", false),
+            ("notContains", "\"xyz\"", "hello", true),
+            ("beginsWith", "\"he\"", "hello", true),
+            ("beginsWith", "\"lo\"", "hello", false),
+            ("endsWith", "\"lo\"", "hello", true),
+        ];
+        for (op, operand, cell_text, hit) in cases {
+            let wb = wb_with_cells(
+                &[("A1", Cell::text(cell_text))],
+                cell_is(op, &[operand]),
+                vec![d.clone()],
+            );
+            assert_eq!(
+                cell_dxf(&wb, 0, 0, 0).is_some(),
+                hit,
+                "{op} {operand} on {cell_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_cell_never_matches_cell_is() {
+        let d = Dxf {
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        // A2 is empty; a cellIs comparison must not fire on it.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(10.0))],
+            cell_is("greaterThan", &["-1"]),
+            vec![d],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 1, 0), None); // A2 empty
+    }
+
+    #[test]
+    fn unknown_operator_and_missing_dxf_and_other_kind() {
+        let d = Dxf {
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        // Unrecognised operator → no match.
+        let wb = wb_with_cells(
+            &[("A1", Cell::number(5.0))],
+            cell_is("weirdOp", &["1"]),
+            vec![d.clone()],
+        );
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+
+        // A rule with no dxf_id is skipped even when it would match.
+        let cf = CondFormat {
+            ranges: vec![(0, 0, 9, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::CellIs {
+                    op: "greaterThan".into(),
+                    formulas: vec!["0".into()],
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, vec![d.clone()]);
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+
+        // CfKind::Other is never evaluated.
+        let cf = CondFormat {
+            ranges: vec![(0, 0, 9, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::Other,
+                dxf_id: Some(0),
+                priority: 1,
+            }],
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, vec![d]);
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn lowest_priority_number_wins() {
+        let red = Dxf {
+            fill: Some((255, 0, 0)),
+            ..Dxf::default()
+        };
+        let green = Dxf {
+            fill: Some((0, 255, 0)),
+            ..Dxf::default()
+        };
+        // Two matching rules; priority 2 (red, dxf 0) vs priority 1 (green, dxf 1).
+        // Lower priority number = higher precedence → green wins.
+        let cf = CondFormat {
+            ranges: vec![(0, 0, 9, 0)],
+            rules: vec![
+                CfRule {
+                    kind: CfKind::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["0".into()],
+                    },
+                    dxf_id: Some(0),
+                    priority: 2,
+                },
+                CfRule {
+                    kind: CfKind::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["0".into()],
+                    },
+                    dxf_id: Some(1),
+                    priority: 1,
+                },
+            ],
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(5.0))], cf, vec![red, green.clone()]);
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), Some(green));
+    }
+
+    #[test]
+    fn empty_expression_formula_does_not_match() {
+        let d = Dxf {
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        let cf = CondFormat {
+            ranges: vec![(0, 0, 4, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::Expression {
+                    formula: String::new(),
+                },
+                dxf_id: Some(0),
+                priority: 1,
+            }],
+        };
+        let wb = wb_with_cells(&[("A1", Cell::number(3.0))], cf, vec![d]);
+        assert_eq!(cell_dxf(&wb, 0, 0, 0), None);
+    }
 }
