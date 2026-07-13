@@ -17,10 +17,12 @@ fn main() {
     });
     let tasks = mppread::mpp::tasks(&bytes);
     let dated = tasks.iter().filter(|t| t.start.is_some()).count();
-    println!("{file}: {} tasks ({dated} with dates)", tasks.len());
+    let leveled = tasks.iter().filter(|t| t.outline_level.is_some()).count();
+    println!("{file}: {} tasks ({dated} with dates, {leveled} with outline)", tasks.len());
     for (i, t) in tasks.iter().enumerate() {
         let start = t.start.as_deref().unwrap_or("");
         let finish = t.finish.as_deref().unwrap_or("");
-        println!("  {:>4}  {:<19}  {:<19}  {}", i + 1, start, finish, t.name);
+        let indent = "  ".repeat(t.outline_level.unwrap_or(1).saturating_sub(1) as usize);
+        println!("  {:>4}  {:<19}  {:<19}  {indent}{}", i + 1, start, finish, t.name);
     }
 }

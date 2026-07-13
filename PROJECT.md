@@ -130,12 +130,18 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   date-field offset are auto-detected as the layout under which every task's
   `start ≤ finish` and the starts vary (a self-validating fit, like the name
   decode), then the two-byte time / two-byte days-since-1984 fields are read at
-  that offset. So `yppxy legacy.mpp` opens with the real WBS **and** the real
-  dates: each decoded task is pinned with a Must-Start-On constraint and given a
-  duration of the working minutes between its start and finish, so the scheduler
-  reproduces Project's own dates. **Durations and links** in the Fixed/Var data
-  blocks are the remaining reverse-engineering layer; `inspect` hex-dumps any
-  block to work them out against an MSPDI oracle export.
+  that offset. The **outline level** (WBS depth) decodes from the same records:
+  its byte column is found by MS Project's tree rule — depth deepens by at most
+  one per row and pops back up at real hierarchy boundaries — a self-validating
+  signature that also rejects look-alike id columns and leaves the WBS flat when
+  no column fits (verified: MPP9 decodes the full tree, the MPP14 sample
+  degrades to flat rather than inventing one). So `yppxy legacy.mpp` opens with
+  the real WBS **and** the real dates: each decoded *leaf* task is pinned with a
+  Must-Start-On constraint and a duration of the working minutes between its
+  start and finish; summary tasks roll their dates up from their children, so
+  the scheduler reproduces Project's own dates. **Task links** in the Fixed/Var
+  data blocks are the remaining reverse-engineering layer; `inspect` hex-dumps
+  any block to work them out against an MSPDI oracle export.
 
 ## Roadmap
 
@@ -146,11 +152,11 @@ backstage, live Gantt, editing, undo/redo, find, vim mode, themes).
 
 Next, roughly in order:
 
-1. **`.mpp` numeric task decoder** — task **names** and **start/finish dates**
-   already decode from real files (MPP9 + MPP12/14); the remaining fields are
-   durations and links in the Fixed/Var data blocks. The workflow (sample files
-   in `corpus/mpp/`, map with `inspect`, reverse each block against an MSPDI
-   oracle export) is documented in `corpus/mpp/README.md`.
+1. **`.mpp` numeric task decoder** — task **names**, **start/finish dates**, and
+   **outline levels** already decode from real files (MPP9 + MPP12/14); the
+   remaining field is task **links** in the Fixed/Var data blocks. The workflow
+   (sample files in `corpus/mpp/`, map with `inspect`, reverse each block against
+   an MSPDI oracle export) is documented in `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,
    optional task splitting, and a "resource-critical" flag.
 3. **Assignment editing depth** — units/work per assignment, effort-driven

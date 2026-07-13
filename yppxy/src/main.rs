@@ -162,8 +162,9 @@ fn load(path: &str) -> Result<Project, String> {
 /// with a Must-Start-On constraint at its start and given a duration equal to
 /// the working minutes between its start and finish, so the scheduler reproduces
 /// the real dates; tasks without decoded dates keep a default 1-day duration.
-/// Task **links and outline levels** aren't parsed yet, so the WBS is flat. Save
-/// As converts it to `.yppx`/MSPDI.
+/// The **outline levels** (WBS depth) decode too, so summary tasks and their
+/// rollup come through; task **links** aren't parsed yet. Save As converts it to
+/// `.yppx`/MSPDI.
 fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = mppread::read_mpp(bytes)?;
     let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
@@ -171,24 +172,39 @@ fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         .find(|s| !s.is_empty())
         .unwrap_or_else(|| "Imported project".into());
     let cal_ref = Project::default();
-    let tasks: Vec<Task> = mppread::mpp::tasks(bytes)
-        .into_iter()
+    let decoded = mppread::mpp::tasks(bytes);
+    // A task is a summary when the next task sits one WBS level deeper.
+    let levels: Vec<u32> = decoded.iter().map(|t| t.outline_level.unwrap_or(1)).collect();
+    let tasks: Vec<Task> = decoded
+        .iter()
         .enumerate()
         .map(|(i, t)| {
+            let is_summary = levels.get(i + 1).is_some_and(|&nxt| nxt > levels[i]);
             let mut task = Task {
                 uid: i as i32 + 1,
                 id: i as i32 + 1,
-                name: t.name,
-                outline_level: 1,
+                name: t.name.clone(),
+                outline_level: levels[i],
+                summary: is_summary,
                 duration_min: 480,
                 ..Task::default()
             };
-            if let (Some(s), Some(f)) = (t.start.as_deref().and_then(parse_mpp_dt), t.finish.as_deref().and_then(parse_mpp_dt)) {
-                task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
-                task.constraint = ConstraintType::MustStartOn;
-                task.constraint_date = Some(s);
+            let s = t.start.as_deref().and_then(parse_mpp_dt);
+            let f = t.finish.as_deref().and_then(parse_mpp_dt);
+            if let (Some(s), Some(f)) = (s, f) {
                 task.stored_start = Some(s);
                 task.stored_finish = Some(f);
+                // Pin only leaf tasks; a summary's dates roll up from its
+                // children, so a constraint on it would fight the rollup.
+                if is_summary {
+                    task.duration_min = 0;
+                } else {
+                    task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
+                    task.constraint = ConstraintType::MustStartOn;
+                    task.constraint_date = Some(s);
+                }
+            } else if is_summary {
+                task.duration_min = 0;
             }
             task
         })

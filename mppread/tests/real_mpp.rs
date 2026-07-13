@@ -37,6 +37,16 @@ fn decodes_real_mpp_task_names_when_present() {
                 assert!(s <= f, "{path}: {} start {s} > finish {f}", t.name);
             }
         }
+        // Outline levels, when detected, form a valid tree: start at 1 and
+        // deepen by at most one level per row (MS Project's WBS rule).
+        if tasks[0].outline_level.is_some() {
+            assert_eq!(tasks[0].outline_level, Some(1), "{path}: root not level 1");
+            for w in tasks.windows(2) {
+                if let (Some(a), Some(b)) = (w[0].outline_level, w[1].outline_level) {
+                    assert!(b <= a + 1, "{path}: outline jumps {a}->{b} at {}", w[1].name);
+                }
+            }
+        }
         checked += 1;
     }
     eprintln!("real .mpp files validated: {checked}");

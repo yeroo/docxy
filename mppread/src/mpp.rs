@@ -49,12 +49,14 @@ pub struct MppInfo {
 }
 
 /// A task decoded from a `.mpp`: its name, and — when the fixed-record layout is
-/// recognized — its start and finish (`YYYY-MM-DD HH:MM`).
+/// recognized — its start and finish (`YYYY-MM-DD HH:MM`) and 1-based outline
+/// level (the WBS depth; 1 = top level).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
+    pub outline_level: Option<u32>,
 }
 
 /// Decode the task **names** from a `.mpp`, in task order. Empty if the task
@@ -83,13 +85,20 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     let names = crate::varmeta::names(&vm, &v2);
     let mut out: Vec<MppTask> = names.into_iter().map(|name| MppTask { name, ..Default::default() }).collect();
 
-    // Add dates from FixedData if a record layout fits the task count.
+    // Add dates from FixedData if a record layout fits the task count. Once the
+    // record size is known, look for the outline-level column in the same
+    // records (the WBS depth), so summaries and rollup come through too.
     let fdpath = v2path.replace("Var2Data", "FixedData");
     if let Some(fd) = cfb.read_path(&fdpath) {
         if let Some((rs, off)) = detect_date_layout(&fd, out.len()) {
             for (i, t) in out.iter_mut().enumerate() {
                 t.start = decode_timestamp(&fd, i * rs + off);
                 t.finish = decode_timestamp(&fd, i * rs + off + 4);
+            }
+            if let Some(oc) = detect_outline_column(&fd, rs, out.len()) {
+                for (i, t) in out.iter_mut().enumerate() {
+                    t.outline_level = Some(fd[i * rs + oc] as u32 + 1);
+                }
             }
         }
     }
@@ -136,6 +145,47 @@ fn detect_date_layout(fd: &[u8], count: usize) -> Option<(usize, usize)> {
         }
     }
     (best.2 * 5 >= count * 4).then_some((best.0, best.1))
+}
+
+/// Find the byte column in `record_size`-byte FixedData records that holds the
+/// **outline level** (0-based WBS depth). It's identified by MS Project's tree
+/// rule, a strong self-validating signature: the first task is at the top
+/// (value ≤ 1), depth increases by at most one per row (you can't jump from
+/// level 1 straight to level 3), it stays ≥ the root, it's shallow (≤ 10), and —
+/// unlike a monotonic id column — it **pops back up** at least once (a summary's
+/// children end and the next sibling returns to a shallower level). Among
+/// columns that qualify, the most tree-like (most pop-ups) wins. `None` when no
+/// column fits — the WBS then stays flat rather than inventing a hierarchy.
+fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<usize> {
+    if count < 3 || record_size == 0 {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (offset, pop-ups)
+    for off in 0..record_size {
+        if (count - 1) * record_size + off >= fd.len() {
+            break;
+        }
+        let v: Vec<i32> = (0..count).map(|i| fd[i * record_size + off] as i32).collect();
+        let maxv = *v.iter().max().unwrap();
+        if !(2..=10).contains(&maxv) || v[0] > 1 {
+            continue;
+        }
+        let (mut ok, mut pops) = (true, 0usize);
+        for i in 1..count {
+            if v[i] < v[0] || v[i] > v[i - 1] + 1 {
+                ok = false;
+                break;
+            }
+            if v[i] < v[i - 1] {
+                pops += 1;
+            }
+        }
+        let distinct = v.iter().collect::<std::collections::HashSet<_>>().len();
+        if ok && pops >= 1 && distinct >= 3 && best.is_none_or(|(_, p)| pops > p) {
+            best = Some((off, pops));
+        }
+    }
+    best.map(|(off, _)| off)
 }
 
 /// Open a `.mpp` (compound file) and extract its documented metadata.
@@ -342,6 +392,28 @@ mod tests {
         assert_eq!(detect_date_layout(&fd, starts.len()), Some((rs, off)));
         // Decode round-trips the first task's dates.
         assert_eq!(decode_timestamp(&fd, off).as_deref(), Some("1989-06-23 08:00"));
+    }
+
+    #[test]
+    fn detects_outline_level_column() {
+        // 6 tasks in 40-byte records; outline (0-based) at offset 0x10.
+        let rs = 40usize;
+        let oc = 0x10usize;
+        let levels = [0u8, 1, 2, 2, 1, 2]; // root, child, 2 grandkids, sibling, its child
+        let mut fd = vec![0u8; rs * levels.len()];
+        for (i, &lv) in levels.iter().enumerate() {
+            fd[i * rs] = i as u8; // a monotonic id column (must NOT be chosen)
+            fd[i * rs + oc] = lv;
+        }
+        assert_eq!(detect_outline_column(&fd, rs, levels.len()), Some(oc));
+    }
+
+    #[test]
+    fn no_outline_column_when_flat() {
+        // A flat list (all one level) has no pop-ups → no column detected.
+        let rs = 40usize;
+        let fd = vec![0u8; rs * 5]; // all zero everywhere
+        assert_eq!(detect_outline_column(&fd, rs, 5), None);
     }
 
     #[test]
