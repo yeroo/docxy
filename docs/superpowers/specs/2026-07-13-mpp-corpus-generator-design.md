@@ -196,3 +196,8 @@ After a full generation run, before publishing a release:
 - Vehicle: **real VSTO AddIn** with ribbon button (user choice over external
   COM script); VSTO workload to be installed into VS Community 2022 (user
   choice over a plain-COM add-in).
+- **Amendment (2026-07-13, user decision):** the AddIn ribbon was skipped.
+  The headless `MppCorpus.Runner` (built as the AddIn's testable core)
+  generates the complete corpus on its own — including the unplanned MPP12
+  old-format emission — so the ribbon added no generation capability. The
+  Runner is the regeneration tool of record.
