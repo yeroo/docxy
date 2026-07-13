@@ -1,6 +1,7 @@
 # Docxy
 
 [![CI](https://github.com/yeroo/docxy/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/docxy/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/yeroo/docxy/graph/badge.svg)](https://codecov.io/gh/yeroo/docxy)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yeroo/docxy/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/docxy)
 [![crates.io](https://img.shields.io/crates/v/docxy.svg)](https://crates.io/crates/docxy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

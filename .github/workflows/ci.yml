@@ -54,3 +54,29 @@ jobs:
         # Compile tests too, so a newer-than-MSRV feature in test code is
         # caught rather than sailing through a bin-only build.
       - run: cargo build --workspace --all-targets --locked
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux clipboard deps (arboard)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          # Public repo: tokenless upload works; a token (repo secret) just
+          # makes uploads more reliable. Never fail CI on an upload hiccup.
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

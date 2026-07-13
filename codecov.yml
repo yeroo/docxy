@@ -1,0 +1,24 @@
+# Codecov configuration.
+# Coverage is reported and badged, but never blocks a merge — the checks are
+# informational so a dip in an unrelated PR doesn't gate unrelated work.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Files that shouldn't count toward coverage: benchmark harnesses (only run
+# under `cargo bench`, never in the coverage run) and the ancillary compare
+# tools / corpus, which aren't workspace members.
+ignore:
+  - "**/benches/**"
+  - "compare/**"
+  - "compare-xlsx/**"
+  - "corpus/**"
+
+comment:
+  layout: "reach, diff, flags, files"
+  require_changes: true
