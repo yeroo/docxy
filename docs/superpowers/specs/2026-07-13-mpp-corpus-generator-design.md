@@ -207,3 +207,6 @@ After a full generation run, before publishing a release:
   `corpus/mpp/` by clone-based scripts (`corpus/tools/fetch-mpp-corpus.*`).
   No release zips are published; the earlier release-zip decision is
   superseded.
+- **Amendment (2026-07-14, user decision):** the repos were split —
+  `yeroo/mpp-corpus` (private) holds **documents only** (snapshots +
+  manifest); the C# generator moved to `yeroo/mpp-corpus-gen` (private).

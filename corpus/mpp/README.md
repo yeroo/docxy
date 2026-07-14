@@ -10,7 +10,8 @@ of git, and the fetch scripts below.
 ## The generated corpus (preferred)
 
 The primary `.mpp` corpus is **generated**, not hand-collected: a headless
-Runner (`mpp-corpus`, a separate private repo) drives a real, licensed copy of
+Runner (`mpp-corpus-gen`, a separate private repo; the documents land in the
+`mpp-corpus` repo) drives a real, licensed copy of
 MS Project via its PIA/COM interop through **46 cumulative steps**. Each step
 adds exactly **one feature** (one link type, one constraint, one calendar
 exception, one custom field, …) on top of the previous step's saved file, so
