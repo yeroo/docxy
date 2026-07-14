@@ -34,7 +34,10 @@ try {
     $cloneDir = Join-Path $TmpDir "mpp-corpus"
     $cloneLog = & git clone --depth 1 --quiet $RepoUrl $cloneDir 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Error ($cloneLog | Out-String)
+        # Guidance must print BEFORE any error is raised: with
+        # $ErrorActionPreference = "Stop", a Write-Error terminates the scope
+        # and everything after it would never be seen.
+        Write-Host ($cloneLog | Out-String)
         Write-Host ""
         Write-Host "error: could not clone $RepoUrl." -ForegroundColor Red
         Write-Host ""
