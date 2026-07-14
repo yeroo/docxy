@@ -390,7 +390,133 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
             }
         }
     }
+    // A footnote / endnote reference: keep the run verbatim (so the anchor
+    // survives save) but surface a superscript marker with the note id.
+    for (needle, endnote) in [("w:footnoteReference", false), ("w:endnoteReference", true)] {
+        if let Some(i) = raw.find(needle) {
+            let id = raw_attr(&raw[i..], "w:id=\"")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return Inline::FootnoteRef { id, endnote, raw };
+        }
+    }
+    // A symbol run (`<w:sym w:font="Symbol" w:char="F0B7"/>`): map the font-code
+    // point to Unicode and surface it as inline text (the run is kept verbatim
+    // for lossless save). Reuses the Field variant (raw + display text).
+    if let Some(i) = raw.find("<w:sym") {
+        let font = raw_attr(&raw[i..], "w:font=\"").unwrap_or_default();
+        let ch = raw_attr(&raw[i..], "w:char=\"").unwrap_or_default();
+        return Inline::Field {
+            text: sym_glyph(&font, &ch).to_string(),
+            raw,
+        };
+    }
     Inline::Raw(raw)
+}
+
+/// Map a `w:sym` (symbol-font name + hex code point) to a Unicode glyph. The
+/// Symbol font uses the Adobe Symbol encoding (Greek + math), offset into the
+/// `0xF000` private-use range in OOXML. Unmapped code points fall back to `□`.
+fn sym_glyph(font: &str, char_hex: &str) -> char {
+    let code = u32::from_str_radix(char_hex.trim(), 16).unwrap_or(0);
+    let low = (code & 0xFF) as u8; // strip the 0xF000 PUA offset Word adds
+    if font.eq_ignore_ascii_case("Symbol") {
+        if let Some(c) = symbol_font_char(low) {
+            return c;
+        }
+    }
+    // Other symbol fonts (Wingdings/Webdings/…) need their own dingbat tables;
+    // until then, a visible placeholder beats an invisible dropped glyph.
+    '□'
+}
+
+/// Adobe Symbol encoding → Unicode for the printable range (uppercase & lowercase
+/// Greek, plus the common mathematical operators and punctuation).
+fn symbol_font_char(code: u8) -> Option<char> {
+    let u: u32 = match code {
+        // punctuation / operators sharing ASCII positions
+        0x22 => 0x2200, // ∀
+        0x24 => 0x2203, // ∃
+        0x27 => 0x220B, // ∋
+        0x2A => 0x2217, // ∗
+        0x2D => 0x2212, // − (minus)
+        0x40 => 0x2245, // ≅
+        // uppercase Greek (A..Z), with the Symbol font's irregular slots
+        0x41 => 0x0391,
+        0x42 => 0x0392,
+        0x43 => 0x03A7,
+        0x44 => 0x0394,
+        0x45 => 0x0395,
+        0x46 => 0x03A6,
+        0x47 => 0x0393,
+        0x48 => 0x0397,
+        0x49 => 0x0399,
+        0x4A => 0x03D1, // ϑ
+        0x4B => 0x039A,
+        0x4C => 0x039B,
+        0x4D => 0x039C,
+        0x4E => 0x039D,
+        0x4F => 0x039F,
+        0x50 => 0x03A0,
+        0x51 => 0x0398, // Θ
+        0x52 => 0x03A1,
+        0x53 => 0x03A3,
+        0x54 => 0x03A4,
+        0x55 => 0x03A5,
+        0x56 => 0x03C2, // ς
+        0x57 => 0x03A9, // Ω
+        0x58 => 0x039E,
+        0x59 => 0x03A8,
+        0x5A => 0x0396,
+        // lowercase Greek (a..z)
+        0x61 => 0x03B1,
+        0x62 => 0x03B2,
+        0x63 => 0x03C7,
+        0x64 => 0x03B4,
+        0x65 => 0x03B5,
+        0x66 => 0x03C6,
+        0x67 => 0x03B3,
+        0x68 => 0x03B7,
+        0x69 => 0x03B9,
+        0x6A => 0x03D5, // ϕ
+        0x6B => 0x03BA,
+        0x6C => 0x03BB,
+        0x6D => 0x03BC,
+        0x6E => 0x03BD,
+        0x6F => 0x03BF,
+        0x70 => 0x03C0,
+        0x71 => 0x03B8,
+        0x72 => 0x03C1,
+        0x73 => 0x03C3,
+        0x74 => 0x03C4,
+        0x75 => 0x03C5,
+        0x76 => 0x03D6, // ϖ
+        0x77 => 0x03C9,
+        0x78 => 0x03BE,
+        0x79 => 0x03C8,
+        0x7A => 0x03B6,
+        // high range: common math operators
+        0xA2 => 0x2032, // ′ prime
+        0xA3 => 0x2264, // ≤
+        0xB1 => 0x00B1, // ±
+        0xB3 => 0x2265, // ≥
+        0xB4 => 0x00D7, // ×
+        0xB7 => 0x2022, // •
+        0xB8 => 0x00F7, // ÷
+        0xB9 => 0x2260, // ≠
+        0xBB => 0x2248, // ≈
+        0xA5 => 0x221E, // ∞
+        0xB6 => 0x2202, // ∂
+        0xCE => 0x2208, // ∈
+        0xCF => 0x2209, // ∉
+        0xD1 => 0x2207, // ∇
+        0xD3 => 0x00AE, // ®
+        0xD6 => 0x221A, // √
+        0xE5 => 0x2211, // ∑
+        0xF2 => 0x222B, // ∫
+        _ => return None,
+    };
+    char::from_u32(u)
 }
 
 /// The quoted value of the first attribute whose text ends with `key` (e.g.
@@ -437,19 +563,53 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     Vec::new()
 }
 
-/// Unwrap a block-level `<w:sdt>` (content control), appending the block content
-/// of its `<w:sdtContent>` to `out`. `sdtPr`/`sdtEndPr` are ignored.
+/// Parse a block-level `<w:sdt>` (content control: cover pages, TOC, …) while
+/// **preserving its wrapper**. The `<w:sdtPr>`/`<w:sdtEndPr>` are captured
+/// verbatim and re-emitted, together with the `<w:sdt>`/`<w:sdtContent>` tags
+/// (both attribute-free per the schema), as two `Raw` boundary blocks around the
+/// normally-parsed — and therefore visible/editable — content. This keeps the
+/// control lossless on save instead of degrading it to plain paragraphs, without
+/// needing a nesting model node: every consumer already treats `Raw` blocks
+/// transparently.
 fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>) {
+    let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
+    let mut saw_content = false;
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:sdtContent" => out.extend(parse_blocks_until_end(p, rels)),
+                "w:sdtPr" | "w:sdtEndPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    props.push_str(p.raw_slice(start, p.pos()));
+                }
+                "w:sdtContent" => {
+                    saw_content = true;
+                    out.push(Block::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
+                    out.extend(parse_blocks_until_end(p, rels));
+                    out.push(Block::Raw(SDT_BLOCK_CLOSE.to_string()));
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+    // A content control with no `<w:sdtContent>` (just `sdtPr`) still round-trips:
+    // emit the wrapper as one self-contained boundary so its props aren't lost.
+    if !saw_content {
+        out.push(Block::Raw(format!("<w:sdt>{props}</w:sdt>")));
+    }
+}
+
+/// The closing boundary for a preserved block-level content control.
+const SDT_BLOCK_CLOSE: &str = "</w:sdtContent></w:sdt>";
+
+/// Whether a `Block::Raw` is a content-control wrapper boundary (produced by
+/// [`parse_sdt_block`]) rather than real embedded content — such boundaries
+/// carry no visible payload and must render as nothing.
+pub(crate) fn is_sdt_boundary(raw: &str) -> bool {
+    let t = raw.trim_start();
+    t.starts_with("<w:sdt>") || t.starts_with("</w:sdtContent>")
 }
 
 /// Parse a sequence of block-level children up to the enclosing End event.
@@ -514,6 +674,14 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
+                // Tracked change: show the inserted/deleted text (instead of
+                // hiding it as opaque raw) while preserving the revision markup.
+                "w:ins" => para
+                    .content
+                    .push(parse_revision(p, rels, RevisionKind::Insert)),
+                "w:del" => para
+                    .content
+                    .push(parse_revision(p, rels, RevisionKind::Delete)),
                 // A simple field: keep its XML verbatim (lossless save) but surface
                 // its cached result text so the value is visible.
                 "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
@@ -571,18 +739,38 @@ fn parse_fld_simple(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
     out.push(Inline::Field { raw, text });
 }
 
-/// Unwrap an inline `<w:sdt>` (content control inside a paragraph), parsing the
-/// inline content of its `<w:sdtContent>` into `out`.
+/// Parse an inline `<w:sdt>` (content control inside a paragraph), preserving its
+/// wrapper the same way [`parse_sdt_block`] does: the `<w:sdtPr>`/`<w:sdtEndPr>`
+/// plus the attribute-free `<w:sdt>`/`<w:sdtContent>` tags bracket the parsed
+/// (visible/editable) runs as two `Inline::Raw` boundaries, which — like inline
+/// bookmarks — serialize verbatim yet render as nothing.
 fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let mut props = String::new(); // sdtPr + sdtEndPr, verbatim, in document order
+    let mut saw_content = false;
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:sdtContent" => parse_inlines_into(p, rels, out),
+                "w:sdtPr" | "w:sdtEndPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    props.push_str(p.raw_slice(start, p.pos()));
+                }
+                "w:sdtContent" => {
+                    saw_content = true;
+                    out.push(Inline::Raw(format!("<w:sdt>{props}<w:sdtContent>")));
+                    parse_inlines_into(p, rels, out);
+                    out.push(Inline::Raw(SDT_BLOCK_CLOSE.to_string()));
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+    // A content control with no `<w:sdtContent>` still round-trips (see
+    // `parse_sdt_block`): keep the wrapper as one self-contained boundary.
+    if !saw_content {
+        out.push(Inline::Raw(format!("<w:sdt>{props}</w:sdt>")));
     }
 }
 
@@ -603,6 +791,8 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                     }
                 }
                 "w:hyperlink" => parse_hyperlink_into(p, rels, out),
+                "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
+                "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
                 "w:fldSimple" => parse_fld_simple(p, rels, out),
                 "w:smartTag" => parse_inlines_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
@@ -615,6 +805,45 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+}
+
+/// Parse a `<w:ins>` / `<w:del>` tracked change: capture the whole element raw
+/// (for lossless save) and parse its inner inlines for display. Deleted content
+/// is marked struck-through and inserted content underlined, so both are visible
+/// and distinguishable. The `content` is display-only — save re-emits `raw`.
+fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
+    let start = p.start_pos();
+    let mut content = Vec::new();
+    parse_inlines_into(p, rels, &mut content);
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    for inl in &mut content {
+        mark_revision(inl, kind);
+    }
+    Inline::Revision { kind, raw, content }
+}
+
+/// Bake a tracked-change display cue into a run tree: strikethrough for a
+/// deletion, underline for an insertion (Word's markup convention).
+fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
+    let apply = |props: &mut RunProps| match kind {
+        RevisionKind::Delete => props.strike = true,
+        RevisionKind::Insert => props.underline = true,
+    };
+    match inl {
+        Inline::Run(r) => apply(&mut r.props),
+        Inline::Tab(props) => apply(props),
+        Inline::Hyperlink(h) => {
+            for r in &mut h.runs {
+                apply(&mut r.props);
+            }
+        }
+        Inline::Revision { content, .. } => {
+            for c in content {
+                mark_revision(c, kind);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -689,12 +918,22 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     });
                     p.skip_element();
                 }
-                _ => p.skip_element(),
+                // Any pPr child we don't model (shading, spacing, keepNext,
+                // outlineLvl, …) is preserved verbatim so save doesn't drop it.
+                _ => capture_element(p, &mut props.raw_props),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
     }
+}
+
+/// Capture the verbatim XML of the element the parser is positioned at (its
+/// Start event), consuming it, and append it to `out`.
+fn capture_element(p: &mut XmlParser, out: &mut Vec<String>) {
+    let start = p.start_pos();
+    p.skip_element();
+    out.push(p.raw_slice(start, p.pos()).to_string());
 }
 
 fn frame_int(p: &XmlParser, name: &str) -> Option<i32> {
@@ -767,7 +1006,9 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPr" => parse_rpr(p, &mut props),
-                "w:t" => {
+                // `w:delText` carries the text of a run inside a `<w:del>`; read it
+                // like `w:t` so deleted content is visible (a normal run has none).
+                "w:t" | "w:delText" => {
                     let text = read_text(p);
                     out.push(Inline::Run(Run {
                         text,
@@ -798,6 +1039,8 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 | "w:instrText"
                 | "w:sym"
                 | "w:commentReference"
+                | "w:footnoteReference"
+                | "w:endnoteReference"
                 | "mc:AlternateContent" => {
                     had_raw = true;
                     p.skip_element();
@@ -817,6 +1060,8 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
             Event::Start => {
                 let name = p.name();
                 let val = p.attr("w:val");
+                let start = p.start_pos();
+                let mut modeled = true;
                 match name {
                     "w:b" | "w:bCs" => props.bold = toggle_on(val),
                     "w:i" | "w:iCs" => props.italic = toggle_on(val),
@@ -861,9 +1106,18 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                             props.code = true;
                         }
                     }
-                    _ => {}
+                    // `w:rStyle` with an empty val, or anything else we don't
+                    // model, is preserved verbatim (character spacing, kern,
+                    // lang, shd, effect, …) so save doesn't drop it.
+                    "w:rStyle" => {}
+                    _ => modeled = false,
                 }
                 p.skip_element();
+                if !modeled {
+                    props
+                        .raw_props
+                        .push(p.raw_slice(start, p.pos()).to_string());
+                }
             }
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -883,12 +1137,47 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
     } else {
         rels.target(&rid).map(|t| t.to_string())
     };
-    if target.is_none() {
-        parse_inlines_into(p, rels, out);
-        return;
-    }
     let rel_id = (!rid.is_empty()).then_some(rid);
     let anchor = (!anchor_attr.is_empty()).then_some(anchor_attr);
+    if target.is_none() {
+        // An internal anchor link (a cross-reference, or a TOC entry). Make it
+        // navigable so a click can jump to the bookmark. Each maximal run of
+        // `Inline::Run` becomes a `Hyperlink`; tabs/breaks are emitted at top
+        // level so TOC leader-dot tab stops still render — the surrounding link
+        // segments keep the whole entry clickable.
+        if let Some(anchor) = anchor {
+            let mut inner = Vec::new();
+            parse_inlines_into(p, rels, &mut inner);
+            let mut runs: Vec<Run> = Vec::new();
+            for it in inner {
+                match it {
+                    Inline::Run(r) => runs.push(r),
+                    other => {
+                        if !runs.is_empty() {
+                            out.push(Inline::Hyperlink(Hyperlink {
+                                target: None,
+                                anchor: Some(anchor.clone()),
+                                rel_id: rel_id.clone(),
+                                runs: std::mem::take(&mut runs),
+                            }));
+                        }
+                        out.push(other);
+                    }
+                }
+            }
+            if !runs.is_empty() {
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs,
+                }));
+            }
+        } else {
+            parse_inlines_into(p, rels, out);
+        }
+        return;
+    }
 
     let mut runs = Vec::new();
     loop {
@@ -924,6 +1213,16 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             Event::Start => match p.name() {
                 "w:tblGrid" => parse_tblgrid(p, &mut table.grid),
                 "w:tr" => table.rows.push(parse_row(p, rels)),
+                // A row-level content control (Repeating Section) wraps its
+                // `<w:tr>` rows in `<w:sdt><w:sdtContent>`. Unwrap it so the
+                // rows survive round-trip.
+                "w:sdt" => parse_sdt_rows(p, rels, &mut table.rows),
+                // Whole table properties (borders/shading/width/style) preserved.
+                "w:tblPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    table.raw_tblpr = Some(p.raw_slice(start, p.pos()).to_string());
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
@@ -931,6 +1230,32 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
         }
     }
     table
+}
+
+/// Unwrap a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows — a
+/// "Repeating Section") into `rows`. The `Table` model has no Raw-boundary
+/// facility for rows the way blocks do, so the control wrapper itself isn't
+/// preserved — but the row data (the important content) always is, rather than
+/// being dropped as an unrecognized element.
+fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, rows: &mut Vec<Row>) {
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:sdtContent" => loop {
+                match p.next() {
+                    Event::Start => match p.name() {
+                        "w:tr" => rows.push(parse_row(p, rels)),
+                        "w:sdt" => parse_sdt_rows(p, rels, rows), // nested section
+                        _ => p.skip_element(),
+                    },
+                    Event::End | Event::Eof => break,
+                    Event::Text => {}
+                }
+            },
+            Event::Start => p.skip_element(), // w:sdtPr, w:sdtEndPr
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
 }
 
 fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
@@ -951,21 +1276,28 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
     let mut row = Row::default();
-    parse_cells_into(p, rels, &mut row.cells);
+    parse_cells_into(p, rels, &mut row.cells, &mut row.raw_props);
     row
 }
 
 /// Collect the cells of a row (or a `<w:sdtContent>` within it), unwrapping
-/// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`).
-fn parse_cells_into(p: &mut XmlParser, rels: &Relationships, cells: &mut Vec<Cell>) {
+/// cell-level content controls (`<w:sdt>` wrapping a `<w:tc>`). Row-level
+/// properties (`w:trPr`/`w:tblPrEx`) are captured verbatim into `raw`.
+fn parse_cells_into(
+    p: &mut XmlParser,
+    rels: &Relationships,
+    cells: &mut Vec<Cell>,
+    raw: &mut Vec<String>,
+) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
                 "w:tc" => cells.push(parse_cell(p, rels)),
+                "w:trPr" | "w:tblPrEx" => capture_element(p, raw),
                 "w:sdt" => loop {
                     match p.next() {
                         Event::Start if p.name() == "w:sdtContent" => {
-                            parse_cells_into(p, rels, cells)
+                            parse_cells_into(p, rels, cells, raw)
                         }
                         Event::Start => p.skip_element(),
                         Event::End | Event::Eof => break,
@@ -985,7 +1317,17 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:tcPr" => parse_tcpr(p, &mut cell),
+                // Parse gridSpan/vMerge for rendering. Keep the whole tcPr
+                // verbatim (borders/shading/width/vAlign) ONLY when it carries
+                // more than gridSpan/vMerge — so a cell the model can fully
+                // describe still round-trips exactly (no spurious raw).
+                "w:tcPr" => {
+                    let start = p.start_pos();
+                    let has_extra = parse_tcpr(p, &mut cell);
+                    if has_extra {
+                        cell.raw_tcpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    }
+                }
                 "w:p" => cell.blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => cell.blocks.push(Block::Table(parse_table(p, rels))),
                 // Unwrap content controls nested in a cell (cover-page titles etc.).
@@ -1004,7 +1346,11 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
     cell
 }
 
-fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
+/// Parse `gridSpan`/`vMerge` into the model. Returns `true` if the `tcPr` holds
+/// any other child (borders/shading/width/vAlign/…) — the signal to preserve the
+/// whole `tcPr` verbatim for lossless save.
+fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) -> bool {
+    let mut has_extra = false;
     loop {
         match p.next() {
             Event::Start => {
@@ -1022,7 +1368,7 @@ fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
                             VMerge::Continue
                         };
                     }
-                    _ => {}
+                    _ => has_extra = true,
                 }
                 p.skip_element();
             }
@@ -1030,6 +1376,7 @@ fn parse_tcpr(p: &mut XmlParser, cell: &mut Cell) {
             Event::Text => {}
         }
     }
+    has_extra
 }
 
 /// Reads character data up to the matching End (used for `w:t`).
@@ -1388,13 +1735,101 @@ mod tests {
     }
 
     #[test]
-    fn inline_sdt_is_unwrapped() {
-        // A content control wrapping runs inside a paragraph must show its text.
+    fn block_sdt_shown_and_preserved() {
+        // A block-level content control (with sdtPr) keeps its body visible and
+        // rebuilds the wrapper — incl. sdtPr — around it on save.
+        let xml = "<w:document><w:body>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Cover\"/></w:sdtPr>\
+                   <w:sdtContent><w:p><w:r><w:t>Title</w:t></w:r></w:p></w:sdtContent></w:sdt>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        // Body = [<w:sdt>…<w:sdtContent>, Title para, </…></w:sdt>].
+        assert_eq!(d.body.len(), 3);
+        assert!(matches!(d.body[0], Block::Raw(_)));
+        assert_eq!(d.body[1].plain_text(), "Title");
+        assert!(matches!(d.body[2], Block::Raw(_)));
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>") && out.contains("<w:sdtContent>"));
+        assert!(out.contains("<w:alias w:val=\"Cover\"/>"), "sdtPr lost");
+        assert!(out.contains(">Title<"), "control body lost");
+        // The wrapper boundaries are recognised as such (render as nothing).
+        if let Block::Raw(open) = &d.body[0] {
+            assert!(is_sdt_boundary(open));
+        }
+    }
+
+    #[test]
+    fn inline_sdt_shown_and_preserved() {
+        // A content control wrapping runs inside a paragraph must show its text …
         let xml = "<w:document><w:body><w:p>\
                    <w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
-                   <w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>inner</w:t></w:r></w:sdtContent></w:sdt>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"nm\"/></w:sdtPr><w:sdtContent><w:r><w:t>inner</w:t></w:r></w:sdtContent></w:sdt>\
                    <w:r><w:t xml:space=\"preserve\"> b</w:t></w:r></w:p></w:body></w:document>";
-        assert_eq!(first_para(&doc(xml)).plain_text(), "a inner b");
+        let d = doc(xml);
+        assert_eq!(first_para(&d).plain_text(), "a inner b");
+        // … and the wrapper (incl. sdtPr) round-trips on save.
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>"), "inline sdt wrapper lost");
+        assert!(out.contains("<w:alias w:val=\"nm\"/>"), "sdtPr lost");
+        assert!(out.contains("<w:sdtContent>"), "inline sdtContent lost");
+    }
+
+    #[test]
+    fn row_level_content_control_keeps_rows() {
+        // A Repeating Section wraps table rows in <w:sdt><w:sdtContent>. The rows
+        // must survive rather than being dropped as an unknown element.
+        let xml = "<w:document><w:body><w:tbl>\
+                   <w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid>\
+                   <w:tr><w:tc><w:p><w:r><w:t>plain</w:t></w:r></w:p></w:tc></w:tr>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Repeat\"/></w:sdtPr><w:sdtContent>\
+                   <w:tr><w:tc><w:p><w:r><w:t>r1</w:t></w:r></w:p></w:tc></w:tr>\
+                   <w:tr><w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc></w:tr>\
+                   </w:sdtContent></w:sdt>\
+                   </w:tbl></w:body></w:document>";
+        let d = doc(xml);
+        let t = match &d.body[0] {
+            Block::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+        assert_eq!(t.rows.len(), 3, "rows inside the sdt were dropped");
+        assert_eq!(t.rows[0].cells[0].blocks[0].plain_text(), "plain");
+        assert_eq!(t.rows[1].cells[0].blocks[0].plain_text(), "r1");
+        assert_eq!(t.rows[2].cells[0].blocks[0].plain_text(), "r2");
+    }
+
+    #[test]
+    fn empty_content_control_wrapper_survives() {
+        // A control with no <w:sdtContent> (just sdtPr) must still round-trip its
+        // wrapper + props instead of vanishing entirely.
+        let xml = "<w:document><w:body>\
+                   <w:sdt><w:sdtPr><w:alias w:val=\"Empty\"/></w:sdtPr></w:sdt>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        assert_eq!(d.body.len(), 1);
+        assert!(matches!(d.body[0], Block::Raw(_)));
+        if let Block::Raw(raw) = &d.body[0] {
+            assert!(is_sdt_boundary(raw), "empty sdt should render as nothing");
+        }
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:sdt>"), "empty sdt wrapper lost");
+        assert!(
+            out.contains("<w:alias w:val=\"Empty\"/>"),
+            "empty sdt props lost"
+        );
+    }
+
+    #[test]
+    fn rtl_flags_round_trip() {
+        // Paragraph bidi + run-level rtl (the latter via rPr raw_props) survive.
+        let xml = "<w:document><w:body>\
+                   <w:p><w:pPr><w:bidi/></w:pPr>\
+                   <w:r><w:rPr><w:rtl/></w:rPr><w:t>שלום</w:t></w:r></w:p>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        assert!(first_para(&d).props.rtl, "paragraph bidi not modeled");
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:bidi/>"), "paragraph bidi lost on save");
+        assert!(out.contains("<w:rtl/>"), "run-level rtl lost on save");
     }
 
     #[test]

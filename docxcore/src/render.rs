@@ -678,6 +678,9 @@ fn render_blocks(
                 absorb(&mut out, sub, sub_imgs, images);
             }
             Block::Table(t) => out.extend(render_table(t, &path, width, opts)),
+            // Content-control wrapper boundaries carry no visible payload; only
+            // real embedded content (drawings, objects, …) gets a placeholder.
+            Block::Raw(raw) if crate::load::is_sdt_boundary(raw) => {}
             Block::Raw(_) => out.push((
                 Line {
                     spans: vec![Line::dim_span("⟨embedded content⟩".to_string())],
@@ -815,6 +818,10 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             Inline::Tab(_) | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
+            Inline::Revision { content, .. } => {
+                w += content.iter().map(|i| str_width(&i.text())).sum::<usize>()
+            }
+            Inline::FootnoteRef { id, .. } => w += str_width(&superscript(*id)),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
@@ -823,6 +830,28 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
         }
     }
     w
+}
+
+/// A note reference's display marker: the id in Unicode superscript digits, so a
+/// footnote/endnote anchor reads as a superscript number in the terminal.
+fn superscript(n: i32) -> String {
+    n.to_string()
+        .chars()
+        .map(|c| match c {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '-' => '⁻',
+            other => other,
+        })
+        .collect()
 }
 
 fn flatten_para(
@@ -1083,6 +1112,44 @@ fn flatten_para(
             Inline::Field { text, .. } => {
                 let st = Style::default();
                 for ch in text.chars() {
+                    segs.last_mut().unwrap().glyphs.push(Glyph {
+                        ch,
+                        disp: None,
+                        style: st.clone(),
+                        link: None,
+                        src: None,
+                        img: None,
+                    });
+                }
+            }
+            // A tracked change flows inline as (non-editable) text; the insert /
+            // delete cue (underline / strikethrough) is baked into its runs.
+            Inline::Revision { content, .. } => {
+                for inner in content {
+                    if let Inline::Run(r) = inner {
+                        let eff = opts.styles.effective_run(
+                            para.props.style_id.as_deref(),
+                            r.props.style_id.as_deref(),
+                            &r.props,
+                        );
+                        let st = style_from_run(&eff);
+                        for ch in r.text.chars() {
+                            segs.last_mut().unwrap().glyphs.push(Glyph {
+                                ch,
+                                disp: None,
+                                style: st.clone(),
+                                link: None,
+                                src: None,
+                                img: None,
+                            });
+                        }
+                    }
+                }
+            }
+            // A footnote/endnote reference: a superscript number marker inline.
+            Inline::FootnoteRef { id, .. } => {
+                let st = Style::default();
+                for ch in superscript(*id).chars() {
                     segs.last_mut().unwrap().glyphs.push(Glyph {
                         ch,
                         disp: None,
@@ -1360,6 +1427,15 @@ fn render_paragraph(
             let align = opts
                 .styles
                 .effective_align(para.props.style_id.as_deref(), para.props.align);
+            // A right-to-left (`w:bidi`) paragraph anchors to the right, as Word
+            // does: with no explicit `w:jc`, the paragraph "start" is the right
+            // edge. (Terminal cells can't shape/reorder the script itself, so this
+            // right-alignment is the visual cue; explicit centre/justify are kept.)
+            let align = if para.props.rtl && align == Align::Left {
+                Align::Right
+            } else {
+                align
+            };
             let lead = match align {
                 Align::Center => width.saturating_sub(total) / 2,
                 Align::Right => width.saturating_sub(total),
@@ -2525,14 +2601,20 @@ fn paginate(
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
     let lead = pad(m.center);
+    // A section with `w:pgBorders` draws its page frame in double lines.
+    let (v, h): (char, char) = if geom.page_border {
+        ('║', '═')
+    } else {
+        ('│', '─')
+    };
     // Frame a header/footer/content line into a page row (left margin + content
     // + right margin, between the borders). Non-editable (no caret map).
     let frame_line = |ln: &Line| -> (Line, LineMap) {
         let (clipped, w) = clip_to_cols(ln.spans.clone(), m.content_cols);
         let rpad = m.content_cols - w;
-        let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+        let mut spans = vec![Line::dim_span(format!("{lead}{v}{}", pad(m.ml)))];
         spans.extend(clipped);
-        spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+        spans.push(Line::dim_span(format!("{}{v}", pad(rpad + m.mr))));
         (Line { spans }, LineMap::default())
     };
     let border = |l: char, r: char| -> (Line, LineMap) {
@@ -2540,7 +2622,7 @@ fn paginate(
             Line {
                 spans: vec![Line::dim_span(format!(
                     "{lead}{l}{}{r}",
-                    "─".repeat(inner_w)
+                    h.to_string().repeat(inner_w)
                 ))],
             },
             LineMap::default(),
@@ -2557,7 +2639,7 @@ fn paginate(
         };
         (
             Line {
-                spans: vec![Line::dim_span(format!("{lead}│{inner}│"))],
+                spans: vec![Line::dim_span(format!("{lead}{v}{inner}{v}"))],
             },
             LineMap::default(),
         )
@@ -2628,8 +2710,13 @@ fn paginate(
     // A table border carried over from the previous page (the table was split):
     // reopen the grid at the top of this page's content.
     let mut pending_top: Option<Rc<(String, String)>> = None;
+    let (tl, tr, bl, br) = if geom.page_border {
+        ('╔', '╗', '╚', '╝')
+    } else {
+        ('┌', '┐', '└', '┘')
+    };
     for page in 0..total_pages {
-        out.push(border('┌', '┐'));
+        out.push(border(tl, tr));
         // Top margin, with this page's header drawn into it.
         let header = pl.header(page);
         for r in 0..m.mt {
@@ -2646,7 +2733,7 @@ fn paginate(
         while it.peek().map(|t| t.3) == Some(page) {
             let (idx, ln, mut map, _) = it.next().unwrap();
             last_edge = map.table_edge.clone();
-            let mut spans = vec![Line::dim_span(format!("{lead}│{}", pad(m.ml)))];
+            let mut spans = vec![Line::dim_span(format!("{lead}{v}{}", pad(m.ml)))];
             if map.overflow {
                 // A wide table line: keep it whole and let it run past the right
                 // border (no clip, no right frame) — the page extends rightward.
@@ -2655,7 +2742,7 @@ fn paginate(
                 let (clipped, w) = clip_to_cols(ln.spans, m.content_cols);
                 let rpad = m.content_cols - w;
                 spans.extend(clipped);
-                spans.push(Line::dim_span(format!("{}│", pad(rpad + m.mr))));
+                spans.push(Line::dim_span(format!("{}{v}", pad(rpad + m.mr))));
             }
             for seg in &mut map.segs {
                 seg.col0 += col_off;
@@ -2693,7 +2780,7 @@ fn paginate(
                 out.push(margin_row(None));
             }
         }
-        out.push(border('└', '┘'));
+        out.push(border(bl, br));
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
     }
 
@@ -2869,6 +2956,30 @@ mod tests {
         assert!(
             plain.iter().any(|l| l.starts_with('─')),
             "expected a rule line, got {plain:?}"
+        );
+    }
+
+    #[test]
+    fn rtl_paragraph_is_right_aligned() {
+        let o = opts(20);
+        let ltr = para(vec![run("hi", RunProps::default())]);
+        let rtl = Block::Paragraph(Paragraph {
+            props: ParProps {
+                rtl: true,
+                ..Default::default()
+            },
+            content: vec![run("hi", RunProps::default())],
+        });
+        let l_ltr = render(&doc(vec![ltr]), &o)[0].plain();
+        let l_rtl = render(&doc(vec![rtl]), &o)[0].plain();
+        // LTR anchors left; the bidi paragraph anchors to the right edge.
+        assert!(
+            l_ltr.starts_with("hi"),
+            "LTR should start at col 0: {l_ltr:?}"
+        );
+        assert!(
+            l_rtl.starts_with(' ') && l_rtl.trim_end().ends_with("hi"),
+            "RTL paragraph should be right-aligned: {l_rtl:?}"
         );
     }
 
@@ -3612,12 +3723,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("Apple"), cell("Banana")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![
             Block::Table(t),
@@ -3646,12 +3760,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let mut o = opts(30);
@@ -3671,17 +3788,21 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("A"), cell("B")],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("c"), cell("d")],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(30));
@@ -3704,13 +3825,16 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let mkrow = || Row {
             cells: (0..10).map(|i| cell(&format!("c{i}"))).collect(),
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100; 10],
             rows: vec![mkrow(), mkrow()],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let o = RenderOptions {
@@ -3734,6 +3858,46 @@ mod tests {
     }
 
     #[test]
+    fn page_borders_render_a_double_line_frame() {
+        let d = doc(vec![para(vec![run("hi", RunProps::default())])]);
+        // Without page borders the frame is single-line.
+        let plain = RenderOptions {
+            width: 60,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+        let single: String = render(&d, &plain).iter().map(|l| l.plain()).collect();
+        assert!(single.contains('┌') && single.contains('│') && !single.contains('╔'));
+        // With w:pgBorders the section switches to a double-line frame.
+        let bordered = RenderOptions {
+            width: 60,
+            page_view: true,
+            page: PageGeom {
+                page_border: true,
+                ..PageGeom::default()
+            },
+            ..RenderOptions::default()
+        };
+        let double: String = render(&d, &bordered).iter().map(|l| l.plain()).collect();
+        assert!(
+            double.contains('╔') && double.contains('║') && double.contains('╝'),
+            "expected a double-line page frame"
+        );
+        assert!(!double.contains('┌'), "single-line corners should be gone");
+    }
+
+    #[test]
+    fn from_sect_pr_detects_page_borders() {
+        assert!(
+            crate::model::PageGeom::from_sect_pr(
+                "<w:sectPr><w:pgBorders><w:top w:val=\"single\"/></w:pgBorders></w:sectPr>"
+            )
+            .page_border
+        );
+        assert!(!crate::model::PageGeom::from_sect_pr("<w:sectPr/>").page_border);
+    }
+
+    #[test]
     fn table_split_across_pages_redraws_top_and_bottom_borders() {
         // A two-column table tall enough to span several pages must be closed
         // (└┴┘) at each page break and reopened (┌┬┐) on the next page, not just
@@ -3742,15 +3906,18 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let rows: Vec<Row> = (0..400)
             .map(|i| Row {
                 cells: vec![cell(&format!("a{i}")), cell(&format!("b{i}"))],
+                ..Default::default()
             })
             .collect();
         let t = Table {
             grid: vec![3000, 3000],
             rows,
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let o = RenderOptions {
@@ -3778,23 +3945,29 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let nested = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("a"), cell("b")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let nested_cell = Cell {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![Block::Table(nested)],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100, 100],
             rows: vec![Row {
                 cells: vec![cell("X"), nested_cell, cell("Y")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(40));
@@ -3812,6 +3985,7 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100, 100, 100],
@@ -3823,6 +3997,7 @@ mod tests {
                         cell("Media"),
                         cell("Product"),
                     ],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![
@@ -3831,8 +4006,10 @@ mod tests {
                         cell("1.44mb"),
                         cell("Office"),
                     ],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let lines = render(&d, &opts(24));
@@ -3848,17 +4025,21 @@ mod tests {
             grid_span: span,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("A", 1), cell("B", 1)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("wide", 2)],
+                    ..Default::default()
                 }, // spans both columns
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (lines, maps) = render_mapped(&d, &opts(30));
@@ -3884,12 +4065,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let mut o = opts(30);
@@ -3913,8 +4097,11 @@ mod tests {
                     grid_span: 2,
                     v_merge: VMerge::None,
                     blocks: vec![para(vec![run("wide", RunProps::default())])],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let joined: String = render(&d, &opts(30))
@@ -3935,17 +4122,21 @@ mod tests {
             grid_span: 1,
             v_merge: vm,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![
                 Row {
                     cells: vec![cell("M", VMerge::Restart), cell("a", VMerge::None)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![cell("", VMerge::Continue), cell("b", VMerge::None)],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (lines, maps) = render_mapped(&d, &opts(30));
@@ -4226,12 +4417,15 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 100],
             rows: vec![Row {
                 cells: vec![cell("A"), cell("B")],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let d = doc(vec![Block::Table(t)]);
         let (_lines, maps) = render_mapped(&d, &opts(30));

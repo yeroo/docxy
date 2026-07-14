@@ -20,6 +20,29 @@ use crate::zipwrite::write_zip;
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
+/// Read the value of attribute `attr` (given as `name="`) on the first `elem`
+/// element (given as its opening `<w:tag` prefix). Scoped to that one tag so an
+/// attribute of a later element can't be picked up by mistake.
+fn attr_in(hay: &str, elem: &str, attr: &str) -> Option<String> {
+    let start = hay.find(elem)?;
+    let tag = &hay[start..];
+    let end = tag.find('>').unwrap_or(tag.len());
+    let tag = &tag[..end];
+    let a = tag.find(attr)? + attr.len();
+    let rest = &tag[a..];
+    let q = rest.find('"')?;
+    Some(rest[..q].to_string())
+}
+
+/// Decode the handful of XML entities a watermark phrase might carry.
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 /// A loaded `.docx`: the editable [`Document`] plus all original parts so save
 /// can preserve what isn't modeled.
 #[derive(Debug, Clone)]
@@ -46,6 +69,85 @@ impl Package {
     /// Replace the trailing section properties (e.g. to change page orientation).
     pub fn set_sect_pr(&mut self, xml: String) {
         self.sect_pr = xml;
+    }
+
+    /// The document's protection state from `word/settings.xml`, as a short human
+    /// label (`read-only`, `comments only`, `tracked changes only`, `form fields
+    /// only`), or `None` when the document isn't protected. Surfaced so the reader
+    /// knows Word would restrict editing; docxy doesn't itself enforce it.
+    pub fn protection(&self) -> Option<String> {
+        let xml = self
+            .part("word/settings.xml")
+            .and_then(|b| std::str::from_utf8(b).ok())?;
+        // An enforced restriction (`w:documentProtection`). `w:edit` limits editing;
+        // `w:formatting="1"` (which can appear alone) locks styles/formatting.
+        if xml.contains("<w:documentProtection") {
+            let enforced = attr_in(xml, "<w:documentProtection", "w:enforcement=\"")
+                .map(|e| matches!(e.as_str(), "1" | "on" | "true"))
+                .unwrap_or(true);
+            if enforced {
+                let edit = attr_in(xml, "<w:documentProtection", "w:edit=\"");
+                let label = match edit.as_deref() {
+                    Some("readOnly") => Some("read-only"),
+                    Some("comments") => Some("comments only"),
+                    Some("trackedChanges") => Some("tracked changes only"),
+                    Some("forms") => Some("form fields only"),
+                    _ if attr_in(xml, "<w:documentProtection", "w:formatting=\"").as_deref()
+                        == Some("1") =>
+                    {
+                        Some("formatting locked")
+                    }
+                    _ => None,
+                };
+                if let Some(l) = label {
+                    return Some(l.to_string());
+                }
+            }
+        }
+        // A "recommend read-only on open" flag (`w:writeProtection`).
+        if xml.contains("<w:writeProtection") {
+            return Some("read-only (recommended)".to_string());
+        }
+        None
+    }
+
+    /// The watermark text, if a header carries a VML WordArt watermark (Word's
+    /// text watermarks store the phrase in `<v:textpath string="…">`). Picture
+    /// watermarks return `None` (no text). Surfaced by docxy as an indicator.
+    pub fn watermark(&self) -> Option<String> {
+        for (name, bytes) in &self.parts {
+            if !name.contains("/header") {
+                continue;
+            }
+            let Ok(xml) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            // A header can hold several <v:textpath> (the shapetype's template one
+            // has no `string`); return the first that carries the watermark text.
+            let mut rest = xml;
+            while let Some(i) = rest.find("<v:textpath") {
+                rest = &rest[i..];
+                let end = rest.find('>').unwrap_or(rest.len());
+                if let Some(s) = attr_in(&rest[..end], "<v:textpath", "string=\"") {
+                    let t = decode_xml_entities(&s);
+                    if !t.trim().is_empty() {
+                        return Some(t);
+                    }
+                }
+                rest = &rest[end..];
+            }
+        }
+        None
+    }
+
+    /// Whether the document defines page borders (`w:pgBorders` in any section).
+    /// Surfaced as an indicator; a terminal doesn't draw the page frame itself.
+    pub fn has_page_borders(&self) -> bool {
+        self.sect_pr.contains("<w:pgBorders")
+            || self.document.body.iter().any(|b| {
+                matches!(b, crate::model::Block::Paragraph(p)
+                    if p.props.section_break.as_deref().is_some_and(|s| s.contains("<w:pgBorders")))
+            })
     }
 
     /// The raw bytes of a part by name.
@@ -554,12 +656,62 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
         }
     }
 
+    // The original `<w:document …>` element declares every namespace the file
+    // uses (w14, mc, v, o, wp, …). Preserved raw property slices may reference
+    // those prefixes, so re-emit the original declarations rather than our
+    // minimal three — otherwise Word rejects the file with "unbound prefix".
+    let original_doc = String::from_utf8_lossy(&parts[pkg.doc_index].1).into_owned();
     let mut xml = document_to_xml(&document);
+    if let (Some(attrs), Some(doc_pos), Some(body_pos)) = (
+        document_root_attrs(&original_doc),
+        xml.find("<w:document"),
+        xml.find("<w:body>"),
+    ) {
+        xml = format!(
+            "{}<w:document {attrs}>{}",
+            &xml[..doc_pos],
+            &xml[body_pos..]
+        );
+    }
     if !pkg.sect_pr.is_empty() {
         xml = xml.replacen("</w:body>", &format!("{}</w:body>", pkg.sect_pr), 1);
     }
     parts[pkg.doc_index].1 = xml.into_bytes();
     write_zip(&parts)
+}
+
+/// The attributes of the original `<w:document …>` element — all the `xmlns:*`
+/// declarations Word wrote — so the regenerated body's preserved raw slices stay
+/// namespace-bound. Ensures the `w`/`r`/`m` prefixes our serializer emits are
+/// present even if the original omitted them (e.g. a freshly created document's
+/// minimal template root).
+fn document_root_attrs(original: &str) -> Option<String> {
+    let start = original.find("<w:document")?;
+    let rest = &original[start + "<w:document".len()..];
+    let end = rest.find('>')?;
+    let mut attrs = rest[..end].trim().trim_end_matches('/').trim().to_string();
+    for (prefix, uri) in [
+        (
+            "xmlns:w",
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        ),
+        (
+            "xmlns:r",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        ),
+        (
+            "xmlns:m",
+            "http://schemas.openxmlformats.org/officeDocument/2006/math",
+        ),
+    ] {
+        if !attrs.contains(prefix) {
+            if !attrs.is_empty() {
+                attrs.push(' ');
+            }
+            attrs.push_str(&format!("{prefix}=\"{uri}\""));
+        }
+    }
+    Some(attrs)
 }
 
 /// Highest `rIdN` number in a `.rels` string, plus one (the next free id).
@@ -625,23 +777,58 @@ fn esc_xml_attr(s: &str) -> String {
     out
 }
 
-/// Capture the last (body-level) `w:sectPr` element verbatim, if any.
+/// Capture the last body-level `w:sectPr` element verbatim, if any.
+///
+/// A depth-tracking scan, not `rfind`, because a section edited with tracked
+/// changes nests the *previous* properties in `<w:sectPrChange><w:sectPr>…` — a
+/// naive last-match would capture that stale inner element and drop the current
+/// page setup on save. Only the outermost (depth-0) `<w:sectPr>` is a real body
+/// section; `<w:sectPrChange>` is skipped (it isn't a `<w:sectPr>` element).
 fn extract_sectpr(xml: &str) -> String {
-    let Some(start) = xml.rfind("<w:sectPr") else {
-        return String::new();
-    };
-    let tail = &xml[start..];
-    if let Some(close) = tail.find("</w:sectPr>") {
-        return tail[..close + "</w:sectPr>".len()].to_string();
-    }
-    // self-closing <w:sectPr .../>
-    if let Some(gt) = tail.find('>') {
-        let seg = &tail[..gt + 1];
-        if seg.ends_with("/>") {
-            return seg.to_string();
+    const OPEN: &str = "<w:sectPr";
+    const CLOSE: &str = "</w:sectPr>";
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < xml.len() {
+        let rest = &xml[i..];
+        if rest.starts_with(CLOSE) {
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    best = Some((start, i + CLOSE.len()));
+                }
+            }
+            i += CLOSE.len();
+        } else if rest.starts_with(OPEN)
+            // Distinguish `<w:sectPr` from `<w:sectPrChange`.
+            && matches!(
+                rest[OPEN.len()..].chars().next(),
+                Some('>' | ' ' | '/' | '\t' | '\r' | '\n')
+            )
+        {
+            let gt = match rest.find('>') {
+                Some(g) => g,
+                None => break, // malformed
+            };
+            if rest[..gt + 1].ends_with("/>") {
+                // Self-closing empty section (rare) at body level.
+                if depth == 0 {
+                    best = Some((i, i + gt + 1));
+                }
+            } else {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            i += gt + 1;
+        } else {
+            i += rest.chars().next().map_or(1, char::len_utf8);
         }
     }
-    String::new()
+    best.map_or_else(String::new, |(s, e)| xml[s..e].to_string())
 }
 
 #[cfg(test)]
@@ -671,6 +858,39 @@ mod tests {
         <w:p><w:r><w:t>World</w:t></w:r></w:p>\
         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
         </w:body></w:document>";
+
+    #[test]
+    fn surfaces_protection_watermark_and_page_borders() {
+        let document = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:r><w:t>Body</w:t></w:r></w:p>\
+            <w:sectPr><w:pgBorders w:offsetFrom=\"page\"><w:top w:val=\"single\"/></w:pgBorders>\
+            <w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>";
+        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\">\
+            <w:documentProtection w:edit=\"readOnly\" w:enforcement=\"1\"/></w:settings>";
+        let header = "<?xml version=\"1.0\"?><w:hdr xmlns:w=\"x\" xmlns:v=\"y\"><w:p><w:r><w:pict>\
+            <v:shape id=\"PowerPlusWaterMarkObject\"><v:textpath string=\"CONFIDENTIAL &amp; DRAFT\"/>\
+            </v:shape></w:pict></w:r></w:p></w:hdr>";
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/settings.xml".into(), settings.into()),
+            ("word/header1.xml".into(), header.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        assert_eq!(pkg.protection().as_deref(), Some("read-only"));
+        assert_eq!(pkg.watermark().as_deref(), Some("CONFIDENTIAL & DRAFT"));
+        assert!(pkg.has_page_borders());
+
+        // An unprotected, plain doc surfaces nothing.
+        let plain = load_package(&make_docx(BODY)).expect("load");
+        assert!(plain.protection().is_none());
+        assert!(plain.watermark().is_none());
+        assert!(!plain.has_page_borders());
+    }
 
     #[test]
     fn create_header_from_scratch_wires_everything() {
@@ -843,6 +1063,35 @@ mod tests {
     }
 
     #[test]
+    fn extract_sectpr_ignores_tracked_change_revision() {
+        // A plain trailing sectPr is captured whole.
+        let plain = "<w:body><w:p/><w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr></w:body>";
+        assert_eq!(
+            extract_sectpr(plain),
+            "<w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr>"
+        );
+        // With a <w:sectPrChange> revision nesting the OLD props, the current
+        // (outer) sectPr must be captured — not the stale inner one.
+        let revised = "<w:body><w:p/><w:sectPr><w:pgSz w:w=\"16838\" w:h=\"11906\" w:orient=\"landscape\"/>\
+            <w:sectPrChange w:id=\"1\"><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:sectPrChange>\
+            </w:sectPr></w:body>";
+        let got = extract_sectpr(revised);
+        assert!(got.contains("landscape"), "captured stale props: {got}");
+        assert!(
+            got.contains("<w:sectPrChange"),
+            "outer sectPr truncated: {got}"
+        );
+        assert!(got.ends_with("</w:sectPr>"));
+        // A self-closing empty section still works.
+        assert_eq!(
+            extract_sectpr("<w:body><w:sectPr/></w:body>"),
+            "<w:sectPr/>"
+        );
+        // No section → empty.
+        assert_eq!(extract_sectpr("<w:body><w:p/></w:body>"), "");
+    }
+
+    #[test]
     fn save_preserves_unmodeled_content() {
         let body = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
             <w:p><w:bookmarkStart w:id=\"0\" w:name=\"bm\"/><w:r><w:t>hi</w:t></w:r><w:bookmarkEnd w:id=\"0\"/></w:p>\
@@ -852,10 +1101,12 @@ mod tests {
         let docx = make_docx(body);
         let pkg1 = load_package(&docx).expect("load");
 
-        // Bookmarks/drawings stay Raw; the block-level sdt is unwrapped so its
-        // content (the "ctrl" paragraph) is visible.
-        assert_eq!(pkg1.document.body.len(), 3);
-        assert_eq!(pkg1.document.body[2].plain_text(), "ctrl");
+        // Bookmarks/drawings stay Raw. The block-level sdt keeps its content (the
+        // "ctrl" paragraph) visible, now wrapped between two Raw wrapper
+        // boundaries so the control survives the round-trip:
+        // [bm para, drawing para, <w:sdt>…<w:sdtContent>, ctrl para, </…></w:sdt>].
+        assert_eq!(pkg1.document.body.len(), 5);
+        assert_eq!(pkg1.document.body[3].plain_text(), "ctrl");
         if let Block::Paragraph(p) = &pkg1.document.body[1] {
             assert!(matches!(p.content[0], Inline::Raw(_))); // the drawing run
         } else {
@@ -867,8 +1118,10 @@ mod tests {
         assert!(text.contains("w:bookmarkStart"), "bookmark lost");
         assert!(text.contains("<w:drawing>"), "drawing lost");
         assert!(text.contains("ctrl"), "sdt content lost");
+        assert!(text.contains("<w:sdt>"), "content-control wrapper lost");
+        assert!(text.contains("<w:sdtContent>"), "sdtContent wrapper lost");
 
-        // And a full round-trip is stable (the unwrapped content stays unwrapped).
+        // And a full round-trip is stable (the preserved wrapper stays put).
         let pkg2 = load_package(&saved).expect("reload");
         assert_eq!(pkg1.document, pkg2.document);
     }
@@ -890,5 +1143,12 @@ mod tests {
         let reloaded = load_package(&bytes).expect("reload new doc");
         assert_eq!(reloaded.document, document);
         assert!(reloaded.part_names().contains(&"word/styles.xml"));
+        // The saved document root must declare w/r/m or Word rejects it as
+        // "unbound prefix" — even for a freshly created doc whose template root
+        // is minimal (regression guard for document_root_attrs).
+        let doc_xml = String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap());
+        for ns in ["xmlns:w=", "xmlns:r=", "xmlns:m="] {
+            assert!(doc_xml.contains(ns), "new-doc root missing {ns}");
+        }
     }
 }

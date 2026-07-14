@@ -78,6 +78,70 @@ fn write_paragraph(s: &mut String, p: &Paragraph) {
     s.push_str("</w:p>");
 }
 
+/// Ordinal of a `CT_PPr` child element (local name, no `w:` prefix) in the
+/// WordprocessingML schema's fixed child order. Unknown elements sort last but
+/// keep their relative order. Word (and strict validators) reject `<w:pPr>`
+/// children out of this order, so both modeled and preserved (`raw_props`)
+/// children are emitted through this rank.
+fn ppr_rank(local: &str) -> u32 {
+    const ORDER: [&str; 36] = [
+        "pStyle",
+        "keepNext",
+        "keepLines",
+        "pageBreakBefore",
+        "framePr",
+        "widowControl",
+        "numPr",
+        "suppressLineNumbers",
+        "pBdr",
+        "shd",
+        "tabs",
+        "suppressAutoHyphens",
+        "kinsoku",
+        "wordWrap",
+        "overflowPunct",
+        "topLinePunct",
+        "autoSpaceDE",
+        "autoSpaceDN",
+        "bidi",
+        "adjustRightInd",
+        "snapToGrid",
+        "spacing",
+        "ind",
+        "contextualSpacing",
+        "mirrorIndents",
+        "suppressOverlap",
+        "jc",
+        "textDirection",
+        "textAlignment",
+        "textboxTightWrap",
+        "outlineLvl",
+        "divId",
+        "cnfStyle",
+        "rPr",
+        "sectPr",
+        "pPrChange",
+    ];
+    ORDER
+        .iter()
+        .position(|&e| e == local)
+        .map_or(u32::MAX, |i| i as u32)
+}
+
+/// The local element name of a serialized child (`"<w:spacing …/>"` → `spacing`),
+/// used to rank preserved `raw_props` against the modeled children.
+fn local_name(raw: &str) -> &str {
+    let t = raw.trim_start();
+    let Some(rest) = t.strip_prefix('<') else {
+        return "";
+    };
+    let end = rest
+        .find([' ', '/', '>', '\t', '\n', '\r'])
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    name.rsplit(':').next().unwrap_or(name)
+}
+
 fn write_ppr(s: &mut String, props: &ParProps) {
     // Effective paragraph style: explicit style, else a synthesized heading style.
     let style = props
@@ -93,84 +157,95 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.borders.top.is_some()
         || props.borders.bottom.is_some()
         || props.indent != 0
-        || !props.tabs.is_empty();
+        || !props.tabs.is_empty()
+        || !props.raw_props.is_empty();
     if !has_any {
         return;
     }
-    s.push_str("<w:pPr>");
+
+    // Assemble children as (schema rank, xml) then stable-sort, so modeled and
+    // preserved children interleave in the order `CT_PPr` requires (e.g. a
+    // preserved `w:spacing`/`w:shd`/`w:bidi` lands before the modeled
+    // `w:ind`/`w:jc`, and a paragraph-mark `w:rPr` stays just before `sectPr`).
+    let mut parts: Vec<(u32, String)> = Vec::new();
+
     if let Some(st) = &style {
-        s.push_str("<w:pStyle w:val=\"");
-        esc_attr(st, s);
-        s.push_str("\"/>");
+        let mut x = String::from("<w:pStyle w:val=\"");
+        esc_attr(st, &mut x);
+        x.push_str("\"/>");
+        parts.push((ppr_rank("pStyle"), x));
     }
-    // framePr must precede numPr/jc in the schema order.
     if let Some(f) = &props.frame {
-        s.push_str("<w:framePr");
+        let mut x = String::from("<w:framePr");
         if let Some(v) = f.w {
-            s.push_str(&format!(" w:w=\"{v}\""));
+            x.push_str(&format!(" w:w=\"{v}\""));
         }
         if let Some(v) = f.h {
-            s.push_str(&format!(" w:h=\"{v}\""));
+            x.push_str(&format!(" w:h=\"{v}\""));
         }
         if let Some(a) = &f.h_anchor {
-            s.push_str(" w:hAnchor=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:hAnchor=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.v_anchor {
-            s.push_str(" w:vAnchor=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:vAnchor=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.x_align {
-            s.push_str(" w:xAlign=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:xAlign=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(a) = &f.y_align {
-            s.push_str(" w:yAlign=\"");
-            esc_attr(a, s);
-            s.push('"');
+            x.push_str(" w:yAlign=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
         }
         if let Some(v) = f.x {
-            s.push_str(&format!(" w:x=\"{v}\""));
+            x.push_str(&format!(" w:x=\"{v}\""));
         }
         if let Some(v) = f.y {
-            s.push_str(&format!(" w:y=\"{v}\""));
+            x.push_str(&format!(" w:y=\"{v}\""));
         }
-        s.push_str("/>");
+        x.push_str("/>");
+        parts.push((ppr_rank("framePr"), x));
     }
     if let Some(num) = props.num_id {
-        s.push_str(&format!(
-            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-            props.ilvl, num
+        parts.push((
+            ppr_rank("numPr"),
+            format!(
+                "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+                props.ilvl, num
+            ),
         ));
     }
-    // pBdr precedes tabs in the schema order.
     if props.borders.top.is_some() || props.borders.bottom.is_some() {
-        s.push_str("<w:pBdr>");
+        let mut x = String::from("<w:pBdr>");
         for (tag, side) in [
             ("w:top", props.borders.top),
             ("w:bottom", props.borders.bottom),
         ] {
             if let Some(k) = side {
-                s.push_str(&format!(
+                x.push_str(&format!(
                     "<{tag} w:val=\"{}\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/>",
                     k.to_val()
                 ));
             }
         }
-        s.push_str("</w:pBdr>");
+        x.push_str("</w:pBdr>");
+        parts.push((ppr_rank("pBdr"), x));
     }
     if !props.tabs.is_empty() {
-        s.push_str("<w:tabs>");
+        let mut x = String::from("<w:tabs>");
         for t in &props.tabs {
             let val = match t.align {
                 TabAlign::Center => "center",
                 TabAlign::Right => "right",
                 TabAlign::Left => "left",
             };
-            s.push_str(&format!("<w:tab w:val=\"{val}\""));
+            x.push_str(&format!("<w:tab w:val=\"{val}\""));
             let leader = match t.leader {
                 TabLeader::Dot => Some("dot"),
                 TabLeader::Hyphen => Some("hyphen"),
@@ -178,42 +253,53 @@ fn write_ppr(s: &mut String, props: &ParProps) {
                 TabLeader::None => None,
             };
             if let Some(l) = leader {
-                s.push_str(&format!(" w:leader=\"{l}\""));
+                x.push_str(&format!(" w:leader=\"{l}\""));
             }
-            s.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
+            x.push_str(&format!(" w:pos=\"{}\"/>", t.pos));
         }
-        s.push_str("</w:tabs>");
+        x.push_str("</w:tabs>");
+        parts.push((ppr_rank("tabs"), x));
     }
-    // w:ind precedes w:jc in the schema order.
     if props.indent != 0 || props.first_line != 0 {
-        s.push_str("<w:ind");
+        let mut x = String::from("<w:ind");
         if props.indent != 0 {
-            s.push_str(&format!(" w:left=\"{}\"", props.indent));
+            x.push_str(&format!(" w:left=\"{}\"", props.indent));
         }
         // firstLine and hanging are mutually exclusive; both are non-negative.
         match props.first_line.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                s.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
+                x.push_str(&format!(" w:firstLine=\"{}\"", props.first_line))
             }
             std::cmp::Ordering::Less => {
-                s.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
+                x.push_str(&format!(" w:hanging=\"{}\"", -props.first_line))
             }
             std::cmp::Ordering::Equal => {}
         }
-        s.push_str("/>");
+        x.push_str("/>");
+        parts.push((ppr_rank("ind"), x));
     }
     match props.align {
         Align::Left => {}
-        Align::Center => s.push_str("<w:jc w:val=\"center\"/>"),
-        Align::Right => s.push_str("<w:jc w:val=\"right\"/>"),
-        Align::Justify => s.push_str("<w:jc w:val=\"both\"/>"),
+        Align::Center => parts.push((ppr_rank("jc"), "<w:jc w:val=\"center\"/>".into())),
+        Align::Right => parts.push((ppr_rank("jc"), "<w:jc w:val=\"right\"/>".into())),
+        Align::Justify => parts.push((ppr_rank("jc"), "<w:jc w:val=\"both\"/>".into())),
     }
     if props.rtl {
-        s.push_str("<w:bidi/>");
+        parts.push((ppr_rank("bidi"), "<w:bidi/>".into()));
     }
-    // A section break (`<w:sectPr>`) is the last pPr child.
+    // Preserved unmodeled pPr children (paragraph-mark `w:rPr`, `outlineLvl`,
+    // shading, spacing, …), each ranked by its own element name.
+    for raw in &props.raw_props {
+        parts.push((ppr_rank(local_name(raw)), raw.clone()));
+    }
     if let Some(sect) = &props.section_break {
-        s.push_str(sect);
+        parts.push((ppr_rank("sectPr"), sect.clone()));
+    }
+
+    parts.sort_by_key(|(rank, _)| *rank);
+    s.push_str("<w:pPr>");
+    for (_, x) in &parts {
+        s.push_str(x);
     }
     s.push_str("</w:pPr>");
 }
@@ -253,6 +339,11 @@ fn write_inline(s: &mut String, item: &Inline) {
         Inline::Chart { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
         Inline::Field { raw, .. } => s.push_str(raw),
+        // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
+        // display `content` is not serialized).
+        Inline::Revision { raw, .. } => s.push_str(raw),
+        // Footnote/endnote reference: re-emit the original reference run verbatim.
+        Inline::FootnoteRef { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
             // Splice the (possibly edited) content back into the shape's
             // `txbxContent`, preserving the surrounding VML/drawing markup.
@@ -292,7 +383,8 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.highlight.is_some()
         || p.size_half_pts.is_some()
         || p.font.is_some()
-        || p.style_id.is_some();
+        || p.style_id.is_some()
+        || !p.raw_props.is_empty();
     if !has_any {
         return;
     }
@@ -352,11 +444,19 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         VertAlign::Superscript => s.push_str("<w:vertAlign w:val=\"superscript\"/>"),
         VertAlign::Subscript => s.push_str("<w:vertAlign w:val=\"subscript\"/>"),
     }
+    // Preserved unmodeled rPr children (character spacing, kern, lang, shd, …).
+    for raw in &p.raw_props {
+        s.push_str(raw);
+    }
     s.push_str("</w:rPr>");
 }
 
 fn write_table(s: &mut String, t: &Table) {
     s.push_str("<w:tbl>");
+    // tblPr is the first tbl child; preserved verbatim when present.
+    if let Some(raw) = &t.raw_tblpr {
+        s.push_str(raw);
+    }
     if !t.grid.is_empty() {
         s.push_str("<w:tblGrid>");
         for w in &t.grid {
@@ -366,6 +466,10 @@ fn write_table(s: &mut String, t: &Table) {
     }
     for row in &t.rows {
         s.push_str("<w:tr>");
+        // trPr / tblPrEx precede the cells; preserved verbatim.
+        for raw in &row.raw_props {
+            s.push_str(raw);
+        }
         for cell in &row.cells {
             write_cell(s, cell);
         }
@@ -376,7 +480,12 @@ fn write_table(s: &mut String, t: &Table) {
 
 fn write_cell(s: &mut String, cell: &Cell) {
     s.push_str("<w:tc>");
-    if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+    if let Some(raw) = &cell.raw_tcpr {
+        // The original tcPr (already carries gridSpan/vMerge) — re-emit as-is so
+        // borders/shading/width/vAlign survive.
+        s.push_str(raw);
+    } else if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+        // A cell created in-editor: synthesize tcPr from the model.
         s.push_str("<w:tcPr>");
         if cell.grid_span > 1 {
             s.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", cell.grid_span));
@@ -431,6 +540,233 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unmodeled_para_table_and_cell_props() {
+        // A paragraph carrying shading + spacing (both unmodeled), and a table
+        // whose tblPr / trPr / tcPr carry borders + shading — none of which the
+        // model represents — must all survive a save round-trip instead of being
+        // silently dropped (docxy gap D-1).
+        let ppr = ParProps {
+            raw_props: vec![
+                "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FFFF00\"/>".to_string(),
+                "<w:spacing w:before=\"120\" w:after=\"120\"/>".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cell = Cell {
+            blocks: vec![para(ParProps::default(), vec![])],
+            raw_tcpr: Some(
+                "<w:tcPr><w:tcBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tcBorders>\
+                 <w:shd w:val=\"clear\" w:fill=\"D9D9D9\"/></w:tcPr>"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let table = Table {
+            grid: vec![100],
+            rows: vec![Row {
+                cells: vec![cell],
+                raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
+            }],
+            raw_tblpr: Some(
+                "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
+                    .to_string(),
+            ),
+        };
+        let d = Document {
+            body: vec![para(ppr, vec![]), Block::Table(table)],
+        };
+        let xml = document_to_xml(&d);
+        assert!(
+            xml.contains("w:fill=\"FFFF00\""),
+            "paragraph shading dropped"
+        );
+        assert!(
+            xml.contains("<w:spacing w:before=\"120\""),
+            "paragraph spacing dropped"
+        );
+        assert!(xml.contains("<w:tblBorders>"), "table borders dropped");
+        assert!(xml.contains("w:fill=\"D9D9D9\""), "cell shading dropped");
+        assert!(xml.contains("<w:trPr>"), "row properties dropped");
+        // And the whole thing round-trips to an identical model.
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn ppr_children_emitted_in_schema_order() {
+        // Modeled ind/jc/bidi and preserved shd/spacing must interleave in the
+        // CT_PPr order: shd(9) < bidi(18) < spacing(21) < ind(22) < jc(26) — even
+        // though the raw_props are supplied out of order.
+        let ppr = ParProps {
+            indent: 100,
+            align: Align::Center,
+            rtl: true,
+            raw_props: vec![
+                "<w:spacing w:before=\"120\"/>".to_string(),
+                "<w:shd w:val=\"clear\" w:fill=\"FFFF00\"/>".to_string(),
+            ],
+            ..Default::default()
+        };
+        let d = Document {
+            body: vec![para(ppr, vec![])],
+        };
+        let xml = document_to_xml(&d);
+        let at = |needle: &str| {
+            xml.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        let (shd, bidi, spacing, ind, jc) = (
+            at("<w:shd"),
+            at("<w:bidi/>"),
+            at("<w:spacing"),
+            at("<w:ind"),
+            at("<w:jc"),
+        );
+        assert!(
+            shd < bidi && bidi < spacing && spacing < ind && ind < jc,
+            "pPr children out of schema order: shd={shd} bidi={bidi} spacing={spacing} ind={ind} jc={jc}"
+        );
+        // Reordering is a normalization: re-parsing then re-serializing is stable.
+        let d2 = roundtrip(&d, &Relationships::default());
+        assert_eq!(document_to_xml(&d2), xml);
+    }
+
+    #[test]
+    fn tracked_changes_visible_and_lossless() {
+        // <w:ins>/<w:del> used to vanish into opaque Raw (invisible). Now the
+        // inserted/deleted text is visible and the revision markup round-trips.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:t>keep </w:t></w:r>\
+            <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>added</w:t></w:r></w:ins>\
+            <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText>gone</w:delText></w:r></w:del>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let text = d.plain_text();
+        assert!(text.contains("added"), "inserted text lost: {text:?}");
+        assert!(text.contains("gone"), "deleted text lost: {text:?}");
+        let out = document_to_xml(&d);
+        assert!(out.contains("<w:ins w:id=\"1\""), "ins markup lost");
+        assert!(out.contains("<w:del w:id=\"2\""), "del markup lost");
+        assert!(out.contains("<w:delText>gone</w:delText>"), "delText lost");
+        // Save is lossless: re-parsing the output yields the same model.
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn footnote_reference_visible_and_lossless() {
+        // A footnote/endnote reference used to be dropped (empty run → orphaned
+        // notes part). Now it is modeled as a FootnoteRef, shown as a marker, and
+        // the reference run survives a save.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:t>See note</w:t></w:r>\
+            <w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr>\
+              <w:footnoteReference w:id=\"1\"/></w:r>\
+            <w:r><w:t> and end</w:t></w:r>\
+            <w:r><w:endnoteReference w:id=\"2\"/></w:r>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let refs: Vec<_> = match &d.body[0] {
+            Block::Paragraph(p) => p
+                .content
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::FootnoteRef { id, endnote, .. } => Some((*id, *endnote)),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        assert_eq!(refs, vec![(1, false), (2, true)]);
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains("<w:footnoteReference w:id=\"1\"/>"),
+            "footnote ref lost"
+        );
+        assert!(
+            out.contains("<w:endnoteReference w:id=\"2\"/>"),
+            "endnote ref lost"
+        );
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn symbol_run_becomes_glyph_and_lossless() {
+        // A <w:sym> used to be preserved-but-invisible; now its font code point
+        // renders as a Unicode glyph while the run round-trips.
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:sym w:font=\"Symbol\" w:char=\"F062\"/></w:r>\
+            <w:r><w:sym w:font=\"Symbol\" w:char=\"F0B7\"/></w:r>\
+            <w:r><w:sym w:font=\"Wingdings\" w:char=\"F04A\"/></w:r>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xml, &Relationships::default());
+        let text = d.plain_text();
+        assert!(text.contains('β'), "Symbol 'b' → beta; got {text:?}");
+        assert!(text.contains('•'), "Symbol 0xB7 → bullet; got {text:?}");
+        assert!(
+            text.contains('□'),
+            "unknown font → placeholder; got {text:?}"
+        );
+        let out = document_to_xml(&d);
+        assert_eq!(out.matches("<w:sym").count(), 3, "sym runs lost");
+        assert_eq!(parse_document_xml(&out, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn internal_anchor_link_navigable_toc_keeps_tabs() {
+        // A plain internal link (a cross-reference) becomes a navigable Hyperlink.
+        let xr = "<w:document><w:body><w:p>\
+            <w:hyperlink w:anchor=\"_Ref1\"><w:r><w:t>see Section 3</w:t></w:r></w:hyperlink>\
+            </w:p></w:body></w:document>";
+        let d = parse_document_xml(xr, &Relationships::default());
+        match &d.body[0] {
+            Block::Paragraph(p) => match &p.content[0] {
+                Inline::Hyperlink(h) => {
+                    assert_eq!(h.anchor.as_deref(), Some("_Ref1"));
+                    assert!(h.target.is_none());
+                }
+                other => panic!("expected navigable Hyperlink, got {other:?}"),
+            },
+            _ => panic!("no paragraph"),
+        }
+        // Round-trips (the w:anchor survives).
+        assert_eq!(
+            parse_document_xml(&document_to_xml(&d), &Relationships::default()),
+            d
+        );
+
+        // A TOC entry (internal link carrying a tab) keeps the tab at top level
+        // (so its leader dots still render) AND stays navigable: the text on each
+        // side of the tab becomes a Hyperlink segment carrying the anchor.
+        let toc = "<w:document><w:body><w:p>\
+            <w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r>\
+              <w:r><w:tab/></w:r><w:r><w:t>9</w:t></w:r></w:hyperlink>\
+            </w:p></w:body></w:document>";
+        let d2 = parse_document_xml(toc, &Relationships::default());
+        match &d2.body[0] {
+            Block::Paragraph(p) => {
+                assert!(
+                    p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+                    "TOC tab dropped"
+                );
+                let links = p
+                    .content
+                    .iter()
+                    .filter(|i| matches!(i, Inline::Hyperlink(h) if h.anchor.as_deref() == Some("_Toc1")))
+                    .count();
+                assert_eq!(
+                    links, 2,
+                    "TOC text should be navigable on both sides of the tab"
+                );
+            }
+            _ => panic!("no paragraph"),
+        }
+        // Round-trips within the model.
+        assert_eq!(
+            parse_document_xml(&document_to_xml(&d2), &Relationships::default()),
+            d2
+        );
+    }
+
+    #[test]
     fn run_properties_roundtrip() {
         let props = RunProps {
             bold: true,
@@ -447,6 +783,7 @@ mod tests {
             size_half_pts: Some(28),
             font: Some("Calibri".to_string()),
             style_id: Some("Emphasis".to_string()),
+            ..Default::default()
         };
         let d = Document {
             body: vec![para(ParProps::default(), vec![run("styled", props)])],
@@ -511,6 +848,7 @@ mod tests {
             },
             indent: 720,
             first_line: -360,
+            ..Default::default()
         };
         let d = Document {
             body: vec![para(pp, vec![run("x", RunProps::default())])],
@@ -703,12 +1041,14 @@ mod tests {
             grid_span: span,
             v_merge: VMerge::None,
             blocks: vec![para(ParProps::default(), vec![run(s, RunProps::default())])],
+            ..Default::default()
         };
         let t = Table {
             grid: vec![100, 200],
             rows: vec![
                 Row {
                     cells: vec![cell("wide", 2)],
+                    ..Default::default()
                 },
                 Row {
                     cells: vec![
@@ -718,8 +1058,10 @@ mod tests {
                         },
                         cell("b", 1),
                     ],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let d = Document {
             body: vec![Block::Table(t)],

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>XlsxyCompare</AssemblyName>
+    <RootNamespace>XlsxyCompare</RootNamespace>
+    <!-- LibraryImport source-generated P/Invoke needs unsafe blocks enabled -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- `dotnet run` otherwise skips MSBuild (and so the cargo step below) when
+         the C# is unchanged; force the build chain so xlsxy is always rebuilt. -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+  </PropertyGroup>
+
+  <!-- Build the xlsxy release binary first, so `dotnet run` always launches the
+       current xlsxy (the launcher prefers target/release/xlsxy.exe). cargo is
+       incremental, so this is a no-op when xlsxy is unchanged. cargo isn't on
+       MSBuild's PATH, so resolve it from CARGO_HOME / the default rustup path. -->
+  <PropertyGroup>
+    <CargoExe Condition="'$(CARGO_HOME)' != ''">$(CARGO_HOME)\bin\cargo.exe</CargoExe>
+    <CargoExe Condition="'$(CargoExe)' == ''">$(USERPROFILE)\.cargo\bin\cargo.exe</CargoExe>
+  </PropertyGroup>
+  <Target Name="BuildXlsxy" BeforeTargets="Build">
+    <Exec Command="&quot;$(CargoExe)&quot; build --release -p xlsxy"
+          WorkingDirectory="$(MSBuildProjectDirectory)\.." />
+  </Target>
+
+</Project>

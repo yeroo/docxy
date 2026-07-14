@@ -71,6 +71,8 @@ pub enum Act {
     /// Add a comment on the selection / delete the selected comment.
     NewComment,
     DeleteComment,
+    /// Toggle the footnotes/endnotes side panel.
+    ToggleNotes,
     // View tab
     /// Reflowed reading view (page layout off).
     ReadMode,
@@ -537,7 +539,7 @@ fn review_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Comments",
-            width: 25,
+            width: 35,
             rows: [
                 vec![
                     btn("✎ New", 5, NewComment, "New comment on the selection"),
@@ -555,6 +557,13 @@ fn review_groups() -> Vec<Group> {
                         10,
                         ToggleComments,
                         "Show/hide the comments panel",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "▤ Notes",
+                        7,
+                        ToggleNotes,
+                        "Show/hide the footnotes/endnotes panel",
                     ),
                 ],
             ],

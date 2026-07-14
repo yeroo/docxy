@@ -1,0 +1,374 @@
+# xlsxy — Spreadsheets in the terminal: architecture & build plan
+
+A terminal editor for Microsoft Excel `.xlsx` workbooks, built on a headless,
+near-complete Excel **calculation engine**. Sibling of `docxy` (same repo, same
+philosophy: dependency-free cores, thin TUI shells, lossless round-trips).
+
+> **Name / crate / binary:** `xlsxy` (so `cargo install xlsxy` installs the
+> `xlsxy` command). The engine lives in the `gridcore` library crate.
+
+Unlike docxy — where the terminal view is deliberately a *reduced* rendering —
+xlsxy's ambition is **calculation fidelity**: the goal is near-100% of Excel as
+a calculation engine. Formatting is display-level only (number formats,
+bold/italic/color); reproducing Excel's visual styling is a non-goal.
+
+---
+
+## 1. Goals / non-goals
+
+**Goals**
+- Open, view, edit, create, and save `.xlsx` without corrupting them.
+- A **headless-first calculation engine** (`gridcore`): dependency-graph
+  recalculation, Excel-compatible semantics, embeddable as a library.
+- **Measured conformance**: recalculate real workbooks and diff against Excel's
+  own cached values — a scoreboard, not a claim (§8).
+- Grid editing UX with Excel muscle memory: formula bar, A1 navigation, range
+  selection, fill-down semantics, ref-translating copy/paste.
+- Lossless save: everything unmodeled (charts, pivots, conditional formatting,
+  print setup…) preserved byte-for-byte.
+- Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`.
+
+**Non-goals (at least initially)**
+- Full visual formatting *editing* (fonts, fills, borders); v1 renders what the
+  file specifies, it doesn't restyle.
+- VBA/macros (preserved, never executed).
+- Excel's pixel layout, embedded objects, form controls (preserved, not shown).
+
+**Long-range direction** (details in §9): pivot tables as a real aggregation
+engine, then a multi-table data model with relationships and measures — the
+seed of a BI product with `gridcore` as its core.
+
+---
+
+## 2. Workspace layout
+
+```
+opc/        shared OPC/container plumbing: zip, inflate, zipwrite, xml
+            (extracted from docxcore; std-only, zero deps)
+docxcore/   WordprocessingML engine (unchanged; re-exports opc modules so its
+            public API stays stable)
+gridcore/   SpreadsheetML engine: model, xlsx I/O, formulas, recalc, numfmt
+            (std-only, zero deps beyond opc)
+docxy/      document TUI (existing binary)
+xlsxy/      spreadsheet TUI + headless CLI (ratatui + arboard, like docxy)
+```
+
+Versioning: `docxcore`/`docxy` keep the shared workspace version; `opc`,
+`gridcore`, and `xlsxy` version independently (young crates move fast, docxy
+releases must not be forced by them).
+
+Why one repo: atomic cross-crate refactors while the shared layer stabilizes,
+one CI/release/corpus infrastructure. A future split (e.g. if `gridcore` grows
+its own community) is cheap with `git filter-repo`; the reverse is not.
+
+---
+
+## 3. gridcore: the model
+
+```
+Workbook
+  sheets: Vec<Sheet>
+  styles: Styles            # xf table → number format + bold/italic/color
+  shared: SharedStrings
+  date1904: bool
+Sheet
+  name: String
+  cells: BTreeMap<(row, col), Cell>    # sparse; (0-based row, col)
+  col_defs: Vec<ColDef>                # widths etc., preserved + editable width
+  row_attrs: BTreeMap<row, RawAttrs>   # heights etc., preserved verbatim
+  merges: Vec<Range>                   # rendered read-only, preserved on save
+Cell
+  value: CellValue           # Empty | Number(f64) | Text | Bool | Error
+  formula: Option<Formula>   # source text + parsed AST
+  style: u32                 # xf index, preserved
+```
+
+Numbers are `f64` (as in Excel); dates are serial numbers plus the workbook's
+1900/1904 flag, interpreted at display/function level. Text cells remember
+whether they came from a shared string so unedited rich-text cells keep their
+original `si` entry.
+
+---
+
+## 4. Load & save — the round-trip strategy
+
+Same strategy that keeps docx files safe, adapted to SpreadsheetML:
+
+**On load:** unzip; parse `xl/workbook.xml` (sheet list, 1904 flag),
+`xl/_rels/workbook.xml.rels`, `xl/sharedStrings.xml`, `xl/styles.xml`
+(display subset), and each worksheet's `<sheetData>` (+ `<cols>`,
+`<mergeCells>`). Keep **every part byte-for-byte**, including the original
+worksheet XML sources.
+
+**On save:**
+- Regenerate only `<sheetData>` (and `<cols>`/`<dimension>` when touched) and
+  **splice** it into the original worksheet XML — sheet-level features we don't
+  model (conditional formatting, data validation, drawings, sheet views) ride
+  along untouched. This is the spreadsheet analogue of docxy's `sectPr` splice.
+- Append new strings to `sharedStrings.xml` (existing entries untouched, so
+  unedited rich-text strings survive), update its counts.
+- Drop `xl/calcChain.xml` (its content-type override and relationship too) and
+  set `<calcPr fullCalcOnLoad="1"/>` — Excel rebuilds the chain and recalcs,
+  so a stale chain can never corrupt the file.
+- Shared formulas: cells that belonged to a shared-formula group are written as
+  ordinary per-cell formulas (expanded via ref translation, §5).
+- Write a STORED zip via `opc::zipwrite`, all other parts verbatim.
+
+**Fidelity gate:** load → save → reload is semantically identical; saved files
+open cleanly in Excel; a corpus round-trip test enforces it (§8).
+
+---
+
+## 5. The formula language
+
+`gridcore::formula` — lexer → parser → AST → evaluator, plus a **serializer**
+(AST → text), because several features are ref rewriting in disguise:
+
+- **Shared formulas** (`<f t="shared">`): expand the master by shifting
+  relative refs.
+- **Copy/paste**: Excel translates relative refs by the paste offset.
+- **Row/column insert/delete** (shipped): shift every affected ref across
+  the whole workbook — absolute or not — and `#REF!` the deleted ones.
+
+AST covers: numbers, strings, booleans, errors; refs with `$` anchoring and
+sheet qualifiers (`Sheet1!A1`, `'My Sheet'!A1`); ranges (incl. whole-row/col
+`A:A`, `1:1` — phase B); operators `+ - * / ^ % & = <> < <= > >=`, unary `±`,
+range/union/intersection; function calls. The node design leaves room for
+`LET`/`LAMBDA` closures (phase C) so dynamic arrays are additive, not a rewrite.
+
+**Value semantics** follow Excel: the eight error values (`#DIV/0!`, `#N/A`,
+`#NAME?`, `#NULL!`, `#NUM!`, `#REF!`, `#VALUE!`, `#SPILL!`) propagate through
+operators; empty cells coerce to `0`/`""` by context; booleans coerce to 1/0;
+text→number coercion in arithmetic; 15-significant-digit display.
+
+---
+
+## 6. The recalculation engine
+
+Dependency-graph recalc **from day one** (this is the spine; a full-recalc
+placeholder would be painful to retrofit):
+
+- Parse each formula once; extract its reference set (cells + ranges).
+- Maintain forward/reverse dependency edges. Editing a cell dirties its
+  dependents transitively; only dirty cells re-evaluate, in topological order.
+- **Cycles** → the affected cells evaluate to a cycle error rather than hanging
+  (Excel's iterative-calculation opt-in comes in phase B).
+- **Graceful degradation, never corruption:** a formula the engine can't parse
+  or evaluate (unknown function, unsupported construct) keeps Excel's cached
+  value, is never re-evaluated, and is saved byte-faithful. With
+  `fullCalcOnLoad` set, Excel recalculates on open. Partial coverage can make
+  a value *stale*, never *wrong by our hand*.
+- Volatile functions (`NOW`, `TODAY`, `RAND`…) and dynamic dependencies
+  (`INDIRECT`, `OFFSET`) are phase B: volatile cells dirty on every recalc;
+  dynamic refs report their resolved dependencies back to the graph after each
+  evaluation.
+
+Phase A ships ~100 core functions (math, aggregation, logic, text, basic
+lookup, date display); the registry is a table so growing toward Excel's ~500
+is data entry plus semantics tests, not architecture.
+
+---
+
+## 7. xlsxy: the TUI + headless CLI
+
+- **Grid view:** A/B/C column headers, row-number gutter, column widths from
+  the file, frozen formula bar (`A1 ▸ =SUM(B1:B9)`), sheet tabs, status bar
+  with Sum/Average/Count for the selection (like Excel's status bar).
+- **Editing:** type to replace, `F2` to edit in place, Enter/Tab commit and
+  move, Esc cancels; `=` starts a formula; Del clears; undo/redo.
+- **Navigation:** arrows, PgUp/PgDn, Ctrl-arrows (data-edge jump), Ctrl-Home,
+  mouse click/drag/wheel, click sheet tabs.
+- **Clipboard:** ranges copy as TSV to the OS clipboard (arboard, like docxy);
+  internal paste translates relative refs Excel-style.
+- **Display fidelity (read-only in v1):** number formats (General, dates,
+  percent), bold/italic/color resolved from `styles.xml`.
+- **Headless:** `--recalc out.xlsx` (load → full recalc → save) and
+  `--csv out.csv` — the engine with no terminal, scriptable and CI-testable.
+- Cross-suggestion: `docxy book.xlsx` says "try xlsxy"; `xlsxy report.docx`
+  says "try docxy".
+
+---
+
+## 8. Testing & the conformance scoreboard
+
+The strategic piece: **conformance is measured, not claimed.**
+
+- **Oracle harness:** every real `.xlsx` stores Excel's computed value cached
+  next to each formula. The harness loads a corpus, recalculates with
+  `gridcore`, and diffs against those cached values → a scoreboard
+  ("N% of M formula cells match") that drives function priorities and catches
+  semantic regressions. Starts in phase B; the phase-A fixture tests are its
+  embryo.
+- **Round-trip goldens:** load → save → reload, semantically identical; saved
+  bytes stay a valid OPC package; unmodeled parts byte-identical.
+- **Engine unit/property tests:** ref math (A1 ⇄ (row,col), translation),
+  coercion tables, per-function semantics incl. error propagation.
+- **Manual gate:** saved workbooks must open cleanly in real Excel.
+
+---
+
+## 9. Phased roadmap
+
+- **Phase A — Foundation (this branch)** ✅ *shipped.* `opc` extraction; `gridcore` model +
+  lossless xlsx I/O; formula parser/serializer; dependency-graph recalc;
+  ~100 functions; `xlsxy` grid TUI; headless `--recalc`/`--csv`; fixtures +
+  round-trip tests. *Acceptance:* real workbooks open/edit/save/reopen cleanly
+  in Excel; recalc matches cached values on fixtures; docxy untouched.
+- **Phase B — Conformance push** ✅ *shipped: oracle harness (`--verify` + corpus/xlsx CI gate); whole-row/col refs, defined names, INDIRECT/OFFSET, XLOOKUP/*IFS, date/financial/statistical batch; structured table refs; 3D sheet spans; iterative calculation; the full number-format runtime (real format-code rendering behind TEXT() and cell display). Corpus: 17 LibreOffice-oracle workbooks, 461/461 formula cells (100%), plus the round-trip/robustness suite in CI. Remaining (rolls forward): real-Excel corpus files.* Corpus oracle harness + scoreboard; function
+  coverage to ~300 (date/time, statistical, financial, text); defined names,
+  whole-row/col refs, 3D refs, structured table refs; `INDIRECT`/`OFFSET`
+  dynamic deps; volatile functions; iterative calculation; `TEXT()` and the
+  full number-format runtime.
+- **Phase C — Dynamic arrays** 🔄 *in progress: the spill engine shipped —
+  formulas whose results are arrays spill into neighboring cells with
+  `#SPILL!` blocking/recovery, ownership tracking (typing into a spill breaks
+  it, Excel-style), and spill-aware recalculation; `A1#` spill references
+  (stored as `_xlfn.ANCHORARRAY`), `@` implicit intersection (`_xlfn.SINGLE`),
+  array constants `{1,2;3,4}`, elementwise operator broadcasting, and `LET`;
+  array functions: `SEQUENCE`, `RANDARRAY`, `TRANSPOSE`, `SORT`, `SORTBY`,
+  `UNIQUE`, `FILTER`, `CHOOSEROWS`/`CHOOSECOLS`, `TAKE`/`DROP`,
+  `HSTACK`/`VSTACK`, `TOCOL`/`TOROW`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`; lookups
+  (`INDEX`/`MATCH`/`V·HLOOKUP`/`XLOOKUP`/`SUMPRODUCT`) accept computed arrays.
+  Anchors save as `<f t="array" ref="…">` with cached spill values, so other
+  engines read the results. `LAMBDA` shipped too: first-class function values
+  with lexical `LET` capture, immediate invocation `LAMBDA(x,…)(v)`, named
+  custom functions through workbook defined names (with dependency tracking
+  into the lambda body), and the functional battery —
+  `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`. Scalar functions lift
+  elementwise over array arguments (`ABS(A1:A3)` spills;
+  `IF(A1:A3>0,"y","n")` lifts while scalar `IF` stays lazily branched).
+  Optional lambda parameters shipped: `LAMBDA(x,[y],…)` with `ISOMITTED`
+  (omitted arguments bind as blank). Remaining: dynamic-array oracle
+  coverage (needs LibreOffice 24.8+/real Excel — 24.2 predates these
+  functions).* Spill semantics + `#SPILL!`; `FILTER`, `SORT`, `UNIQUE`,
+  `SEQUENCE`, `XLOOKUP`; `LET`/`LAMBDA` (closures).
+- **Phase D — Pivot engine** 🔄 *in progress: the columnar query core
+  (`gridcore::frame`) shipped — `Frame` snapshots of ranges/Tables,
+  group-by on rows and columns, all eleven pivot aggregations
+  (sum/count/countNums/average/max/min/product/stdDev(p)/var(p)), filters,
+  grand totals, Excel's case-insensitive grouping and default ascending
+  sort. Pivot parts (`pivotTableDefinition` + `pivotCacheDefinition`, wired
+  through workbook `pivotCaches`) parse read-only into the model, and
+  **refresh** recomputes the output region from current source data:
+  `xlsxy --recalc` refreshes headlessly, `F9` refreshes in the TUI, save
+  patches the location ref and sets `refreshOnLoad="1"` so real Excel
+  rebuilds its own layout from the same definition. Pivots using features
+  we don't model — page filters, hidden items, calculated fields,
+  measures-on-rows — are never refreshed (stale-not-wrong). Pivot *editing*
+  shipped too: `Ctrl-P` opens a field editor in the TUI (add fields to
+  rows/columns/values, remove them, cycle aggregations) with live refresh
+  after every change; save rewrites the edited definition part
+  (regenerated `pivotFields`/`rowFields`/`colFields`/`dataFields`, stale
+  `rowItems`/`colItems` dropped, styles preserved) so the layout round-trips
+  and real Excel rebuilds from it. Subtotal rows shipped: outer row-field
+  groups get "<value> Total" control-break rows (Excel's default with
+  nested row fields, honoring `defaultSubtotal="0"` opt-outs). Creating pivots
+  from scratch shipped: `Ctrl-P` on a data selection (or inside a Table)
+  writes real pivotCacheDefinition + pivotTableDefinition parts with full
+  OPC wiring, lands the pivot on a fresh sheet, and opens the field editor
+  — validated externally (openpyxl parses the created pivot; LibreOffice
+  opens it as a genuine pivot table and regenerates its own cache records).
+  Remaining: real-Excel pivot corpus files.* Pivot parts parsed (already preserved from A);
+  a **columnar snapshot + group-by/aggregate query layer**, deliberately
+  format-independent; pivot refresh/edit in the TUI. The query layer — not the
+  XML — is the point: it is the aggregation core everything later builds on.
+- **Phase E — Data model** 🔄 *in progress: the core shipped as
+  `gridcore::model`. A `DataModel` holds named `Frame`s (from workbook
+  Tables, CSV via the std-only `Frame::from_csv` parser, or built
+  programmatically), **many-to-one relationships** (`Sales[ProductID]` →
+  `Products[ID]`, one-side uniqueness enforced), and named **measures**
+  written in ordinary Excel formula syntax over `Table[Column]` references —
+  the whole gridcore function library works inside measures
+  (`SUM(Sales[Amount])/SUM(Sales[Qty])`, `SUMIFS`, `SUMPRODUCT`, …), and
+  measures compose by name. `expanded_frame` joins related dimension
+  columns transitively (star schema, `RELATED`-style blanks for unmatched
+  keys); `model_pivot` groups by any related column and evaluates measures
+  per group with **filter context** propagated through the relationships.
+  xlsxy opens `.csv` files directly (imported as a workbook, saved as
+  `.xlsx`). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
+  relationships, measures) with prompt-driven editing — `r` relates
+  `Sales[PID] = Products[ID]` (validated against the live tables), `m`
+  defines `Total = SUM(Sales[Amount])`, `p` materializes a report
+  (`Base; rows; values[; cols]`) into a fresh sheet, `d` deletes.
+  Definitions persist across save/load in a custom `xl/gridcoreModel.xml`
+  part (a gridcore extension — Excel ignores it; our round-trip keeps it).
+  DAX-style row-context iterators shipped: `SUMX`/`AVERAGEX`/`MAXX`/
+  `MINX`/`COUNTX`/`COUNTAX` evaluate an expression once per table data row
+  with bare `[@Col]` references bound to that row — in sheet formulas over
+  Excel Tables (with whole-table dependency tracking) and in model
+  measures, where filter context restricts the iterated rows. Delimited
+  imports sniff their separator (comma/semicolon/tab; `.tsv` opens
+  directly). Remaining: more sources (JSON, databases).* Multiple
+  tables, relationships, measures over the phase-D query core; sources
+  beyond xlsx (CSV first). Headless-first: by this point `gridcore` is a
+  small BI engine that happens to have a terminal frontend.
+
+- **Phase F — Breadth push** ✅ *shipped: a wide worksheet-function
+  expansion so real workbooks stop hitting `#NAME?`. Added families across
+  the library — financial (`IPMT`/`PPMT`, `SLN`/`SYD`/`DDB`/`DB`,
+  `EFFECT`/`NOMINAL`, `MIRR`/`XNPV`/`XIRR`, `CUMIPMT`/`CUMPRINC`,
+  `PDURATION`/`RRI`/`ISPMT`/`DOLLARDE`/`DOLLARFR`); statistics
+  (`CORREL`/`PEARSON`/`SLOPE`/`INTERCEPT`/`RSQ`/`FORECAST`, `COVARIANCE.*`,
+  `DEVSQ`/`AVEDEV`/`GEOMEAN`/`HARMEAN`/`STANDARDIZE`/`TRIMMEAN`,
+  `SKEW`/`KURT`/`FISHER`/`FISHERINV`, `PERCENTRANK`/`PERCENTILE.EXC`/
+  `QUARTILE.EXC`, the `…A` variants); date/time (`DATEVALUE`/`TIMEVALUE`,
+  `YEARFRAC`, `DAYS360`, `WORKDAY`/`NETWORKDAYS` incl. `.INTL`); text
+  (`TEXTBEFORE`/`TEXTAFTER`/`TEXTSPLIT`, `DOLLAR`/`FIXED`); lookup/info
+  (`XMATCH`, `ADDRESS`, `ERROR.TYPE`, `TYPE`); math (`MROUND`, `ROMAN`/
+  `ARABIC`, `BASE`/`DECIMAL`, `SQRTPI`, `SUMX2MY2`-family, `COMBINA`/
+  `FACTDOUBLE`, the hyperbolic/reciprocal trig set, matrix `MMULT`/
+  `MINVERSE`/`MDETERM`/`MUNIT`); engineering (`BITAND`-family, `DEC2BIN`/
+  `HEX2DEC` and all cross-base conversions, `DELTA`/`GESTEP`); and the full
+  database family (`DSUM`/`DCOUNT`/`DGET`/…). Each batch lands with
+  Microsoft-documented conformance tests; the corpus stays 461/461. Twin
+  of docxy's browser, `compare-xlsx/` tiles xlsxy next to Excel over the
+  xlsx corpus classified by `corpus/tools/classify_xlsx.py` (search by
+  feature tag or worksheet-function name).*
+
+- **Phase G — Review & comments** ✅ *shipped: cell comments, modelled the
+  same way docxy handles Word review comments. `gridcore::comments` reads
+  both legacy `xl/comments*.xml` notes and modern threaded conversations
+  (resolving authors through `xl/persons`), and authors legacy notes with
+  the full OPC wiring — comments part, VML note box, worksheet
+  `<legacyDrawing>` hook, content types, relationships — so a note written
+  in xlsxy opens as a real note in Excel and survives round-trips. xlsxy
+  grew a Word/Excel-style **ribbon** (F9 to engage; Home / Insert / Review /
+  View tabs, mouse- and keyboard-driven) whose **Review** tab drives the
+  comment lifecycle: New, Delete, Prev/Next navigation, and a toggleable
+  side panel. Commented cells are underlined in the grid (the terminal
+  analogue of Excel's red triangle).*
+
+- **Phase H — UX parity with docxy** ✅ *shipped: xlsxy grew the editor
+  chrome docxy already had, translated to a grid. A **File backstage**
+  (New / Open / Info / Save As / Export CSV) with a folder browser + live
+  workbook preview, and a **welcome screen** on launch with no file.
+  **Cell-formatting authoring** — bold/italic, font & fill color,
+  horizontal alignment, and number format via the Home ribbon + pickers,
+  backed by a new gridcore `styles.xml` *append-writer* (`Styles::intern`
+  + `splice_styles`) that adds fonts/fills/numFmts/xfs without disturbing
+  a single existing style byte, so it round-trips. **View toggles**:
+  formula view (Ctrl+`), freeze panes, light/dark theme, ribbon
+  auto-hide, all persisted to `~/.config/xlsxy/view.conf`. **Navigation**:
+  Find & Replace (Ctrl+H, literal replace across formulas and values) and
+  Go To (Ctrl+G) for A1 refs, `Sheet!A1`, and defined names. And a
+  **`--vim` modal mode**: Normal/Visual/VisualLine with hjkl, `gg`/`G`/
+  `0`/`$`, `w`/`b`, `i`/`a`/`c`, `x`, `v`/`V`, `dd`/`yy`/`p`, `u`/Ctrl-R,
+  and a `:` command line (`:w :q :wq :x :q!`).*
+
+Each phase ships independently through the existing signed-release pipeline.
+
+---
+
+## 10. Risks & mitigations
+
+- **Excel semantics are deep** (coercions, date bug, criteria matching,
+  floating-point display). Mitigation: the oracle scoreboard makes gaps
+  visible and rankable instead of anecdotal.
+- **Regenerating `<sheetData>` near unmodeled features** (tables, data
+  validation ranges) — mitigated by splicing into the original XML and
+  preserving all sibling elements; corpus round-trips guard it.
+- **Recalc performance on large sheets** — dirty propagation bounds work to
+  the affected subgraph; sparse storage keeps memory proportional to content;
+  columnar snapshots (phase D) are the long-term answer for aggregation loads.
+- **Two TUIs drift apart** — accepted for now; shared chrome is extracted
+  *after* xlsxy exists, when what's actually common is known.

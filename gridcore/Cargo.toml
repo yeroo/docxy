@@ -1,0 +1,35 @@
+[package]
+name = "gridcore"
+description = "Dependency-free XLSX (SpreadsheetML) engine: workbook model, lossless I/O, and an Excel-compatible formula/recalculation engine."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["xlsx", "excel", "spreadsheet", "ooxml", "formula"]
+categories = ["parser-implementations", "mathematics"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — keep this crate pure and auditable. The one
+# dependency is our own shared OPC container layer (also std-only).
+opccore = { version = "0.1.0", path = "../opccore" }
+
+[dev-dependencies]
+# Dev-only, and gated behind the `bench` feature (see [[bench]] below) so
+# normal + MSRV `--all-targets` builds never pull criterion's tree.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[features]
+# Enable to compile/run the benchmarks: `cargo bench -p gridcore --features bench`.
+bench = []
+
+[[bench]]
+name = "engine"
+harness = false
+required-features = ["bench"]

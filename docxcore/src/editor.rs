@@ -1378,6 +1378,8 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::Equation { .. }
         | Inline::Field { .. }
         | Inline::TextBox { .. }
+        | Inline::Revision { .. }
+        | Inline::FootnoteRef { .. }
         | Inline::Raw(_) => 0,
     }
 }
@@ -1451,6 +1453,16 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             Inline::TextBox { raw, blocks } => out.push(Inline::TextBox {
                 raw: raw.clone(),
                 blocks: blocks.clone(),
+            }),
+            Inline::Revision { kind, raw, content } => out.push(Inline::Revision {
+                kind: *kind,
+                raw: raw.clone(),
+                content: content.clone(),
+            }),
+            Inline::FootnoteRef { id, endnote, raw } => out.push(Inline::FootnoteRef {
+                id: *id,
+                endnote: *endnote,
+                raw: raw.clone(),
             }),
             Inline::Raw(s) => out.push(Inline::Raw(s.clone())),
         }
@@ -1536,6 +1548,8 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Equation { .. }
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
+                | Inline::Revision { .. }
+                | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
                         if i > 0 {
@@ -1611,6 +1625,8 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Equation { .. }
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
+                | Inline::Revision { .. }
+                | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
                 }
@@ -1686,6 +1702,8 @@ fn range_all_have(
             | Inline::Equation { .. }
             | Inline::Field { .. }
             | Inline::TextBox { .. }
+            | Inline::Revision { .. }
+            | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => {} // zero-length
         }
     }
@@ -2403,6 +2421,7 @@ mod tests {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: vec![para(s)],
+            ..Default::default()
         };
         Document {
             body: vec![
@@ -2412,11 +2431,14 @@ mod tests {
                     rows: vec![
                         Row {
                             cells: vec![cell("A"), cell("B")],
+                            ..Default::default()
                         },
                         Row {
                             cells: vec![cell("C"), cell("D")],
+                            ..Default::default()
                         },
                     ],
+                    ..Default::default()
                 }),
                 para("after"),
             ],

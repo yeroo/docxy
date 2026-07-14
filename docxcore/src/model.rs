@@ -46,6 +46,10 @@ pub struct RunProps {
     pub font: Option<String>,
     /// Character style id (`w:rStyle`).
     pub style_id: Option<String>,
+    /// Verbatim XML of `w:rPr` children we don't model (character spacing
+    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), preserved so save
+    /// doesn't drop them. Re-emitted at the end of `w:rPr`.
+    pub raw_props: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -126,9 +130,38 @@ pub enum Inline {
         raw: String,
         text: String,
     },
+    /// A tracked change: `<w:ins>` (insertion) or `<w:del>` (deletion). `raw` is
+    /// the original element preserved verbatim for lossless save; `content` is the
+    /// inner inline content with a display style baked in (deletions struck
+    /// through) so it renders visibly instead of vanishing into opaque `Raw`.
+    Revision {
+        kind: RevisionKind,
+        raw: String,
+        content: Vec<Inline>,
+    },
+    /// A footnote / endnote reference (`<w:footnoteReference>` /
+    /// `<w:endnoteReference>`). `id` is the note id (also its display number for
+    /// normal documents, whose notes are numbered 1, 2, 3…); `raw` is the whole
+    /// reference run, preserved verbatim so save keeps the anchor (otherwise the
+    /// notes part is orphaned). Rendered as a superscript marker; the note body
+    /// lives in `word/footnotes.xml` / `endnotes.xml` (see [`crate::notes`]).
+    FootnoteRef {
+        id: i32,
+        endnote: bool,
+        raw: String,
+    },
     /// Verbatim XML for inline content we don't model (images/bookmarks),
     /// preserved so save stays lossless. Zero-length and invisible for now.
     Raw(String),
+}
+
+/// The kind of a tracked change ([`Inline::Revision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionKind {
+    /// `<w:ins>` — inserted content.
+    Insert,
+    /// `<w:del>` — deleted content (shown struck through).
+    Delete,
 }
 
 impl Inline {
@@ -148,6 +181,8 @@ impl Inline {
                 .map(|b| b.plain_text())
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Inline::Revision { content, .. } => content.iter().map(|i| i.text()).collect(),
+            Inline::FootnoteRef { id, .. } => id.to_string(),
             Inline::Raw(_) => String::new(),
         }
     }
@@ -183,6 +218,10 @@ pub struct ParProps {
     /// (first line pulled left of the rest, as in lists/bibliographies). Zero =
     /// every line shares `indent`.
     pub first_line: i32,
+    /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`, spacing
+    /// `w:spacing`, `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
+    /// silently drop them. Re-emitted in `w:pPr` in document order.
+    pub raw_props: Vec<String>,
 }
 
 /// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
@@ -301,6 +340,9 @@ pub struct PageGeom {
     pub cols: i32,
     /// Space between columns, in twips (`w:cols w:space`).
     pub col_space: i32,
+    /// The section declares decorative page borders (`w:pgBorders`), drawn in the
+    /// page view as a double-line frame.
+    pub page_border: bool,
 }
 
 impl Default for PageGeom {
@@ -315,6 +357,7 @@ impl Default for PageGeom {
             mb: 1440,
             cols: 1,
             col_space: 720,
+            page_border: false,
         }
     }
 }
@@ -347,6 +390,7 @@ impl PageGeom {
             mb: attr("<w:pgMar", "w:bottom", d.mb),
             cols: attr("<w:cols", "w:num", d.cols).max(1),
             col_space: attr("<w:cols", "w:space", d.col_space).max(0),
+            page_border: sect.contains("<w:pgBorders"),
         }
     }
 }
@@ -379,6 +423,11 @@ pub struct Cell {
     pub grid_span: u32,
     pub v_merge: VMerge,
     pub blocks: Vec<Block>,
+    /// The cell's entire `w:tcPr` verbatim (borders, shading, width, vAlign, …),
+    /// preserved so save round-trips cell formatting. `grid_span`/`v_merge` are
+    /// also parsed out of it for rendering; when present it is re-emitted as-is
+    /// instead of regenerating tcPr from the model. `None` for a new cell.
+    pub raw_tcpr: Option<String>,
 }
 
 impl Default for Cell {
@@ -387,6 +436,7 @@ impl Default for Cell {
             grid_span: 1,
             v_merge: VMerge::None,
             blocks: Vec::new(),
+            raw_tcpr: None,
         }
     }
 }
@@ -394,6 +444,9 @@ impl Default for Cell {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row {
     pub cells: Vec<Cell>,
+    /// Verbatim `w:trPr` / `w:tblPrEx` XML (row height, header flag, exceptions),
+    /// preserved so save doesn't drop row formatting. Re-emitted in document order.
+    pub raw_props: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -401,6 +454,9 @@ pub struct Table {
     /// Column widths in twips (`w:tblGrid`/`w:gridCol`).
     pub grid: Vec<u32>,
     pub rows: Vec<Row>,
+    /// The table's entire `w:tblPr` verbatim (borders, shading, width, style,
+    /// look, layout), preserved so save round-trips table formatting.
+    pub raw_tblpr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -653,6 +653,223 @@ mod tests {
         assert!(decode(b"not a compound file").is_none());
     }
 
+    #[test]
+    fn rejects_short_or_wrong_version() {
+        // Fewer than 5 header bytes, and a non-v3 version byte, both fail.
+        assert!(decode_mtef(&[3, 0, 0]).is_none());
+        assert!(decode_mtef(&[4, 0, 0, 0, 0, 2, 1, 0x78, 0]).is_none());
+    }
+
+    #[test]
+    fn empty_body_yields_none() {
+        // A valid header with no records has nothing to render.
+        assert_eq!(dec(&[]), None);
+    }
+
+    #[test]
+    fn decodes_a_single_char() {
+        assert_eq!(dec(&chr('x')).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn decodes_a_char_run() {
+        let mut body = chr('x');
+        body.extend(chr('y'));
+        assert_eq!(dec(&body).as_deref(), Some("xy"));
+    }
+
+    #[test]
+    fn skips_invalid_codepoint_char() {
+        // A lone surrogate (U+D800) is not a scalar value and is dropped.
+        let mut body = vec![0x02, 0x01, 0x00, 0xd8];
+        body.extend(chr('x'));
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_small_lmove_nudge_on_char() {
+        // XF_LMOVE (0x80) sets a 2-byte nudge before the typeface/char.
+        let body = [0x82, 0x05, 0x05, 0x01, 0x78, 0x00];
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_large_lmove_nudge_on_char() {
+        // dx==dy==128 signals a 6-byte nudge (two extra WORDs).
+        let body = [0x82, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x78, 0x00];
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_font_record() {
+        // FONT (type 8): typeface, style, null-terminated name — all ignored.
+        let mut body = vec![0x08, 0x00, 0x00, 0x41, 0x00];
+        body.extend(chr('x'));
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_ruler_and_size_records() {
+        // RULER (type 7) with no stops, then SIZE (type 9) short form.
+        let mut body = vec![0x07, 0x00, 0x09, 0x05, 0x00];
+        body.extend(chr('x'));
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_typesize_shorthand() {
+        // TYPESIZE shorthands (types 10..=14) carry no payload.
+        let mut body = vec![0x0a];
+        body.extend(chr('x'));
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn decodes_fraction_template() {
+        // TMPL selector 14 = fraction: "(num)/(den)".
+        let body = tmpl(14, &[&chr('a'), &chr('b')]);
+        assert_eq!(dec(&body).as_deref(), Some("(a)/(b)"));
+    }
+
+    #[test]
+    fn decodes_subsuperscript_template() {
+        // TMPL selector 15: slot0 → subscript, slot1 → superscript.
+        let body = tmpl(15, &[&chr('2'), &chr('2')]);
+        assert_eq!(dec(&body).as_deref(), Some("₂²"));
+    }
+
+    #[test]
+    fn subscript_falls_back_when_unmappable() {
+        // 'q' has no Unicode subscript, so the marker form "_(q)" is used.
+        let body = tmpl(15, &[&chr('q')]);
+        assert_eq!(dec(&body).as_deref(), Some("_(q)"));
+    }
+
+    #[test]
+    fn decodes_square_root() {
+        // TMPL selector 9 with an empty index slot is a plain square root.
+        let body = tmpl(9, &[&chr('x')]);
+        assert_eq!(dec(&body).as_deref(), Some("√(x)"));
+    }
+
+    #[test]
+    fn decodes_nth_root_with_mapped_index() {
+        // Index 'n' maps to the Unicode superscript ⁿ.
+        let body = tmpl(9, &[&chr('x'), &chr('n')]);
+        assert_eq!(dec(&body).as_deref(), Some("ⁿ√(x)"));
+    }
+
+    #[test]
+    fn nth_root_index_falls_back_when_unmappable() {
+        // A multi-letter index has no superscript form → "^(ab)".
+        let mut ab = chr('a');
+        ab.extend(chr('b'));
+        let body = tmpl(9, &[&chr('x'), &ab]);
+        assert_eq!(dec(&body).as_deref(), Some("^(ab)√(x)"));
+    }
+
+    #[test]
+    fn decodes_paren_fence() {
+        // TMPL selector 1 = parentheses around its single slot.
+        let body = tmpl(1, &[&chr('x')]);
+        assert_eq!(dec(&body).as_deref(), Some("(x)"));
+    }
+
+    #[test]
+    fn drops_empty_fence_placeholder() {
+        // A fence (selector ≤ 5) around an empty slot is a MathType placeholder
+        // and is dropped, leaving the preceding char intact.
+        let mut body = chr('x');
+        body.extend([0x03, 0x01, 0x00, 0x00, 0x11, 0x00]); // TMPL sel1, NULL slot, END
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn unknown_selector_keeps_content() {
+        // An unmodelled selector lays its slots out in a row (no decoration).
+        let body = tmpl(20, &[&chr('x')]);
+        assert_eq!(dec(&body).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn decodes_pile_as_vertical_stack() {
+        // PILE (type 4): a column of lines, stacked top to bottom.
+        let mut body = vec![0x04, 0x00, 0x00];
+        body.extend(line(&chr('a')));
+        body.extend(line(&chr('b')));
+        body.push(0x00); // END slots
+        assert_eq!(dec(&body).as_deref(), Some("a\nb"));
+    }
+
+    #[test]
+    fn decodes_matrix_grid() {
+        // MATRIX (type 5): a 2×2 grid laid out with aligned columns.
+        let mut body = vec![
+            0x05, // MATRIX
+            0x00, // v-align
+            0x00, // h-just
+            0x00, // v-just
+            0x02, // rows
+            0x02, // cols
+            0x00, // row line-partition bits
+            0x00, // col line-partition bits
+        ];
+        for c in ['a', 'b', 'c', 'd'] {
+            body.extend(line(&chr(c)));
+        }
+        assert_eq!(dec(&body).as_deref(), Some("a  b\nc  d"));
+    }
+
+    #[test]
+    fn decode_equation_native_strips_header() {
+        // EQNOLEFILEHDR.cbHdr (first WORD) points past the header to the MTEF.
+        let stream = [
+            0x04, 0x00, 0x00, 0x00, // cbHdr = 4, then 2 filler header bytes
+            0x03, 0x00, 0x00, 0x00, 0x00, // MTEF header
+            0x02, 0x01, 0x78, 0x00, // CHAR 'x'
+        ];
+        assert_eq!(decode_equation_native(&stream).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn decode_equation_native_rejects_oversize_header() {
+        // A cbHdr larger than the stream leaves no MTEF body.
+        assert!(decode_equation_native(&[0xff, 0xff, 0x00, 0x00]).is_none());
+    }
+
+    // ---- MTEF stream builders --------------------------------------------
+
+    /// Prepend the 5-byte MTEF v3 header to `body` and decode it.
+    fn dec(body: &[u8]) -> Option<String> {
+        let mut m = vec![3u8, 0, 0, 0, 0];
+        m.extend_from_slice(body);
+        decode_mtef(&m)
+    }
+
+    /// A CHAR record for an ASCII scalar: type 2, typeface 1, then the codepoint.
+    fn chr(c: char) -> Vec<u8> {
+        let u = c as u32;
+        vec![0x02, 0x01, (u & 0xff) as u8, ((u >> 8) & 0xff) as u8]
+    }
+
+    /// Wrap record `content` in a LINE record (type 1) terminated by END.
+    fn line(content: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x01];
+        v.extend_from_slice(content);
+        v.push(0x00); // END of the line's object list
+        v
+    }
+
+    /// A TMPL record (type 3) with `selector` and one LINE per slot.
+    fn tmpl(selector: u8, slots: &[&[u8]]) -> Vec<u8> {
+        let mut v = vec![0x03, selector, 0x00, 0x00]; // selector, variation, options
+        for s in slots {
+            v.extend(line(s));
+        }
+        v.push(0x00); // END of the slot list
+        v
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         (0..s.len() / 2)

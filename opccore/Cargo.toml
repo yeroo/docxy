@@ -1,0 +1,33 @@
+[package]
+name = "opccore"
+description = "Dependency-free OPC container plumbing shared by docxcore and gridcore: ZIP read/write, DEFLATE, and a minimal XML pull parser."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["ooxml", "opc", "zip", "deflate", "xml"]
+categories = ["parser-implementations", "compression"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — keep this crate pure and auditable.
+
+[dev-dependencies]
+# Dev-only, and gated behind the `bench` feature (see [[bench]] below) so
+# normal + MSRV `--all-targets` builds never pull criterion's tree.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[features]
+# Enable to compile/run the benchmarks: `cargo bench -p opccore --features bench`.
+bench = []
+
+[[bench]]
+name = "opc"
+harness = false
+required-features = ["bench"]

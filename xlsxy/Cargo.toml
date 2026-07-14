@@ -1,0 +1,35 @@
+[package]
+name = "xlsxy"
+description = "Xlsxy — a fast terminal (TUI) viewer and editor for Microsoft Excel .xlsx workbooks, with a real recalculation engine."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["xlsx", "excel", "spreadsheet", "tui", "editor"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "xlsxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Path + version so `xlsxy` can be published once `gridcore` is on crates.io.
+gridcore = { version = "0.1.0", path = "../gridcore" }
+# ratatui re-exports crossterm, so we don't depend on crossterm separately.
+ratatui = "0.29"
+# OS clipboard bridge (copy/paste across applications), same as docxy.
+arboard = "3"
+# Display-column widths for correct grid alignment + mouse hit-testing with
+# wide (CJK/emoji) glyphs. Already in ratatui's tree.
+unicode-width = "0.2"
+# Inline images for embedded pictures (kitty/iTerm2/Sixel, half-block fallback).
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+# Only the raster formats a workbook embeds; avoids heavy AVIF/AV1 codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }

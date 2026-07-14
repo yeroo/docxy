@@ -118,6 +118,7 @@ impl StyleSheet {
             size_half_pts: direct.size_half_pts.or(agg.size),
             font: direct.font.clone().or_else(|| agg.font.clone()),
             style_id: direct.style_id.clone(),
+            ..Default::default()
         }
     }
 

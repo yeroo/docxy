@@ -1,6 +1,7 @@
 # Docxy
 
 [![CI](https://github.com/yeroo/docxy/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/docxy/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/yeroo/docxy/graph/badge.svg)](https://codecov.io/gh/yeroo/docxy)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yeroo/docxy/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/docxy)
 [![crates.io](https://img.shields.io/crates/v/docxy.svg)](https://crates.io/crates/docxy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -126,15 +127,61 @@ docxy in.md    --docx out.docx  # convert Markdown → Word
 | F8 · F9 | insert landscape · portrait section at cursor |
 | mouse | click to move · click a link to open · wheel/drag to scroll/select |
 
+## Xlsxy — spreadsheets too
+
+The workspace now ships a sibling app: **`xlsxy`**, a terminal editor for
+Microsoft Excel `.xlsx` workbooks built on `gridcore`, a dependency-free
+SpreadsheetML engine with a real **recalculation engine** — a dependency
+graph over your formulas, ~170 Excel functions, Excel-faithful semantics
+(error values, coercions, the 1900 leap-year quirk), whole-column
+references, defined names, structured table references, 3D sheet spans,
+`INDIRECT`/`OFFSET`, `XLOOKUP` and the `*IFS` family, the full
+number-format runtime, **dynamic arrays** (`FILTER`/`SORT`/`UNIQUE`/
+`SEQUENCE` spill into neighboring cells, `A1#` spill references, `@`,
+`LET`, `#SPILL!` blocking and recovery), **`LAMBDA`** (custom functions via
+defined names, `MAP`/`REDUCE`/`SCAN`/`BYROW`/`BYCOL`/`MAKEARRAY`,
+elementwise lifting like `ABS(A1:A3)`), **pivot-table refresh and editing** (a
+columnar group-by/aggregate engine recomputes pivots from current data —
+`F9` in the TUI, automatic under `--recalc`; `Ctrl-P` edits a pivot's
+fields — or creates a new pivot from the selected data range), a **data model**
+(`gridcore::model`: multiple tables with relationships, Excel-formula
+measures plus DAX-style row-context iterators like
+`SUMX(Sales,[@Qty]*[@Price])`, filter context through star schemas, CSV
+sources — `xlsxy data.csv` imports directly; `Ctrl-M` manages the model in
+the TUI and materializes reports, with definitions persisted in the file), and the
+same lossless
+round-trip guarantee: anything it doesn't model (charts, pivots, conditional
+formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
+Excel's cached results and are saved untouched.
+
+```sh
+xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
+xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
+xlsxy in.xlsx --csv out.csv       # headless: export the first sheet as CSV
+xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
+                                  # against cached values (461/461 = 100%
+                                  # on the LibreOffice-oracle corpus)
+```
+
+Type to replace, `F2` to edit, `=` starts a formula; copy/paste and
+fill-down translate relative references like Excel; insert/delete rows and
+columns rewrites every affected formula workbook-wide; find, Save As, and
+sheet add/rename/delete round out the basics; range selections show
+Sum/Average/Count in the status bar. Try it: `cargo run -p gridcore --example gen_sample_xlsx &&
+xlsxy assets/sample.xlsx`. The design and roadmap (conformance scoreboard,
+dynamic arrays, pivot engine) live in [SPREADSHEET.md](SPREADSHEET.md).
+
 ## Install
 
 ```sh
-cargo install docxy
+cargo install docxy   # the document editor
+cargo install xlsxy   # the spreadsheet editor
 ```
 
-Or grab a prebuilt binary (Linux / Windows / macOS) from the
-[latest release](https://github.com/yeroo/docxy/releases/latest) — each is
-checksummed, cosign-signed, and carries a build-provenance attestation.
+Or grab prebuilt binaries (Linux / Windows / macOS) from the
+[latest release](https://github.com/yeroo/docxy/releases/latest) — both apps
+ship with every release, each checksummed, cosign-signed, and carrying a
+build-provenance attestation.
 
 ## Image support
 
@@ -156,18 +203,24 @@ cargo build --release
 cargo test
 ```
 
-The workspace has two crates:
+The workspace has five crates:
 
-- **`docxcore`** — pure, `std`-only OOXML I/O (ZIP/DEFLATE/XML, the document model,
-  rendering, and the from-scratch PDF writer). No third-party dependencies.
-- **`docxy`** — the terminal UI (ratatui), clipboard (arboard), and image rendering
-  (ratatui-image).
+- **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
+  DEFLATE, XML pull parser) shared by both engines.
+- **`docxcore`** — the WordprocessingML engine (document model, rendering,
+  and the from-scratch PDF writer). No third-party dependencies.
+- **`gridcore`** — the SpreadsheetML engine (workbook model, formula
+  parser/evaluator, dependency-graph recalculation, lossless xlsx I/O).
+- **`docxy`** — the document TUI (ratatui), clipboard (arboard), and image
+  rendering (ratatui-image).
+- **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).
 
 ### Examples
 
 ```sh
 cargo run -p docxcore --example gen_sample [out.docx]   # build the showcase doc
 cargo run -p docxcore --example dump_doc -- assets/sample.docx   # inspect a .docx
+cargo run -p gridcore --example gen_sample_xlsx   # build the showcase workbook
 ```
 
 ## License

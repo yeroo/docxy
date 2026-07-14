@@ -41,7 +41,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -82,9 +82,25 @@ fn format_for(path: &str) -> DocFormat {
     }
 }
 
+/// The terminal window title: `* AppName - filename` (the `* ` only when the
+/// document has unsaved changes).
+fn window_title(app: &str, path: &str, dirty: bool) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    format!("{}{app} - {name}", if dirty { "* " } else { "" })
+}
+
 /// Load a file into a package, parsing Markdown into a numbered package when the
 /// path is a `.md`. Returns the package and the format it was read as.
 fn load_input(path: &str) -> Result<(Package, DocFormat), String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+        return Err(format!(
+            "{path} is a spreadsheet, not a document — try: xlsxy {path}"
+        ));
+    }
     let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     match format_for(path) {
         DocFormat::Markdown => {
@@ -682,6 +698,11 @@ struct App {
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
+    /// Document-level notices surfaced on open (protection state, watermark text,
+    /// page borders) — Word features docxy shows but doesn't render/enforce.
+    doc_protection: Option<String>,
+    doc_watermark: Option<String>,
+    doc_page_borders: bool,
     scroll: usize,
     viewport_h: usize,
     page_view: bool,
@@ -725,6 +746,12 @@ struct App {
     comments_scroll: usize,
     /// The comments panel rect (set by draw() for wheel hit-testing).
     comments_rect: Rect,
+    /// Footnotes/endnotes parsed from the package, shown in a side panel.
+    notes: Vec<docxcore::notes::Note>,
+    show_notes: bool,
+    notes_scroll: usize,
+    /// The notes panel rect (set by draw() for wheel hit-testing).
+    notes_rect: Rect,
     /// In page view, how far the canvas is scrolled right to reveal the comments
     /// that sit beside the (un-shrunk) page. 0 = comments off-screen.
     comments_hscroll: usize,
@@ -842,6 +869,7 @@ impl App {
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
+        let notes = docxcore::notes::parse_notes(&pkg);
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
         // rather than the value last cached in the file.
@@ -857,6 +885,9 @@ impl App {
                 .unwrap_or_default(),
         };
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
+        let doc_protection = pkg.protection();
+        let doc_watermark = pkg.watermark();
+        let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
@@ -870,6 +901,9 @@ impl App {
             start_btns: [Rect::default(); START_ITEMS.len()],
             quit_requested: false,
             status: None,
+            doc_protection,
+            doc_watermark,
+            doc_page_borders,
             scroll: 0,
             viewport_h: 1,
             page_view: false,
@@ -894,6 +928,10 @@ impl App {
             comment_input: None,
             comments_scroll: 0,
             comments_rect: Rect::default(),
+            notes,
+            show_notes: false,
+            notes_scroll: 0,
+            notes_rect: Rect::default(),
             comments_hscroll: 0,
             doc_hscroll: 0,
             // Set each frame by draw(); 0 until then so mouse rows map directly.
@@ -1001,6 +1039,7 @@ impl App {
             show_ruler: self.show_ruler,
             show_nav: self.show_nav,
             show_comments: self.show_comments,
+            show_notes: self.show_notes,
             auto_hide_ribbon: self.auto_hide_ribbon,
         }
         .save();
@@ -1070,6 +1109,23 @@ impl App {
             format!("Showing {} comment(s).", self.comments.len())
         } else {
             "Comments panel hidden.".to_string()
+        });
+        self.dirty = true;
+    }
+
+    /// Toggle the footnotes/endnotes side panel.
+    fn toggle_notes(&mut self) {
+        self.show_notes = !self.show_notes;
+        self.notes_scroll = 0;
+        self.save_view_prefs();
+        self.status = Some(if self.notes.is_empty() {
+            "No footnotes or endnotes in this document.".to_string()
+        } else if self.show_notes {
+            let f = self.notes.iter().filter(|n| !n.endnote).count();
+            let e = self.notes.len() - f;
+            format!("Showing {f} footnote(s), {e} endnote(s).")
+        } else {
+            "Notes panel hidden.".to_string()
         });
         self.dirty = true;
     }
@@ -1189,6 +1245,7 @@ impl App {
                 self.dirty = true;
             }
             ToggleComments => self.toggle_comments(),
+            ToggleNotes => self.toggle_notes(),
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
             NewComment => self.start_comment(),
@@ -2028,9 +2085,14 @@ impl App {
         self.header_part = hf_part_name(&pkg, &rels, "headerReference");
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
+        self.notes = docxcore::notes::parse_notes(&pkg);
+        self.notes_scroll = 0;
         self.comments_scroll = 0;
         self.comment_sel = 0;
         self.comment_active = false;
+        self.doc_protection = pkg.protection();
+        self.doc_watermark = pkg.watermark();
+        self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
         self.editor = Editor::new(doc);
@@ -2049,6 +2111,26 @@ impl App {
         self.find = None;
         self.img_cache.clear();
         self.dirty = true;
+    }
+
+    /// A compact status-line suffix for document-level notices (protection,
+    /// watermark, page borders) — empty when the document has none.
+    fn doc_notice(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = &self.doc_protection {
+            parts.push(format!("Protected: {p}"));
+        }
+        if let Some(w) = &self.doc_watermark {
+            parts.push(format!("Watermark: {w}"));
+        }
+        if self.doc_page_borders {
+            parts.push("Page border".to_string());
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  ·  {}", parts.join(" · "))
+        }
     }
 
     fn draw_backstage(&self, f: &mut Frame, area: Rect) {
@@ -2508,6 +2590,64 @@ impl App {
         let scroll = self.comments_scroll.min(total.saturating_sub(inner_h));
         let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
         let title = format!(" Comments ({}) ", self.comments.len());
+        f.render_widget(
+            Paragraph::new(shown).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            ),
+            area,
+        );
+        if total > inner_h {
+            let mut sb = ScrollbarState::new(total)
+                .position(scroll)
+                .viewport_content_length(inner_h);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area.inner(ratatui::layout::Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut sb,
+            );
+        }
+    }
+
+    /// Build the notes side-panel content (footnotes then endnotes) wrapped to
+    /// `inner_w`.
+    fn note_panel_lines(&self, inner_w: usize) -> Vec<RLine<'static>> {
+        let head = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let mut lines: Vec<RLine> = Vec::new();
+        for (i, n) in self.notes.iter().enumerate() {
+            if i > 0 {
+                lines.push(RLine::raw(""));
+            }
+            let kind = if n.endnote { "Endnote" } else { "Footnote" };
+            lines.push(RLine::styled(format!("{kind} {}", n.id), head));
+            for para in n.text.split('\n') {
+                for w in wrap_str(para, inner_w) {
+                    lines.push(RLine::raw(w));
+                }
+            }
+        }
+        lines
+    }
+
+    fn draw_notes_panel(&self, f: &mut Frame, area: Rect) {
+        let inner_w = area.width.saturating_sub(2).max(4) as usize;
+        let inner_h = area.height.saturating_sub(2).max(1) as usize;
+        let lines = self.note_panel_lines(inner_w);
+        let total = lines.len();
+        let scroll = self.notes_scroll.min(total.saturating_sub(inner_h));
+        let shown: Vec<RLine> = lines.into_iter().skip(scroll).take(inner_h).collect();
+        let f_count = self.notes.iter().filter(|n| !n.endnote).count();
+        let e_count = self.notes.len() - f_count;
+        let title = format!(" Notes ({f_count} fn / {e_count} en) ");
         f.render_widget(
             Paragraph::new(shown).block(
                 RBlock::default()
@@ -3663,6 +3803,34 @@ impl App {
         None
     }
 
+    /// Jump to the bookmark named `anchor` (the target of an internal link).
+    /// Scrolls so the paragraph holding its `<w:bookmarkStart w:name=…>` is at
+    /// the top of the view.
+    fn jump_to_anchor(&mut self, anchor: &str) {
+        let needle = format!("w:name=\"{anchor}\"");
+        let bi = self
+            .editor
+            .doc
+            .body
+            .iter()
+            .position(|b| block_has_bookmark(b, &needle));
+        if let Some(bi) = bi {
+            if let Some(line) = self
+                .maps
+                .iter()
+                .position(|m| m.segs.iter().any(|s| s.path.first() == Some(&bi)))
+            {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.follow_caret = false;
+                self.dirty = true;
+                self.status = Some(format!("Jumped to “{anchor}”."));
+                return;
+            }
+        }
+        self.status = Some(format!("Bookmark “{anchor}” not found."));
+        self.dirty = true;
+    }
+
     /// If `col` is in the scrollbar gutter (just past the rendered content) and
     /// the document overflows, jump the scroll to the indicated position and
     /// return true. Used so clicking/dragging the bar scrolls instead of selecting.
@@ -3845,10 +4013,12 @@ impl App {
                     self.drag_from = Some(c);
                     self.dirty = true;
                 }
-                // A clicked link is never opened directly: show the real URL and
-                // ask for confirmation, and refuse anything that isn't http/https.
+                // A clicked link: an internal `#anchor` jumps to its bookmark; an
+                // external link is never opened directly (confirm + http/https only).
                 if let Some(url) = self.link_at(doc_line, col) {
-                    if !url.is_empty() {
+                    if let Some(anchor) = url.strip_prefix('#') {
+                        self.jump_to_anchor(anchor);
+                    } else if !url.is_empty() {
                         if safe_url(&url) {
                             self.pending_link = Some(url);
                         } else {
@@ -3916,6 +4086,15 @@ impl App {
                     self.dirty = true;
                     return;
                 }
+                if self.notes_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    let cap = self.notes.len() * 12;
+                    self.notes_scroll = (self.notes_scroll + 3).min(cap);
+                    self.dirty = true;
+                    return;
+                }
                 // Scrolling changes only the visible slice, not the document, so
                 // don't mark dirty (that would re-render the whole doc per tick).
                 self.follow_caret = false;
@@ -3928,6 +4107,14 @@ impl App {
                     y: m.row,
                 }) {
                     self.comments_scroll = self.comments_scroll.saturating_sub(3);
+                    self.dirty = true;
+                    return;
+                }
+                if self.notes_rect.contains(Position {
+                    x: m.column,
+                    y: m.row,
+                }) {
+                    self.notes_scroll = self.notes_scroll.saturating_sub(3);
                     self.dirty = true;
                     return;
                 }
@@ -4800,6 +4987,9 @@ impl App {
         if self.show_comments {
             toggles.push(ribbon::Act::ToggleComments);
         }
+        if self.show_notes {
+            toggles.push(ribbon::Act::ToggleNotes);
+        }
         // Read/Print layout applies to `.docx` only; Markdown has no such group.
         if self.format != DocFormat::Markdown {
             toggles.push(if self.page_view {
@@ -4883,6 +5073,17 @@ impl App {
             full = cols[0];
             self.comments_rect = cols[1];
             self.draw_comments_panel(f, cols[1]);
+        }
+
+        // The footnotes/endnotes panel docks on the right, like comments.
+        self.notes_rect = Rect::default();
+        if self.show_notes && !self.notes.is_empty() && full.width > 50 {
+            let pw = 40.min(full.width / 2);
+            let cols =
+                Layout::horizontal([Constraint::Min(10), Constraint::Length(pw)]).split(full);
+            full = cols[0];
+            self.notes_rect = cols[1];
+            self.draw_notes_panel(f, cols[1]);
         }
 
         // Navigation (outline) pane on the left.
@@ -5114,15 +5315,19 @@ impl App {
                 match &self.status {
                     Some(msg) => format!(" {m} {dirty_mark}{}  │ {msg}", self.path),
                     None => format!(
-                        " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}",
-                        self.path
+                        " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}{}",
+                        self.path,
+                        self.doc_notice()
                     ),
                 }
             }
         } else {
             match &self.status {
                 Some(msg) => format!("{left} │ {msg}"),
-                None => format!("{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit"),
+                None => format!(
+                    "{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit{}",
+                    self.doc_notice()
+                ),
             }
         };
         let status_widget =
@@ -5616,6 +5821,22 @@ fn wrap_str(s: &str, w: usize) -> Vec<String> {
     out
 }
 
+/// Does a block (recursively, through table cells) hold a `<w:bookmarkStart>`
+/// whose raw XML contains `needle` (the `w:name="…"` attribute)?
+fn block_has_bookmark(b: &Block, needle: &str) -> bool {
+    match b {
+        Block::Paragraph(p) => p.content.iter().any(
+            |i| matches!(i, Inline::Raw(s) if s.contains("bookmarkStart") && s.contains(needle)),
+        ),
+        Block::Table(t) => t.rows.iter().any(|r| {
+            r.cells
+                .iter()
+                .any(|c| c.blocks.iter().any(|bb| block_has_bookmark(bb, needle)))
+        }),
+        Block::Raw(_) => false,
+    }
+}
+
 /// Truncate `s` to at most `w` columns, ending with `…` when clipped.
 fn fit_width(s: &str, w: usize) -> String {
     if w == 0 {
@@ -5641,6 +5862,7 @@ struct ViewPrefs {
     show_ruler: bool,
     show_nav: bool,
     show_comments: bool,
+    show_notes: bool,
     auto_hide_ribbon: bool,
 }
 
@@ -5671,6 +5893,7 @@ impl ViewPrefs {
                     "show_ruler" => p.show_ruler = on,
                     "show_nav" => p.show_nav = on,
                     "show_comments" => p.show_comments = on,
+                    "show_notes" => p.show_notes = on,
                     "auto_hide_ribbon" => p.auto_hide_ribbon = on,
                     _ => {}
                 }
@@ -5681,7 +5904,7 @@ impl ViewPrefs {
 
     fn to_conf(self) -> String {
         format!(
-            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\nauto_hide_ribbon={}\n",
+            "page_view={}\ninvisibles={}\nborderless={}\nlight_page={}\nshow_ruler={}\nshow_nav={}\nshow_comments={}\nshow_notes={}\nauto_hide_ribbon={}\n",
             self.page_view as u8,
             self.invisibles as u8,
             self.borderless as u8,
@@ -5689,6 +5912,7 @@ impl ViewPrefs {
             self.show_ruler as u8,
             self.show_nav as u8,
             self.show_comments as u8,
+            self.show_notes as u8,
             self.auto_hide_ribbon as u8,
         )
     }
@@ -6111,6 +6335,7 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
     app.show_ruler = prefs.show_ruler;
     app.show_nav = prefs.show_nav;
     app.show_comments = prefs.show_comments;
+    app.show_notes = prefs.show_notes;
     app.auto_hide_ribbon = prefs.auto_hide_ribbon;
     // With auto-hide off the ribbon is pinned, so start it expanded (focus stays
     // in the document); with auto-hide on it starts collapsed to the tab strip.
@@ -6121,7 +6346,14 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
     // to a half-block renderer if the query fails (e.g. a plain console).
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
+    let mut last_title = String::new();
     let result = loop {
+        // Reflect the file + dirty state in the terminal window title.
+        let title = window_title("docxy", &app.path, app.dirty);
+        if title != last_title {
+            let _ = execute!(io::stdout(), SetTitle(&title));
+            last_title = title;
+        }
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(e);
         }
@@ -6191,6 +6423,18 @@ mod tests {
     use docxcore::package::new_package;
 
     #[test]
+    fn window_title_format() {
+        assert_eq!(
+            window_title("docxy", "/tmp/notes.docx", false),
+            "docxy - notes.docx"
+        );
+        assert_eq!(
+            window_title("docxy", "/tmp/notes.docx", true),
+            "* docxy - notes.docx"
+        );
+    }
+
+    #[test]
     fn page_on_black_paints_margin_black_and_page_white() {
         // "   │ hi │" → centering margin black, page region white.
         let line = RLine::from(vec![RSpan::raw("   "), RSpan::raw("│ hi │")]);
@@ -6224,6 +6468,7 @@ mod tests {
             show_ruler: false,
             show_nav: true,
             show_comments: true,
+            show_notes: true,
             auto_hide_ribbon: true,
         };
         let back = ViewPrefs::parse(&p.to_conf());
@@ -6234,6 +6479,7 @@ mod tests {
         assert_eq!(back.show_ruler, p.show_ruler);
         assert_eq!(back.show_nav, p.show_nav);
         assert_eq!(back.show_comments, p.show_comments);
+        assert_eq!(back.show_notes, p.show_notes);
         assert_eq!(back.auto_hide_ribbon, p.auto_hide_ribbon);
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
@@ -6392,6 +6638,22 @@ mod tests {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         app.load_package_state(new_package(Document { body }), "x.md".to_string());
         assert!(!app.page_view);
+    }
+
+    #[test]
+    fn doc_notice_reports_surfaced_features() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        // A plain document shows nothing.
+        assert_eq!(app.doc_notice(), "");
+        // Each surfaced feature appears in the notice.
+        app.doc_protection = Some("read-only".to_string());
+        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        app.doc_page_borders = true;
+        let n = app.doc_notice();
+        assert!(n.contains("Protected: read-only"), "{n}");
+        assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
+        assert!(n.contains("Page border"), "{n}");
     }
 
     #[test]

@@ -1,0 +1,115 @@
+using System.Runtime.InteropServices;
+
+namespace XlsxyCompare;
+
+/// <summary>Thin Win32 wrappers for positioning the launcher, the xlsxy console,
+/// and the Excel window (all in physical pixels, so no DPI conversion is needed).</summary>
+internal static partial class Win32
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    public readonly record struct Area(int Left, int Top, int Width, int Height);
+
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const int SW_RESTORE = 9;
+    public const uint WM_CLOSE = 0x0010;
+    private const uint SPI_GETWORKAREA = 0x0030;
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SystemParametersInfoW(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetForegroundWindow(IntPtr hWnd);
+
+    private delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool EnumWindows(EnumProc cb, IntPtr lParam);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetClassNameW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int GetClassName(IntPtr hWnd, [Out] char[] buf, int max);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetWindowTextW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int GetWindowText(IntPtr hWnd, [Out] char[] buf, int max);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsWindowVisible(IntPtr hWnd);
+
+    /// <summary>Work area of the primary monitor (minus the taskbar), in pixels.</summary>
+    public static Area WorkArea()
+    {
+        RECT r = default;
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, ref r, 0))
+            return new Area(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+        return new Area(0, 0, 1920, 1040);
+    }
+
+    public static void Place(IntPtr hWnd, int x, int y, int w, int h)
+    {
+        if (hWnd == IntPtr.Zero) return;
+        ShowWindow(hWnd, SW_RESTORE);
+        // Pass HWND_TOP (IntPtr.Zero) and *omit* SWP_NOZORDER so the window is
+        // raised to the front — otherwise Excel/the terminal stay wherever they
+        // spawned (often behind other windows). NOACTIVATE keeps the three tiled
+        // windows from fighting over keyboard focus as each is placed.
+        SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    /// <summary>Lift a window to the top of the z-order without moving, resizing,
+    /// or activating it. Windows Terminal snaps its width up to a whole number of
+    /// character cells, so it spills a few pixels into Excel's tile; raising Excel
+    /// back above it afterwards keeps that spill hidden and the two tiled cleanly.</summary>
+    public static void Raise(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return;
+        SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    /// <summary>Find a top-level window of <paramref name="className"/> whose title
+    /// contains <paramref name="titlePart"/> (case-insensitive).</summary>
+    public static IntPtr FindWindowByClassAndTitle(string className, string titlePart)
+    {
+        IntPtr found = IntPtr.Zero;
+        var cbuf = new char[256];
+        var tbuf = new char[512];
+        EnumWindows((h, _) =>
+        {
+            if (!IsWindowVisible(h)) return true;
+            int cn = GetClassName(h, cbuf, cbuf.Length);
+            if (cn <= 0) return true;
+            var cls = new string(cbuf, 0, cn);
+            if (!string.Equals(cls, className, StringComparison.OrdinalIgnoreCase)) return true;
+            int tn = GetWindowText(h, tbuf, tbuf.Length);
+            var title = tn > 0 ? new string(tbuf, 0, tn) : "";
+            if (titlePart.Length == 0 || title.Contains(titlePart, StringComparison.OrdinalIgnoreCase))
+            {
+                found = h;
+                return false; // stop
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}

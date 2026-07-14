@@ -20,14 +20,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bin: docxy
-            asset: docxy-linux-x86_64
+            suffix: linux-x86_64
+            ext: ""
           - os: windows-latest
-            bin: docxy.exe
-            asset: docxy-windows-x86_64.exe
+            suffix: windows-x86_64.exe
+            ext: ".exe"
           - os: macos-latest
-            bin: docxy
-            asset: docxy-macos-aarch64
+            suffix: macos-aarch64
+            ext: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,46 +39,54 @@ jobs:
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
       - name: Build
-        run: cargo build --release -p docxy
+        run: cargo build --release -p docxy -p xlsxy
 
-      - name: Stage binary + checksum
+      - name: Stage binaries + checksums
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          for bin in docxy xlsxy; do
+            cp "target/release/${bin}${{ matrix.ext }}" "dist/${bin}-${{ matrix.suffix }}"
+          done
           cd dist
-          if command -v sha256sum >/dev/null; then
-            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
-          else
-            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
-          fi
-          cat "${{ matrix.asset }}.sha256"
+          for asset in *; do
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$asset" > "$asset.sha256"
+            else
+              shasum -a 256 "$asset" > "$asset.sha256"
+            fi
+            cat "$asset.sha256"
+          done
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: dist/${{ matrix.asset }}
+          subject-path: |
+            dist/docxy-${{ matrix.suffix }}
+            dist/xlsxy-${{ matrix.suffix }}
 
       - name: Install cosign
         if: startsWith(github.ref, 'refs/tags/')
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign artifact (keyless)
+      - name: Sign artifacts (keyless)
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           COSIGN_YES: "true"
         run: |
-          cosign sign-blob --yes \
-            --output-signature "dist/${{ matrix.asset }}.sig" \
-            --output-certificate "dist/${{ matrix.asset }}.pem" \
-            "dist/${{ matrix.asset }}"
+          for bin in docxy xlsxy; do
+            cosign sign-blob --yes \
+              --output-signature "dist/${bin}-${{ matrix.suffix }}.sig" \
+              --output-certificate "dist/${bin}-${{ matrix.suffix }}.pem" \
+              "dist/${bin}-${{ matrix.suffix }}"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
+          name: binaries-${{ matrix.suffix }}
           path: dist/*
 
       - name: Attach to release
@@ -86,11 +94,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            dist/${{ matrix.asset }}
-            dist/${{ matrix.asset }}.sha256
-            dist/${{ matrix.asset }}.sig
-            dist/${{ matrix.asset }}.pem
+          files: dist/*
 
   publish:
     name: publish to crates.io
@@ -104,7 +108,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Publish docxcore, then docxy
+      - name: Publish crates (dependency order, skip already-published)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -114,7 +118,24 @@ jobs:
             echo "CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
             exit 0
           fi
-          cargo publish -p docxcore
-          # Give crates.io a moment to index docxcore before docxy depends on it.
-          sleep 30
-          cargo publish -p docxy
+          # opccore/gridcore/xlsxy version independently of the docxy release
+          # train, so a tag often re-carries versions that are already on
+          # crates.io. Publishing those again would hard-fail the job, so each
+          # crate is skipped when its exact version is already indexed.
+          publish() {
+            crate="$1"
+            ver=$(cargo pkgid -p "$crate" | sed 's/.*[@#]//')
+            if curl -fsSL -A "docxy-release-workflow" \
+                 "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
+              echo "${crate} ${ver} is already on crates.io — skipping."
+              return 0
+            fi
+            cargo publish -p "$crate"
+            # Give crates.io a moment to index before dependents publish.
+            sleep 30
+          }
+          publish opccore
+          publish docxcore
+          publish gridcore
+          publish docxy
+          publish xlsxy
