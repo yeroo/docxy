@@ -12,7 +12,7 @@ and to drive the corpus verify sweeps.
 - `tools/classify.py`, `tools/classify_xlsx.py` — regenerate the manifests by
   scanning each file's parts/XML.
 
-## What lives in the separate corpus repo
+## What lives in the separate corpus repos
 
 The large third-party binary corpus (~14 MB) was moved to
 [**github.com/yeroo/docxy-corpus**](https://github.com/yeroo/docxy-corpus) so it

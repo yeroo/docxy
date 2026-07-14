@@ -201,3 +201,9 @@ After a full generation run, before publishing a release:
   generates the complete corpus on its own — including the unplanned MPP12
   old-format emission — so the ribbon added no generation capability. The
   Runner is the regeneration tool of record.
+- **Amendment (2026-07-14, user decision):** distribution follows the
+  docxy-corpus pattern learned from docxy main — the corpus is plain git
+  content in the private repo, fetched into docxy's git-ignored
+  `corpus/mpp/` by clone-based scripts (`corpus/tools/fetch-mpp-corpus.*`).
+  No release zips are published; the earlier release-zip decision is
+  superseded.
