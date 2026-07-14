@@ -60,7 +60,7 @@ jobs:
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/docxy-${{ matrix.suffix }}
