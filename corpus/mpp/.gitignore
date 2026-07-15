@@ -1,0 +1,10 @@
+# Real .mpp files are third-party binaries — keep them local, never commit them.
+*.mpp
+# MSPDI oracle exports paired with the above may be large too; keep local.
+*.xml
+# Generated corpus (fetch-mpp-corpus.{sh,ps1}): the whole snapshots/ dir
+# (mpp/mpp12/xml plus any stray file like a .gitkeep from the source repo)
+# and its manifest, ignored outright rather than by extension.
+/snapshots/
+manifest.json
+!README.md

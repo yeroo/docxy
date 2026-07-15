@@ -1,0 +1,114 @@
+{
+  "anchor": "2026-03-02T08:00:00",
+  "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",
+  "note": "Start/Finish embedded in each file are the CPM oracle.",
+  "files": [
+    {
+      "file": "01-single-task.xml",
+      "category": "basic",
+      "tags": [
+        "basic"
+      ],
+      "desc": "One 2-day task; the irreducible minimum."
+    },
+    {
+      "file": "02-link-fs.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "link-fs"
+      ],
+      "desc": "Finish-to-start dependency."
+    },
+    {
+      "file": "03-link-ss.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "link-ss"
+      ],
+      "desc": "Start-to-start dependency."
+    },
+    {
+      "file": "04-link-ff.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "link-ff"
+      ],
+      "desc": "Finish-to-finish dependency."
+    },
+    {
+      "file": "05-link-sf.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "link-sf"
+      ],
+      "desc": "Start-to-finish dependency."
+    },
+    {
+      "file": "06-lag.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "lag"
+      ],
+      "desc": "FS link with +2 working-day lag."
+    },
+    {
+      "file": "07-lead.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "lead"
+      ],
+      "desc": "FS link with -1 working-day lead."
+    },
+    {
+      "file": "08-milestone.xml",
+      "category": "milestone",
+      "tags": [
+        "milestone",
+        "constraint",
+        "constraint-snet"
+      ],
+      "desc": "Zero-duration milestone with SNET constraint."
+    },
+    {
+      "file": "09-constraint-snet.xml",
+      "category": "constraint",
+      "tags": [
+        "constraint",
+        "constraint-snet"
+      ],
+      "desc": "Start-No-Earlier-Than constraint delays the start."
+    },
+    {
+      "file": "10-summary.xml",
+      "category": "summary",
+      "tags": [
+        "summary"
+      ],
+      "desc": "Summary task rolling up two children."
+    },
+    {
+      "file": "11-resource-assignment.xml",
+      "category": "resource",
+      "tags": [
+        "resource",
+        "assignment"
+      ],
+      "desc": "One work resource assigned to a task at 100% units."
+    },
+    {
+      "file": "12-calendar-6day.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "calendar-6day"
+      ],
+      "desc": "Custom 6-day calendar (Saturday working) shortens the schedule."
+    }
+  ]
+}

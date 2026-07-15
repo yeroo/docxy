@@ -1,0 +1,13 @@
+{
+  "name": "docxy-tools",
+  "owner": {
+    "name": "Boris Kudriashov"
+  },
+  "plugins": [
+    {
+      "name": "offdev",
+      "source": "./offdev",
+      "description": "docxy development commands: launch docxy/xlsxy/yppxy in agwinterm test sessions"
+    }
+  ]
+}

@@ -635,6 +635,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mppread"
+version = "0.1.0"
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -805,6 +809,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "projcore"
+version = "0.1.0"
+dependencies = [
+ "opccore",
 ]
 
 [[package]]
@@ -1433,6 +1444,16 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "yppxy"
+version = "0.1.0"
+dependencies = [
+ "mppread",
+ "projcore",
+ "ratatui",
  "unicode-width 0.2.0",
 ]
 
