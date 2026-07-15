@@ -3624,7 +3624,7 @@ fn draw(app: &mut App, f: &mut Frame) {
     app.ribbon.set_toggles(toggles);
     let engaged = app.ribbon_focus != ribbon::Focus::None;
     let ribbon_h: u16 = if engaged {
-        7
+        8 // tab strip + closed body box (6) + hint bar
     } else if app.auto_hide_ribbon {
         0 // auto-hide reclaims the tab strip line for the grid
     } else {
@@ -3641,8 +3641,8 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     if engaged {
         let body = app.ribbon.render_body(app.ribbon_focus);
-        f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 5));
-        y += 5;
+        f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 6));
+        y += 6;
         f.render_widget(
             Paragraph::new(app.ribbon.render_hint(app.ribbon_focus, area.width)),
             Rect::new(area.x, y, area.width, 1),

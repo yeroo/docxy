@@ -7,6 +7,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// A ribbon command. `Todo` entries are drawn dimmed and only report
 /// "not implemented yet" until wired up.
@@ -65,6 +66,8 @@ impl Act {
 
 struct Button {
     glyph: &'static str,
+    /// Display columns the glyph occupies — computed, since some glyphs
+    /// (💾 ＋ …) are two columns wide and hand-counted widths drift.
     width: usize,
     act: Act,
     hint: &'static str,
@@ -75,10 +78,10 @@ enum Seg {
     Gap(&'static str),
 }
 
-fn btn(glyph: &'static str, width: usize, act: Act, hint: &'static str) -> Seg {
+fn btn(glyph: &'static str, act: Act, hint: &'static str) -> Seg {
     Seg::Btn(Button {
         glyph,
-        width,
+        width: glyph.width(),
         act,
         hint,
     })
@@ -197,7 +200,7 @@ impl Ribbon {
                 let mut x = gx + 1;
                 for seg in row {
                     match seg {
-                        Seg::Gap(s) => x += s.chars().count() as u16,
+                        Seg::Gap(s) => x += s.width() as u16,
                         Seg::Btn(b) => {
                             self.placed.push(Placed {
                                 row: ri as u8,
@@ -375,7 +378,7 @@ impl Ribbon {
         let row_w = |row: &[Seg]| -> usize {
             row.iter()
                 .map(|s| match s {
-                    Seg::Gap(g) => g.chars().count(),
+                    Seg::Gap(g) => g.width(),
                     Seg::Btn(b) => b.width,
                 })
                 .sum()
@@ -395,7 +398,7 @@ impl Ribbon {
         out.push(bar("├", "┼", "┤"));
         let mut spans = vec![Span::styled("│", dim)];
         for g in self.groups() {
-            let pad = g.width.saturating_sub(g.title.chars().count());
+            let pad = g.width.saturating_sub(g.title.width());
             let l = pad / 2;
             spans.push(Span::raw(format!(
                 " {}{}{} ",
@@ -406,6 +409,7 @@ impl Ribbon {
             spans.push(Span::styled("│", dim));
         }
         out.push(Line::from(spans));
+        out.push(bar("└", "┴", "┘"));
         out
     }
 
@@ -479,11 +483,11 @@ fn home_groups() -> Vec<Group> {
             title: "Clipboard",
             width: 13,
             rows: [
-                vec![btn("Paste", 5, Paste, "Paste (Ctrl+V)")],
+                vec![btn("Paste", Paste, "Paste (Ctrl+V)")],
                 vec![
-                    btn("✂ Cut", 5, Cut, "Cut (Ctrl+X)"),
+                    btn("✂ Cut", Cut, "Cut (Ctrl+X)"),
                     Seg::Gap(" "),
-                    btn("⧉", 1, Copy, "Copy (Ctrl+C)"),
+                    btn("⧉", Copy, "Copy (Ctrl+C)"),
                 ],
             ],
         },
@@ -492,18 +496,18 @@ fn home_groups() -> Vec<Group> {
             width: 26,
             rows: [
                 vec![
-                    btn("+Row", 4, InsertRow, "Insert rows above the selection"),
+                    btn("+Row", InsertRow, "Insert rows above the selection"),
                     Seg::Gap(" "),
-                    btn("+Col", 4, InsertCol, "Insert columns left of the selection"),
+                    btn("+Col", InsertCol, "Insert columns left of the selection"),
                     Seg::Gap(" "),
-                    btn("Fill↓", 5, FillDown, "Fill down (Ctrl+D)"),
+                    btn("Fill↓", FillDown, "Fill down (Ctrl+D)"),
                 ],
                 vec![
-                    btn("−Row", 4, DeleteRow, "Delete the selected rows"),
+                    btn("−Row", DeleteRow, "Delete the selected rows"),
                     Seg::Gap(" "),
-                    btn("−Col", 4, DeleteCol, "Delete the selected columns"),
+                    btn("−Col", DeleteCol, "Delete the selected columns"),
                     Seg::Gap(" "),
-                    btn("Fill→", 5, FillRight, "Fill right (Ctrl+R)"),
+                    btn("Fill→", FillRight, "Fill right (Ctrl+R)"),
                 ],
             ],
         },
@@ -512,20 +516,20 @@ fn home_groups() -> Vec<Group> {
             width: 17,
             rows: [
                 vec![
-                    btn("B", 1, Bold, "Bold (Ctrl+B)"),
+                    btn("B", Bold, "Bold (Ctrl+B)"),
                     Seg::Gap("  "),
-                    btn("I", 1, Italic, "Italic (Ctrl+I)"),
+                    btn("I", Italic, "Italic (Ctrl+I)"),
                     Seg::Gap("  "),
-                    btn("A▾", 2, FontColor, "Font color"),
+                    btn("A▾", FontColor, "Font color"),
                     Seg::Gap(" "),
-                    btn("▧▾", 2, FillColor, "Fill color"),
+                    btn("▧▾", FillColor, "Fill color"),
                 ],
                 vec![
-                    btn("Left", 4, AlignLeft, "Align left"),
+                    btn("Left", AlignLeft, "Align left"),
                     Seg::Gap(" "),
-                    btn("Center", 6, AlignCenter, "Align center"),
+                    btn("Center", AlignCenter, "Align center"),
                     Seg::Gap(" "),
-                    btn("Right", 5, AlignRight, "Align right"),
+                    btn("Right", AlignRight, "Align right"),
                 ],
             ],
         },
@@ -533,7 +537,7 @@ fn home_groups() -> Vec<Group> {
             title: "Number",
             width: 8,
             rows: [
-                vec![btn("Format ▾", 8, NumberFormat, "Number format…")],
+                vec![btn("Format ▾", NumberFormat, "Number format…")],
                 vec![],
             ],
         },
@@ -542,18 +546,18 @@ fn home_groups() -> Vec<Group> {
             width: 22,
             rows: [
                 vec![
-                    btn("⌕ Find", 6, Find, "Find (Ctrl+F)"),
+                    btn("⌕ Find", Find, "Find (Ctrl+F)"),
                     Seg::Gap(" "),
-                    btn("⇄ Replace", 9, Replace, "Replace (Ctrl+H)"),
+                    btn("⇄ Replace", Replace, "Replace (Ctrl+H)"),
                     Seg::Gap(" "),
-                    btn("→", 1, GoTo, "Go To (Ctrl+G)"),
+                    btn("→", GoTo, "Go To (Ctrl+G)"),
                 ],
                 vec![
-                    btn("↶ Undo", 6, Undo, "Undo (Ctrl+Z)"),
+                    btn("↶ Undo", Undo, "Undo (Ctrl+Z)"),
                     Seg::Gap(" "),
-                    btn("↷ Redo", 6, Redo, "Redo (Ctrl+Y)"),
+                    btn("↷ Redo", Redo, "Redo (Ctrl+Y)"),
                     Seg::Gap(" "),
-                    btn("⌫ Clear", 7, ClearContents, "Clear (Del)"),
+                    btn("⌫ Clear", ClearContents, "Clear (Del)"),
                 ],
             ],
         },
@@ -561,8 +565,8 @@ fn home_groups() -> Vec<Group> {
             title: "File",
             width: 14,
             rows: [
-                vec![btn("💾 Save", 6, Save, "Save (Ctrl+S)")],
-                vec![btn("Save As…", 8, SaveAs, "Save As (F12)")],
+                vec![btn("💾 Save", Save, "Save (Ctrl+S)")],
+                vec![btn("Save As…", SaveAs, "Save As (F12)")],
             ],
         },
     ]
@@ -575,26 +579,16 @@ fn insert_groups() -> Vec<Group> {
             title: "Sheets",
             width: 20,
             rows: [
-                vec![btn("＋ New Sheet", 11, AddSheet, "Add a sheet (Ctrl+T)")],
-                vec![btn(
-                    "✎ Rename",
-                    8,
-                    RenameSheet,
-                    "Rename the sheet (Shift+F2)",
-                )],
+                vec![btn("＋ New Sheet", AddSheet, "Add a sheet (Ctrl+T)")],
+                vec![btn("✎ Rename", RenameSheet, "Rename the sheet (Shift+F2)")],
             ],
         },
         Group {
             title: "Tables",
             width: 12,
             rows: [
-                vec![btn(
-                    "PivotTable",
-                    10,
-                    Todo("PivotTable"),
-                    "Insert a PivotTable",
-                )],
-                vec![btn("Function", 8, Todo("Function"), "Insert a function")],
+                vec![btn("PivotTable", Todo("PivotTable"), "Insert a PivotTable")],
+                vec![btn("Function", Todo("Function"), "Insert a function")],
             ],
         },
     ]
@@ -609,26 +603,24 @@ fn review_groups() -> Vec<Group> {
             vec![
                 btn(
                     "✎ Comment",
-                    9,
                     NewComment,
                     "New threaded comment / reply on the current cell",
                 ),
                 Seg::Gap("  "),
                 btn(
                     "✗ Delete",
-                    8,
                     DeleteComment,
                     "Delete the current cell's comment",
                 ),
             ],
             vec![
-                btn("☰ Note", 6, NewNote, "New legacy note on the current cell"),
+                btn("☰ Note", NewNote, "New legacy note on the current cell"),
                 Seg::Gap(" "),
-                btn("‹ Prev", 6, PrevComment, "Previous comment"),
+                btn("‹ Prev", PrevComment, "Previous comment"),
                 Seg::Gap(" "),
-                btn("Next ›", 6, NextComment, "Next comment"),
+                btn("Next ›", NextComment, "Next comment"),
                 Seg::Gap(" "),
-                btn("▤", 1, ToggleComments, "Show/hide the comments panel"),
+                btn("▤", ToggleComments, "Show/hide the comments panel"),
             ],
         ],
     }]
@@ -644,13 +636,11 @@ fn view_groups() -> Vec<Group> {
                 vec![
                     btn(
                         "ƒ Formulas",
-                        10,
                         FormulaView,
                         "Show formulas instead of values (Ctrl+`)",
                     ),
                     btn(
                         "⤢ Hidden",
-                        9,
                         ShowHidden,
                         "Reveal rows/columns hidden by a filter or manual hide",
                     ),
@@ -658,13 +648,11 @@ fn view_groups() -> Vec<Group> {
                 vec![
                     btn(
                         "❄ Freeze",
-                        8,
                         FreezePanes,
                         "Freeze panes at the cursor (toggle)",
                     ),
                     btn(
                         "🖼 Objects",
-                        10,
                         ShowObjects,
                         "Show/hide floating pictures and charts",
                     ),
@@ -675,10 +663,9 @@ fn view_groups() -> Vec<Group> {
             title: "Window",
             width: 14,
             rows: [
-                vec![btn("◐ Theme", 7, ThemeToggle, "Toggle light / dark theme")],
+                vec![btn("◐ Theme", ThemeToggle, "Toggle light / dark theme")],
                 vec![btn(
                     "⬒ Auto-hide",
-                    11,
                     AutoHideRibbon,
                     "Auto-hide the ribbon after each use",
                 )],
@@ -690,7 +677,6 @@ fn view_groups() -> Vec<Group> {
             rows: [
                 vec![btn(
                     "▤ Comments",
-                    10,
                     ToggleComments,
                     "Show/hide the comments panel",
                 )],
@@ -716,7 +702,7 @@ mod tests {
                     .map(|row| {
                         row.iter()
                             .map(|seg| match seg {
-                                Seg::Gap(s) => s.chars().count(),
+                                Seg::Gap(s) => s.width(),
                                 Seg::Btn(b) => b.width,
                             })
                             .sum::<usize>()
@@ -753,19 +739,66 @@ mod tests {
         assert!(matches!(r.nav(Focus::Tab(0), Dir::Down), Focus::Button(_)));
     }
 
+    /// Every body line must span the same number of terminal COLUMNS (display
+    /// width, not chars) on every tab — otherwise the side borders zigzag
+    /// wherever a two-column glyph (💾 ＋ …) appears.
     #[test]
     fn body_rows_share_one_width() {
+        let mut r = Ribbon::new();
+        for tab in 0..r.tabs.len() {
+            if r.tab_groups[tab].is_empty() {
+                continue;
+            }
+            r.set_active(tab);
+            let lines = r.render_body(Focus::None);
+            let w = |l: &Line| l.spans.iter().map(|s| s.width()).sum::<usize>();
+            let w0 = w(&lines[0]);
+            for (i, l) in lines.iter().enumerate() {
+                assert_eq!(w(l), w0, "tab {tab} line {i} width");
+            }
+        }
+    }
+
+    /// The body is a closed box: top ┌…┐, bottom └…┘.
+    #[test]
+    fn body_box_is_closed() {
         let r = Ribbon::new();
         let lines = r.render_body(Focus::None);
-        let w = |l: &Line| {
+        assert_eq!(lines.len(), 6, "bar + 2 rows + separator + titles + bar");
+        let text = |l: &Line| {
             l.spans
                 .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
         };
-        let w0 = w(&lines[0]);
-        for l in &lines {
-            assert_eq!(w(l), w0);
+        let top = text(&lines[0]);
+        let bottom = text(lines.last().unwrap());
+        assert!(top.starts_with('┌') && top.ends_with('┐'), "top: {top}");
+        assert!(
+            bottom.starts_with('└') && bottom.ends_with('┘'),
+            "bottom: {bottom}"
+        );
+    }
+
+    /// A button's placed hit-box width equals its glyph's display width, so
+    /// clicks land on what the eye sees.
+    #[test]
+    fn placed_widths_are_display_widths() {
+        let mut r = Ribbon::new();
+        for tab in 0..r.tabs.len() {
+            if r.tab_groups[tab].is_empty() {
+                continue;
+            }
+            r.set_active(tab);
+            for g in r.groups() {
+                for row in &g.rows {
+                    for seg in row {
+                        if let Seg::Btn(b) = seg {
+                            assert_eq!(b.width, b.glyph.width(), "button {:?}", b.glyph);
+                        }
+                    }
+                }
+            }
         }
     }
 }
