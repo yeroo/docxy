@@ -1,0 +1,8 @@
+{
+  "name": "offdev",
+  "version": "0.1.0",
+  "description": "Development commands for the docxy repo: build a TUI (docxy/xlsxy/yppxy) and open it in a new agwinterm session on a corpus file",
+  "author": {
+    "name": "Boris Kudriashov"
+  }
+}
