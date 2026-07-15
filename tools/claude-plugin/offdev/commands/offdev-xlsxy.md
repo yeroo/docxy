@@ -25,8 +25,9 @@ Follow these steps exactly; do not create a session unless the binary and the fi
    - If the build fails, diagnose and report the actual compiler error; do not launch.
 
 4. **Launch.** Find `agwintermctl` on PATH; if absent, use `%LOCALAPPDATA%\Programs\agwinterm\agwintermctl.exe`. Then run:
-   `agwintermctl session new --name xlsxy --cwd "<repo root>" --command "<repo root>\target\release\xlsxy.exe <resolved file>"`
+   `agwintermctl session new --name xlsxy --cwd "<repo root>" --command "\"<repo root>\target\release\xlsxy.exe\" \"<resolved file>\""`
+   The `--command` string is split on whitespace with double-quote grouping (there is no shell), so wrap both the exe path and the resolved file path in embedded double quotes — this matters because corpus filenames commonly contain spaces (e.g. `1 Comment.docx`).
    It prints the new session id on success. If the control pipe is unreachable, agwinterm isn't running — tell the user to start agwinterm and stop.
    - Caveat: `agwintermctl` has no `--help` — probing `session new --help` **creates a session**. Don't probe; if you create one by accident, close it with `agwintermctl session close <id>`.
 
-5. **Verify and report.** Run `agwintermctl session text --target <session id>` and confirm the xlsxy grid rendered (ribbon row, formula bar, cell grid). Report the session id, the file opened, and a one-line description of what's on screen.
+5. **Verify and report.** Run `agwintermctl session text --target <session id>` and confirm the xlsxy grid rendered (ribbon row, formula bar, cell grid). If the text dump comes back empty or truncated, wait a few seconds and re-run it before concluding anything; if it stays empty but the session and process exist, report that the screen dump was unavailable rather than declaring the launch failed. Report the session id, the file opened, and a one-line description of what's on screen.
