@@ -7,7 +7,7 @@
 //!     cargo run -p mppread --example inspect -- some.mpp "   1/TBkndTask/Var2Data"        # hex-dump
 //!     cargo run -p mppread --example inspect -- some.mpp "   1/TBkndTask/Var2Data" strings # UTF-16 strings
 
-use mppread::{vardata, Cfb};
+use mppread::{Cfb, vardata};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -37,7 +37,11 @@ fn main() {
         Some(stream) => match cfb.read_path(&stream) {
             Some(data) if strings_mode => {
                 let names = vardata::strings(&data);
-                println!("{stream}: {} UTF-16 strings in {} bytes", names.len(), data.len());
+                println!(
+                    "{stream}: {} UTF-16 strings in {} bytes",
+                    names.len(),
+                    data.len()
+                );
                 for s in names {
                     println!("  {s}");
                 }
@@ -56,12 +60,24 @@ fn main() {
 
 /// Classic 16-bytes-per-line hex + ASCII dump, capped at `limit` bytes.
 fn hexdump(data: &[u8], limit: usize) {
-    for (row, chunk) in data.iter().take(limit).collect::<Vec<_>>().chunks(16).enumerate() {
+    for (row, chunk) in data
+        .iter()
+        .take(limit)
+        .collect::<Vec<_>>()
+        .chunks(16)
+        .enumerate()
+    {
         let off = row * 16;
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("{off:08x}  {:<47}  {ascii}", hex.join(" "));
     }

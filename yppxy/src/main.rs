@@ -25,7 +25,7 @@ use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
 use projcore::model::{Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, Task};
-use projcore::schedule::{level, schedule, Leveled, Schedule};
+use projcore::schedule::{Leveled, Schedule, level, schedule};
 use projcore::{gantt, mspdi, yppx};
 
 use ratatui::backend::CrosstermBackend;
@@ -35,7 +35,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -115,7 +115,13 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut out = Args { input: None, gantt_md: None, save: None, help: false, vim: false };
+    let mut out = Args {
+        input: None,
+        gantt_md: None,
+        save: None,
+        help: false,
+        vim: false,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -167,14 +173,21 @@ fn load(path: &str) -> Result<Project, String> {
 /// table. Save As converts it to `.yppx`/MSPDI.
 fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = mppread::read_mpp(bytes)?;
-    let name = [info.title.clone(), info.subject.clone(), info.company.clone()]
-        .into_iter()
-        .find(|s| !s.is_empty())
-        .unwrap_or_else(|| "Imported project".into());
+    let name = [
+        info.title.clone(),
+        info.subject.clone(),
+        info.company.clone(),
+    ]
+    .into_iter()
+    .find(|s| !s.is_empty())
+    .unwrap_or_else(|| "Imported project".into());
     let cal_ref = Project::default();
     let decoded = mppread::mpp::tasks(bytes);
     // A task is a summary when the next task sits one WBS level deeper.
-    let levels: Vec<u32> = decoded.iter().map(|t| t.outline_level.unwrap_or(1)).collect();
+    let levels: Vec<u32> = decoded
+        .iter()
+        .map(|t| t.outline_level.unwrap_or(1))
+        .collect();
     let tasks: Vec<Task> = decoded
         .iter()
         .enumerate()
@@ -223,7 +236,11 @@ fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             task
         })
         .collect();
-    let start = tasks.iter().filter_map(|t| t.stored_start).min().unwrap_or_else(next_monday);
+    let start = tasks
+        .iter()
+        .filter_map(|t| t.stored_start)
+        .min()
+        .unwrap_or_else(next_monday);
     Ok(Project {
         name,
         title: info.title,
@@ -237,9 +254,19 @@ fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
 fn parse_mpp_dt(s: &str) -> Option<DateTime> {
     let (date, time) = s.split_once(' ')?;
     let mut d = date.split('-');
-    let (y, mo, da) = (d.next()?.parse().ok()?, d.next()?.parse().ok()?, d.next()?.parse().ok()?);
+    let (y, mo, da) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
     let (hh, mm) = time.split_once(':')?;
-    Some(DateTime::from_ymd_hm(y, mo, da, hh.parse().ok()?, mm.parse().ok()?))
+    Some(DateTime::from_ymd_hm(
+        y,
+        mo,
+        da,
+        hh.parse().ok()?,
+        mm.parse().ok()?,
+    ))
 }
 
 fn save_to(proj: &Project, path: &str) -> Result<(), String> {
@@ -252,7 +279,10 @@ fn save_to(proj: &Project, path: &str) -> Result<(), String> {
 
 /// A fresh schedule: one task so the chart has something to show.
 fn new_project() -> Project {
-    let mut p = Project { name: "Untitled".into(), ..Project::default() };
+    let mut p = Project {
+        name: "Untitled".into(),
+        ..Project::default()
+    };
     p.start_date = Some(next_monday());
     p.tasks.push(Task {
         uid: 1,
@@ -275,14 +305,18 @@ fn next_monday() -> DateTime {
 fn prefs_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
     Some(base.join("yppxy").join("prefs"))
 }
 
 /// Load the persisted theme preference (light/dark); defaults to dark.
 fn load_theme_pref() -> bool {
     let Some(p) = prefs_path() else { return false };
-    let Ok(text) = std::fs::read_to_string(p) else { return false };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return false;
+    };
     text.lines()
         .find_map(|l| l.strip_prefix("theme="))
         .map(|v| v.trim() == "light")
@@ -295,7 +329,10 @@ fn save_theme_pref(light: bool) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(p, format!("theme={}\n", if light { "light" } else { "dark" }));
+    let _ = std::fs::write(
+        p,
+        format!("theme={}\n", if light { "light" } else { "dark" }),
+    );
 }
 
 fn window_title(path: &Option<String>, dirty: bool) -> String {
@@ -329,11 +366,11 @@ struct App {
     proj: Project,
     path: Option<String>,
     dirty: bool,
-    sel: usize,     // selected task index
-    top: usize,     // first visible task row
-    hscroll: i64,   // gantt horizontal scroll in days from project start
+    sel: usize,   // selected task index
+    top: usize,   // first visible task row
+    hscroll: i64, // gantt horizontal scroll in days from project start
     sched: Schedule,
-    base_day: i64,  // day-number of project start (gantt column origin)
+    base_day: i64, // day-number of project start (gantt column origin)
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
@@ -352,9 +389,9 @@ struct App {
     leveled: bool,
     level: Option<Leveled>,
     // geometry recorded during draw for mouse hit-testing
-    list_y0: u16,   // absolute y of the first task row
+    list_y0: u16,     // absolute y of the first task row
     list_left_w: u16, // width of the task pane (left of the gantt)
-    gantt_x0: u16,  // absolute x where the gantt inner area begins
+    gantt_x0: u16,    // absolute x where the gantt inner area begins
 }
 
 const RIBBON_H: u16 = 6; // tab strip (1) + body (5: border, 2 rows, separator, titles)
@@ -474,7 +511,11 @@ impl App {
         let n = self.proj.tasks.len();
         for step in 1..=n {
             let i = (self.sel + step) % n;
-            if self.proj.tasks[i].name.to_lowercase().contains(&self.find_query) {
+            if self.proj.tasks[i]
+                .name
+                .to_lowercase()
+                .contains(&self.find_query)
+            {
                 self.sel = i;
                 self.status = format!("Found '{}'  (F3 next)", self.find_query);
                 return;
@@ -501,15 +542,22 @@ impl App {
             "mso" => ConstraintType::MustStartOn,
             "mfo" => ConstraintType::MustFinishOn,
             _ => {
-                self.status = "Constraint: TYPE [date] — SNET/SNLT/FNET/FNLT/MSO/MFO/ALAP/none".into();
+                self.status =
+                    "Constraint: TYPE [date] — SNET/SNLT/FNET/FNLT/MSO/MFO/ALAP/none".into();
                 return;
             }
         };
         // Constraints other than ASAP/ALAP need a date.
-        let needs_date = !matches!(ctype, ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible);
+        let needs_date = !matches!(
+            ctype,
+            ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible
+        );
         let date = it.next().and_then(DateTime::parse_mspdi);
         if needs_date && date.is_none() {
-            self.status = format!("{} needs a date, e.g. {kind} 2026-03-05", kind.to_uppercase());
+            self.status = format!(
+                "{} needs a date, e.g. {kind} 2026-03-05",
+                kind.to_uppercase()
+            );
             return;
         }
         self.snapshot();
@@ -540,9 +588,19 @@ impl App {
             return;
         }
 
-        let existing = self.proj.resources.iter().find(|r| r.name.eq_ignore_ascii_case(&name)).map(|r| r.uid);
+        let existing = self
+            .proj
+            .resources
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(&name))
+            .map(|r| r.uid);
         if let Some(rid) = existing {
-            if self.proj.assignments.iter().any(|a| a.task_uid == task_uid && a.resource_uid == rid) {
+            if self
+                .proj
+                .assignments
+                .iter()
+                .any(|a| a.task_uid == task_uid && a.resource_uid == rid)
+            {
                 self.status = format!("{name} is already assigned");
                 return;
             }
@@ -552,12 +610,32 @@ impl App {
         let rid = existing.unwrap_or_else(|| {
             let uid = self.proj.resources.iter().map(|r| r.uid).max().unwrap_or(0) + 1;
             let id = self.proj.resources.len() as i32 + 1;
-            self.proj.resources.push(Resource { uid, id, name: name.clone(), is_work: true, max_units: 1.0, calendar_uid: None });
+            self.proj.resources.push(Resource {
+                uid,
+                id,
+                name: name.clone(),
+                is_work: true,
+                max_units: 1.0,
+                calendar_uid: None,
+            });
             uid
         });
-        let auid = self.proj.assignments.iter().map(|a| a.uid).max().unwrap_or(0) + 1;
+        let auid = self
+            .proj
+            .assignments
+            .iter()
+            .map(|a| a.uid)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let work = self.proj.tasks[self.sel].duration_min;
-        self.proj.assignments.push(Assignment { uid: auid, task_uid, resource_uid: rid, units: 1.0, work_min: work });
+        self.proj.assignments.push(Assignment {
+            uid: auid,
+            task_uid,
+            resource_uid: rid,
+            units: 1.0,
+            work_min: work,
+        });
         self.mark_dirty();
         self.status = format!("Assigned {name}");
     }
@@ -624,22 +702,47 @@ impl App {
             Act::Outdent => self.indent(-1),
             Act::Rename => {
                 if let Some(t) = self.proj.tasks.get(self.sel) {
-                    self.prompt = Some(Prompt { kind: PromptKind::Rename, label: "Rename".into(), buf: t.name.clone() });
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::Rename,
+                        label: "Rename".into(),
+                        buf: t.name.clone(),
+                    });
                 }
             }
             Act::Duration => {
-                self.prompt = Some(Prompt { kind: PromptKind::Duration, label: "Duration".into(), buf: String::new() });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Duration,
+                    label: "Duration".into(),
+                    buf: String::new(),
+                });
             }
             Act::AddLink => {
-                self.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::AddPredecessor,
+                    label: "Predecessor ID".into(),
+                    buf: String::new(),
+                });
             }
             Act::Constraint => {
-                let cur = self.proj.tasks.get(self.sel).map(constraint_hint).unwrap_or_default();
-                self.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
+                let cur = self
+                    .proj
+                    .tasks
+                    .get(self.sel)
+                    .map(constraint_hint)
+                    .unwrap_or_default();
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Constraint,
+                    label: "Constraint".into(),
+                    buf: cur,
+                });
             }
             Act::Baseline => self.set_baseline(),
             Act::Assign => {
-                self.prompt = Some(Prompt { kind: PromptKind::Assign, label: "Assign resource".into(), buf: String::new() });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Assign,
+                    label: "Assign resource".into(),
+                    buf: String::new(),
+                });
             }
             Act::ClearResources => self.assign_resource(""),
             Act::ExportGantt => self.export_md(),
@@ -650,7 +753,11 @@ impl App {
             Act::Level => self.toggle_level(),
             Act::Save => self.save(),
             Act::SaveAs => {
-                self.prompt = Some(Prompt { kind: PromptKind::SaveAs, label: "Save as".into(), buf: self.path.clone().unwrap_or_default() });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::SaveAs,
+                    label: "Save as".into(),
+                    buf: self.path.clone().unwrap_or_default(),
+                });
             }
             Act::Todo(name) => self.status = format!("{name} — not implemented yet"),
         }
@@ -660,7 +767,11 @@ impl App {
         self.recompute_summaries();
         self.sched = schedule(&self.proj);
         self.base_day = self.sched.project_start.day_number();
-        self.level = if self.leveled { Some(level(&self.proj)) } else { None };
+        self.level = if self.leveled {
+            Some(level(&self.proj))
+        } else {
+            None
+        };
     }
 
     fn toggle_level(&mut self) {
@@ -705,12 +816,24 @@ impl App {
 
     fn add_task(&mut self) {
         self.snapshot();
-        let level = self.proj.tasks.get(self.sel).map(|t| t.outline_level).unwrap_or(1);
+        let level = self
+            .proj
+            .tasks
+            .get(self.sel)
+            .map(|t| t.outline_level)
+            .unwrap_or(1);
         let uid = self.proj.tasks.iter().map(|t| t.uid).max().unwrap_or(0) + 1;
         let at = (self.sel + 1).min(self.proj.tasks.len());
         self.proj.tasks.insert(
             at,
-            Task { uid, id: uid, name: "New task".into(), outline_level: level, duration_min: 480, ..Task::default() },
+            Task {
+                uid,
+                id: uid,
+                name: "New task".into(),
+                outline_level: level,
+                duration_min: 480,
+                ..Task::default()
+            },
         );
         self.sel = at;
         self.mark_dirty();
@@ -778,12 +901,20 @@ impl App {
             self.status = format!("No other task with ID {uid}");
             return;
         }
-        if self.proj.tasks[self.sel].predecessors.iter().any(|p| p.uid == uid) {
+        if self.proj.tasks[self.sel]
+            .predecessors
+            .iter()
+            .any(|p| p.uid == uid)
+        {
             self.status = format!("Already depends on {uid}");
             return;
         }
         self.snapshot();
-        self.proj.tasks[self.sel].predecessors.push(Predecessor { uid, link: LinkType::FinishStart, lag_min: 0 });
+        self.proj.tasks[self.sel].predecessors.push(Predecessor {
+            uid,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        });
         self.mark_dirty();
         self.reschedule();
     }
@@ -798,7 +929,11 @@ impl App {
                 Err(e) => self.status = format!("Save failed: {e}"),
             },
             None => {
-                self.prompt = Some(Prompt { kind: PromptKind::SaveAs, label: "Save as".into(), buf: String::new() });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::SaveAs,
+                    label: "Save as".into(),
+                    buf: String::new(),
+                });
             }
         }
     }
@@ -830,7 +965,10 @@ impl App {
                 self.reschedule();
                 let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
                 self.status = if is_mpp && !self.proj.tasks.is_empty() {
-                    format!("Opened {path} — {} task names decoded (.mpp dates/links pending)", self.proj.tasks.len())
+                    format!(
+                        "Opened {path} — {} task names decoded (.mpp dates/links pending)",
+                        self.proj.tasks.len()
+                    )
                 } else if is_mpp {
                     format!("Opened {path} — .mpp metadata only (no task table found)")
                 } else {
@@ -874,7 +1012,9 @@ impl App {
 
     /// Activate the highlighted backstage menu item.
     fn bs_activate_item(&mut self) {
-        let Some(item) = self.backstage.as_ref().map(|b| b.item) else { return };
+        let Some(item) = self.backstage.as_ref().map(|b| b.item) else {
+            return;
+        };
         match item {
             Item::New => {
                 self.proj = new_project();
@@ -909,7 +1049,11 @@ impl App {
                 let cur = self
                     .path
                     .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()))
+                    .and_then(|p| {
+                        std::path::Path::new(p)
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                    })
                     .unwrap_or_default();
                 if let Some(b) = self.backstage.as_mut() {
                     b.name_input = cur;
@@ -930,17 +1074,37 @@ fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
     let fin = sched.project_finish.parts();
     let start = sched.project_start.parts();
     let leaves = proj.tasks.iter().filter(|t| !t.summary).count();
-    let crit = proj.tasks.iter().filter(|t| !t.summary && sched.get(t.uid).is_some_and(|r| r.critical)).count();
+    let crit = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.summary && sched.get(t.uid).is_some_and(|r| r.critical))
+        .count();
     let mut out = vec![
-        format!("Project: {}", if proj.name.is_empty() { "Untitled" } else { &proj.name }),
-        format!("Start:   {:04}-{:02}-{:02}", start.year, start.month, start.day),
+        format!(
+            "Project: {}",
+            if proj.name.is_empty() {
+                "Untitled"
+            } else {
+                &proj.name
+            }
+        ),
+        format!(
+            "Start:   {:04}-{:02}-{:02}",
+            start.year, start.month, start.day
+        ),
         format!("Finish:  {:04}-{:02}-{:02}", fin.year, fin.month, fin.day),
         format!("Tasks:   {} ({crit} critical)", leaves),
         String::new(),
     ];
     for t in proj.tasks.iter().take(16) {
         let indent = "  ".repeat(t.outline_level.saturating_sub(1) as usize);
-        let bullet = if t.summary { "▾" } else if t.is_milestone() { "◆" } else { "•" };
+        let bullet = if t.summary {
+            "▾"
+        } else if t.is_milestone() {
+            "◆"
+        } else {
+            "•"
+        };
         out.push(format!("{indent}{bullet} {}", t.name));
     }
     if proj.tasks.len() > 16 {
@@ -1004,7 +1168,11 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     res
 }
@@ -1129,7 +1297,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('z') => app.undo(),
             KeyCode::Char('y') | KeyCode::Char('r') => app.redo(),
             KeyCode::Char('f') => {
-                app.prompt = Some(Prompt { kind: PromptKind::Find, label: "Find".into(), buf: String::new() });
+                app.prompt = Some(Prompt {
+                    kind: PromptKind::Find,
+                    label: "Find".into(),
+                    buf: String::new(),
+                });
             }
             KeyCode::Char('q') => app.quit = true, // Ctrl+Q: quit even if dirty
             _ => {}
@@ -1161,33 +1333,66 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::BackTab | KeyCode::Char('<') => app.indent(-1),
         KeyCode::Enter | KeyCode::F(2) => {
             if let Some(t) = app.proj.tasks.get(app.sel) {
-                app.prompt = Some(Prompt { kind: PromptKind::Rename, label: "Rename".into(), buf: t.name.clone() });
+                app.prompt = Some(Prompt {
+                    kind: PromptKind::Rename,
+                    label: "Rename".into(),
+                    buf: t.name.clone(),
+                });
             }
         }
         KeyCode::Char('d') => {
-            app.prompt = Some(Prompt { kind: PromptKind::Duration, label: "Duration".into(), buf: String::new() });
+            app.prompt = Some(Prompt {
+                kind: PromptKind::Duration,
+                label: "Duration".into(),
+                buf: String::new(),
+            });
         }
         KeyCode::Char('p') => {
-            app.prompt = Some(Prompt { kind: PromptKind::AddPredecessor, label: "Predecessor ID".into(), buf: String::new() });
+            app.prompt = Some(Prompt {
+                kind: PromptKind::AddPredecessor,
+                label: "Predecessor ID".into(),
+                buf: String::new(),
+            });
         }
         KeyCode::Char('c') => {
-            let cur = app.proj.tasks.get(app.sel).map(constraint_hint).unwrap_or_default();
-            app.prompt = Some(Prompt { kind: PromptKind::Constraint, label: "Constraint".into(), buf: cur });
+            let cur = app
+                .proj
+                .tasks
+                .get(app.sel)
+                .map(constraint_hint)
+                .unwrap_or_default();
+            app.prompt = Some(Prompt {
+                kind: PromptKind::Constraint,
+                label: "Constraint".into(),
+                buf: cur,
+            });
         }
         KeyCode::Char('b') => app.set_baseline(),
         KeyCode::Char('L') => app.toggle_level(),
         KeyCode::Char('a') => {
-            app.prompt = Some(Prompt { kind: PromptKind::Assign, label: "Assign resource".into(), buf: String::new() });
+            app.prompt = Some(Prompt {
+                kind: PromptKind::Assign,
+                label: "Assign resource".into(),
+                buf: String::new(),
+            });
         }
         KeyCode::F(3) => app.find(""), // repeat the last search
         KeyCode::F(9) => app.rfocus = ribbon::Focus::Tab(app.ribbon.active_tab()),
         // Vim niceties (only when launched with --vim).
         KeyCode::Char(':') if app.vim => {
-            app.prompt = Some(Prompt { kind: PromptKind::VimCommand, label: ":".into(), buf: String::new() });
+            app.prompt = Some(Prompt {
+                kind: PromptKind::VimCommand,
+                label: ":".into(),
+                buf: String::new(),
+            });
         }
         KeyCode::Char('u') if app.vim => app.undo(),
         KeyCode::Char('/') if app.vim => {
-            app.prompt = Some(Prompt { kind: PromptKind::Find, label: "/".into(), buf: String::new() });
+            app.prompt = Some(Prompt {
+                kind: PromptKind::Find,
+                label: "/".into(),
+                buf: String::new(),
+            });
         }
         _ => {}
     }
@@ -1248,12 +1453,18 @@ fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
 
 fn backstage_key(app: &mut App, k: KeyEvent) {
     // Read pane/item without holding a borrow across app-method calls.
-    let Some((pane, item)) = app.backstage.as_ref().map(|b| (b.pane, b.item)) else { return };
+    let Some((pane, item)) = app.backstage.as_ref().map(|b| (b.pane, b.item)) else {
+        return;
+    };
     match pane {
         Pane::SaveAs => match k.code {
             KeyCode::Esc => set_pane(app, Pane::Menu),
             KeyCode::Enter => {
-                let name = app.backstage.as_ref().map(|b| b.name_input.trim().to_string()).unwrap_or_default();
+                let name = app
+                    .backstage
+                    .as_ref()
+                    .map(|b| b.name_input.trim().to_string())
+                    .unwrap_or_default();
                 if !name.is_empty() {
                     let dir = app.backstage.as_ref().map(|b| b.dir.clone());
                     if let Some(dir) = dir {
@@ -1308,13 +1519,19 @@ fn backstage_key(app: &mut App, k: KeyEvent) {
             KeyCode::Esc => app.backstage = None, // back to the schedule
             KeyCode::Up => {
                 if let Some(b) = app.backstage.as_mut() {
-                    let i = backstage::ITEMS.iter().position(|&x| x == b.item).unwrap_or(0);
+                    let i = backstage::ITEMS
+                        .iter()
+                        .position(|&x| x == b.item)
+                        .unwrap_or(0);
                     b.item = backstage::ITEMS[i.saturating_sub(1)];
                 }
             }
             KeyCode::Down => {
                 if let Some(b) = app.backstage.as_mut() {
-                    let i = backstage::ITEMS.iter().position(|&x| x == b.item).unwrap_or(0);
+                    let i = backstage::ITEMS
+                        .iter()
+                        .position(|&x| x == b.item)
+                        .unwrap_or(0);
                     b.item = backstage::ITEMS[(i + 1).min(backstage::ITEMS.len() - 1)];
                 }
             }
@@ -1375,7 +1592,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_header(f, rows[2], app);
     draw_body(f, rows[3], app);
     if app.rfocus != ribbon::Focus::None {
-        f.render_widget(Paragraph::new(app.ribbon.render_hint(app.rfocus, area.width)), rows[4]);
+        f.render_widget(
+            Paragraph::new(app.ribbon.render_hint(app.rfocus, area.width)),
+            rows[4],
+        );
     } else {
         draw_status(f, rows[4], app);
     }
@@ -1391,13 +1611,19 @@ fn draw_start(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled("   yppxy", bold)),
-        Line::from(Span::styled("   terminal project scheduler — Critical Path Method + live Gantt", dim)),
+        Line::from(Span::styled(
+            "   terminal project scheduler — Critical Path Method + live Gantt",
+            dim,
+        )),
         Line::from(""),
         Line::from("   [N] or Enter    New schedule"),
         Line::from("   [O]             Open a project  (.xml · .yppx · .mpp)"),
         Line::from("   [Q] or Esc      Quit"),
         Line::from(""),
-        Line::from(Span::styled("   Tip: press F9 for the ribbon, Alt+F for the File menu.", dim)),
+        Line::from(Span::styled(
+            "   Tip: press F9 for the ribbon, Alt+F for the File menu.",
+            dim,
+        )),
     ];
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Welcome ")),
@@ -1406,7 +1632,9 @@ fn draw_start(f: &mut Frame, area: Rect) {
 }
 
 fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
-    let Some(bs) = app.backstage.as_ref() else { return };
+    let Some(bs) = app.backstage.as_ref() else {
+        return;
+    };
     f.render_widget(Clear, area);
     let outer = Block::default().borders(Borders::ALL).title(" File ");
     let inner = outer.inner(area);
@@ -1437,7 +1665,10 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
         Pane::SaveAs => {
             let dir = bs.dir.to_string_lossy();
             let lines = vec![
-                Line::from(Span::styled("Save As", Style::default().add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Save As",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(format!("Folder: {dir}")),
                 Line::from(vec![
@@ -1446,7 +1677,10 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled("▏", Style::default().fg(Color::Gray)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled("Use .yppx (native) or .xml (MSPDI). Enter saves · Esc back", Style::default().add_modifier(Modifier::DIM))),
+                Line::from(Span::styled(
+                    "Use .yppx (native) or .xml (MSPDI). Enter saves · Esc back",
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
             ];
             f.render_widget(Paragraph::new(lines), body);
         }
@@ -1467,11 +1701,17 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
                 };
                 f.render_widget(
                     Paragraph::new(vec![
-                        Line::from(Span::styled(bs.item.label(), Style::default().add_modifier(Modifier::BOLD))),
+                        Line::from(Span::styled(
+                            bs.item.label(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )),
                         Line::from(""),
                         Line::from(hint),
                         Line::from(""),
-                        Line::from(Span::styled("Enter to apply · Esc to close", Style::default().add_modifier(Modifier::DIM))),
+                        Line::from(Span::styled(
+                            "Enter to apply · Esc to close",
+                            Style::default().add_modifier(Modifier::DIM),
+                        )),
                     ]),
                     body,
                 );
@@ -1495,10 +1735,20 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) {
     let h = cols[0].height.saturating_sub(1) as usize;
     let start = bs.sel.saturating_sub(h.saturating_sub(1));
     for (i, e) in bs.entries.iter().enumerate().skip(start).take(h) {
-        let icon = if e.is_parent { "⬑ " } else if e.is_dir { "▸ " } else { "  " };
+        let icon = if e.is_parent {
+            "⬑ "
+        } else if e.is_dir {
+            "▸ "
+        } else {
+            "  "
+        };
         let size = e.size_str();
         let label = format!("{icon}{}", e.name);
-        let text = if size.is_empty() { label } else { format!("{label:<28} {size:>8}") };
+        let text = if size.is_empty() {
+            label
+        } else {
+            format!("{label:<28} {size:>8}")
+        };
         let mut line = Line::from(text);
         if i == bs.sel && focused {
             line.style = Style::default().add_modifier(Modifier::REVERSED);
@@ -1510,22 +1760,42 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) {
     f.render_widget(Paragraph::new(lines), cols[0]);
 
     // Preview of the highlighted project.
-    let mut prev: Vec<Line> = vec![Line::from(Span::styled("Preview", Style::default().add_modifier(Modifier::DIM)))];
+    let mut prev: Vec<Line> = vec![Line::from(Span::styled(
+        "Preview",
+        Style::default().add_modifier(Modifier::DIM),
+    ))];
     prev.extend(bs.preview.iter().map(|s| Line::from(s.clone())));
-    f.render_widget(Paragraph::new(prev).block(Block::default().borders(Borders::LEFT)), cols[1]);
+    f.render_widget(
+        Paragraph::new(prev).block(Block::default().borders(Borders::LEFT)),
+        cols[1],
+    );
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let fin = app.sched.project_finish.parts();
-    let crit = app.proj.tasks.iter().filter(|t| app.sched.get(t.uid).is_some_and(|r| r.critical) && !t.summary).count();
-    let name = if app.proj.name.is_empty() { "Untitled" } else { &app.proj.name };
+    let crit = app
+        .proj
+        .tasks
+        .iter()
+        .filter(|t| app.sched.get(t.uid).is_some_and(|r| r.critical) && !t.summary)
+        .count();
+    let name = if app.proj.name.is_empty() {
+        "Untitled"
+    } else {
+        &app.proj.name
+    };
     let title = format!(
         " {name}{}   finish {:04}-{:02}-{:02}   {} task(s), {crit} critical ",
         if app.dirty { " *" } else { "" },
-        fin.year, fin.month, fin.day,
+        fin.year,
+        fin.month,
+        fin.day,
         app.proj.tasks.len(),
     );
-    let mut spans = vec![Span::styled(title, Style::default().add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
     // Baseline variance for the selected task.
     if let Some(t) = app.proj.tasks.get(app.sel) {
         if let (Some(bf), Some(r)) = (t.baseline_finish, app.sched.get(t.uid)) {
@@ -1535,12 +1805,18 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 std::cmp::Ordering::Less => (format!("▼ {}d early", -delta), ONTRACK),
                 std::cmp::Ordering::Equal => ("on baseline".to_string(), Color::Gray),
             };
-            spans.push(Span::styled(format!("· {}: {label} ", truncate(&t.name, 16)), Style::default().fg(color)));
+            spans.push(Span::styled(
+                format!("· {}: {label} ", truncate(&t.name, 16)),
+                Style::default().fg(color),
+            ));
         }
         // Resources assigned to the selected task.
         let res = task_resources(&app.proj, t.uid);
         if !res.is_empty() {
-            spans.push(Span::styled(format!("· 👤 {} ", res.join(", ")), Style::default().add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(
+                format!("· 👤 {} ", res.join(", ")),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1579,7 +1855,13 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         let t = &app.proj.tasks[i];
         let r = app.sched.get(t.uid);
         let indent = "  ".repeat((t.outline_level.saturating_sub(1)) as usize);
-        let bullet = if t.summary { "▾ " } else if t.is_milestone() { "◆ " } else { "• " };
+        let bullet = if t.summary {
+            "▾ "
+        } else if t.is_milestone() {
+            "◆ "
+        } else {
+            "• "
+        };
         let res = task_resources(&app.proj, t.uid);
         let base = format!("{indent}{bullet}{}", t.name);
         let full = if res.is_empty() {
@@ -1597,7 +1879,9 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             fmt_days(app.proj.minutes_to_days(t.duration_min))
         };
-        let slack = r.map(|r| fmt_days(app.proj.minutes_to_days(r.total_slack_min.max(0)))).unwrap_or_else(|| "?".into());
+        let slack = r
+            .map(|r| fmt_days(app.proj.minutes_to_days(r.total_slack_min.max(0))))
+            .unwrap_or_else(|| "?".into());
         let crit = r.is_some_and(|r| r.critical);
         let mut style = Style::default();
         if t.summary {
@@ -1630,16 +1914,34 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     for i in app.top..end {
         let t = &app.proj.tasks[i];
         let crit = app.sched.get(t.uid).is_some_and(|r| r.critical);
-        let s_day = app.disp_start(t.uid).map(|d| d.day_number() - app.base_day).unwrap_or(i64::MAX);
-        let e_day = app.disp_finish(t.uid).map(|d| d.day_number() - app.base_day).unwrap_or(i64::MIN);
-        let mut line = build_gantt_row(gw, app.hscroll, app.base_day, s_day, e_day, crit, t.summary, t.is_milestone());
+        let s_day = app
+            .disp_start(t.uid)
+            .map(|d| d.day_number() - app.base_day)
+            .unwrap_or(i64::MAX);
+        let e_day = app
+            .disp_finish(t.uid)
+            .map(|d| d.day_number() - app.base_day)
+            .unwrap_or(i64::MIN);
+        let mut line = build_gantt_row(
+            gw,
+            app.hscroll,
+            app.base_day,
+            s_day,
+            e_day,
+            crit,
+            t.summary,
+            t.is_milestone(),
+        );
         if i == app.sel {
             line.style = Style::default().bg(app.sel_bg());
         }
         right_lines.push(line);
     }
     let lev = if app.leveled { " · leveled" } else { "" };
-    let gtitle = format!(" Gantt — from {:04}-{:02}-{:02} (◀ ▶ scroll){lev} ", start.year, start.month, start.day);
+    let gtitle = format!(
+        " Gantt — from {:04}-{:02}-{:02} (◀ ▶ scroll){lev} ",
+        start.year, start.month, start.day
+    );
     f.render_widget(
         Paragraph::new(right_lines).block(Block::default().borders(Borders::ALL).title(gtitle)),
         right,
@@ -1663,7 +1965,10 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
             }
         }
     }
-    Line::from(Span::styled(buf.into_iter().collect::<String>(), Style::default().fg(WEEKEND)))
+    Line::from(Span::styled(
+        buf.into_iter().collect::<String>(),
+        Style::default().fg(WEEKEND),
+    ))
 }
 
 /// One task's bar across the visible day columns. `s_day`/`e_day` are day
@@ -1688,15 +1993,28 @@ fn build_gantt_row(
         let weekend = matches!(dt.weekday(), 0 | 6);
         let in_span = day >= s_day && day <= e_day;
         if milestone && day == s_day {
-            spans.push(Span::styled("◆", Style::default().fg(MILESTONE).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                "◆",
+                Style::default().fg(MILESTONE).add_modifier(Modifier::BOLD),
+            ));
         } else if is_summary && in_span {
             // rollup bar: end caps + a thin spine, distinct from task bars
-            let ch = if day == s_day || day == e_day { "▟" } else { "▬" };
-            spans.push(Span::styled(ch, Style::default().fg(SUMMARY).add_modifier(Modifier::BOLD)));
+            let ch = if day == s_day || day == e_day {
+                "▟"
+            } else {
+                "▬"
+            };
+            spans.push(Span::styled(
+                ch,
+                Style::default().fg(SUMMARY).add_modifier(Modifier::BOLD),
+            ));
         } else if !milestone && in_span {
             spans.push(Span::styled("█", Style::default().fg(bar_color)));
         } else if weekend {
-            spans.push(Span::styled("·", Style::default().fg(WEEKEND).add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(
+                "·",
+                Style::default().fg(WEEKEND).add_modifier(Modifier::DIM),
+            ));
         } else {
             spans.push(Span::raw(" "));
         }
@@ -1706,12 +2024,22 @@ fn build_gantt_row(
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · q quit";
-    let text = if app.status.is_empty() { help.to_string() } else { app.status.clone() };
+    let text = if app.status.is_empty() {
+        help.to_string()
+    } else {
+        app.status.clone()
+    };
     let mut spans = Vec::new();
     if app.vim {
-        spans.push(Span::styled(" -- VIM -- ", Style::default().fg(Color::Black).bg(Color::Green)));
+        spans.push(Span::styled(
+            " -- VIM -- ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
     }
-    spans.push(Span::styled(format!(" {text}"), Style::default().fg(Color::Gray)));
+    spans.push(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(Color::Gray),
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1720,15 +2048,27 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
     let w = area.width.clamp(20, 60);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = area.height / 2;
-    let rect = Rect { x, y, width: w, height: 3 };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: 3,
+    };
     f.render_widget(Clear, rect);
     let content = Line::from(vec![
-        Span::styled(format!(" {}: ", p.label), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {}: ", p.label),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(p.buf.clone()),
         Span::styled("▏", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(" Enter ↵  Esc ✕ ")),
+        Paragraph::new(content).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Enter ↵  Esc ✕ "),
+        ),
         rect,
     );
 }
@@ -1740,7 +2080,12 @@ fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
     proj.assignments
         .iter()
         .filter(|a| a.task_uid == uid)
-        .filter_map(|a| proj.resources.iter().find(|r| r.uid == a.resource_uid).map(|r| r.name.clone()))
+        .filter_map(|a| {
+            proj.resources
+                .iter()
+                .find(|r| r.uid == a.resource_uid)
+                .map(|r| r.name.clone())
+        })
         .collect()
 }
 
@@ -1798,8 +2143,14 @@ mod tests {
 
     #[test]
     fn window_title_format() {
-        assert_eq!(window_title(&Some("/a/plan.yppx".into()), false), "yppxy - plan.yppx");
-        assert_eq!(window_title(&Some("plan.xml".into()), true), "* yppxy - plan.xml");
+        assert_eq!(
+            window_title(&Some("/a/plan.yppx".into()), false),
+            "yppxy - plan.yppx"
+        );
+        assert_eq!(
+            window_title(&Some("plan.xml".into()), true),
+            "* yppxy - plan.xml"
+        );
         assert_eq!(window_title(&None, false), "yppxy - untitled");
     }
 
@@ -1857,7 +2208,11 @@ mod tests {
             name: "Build".into(),
             outline_level: 1,
             duration_min: 960,
-            predecessors: vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 0 }],
+            predecessors: vec![Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag_min: 0,
+            }],
             ..Task::default()
         });
         let mut app = App::new(proj, Some("plan.yppx".into()), false);
@@ -1897,10 +2252,22 @@ mod tests {
     #[test]
     fn ribbon_renders_tabs_and_groups() {
         let mut proj = new_project();
-        proj.tasks.push(Task { uid: 2, id: 2, name: "Build".into(), outline_level: 1, duration_min: 960, ..Task::default() });
+        proj.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            name: "Build".into(),
+            outline_level: 1,
+            duration_min: 960,
+            ..Task::default()
+        });
         let mut app = App::new(proj, Some("plan.yppx".into()), false);
         let s = buffer_text(&mut app, 110, 24);
-        assert!(s.contains("File") && s.contains("Task") && s.contains("Schedule") && s.contains("View"));
+        assert!(
+            s.contains("File")
+                && s.contains("Task")
+                && s.contains("Schedule")
+                && s.contains("View")
+        );
         assert!(s.contains("Milestone"), "ribbon body missing");
         assert!(s.contains("Gantt"), "gantt pane missing");
     }
@@ -1943,8 +2310,22 @@ mod tests {
     fn find_selects_matching_task_and_wraps() {
         let mut proj = new_project();
         proj.tasks[0].name = "Alpha".into();
-        proj.tasks.push(Task { uid: 2, id: 2, name: "Bravo".into(), outline_level: 1, duration_min: 480, ..Task::default() });
-        proj.tasks.push(Task { uid: 3, id: 3, name: "Charlie".into(), outline_level: 1, duration_min: 480, ..Task::default() });
+        proj.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            name: "Bravo".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        });
+        proj.tasks.push(Task {
+            uid: 3,
+            id: 3,
+            name: "Charlie".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        });
         let mut app = App::new(proj, None, false);
         app.find("charlie");
         assert_eq!(app.sel, 2);
@@ -1957,7 +2338,11 @@ mod tests {
 
     #[test]
     fn vim_commands_save_and_quit() {
-        let mut app = App::new(new_project(), Some("/nonexistent/dir/plan.yppx".into()), true);
+        let mut app = App::new(
+            new_project(),
+            Some("/nonexistent/dir/plan.yppx".into()),
+            true,
+        );
         app.vim_run("q"); // dirty? no — fresh project isn't dirty
         assert!(app.quit);
         let mut app = App::new(new_project(), None, true);
@@ -1980,10 +2365,15 @@ mod tests {
     fn baseline_captures_plan_and_variance_shows() {
         let mut app = App::new(new_project(), None, false);
         app.set_baseline();
-        let bf = app.proj.tasks[0].baseline_finish.expect("baseline captured");
+        let bf = app.proj.tasks[0]
+            .baseline_finish
+            .expect("baseline captured");
         app.set_duration("5d"); // extend past the baseline
         let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
-        assert!(r.early_finish.day_number() > bf.day_number(), "finish should slip past baseline");
+        assert!(
+            r.early_finish.day_number() > bf.day_number(),
+            "finish should slip past baseline"
+        );
     }
 
     #[test]
@@ -2014,14 +2404,24 @@ mod tests {
     #[test]
     fn level_toggle_delays_shared_resource() {
         let mut proj = new_project(); // task 1 (1d)
-        proj.tasks.push(Task { uid: 2, id: 2, name: "B".into(), outline_level: 1, duration_min: 480, ..Task::default() });
+        proj.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            name: "B".into(),
+            outline_level: 1,
+            duration_min: 480,
+            ..Task::default()
+        });
         let mut app = App::new(proj, None, false);
         app.sel = 0;
         app.assign_resource("Alice");
         app.sel = 1;
         app.assign_resource("Alice");
         // unleveled: both start the same day
-        assert_eq!(app.disp_start(1).unwrap().day_number(), app.disp_start(2).unwrap().day_number());
+        assert_eq!(
+            app.disp_start(1).unwrap().day_number(),
+            app.disp_start(2).unwrap().day_number()
+        );
         // leveled: task 2 waits for Alice to free up
         app.toggle_level();
         assert!(app.disp_start(2).unwrap().day_number() > app.disp_start(1).unwrap().day_number());

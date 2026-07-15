@@ -19,7 +19,10 @@ use opccore::xml::{Event, XmlParser};
 /// Parse an MSPDI document into a [`Project`].
 pub fn read_mspdi(xml: &str) -> Result<Project, String> {
     let mut p = XmlParser::new(xml);
-    let mut proj = Project { calendars: Vec::new(), ..Project::default() };
+    let mut proj = Project {
+        calendars: Vec::new(),
+        ..Project::default()
+    };
     let mut minutes_per_day: Option<f64> = None;
     let mut minutes_per_week: Option<f64> = None;
 
@@ -67,7 +70,8 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
         .map(|m| m / 60.0)
         .unwrap_or(proj.hours_per_day * 5.0);
     if proj.calendars.is_empty() {
-        proj.calendars.push(Calendar::standard(proj.default_calendar_uid));
+        proj.calendars
+            .push(Calendar::standard(proj.default_calendar_uid));
     }
     Ok(proj)
 }
@@ -168,7 +172,9 @@ fn parse_predecessor(p: &mut XmlParser) -> Option<Predecessor> {
                 let name = p.name().to_string();
                 match name.as_str() {
                     "PredecessorUID" => uid = Some(int_of(p) as i32),
-                    "Type" => link = LinkType::from_code(int_of(p)).unwrap_or(LinkType::FinishStart),
+                    "Type" => {
+                        link = LinkType::from_code(int_of(p)).unwrap_or(LinkType::FinishStart)
+                    }
                     "LinkLag" => lag_tenths = int_of(p),
                     _ => p.skip_element(),
                 }
@@ -199,7 +205,11 @@ fn parse_resources(p: &mut XmlParser, out: &mut Vec<Resource>) {
 }
 
 fn parse_resource(p: &mut XmlParser) -> Resource {
-    let mut r = Resource { max_units: 1.0, is_work: true, ..Resource::default() };
+    let mut r = Resource {
+        max_units: 1.0,
+        is_work: true,
+        ..Resource::default()
+    };
     loop {
         match p.next() {
             Event::Start => {
@@ -238,7 +248,13 @@ fn parse_assignments(p: &mut XmlParser, out: &mut Vec<Assignment>) {
 }
 
 fn parse_assignment(p: &mut XmlParser) -> Assignment {
-    let mut a = Assignment { uid: 0, task_uid: 0, resource_uid: 0, units: 1.0, work_min: 0 };
+    let mut a = Assignment {
+        uid: 0,
+        task_uid: 0,
+        resource_uid: 0,
+        units: 1.0,
+        work_min: 0,
+    };
     loop {
         match p.next() {
             Event::Start => {
@@ -276,7 +292,11 @@ fn parse_calendars(p: &mut XmlParser, out: &mut Vec<Calendar>) {
 }
 
 fn parse_calendar(p: &mut XmlParser) -> Calendar {
-    let mut cal = Calendar { uid: 0, name: String::new(), week: Default::default() };
+    let mut cal = Calendar {
+        uid: 0,
+        name: String::new(),
+        week: Default::default(),
+    };
     loop {
         match p.next() {
             Event::Start => {
@@ -334,7 +354,9 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
     if let Some(d) = day_type {
         if d < 7 {
             // A non-working day yields empty times even if some were present.
-            week[d] = DayWorking { times: if working { times } else { Vec::new() } };
+            week[d] = DayWorking {
+                times: if working { times } else { Vec::new() },
+            };
         }
     }
 }
@@ -461,9 +483,24 @@ pub fn write_mspdi(proj: &Project) -> String {
     if !proj.title.is_empty() {
         tag(&mut s, 1, "Title", &proj.title);
     }
-    tag(&mut s, 1, "MinutesPerDay", &((proj.hours_per_day * 60.0).round() as i64).to_string());
-    tag(&mut s, 1, "MinutesPerWeek", &((proj.hours_per_week * 60.0).round() as i64).to_string());
-    tag(&mut s, 1, "CalendarUID", &proj.default_calendar_uid.to_string());
+    tag(
+        &mut s,
+        1,
+        "MinutesPerDay",
+        &((proj.hours_per_day * 60.0).round() as i64).to_string(),
+    );
+    tag(
+        &mut s,
+        1,
+        "MinutesPerWeek",
+        &((proj.hours_per_week * 60.0).round() as i64).to_string(),
+    );
+    tag(
+        &mut s,
+        1,
+        "CalendarUID",
+        &proj.default_calendar_uid.to_string(),
+    );
     if let Some(d) = proj.start_date {
         tag(&mut s, 1, "StartDate", &d.to_mspdi());
     }
@@ -742,7 +779,10 @@ mod tests {
 
     #[test]
     fn baseline_round_trips() {
-        let mut proj = Project { calendars: vec![Calendar::standard(1)], ..Project::default() };
+        let mut proj = Project {
+            calendars: vec![Calendar::standard(1)],
+            ..Project::default()
+        };
         proj.tasks.push(Task {
             uid: 1,
             id: 1,

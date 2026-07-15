@@ -31,7 +31,10 @@ pub const MAIN_PART: &str = "project.xml";
 /// Serialize a [`Project`] into a `.yppx` package (bytes of a ZIP container).
 pub fn write_yppx(proj: &Project) -> Vec<u8> {
     let entries = vec![
-        ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+        (
+            "[Content_Types].xml".to_string(),
+            CONTENT_TYPES.as_bytes().to_vec(),
+        ),
         (MAIN_PART.to_string(), write_mspdi(proj).into_bytes()),
     ];
     write_zip(&entries)
@@ -71,7 +74,11 @@ mod tests {
             duration_min: 480,
             ..Task::default()
         };
-        b.predecessors = vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 240 }];
+        b.predecessors = vec![Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 240,
+        }];
         Project {
             name: "Demo".into(),
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),

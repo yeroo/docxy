@@ -129,7 +129,13 @@ impl Backstage {
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 if is_dir {
                     if !name.starts_with('.') {
-                        dirs.push(Entry { name, is_dir: true, is_parent: false, size: 0, locked: false });
+                        dirs.push(Entry {
+                            name,
+                            is_dir: true,
+                            is_parent: false,
+                            size: 0,
+                            locked: false,
+                        });
                     }
                 } else if is_openable(&name) {
                     files.push(Entry {

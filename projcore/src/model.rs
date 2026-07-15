@@ -17,8 +17,8 @@ pub enum LinkType {
     FinishFinish, // 0
     #[default]
     FinishStart, // 1
-    StartFinish, // 2
-    StartStart,  // 3
+    StartFinish,  // 2
+    StartStart,   // 3
 }
 
 impl LinkType {
@@ -47,11 +47,11 @@ impl LinkType {
 pub enum ConstraintType {
     #[default]
     AsSoonAsPossible, // 0
-    AsLateAsPossible,  // 1
-    MustStartOn,       // 2
-    MustFinishOn,      // 3
-    StartNoEarlierThan, // 4
-    StartNoLaterThan,   // 5
+    AsLateAsPossible,    // 1
+    MustStartOn,         // 2
+    MustFinishOn,        // 3
+    StartNoEarlierThan,  // 4
+    StartNoLaterThan,    // 5
     FinishNoEarlierThan, // 6
     FinishNoLaterThan,   // 7
 }
@@ -195,8 +195,14 @@ impl Calendar {
     /// 13:00–17:00 (8 working hours), weekends off.
     pub fn standard(uid: i32) -> Calendar {
         let shift = vec![
-            WorkingTime { from: 8 * 60, to: 12 * 60 },
-            WorkingTime { from: 13 * 60, to: 17 * 60 },
+            WorkingTime {
+                from: 8 * 60,
+                to: 12 * 60,
+            },
+            WorkingTime {
+                from: 13 * 60,
+                to: 17 * 60,
+            },
         ];
         let off = DayWorking::default();
         let on = DayWorking { times: shift };

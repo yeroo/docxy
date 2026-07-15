@@ -89,8 +89,14 @@ pub fn task_names(bytes: &[u8]) -> Vec<String> {
 /// real Microsoft Project and ProjectLibre files). If no layout fits, dates are
 /// left `None`. Timestamps use MPXJ's epoch/encoding.
 pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
-    let Ok(cfb) = Cfb::open(bytes) else { return Vec::new() };
-    let Some(v2path) = cfb.paths().into_iter().find(|p| p.ends_with("TBkndTask/Var2Data")) else {
+    let Ok(cfb) = Cfb::open(bytes) else {
+        return Vec::new();
+    };
+    let Some(v2path) = cfb
+        .paths()
+        .into_iter()
+        .find(|p| p.ends_with("TBkndTask/Var2Data"))
+    else {
         return Vec::new();
     };
     let vmpath = v2path.replace("Var2Data", "VarMeta");
@@ -98,7 +104,13 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
         return Vec::new();
     };
     let names = crate::varmeta::names(&vm, &v2);
-    let mut out: Vec<MppTask> = names.into_iter().map(|name| MppTask { name, ..Default::default() }).collect();
+    let mut out: Vec<MppTask> = names
+        .into_iter()
+        .map(|name| MppTask {
+            name,
+            ..Default::default()
+        })
+        .collect();
 
     // Add dates from FixedData if a record layout fits the task count. Once the
     // record size is known, look for the outline-level column in the same
@@ -111,7 +123,12 @@ pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     // that disambiguates which date field is Start/Finish.
     let naive_links: Vec<(usize, usize)> = cons
         .as_deref()
-        .map(|c| parse_cons(c).iter().map(|l| (l.pred_uid as usize, l.succ_uid as usize)).collect())
+        .map(|c| {
+            parse_cons(c)
+                .iter()
+                .map(|l| (l.pred_uid as usize, l.succ_uid as usize))
+                .collect()
+        })
         .unwrap_or_default();
     if let Some(fd) = cfb.read_path(&fdpath) {
         if let Some((rs, off)) = detect_date_layout(&fd, out.len(), &naive_links) {
@@ -155,7 +172,11 @@ fn parse_cons(cons: &[u8]) -> Vec<RawLink> {
     (0..cons.len() / 20)
         .map(|i| {
             let o = i * 20;
-            RawLink { pred_uid: u32le(cons, o + 4), succ_uid: u32le(cons, o + 8), kind: u16le(cons, o + 12) }
+            RawLink {
+                pred_uid: u32le(cons, o + 4),
+                succ_uid: u32le(cons, o + 8),
+                kind: u16le(cons, o + 12),
+            }
         })
         .collect()
 }
@@ -218,9 +239,14 @@ fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
     }
     let map = build(off);
     for l in &links {
-        let (Some(&p), Some(&s)) = (map.get(&l.pred_uid), map.get(&l.succ_uid)) else { continue };
+        let (Some(&p), Some(&s)) = (map.get(&l.pred_uid), map.get(&l.succ_uid)) else {
+            continue;
+        };
         if p != s && l.kind <= 3 {
-            tasks[s].predecessors.push(MppPred { pred: p, kind: l.kind as u8 });
+            tasks[s].predecessors.push(MppPred {
+                pred: p,
+                kind: l.kind as u8,
+            });
         }
     }
 }
@@ -264,7 +290,8 @@ fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Opti
             let mut ok = 0usize;
             let mut distinct = std::collections::HashSet::new();
             for i in 0..count {
-                if let (Some(s), Some(f)) = (ts_ord(fd, i * rs + off), ts_ord(fd, i * rs + off + 4)) {
+                if let (Some(s), Some(f)) = (ts_ord(fd, i * rs + off), ts_ord(fd, i * rs + off + 4))
+                {
                     if s <= f {
                         ok += 1;
                         distinct.insert(s);
@@ -281,7 +308,9 @@ fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Opti
             let (mut fo, mut ft) = (0usize, 0usize);
             for &(p, s) in links {
                 if p < count && s < count {
-                    if let (Some(pf), Some(ss)) = (ts_ord(fd, p * rs + off + 4), ts_ord(fd, s * rs + off)) {
+                    if let (Some(pf), Some(ss)) =
+                        (ts_ord(fd, p * rs + off + 4), ts_ord(fd, s * rs + off))
+                    {
                         ft += 1;
                         if ss >= pf {
                             fo += 1;
@@ -289,7 +318,11 @@ fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Opti
                     }
                 }
             }
-            if ft >= 3 && ft * 2 >= links.len() && fo * 10 >= ft * 9 && lnk_best.is_none_or(|(_, _, b)| fo > b) {
+            if ft >= 3
+                && ft * 2 >= links.len()
+                && fo * 10 >= ft * 9
+                && lnk_best.is_none_or(|(_, _, b)| fo > b)
+            {
                 lnk_best = Some((rs, off, fo));
             }
         }
@@ -318,7 +351,9 @@ fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<
         if (count - 1) * record_size + off >= fd.len() {
             break;
         }
-        let v: Vec<i32> = (0..count).map(|i| fd[i * record_size + off] as i32).collect();
+        let v: Vec<i32> = (0..count)
+            .map(|i| fd[i * record_size + off] as i32)
+            .collect();
         let maxv = *v.iter().max().unwrap();
         if !(2..=10).contains(&maxv) || v[0] > 1 {
             continue;
@@ -344,10 +379,18 @@ fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<
 /// Open a `.mpp` (compound file) and extract its documented metadata.
 pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
     let cfb = Cfb::open(bytes)?;
-    let mut info = MppInfo { streams: cfb.stream_names(), ..MppInfo::default() };
+    let mut info = MppInfo {
+        streams: cfb.stream_names(),
+        ..MppInfo::default()
+    };
 
     if let Some(sum) = cfb.read_stream(SUMMARY).and_then(|s| oleps::parse(&s)) {
-        let s = |id| sum.get(&id).and_then(|p| p.as_str()).unwrap_or("").to_string();
+        let s = |id| {
+            sum.get(&id)
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         info.title = s(PID_TITLE);
         info.subject = s(PID_SUBJECT);
         info.author = s(PID_AUTHOR);
@@ -355,11 +398,22 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
         info.comments = s(PID_COMMENTS);
         info.last_author = s(PID_LAST_AUTHOR);
         info.revision = s(PID_REVISION);
-        info.created = sum.get(&PID_CREATED).and_then(|p| p.as_time()).and_then(filetime_to_string);
-        info.saved = sum.get(&PID_SAVED).and_then(|p| p.as_time()).and_then(filetime_to_string);
+        info.created = sum
+            .get(&PID_CREATED)
+            .and_then(|p| p.as_time())
+            .and_then(filetime_to_string);
+        info.saved = sum
+            .get(&PID_SAVED)
+            .and_then(|p| p.as_time())
+            .and_then(filetime_to_string);
     }
     if let Some(doc) = cfb.read_stream(DOC_SUMMARY).and_then(|s| oleps::parse(&s)) {
-        let s = |id| doc.get(&id).and_then(|p| p.as_str()).unwrap_or("").to_string();
+        let s = |id| {
+            doc.get(&id)
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         info.manager = s(PID_MANAGER);
         info.company = s(PID_COMPANY);
     }
@@ -390,7 +444,11 @@ pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
     }
     let secs = if time == 0xFFFF { 0 } else { time as u32 * 6 }; // tenths-min → seconds
     let (y, m, d) = civil_from_days(MPP_EPOCH_DAYS + days as i64);
-    Some(format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60))
+    Some(format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60
+    ))
 }
 
 /// Decode an MPP duration (a 4-byte value in tenths of a minute) at `off` into
@@ -417,7 +475,12 @@ fn filetime_to_string(ft: u64) -> Option<String> {
     let (y, m, d) = civil_from_days(days);
     Some(format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60
+        y,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
     ))
 }
 
@@ -516,9 +579,15 @@ mod tests {
     #[test]
     fn mpp_timestamp_decode() {
         // days=0, time=4800 tenths-of-min (=8h) → 1984-01-01 08:00
-        assert_eq!(decode_timestamp(&[0xC0, 0x12, 0x00, 0x00], 0).as_deref(), Some("1984-01-01 08:00"));
+        assert_eq!(
+            decode_timestamp(&[0xC0, 0x12, 0x00, 0x00], 0).as_deref(),
+            Some("1984-01-01 08:00")
+        );
         // days=366 → 1985-01-01 (1984 is a leap year)
-        assert_eq!(decode_timestamp(&[0x00, 0x00, 0x6E, 0x01], 0).as_deref(), Some("1985-01-01 00:00"));
+        assert_eq!(
+            decode_timestamp(&[0x00, 0x00, 0x6E, 0x01], 0).as_deref(),
+            Some("1985-01-01 00:00")
+        );
         // 0xFFFF days is the NA marker
         assert_eq!(decode_timestamp(&[0x00, 0x00, 0xFF, 0xFF], 0), None);
     }
@@ -544,7 +613,10 @@ mod tests {
         }
         assert_eq!(detect_date_layout(&fd, starts.len(), &[]), Some((rs, off)));
         // Decode round-trips the first task's dates.
-        assert_eq!(decode_timestamp(&fd, off).as_deref(), Some("1989-06-23 08:00"));
+        assert_eq!(
+            decode_timestamp(&fd, off).as_deref(),
+            Some("1989-06-23 08:00")
+        );
     }
 
     #[test]
@@ -588,9 +660,24 @@ mod tests {
             cons.extend_from_slice(&[0u8; 6]); // flag + lag
         }
         let mut tasks = vec![
-            MppTask { name: "A".into(), start: Some("2020-01-01 08:00".into()), finish: Some("2020-01-02 17:00".into()), ..Default::default() },
-            MppTask { name: "B".into(), start: Some("2020-01-03 08:00".into()), finish: Some("2020-01-04 17:00".into()), ..Default::default() },
-            MppTask { name: "C".into(), start: Some("2020-01-05 08:00".into()), finish: Some("2020-01-06 17:00".into()), ..Default::default() },
+            MppTask {
+                name: "A".into(),
+                start: Some("2020-01-01 08:00".into()),
+                finish: Some("2020-01-02 17:00".into()),
+                ..Default::default()
+            },
+            MppTask {
+                name: "B".into(),
+                start: Some("2020-01-03 08:00".into()),
+                finish: Some("2020-01-04 17:00".into()),
+                ..Default::default()
+            },
+            MppTask {
+                name: "C".into(),
+                start: Some("2020-01-05 08:00".into()),
+                finish: Some("2020-01-06 17:00".into()),
+                ..Default::default()
+            },
         ];
         decode_links(&cons, &fd, rs, &mut tasks);
         assert_eq!(tasks[0].predecessors, vec![]);
@@ -613,8 +700,18 @@ mod tests {
         cons.extend_from_slice(&1u16.to_le_bytes());
         cons.extend_from_slice(&[0u8; 6]);
         let mut tasks = vec![
-            MppTask { name: "late".into(), start: Some("2020-02-01 08:00".into()), finish: Some("2020-02-10 17:00".into()), ..Default::default() },
-            MppTask { name: "early".into(), start: Some("2020-01-01 08:00".into()), finish: Some("2020-01-02 17:00".into()), ..Default::default() },
+            MppTask {
+                name: "late".into(),
+                start: Some("2020-02-01 08:00".into()),
+                finish: Some("2020-02-10 17:00".into()),
+                ..Default::default()
+            },
+            MppTask {
+                name: "early".into(),
+                start: Some("2020-01-01 08:00".into()),
+                finish: Some("2020-01-02 17:00".into()),
+                ..Default::default()
+            },
         ];
         decode_links(&cons, &fd, rs, &mut tasks);
         assert!(tasks.iter().all(|t| t.predecessors.is_empty()));
@@ -663,7 +760,9 @@ mod tests {
     fn filetime_epoch_and_zero() {
         assert_eq!(filetime_to_string(0), None);
         // 1970-01-01 00:00:00
-        assert_eq!(filetime_to_string(11_644_473_600 * 10_000_000).as_deref(), Some("1970-01-01 00:00:00"));
+        assert_eq!(
+            filetime_to_string(11_644_473_600 * 10_000_000).as_deref(),
+            Some("1970-01-01 00:00:00")
+        );
     }
 }
-
