@@ -81,7 +81,10 @@ pub fn utf16le_string(b: &[u8]) -> Option<String> {
     if b.len() < 2 || !b.len().is_multiple_of(2) {
         return None;
     }
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     let s = String::from_utf16(&units[..end]).ok()?;
     let total = s.chars().count();
@@ -91,7 +94,10 @@ pub fn utf16le_string(b: &[u8]) -> Option<String> {
     // Keep ASCII-heavy text (real Latin names) or reasonably long runs (so
     // non-Latin names survive) — but reject the 1–2 char blobs that binary
     // metadata blocks decode into.
-    let ascii = s.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+    let ascii = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .count();
     (ascii * 10 >= total * 6 || total >= 4).then_some(s)
 }
 
@@ -99,7 +105,10 @@ pub fn utf16le_string(b: &[u8]) -> Option<String> {
 /// in stream order. For a task `Var2Data` this surfaces the task names (and
 /// other text fields) — the first useful decode of real `.mpp` content.
 pub fn strings(data: &[u8]) -> Vec<String> {
-    blocks(data).into_iter().filter_map(utf16le_string).collect()
+    blocks(data)
+        .into_iter()
+        .filter_map(utf16le_string)
+        .collect()
 }
 
 #[cfg(test)]

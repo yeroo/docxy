@@ -84,7 +84,12 @@ impl Timeline {
     /// Build a timeline for `week` (Sun=0..Sat=6 working patterns) starting at
     /// `anchor_abs`, extended until it covers at least `min_total` working
     /// minutes and reaches wall-clock minute `min_reach`.
-    fn build(week: &[Vec<(u32, u32)>; 7], anchor_abs: i64, min_total: i64, min_reach: i64) -> Timeline {
+    fn build(
+        week: &[Vec<(u32, u32)>; 7],
+        anchor_abs: i64,
+        min_total: i64,
+        min_reach: i64,
+    ) -> Timeline {
         let mut segs = Vec::new();
         let mut cum = Vec::new();
         let mut total = 0i64;
@@ -226,7 +231,12 @@ impl<'a> Scheduler<'a> {
             timelines.insert(default_cal, tl);
         }
 
-        Scheduler { proj, timelines, default_cal, anchor }
+        Scheduler {
+            proj,
+            timelines,
+            default_cal,
+            anchor,
+        }
     }
 
     fn tl(&self, task: &Task) -> &Timeline {
@@ -244,8 +254,13 @@ impl<'a> Scheduler<'a> {
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> =
-            self.proj.tasks.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
+        let idx_of: HashMap<i32, usize> = self
+            .proj
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.uid, i))
+            .collect();
 
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
@@ -255,7 +270,10 @@ impl<'a> Scheduler<'a> {
             let t = &self.proj.tasks[i];
             for p in &t.predecessors {
                 if leaf_uids.contains(&p.uid) {
-                    succs.entry(p.uid).or_default().push((t.uid, p.link, p.lag_min));
+                    succs
+                        .entry(p.uid)
+                        .or_default()
+                        .push((t.uid, p.link, p.lag_min));
                 }
             }
         }
@@ -270,8 +288,12 @@ impl<'a> Scheduler<'a> {
             let tl = self.tl(t);
             let mut start_abs = self.anchor;
             for p in &t.predecessors {
-                let Some(&pf_abs) = ef_abs.get(&p.uid) else { continue };
-                let Some(&ps_abs) = es_abs.get(&p.uid) else { continue };
+                let Some(&pf_abs) = ef_abs.get(&p.uid) else {
+                    continue;
+                };
+                let Some(&ps_abs) = es_abs.get(&p.uid) else {
+                    continue;
+                };
                 let cand = match p.link {
                     LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + p.lag_min),
                     LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + p.lag_min),
@@ -307,7 +329,11 @@ impl<'a> Scheduler<'a> {
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
             // A milestone (zero duration) finishes exactly when it starts.
-            let f_abs = if t.duration_min == 0 { s_abs } else { tl.abs_finish(f_idx) };
+            let f_abs = if t.duration_min == 0 {
+                s_abs
+            } else {
+                tl.abs_finish(f_idx)
+            };
             es.insert(t.uid, s_idx);
             ef.insert(t.uid, f_idx);
             es_abs.insert(t.uid, s_abs);
@@ -416,8 +442,7 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             let kids = descendant_leaves(self.proj, i);
-            let child: Vec<&TaskResult> =
-                kids.iter().filter_map(|u| results.get(u)).collect();
+            let child: Vec<&TaskResult> = kids.iter().filter_map(|u| results.get(u)).collect();
             if child.is_empty() {
                 continue;
             }
@@ -614,7 +639,7 @@ fn max_load_in(bookings: &[(i64, i64, f64)], start: i64, end: i64) -> f64 {
             events.push((e.min(end), -u));
         }
     }
-    events.sort_by(|a, b| a.0.cmp(&b.0));
+    events.sort_by_key(|&(t, _)| t);
     let (mut load, mut peak) = (0.0f64, 0.0f64);
     for (_, d) in events {
         load += d;
@@ -627,7 +652,13 @@ fn max_load_in(bookings: &[(i64, i64, f64)], start: i64, end: i64) -> f64 {
 
 /// Earliest index ≥ `start` where adding `units` for `dur` keeps one resource
 /// within `cap`.
-fn earliest_feasible(bookings: &[(i64, i64, f64)], cap: f64, units: f64, start: i64, dur: i64) -> i64 {
+fn earliest_feasible(
+    bookings: &[(i64, i64, f64)],
+    cap: f64,
+    units: f64,
+    start: i64,
+    dur: i64,
+) -> i64 {
     if dur <= 0 {
         return start;
     }
@@ -690,8 +721,13 @@ impl Scheduler<'_> {
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> =
-            self.proj.tasks.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
+        let idx_of: HashMap<i32, usize> = self
+            .proj
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.uid, i))
+            .collect();
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
         // Work-resource capacities and per-task assignments.
@@ -732,10 +768,17 @@ impl Scheduler<'_> {
             let placed = place_all(&res, &bookings, &caps, earliest, t.duration_min);
             delay.insert(t.uid, placed - cpm_start_idx);
             for (rid, units) in &res {
-                bookings.entry(*rid).or_default().push((placed, placed + t.duration_min, *units));
+                bookings
+                    .entry(*rid)
+                    .or_default()
+                    .push((placed, placed + t.duration_min, *units));
             }
             let s_abs = tl.abs_start(placed);
-            let f_abs = if t.duration_min == 0 { s_abs } else { tl.abs_finish(placed + t.duration_min) };
+            let f_abs = if t.duration_min == 0 {
+                s_abs
+            } else {
+                tl.abs_finish(placed + t.duration_min)
+            };
             start.insert(t.uid, DateTime::from_minutes(s_abs));
             finish.insert(t.uid, DateTime::from_minutes(f_abs));
         }
@@ -761,7 +804,11 @@ impl Scheduler<'_> {
             .map(DateTime::from_minutes)
             .unwrap_or(base.project_finish);
 
-        Leveled { start, finish, project_finish }
+        Leveled {
+            start,
+            finish,
+            project_finish,
+        }
     }
 }
 
@@ -771,10 +818,21 @@ mod tests {
     use crate::model::*;
 
     fn task(uid: i32, name: &str, days_min: i64) -> Task {
-        Task { uid, id: uid, name: name.into(), outline_level: 1, duration_min: days_min, ..Task::default() }
+        Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: 1,
+            duration_min: days_min,
+            ..Task::default()
+        }
     }
     fn fs(uid: i32) -> Predecessor {
-        Predecessor { uid, link: LinkType::FinishStart, lag_min: 0 }
+        Predecessor {
+            uid,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }
     }
 
     /// The classic worked example: A(2d)→B(3d), A→C(1d), B→D, C→D.
@@ -796,10 +854,23 @@ mod tests {
     }
 
     fn worker(uid: i32, name: &str, units: f64) -> Resource {
-        Resource { uid, id: uid, name: name.into(), is_work: true, max_units: units, calendar_uid: None }
+        Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            is_work: true,
+            max_units: units,
+            calendar_uid: None,
+        }
     }
     fn assign(uid: i32, task: i32, res: i32, units: f64) -> Assignment {
-        Assignment { uid, task_uid: task, resource_uid: res, units, work_min: 0 }
+        Assignment {
+            uid,
+            task_uid: task,
+            resource_uid: res,
+            units,
+            work_min: 0,
+        }
     }
 
     #[test]
@@ -814,8 +885,14 @@ mod tests {
         };
         // Unleveled, both start Monday (they'd overlap).
         let s = schedule(&proj);
-        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-02T08:00:00");
-        assert_eq!(s.get(2).unwrap().early_start.to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(
+            s.get(1).unwrap().early_start.to_mspdi(),
+            "2026-03-02T08:00:00"
+        );
+        assert_eq!(
+            s.get(2).unwrap().early_start.to_mspdi(),
+            "2026-03-02T08:00:00"
+        );
         // Leveled, B waits until A frees Alice: A Mon–Tue, B Wed–Thu.
         let lv = level(&proj);
         assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-02T08:00:00");
@@ -847,10 +924,20 @@ mod tests {
         let mut t = task(1, "Imported", dur);
         t.constraint = ConstraintType::MustStartOn;
         t.constraint_date = Some(start);
-        let proj = Project { start_date: Some(start), tasks: vec![t], ..Project::default() };
+        let proj = Project {
+            start_date: Some(start),
+            tasks: vec![t],
+            ..Project::default()
+        };
         let s = schedule(&proj);
-        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-06T08:00:00");
-        assert_eq!(s.get(1).unwrap().early_finish.to_mspdi(), "2026-03-09T17:00:00");
+        assert_eq!(
+            s.get(1).unwrap().early_start.to_mspdi(),
+            "2026-03-06T08:00:00"
+        );
+        assert_eq!(
+            s.get(1).unwrap().early_finish.to_mspdi(),
+            "2026-03-09T17:00:00"
+        );
     }
 
     #[test]
@@ -884,7 +971,10 @@ mod tests {
         let proj = diamond();
         let s = schedule(&proj);
         // A starts Monday 08:00.
-        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(
+            s.get(1).unwrap().early_start.to_mspdi(),
+            "2026-03-02T08:00:00"
+        );
         // Critical path is A, B, D; C is not critical.
         assert!(s.get(1).unwrap().critical);
         assert!(s.get(2).unwrap().critical);
@@ -917,14 +1007,21 @@ mod tests {
         let mut a = task(1, "A", 480);
         a.id = 1;
         let mut b = task(2, "B", 480);
-        b.predecessors = vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 480 }];
+        b.predecessors = vec![Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 480,
+        }];
         let proj = Project {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![a, b],
             ..Project::default()
         };
         let s = schedule(&proj);
-        assert_eq!(s.get(2).unwrap().early_start.to_mspdi(), "2026-03-04T08:00:00");
+        assert_eq!(
+            s.get(2).unwrap().early_start.to_mspdi(),
+            "2026-03-04T08:00:00"
+        );
     }
 
     #[test]
@@ -938,7 +1035,10 @@ mod tests {
             ..Project::default()
         };
         let s = schedule(&proj);
-        assert_eq!(s.get(1).unwrap().early_start.to_mspdi(), "2026-03-05T08:00:00");
+        assert_eq!(
+            s.get(1).unwrap().early_start.to_mspdi(),
+            "2026-03-05T08:00:00"
+        );
     }
 
     #[test]

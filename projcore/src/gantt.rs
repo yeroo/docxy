@@ -39,7 +39,9 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
             }
             continue;
         }
-        let Some(r) = sched.get(task.uid) else { continue };
+        let Some(r) = sched.get(task.uid) else {
+            continue;
+        };
         let sec = section.clone().unwrap_or_else(|| "Tasks".into());
         if emitted.as_ref() != Some(&sec) {
             out.push_str(&format!("    section {sec}\n"));
@@ -74,7 +76,10 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
     let heading = sanitize(&proj.title)
         .or_else(|| sanitize(&proj.name))
         .unwrap_or_else(|| "Project schedule".into());
-    let mut out = format!("# {heading}\n\n```mermaid\n{}```\n\n", to_mermaid(proj, sched));
+    let mut out = format!(
+        "# {heading}\n\n```mermaid\n{}```\n\n",
+        to_mermaid(proj, sched)
+    );
 
     out.push_str("| Task | Start | Finish | Duration | Total slack | Critical |\n");
     out.push_str("|------|-------|--------|----------|-------------|----------|\n");
@@ -82,7 +87,9 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         if task.summary {
             continue;
         }
-        let Some(r) = sched.get(task.uid) else { continue };
+        let Some(r) = sched.get(task.uid) else {
+            continue;
+        };
         let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
         let dur = duration_str(proj, task.duration_min);
         let slack = fmt_days(proj.minutes_to_days(r.total_slack_min.max(0)));
@@ -138,7 +145,13 @@ fn excludes_weekends(proj: &Project) -> bool {
 fn sanitize(s: &str) -> Option<String> {
     let cleaned: String = s
         .chars()
-        .map(|c| if matches!(c, ':' | ',' | ';' | '#' | '\n' | '\r' | '\t') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, ':' | ',' | ';' | '#' | '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let out = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     (!out.is_empty()).then_some(out)
@@ -152,18 +165,41 @@ mod tests {
     use crate::schedule::schedule;
 
     fn task(uid: i32, name: &str, dur: i64) -> Task {
-        Task { uid, id: uid, name: name.into(), outline_level: 1, duration_min: dur, ..Task::default() }
+        Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: 1,
+            duration_min: dur,
+            ..Task::default()
+        }
     }
 
     fn diamond() -> Project {
         let mut b = task(2, "B", 1440);
-        b.predecessors = vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 0 }];
+        b.predecessors = vec![Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }];
         let mut c = task(3, "C", 480);
-        c.predecessors = vec![Predecessor { uid: 1, link: LinkType::FinishStart, lag_min: 0 }];
+        c.predecessors = vec![Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }];
         let mut d = task(4, "D", 960);
         d.predecessors = vec![
-            Predecessor { uid: 2, link: LinkType::FinishStart, lag_min: 0 },
-            Predecessor { uid: 3, link: LinkType::FinishStart, lag_min: 0 },
+            Predecessor {
+                uid: 2,
+                link: LinkType::FinishStart,
+                lag_min: 0,
+            },
+            Predecessor {
+                uid: 3,
+                link: LinkType::FinishStart,
+                lag_min: 0,
+            },
         ];
         Project {
             name: "Demo".into(),
@@ -198,7 +234,11 @@ mod tests {
         let mut ms = task(3, "Sign-off", 0);
         ms.outline_level = 2;
         ms.milestone = true;
-        ms.predecessors = vec![Predecessor { uid: 2, link: LinkType::FinishStart, lag_min: 0 }];
+        ms.predecessors = vec![Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }];
         let proj = Project {
             name: "P".into(),
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),

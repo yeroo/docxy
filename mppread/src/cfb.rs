@@ -154,7 +154,11 @@ impl Cfb {
             }
             let kind = chunk[66];
             let name_len = u16le(chunk, 64) as usize;
-            let name = if kind == 0 { String::new() } else { utf16_name(&chunk[0..64], name_len) };
+            let name = if kind == 0 {
+                String::new()
+            } else {
+                utf16_name(&chunk[0..64], name_len)
+            };
             let start = u32le(chunk, 116);
             let mut size = u64le(chunk, 120);
             if sector_size == 512 {
@@ -177,11 +181,14 @@ impl Cfb {
         }
         if first_minifat != ENDOFCHAIN && num_minifat > 0 {
             let mf = cfb.read_fat_chain(first_minifat, None);
-            cfb.minifat = mf.chunks(4).map(|c| {
-                let mut v = [0u8; 4];
-                v[..c.len()].copy_from_slice(c);
-                u32::from_le_bytes(v)
-            }).collect();
+            cfb.minifat = mf
+                .chunks(4)
+                .map(|c| {
+                    let mut v = [0u8; 4];
+                    v[..c.len()].copy_from_slice(c);
+                    u32::from_le_bytes(v)
+                })
+                .collect();
         }
 
         Ok(cfb)
@@ -233,7 +240,11 @@ impl Cfb {
                 break;
             }
             out.extend_from_slice(&self.mini_stream[off..off + MINI_SECTOR_SIZE]);
-            sec = self.minifat.get(sec as usize).copied().unwrap_or(ENDOFCHAIN);
+            sec = self
+                .minifat
+                .get(sec as usize)
+                .copied()
+                .unwrap_or(ENDOFCHAIN);
             steps += 1;
         }
         out.truncate(size);
@@ -249,13 +260,20 @@ impl Cfb {
     /// Prefer [`paths`](Cfb::paths) to disambiguate same-named streams in
     /// different storages.
     pub fn stream_names(&self) -> Vec<String> {
-        self.entries.iter().filter(|e| e.is_stream()).map(|e| e.name.clone()).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.is_stream())
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     /// Read a stream's bytes by leaf name (first match). Chooses the mini stream
     /// or the regular FAT chain based on the stream's size.
     pub fn read_stream(&self, name: &str) -> Option<Vec<u8>> {
-        let e = self.entries.iter().find(|e| e.is_stream() && e.name == name)?;
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.is_stream() && e.name == name)?;
         Some(self.read_entry(e))
     }
 
@@ -279,7 +297,11 @@ impl Cfb {
     fn children_of(&self, storage_idx: usize) -> Vec<usize> {
         let mut out = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
-        let mut cur = self.entries.get(storage_idx).map(|e| e.child).unwrap_or(NOSTREAM);
+        let mut cur = self
+            .entries
+            .get(storage_idx)
+            .map(|e| e.child)
+            .unwrap_or(NOSTREAM);
         let cap = self.entries.len() + 1;
         while (!stack.is_empty() || cur != NOSTREAM) && out.len() <= cap {
             while cur != NOSTREAM && (cur as usize) < self.entries.len() {
@@ -306,7 +328,11 @@ impl Cfb {
     fn collect_paths(&self, storage_idx: usize, prefix: &str, out: &mut Vec<String>) {
         for c in self.children_of(storage_idx) {
             let e = &self.entries[c];
-            let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+            let path = if prefix.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{prefix}/{}", e.name)
+            };
             if e.is_stream() {
                 out.push(path);
             } else if e.is_storage() {
@@ -321,7 +347,10 @@ impl Cfb {
         let mut idx = self.root_index()?;
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         for (i, part) in parts.iter().enumerate() {
-            let child = self.children_of(idx).into_iter().find(|&c| self.entries[c].name == *part)?;
+            let child = self
+                .children_of(idx)
+                .into_iter()
+                .find(|&c| self.entries[c].name == *part)?;
             let e = &self.entries[child];
             if i == parts.len() - 1 {
                 return e.is_stream().then(|| self.read_entry(e));
@@ -368,18 +397,38 @@ fn assign_dir(nodes: &[Node], dir: &mut Vec<DirEnt>) -> u32 {
     }
     let base = dir.len() as u32;
     for _ in nodes {
-        dir.push(DirEnt { name: String::new(), kind: 0, data: None, child: NOSTREAM, right: NOSTREAM });
+        dir.push(DirEnt {
+            name: String::new(),
+            kind: 0,
+            data: None,
+            child: NOSTREAM,
+            right: NOSTREAM,
+        });
     }
     for (i, node) in nodes.iter().enumerate() {
         let idx = base as usize + i;
-        let right = if i + 1 < nodes.len() { base + i as u32 + 1 } else { NOSTREAM };
+        let right = if i + 1 < nodes.len() {
+            base + i as u32 + 1
+        } else {
+            NOSTREAM
+        };
         dir[idx] = match node {
-            Node::Stream(name, data) => {
-                DirEnt { name: (*name).to_string(), kind: 2, data: Some(data.clone()), child: NOSTREAM, right }
-            }
+            Node::Stream(name, data) => DirEnt {
+                name: (*name).to_string(),
+                kind: 2,
+                data: Some(data.clone()),
+                child: NOSTREAM,
+                right,
+            },
             Node::Storage(name, kids) => {
                 let child = assign_dir(kids, dir);
-                DirEnt { name: (*name).to_string(), kind: 1, data: None, child, right }
+                DirEnt {
+                    name: (*name).to_string(),
+                    kind: 1,
+                    data: None,
+                    child,
+                    right,
+                }
             }
         };
     }
@@ -389,7 +438,10 @@ fn assign_dir(nodes: &[Node], dir: &mut Vec<DirEnt>) -> u32 {
 /// Assemble a minimal v3 compound file with `streams` (name, bytes) directly
 /// under the root storage. See [`write_cfb_tree`] for nested storages.
 pub fn write_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    let nodes: Vec<Node> = streams.iter().map(|(n, d)| Node::Stream(n, d.clone())).collect();
+    let nodes: Vec<Node> = streams
+        .iter()
+        .map(|(n, d)| Node::Stream(n, d.clone()))
+        .collect();
     write_cfb_tree(&nodes)
 }
 
@@ -403,8 +455,13 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     const CUTOFF: usize = 4096;
 
     // 1) Build the directory tree (index 0 = root storage).
-    let mut dir: Vec<DirEnt> =
-        vec![DirEnt { name: "Root Entry".into(), kind: 5, data: None, child: NOSTREAM, right: NOSTREAM }];
+    let mut dir: Vec<DirEnt> = vec![DirEnt {
+        name: "Root Entry".into(),
+        kind: 5,
+        data: None,
+        child: NOSTREAM,
+        right: NOSTREAM,
+    }];
     let rc = assign_dir(root_children, &mut dir);
     dir[0].child = rc;
 
@@ -424,7 +481,11 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
             s[..b - a].copy_from_slice(&bytes[a..b]);
             sectors.push(s);
             let idx = start as usize + i;
-            fat.push(if i + 1 < n { (idx + 1) as u32 } else { ENDOFCHAIN });
+            fat.push(if i + 1 < n {
+                (idx + 1) as u32
+            } else {
+                ENDOFCHAIN
+            });
         }
         start
     };
@@ -450,7 +511,11 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
                 mini_stream.extend_from_slice(&data[a..b]);
                 mini_stream.resize(mini_stream.len() + (MINI_SECTOR_SIZE - (b - a)), 0);
                 let mi = start as usize + i;
-                minifat.push(if i + 1 < n { (mi + 1) as u32 } else { ENDOFCHAIN });
+                minifat.push(if i + 1 < n {
+                    (mi + 1) as u32
+                } else {
+                    ENDOFCHAIN
+                });
             }
             place[idx] = (start, data.len() as u64, true);
         } else {
@@ -470,7 +535,11 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     let mini_start = alloc(&mini_stream, &mut sectors, &mut fat);
     let minifat_bytes: Vec<u8> = minifat.iter().flat_map(|v| v.to_le_bytes()).collect();
     let minifat_start = alloc(&minifat_bytes, &mut sectors, &mut fat);
-    let num_minifat = if minifat_bytes.is_empty() { 0 } else { minifat_bytes.len().div_ceil(SS) };
+    let num_minifat = if minifat_bytes.is_empty() {
+        0
+    } else {
+        minifat_bytes.len().div_ceil(SS)
+    };
 
     // 4) Serialize the directory entries with their tree pointers.
     let mut dbytes: Vec<u8> = Vec::new();
@@ -488,7 +557,11 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
         for (i, u) in utf16.iter().enumerate().take(31) {
             e[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
         }
-        let name_len = if ent.kind == 0 { 0 } else { ((utf16.len().min(31) + 1) * 2) as u16 };
+        let name_len = if ent.kind == 0 {
+            0
+        } else {
+            ((utf16.len().min(31) + 1) * 2) as u16
+        };
         e[64..66].copy_from_slice(&name_len.to_le_bytes());
         e[66] = ent.kind;
         e[67] = 1; // color: black
@@ -550,7 +623,11 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
     header[72..76].copy_from_slice(&0u32.to_le_bytes()); // # DIFAT sectors
     // DIFAT array: the FAT sector indices, then FREESECT.
     for i in 0..109 {
-        let v = if i < f { (fat_start + i) as u32 } else { FREESECT };
+        let v = if i < f {
+            (fat_start + i) as u32
+        } else {
+            FREESECT
+        };
         header[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
 
@@ -603,9 +680,15 @@ mod tests {
             ]
         );
         // path lookup resolves through storages, disambiguating same leaf names
-        assert_eq!(cfb.read_path("TBkndTask/FixedData").unwrap(), vec![2u8; 6000]);
+        assert_eq!(
+            cfb.read_path("TBkndTask/FixedData").unwrap(),
+            vec![2u8; 6000]
+        );
         assert_eq!(cfb.read_path("TBkndRsc/FixedData").unwrap(), vec![9u8; 24]);
-        assert_eq!(cfb.read_path("TBkndTask/Var2Data").unwrap(), b"vars".repeat(10));
+        assert_eq!(
+            cfb.read_path("TBkndTask/Var2Data").unwrap(),
+            b"vars".repeat(10)
+        );
         assert!(cfb.read_path("TBkndTask/Missing").is_none());
         assert!(cfb.read_path("TBkndTask").is_none()); // a storage, not a stream
     }
@@ -633,15 +716,19 @@ mod tests {
     fn round_trip_many_small_streams() {
         // several mini streams forces multi-entry mini-FAT chains
         let streams: Vec<(&str, Vec<u8>)> = vec![
-            ("Props", b"AB".repeat(50)),      // 100 bytes -> 2 mini sectors
-            ("Tasks", b"task".repeat(20)),    // 80 bytes
-            ("Empty", Vec::new()),            // zero-length
-            ("Calendars", vec![7u8; 200]),    // 200 bytes -> 4 mini sectors
+            ("Props", b"AB".repeat(50)),   // 100 bytes -> 2 mini sectors
+            ("Tasks", b"task".repeat(20)), // 80 bytes
+            ("Empty", Vec::new()),         // zero-length
+            ("Calendars", vec![7u8; 200]), // 200 bytes -> 4 mini sectors
         ];
         let bytes = write_cfb(&streams);
         let cfb = Cfb::open(&bytes).unwrap();
         for (name, data) in &streams {
-            assert_eq!(cfb.read_stream(name).unwrap(), *data, "stream {name} mismatch");
+            assert_eq!(
+                cfb.read_stream(name).unwrap(),
+                *data,
+                "stream {name} mismatch"
+            );
         }
         assert_eq!(cfb.entries().iter().filter(|e| e.is_stream()).count(), 4);
     }
@@ -656,4 +743,3 @@ mod tests {
         assert_eq!(cfb.read_stream("Big").unwrap(), big);
     }
 }
-

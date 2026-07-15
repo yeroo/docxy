@@ -27,9 +27,11 @@ fn main() {
 
     // Save in the format named by the output extension.
     if output.ends_with(".yppx") {
-        std::fs::write(output, yppx::write_yppx(&proj)).unwrap_or_else(|e| fail(output, &e.to_string()));
+        std::fs::write(output, yppx::write_yppx(&proj))
+            .unwrap_or_else(|e| fail(output, &e.to_string()));
     } else {
-        std::fs::write(output, mspdi::write_mspdi(&proj)).unwrap_or_else(|e| fail(output, &e.to_string()));
+        std::fs::write(output, mspdi::write_mspdi(&proj))
+            .unwrap_or_else(|e| fail(output, &e.to_string()));
     }
     eprintln!("{} task(s): {input} -> {output}", proj.tasks.len());
 }

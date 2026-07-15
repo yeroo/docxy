@@ -43,11 +43,7 @@ const FIELD_RELS: [isize; 3] = [
 ];
 
 fn u16_at(b: &[u8], p: isize) -> u16 {
-    if p >= 0 {
-        u16le(b, p as usize)
-    } else {
-        0
-    }
+    if p >= 0 { u16le(b, p as usize) } else { 0 }
 }
 
 /// Extract the task (or resource) **names** from a `VarMeta` + `Var2Data` pair,
@@ -72,10 +68,13 @@ pub fn names(varmeta: &[u8], var2data: &[u8]) -> Vec<String> {
         let mut p = 0usize;
         while p + 4 <= varmeta.len() {
             let off = u32le(varmeta, p) as usize;
-            m.entry(off).or_insert_with(|| vardata::string_at(var2data, off));
+            m.entry(off)
+                .or_insert_with(|| vardata::string_at(var2data, off));
             p += 2;
         }
-        m.into_iter().filter_map(|(o, s)| s.map(|s| (o, s))).collect()
+        m.into_iter()
+            .filter_map(|(o, s)| s.map(|s| (o, s)))
+            .collect()
     };
 
     let mut best: Vec<String> = Vec::new();
@@ -146,7 +145,10 @@ mod tests {
             vm.extend_from_slice(&(*off as u32).to_le_bytes());
         }
         let got = names(&vm, &v2);
-        assert_eq!(got, vec!["Alpha".to_string(), "Beta".into(), "Gamma".into()]);
+        assert_eq!(
+            got,
+            vec!["Alpha".to_string(), "Beta".into(), "Gamma".into()]
+        );
     }
 
     #[test]
@@ -172,7 +174,14 @@ mod tests {
         // shares the constant 0x0B40 marker position — so a wrong entry layout
         // merges names+markers into one impure group. The correct field split
         // plus the purity gate must recover the names alone.
-        let (v2, offs) = build_var2(&["Business Understanding", "'", "Modeling", "'", "Deployment", "'"]);
+        let (v2, offs) = build_var2(&[
+            "Business Understanding",
+            "'",
+            "Modeling",
+            "'",
+            "Deployment",
+            "'",
+        ]);
         let mut vm = Vec::new();
         vm.extend_from_slice(&MAGIC.to_le_bytes());
         vm.resize(32, 0); // header
@@ -185,7 +194,14 @@ mod tests {
             vm.extend_from_slice(&(*off as u32).to_le_bytes());
         }
         let got = names(&vm, &v2);
-        assert_eq!(got, vec!["Business Understanding".to_string(), "Modeling".into(), "Deployment".into()]);
+        assert_eq!(
+            got,
+            vec![
+                "Business Understanding".to_string(),
+                "Modeling".into(),
+                "Deployment".into()
+            ]
+        );
     }
 
     #[test]

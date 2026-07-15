@@ -56,7 +56,12 @@ enum Seg {
 }
 
 fn btn(glyph: &'static str, width: usize, act: Act, hint: &'static str) -> Seg {
-    Seg::Btn(Button { glyph, width, act, hint })
+    Seg::Btn(Button {
+        glyph,
+        width,
+        act,
+        hint,
+    })
 }
 
 struct Group {
@@ -295,7 +300,11 @@ impl Ribbon {
 
     pub fn render_tabs(&self, focus: Focus) -> Line<'static> {
         let engaged = focus != Focus::None;
-        let focused_tab = if let Focus::Tab(t) = focus { Some(t) } else { None };
+        let focused_tab = if let Focus::Tab(t) = focus {
+            Some(t)
+        } else {
+            None
+        };
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
             let style = if !engaged {
@@ -310,7 +319,10 @@ impl Ribbon {
             spans.push(Span::styled(t.to_string(), style));
             spans.push(Span::raw("   "));
         }
-        spans.push(Span::styled("· F9 ribbon".to_string(), Style::default().add_modifier(Modifier::DIM)));
+        spans.push(Span::styled(
+            "· F9 ribbon".to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
         Line::from(spans)
     }
 
@@ -328,7 +340,11 @@ impl Ribbon {
             s.push_str(r);
             Line::styled(s, dim)
         };
-        let focused = if let Focus::Button(i) = focus { self.placed.get(i).copied() } else { None };
+        let focused = if let Focus::Button(i) = focus {
+            self.placed.get(i).copied()
+        } else {
+            None
+        };
         let row_w = |row: &[Seg]| -> usize {
             row.iter()
                 .map(|s| match s {
@@ -354,14 +370,25 @@ impl Ribbon {
         for g in self.groups() {
             let pad = g.width.saturating_sub(g.title.chars().count());
             let l = pad / 2;
-            spans.push(Span::raw(format!(" {}{}{} ", " ".repeat(l), g.title, " ".repeat(pad - l))));
+            spans.push(Span::raw(format!(
+                " {}{}{} ",
+                " ".repeat(l),
+                g.title,
+                " ".repeat(pad - l)
+            )));
             spans.push(Span::styled("│", dim));
         }
         out.push(Line::from(spans));
         out
     }
 
-    fn row_spans(&self, row: &[Seg], rr: u8, focused: Option<Placed>, out: &mut Vec<Span<'static>>) {
+    fn row_spans(
+        &self,
+        row: &[Seg],
+        rr: u8,
+        focused: Option<Placed>,
+        out: &mut Vec<Span<'static>>,
+    ) {
         for seg in row {
             match seg {
                 Seg::Gap(s) => out.push(Span::raw(s.to_string())),
@@ -430,7 +457,12 @@ fn task_groups() -> Vec<Group> {
                     Seg::Gap("  "),
                     btn("✗ Delete", 8, DeleteTask, "Delete the task (x)"),
                 ],
-                vec![btn("◆ Milestone", 11, Milestone, "Toggle milestone (0-day) on the task")],
+                vec![btn(
+                    "◆ Milestone",
+                    11,
+                    Milestone,
+                    "Toggle milestone (0-day) on the task",
+                )],
             ],
         },
         Group {
@@ -446,7 +478,12 @@ fn task_groups() -> Vec<Group> {
             width: 18,
             rows: [
                 vec![btn("✎ Rename", 8, Rename, "Rename the task (Enter)")],
-                vec![btn("⏱ Duration", 10, Duration, "Set duration — 3d / 4h / 2w (d)")],
+                vec![btn(
+                    "⏱ Duration",
+                    10,
+                    Duration,
+                    "Set duration — 3d / 4h / 2w (d)",
+                )],
             ],
         },
         Group {
@@ -467,24 +504,54 @@ fn schedule_groups() -> Vec<Group> {
             title: "Dependencies",
             width: 22,
             rows: [
-                vec![btn("🔗 Link", 6, AddLink, "Add a predecessor by task ID (p)")],
-                vec![btn("⛓ Constraint", 12, Constraint, "Set a date constraint — SNET/MSO/… (c)")],
+                vec![btn(
+                    "🔗 Link",
+                    6,
+                    AddLink,
+                    "Add a predecessor by task ID (p)",
+                )],
+                vec![btn(
+                    "⛓ Constraint",
+                    12,
+                    Constraint,
+                    "Set a date constraint — SNET/MSO/… (c)",
+                )],
             ],
         },
         Group {
             title: "Resources",
             width: 16,
             rows: [
-                vec![btn("👤 Assign", 8, Assign, "Assign a resource to the task (a)")],
-                vec![btn("✗ Clear", 7, ClearResources, "Remove the task's resources")],
+                vec![btn(
+                    "👤 Assign",
+                    8,
+                    Assign,
+                    "Assign a resource to the task (a)",
+                )],
+                vec![btn(
+                    "✗ Clear",
+                    7,
+                    ClearResources,
+                    "Remove the task's resources",
+                )],
             ],
         },
         Group {
             title: "Baseline",
             width: 14,
             rows: [
-                vec![btn("⚑ Baseline", 10, Baseline, "Snapshot the current plan as the baseline (b)")],
-                vec![btn("⟳ Recalc", 8, Todo("Reschedule"), "Recompute (automatic on every edit)")],
+                vec![btn(
+                    "⚑ Baseline",
+                    10,
+                    Baseline,
+                    "Snapshot the current plan as the baseline (b)",
+                )],
+                vec![btn(
+                    "⟳ Recalc",
+                    8,
+                    Todo("Reschedule"),
+                    "Recompute (automatic on every edit)",
+                )],
             ],
         },
     ]
@@ -504,7 +571,12 @@ fn view_groups() -> Vec<Group> {
                     Seg::Gap("  "),
                     btn("⇤ Start", 7, GoToStart, "Scroll to the project start"),
                 ],
-                vec![btn("⭳ Export Markdown", 17, ExportGantt, "Export a Markdown/Mermaid Gantt (Ctrl+E)")],
+                vec![btn(
+                    "⭳ Export Markdown",
+                    17,
+                    ExportGantt,
+                    "Export a Markdown/Mermaid Gantt (Ctrl+E)",
+                )],
             ],
         },
         Group {
@@ -552,10 +624,18 @@ mod tests {
     #[test]
     fn task_tab_exposes_core_actions() {
         let mut r = Ribbon::new();
-        let task = (0..r.tabs.len()).find(|&i| r.tab_label(i) == Some("Task")).unwrap();
+        let task = (0..r.tabs.len())
+            .find(|&i| r.tab_label(i) == Some("Task"))
+            .unwrap();
         r.set_active(task);
         let acts: Vec<Act> = r.placed.iter().map(|p| p.act).collect();
-        for a in [Act::AddTask, Act::DeleteTask, Act::Indent, Act::Duration, Act::Save] {
+        for a in [
+            Act::AddTask,
+            Act::DeleteTask,
+            Act::Indent,
+            Act::Duration,
+            Act::Save,
+        ] {
             assert!(acts.contains(&a), "Task tab missing {a:?}");
         }
     }
@@ -563,7 +643,9 @@ mod tests {
     #[test]
     fn file_tab_is_bodyless() {
         let r = Ribbon::new();
-        let file = (0..r.tabs.len()).find(|&i| r.tab_label(i) == Some("File")).unwrap();
+        let file = (0..r.tabs.len())
+            .find(|&i| r.tab_label(i) == Some("File"))
+            .unwrap();
         assert!(r.tab_is_file(file));
         assert!(r.tab_groups[file].is_empty());
     }
@@ -578,7 +660,12 @@ mod tests {
     fn body_rows_share_one_width() {
         let r = Ribbon::new();
         let lines = r.render_body(Focus::None);
-        let w = |l: &Line| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+        let w = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        };
         let w0 = w(&lines[0]);
         for l in &lines {
             assert_eq!(w(l), w0);

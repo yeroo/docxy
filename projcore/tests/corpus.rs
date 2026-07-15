@@ -27,7 +27,11 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 #[test]
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
-    assert!(files.len() >= 12, "expected the full seed corpus, got {}", files.len());
+    assert!(
+        files.len() >= 12,
+        "expected the full seed corpus, got {}",
+        files.len()
+    );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -84,7 +88,11 @@ fn yppx_package_round_trip_preserves_schedule() {
         assert_eq!(&bytes[..2], b"PK", "{name}: .yppx is not a ZIP");
         let back = read_yppx(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        assert_eq!(back.tasks.len(), proj.tasks.len(), "{name}: task count changed");
+        assert_eq!(
+            back.tasks.len(),
+            proj.tasks.len(),
+            "{name}: task count changed"
+        );
         let sched = schedule(&back);
         for t in &back.tasks {
             let r = sched.get(t.uid).unwrap();

@@ -7,7 +7,7 @@
 //! (`Props`, `Var2Data`, `Fixed2Data`, calendar/task/resource blocks, …) are
 //! the map for the eventual `.mpp` → projcore decoder.
 
-use mppread::{read_mpp, Cfb};
+use mppread::{Cfb, read_mpp};
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
@@ -52,7 +52,11 @@ fn main() {
         }
     };
     let paths = cfb.paths();
-    println!("{path}: {} streams across {} directory entries", paths.len(), cfb.entries().len());
+    println!(
+        "{path}: {} streams across {} directory entries",
+        paths.len(),
+        cfb.entries().len()
+    );
     for p in &paths {
         let size = cfb.read_path(p).map(|d| d.len()).unwrap_or(0);
         println!("  {p:<40} {size} bytes");
