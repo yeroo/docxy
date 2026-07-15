@@ -26,7 +26,7 @@ Follow these steps exactly; do not create a session unless the binary and the fi
 
 4. **Launch.** Find `agwintermctl` on PATH; if absent, use `%LOCALAPPDATA%\Programs\agwinterm\agwintermctl.exe`. Then run:
    `agwintermctl session new --name xlsxy --cwd "<repo root>" --command "\"<repo root>\target\release\xlsxy.exe\" \"<resolved file>\""`
-   The `--command` string is split on whitespace with double-quote grouping (there is no shell), so wrap both the exe path and the resolved file path in embedded double quotes — this matters because corpus filenames commonly contain spaces (e.g. `1 Comment.docx`).
+   The `--command` string is split on whitespace with double-quote grouping (there is no shell), so wrap both the exe path and the resolved file path in embedded double quotes — this matters because paths may contain spaces (user-supplied paths especially).
    It prints the new session id on success. If the control pipe is unreachable, agwinterm isn't running — tell the user to start agwinterm and stop.
    - Caveat: `agwintermctl` has no `--help` — probing `session new --help` **creates a session**. Don't probe; if you create one by accident, close it with `agwintermctl session close <id>`.
 
