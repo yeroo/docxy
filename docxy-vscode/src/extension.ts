@@ -82,11 +82,27 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
         },
       ),
     ];
-    // Register the command-palette actions once; each routes to the active panel.
-    for (const [cmd, op] of [
+    // Register the command-palette actions once; each posts a bridge command
+    // string (tab-delimited) to the active panel's webview.
+    const COMMANDS: Array<[string, string]> = [
       ['docxy.toggleBold', 'bold'],
       ['docxy.toggleItalic', 'italic'],
-    ] as const) {
+      ['docxy.toggleUnderline', 'underline'],
+      ['docxy.toggleStrike', 'strike'],
+      ['docxy.heading1', 'heading\t1'],
+      ['docxy.heading2', 'heading\t2'],
+      ['docxy.heading3', 'heading\t3'],
+      ['docxy.normalStyle', 'heading\t0'],
+      ['docxy.bulletList', 'list\tbullet'],
+      ['docxy.numberedList', 'list\tnumber'],
+      ['docxy.alignLeft', 'align\tleft'],
+      ['docxy.alignCenter', 'align\tcenter'],
+      ['docxy.alignRight', 'align\tright'],
+      ['docxy.alignJustify', 'align\tjustify'],
+      ['docxy.fontBigger', 'fontsize\t2'],
+      ['docxy.fontSmaller', 'fontsize\t-2'],
+    ];
+    for (const [cmd, op] of COMMANDS) {
       disposables.push(
         vscode.commands.registerCommand(cmd, () => {
           provider.activePanel?.webview.postMessage({ type: 'command', op });

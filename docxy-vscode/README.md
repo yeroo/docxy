@@ -52,6 +52,10 @@ Development Host, and open any `.docx` file.
   click to place the caret and drag to select, <kbd>Ctrl/Cmd</kbd>+
   <kbd>B</kbd>/<kbd>I</kbd>/<kbd>U</kbd> formatting, <kbd>Ctrl/Cmd</kbd>+
   <kbd>A</kbd> select-all, and copy/cut/paste mediated through the OS clipboard.
+- **Formatting surface** — a slim, no-ribbon toolbar (bold / italic / underline /
+  strike, Heading 1–2 / Normal, bulleted & numbered lists, alignment, font
+  size), with every action also on the command palette (`Docxy: …`). Headings,
+  lists, and alignment apply to the selected paragraphs.
 - **Native integration** — the VS Code **dirty indicator**, **undo/redo**
   (<kbd>Ctrl/Cmd</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd>), **Save**, **Save As**, and
   **hot-exit backup** all work, driven through the standard `CustomEditor` edit

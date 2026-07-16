@@ -38,16 +38,22 @@
       }
     ],
     "commands": [
-      {
-        "command": "docxy.toggleBold",
-        "title": "Docxy: Bold",
-        "category": "Docxy"
-      },
-      {
-        "command": "docxy.toggleItalic",
-        "title": "Docxy: Italic",
-        "category": "Docxy"
-      }
+      { "command": "docxy.toggleBold", "title": "Bold", "category": "Docxy" },
+      { "command": "docxy.toggleItalic", "title": "Italic", "category": "Docxy" },
+      { "command": "docxy.toggleUnderline", "title": "Underline", "category": "Docxy" },
+      { "command": "docxy.toggleStrike", "title": "Strikethrough", "category": "Docxy" },
+      { "command": "docxy.heading1", "title": "Heading 1", "category": "Docxy" },
+      { "command": "docxy.heading2", "title": "Heading 2", "category": "Docxy" },
+      { "command": "docxy.heading3", "title": "Heading 3", "category": "Docxy" },
+      { "command": "docxy.normalStyle", "title": "Normal (clear heading)", "category": "Docxy" },
+      { "command": "docxy.bulletList", "title": "Bulleted List", "category": "Docxy" },
+      { "command": "docxy.numberedList", "title": "Numbered List", "category": "Docxy" },
+      { "command": "docxy.alignLeft", "title": "Align Left", "category": "Docxy" },
+      { "command": "docxy.alignCenter", "title": "Align Center", "category": "Docxy" },
+      { "command": "docxy.alignRight", "title": "Align Right", "category": "Docxy" },
+      { "command": "docxy.alignJustify", "title": "Justify", "category": "Docxy" },
+      { "command": "docxy.fontBigger", "title": "Increase Font Size", "category": "Docxy" },
+      { "command": "docxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" }
     ]
   },
   "scripts": {

@@ -9,14 +9,60 @@ body {
 }
 
 body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
   color: var(--vscode-editor-foreground);
   background: var(--vscode-editor-background);
+}
+
+/* A slim, no-ribbon toolbar with just the essentials; everything here is also on
+   the command palette. */
+#toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 8px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-editorWidget-border, transparent);
+  user-select: none;
+}
+
+#toolbar button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 5px;
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#toolbar button.tb-b { font-weight: bold; }
+#toolbar button.tb-i { font-style: italic; }
+#toolbar button.tb-u { text-decoration: underline; }
+#toolbar button.tb-s { text-decoration: line-through; }
+#toolbar button:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+#toolbar button:active {
+  background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.3));
+}
+#toolbar .tb-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 5px;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35));
 }
 
 #doc {
   position: relative;
   box-sizing: border-box;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   padding: 8px 12px 32px;
   outline: none;

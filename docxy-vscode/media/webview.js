@@ -162,7 +162,8 @@
   // ---- input ---------------------------------------------------------------
   const MUTATING = new Set([
     'insert', 'newline', 'backspace', 'delete', 'bold', 'italic', 'underline',
-    'strike', 'paste', 'cut',
+    'strike', 'paste', 'cut', 'heading', 'list', 'align', 'indent', 'fontsize',
+    'color',
   ]);
 
   /** Run a user-initiated command and, if it mutates, tell the host so VS Code
@@ -309,11 +310,60 @@
     return btoa(bin);
   }
 
+  // ---- floating toolbar (no ribbon — just the essentials) ------------------
+  function buildToolbar() {
+    const bar = document.createElement('div');
+    bar.id = 'toolbar';
+    const SEP = '|';
+    const buttons = [
+      ['B', 'bold', 'Bold', 'tb-b'],
+      ['I', 'italic', 'Italic', 'tb-i'],
+      ['U', 'underline', 'Underline', 'tb-u'],
+      ['S', 'strike', 'Strikethrough', 'tb-s'],
+      [SEP],
+      ['H1', 'heading\t1', 'Heading 1'],
+      ['H2', 'heading\t2', 'Heading 2'],
+      ['¶', 'heading\t0', 'Normal'],
+      [SEP],
+      ['•', 'list\tbullet', 'Bulleted list'],
+      ['1.', 'list\tnumber', 'Numbered list'],
+      [SEP],
+      ['⯇', 'align\tleft', 'Align left'],
+      ['≡', 'align\tcenter', 'Center'],
+      ['⯈', 'align\tright', 'Align right'],
+      [SEP],
+      ['A−', 'fontsize\t-2', 'Smaller'],
+      ['A+', 'fontsize\t2', 'Larger'],
+    ];
+    for (const [label, op, title, cls] of buttons) {
+      if (label === SEP) {
+        const s = document.createElement('span');
+        s.className = 'tb-sep';
+        bar.appendChild(s);
+        continue;
+      }
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.title = title;
+      if (cls) b.classList.add(cls);
+      // Keep the document's selection: don't let the button take focus.
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', () => {
+        userCmd(op);
+        docEl.focus();
+      });
+      bar.appendChild(b);
+    }
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+
   // ---- boot ----------------------------------------------------------------
   async function boot() {
     const resp = await fetch(window.__DOCXY__.wasmUri);
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
     ex = instance.exports;
+    buildToolbar();
     docEl.addEventListener('keydown', onKeydown);
     docEl.addEventListener('mousedown', onMousedown);
     window.addEventListener('mousemove', onMousemove);

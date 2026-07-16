@@ -17,6 +17,7 @@
 use std::rc::Rc;
 
 use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::model::Align;
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{self, Color, LineMap, RenderOptions};
@@ -184,6 +185,28 @@ impl Session {
             "italic" => self.editor.toggle_italic(),
             "underline" => self.editor.toggle_underline(),
             "strike" => self.editor.toggle_strike(),
+            "heading" => {
+                let n: u8 = rest.trim().parse().unwrap_or(0);
+                if (1..=9).contains(&n) {
+                    self.editor.set_para_style(Some(&format!("Heading{n}")));
+                } else {
+                    self.editor.set_para_style(None);
+                }
+            }
+            "list" => self.toggle_list(rest.trim()),
+            "align" => self.editor.set_align(match rest.trim() {
+                "center" => Align::Center,
+                "right" => Align::Right,
+                "justify" => Align::Justify,
+                _ => Align::Left,
+            }),
+            "indent" => self.editor.change_indent(rest.trim().parse().unwrap_or(0)),
+            "fontsize" => self.editor.resize_font(rest.trim().parse().unwrap_or(0)),
+            "color" => {
+                let hex = rest.trim();
+                self.editor
+                    .set_color((!hex.is_empty()).then(|| hex.to_string()));
+            }
             "undo" => {
                 self.editor.undo();
             }
@@ -232,6 +255,29 @@ impl Session {
             self.dirty = true;
         }
         copied
+    }
+
+    /// Toggle a bulleted/numbered list on the selected paragraphs, or clear it.
+    /// Mirrors the terminal app: `ensure_list` provisions a numbering definition
+    /// in the package, then the paragraphs join or leave it; the numbering is
+    /// re-parsed so list markers render.
+    fn toggle_list(&mut self, kind: &str) {
+        match kind {
+            "bullet" | "number" => {
+                let num_id = self.pkg.ensure_list(kind == "bullet");
+                if self.editor.all_in_list(num_id) {
+                    self.editor.set_list(None);
+                } else {
+                    self.editor.set_list(Some(num_id));
+                }
+            }
+            _ => self.editor.set_list(None),
+        }
+        self.numbering = self
+            .pkg
+            .part("word/numbering.xml")
+            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
     }
 
     /// `move\t<dir>\t<select>` — arrow / word / document navigation.
@@ -405,6 +451,36 @@ mod tests {
         let copied = s.dispatch("copy");
         assert_eq!(copied.as_deref(), Some("pick me"));
         assert!(!s.is_dirty(), "copy must not dirty the document");
+    }
+
+    #[test]
+    fn formatting_commands_apply_and_survive_save() {
+        let bytes = sample_docx("Heading text");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("selectall");
+        s.dispatch("heading\t1");
+        s.dispatch("align\tcenter");
+        s.dispatch("fontsize\t8");
+        assert!(s.is_dirty());
+        // Re-open the saved bytes: the heading style must round-trip losslessly.
+        let out = s.save();
+        let mut s2 = Session::open(&out).expect("reopen");
+        let v = s2.view_json(None);
+        assert!(v.contains("Heading text"), "text lost: {v}");
+    }
+
+    #[test]
+    fn bullet_list_adds_a_marker() {
+        let bytes = sample_docx("Item one");
+        let mut s = Session::open(&bytes).expect("open");
+        let before = s.view_json(None);
+        s.dispatch("selectall");
+        s.dispatch("list\tbullet");
+        let after = s.view_json(None);
+        assert!(s.is_dirty());
+        // The list marker makes the paragraph's first line wider than before.
+        assert_ne!(before, after, "list toggle changed nothing");
+        assert!(after.contains("Item one"));
     }
 
     #[test]
