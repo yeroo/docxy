@@ -4,6 +4,9 @@
 
 - Opening an empty (0-byte) `.docx` — e.g. a file just created in the
   explorer — now offers to create a new Word document in its place.
+- Fixed the caret visually jumping to the document start when typing a
+  space at a soft-wrap margin (the wrapped-away space made the caret's
+  position unmappable); it now stays pinned at the wrap margin.
 
 ## 0.3.0
 

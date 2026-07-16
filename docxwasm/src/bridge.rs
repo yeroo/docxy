@@ -427,6 +427,27 @@ fn caret_screen(maps: &[LineMap], caret: &Caret) -> (usize, usize) {
             }
         }
     }
+    // No segment contains the offset — typically a trailing space the soft-wrap
+    // consumed (it's in the model but never rendered). Pin the caret at the wrap
+    // margin: the end of the caret paragraph's nearest segment at or below the
+    // offset (or the paragraph's first segment when the offset precedes them
+    // all), rather than teleporting to the document start.
+    let mut below: Option<(usize, usize, usize)> = None; // (end_offset, line, col)
+    let mut first: Option<(usize, usize, usize)> = None; // (start_offset, line, col0)
+    for (i, m) in maps.iter().enumerate() {
+        for seg in m.segs.iter().filter(|s| s.path == caret.path) {
+            let end = seg.start + seg.nchars();
+            if end <= caret.offset && below.is_none_or(|(be, _, _)| end >= be) {
+                below = Some((end, i, seg.col_range().1));
+            }
+            if first.is_none_or(|(fs, _, _)| seg.start < fs) {
+                first = Some((seg.start, i, seg.col0));
+            }
+        }
+    }
+    if let Some((_, line, col)) = below.or(first) {
+        return (line, col);
+    }
     (0, 0)
 }
 
@@ -609,6 +630,40 @@ mod tests {
         assert!(v.contains("\"images\":["), "images array missing: {v}");
         // An unknown relationship id must resolve to nothing, not panic.
         assert!(s.media("rIdNope").is_none());
+    }
+
+    /// Parse `"caret":{"line":N,"col":M}` out of a view JSON.
+    fn caret_of(v: &str) -> (usize, usize) {
+        let s = v
+            .split("\"caret\":{\"line\":")
+            .nth(1)
+            .expect("caret in view");
+        let (line, rest) = s.split_once(",\"col\":").expect("caret line");
+        let col: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        (line.parse().unwrap(), col.parse().unwrap())
+    }
+
+    #[test]
+    fn trailing_space_keeps_caret_at_wrap_margin() {
+        // A soft-wrap consumes trailing spaces, so the caret offset right after
+        // a typed space belongs to no rendered segment. It must stay pinned at
+        // the wrap margin, not jump to the document start (0,0).
+        let bytes = sample_docx("The quick brown fox jumps over the lazy dog again and again");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("width\t30");
+        s.dispatch("move\tdocend\t0");
+        let before = caret_of(&s.view_json(None));
+        assert_ne!(before, (0, 0), "caret should start at the paragraph end");
+        for n in 1..=3 {
+            s.dispatch("insert\t ");
+            let after = caret_of(&s.view_json(None));
+            assert_ne!(
+                after,
+                (0, 0),
+                "caret jumped to doc start after {n} space(s)"
+            );
+            assert_eq!(after.0, before.0, "caret left its line after {n} space(s)");
+        }
     }
 
     #[test]
