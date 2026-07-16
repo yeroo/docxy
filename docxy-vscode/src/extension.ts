@@ -245,17 +245,22 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
         'Create',
       );
       if (pick === 'Create') {
-        const bytes = await markdownToDocx(this.context, '');
-        if (document.uri.scheme !== 'untitled') {
-          await vscode.workspace.fs.writeFile(document.uri, bytes);
-        }
-        document.initialContent = bytes;
+        await this.seedNewDocument(document);
       }
     }
     panel.webview.postMessage({
       type: 'open',
       data: Buffer.from(document.initialContent).toString('base64'),
     });
+  }
+
+  /** Mint a fresh empty Word document and write it over the (empty) file. */
+  private async seedNewDocument(document: DocxDocument): Promise<void> {
+    const bytes = await markdownToDocx(this.context, '');
+    if (document.uri.scheme !== 'untitled') {
+      await vscode.workspace.fs.writeFile(document.uri, bytes);
+    }
+    document.initialContent = bytes;
   }
 
   private onMessage(
@@ -282,6 +287,16 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
           redo: () => {
             void panel.webview.postMessage({ type: 'do', op: 'redo' });
           },
+        });
+        break;
+
+      case 'createNew':
+        // The webview's empty-file state: create the document in place.
+        void this.seedNewDocument(document).then(() => {
+          panel.webview.postMessage({
+            type: 'open',
+            data: Buffer.from(document.initialContent).toString('base64'),
+          });
         });
         break;
 

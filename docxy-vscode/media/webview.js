@@ -52,8 +52,7 @@
     mediaCache.clear();
     if (u8.length === 0) {
       handle = 0;
-      docEl.textContent =
-        'This file is empty. Reopen it and choose “Create” to start a new Word document.';
+      showEmptyState();
       return;
     }
     const p = writeBytes(u8);
@@ -65,6 +64,23 @@
     }
     render();
   }
+  /** Empty file: offer to turn it into a real Word document right here. */
+  function showEmptyState() {
+    const box = document.createElement('div');
+    box.className = 'empty-state';
+    const note = document.createElement('p');
+    note.textContent = 'This file is empty — it isn’t a Word document yet.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Create new Word document';
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      vscode.postMessage({ type: 'createNew' });
+    });
+    box.append(note, btn);
+    docEl.replaceChildren(box);
+  }
+
   function render() {
     lastView = JSON.parse(dec.decode(readResult(ex.docx_render(handle))));
     paint();
