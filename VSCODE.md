@@ -114,15 +114,15 @@ lifecycle**. They talk over a small `postMessage` protocol:
 ## Status & next steps
 
 Working today: faithful rendering (runs, headings, lists, tables, links),
-editing (typing, navigation, selection, B/I/U, copy/cut/paste), and native
-dirty / undo-redo / save / Save As / backup with lossless round-trip.
+editing (typing, navigation, selection, B/I/U, copy/cut/paste), a no-ribbon
+formatting toolbar + command palette (headings, lists, alignment, font size),
+**find** (VS Code's find widget over the rendered text) and **replace** (the
+engine's replace-all), and native dirty / undo-redo / save / Save As / backup
+with lossless round-trip.
 
 Next, roughly in order:
 
-1. **Richer formatting surface** — a lightweight floating toolbar or more
-   command-palette actions (font size, color, headings, lists) over the editor
-   ops `docxcore` already exposes.
-2. **Images** — the terminal app overlays real pixels on placeholder boxes; the
+1. **Images** — the terminal app overlays real pixels on placeholder boxes; the
    webview can render embedded media inline from the package's media parts.
-3. **Find & replace** wired to VS Code's find widget.
-4. **Markdown ↔ docx** — surface `docxcore`'s conversion as an editor action.
+2. **Markdown ↔ docx** — surface `docxcore`'s conversion as an editor action.
+3. **Color / font pickers** over the `color` and `fontsize` bridge commands.

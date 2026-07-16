@@ -56,6 +56,9 @@ Development Host, and open any `.docx` file.
   strike, Heading 1–2 / Normal, bulleted & numbered lists, alignment, font
   size), with every action also on the command palette (`Docxy: …`). Headings,
   lists, and alignment apply to the selected paragraphs.
+- **Find & replace** — <kbd>Ctrl/Cmd</kbd>+<kbd>F</kbd> searches the rendered
+  document with VS Code's own find widget; **Docxy: Replace…** runs a
+  replace-all through the engine.
 - **Native integration** — the VS Code **dirty indicator**, **undo/redo**
   (<kbd>Ctrl/Cmd</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd>), **Save**, **Save As**, and
   **hot-exit backup** all work, driven through the standard `CustomEditor` edit

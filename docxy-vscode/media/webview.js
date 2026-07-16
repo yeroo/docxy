@@ -163,7 +163,7 @@
   const MUTATING = new Set([
     'insert', 'newline', 'backspace', 'delete', 'bold', 'italic', 'underline',
     'strike', 'paste', 'cut', 'heading', 'list', 'align', 'indent', 'fontsize',
-    'color',
+    'color', 'replace',
   ]);
 
   /** Run a user-initiated command and, if it mutates, tell the host so VS Code

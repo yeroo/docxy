@@ -214,6 +214,14 @@ impl Session {
                 self.editor.redo();
             }
             "paste" => self.editor.paste(&Clip::from_text(rest)),
+            "replace" => {
+                let mut p = rest.splitn(2, '\t');
+                let find = p.next().unwrap_or("");
+                let with = p.next().unwrap_or("");
+                if find.is_empty() || self.editor.replace_all(find, with, false) == 0 {
+                    mutated = false; // nothing matched — don't dirty the document
+                }
+            }
             "cut" => {
                 let t = self.editor.selection_text();
                 if t.is_empty() {
@@ -481,6 +489,21 @@ mod tests {
         // The list marker makes the paragraph's first line wider than before.
         assert_ne!(before, after, "list toggle changed nothing");
         assert!(after.contains("Item one"));
+    }
+
+    #[test]
+    fn replace_all_rewrites_and_persists() {
+        let bytes = sample_docx("red fish red fish");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("replace\tred\tblue");
+        assert!(s.is_dirty());
+        let v = s.view_json(None);
+        assert!(v.contains("blue fish blue fish"), "replace failed: {v}");
+        // No-match replace must not dirty a freshly-saved doc.
+        let out = s.save();
+        let mut s2 = Session::open(&out).expect("reopen");
+        s2.dispatch("replace\tzzz\tqqq");
+        assert!(!s2.is_dirty(), "no-match replace should not dirty");
     }
 
     #[test]

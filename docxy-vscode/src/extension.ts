@@ -77,7 +77,9 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
         DocxyEditorProvider.viewType,
         provider,
         {
-          webviewOptions: { retainContextWhenHidden: true },
+          // enableFindWidget lets Ctrl+F search the rendered document text (it's
+          // real DOM text in the webview) with no extra code.
+          webviewOptions: { retainContextWhenHidden: true, enableFindWidget: true },
           supportsMultipleEditorsPerDocument: false,
         },
       ),
@@ -109,10 +111,39 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
         }),
       );
     }
+    // Replace… prompts for the terms, then drives the engine's replace-all.
+    disposables.push(
+      vscode.commands.registerCommand('docxy.replace', () => provider.runReplace()),
+    );
     return vscode.Disposable.from(...disposables);
   }
 
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  /** Prompt for find/replace terms and apply replace-all in the active editor. */
+  async runReplace(): Promise<void> {
+    const panel = this.activePanel;
+    if (!panel) {
+      return;
+    }
+    const find = await vscode.window.showInputBox({
+      title: 'Docxy — Replace',
+      prompt: 'Find what',
+      ignoreFocusOut: true,
+    });
+    if (!find) {
+      return;
+    }
+    const withText = await vscode.window.showInputBox({
+      title: 'Docxy — Replace',
+      prompt: `Replace “${find}” with`,
+      ignoreFocusOut: true,
+    });
+    if (withText === undefined) {
+      return; // cancelled (empty string is a valid "delete" replacement)
+    }
+    panel.webview.postMessage({ type: 'command', op: `replace\t${find}\t${withText}` });
+  }
 
   // --- edit / dirty / undo-redo plumbing ------------------------------------
 

@@ -53,7 +53,8 @@
       { "command": "docxy.alignRight", "title": "Align Right", "category": "Docxy" },
       { "command": "docxy.alignJustify", "title": "Justify", "category": "Docxy" },
       { "command": "docxy.fontBigger", "title": "Increase Font Size", "category": "Docxy" },
-      { "command": "docxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" }
+      { "command": "docxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" },
+      { "command": "docxy.replace", "title": "Replace…", "category": "Docxy" }
     ]
   },
   "scripts": {
