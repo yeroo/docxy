@@ -238,6 +238,25 @@ outline/link tables and link lag remain to be reversed.
 The design, the CPM engine, resource leveling, and the format landscape are
 written up in [PROJECT.md](PROJECT.md).
 
+## Docxy in VS Code — the same engine, in an editor tab
+
+Because `docxcore` is pure `std` with no third-party crates, it compiles straight
+to **WebAssembly** — so the whole DOCX engine (parse → render → edit → **lossless
+save**) runs inside a **VS Code editor tab**. The
+[`docxy-vscode`](docxy-vscode) extension opens a `.docx` on the same faithful
+character grid the terminal app uses, at the editor's own font and size and
+honoring your color theme — no ribbon, just the keyboard and command palette,
+like editing code. It's a binary custom editor with native dirty state,
+undo/redo, Save/Save As, and hot-exit backups, and because it edits the real
+OOXML model (not HTML), it keeps Word's structure intact on save — the lossless
+round-trip that the crowded field of HTML-based `.docx` extensions lacks.
+
+The engine is a single ~650 KB `.wasm` built by the
+[`docxwasm`](docxwasm) crate (a hand-written C-ABI bridge, no `wasm-bindgen`). The
+architecture — the wasm ABI, the host ↔ webview split, and how VS Code's edit
+events stay in lockstep with the engine's own undo stack — is written up in
+[VSCODE.md](VSCODE.md).
+
 ## Install
 
 ```sh

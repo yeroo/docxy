@@ -1,0 +1,423 @@
+//! The host-agnostic editing session: everything the wasm ABI exposes, written
+//! as plain Rust so it can be unit-tested natively (`cargo test -p docxwasm`).
+//!
+//! A [`Session`] wraps a loaded [`Package`] (kept whole for lossless save) and an
+//! [`Editor`] over its document. The webview drives it through two channels:
+//!
+//! - **render** — [`Session::view_json`] turns the document into styled lines
+//!   (the same [`render`] engine the TUI uses) plus the caret's screen position,
+//!   serialized as compact JSON the webview paints onto a monospace grid.
+//! - **commands** — [`Session::dispatch`] applies one edit/navigation command,
+//!   encoded as a tab-delimited string (no JSON parser needed on this side).
+//!
+//! The view is a **continuous flow** (`page_view = false`): no pagination,
+//! headers, or footers — the document reads like text in an editor tab, which is
+//! exactly the fidelity target for the VS Code host.
+
+use std::rc::Rc;
+
+use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
+use docxcore::package::{Package, load_package, save_package};
+use docxcore::render::{self, Color, LineMap, RenderOptions};
+use docxcore::styles::{StyleSheet, parse_styles_xml};
+
+use crate::json;
+
+/// A live editing session over one `.docx`.
+pub struct Session {
+    /// The whole package, retained so save preserves unmodeled parts byte-for-
+    /// faithful. Its `document` is synced from the editor only at save time.
+    pkg: Package,
+    editor: Editor,
+    styles: Rc<StyleSheet>,
+    numbering: Numbering,
+    /// Wrap width in grid columns (the webview reports its viewport width).
+    width: usize,
+    /// Unsaved-changes flag, mirrored to the host's dirty indicator.
+    dirty: bool,
+    /// Caret maps from the most recent render, used to resolve clicks and
+    /// vertical movement (both are screen-position → model-offset lookups).
+    maps: Vec<LineMap>,
+}
+
+impl Session {
+    /// Open a `.docx` from its raw bytes. Returns `None` if the container or the
+    /// main document part can't be parsed.
+    pub fn open(bytes: &[u8]) -> Option<Session> {
+        let pkg = load_package(bytes).ok()?;
+        let styles = pkg
+            .part("word/styles.xml")
+            .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let numbering = pkg
+            .part("word/numbering.xml")
+            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let editor = Editor::new(pkg.document.clone());
+        Some(Session {
+            pkg,
+            editor,
+            styles: Rc::new(styles),
+            numbering,
+            width: 80,
+            dirty: false,
+            maps: Vec::new(),
+        })
+    }
+
+    /// Continuous-flow render options (no pagination/headers/footers).
+    fn options(&self) -> RenderOptions {
+        RenderOptions {
+            width: self.width.max(1),
+            show_invisibles: false,
+            page_view: false,
+            borderless_tables: false,
+            selection: self.editor.selection_spans(),
+            styles: self.styles.clone(),
+            list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
+            page: self.pkg.page_geom(),
+            headers: Default::default(),
+            footers: Default::default(),
+            title_page: false,
+            even_odd: false,
+        }
+    }
+
+    /// Render the document to the JSON view the webview consumes. `copied`, when
+    /// set, carries text the host should place on the OS clipboard (from a copy
+    /// or cut command).
+    pub fn view_json(&mut self, copied: Option<&str>) -> String {
+        let opts = self.options();
+        let (lines, maps) = render::render_mapped(&self.editor.doc, &opts);
+        let (cl, cc) = caret_screen(&maps, &self.editor.caret);
+        self.maps = maps;
+
+        let mut out = String::with_capacity(lines.len() * 48 + 64);
+        out.push_str("{\"lines\":[");
+        for (li, line) in lines.iter().enumerate() {
+            if li > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            for (si, span) in line.spans.iter().enumerate() {
+                if si > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"t\":");
+                json::push_str(&mut out, &span.text);
+                let st = &span.style;
+                if st.bold {
+                    out.push_str(",\"b\":1");
+                }
+                if st.italic {
+                    out.push_str(",\"i\":1");
+                }
+                if st.underline {
+                    out.push_str(",\"u\":1");
+                }
+                if st.strike {
+                    out.push_str(",\"s\":1");
+                }
+                if st.dim {
+                    out.push_str(",\"d\":1");
+                }
+                if st.highlight {
+                    out.push_str(",\"h\":1");
+                }
+                if let Some(c) = st.color {
+                    out.push_str(",\"c\":\"");
+                    out.push_str(color_name(c));
+                    out.push('"');
+                }
+                if let Some(l) = &span.link {
+                    out.push_str(",\"lnk\":");
+                    json::push_str(&mut out, l);
+                }
+                out.push('}');
+            }
+            out.push(']');
+        }
+        out.push_str("],\"caret\":{\"line\":");
+        out.push_str(&cl.to_string());
+        out.push_str(",\"col\":");
+        out.push_str(&cc.to_string());
+        out.push_str("},\"selection\":");
+        out.push_str(if self.editor.has_selection() {
+            "1"
+        } else {
+            "0"
+        });
+        out.push_str(",\"dirty\":");
+        out.push_str(if self.dirty { "true" } else { "false" });
+        out.push_str(",\"width\":");
+        out.push_str(&self.width.to_string());
+        if let Some(t) = copied {
+            out.push_str(",\"copied\":");
+            json::push_str(&mut out, t);
+        }
+        out.push('}');
+        out
+    }
+
+    /// The caret's current screen position from the last render.
+    fn caret_screen_now(&self) -> (usize, usize) {
+        caret_screen(&self.maps, &self.editor.caret)
+    }
+
+    /// Apply one tab-delimited command. Returns `Some(text)` when the host should
+    /// copy `text` to the OS clipboard (copy/cut); sets the dirty flag on any
+    /// mutating command.
+    pub fn dispatch(&mut self, cmd: &str) -> Option<String> {
+        let mut it = cmd.splitn(2, '\t');
+        let op = it.next().unwrap_or("");
+        let rest = it.next().unwrap_or("");
+        let mut copied = None;
+        let mut mutated = true; // default; navigation ops flip this to false
+
+        match op {
+            "insert" => self.editor.insert_str(rest),
+            "newline" => self.editor.insert_newline(),
+            "backspace" => self.editor.backspace(),
+            "delete" => self.editor.delete_forward(),
+            "bold" => self.editor.toggle_bold(),
+            "italic" => self.editor.toggle_italic(),
+            "underline" => self.editor.toggle_underline(),
+            "strike" => self.editor.toggle_strike(),
+            "undo" => {
+                self.editor.undo();
+            }
+            "redo" => {
+                self.editor.redo();
+            }
+            "paste" => self.editor.paste(&Clip::from_text(rest)),
+            "cut" => {
+                let t = self.editor.selection_text();
+                if t.is_empty() {
+                    mutated = false;
+                } else {
+                    self.editor.delete_selection();
+                    copied = Some(t);
+                }
+            }
+            "copy" => {
+                mutated = false;
+                let t = self.editor.selection_text();
+                if !t.is_empty() {
+                    copied = Some(t);
+                }
+            }
+            "selectall" => {
+                mutated = false;
+                self.editor.select_all();
+            }
+            "width" => {
+                mutated = false;
+                if let Ok(w) = rest.trim().parse::<usize>() {
+                    self.width = w.max(1);
+                }
+            }
+            "move" => {
+                mutated = false;
+                self.do_move(rest);
+            }
+            "click" => {
+                mutated = false;
+                self.do_click(rest);
+            }
+            _ => mutated = false,
+        }
+
+        if mutated {
+            self.dirty = true;
+        }
+        copied
+    }
+
+    /// `move\t<dir>\t<select>` — arrow / word / document navigation.
+    fn do_move(&mut self, rest: &str) {
+        let mut a = rest.split('\t');
+        let dir = a.next().unwrap_or("");
+        let select = a.next() == Some("1");
+        if select {
+            self.editor.extend_selection(true);
+        } else {
+            self.editor.clear_selection();
+        }
+        match dir {
+            "left" => self.editor.move_left(),
+            "right" => self.editor.move_right(),
+            "wordleft" => self.editor.move_word_left(),
+            "wordright" => self.editor.move_word_right(),
+            "home" => self.editor.move_home(),
+            "end" => self.editor.move_end(),
+            "docstart" => self.editor.move_doc_start(),
+            "docend" => self.editor.move_doc_end(),
+            "up" => self.move_vert(true),
+            "down" => self.move_vert(false),
+            _ => {}
+        }
+    }
+
+    /// Vertical movement is view-dependent: keep the screen column and hop to the
+    /// nearest editable segment one visual line up/down (using the last render's
+    /// caret maps).
+    fn move_vert(&mut self, up: bool) {
+        let (line, col) = self.caret_screen_now();
+        let target = if up {
+            line.checked_sub(1)
+        } else {
+            Some(line + 1)
+        };
+        if let Some(t) = target {
+            if let Some(m) = self.maps.get(t) {
+                if let Some(seg) = m.nearest_seg(col) {
+                    self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+                }
+            }
+        }
+    }
+
+    /// `click\t<line>\t<col>\t<select>` — place (or extend to) the caret at a grid
+    /// cell.
+    fn do_click(&mut self, rest: &str) {
+        let mut a = rest.split('\t');
+        let line: usize = a.next().unwrap_or("").parse().unwrap_or(0);
+        let col: usize = a.next().unwrap_or("").parse().unwrap_or(0);
+        let select = a.next() == Some("1");
+        if select {
+            self.editor.extend_selection(true);
+        } else {
+            self.editor.clear_selection();
+        }
+        if let Some(m) = self.maps.get(line) {
+            if let Some(seg) = m.nearest_seg(col) {
+                self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+            }
+        }
+    }
+
+    /// Serialize the (edited) document back to `.docx` bytes, losslessly — every
+    /// unmodeled part of the original package is preserved. Clears the dirty flag.
+    pub fn save(&mut self) -> Vec<u8> {
+        self.pkg.document = self.editor.doc.clone();
+        self.dirty = false;
+        save_package(&self.pkg)
+    }
+
+    #[cfg(test)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+}
+
+/// Find the caret's screen `(line, col)` from a set of caret maps.
+fn caret_screen(maps: &[LineMap], caret: &Caret) -> (usize, usize) {
+    for (i, m) in maps.iter().enumerate() {
+        if let Some(seg) = m.seg_for(&caret.path, caret.offset) {
+            if let Some(col) = seg.col_for_offset(caret.offset) {
+                return (i, col);
+            }
+        }
+    }
+    (0, 0)
+}
+
+/// Map a rendered [`Color`] to a VS Code terminal ANSI palette name (the webview
+/// resolves it to `--vscode-terminal-ansi<Name>`, so colors honor the theme).
+fn color_name(c: Color) -> &'static str {
+    match c {
+        Color::Black => "Black",
+        Color::Red => "Red",
+        Color::Green => "Green",
+        Color::Yellow => "Yellow",
+        Color::Blue => "Blue",
+        Color::Magenta => "Magenta",
+        Color::Cyan => "Cyan",
+        Color::White => "White",
+        Color::Gray => "BrightBlack",
+        Color::BrightRed => "BrightRed",
+        Color::BrightGreen => "BrightGreen",
+        Color::BrightYellow => "BrightYellow",
+        Color::BrightBlue => "BrightBlue",
+        Color::BrightMagenta => "BrightMagenta",
+        Color::BrightCyan => "BrightCyan",
+        Color::BrightWhite => "BrightWhite",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use docxcore::package::{new_package, save_package};
+
+    /// A tiny real `.docx` (one paragraph) built through the package layer, so
+    /// tests exercise the same load path the webview uses.
+    fn sample_docx(text: &str) -> Vec<u8> {
+        let xml = format!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let doc = docxcore::load::parse_document_xml(&xml, &Default::default());
+        save_package(&new_package(doc))
+    }
+
+    #[test]
+    fn opens_and_renders_text() {
+        let bytes = sample_docx("Hello world");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("Hello world"), "render missing text: {v}");
+        assert!(v.contains("\"caret\""));
+        assert!(v.contains("\"dirty\":false"));
+    }
+
+    #[test]
+    fn typing_inserts_and_marks_dirty() {
+        let bytes = sample_docx("Hi");
+        let mut s = Session::open(&bytes).expect("open");
+        // caret starts at doc start; type "X"
+        s.dispatch("insert\tX");
+        assert!(s.is_dirty());
+        let v = s.view_json(None);
+        assert!(v.contains("XHi"), "expected inserted text: {v}");
+        assert!(v.contains("\"dirty\":true"));
+    }
+
+    #[test]
+    fn save_round_trips_edit() {
+        let bytes = sample_docx("abc");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("insert\tZ");
+        let out = s.save();
+        assert!(!s.is_dirty(), "dirty should clear after save");
+        // Re-open the saved bytes and confirm the edit survived the round-trip.
+        let mut s2 = Session::open(&out).expect("reopen");
+        let v = s2.view_json(None);
+        assert!(v.contains("Zabc"), "edit not persisted: {v}");
+    }
+
+    #[test]
+    fn copy_returns_clipboard_text() {
+        let bytes = sample_docx("pick me");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("selectall");
+        let copied = s.dispatch("copy");
+        assert_eq!(copied.as_deref(), Some("pick me"));
+        assert!(!s.is_dirty(), "copy must not dirty the document");
+    }
+
+    #[test]
+    fn dispatch_render_after_move_is_stable() {
+        let bytes = sample_docx("one two three");
+        let mut s = Session::open(&bytes).expect("open");
+        s.view_json(None); // populate caret maps
+        s.dispatch("move\tright\t0");
+        s.dispatch("move\twordright\t1"); // extend selection
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"selection\":1"),
+            "expected active selection: {v}"
+        );
+    }
+}

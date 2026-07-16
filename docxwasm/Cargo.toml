@@ -1,0 +1,26 @@
+[package]
+name = "docxwasm"
+description = "WebAssembly bridge for docxcore: open, render (styled grid), edit, and losslessly save .docx from a browser/webview host (e.g. the VS Code extension)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["docx", "ooxml", "wasm", "webassembly", "editor"]
+categories = ["wasm", "text-processing"]
+
+[lints]
+workspace = true
+
+[lib]
+# `cdylib` is the wasm artifact the extension loads; `rlib` lets the bridge's
+# render/serialize/dispatch logic be unit-tested natively with `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Std-only, like the rest of the core stack — the only dependency is our own
+# DOCX engine. The wasm ABI is hand-written (no wasm-bindgen), matching this
+# project's from-scratch ethos and keeping the artifact tiny and auditable.
+docxcore = { version = "0.2.0", path = "../docxcore" }

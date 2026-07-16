@@ -1,0 +1,67 @@
+{
+  "name": "docxy-vscode",
+  "displayName": "Docxy — Word .docx viewer & editor",
+  "description": "Open, read, and edit Microsoft Word .docx files right in an editor tab — a faithful monospace-grid view with lossless save, powered by a WebAssembly build of the dependency-free docxcore engine.",
+  "version": "0.2.0",
+  "license": "MIT",
+  "publisher": "yeroo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yeroo/docxy"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "docx",
+    "word",
+    "ooxml",
+    "editor",
+    "wasm"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "docxy.docxEditor",
+        "displayName": "Docxy",
+        "selector": [
+          {
+            "filenamePattern": "*.docx"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "docxy.toggleBold",
+        "title": "Docxy: Bold",
+        "category": "Docxy"
+      },
+      {
+        "command": "docxy.toggleItalic",
+        "title": "Docxy: Italic",
+        "category": "Docxy"
+      }
+    ]
+  },
+  "scripts": {
+    "build:wasm": "cargo build -p docxwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
+    "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
+    "build": "npm run build:wasm && npm run build:ext",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.84.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0"
+  }
+}

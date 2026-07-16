@@ -1,0 +1,9 @@
+# Node / build outputs
+node_modules/
+out/
+*.vsix
+.vscode-test/
+
+# The wasm artifact is built from the docxwasm crate (npm run build:wasm),
+# not committed — same policy as other binaries in this repo.
+media/*.wasm
