@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "docxcore"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "opccore",
@@ -325,14 +325,14 @@ dependencies = [
 
 [[package]]
 name = "docxwasm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "docxcore",
 ]
 
 [[package]]
 name = "docxy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "docxcore",

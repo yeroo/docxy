@@ -23,4 +23,4 @@ crate-type = ["cdylib", "rlib"]
 # Std-only, like the rest of the core stack — the only dependency is our own
 # DOCX engine. The wasm ABI is hand-written (no wasm-bindgen), matching this
 # project's from-scratch ethos and keeping the artifact tiny and auditable.
-docxcore = { version = "0.2.0", path = "../docxcore" }
+docxcore = { version = "0.3.0", path = "../docxcore" }

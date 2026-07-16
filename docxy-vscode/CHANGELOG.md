@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## 0.3.0
 
 Initial release of the Docxy VS Code extension — open and edit Word `.docx` in
 a VS Code editor tab.
