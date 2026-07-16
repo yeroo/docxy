@@ -5,6 +5,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// A ribbon command. `Todo` entries render dimmed and report "not implemented
 /// yet" until wired up.
@@ -45,6 +46,8 @@ impl Act {
 
 struct Button {
     glyph: &'static str,
+    /// Display columns the glyph occupies — computed, since several glyphs
+    /// (💾 ＋ ⏱ 🔗 👤 ⛓) are two columns wide and hand-counted widths drift.
     width: usize,
     act: Act,
     hint: &'static str,
@@ -55,10 +58,10 @@ enum Seg {
     Gap(&'static str),
 }
 
-fn btn(glyph: &'static str, width: usize, act: Act, hint: &'static str) -> Seg {
+fn btn(glyph: &'static str, act: Act, hint: &'static str) -> Seg {
     Seg::Btn(Button {
         glyph,
-        width,
+        width: glyph.width(),
         act,
         hint,
     })
@@ -170,7 +173,7 @@ impl Ribbon {
                 let mut x = gx + 1;
                 for seg in row {
                     match seg {
-                        Seg::Gap(s) => x += s.chars().count() as u16,
+                        Seg::Gap(s) => x += s.width() as u16,
                         Seg::Btn(b) => {
                             self.placed.push(Placed {
                                 row: ri as u8,
@@ -348,7 +351,7 @@ impl Ribbon {
         let row_w = |row: &[Seg]| -> usize {
             row.iter()
                 .map(|s| match s {
-                    Seg::Gap(g) => g.chars().count(),
+                    Seg::Gap(g) => g.width(),
                     Seg::Btn(b) => b.width,
                 })
                 .sum()
@@ -368,7 +371,7 @@ impl Ribbon {
         out.push(bar("├", "┼", "┤"));
         let mut spans = vec![Span::styled("│", dim)];
         for g in self.groups() {
-            let pad = g.width.saturating_sub(g.title.chars().count());
+            let pad = g.width.saturating_sub(g.title.width());
             let l = pad / 2;
             spans.push(Span::raw(format!(
                 " {}{}{} ",
@@ -379,6 +382,7 @@ impl Ribbon {
             spans.push(Span::styled("│", dim));
         }
         out.push(Line::from(spans));
+        out.push(bar("└", "┴", "┘"));
         out
     }
 
@@ -453,13 +457,12 @@ fn task_groups() -> Vec<Group> {
             width: 24,
             rows: [
                 vec![
-                    btn("＋ Task", 6, AddTask, "Add a task below (n)"),
+                    btn("＋ Task", AddTask, "Add a task below (n)"),
                     Seg::Gap("  "),
-                    btn("✗ Delete", 8, DeleteTask, "Delete the task (x)"),
+                    btn("✗ Delete", DeleteTask, "Delete the task (x)"),
                 ],
                 vec![btn(
                     "◆ Milestone",
-                    11,
                     Milestone,
                     "Toggle milestone (0-day) on the task",
                 )],
@@ -469,18 +472,17 @@ fn task_groups() -> Vec<Group> {
             title: "Outline",
             width: 20,
             rows: [
-                vec![btn("→ Indent", 8, Indent, "Indent — make a subtask (Tab)")],
-                vec![btn("← Outdent", 9, Outdent, "Outdent (Shift+Tab)")],
+                vec![btn("→ Indent", Indent, "Indent — make a subtask (Tab)")],
+                vec![btn("← Outdent", Outdent, "Outdent (Shift+Tab)")],
             ],
         },
         Group {
             title: "Edit",
             width: 18,
             rows: [
-                vec![btn("✎ Rename", 8, Rename, "Rename the task (Enter)")],
+                vec![btn("✎ Rename", Rename, "Rename the task (Enter)")],
                 vec![btn(
                     "⏱ Duration",
-                    10,
                     Duration,
                     "Set duration — 3d / 4h / 2w (d)",
                 )],
@@ -490,8 +492,8 @@ fn task_groups() -> Vec<Group> {
             title: "File",
             width: 14,
             rows: [
-                vec![btn("💾 Save", 6, Save, "Save (Ctrl+S)")],
-                vec![btn("Save As…", 8, SaveAs, "Save As")],
+                vec![btn("💾 Save", Save, "Save (Ctrl+S)")],
+                vec![btn("Save As…", SaveAs, "Save As")],
             ],
         },
     ]
@@ -504,15 +506,9 @@ fn schedule_groups() -> Vec<Group> {
             title: "Dependencies",
             width: 22,
             rows: [
-                vec![btn(
-                    "🔗 Link",
-                    6,
-                    AddLink,
-                    "Add a predecessor by task ID (p)",
-                )],
+                vec![btn("🔗 Link", AddLink, "Add a predecessor by task ID (p)")],
                 vec![btn(
                     "⛓ Constraint",
-                    12,
                     Constraint,
                     "Set a date constraint — SNET/MSO/… (c)",
                 )],
@@ -524,13 +520,11 @@ fn schedule_groups() -> Vec<Group> {
             rows: [
                 vec![btn(
                     "👤 Assign",
-                    8,
                     Assign,
                     "Assign a resource to the task (a)",
                 )],
                 vec![btn(
                     "✗ Clear",
-                    7,
                     ClearResources,
                     "Remove the task's resources",
                 )],
@@ -542,13 +536,11 @@ fn schedule_groups() -> Vec<Group> {
             rows: [
                 vec![btn(
                     "⚑ Baseline",
-                    10,
                     Baseline,
                     "Snapshot the current plan as the baseline (b)",
                 )],
                 vec![btn(
                     "⟳ Recalc",
-                    8,
                     Todo("Reschedule"),
                     "Recompute (automatic on every edit)",
                 )],
@@ -565,15 +557,14 @@ fn view_groups() -> Vec<Group> {
             width: 26,
             rows: [
                 vec![
-                    btn("◀", 1, ScrollLeft, "Scroll the timeline left (h)"),
+                    btn("◀", ScrollLeft, "Scroll the timeline left (h)"),
                     Seg::Gap(" "),
-                    btn("▶", 1, ScrollRight, "Scroll the timeline right (l)"),
+                    btn("▶", ScrollRight, "Scroll the timeline right (l)"),
                     Seg::Gap("  "),
-                    btn("⇤ Start", 7, GoToStart, "Scroll to the project start"),
+                    btn("⇤ Start", GoToStart, "Scroll to the project start"),
                 ],
                 vec![btn(
                     "⭳ Export Markdown",
-                    17,
                     ExportGantt,
                     "Export a Markdown/Mermaid Gantt (Ctrl+E)",
                 )],
@@ -583,8 +574,8 @@ fn view_groups() -> Vec<Group> {
             title: "Window",
             width: 16,
             rows: [
-                vec![btn("◐ Theme", 7, ThemeToggle, "Toggle light / dark theme")],
-                vec![btn("⚖ Level", 7, Level, "Toggle resource leveling (L)")],
+                vec![btn("◐ Theme", ThemeToggle, "Toggle light / dark theme")],
+                vec![btn("⚖ Level", Level, "Toggle resource leveling (L)")],
             ],
         },
     ]
@@ -596,6 +587,7 @@ mod tests {
 
     #[test]
     fn groups_fit_their_declared_width() {
+        use unicode_width::UnicodeWidthStr;
         let mut r = Ribbon::new();
         for tab in 0..r.tabs.len() {
             if r.tab_groups[tab].is_empty() {
@@ -609,7 +601,7 @@ mod tests {
                     .map(|row| {
                         row.iter()
                             .map(|seg| match seg {
-                                Seg::Gap(s) => s.chars().count(),
+                                Seg::Gap(s) => s.width(),
                                 Seg::Btn(b) => b.width,
                             })
                             .sum::<usize>()
@@ -656,19 +648,67 @@ mod tests {
         assert!(matches!(r.nav(Focus::Tab(1), Dir::Down), Focus::Button(_)));
     }
 
+    /// Every body line must span the same number of terminal COLUMNS (display
+    /// width, not chars) on every tab — otherwise the side borders zigzag
+    /// wherever a two-column glyph (💾 ＋ ⏱ …) appears.
     #[test]
     fn body_rows_share_one_width() {
+        let mut r = Ribbon::new();
+        for tab in 0..r.tabs.len() {
+            if r.tab_groups[tab].is_empty() {
+                continue;
+            }
+            r.set_active(tab);
+            let lines = r.render_body(Focus::None);
+            let w = |l: &Line| l.spans.iter().map(|s| s.width()).sum::<usize>();
+            let w0 = w(&lines[0]);
+            for (i, l) in lines.iter().enumerate() {
+                assert_eq!(w(l), w0, "tab {tab} line {i} width");
+            }
+        }
+    }
+
+    /// The body is a closed box: top ┌…┐, bottom └…┘.
+    #[test]
+    fn body_box_is_closed() {
         let r = Ribbon::new();
         let lines = r.render_body(Focus::None);
-        let w = |l: &Line| {
+        assert_eq!(lines.len(), 6, "bar + 2 rows + separator + titles + bar");
+        let text = |l: &Line| {
             l.spans
                 .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
         };
-        let w0 = w(&lines[0]);
-        for l in &lines {
-            assert_eq!(w(l), w0);
+        let top = text(&lines[0]);
+        let bottom = text(lines.last().unwrap());
+        assert!(top.starts_with('┌') && top.ends_with('┐'), "top: {top}");
+        assert!(
+            bottom.starts_with('└') && bottom.ends_with('┘'),
+            "bottom: {bottom}"
+        );
+    }
+
+    /// A button's placed hit-box width equals its glyph's display width, so
+    /// clicks land on what the eye sees.
+    #[test]
+    fn placed_widths_are_display_widths() {
+        use unicode_width::UnicodeWidthStr;
+        let mut r = Ribbon::new();
+        for tab in 0..r.tabs.len() {
+            if r.tab_groups[tab].is_empty() {
+                continue;
+            }
+            r.set_active(tab);
+            for g in r.groups() {
+                for row in &g.rows {
+                    for seg in row {
+                        if let Seg::Btn(b) = seg {
+                            assert_eq!(b.width, b.glyph.width(), "button {:?}", b.glyph);
+                        }
+                    }
+                }
+            }
         }
     }
 }
