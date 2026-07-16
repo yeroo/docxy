@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.2.0
+## 0.2.1
 
-Initial release — open and edit Word `.docx` in a VS Code editor tab.
+Initial release of the Docxy VS Code extension — open and edit Word `.docx` in
+a VS Code editor tab.
 
 - Faithful monospace-grid rendering (runs, headings, lists, tables, links,
   embedded images) at the editor's font/size, honoring the color theme.
