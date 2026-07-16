@@ -61,6 +61,10 @@ Development Host, and open any `.docx` file.
 - **Find & replace** — <kbd>Ctrl/Cmd</kbd>+<kbd>F</kbd> searches the rendered
   document with VS Code's own find widget; **Docxy: Replace…** runs a
   replace-all through the engine.
+- **Markdown ⇄ Word** — right-click a `.md` file → **Convert Markdown to Word
+  (.docx)** (opens the result in Docxy), and **Docxy: Export to Markdown (.md)**
+  from an open document. Both run the wasm engine in the extension host — no
+  open editor required for the conversion.
 - **Native integration** — the VS Code **dirty indicator**, **undo/redo**
   (<kbd>Ctrl/Cmd</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd>), **Save**, **Save As**, and
   **hot-exit backup** all work, driven through the standard `CustomEditor` edit

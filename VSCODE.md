@@ -128,7 +128,15 @@ fetches each rid once, sniffs the format, and paints a data-URI `<img>` over the
 placeholder box (raster + SVG); vector WMF/EMF, which browsers can't decode, fall
 back to a labeled box — exactly the terminal app's fallback.
 
+**Markdown ⇄ docx** conversion runs the *same wasm in the extension host*
+(Node instantiates `docxwasm` too), via stateless exports `docx_from_markdown`
+and `docx_to_md` — so **Convert Markdown to Word** (right-click a `.md`) and
+**Export to Markdown** (from an open document) work without an open editor or a
+webview round-trip. This is the one place the engine runs host-side rather than
+in the webview.
+
 Next, roughly in order:
 
-1. **Markdown ↔ docx** — surface `docxcore`'s conversion as an editor action.
-2. **Color / font pickers** over the `color` and `fontsize` bridge commands.
+1. **Color / font pickers** over the `color` and `fontsize` bridge commands.
+2. **Table structure editing** (add/delete rows and columns).
+3. **New blank `.docx`** from the untitled/new-file flow.

@@ -54,8 +54,32 @@
       { "command": "docxy.alignJustify", "title": "Justify", "category": "Docxy" },
       { "command": "docxy.fontBigger", "title": "Increase Font Size", "category": "Docxy" },
       { "command": "docxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" },
-      { "command": "docxy.replace", "title": "Replace…", "category": "Docxy" }
-    ]
+      { "command": "docxy.replace", "title": "Replace…", "category": "Docxy" },
+      { "command": "docxy.convertMarkdown", "title": "Convert Markdown to Word (.docx)", "category": "Docxy" },
+      { "command": "docxy.exportMarkdown", "title": "Export to Markdown (.md)", "category": "Docxy" }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "docxy.convertMarkdown",
+          "when": "resourceExtname == .md",
+          "group": "docxy@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "docxy.convertMarkdown",
+          "when": "resourceExtname == .md",
+          "group": "docxy@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "docxy.exportMarkdown",
+          "when": "activeCustomEditorId == docxy.docxEditor"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run build",

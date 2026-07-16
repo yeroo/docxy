@@ -26,6 +26,30 @@ use docxcore::styles::{StyleSheet, parse_styles_xml};
 
 use crate::json;
 
+/// Convert Markdown source to `.docx` bytes — the same conversion the terminal
+/// app does on `Save As` to a `.docx` name. Stateless (no session): the VS Code
+/// host calls this to turn a `.md` file into a Word document.
+pub fn markdown_to_docx(md: &str) -> Vec<u8> {
+    use docxcore::markdown::from_markdown;
+    use docxcore::package::new_markdown_package;
+    save_package(&new_markdown_package(from_markdown(md)))
+}
+
+/// Convert `.docx` bytes to Markdown source (list markers resolved from the
+/// package's numbering), or `None` if the container can't be parsed. Stateless.
+pub fn docx_to_markdown(bytes: &[u8]) -> Option<String> {
+    let pkg = load_package(bytes).ok()?;
+    let numbering = pkg
+        .part("word/numbering.xml")
+        .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+        .unwrap_or_default();
+    let markers = compute_markers(&pkg.document, &numbering);
+    Some(docxcore::markdown::to_markdown_with(
+        &pkg.document,
+        &markers,
+    ))
+}
+
 /// A live editing session over one `.docx`.
 pub struct Session {
     /// The whole package, retained so save preserves unmodeled parts byte-for-
@@ -554,6 +578,27 @@ mod tests {
         let mut s2 = Session::open(&out).expect("reopen");
         s2.dispatch("replace\tzzz\tqqq");
         assert!(!s2.is_dirty(), "no-match replace should not dirty");
+    }
+
+    #[test]
+    fn markdown_converts_to_docx_and_back() {
+        let md = "# Title\n\nHello **bold** and *italic*.\n\n- one\n- two\n";
+        let docx = markdown_to_docx(md);
+        // The produced bytes are a real package the session can open and render.
+        let mut s = Session::open(&docx).expect("open converted docx");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("Title") && v.contains("Hello"),
+            "converted render: {v}"
+        );
+        // Round-trip back to Markdown recovers the heading + emphasis + list.
+        let back = docx_to_markdown(&docx).expect("to md");
+        assert!(back.contains("# Title"), "heading lost: {back}");
+        assert!(back.contains("**bold**"), "bold lost: {back}");
+        assert!(
+            back.contains("- one") && back.contains("- two"),
+            "list lost: {back}"
+        );
     }
 
     #[test]

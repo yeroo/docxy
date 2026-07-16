@@ -165,6 +165,29 @@ pub unsafe extern "C" fn docx_media(handle: u32, ptr: *const u8, len: usize) -> 
     with_session(handle, |s| s.media(&rid).unwrap_or_default())
 }
 
+// ---- stateless format conversion -------------------------------------------
+
+/// Convert the Markdown source at `ptr`/`len` to `.docx` bytes. Stateless — no
+/// handle needed. The host uses this for the "Convert Markdown to Word" command.
+///
+/// # Safety
+/// `ptr`/`len` must describe a live host allocation of the Markdown UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn docx_from_markdown(ptr: *const u8, len: usize) -> *mut u8 {
+    let md = String::from_utf8_lossy(unsafe { input(ptr, len) }).into_owned();
+    ret_bytes(&bridge::markdown_to_docx(&md))
+}
+
+/// Convert the `.docx` bytes at `ptr`/`len` to Markdown source. Stateless.
+///
+/// # Safety
+/// `ptr`/`len` must describe a live host allocation of the `.docx` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn docx_to_md(ptr: *const u8, len: usize) -> *mut u8 {
+    let md = bridge::docx_to_markdown(unsafe { input(ptr, len) }).unwrap_or_default();
+    ret_bytes(md.as_bytes())
+}
+
 /// Run `f` against the session for `handle`, returning its bytes as a
 /// length-prefixed result buffer (empty payload if the handle is unknown).
 fn with_session(handle: u32, f: impl FnOnce(&mut Session) -> Vec<u8>) -> *mut u8 {

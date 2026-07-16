@@ -10,6 +10,7 @@
 // standard CustomEditor edit events.
 
 import * as vscode from 'vscode';
+import { docxToMarkdown, markdownToDocx } from './engine';
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(DocxyEditorProvider.register(context));
@@ -69,6 +70,12 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   /** The most recently focused Docxy panel, so command-palette actions target
    *  the editor the user is looking at. */
   private activePanel?: vscode.WebviewPanel;
+  /** Panel → its document, so commands can reach the active document's bytes. */
+  private readonly panelDocs = new Map<vscode.WebviewPanel, DocxDocument>();
+
+  private get activeDocument(): DocxDocument | undefined {
+    return this.activePanel ? this.panelDocs.get(this.activePanel) : undefined;
+  }
 
   static register(context: vscode.ExtensionContext): vscode.Disposable {
     const provider = new DocxyEditorProvider(context);
@@ -114,6 +121,15 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     // Replace… prompts for the terms, then drives the engine's replace-all.
     disposables.push(
       vscode.commands.registerCommand('docxy.replace', () => provider.runReplace()),
+    );
+    // Markdown ⇄ docx conversion (runs the wasm in the extension host).
+    disposables.push(
+      vscode.commands.registerCommand('docxy.convertMarkdown', (uri?: vscode.Uri) =>
+        convertMarkdownToDocx(context, uri),
+      ),
+      vscode.commands.registerCommand('docxy.exportMarkdown', () =>
+        provider.runExportMarkdown(context),
+      ),
     );
     return vscode.Disposable.from(...disposables);
   }
@@ -166,6 +182,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     panel: vscode.WebviewPanel,
   ): Promise<void> {
     document.panel = panel;
+    this.panelDocs.set(panel, document);
     panel.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
@@ -186,6 +203,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     panel.onDidDispose(() => {
       sub.dispose();
       viewSub.dispose();
+      this.panelDocs.delete(panel);
       if (document.panel === panel) {
         document.panel = undefined;
       }
@@ -193,6 +211,22 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
         this.activePanel = undefined;
       }
     });
+  }
+
+  /** Export the active Docxy document's current content to a sibling `.md`. */
+  async runExportMarkdown(context: vscode.ExtensionContext): Promise<void> {
+    const document = this.activeDocument;
+    if (!document) {
+      void vscode.window.showInformationMessage('Docxy: open a .docx first.');
+      return;
+    }
+    const bytes = await document.requestBytes();
+    const md = await docxToMarkdown(context, bytes);
+    const target = withExtension(document.uri, '.md');
+    await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(md));
+    const doc = await vscode.workspace.openTextDocument(target);
+    await vscode.window.showTextDocument(doc);
+    void vscode.window.showInformationMessage(`Docxy: exported ${basename(target)}`);
   }
 
   private onMessage(
@@ -333,6 +367,36 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
 </body>
 </html>`;
   }
+}
+
+/** Convert a Markdown file to a sibling `.docx` and open it in the Docxy editor.
+ *  `uri` comes from the explorer/editor-title context; falls back to the active
+ *  text editor when invoked from the command palette. */
+async function convertMarkdownToDocx(
+  context: vscode.ExtensionContext,
+  uri?: vscode.Uri,
+): Promise<void> {
+  const source = uri ?? vscode.window.activeTextEditor?.document.uri;
+  if (!source || !source.path.toLowerCase().endsWith('.md')) {
+    void vscode.window.showInformationMessage('Docxy: select a Markdown (.md) file to convert.');
+    return;
+  }
+  const md = new TextDecoder().decode(await vscode.workspace.fs.readFile(source));
+  const docx = await markdownToDocx(context, md);
+  const target = withExtension(source, '.docx');
+  await vscode.workspace.fs.writeFile(target, docx);
+  await vscode.commands.executeCommand('vscode.openWith', target, 'docxy.docxEditor');
+  void vscode.window.showInformationMessage(`Docxy: created ${basename(target)}`);
+}
+
+/** Replace a URI's file extension (e.g. `report.md` → `report.docx`). */
+function withExtension(uri: vscode.Uri, ext: string): vscode.Uri {
+  const path = uri.path.replace(/\.[^./]*$/, '') + ext;
+  return uri.with({ path });
+}
+
+function basename(uri: vscode.Uri): string {
+  return uri.path.split('/').pop() || uri.path;
 }
 
 function makeNonce(): string {
