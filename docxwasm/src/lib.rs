@@ -152,6 +152,19 @@ pub extern "C" fn docx_save(handle: u32) -> *mut u8 {
     with_session(handle, |s| s.save())
 }
 
+/// Return the raw bytes of the embedded media referenced by the relationship id
+/// at `ptr`/`len` (an `rId…` string from a rendered image box). Empty buffer if
+/// the handle or the media is unknown. The webview fetches each rid once and
+/// caches the resulting data URI.
+///
+/// # Safety
+/// `ptr`/`len` must describe a live host allocation of the rid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn docx_media(handle: u32, ptr: *const u8, len: usize) -> *mut u8 {
+    let rid = String::from_utf8_lossy(unsafe { input(ptr, len) }).into_owned();
+    with_session(handle, |s| s.media(&rid).unwrap_or_default())
+}
+
 /// Run `f` against the session for `handle`, returning its bytes as a
 /// length-prefixed result buffer (empty payload if the handle is unknown).
 fn with_session(handle: u32, f: impl FnOnce(&mut Session) -> Vec<u8>) -> *mut u8 {

@@ -17,10 +17,11 @@
 use std::rc::Rc;
 
 use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::model::Align;
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
-use docxcore::render::{self, Color, LineMap, RenderOptions};
+use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 
 use crate::json;
@@ -33,6 +34,8 @@ pub struct Session {
     editor: Editor,
     styles: Rc<StyleSheet>,
     numbering: Numbering,
+    /// document.xml relationships (rId → media target), for resolving images.
+    rels: Relationships,
     /// Wrap width in grid columns (the webview reports its viewport width).
     width: usize,
     /// Unsaved-changes flag, mirrored to the host's dirty indicator.
@@ -55,16 +58,34 @@ impl Session {
             .part("word/numbering.xml")
             .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
             .unwrap_or_default();
+        let rels = pkg
+            .part("word/_rels/document.xml.rels")
+            .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
         let editor = Editor::new(pkg.document.clone());
         Some(Session {
             pkg,
             editor,
             styles: Rc::new(styles),
             numbering,
+            rels,
             width: 80,
             dirty: false,
             maps: Vec::new(),
         })
+    }
+
+    /// Raw bytes of the embedded media referenced by relationship `rid`
+    /// (`word/media/imageN.*`), or `None` if it can't be resolved. The webview
+    /// turns these into data URIs and paints them over the image placeholders.
+    pub fn media(&self, rid: &str) -> Option<Vec<u8>> {
+        let target = self.rels.target(rid)?;
+        // Rel targets are relative to `word/` (or absolute with a leading `/`).
+        let name = match target.strip_prefix('/') {
+            Some(abs) => abs.to_string(),
+            None => format!("word/{}", target.trim_start_matches("./")),
+        };
+        self.pkg.part(&name).map(<[u8]>::to_vec)
     }
 
     /// Continuous-flow render options (no pagination/headers/footers).
@@ -90,7 +111,7 @@ impl Session {
     /// or cut command).
     pub fn view_json(&mut self, copied: Option<&str>) -> String {
         let opts = self.options();
-        let (lines, maps) = render::render_mapped(&self.editor.doc, &opts);
+        let (lines, maps, images) = render::render_with_images(&self.editor.doc, &opts);
         let (cl, cc) = caret_screen(&maps, &self.editor.caret);
         self.maps = maps;
 
@@ -153,6 +174,14 @@ impl Session {
         out.push_str(if self.dirty { "true" } else { "false" });
         out.push_str(",\"width\":");
         out.push_str(&self.width.to_string());
+        out.push_str(",\"images\":[");
+        for (ii, ib) in images.iter().enumerate() {
+            if ii > 0 {
+                out.push(',');
+            }
+            push_image(&mut out, ib);
+        }
+        out.push(']');
         if let Some(t) = copied {
             out.push_str(",\"copied\":");
             json::push_str(&mut out, t);
@@ -377,6 +406,27 @@ fn caret_screen(maps: &[LineMap], caret: &Caret) -> (usize, usize) {
     (0, 0)
 }
 
+/// Serialize an image placeholder box for the webview: its grid position/size
+/// (`row`,`col`,`w`,`h` in cells), whether it's bordered, the relationship id to
+/// fetch the pixels with, and a text fallback label.
+fn push_image(out: &mut String, ib: &ImageBox) {
+    out.push_str("{\"rid\":");
+    json::push_str(out, &ib.rid);
+    out.push_str(",\"row\":");
+    out.push_str(&ib.row.to_string());
+    out.push_str(",\"col\":");
+    out.push_str(&ib.col.to_string());
+    out.push_str(",\"w\":");
+    out.push_str(&ib.cols.to_string());
+    out.push_str(",\"h\":");
+    out.push_str(&ib.rows.to_string());
+    out.push_str(",\"bordered\":");
+    out.push_str(if ib.bordered { "1" } else { "0" });
+    out.push_str(",\"label\":");
+    json::push_str(out, &ib.label);
+    out.push('}');
+}
+
 /// Map a rendered [`Color`] to a VS Code terminal ANSI palette name (the webview
 /// resolves it to `--vscode-terminal-ansi<Name>`, so colors honor the theme).
 fn color_name(c: Color) -> &'static str {
@@ -504,6 +554,16 @@ mod tests {
         let mut s2 = Session::open(&out).expect("reopen");
         s2.dispatch("replace\tzzz\tqqq");
         assert!(!s2.is_dirty(), "no-match replace should not dirty");
+    }
+
+    #[test]
+    fn view_exposes_images_array_and_media_is_safe() {
+        let bytes = sample_docx("no pictures here");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"images\":["), "images array missing: {v}");
+        // An unknown relationship id must resolve to nothing, not panic.
+        assert!(s.media("rIdNope").is_none());
     }
 
     #[test]

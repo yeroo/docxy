@@ -46,8 +46,10 @@ Development Host, and open any `.docx` file.
 ## What works
 
 - **Faithful rendering** — paragraphs, runs (bold / italic / underline / strike /
-  color), headings, lists, tables (with borders), and hyperlinks, laid out on a
-  character grid at the editor's text size, honoring the active color theme.
+  color), headings, lists, tables (with borders), hyperlinks, and **embedded
+  images** (PNG/JPEG/GIF/BMP/SVG painted over their placeholder boxes; vector
+  WMF/EMF fall back to a labeled box), laid out on a character grid at the
+  editor's text size, honoring the active color theme.
 - **Editing** — type, Enter/Backspace/Delete, arrow / word / document navigation,
   click to place the caret and drag to select, <kbd>Ctrl/Cmd</kbd>+
   <kbd>B</kbd>/<kbd>I</kbd>/<kbd>U</kbd> formatting, <kbd>Ctrl/Cmd</kbd>+

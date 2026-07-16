@@ -59,6 +59,7 @@ docx_alloc(len) -> ptr          docx_free(ptr, len)
 docx_open(ptr, len) -> handle   docx_close(handle)
 docx_render(handle) -> result
 docx_cmd(handle, ptr, len) -> result
+docx_media(handle, ptr, len) -> result   // raw bytes of the media for an rId
 docx_save(handle) -> result
 ```
 
@@ -113,16 +114,21 @@ lifecycle**. They talk over a small `postMessage` protocol:
 
 ## Status & next steps
 
-Working today: faithful rendering (runs, headings, lists, tables, links),
-editing (typing, navigation, selection, B/I/U, copy/cut/paste), a no-ribbon
-formatting toolbar + command palette (headings, lists, alignment, font size),
-**find** (VS Code's find widget over the rendered text) and **replace** (the
-engine's replace-all), and native dirty / undo-redo / save / Save As / backup
-with lossless round-trip.
+Working today: faithful rendering (runs, headings, lists, tables, links, and
+**embedded images**), editing (typing, navigation, selection, B/I/U,
+copy/cut/paste), a no-ribbon formatting toolbar + command palette (headings,
+lists, alignment, font size), **find** (VS Code's find widget over the rendered
+text) and **replace** (the engine's replace-all), and native dirty / undo-redo /
+save / Save As / backup with lossless round-trip.
+
+Images ride the same overlay idea the terminal app uses: `render_with_images`
+returns image **boxes** (grid position + size + relationship id) in the JSON
+view, and a `docx_media(rid)` ABI export returns the raw media bytes. The webview
+fetches each rid once, sniffs the format, and paints a data-URI `<img>` over the
+placeholder box (raster + SVG); vector WMF/EMF, which browsers can't decode, fall
+back to a labeled box — exactly the terminal app's fallback.
 
 Next, roughly in order:
 
-1. **Images** — the terminal app overlays real pixels on placeholder boxes; the
-   webview can render embedded media inline from the package's media parts.
-2. **Markdown ↔ docx** — surface `docxcore`'s conversion as an editor action.
-3. **Color / font pickers** over the `color` and `fontsize` bridge commands.
+1. **Markdown ↔ docx** — surface `docxcore`'s conversion as an editor action.
+2. **Color / font pickers** over the `color` and `fontsize` bridge commands.

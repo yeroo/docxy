@@ -49,6 +49,7 @@
 
   function openBytes(u8) {
     if (handle) ex.docx_close(handle);
+    mediaCache.clear();
     const p = writeBytes(u8);
     handle = ex.docx_open(p, u8.length);
     ex.docx_free(p, u8.length);
@@ -73,6 +74,66 @@
   }
   function saveBytes() {
     return readResult(ex.docx_save(handle));
+  }
+  function mediaBytes(rid) {
+    const u8 = enc.encode(rid);
+    const p = writeBytes(u8);
+    const r = ex.docx_media(handle, p, u8.length);
+    ex.docx_free(p, u8.length);
+    return readResult(r);
+  }
+
+  // ---- embedded images -----------------------------------------------------
+  const PAD_L = 12; // must match #doc padding-left
+  const PAD_T = 8; //  must match #doc padding-top
+  const mediaCache = new Map(); // rid -> data URI (or null if undecodable)
+
+  function sniffMime(b) {
+    if (b.length < 4) return null;
+    if (b[0] === 0x89 && b[1] === 0x50) return 'image/png';
+    if (b[0] === 0xff && b[1] === 0xd8) return 'image/jpeg';
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif';
+    if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
+    if (b[0] === 0x3c && b.length > 4) return 'image/svg+xml'; // '<'
+    return null; // WMF/EMF and friends: no browser support → fallback box
+  }
+  function loadMedia(rid) {
+    if (mediaCache.has(rid)) return mediaCache.get(rid);
+    const bytes = mediaBytes(rid);
+    const mime = bytes.length ? sniffMime(bytes) : null;
+    const uri = mime ? `data:${mime};base64,${bytesToBase64(bytes)}` : null;
+    mediaCache.set(rid, uri);
+    return uri;
+  }
+
+  let imgEls = [];
+  function paintImages() {
+    for (const el of imgEls) el.remove();
+    imgEls = [];
+    for (const box of lastView.images || []) {
+      const left = PAD_L + box.col * metrics.charW;
+      const top = PAD_T + box.row * metrics.lineH;
+      const w = box.w * metrics.charW;
+      const h = box.h * metrics.lineH;
+      const uri = box.rid ? loadMedia(box.rid) : null;
+      let el;
+      if (uri) {
+        el = document.createElement('img');
+        el.src = uri;
+        el.className = 'docimg';
+      } else {
+        el = document.createElement('div');
+        el.className = 'docimg fallback';
+        el.textContent = box.label || 'image';
+      }
+      if (box.bordered) el.classList.add('bordered');
+      el.style.left = left + 'px';
+      el.style.top = top + 'px';
+      el.style.width = w + 'px';
+      el.style.height = h + 'px';
+      docEl.appendChild(el);
+      imgEls.push(el);
+    }
   }
 
   // ---- painting ------------------------------------------------------------
@@ -105,7 +166,9 @@
       frag.appendChild(div);
     }
     docEl.replaceChildren(frag);
+    imgEls = []; // replaceChildren removed the old overlays
     placeCaret();
+    paintImages();
     updateStatus();
   }
 
