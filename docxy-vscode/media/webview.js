@@ -50,6 +50,12 @@
   function openBytes(u8) {
     if (handle) ex.docx_close(handle);
     mediaCache.clear();
+    if (u8.length === 0) {
+      handle = 0;
+      docEl.textContent =
+        'This file is empty. Reopen it and choose “Create” to start a new Word document.';
+      return;
+    }
     const p = writeBytes(u8);
     handle = ex.docx_open(p, u8.length);
     ex.docx_free(p, u8.length);

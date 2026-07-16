@@ -31,7 +31,9 @@ class DocxDocument implements vscode.CustomDocument {
 
   constructor(
     public readonly uri: vscode.Uri,
-    public readonly initialContent: Uint8Array,
+    /** Last-known serialized bytes; replaced when an empty file is seeded with
+     *  a fresh document. */
+    public initialContent: Uint8Array,
   ) {}
 
   dispose(): void {
@@ -229,6 +231,33 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     void vscode.window.showInformationMessage(`Docxy: exported ${basename(target)}`);
   }
 
+  /** Send the document bytes to the webview. A 0-byte file (e.g. created via
+   *  the explorer's "New File…") can't be parsed as OOXML, so offer to seed it
+   *  with a fresh empty Word document instead. */
+  private async openInWebview(
+    document: DocxDocument,
+    panel: vscode.WebviewPanel,
+  ): Promise<void> {
+    if (document.initialContent.length === 0) {
+      const pick = await vscode.window.showInformationMessage(
+        `“${basename(document.uri)}” is empty — it isn't a Word document yet. Create a new Word document in its place?`,
+        { modal: true },
+        'Create',
+      );
+      if (pick === 'Create') {
+        const bytes = await markdownToDocx(this.context, '');
+        if (document.uri.scheme !== 'untitled') {
+          await vscode.workspace.fs.writeFile(document.uri, bytes);
+        }
+        document.initialContent = bytes;
+      }
+    }
+    panel.webview.postMessage({
+      type: 'open',
+      data: Buffer.from(document.initialContent).toString('base64'),
+    });
+  }
+
   private onMessage(
     document: DocxDocument,
     panel: vscode.WebviewPanel,
@@ -237,10 +266,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     switch (msg?.type) {
       case 'ready':
         // Hand the webview the file bytes (base64) to open in wasm.
-        panel.webview.postMessage({
-          type: 'open',
-          data: Buffer.from(document.initialContent).toString('base64'),
-        });
+        void this.openInWebview(document, panel);
         break;
 
       case 'edit':

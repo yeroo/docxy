@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Opening an empty (0-byte) `.docx` — e.g. a file just created in the
+  explorer — now offers to create a new Word document in its place.
+
 ## 0.3.0
 
 Initial release of the Docxy VS Code extension — open and edit Word `.docx` in
