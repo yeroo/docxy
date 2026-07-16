@@ -1,0 +1,21 @@
+# Files kept OUT of the packaged .vsix. Everything not matched here ships.
+# (A .vscodeignore is required so vsce doesn't fall back to .gitignore, which
+#  excludes media/*.wasm — the wasm MUST be in the vsix.)
+
+# Source & build tooling (only the bundled out/ + media/ ship)
+src/**
+scripts/**
+tsconfig.json
+.gitignore
+.vscode/**
+.vscode-test/**
+
+# Dev artifacts
+node_modules/**
+**/*.map
+**/*.ts
+package-lock.json
+
+# Meta
+.github/**
+*.vsix

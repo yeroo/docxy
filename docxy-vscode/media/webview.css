@@ -1,0 +1,155 @@
+/* The document reads like text in the editor: the grid uses VS Code's own editor
+   font, size, and theme colors, so a .docx tab feels native rather than like an
+   embedded Word canvas. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  color: var(--vscode-editor-foreground);
+  background: var(--vscode-editor-background);
+}
+
+/* A slim, no-ribbon toolbar with just the essentials; everything here is also on
+   the command palette. */
+#toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 8px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-editorWidget-border, transparent);
+  user-select: none;
+}
+
+#toolbar button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 5px;
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#toolbar button.tb-b { font-weight: bold; }
+#toolbar button.tb-i { font-style: italic; }
+#toolbar button.tb-u { text-decoration: underline; }
+#toolbar button.tb-s { text-decoration: line-through; }
+#toolbar button:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+#toolbar button:active {
+  background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.3));
+}
+#toolbar .tb-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 5px;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35));
+}
+
+#doc {
+  position: relative;
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 12px 32px;
+  outline: none;
+  cursor: text;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: var(--vscode-editor-font-size, 13px);
+  font-weight: var(--vscode-editor-font-weight, normal);
+  line-height: 1.4;
+  white-space: pre;
+  tab-size: 4;
+}
+
+.line {
+  white-space: pre;
+  min-height: 1em;
+}
+
+/* Run styles — mapped from the rendered spans. */
+.b { font-weight: bold; }
+.i { font-style: italic; }
+.u { text-decoration: underline; }
+.st { text-decoration: line-through; }
+.u.st { text-decoration: underline line-through; }
+.dim { opacity: 0.6; }
+
+.sel {
+  background: var(--vscode-editor-selectionBackground);
+  color: var(--vscode-editor-selectionForeground, inherit);
+}
+
+.link {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* Embedded images are painted over their placeholder boxes (blank grid lines),
+   positioned by the same col×charWidth / line×lineHeight math. */
+.docimg {
+  position: absolute;
+  object-fit: contain;
+  pointer-events: none; /* clicks/drag-select pass through to the grid */
+}
+.docimg.bordered {
+  border: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.5));
+  box-sizing: border-box;
+}
+.docimg.fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  font-family: var(--vscode-font-family);
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background);
+  border: 1px dashed var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.5));
+  box-sizing: border-box;
+}
+
+/* The caret is an absolutely-positioned bar; grid math (col × charWidth,
+   line × lineHeight) places it because the font is monospace. */
+#caret {
+  position: absolute;
+  left: 12px; /* matches #doc padding-left */
+  top: 8px; /* matches #doc padding-top */
+  width: 2px;
+  background: var(--vscode-editorCursor-foreground, var(--vscode-editor-foreground));
+  pointer-events: none;
+  animation: docxy-blink 1s step-end infinite;
+}
+
+@keyframes docxy-blink {
+  50% { opacity: 0; }
+}
+
+#status {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  padding: 2px 12px;
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-top: 1px solid var(--vscode-editorWidget-border, transparent);
+  text-align: right;
+  pointer-events: none;
+}

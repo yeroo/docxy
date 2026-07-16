@@ -96,6 +96,42 @@ jobs:
           generate_release_notes: true
           files: dist/*
 
+  vsix:
+    name: package VS Code extension
+    permissions:
+      contents: write # attach the .vsix to the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build the .vsix
+        working-directory: docxy-vscode
+        # `vsce package` runs the vscode:prepublish script, which builds the
+        # docxwasm wasm (cargo) and bundles the extension before packaging.
+        run: |
+          npm ci
+          npx --yes @vscode/vsce@latest package --no-dependencies
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docxy-vscode-vsix
+          path: docxy-vscode/*.vsix
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: docxy-vscode/*.vsix
+
   publish:
     name: publish to crates.io
     needs: build
