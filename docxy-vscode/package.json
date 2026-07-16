@@ -58,6 +58,7 @@
     ]
   },
   "scripts": {
+    "vscode:prepublish": "npm run build",
     "build:wasm": "cargo build -p docxwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
     "build": "npm run build:wasm && npm run build:ext",
