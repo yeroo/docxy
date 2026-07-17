@@ -2,9 +2,9 @@
 //! sync handle, where the three panes (folders/list/reading) currently
 //! point, and the triage actions (`m`/`u`/`f`/`d`/`v`) that mutate them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use mailcore::graph::model::Body;
+use mailcore::graph::model::{AttachmentMeta, Body};
 use mailcore::store::{FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncHandle, SyncState};
 
@@ -52,6 +52,24 @@ pub struct App {
     pub quit: bool,
     /// The open move-folder popup (`v`), if any — see `open_move_picker`.
     pub move_picker: Option<MovePicker>,
+    /// The in-progress/submitted search prompt (`/`), if any — see
+    /// `start_search`. `None` is the normal folder view; `visible_messages`
+    /// is the one seam that reads through either state.
+    pub search: Option<SearchState>,
+    /// The open attachments popup (`a`), if any — see `open_attachments_popup`.
+    pub attachments: Option<AttachmentsPopup>,
+    /// The last attachment save/open outcome (e.g. "Saved: C:\...\f.txt"),
+    /// for the status bar to show. `None` until the first save completes.
+    pub attachment_notice: Option<String>,
+    /// Set by `save_and_open_attachment` (`o`) so that once the matching
+    /// `SyncEvent::AttachmentSaved` lands, `finish_attachment_save` opens the
+    /// file with the OS handler instead of only reporting the saved path.
+    open_after_save: bool,
+    /// Test-only: counts calls to the OS-open seam (`open_with_os_handler`),
+    /// which is a no-op under `cfg(test)` — see that function's doc comment.
+    /// `None` for a production `App`.
+    #[cfg(test)]
+    pub open_invocations: std::cell::Cell<u32>,
     /// Test-only: sees every `SyncCommand` this `App` has sent, so tests can
     /// assert on it (see `last_sent_command_is_mark_read`). `None` for a
     /// production `App`; `for_test_with_seeded_store`/`for_test_with_empty_store`
@@ -71,9 +89,29 @@ pub struct MovePicker {
     pub message_id: String,
 }
 
+/// State for the search prompt opened by `/`: the in-progress query text,
+/// and the results of the last `submit_search` (`None` until the first
+/// Enter — the prompt can be open with nothing searched yet).
+pub struct SearchState {
+    pub query: String,
+    pub results: Option<Vec<MessageRow>>,
+}
+
+/// State for the attachments popup opened by `a`: the message it lists
+/// attachments for, the attachment metadata (`Store::attachments`), and
+/// which one is highlighted — same captured-up-front shape as `MovePicker`.
+pub struct AttachmentsPopup {
+    pub message_id: String,
+    pub items: Vec<AttachmentMeta>,
+    pub index: usize,
+}
+
 /// How many messages `reload_messages` pulls per folder. Paging further back
 /// is a later task's concern; this is enough to fill a screen many times over.
 const MESSAGE_PAGE_SIZE: i64 = 200;
+/// How many results `submit_search` pulls from the FTS index — generous
+/// enough to cover realistic queries without an unbounded scan.
+const SEARCH_PAGE_SIZE: i64 = 200;
 
 impl App {
     pub fn new(store: Store, sync: SyncHandle) -> App {
@@ -92,6 +130,12 @@ impl App {
             status: SyncState::Idle,
             quit: false,
             move_picker: None,
+            search: None,
+            attachments: None,
+            attachment_notice: None,
+            open_after_save: false,
+            #[cfg(test)]
+            open_invocations: std::cell::Cell::new(0),
             #[cfg(test)]
             test_cmd_rx: None,
         };
@@ -178,10 +222,12 @@ impl App {
     /// Dispatches a single-character triage key against the message
     /// currently highlighted in the list pane (`messages[msg_index]`):
     /// `m`/`u` mark read/unread, `f` toggles the flag, `d` deletes. `v`
-    /// (move) is handled separately by `open_move_picker`, since it needs a
-    /// folder choice before anything can be sent. Unrecognized characters
-    /// are ignored. Called from `ui::handle_key` for every `KeyCode::Char`
-    /// not already claimed by pane navigation.
+    /// (move) and `a` (attachments) are handled separately by
+    /// `open_move_picker`/`open_attachments_popup`, since they need a
+    /// picker/popup opened before anything can be sent. `/` opens the search
+    /// prompt (`start_search`). Unrecognized characters are ignored. Called
+    /// from `ui::handle_key` for every `KeyCode::Char` not already claimed by
+    /// pane navigation or an open popup/prompt.
     pub fn on_key_char(&mut self, c: char) {
         match c {
             'm' => self.mark_read(true),
@@ -189,6 +235,8 @@ impl App {
             'f' => self.toggle_flag(),
             'd' => self.delete_selected(),
             'v' => self.open_move_picker(),
+            'a' => self.open_attachments_popup(),
+            '/' => self.start_search(),
             _ => {}
         }
     }
@@ -300,6 +348,212 @@ impl App {
                 dest,
             });
         }
+    }
+
+    // --- Search -------------------------------------------------------
+
+    /// `/`: opens the search prompt with an empty query and no results yet.
+    /// Resets `msg_index` to 0 so the eventual results list starts at the
+    /// top rather than wherever the folder view's selection happened to be.
+    pub fn start_search(&mut self) {
+        self.search = Some(SearchState {
+            query: String::new(),
+            results: None,
+        });
+        self.msg_index = 0;
+    }
+
+    /// Appends `s` to the in-progress query; a no-op if the prompt isn't
+    /// open. Used both directly (typing a whole query in one call, as the
+    /// `search_prompt_filters_results` test does) and, one character at a
+    /// time, by `ui::handle_key` while the prompt has focus.
+    pub fn type_query(&mut self, s: &str) {
+        if let Some(search) = &mut self.search {
+            search.query.push_str(s);
+        }
+    }
+
+    /// Removes the last character of the in-progress query, if any. A no-op
+    /// if the prompt isn't open or the query is already empty.
+    pub fn backspace_query(&mut self) {
+        if let Some(search) = &mut self.search {
+            search.query.pop();
+        }
+    }
+
+    /// Enter: runs the in-progress query against the store's FTS index
+    /// (`Store::search`, capped at `SEARCH_PAGE_SIZE`) and stores the
+    /// results as a virtual message list; `msg_index` is clamped in case a
+    /// previous result set (or the folder view) was longer. A no-op if the
+    /// prompt isn't open.
+    pub fn submit_search(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let results = self.store.search(&query, SEARCH_PAGE_SIZE).unwrap_or_default();
+        if let Some(search) = &mut self.search {
+            search.results = Some(results);
+        }
+        let len = self.visible_messages().len();
+        if self.msg_index >= len {
+            self.msg_index = len.saturating_sub(1);
+        }
+    }
+
+    /// Moves the selection within whatever `visible_messages` currently
+    /// shows, wrapping — the search-mode equivalent of `ui::move_selection`'s
+    /// `Pane::List` branch (kept as its own copy for the same reason
+    /// `move_picker_select` is: `ui::wrapped` is private to the `ui` module).
+    pub fn move_search_selection(&mut self, delta: isize) {
+        let len = self.visible_messages().len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        self.msg_index = (((self.msg_index as isize + delta) % len + len) % len) as usize;
+    }
+
+    /// Esc: closes the search prompt/results and returns to the normal
+    /// folder view (`visible_messages` falls back to `messages` once
+    /// `search` is `None`). Clamps `msg_index` in case the folder view's
+    /// message list is shorter than wherever the virtual list had it.
+    pub fn cancel_search(&mut self) {
+        self.search = None;
+        if self.msg_index >= self.messages.len() {
+            self.msg_index = self.messages.len().saturating_sub(1);
+        }
+    }
+
+    /// The messages the list pane should currently render and navigate:
+    /// the search results once a query has been submitted, otherwise the
+    /// selected folder's messages.
+    pub fn visible_messages(&self) -> &[MessageRow] {
+        match self.search.as_ref().and_then(|s| s.results.as_ref()) {
+            Some(r) => r,
+            None => &self.messages,
+        }
+    }
+
+    /// `visible_messages().len()` — how many rows the list pane currently
+    /// shows, whichever source they came from.
+    pub fn visible_message_count(&self) -> usize {
+        self.visible_messages().len()
+    }
+
+    // --- Attachments ----------------------------------------------------
+
+    /// `a`: opens the attachments popup over the highlighted message,
+    /// listing `store.attachments(id)`. A no-op if nothing is highlighted,
+    /// or the message has no stored attachments — same "don't open a popup
+    /// that can't work" pattern as `open_move_picker`.
+    pub fn open_attachments_popup(&mut self) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        let items = self.store.attachments(&id).unwrap_or_default();
+        if items.is_empty() {
+            return;
+        }
+        self.attachments = Some(AttachmentsPopup {
+            message_id: id,
+            items,
+            index: 0,
+        });
+    }
+
+    /// Moves the popup's highlighted attachment by `delta`, wrapping — same
+    /// shape as `move_picker_select`. A no-op if the popup isn't open.
+    pub fn attachments_select(&mut self, delta: isize) {
+        if let Some(popup) = &mut self.attachments {
+            let len = popup.items.len();
+            if len == 0 {
+                return;
+            }
+            let len = len as isize;
+            popup.index = (((popup.index as isize + delta) % len + len) % len) as usize;
+        }
+    }
+
+    /// Esc: closes the popup without saving anything.
+    pub fn cancel_attachments_popup(&mut self) {
+        self.attachments = None;
+    }
+
+    /// Enter: saves the highlighted attachment's bytes to the Downloads
+    /// directory. A no-op if the popup isn't open or has no highlighted row.
+    pub fn save_attachment(&mut self) {
+        self.send_save_attachment_command(false);
+    }
+
+    /// `o`: same save, but also opens the file with the OS handler once the
+    /// save completes — see `finish_attachment_save`, which
+    /// `main::drain_events` calls when `SyncEvent::AttachmentSaved` lands.
+    pub fn save_and_open_attachment(&mut self) {
+        self.send_save_attachment_command(true);
+    }
+
+    /// Resolves the highlighted attachment's destination path (Downloads
+    /// dir + a sanitized filename) and fires `SyncCommand::SaveAttachment`;
+    /// records whether the file should be opened once it lands.
+    fn send_save_attachment_command(&mut self, open_after: bool) {
+        let Some(popup) = &self.attachments else {
+            return;
+        };
+        let Some(att) = popup.items.get(popup.index) else {
+            return;
+        };
+        let message_id = popup.message_id.clone();
+        let attachment_id = att.id.clone();
+        let dest = downloads_dir().join(sanitize_filename(&att.name));
+        self.open_after_save = open_after;
+        let _ = self.sync.cmd_tx.send(SyncCommand::SaveAttachment {
+            message_id,
+            attachment_id,
+            dest,
+        });
+    }
+
+    /// Called from `main::drain_events` when `SyncEvent::AttachmentSaved`
+    /// lands: opens the file with the OS handler if this save was triggered
+    /// by `o` (`save_and_open_attachment`), records a status notice either
+    /// way, and closes the popup.
+    pub fn finish_attachment_save(&mut self, path: PathBuf) {
+        if self.open_after_save {
+            self.open_after_save = false;
+            self.open_with_os_handler(&path);
+        }
+        self.attachment_notice = Some(format!("Saved: {}", path.display()));
+        self.attachments = None;
+    }
+
+    /// Shells out to the OS's "open" handler for `path` (`cmd /c start` on
+    /// Windows, `open` on macOS, `xdg-open` elsewhere), fire-and-forget.
+    /// Compiled out under `cfg(test)` in favor of a counter
+    /// (`open_invocations`) — so a test exercising `o` can assert the seam
+    /// was reached without ever launching a real OS handler.
+    #[cfg(not(test))]
+    fn open_with_os_handler(&self, path: &Path) {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(path)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let _ = std::process::Command::new(opener).arg(path).spawn();
+        }
+    }
+
+    #[cfg(test)]
+    fn open_with_os_handler(&self, _path: &Path) {
+        self.open_invocations.set(self.open_invocations.get() + 1);
     }
 
     /// Test-only: drains `test_cmd_rx` and reports whether the last command
@@ -423,6 +677,47 @@ pub fn store_path_for(account: &str) -> PathBuf {
     lookxy_dir().join(sanitized).join("mail.db")
 }
 
+/// The OS "Downloads" directory attachments are saved into:
+/// `%USERPROFILE%\Downloads` on Windows, `$HOME/Downloads` elsewhere.
+pub fn downloads_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(base) = std::env::var("USERPROFILE") {
+            return PathBuf::from(base).join("Downloads");
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join("Downloads")
+}
+
+/// Sanitizes an attachment's `name` so it's safe to use as a single path
+/// component under `downloads_dir()`: path separators (`/`, `\`), drive/ADS
+/// colons, and control characters become `_`, and any `..` (which would
+/// otherwise still read as a parent-directory reference even with
+/// separators stripped, e.g. on a `..` bare component) is neutralized too.
+/// Falls back to a fixed name if nothing usable is left, so a malicious or
+/// empty attachment name can never escape Downloads or produce a path
+/// `std::fs::write` would choke on.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.replace("..", "__");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +790,174 @@ mod tests {
 
         assert!(!app.body_loading);
         assert!(app.body.is_none());
+    }
+
+    #[test]
+    fn sanitize_filename_strips_separators_and_traversal() {
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+        assert_eq!(sanitize_filename("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(sanitize_filename("a\\b/c"), "a_b_c");
+        assert_eq!(sanitize_filename("C:\\evil"), "C__evil");
+        assert_eq!(sanitize_filename(""), "attachment");
+        assert_eq!(sanitize_filename("   "), "attachment");
+    }
+
+    #[test]
+    fn downloads_dir_ends_with_downloads() {
+        let d = downloads_dir();
+        assert_eq!(d.file_name().unwrap(), "Downloads");
+    }
+
+    #[test]
+    fn opening_attachments_popup_lists_stored_attachments() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "notes.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 12,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+
+        app.open_attachments_popup();
+
+        let popup = app.attachments.as_ref().expect("popup open");
+        assert_eq!(popup.message_id, "m1");
+        assert_eq!(popup.items.len(), 1);
+        assert_eq!(popup.items[0].name, "notes.txt");
+    }
+
+    #[test]
+    fn attachments_popup_does_not_open_with_no_attachments() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_attachments_popup();
+        assert!(app.attachments.is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_attachments_popup() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "notes.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 12,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        app.open_attachments_popup();
+        assert!(app.attachments.is_some());
+
+        app.cancel_attachments_popup();
+
+        assert!(app.attachments.is_none());
+    }
+
+    #[test]
+    fn enter_saves_the_highlighted_attachment_via_sync_command() {
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "notes.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 12,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+        app.open_attachments_popup();
+
+        app.save_attachment();
+
+        match cmd_rx.try_recv() {
+            Ok(SyncCommand::SaveAttachment {
+                message_id,
+                attachment_id,
+                dest,
+            }) => {
+                assert_eq!(message_id, "m1");
+                assert_eq!(attachment_id, "a1");
+                assert_eq!(dest.file_name().unwrap(), "notes.txt");
+                assert!(dest.starts_with(downloads_dir()));
+            }
+            other => panic!("expected a SaveAttachment command, got {other:?}"),
+        }
+        // `save_attachment` (Enter, not `o`) must not schedule an open once
+        // the save completes.
+        assert!(!app.open_after_save);
+    }
+
+    #[test]
+    fn o_marks_the_save_to_open_once_it_completes() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "notes.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 12,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        app.open_attachments_popup();
+
+        app.save_and_open_attachment();
+        assert!(app.open_after_save);
+
+        // Once the sync engine reports the save, `finish_attachment_save`
+        // must reach the (test-mode, no-op) OS-open seam exactly once — and
+        // never a real process, since that would hang/pop up in CI.
+        let dest = std::path::PathBuf::from("C:/tmp/notes.txt");
+        app.finish_attachment_save(dest.clone());
+
+        assert!(!app.open_after_save);
+        assert!(app.attachments.is_none());
+        assert_eq!(app.open_invocations.get(), 1);
+        assert_eq!(
+            app.attachment_notice.as_deref(),
+            Some(format!("Saved: {}", dest.display()).as_str())
+        );
+    }
+
+    #[test]
+    fn enter_save_does_not_invoke_the_os_open_seam() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "notes.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 12,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        app.open_attachments_popup();
+
+        app.save_attachment();
+        app.finish_attachment_save(std::path::PathBuf::from("C:/tmp/notes.txt"));
+
+        assert_eq!(app.open_invocations.get(), 0);
     }
 }

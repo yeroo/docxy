@@ -47,6 +47,16 @@ pub enum SyncCommand {
     Delete { id: String },
     /// Fetch and store a message body, then emit [`SyncEvent::BodyReady`].
     FetchBody { id: String },
+    /// Fetch an attachment's bytes (`GraphClient::get_attachment_bytes`) and
+    /// write them to `dest`, then emit [`SyncEvent::AttachmentSaved`]. `dest`
+    /// is a full file path (the UI has already resolved the Downloads
+    /// directory and sanitized the attachment's name into a single path
+    /// component) — the engine only writes to it, it doesn't derive it.
+    SaveAttachment {
+        message_id: String,
+        attachment_id: String,
+        dest: PathBuf,
+    },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -70,6 +80,9 @@ pub enum SyncEvent {
     MessagesUpdated { folder_id: String },
     /// A message body was fetched and stored; re-read `Store::get_body`.
     BodyReady { id: String },
+    /// An attachment's bytes were fetched and written to `path` (the `dest`
+    /// from the triggering [`SyncCommand::SaveAttachment`]).
+    AttachmentSaved { path: PathBuf },
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -315,6 +328,11 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::Delete { id });
             }
             SyncCommand::FetchBody { id } => self.fetch_body(&id),
+            SyncCommand::SaveAttachment {
+                message_id,
+                attachment_id,
+                dest,
+            } => self.save_attachment(&message_id, &attachment_id, dest),
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -553,6 +571,41 @@ impl Engine {
             Ok(body) => {
                 let _ = self.store.put_body(id, &body);
                 self.emit(SyncEvent::BodyReady { id: id.to_string() });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch one attachment's bytes and write them to `dest`, then emit
+    /// `SyncEvent::AttachmentSaved` — or `SyncEvent::Error` on either a
+    /// Graph failure (via `react`, so auth/throttle/transport get the same
+    /// central handling as every other Graph call) or a filesystem failure
+    /// writing `dest`. Same signed-in guard as `fetch_body`.
+    fn save_attachment(&mut self, message_id: &str, attachment_id: &str, dest: PathBuf) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_attachment_bytes(message_id, attachment_id)) {
+            Ok(bytes) => {
+                if let Some(parent) = dest.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        self.emit(SyncEvent::Error(format!(
+                            "failed to create {}: {e}",
+                            parent.display()
+                        )));
+                        return;
+                    }
+                }
+                match std::fs::write(&dest, &bytes) {
+                    Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
+                    Err(e) => self.emit(SyncEvent::Error(format!(
+                        "failed to save attachment to {}: {e}",
+                        dest.display()
+                    ))),
+                }
             }
             Err(e) => {
                 self.react(e);
@@ -1359,6 +1412,69 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_attachment_writes_bytes_and_emits_saved_path() {
+        // "aGVsbG8=" is the base64 Graph would send for a `fileAttachment`
+        // whose bytes are "hello" (same fixture `GraphClient`'s own
+        // `get_attachment_bytes_decodes_base64` test uses).
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1/attachments/A1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"A1","contentBytes":"aGVsbG8="}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("save-attachment");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let dest = dir.join("downloads").join("f.txt");
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Let the backfill land first so M1 exists locally (not strictly
+        // required for the Graph fetch itself, but keeps the fixture
+        // realistic and lets us wait on a well-defined signal first).
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+        });
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveAttachment {
+                message_id: "M1".into(),
+                attachment_id: "A1".into(),
+                dest: dest.clone(),
+            })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::AttachmentSaved { .. })
+        });
+        assert!(events.iter().any(
+            |e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest)
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

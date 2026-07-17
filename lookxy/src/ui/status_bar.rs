@@ -1,6 +1,7 @@
-//! The bottom, single-row status bar: sync state and folder/message counts.
-//! A simple line for now — Task 17 enriches it (account, richer sync
-//! progress) once sign-in is wired up.
+//! The bottom, single-row status bar: sync state, folder/message counts,
+//! and the last attachment save/open notice. A simple line for now —
+//! Task 17 enriches it (account, richer sync progress) once sign-in is
+//! wired up.
 
 use crate::app::App;
 
@@ -25,11 +26,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .and_then(|id| app.folders.iter().find(|f| &f.id == id))
         .map(|f| f.display_name.as_str())
         .unwrap_or("(no folder)");
-    let line = format!(
+    // `visible_message_count` (not `app.messages.len()`) so the count
+    // reflects the search results while a query is active, not the
+    // underlying folder's real size.
+    let mut line = format!(
         "{status} — {folder} — {} folder(s), {} message(s)",
         app.folders.len(),
-        app.messages.len()
+        app.visible_message_count()
     );
+    if let Some(notice) = &app.attachment_notice {
+        line.push_str(" — ");
+        line.push_str(notice);
+    }
     f.render_widget(
         Paragraph::new(line).style(Style::new().fg(Color::White).bg(Color::DarkGray)),
         area,

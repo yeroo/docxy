@@ -4,20 +4,37 @@
 //! messages render bold.
 
 use crate::app::{App, Pane};
-use crate::ui::{border_style, truncate_width};
+use crate::ui::{border_style, centered_rect, truncate_width};
 
 use mailcore::store::MessageRow;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Pane::List;
+    draw_list(f, area, "Messages", focused, &app.messages, app.msg_index);
+}
+
+/// Renders a titled, bordered list of `messages` with `selected` highlighted
+/// — the row widget shared by the normal folder-view message list
+/// (`draw`, above) and the search-results view (`ui::search::draw`), so a
+/// message row looks and behaves identically in both places. Bounds-safe:
+/// `selected` is clamped into range (or left unselected on an empty list)
+/// rather than indexed directly, so `ListState::select` can never panic.
+pub(crate) fn draw_list(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    messages: &[MessageRow],
+    selected: usize,
+) {
     let block = Block::default()
-        .title("Messages")
+        .title(title.to_string())
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
@@ -25,8 +42,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // out, so long senders/subjects truncate instead of wrapping/overrunning.
     let inner_width = area.width.saturating_sub(2) as usize;
 
-    let items: Vec<ListItem> = app
-        .messages
+    let items: Vec<ListItem> = messages
         .iter()
         .map(|m| ListItem::new(line(m, inner_width)))
         .collect();
@@ -35,8 +51,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
 
     let mut state = ListState::default();
-    if !app.messages.is_empty() {
-        state.select(Some(app.msg_index));
+    if !messages.is_empty() {
+        state.select(Some(selected.min(messages.len() - 1)));
     }
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -93,26 +109,6 @@ pub fn draw_move_picker(f: &mut Frame, app: &App) {
         state.select(Some(picker.index));
     }
     f.render_stateful_widget(list, area, &mut state);
-}
-
-/// A `percent_x` × `percent_y` rectangle centered within `r`.
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
 }
 
 /// Shortens an ISO-8601 `receivedDateTime` (`2026-07-16T10:00:00Z`) down to

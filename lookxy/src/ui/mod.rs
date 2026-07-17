@@ -4,20 +4,25 @@
 //! `App` state changes. All panes render from `App`'s cached
 //! `folders`/`messages` (see `app.rs`) — never by querying the store mid-draw.
 
+mod attachments;
 mod folders;
 mod message_list;
 mod reading;
+mod search;
 mod status_bar;
 
 use crate::app::{App, Pane};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 
 /// Renders the whole screen: folders (~22%) | message list (~38%) | reading
-/// pane (~40%) on top, a 1-row status bar pinned to the bottom.
+/// pane (~40%) on top, a 1-row status bar pinned to the bottom. While the
+/// search prompt (`/`) is open, `search::draw` takes over the message-list
+/// column instead of `message_list::draw` — same column, a virtual list of
+/// results instead of the selected folder's messages.
 pub fn draw(f: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -34,25 +39,40 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(rows[0]);
 
     folders::draw(f, app, cols[0]);
-    message_list::draw(f, app, cols[1]);
+    if app.search.is_some() {
+        search::draw(f, app, cols[1]);
+    } else {
+        message_list::draw(f, app, cols[1]);
+    }
     reading::draw(f, app, cols[2]);
     status_bar::draw(f, app, rows[1]);
 
-    // Drawn last (and over the full frame, not just the list column) so the
-    // move-folder popup (`v`) sits on top of everything else.
+    // Drawn last (and over the full frame, not just the list column) so
+    // popups sit on top of everything else.
     message_list::draw_move_picker(f, app);
+    attachments::draw(f, app);
 }
 
 /// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k),
 /// opens/activates the current selection (Enter), or — while the move-folder
-/// popup (`v`) is open — routes to its own key handling instead. The sole
-/// place keyboard input turns into `App` state changes; `main`'s event loop
-/// routes non-global keys (everything but `q`/Ctrl-C) here. Triage keys
-/// (`m`/`u`/`f`/`d`/`v`) fall through to `App::on_key_char`/`Del` to
+/// popup (`v`), the attachments popup (`a`), or the search prompt (`/`) is
+/// open — routes to that one's own key handling instead (checked in that
+/// order; only one can be open at a time in practice). The sole place
+/// keyboard input turns into `App` state changes; `main`'s event loop routes
+/// non-global keys (everything but `q`/Ctrl-C) here. Triage keys
+/// (`m`/`u`/`f`/`d`/`v`/`a`/`/`) fall through to `App::on_key_char`/`Del` to
 /// `App::delete_selected` — see `app.rs` for what each one does.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.move_picker.is_some() {
         handle_move_picker_key(app, key);
+        return;
+    }
+    if app.attachments.is_some() {
+        handle_attachments_key(app, key);
+        return;
+    }
+    if app.search.is_some() {
+        handle_search_key(app, key);
         return;
     }
     match key.code {
@@ -75,6 +95,38 @@ fn handle_move_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => app.move_picker_select(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_picker_select(1),
         KeyCode::Enter => app.confirm_move(),
+        _ => {}
+    }
+}
+
+/// Keys while the attachments popup is open: ↑/↓/j/k pick an attachment,
+/// Enter saves it to Downloads, `o` saves then opens it, Esc closes the
+/// popup without saving anything.
+fn handle_attachments_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_attachments_popup(),
+        KeyCode::Up | KeyCode::Char('k') => app.attachments_select(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.attachments_select(1),
+        KeyCode::Enter => app.save_attachment(),
+        KeyCode::Char('o') => app.save_and_open_attachment(),
+        _ => {}
+    }
+}
+
+/// Keys while the search prompt is open. Every printable character types
+/// into the query (so a query containing `j`/`k` still works — unlike the
+/// move/attachments popups, this one can't reserve those letters for
+/// navigation); ↑/↓ move the selection within the results instead. Enter
+/// (re-)runs the search, Backspace edits the query, Esc closes the prompt
+/// and restores the normal folder view.
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_search(),
+        KeyCode::Enter => app.submit_search(),
+        KeyCode::Backspace => app.backspace_query(),
+        KeyCode::Up => app.move_search_selection(-1),
+        KeyCode::Down => app.move_search_selection(1),
+        KeyCode::Char(c) => app.type_query(&c.to_string()),
         _ => {}
     }
 }
@@ -144,6 +196,28 @@ pub(crate) fn border_style(focused: bool) -> Style {
     } else {
         Style::new().fg(Color::DarkGray)
     }
+}
+
+/// A `percent_x` × `percent_y` rectangle centered within `r` — the overlay
+/// placement shared by every popup (`message_list::draw_move_picker`,
+/// `attachments::draw`).
+pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 /// Truncates `s` to at most `w` display columns (wide CJK/emoji glyphs count
@@ -414,6 +488,75 @@ mod tests {
     }
 
     #[test]
+    fn slash_opens_search_and_letters_type_into_the_query_not_navigation() {
+        // 'j'/'k' navigate the list pane normally, but inside the search
+        // prompt they must be ordinary query characters — otherwise no one
+        // could ever search for a word containing either letter.
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')));
+        assert!(app.search.is_some());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.search.as_ref().unwrap().query, "jk");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.search.as_ref().unwrap().query, "j");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn search_enter_runs_the_query_and_esc_restores_the_folder_view() {
+        let mut app = App::for_test_with_seeded_store();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')));
+        for c in "Hello".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(app.visible_message_count(), 1);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.search.is_none());
+        assert_eq!(app.visible_message_count(), app.messages.len());
+    }
+
+    #[test]
+    fn attachments_popup_enter_sends_save_attachment_and_esc_closes_it() {
+        use mailcore::graph::model::AttachmentMeta;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "f.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 5,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.attachments.is_some());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(last, Ok(SyncCommand::SaveAttachment { .. })));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.attachments.is_none());
+    }
+
+    #[test]
     fn empty_store_renders_and_handles_keys_without_panicking() {
         let mut app = App::for_test_with_empty_store();
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -422,8 +565,11 @@ mod tests {
         // Drive every navigation and triage key, through every pane (Tab
         // cycles focus in between), with nothing to select. None of this
         // should panic, and nothing should get selected out of thin air —
-        // including `v`, which must not open a popup with no message and no
-        // folders to populate it from.
+        // including `v` and `a`, which must not open a popup with no
+        // message (and, for `v`, no folders) to populate it from. `/` DOES
+        // open on an empty store (there's nothing wrong with searching an
+        // empty mailbox), so its Enter/Esc are driven too, over an empty
+        // results list.
         let keys = [
             KeyCode::Down,
             KeyCode::Up,
@@ -443,6 +589,15 @@ mod tests {
             KeyCode::Delete,
             KeyCode::Char('v'),
             KeyCode::Esc,
+            KeyCode::Char('a'),
+            KeyCode::Esc,
+            KeyCode::Char('/'),
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Esc,
         ];
         for code in keys {
             handle_key(&mut app, KeyEvent::from(code));
@@ -451,6 +606,8 @@ mod tests {
 
         assert!(app.selected_folder.is_none());
         assert!(app.selected_msg.is_none());
+        assert!(app.attachments.is_none());
+        assert!(app.search.is_none());
         assert_eq!(app.folder_index, 0);
         assert_eq!(app.msg_index, 0);
     }
