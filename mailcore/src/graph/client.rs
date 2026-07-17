@@ -90,14 +90,52 @@ impl GraphClient {
         }
     }
 
-    /// GET `/me/mailFolders?$top=100` — the top-level mail folders. (Child
-    /// folders live under `/childFolders` per parent and are out of scope
-    /// for this pass; see the task brief.)
+    /// GET `/me/mailFolders?$top=100` — the top-level mail folders — then
+    /// recursively GET each folder's `/childFolders?$top=100`, flattening
+    /// the whole tree into one `Vec` (each folder's `parent_id`, parsed from
+    /// Graph's `parentFolderId`, is enough for callers to reconstruct the
+    /// hierarchy later). A `visited` guard skips any folder id already
+    /// collected, so a server that (erroneously, or via test-double route
+    /// reuse) reports a folder as its own descendant can't recurse forever.
     pub fn list_folders(&self) -> Result<Vec<MailFolder>, GraphError> {
         let resp = self.send(Method::Get, "/me/mailFolders?$top=100", None, &[])?;
         let v = parse_body(resp)?;
         let items = value_array(&v, "value")?;
-        Ok(items.iter().filter_map(MailFolder::from_json).collect())
+        let top: Vec<MailFolder> = items.iter().filter_map(MailFolder::from_json).collect();
+
+        let mut all = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        for folder in top {
+            self.collect_folder_and_children(folder, &mut all, &mut visited)?;
+        }
+        Ok(all)
+    }
+
+    /// Pushes `folder` onto `out`, then fetches and recurses into its
+    /// `/childFolders`. See `list_folders` for the `visited` cycle guard.
+    fn collect_folder_and_children(
+        &self,
+        folder: MailFolder,
+        out: &mut Vec<MailFolder>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<(), GraphError> {
+        if !visited.insert(folder.id.clone()) {
+            return Ok(());
+        }
+        let path = format!(
+            "/me/mailFolders/{}/childFolders?$top=100",
+            encode_path_segment(&folder.id)
+        );
+        out.push(folder);
+
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?;
+        let children: Vec<MailFolder> = items.iter().filter_map(MailFolder::from_json).collect();
+        for child in children {
+            self.collect_folder_and_children(child, out, visited)?;
+        }
+        Ok(())
     }
 
     /// GET a folder's `/messages/delta` (first call, `DeltaCursor::Folder`)
@@ -106,6 +144,7 @@ impl GraphClient {
     pub fn delta(&self, cursor: DeltaCursor) -> Result<DeltaPage, GraphError> {
         let target = match cursor {
             DeltaCursor::Folder(folder_id) => {
+                let folder_id = encode_path_segment(&folder_id);
                 format!("/me/mailFolders/{folder_id}/messages/delta?$select={MESSAGE_SELECT}")
             }
             DeltaCursor::Link(url) => url,
@@ -125,6 +164,7 @@ impl GraphClient {
     /// `Prefer: outlook.body-content-type="text"`; otherwise Graph returns
     /// its native HTML.
     pub fn get_body(&self, message_id: &str, prefer_text: bool) -> Result<Body, GraphError> {
+        let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select=body");
         let headers: &[(&str, &str)] = if prefer_text {
             &[("Prefer", "outlook.body-content-type=\"text\"")]
@@ -141,6 +181,7 @@ impl GraphClient {
 
     /// GET `/me/messages/{id}/attachments` — metadata only, no bytes.
     pub fn list_attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>, GraphError> {
+        let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}/attachments");
         let resp = self.send(Method::Get, &path, None, &[])?;
         let v = parse_body(resp)?;
@@ -156,6 +197,8 @@ impl GraphClient {
         message_id: &str,
         attachment_id: &str,
     ) -> Result<Vec<u8>, GraphError> {
+        let message_id = encode_path_segment(message_id);
+        let attachment_id = encode_path_segment(attachment_id);
         let path = format!("/me/messages/{message_id}/attachments/{attachment_id}");
         let resp = self.send(Method::Get, &path, None, &[])?;
         let v = parse_body(resp)?;
@@ -169,6 +212,7 @@ impl GraphClient {
 
     /// PATCH `/me/messages/{id}` with `{"isRead":true|false}`.
     pub fn mark_read(&self, id: &str, read: bool) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
         let body = Value::Object(vec![("isRead".to_string(), Value::Bool(read))]).to_string();
         self.send(Method::Patch, &path, Some(body), &[])?;
@@ -177,6 +221,7 @@ impl GraphClient {
 
     /// PATCH `/me/messages/{id}` with `{"flag":{"flagStatus":"flagged"|"notFlagged"}}`.
     pub fn set_flag(&self, id: &str, flagged: bool) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
         let status = if flagged { "flagged" } else { "notFlagged" };
         let body = Value::Object(vec![(
@@ -191,7 +236,10 @@ impl GraphClient {
     /// POST `/me/messages/{id}/move` with `{"destinationId": dest}`, returning
     /// the id of the moved message (Graph mints a new one on move).
     pub fn move_message(&self, id: &str, dest_folder: &str) -> Result<String, GraphError> {
-        let path = format!("/me/messages/{id}/move");
+        // Only `id` is part of the URL path and needs escaping; `dest_folder`
+        // goes into the JSON body as `destinationId`, not the path.
+        let encoded_id = encode_path_segment(id);
+        let path = format!("/me/messages/{encoded_id}/move");
         let body = Value::Object(vec![(
             "destinationId".to_string(),
             Value::Str(dest_folder.to_string()),
@@ -207,6 +255,7 @@ impl GraphClient {
 
     /// DELETE `/me/messages/{id}`.
     pub fn delete_message(&self, id: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
         self.send(Method::Delete, &path, None, &[])?;
         Ok(())
@@ -296,6 +345,25 @@ fn value_array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], GraphError> {
     v.get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| GraphError::Parse(format!("response has no '{key}' array")))
+}
+
+/// Percent-encodes every byte except RFC 3986 unreserved characters
+/// (`A-Za-z0-9-._~`). Graph's REST-format message/folder/attachment ids
+/// commonly contain `/`, `+`, and trailing `=` (they're base64-ish), which
+/// would otherwise be misread as path separators or otherwise corrupt the
+/// URL when interpolated straight into a path segment — Microsoft's Graph
+/// docs call out URL-encoding ids used in paths for exactly this reason.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Decodes standard base64 (RFC 4648 section 4: `+`/`/` alphabet, `=`
@@ -529,5 +597,72 @@ mod tests {
         assert_eq!(base64_decode("aGVsbG8h").unwrap(), b"hello!");
         assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
         assert!(base64_decode("not*base64!").is_none());
+    }
+
+    #[test]
+    fn base64_decode_handles_two_char_final_group() {
+        // "YQ==" is a 2-char final group (1 padding-trimmed data char pair),
+        // the mod-4-remainder-2 case: 1 output byte, distinct from
+        // `base64_decode_matches_known_vector`'s remainder-3 case ("aGk=").
+        assert_eq!(base64_decode("YQ==").unwrap(), b"a");
+    }
+
+    #[test]
+    fn ids_are_percent_encoded_in_path_segments() {
+        // Real Graph REST-format ids commonly contain '/', '+', and a
+        // trailing '=' — all of which must be percent-encoded when placed
+        // in a URL path, or an id containing '/' would silently change the
+        // path structure.
+        let raw_id = "AAMk/id+with=chars";
+        let encoded_id = "AAMk%2Fid%2Bwith%3Dchars";
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: format!("/me/messages/{encoded_id}"),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.mark_read(raw_id, true).unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.contains(encoded_id));
+        assert!(!reqs[0].path.contains(raw_id));
+        assert!(!reqs[0].path.contains("AAMk/id"));
+    }
+
+    #[test]
+    fn list_folders_recurses_into_child_folders() {
+        // Order matters: the fake server matches the *first* route whose
+        // path_prefix is a prefix of the request path, so the more specific
+        // child-folder routes must come before the generic top-level route
+        // (which would otherwise also match "/me/mailFolders/F1/..." paths).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F2","displayName":"Sub","parentFolderId":"F1","totalItemCount":0,"unreadItemCount":0,"wellKnownName":null}]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F2/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":0,"wellKnownName":"inbox"}]}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let folders = c.list_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert!(folders.iter().any(|f| f.id == "F1" && f.display_name == "Inbox"));
+        assert!(folders.iter().any(|f| f.id == "F2" && f.display_name == "Sub"));
     }
 }
