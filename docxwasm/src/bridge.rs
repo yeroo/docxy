@@ -16,9 +16,10 @@
 
 use std::rc::Rc;
 
+use docxcore::agent;
 use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::load::{Relationships, parse_rels_xml};
-use docxcore::model::Align;
+use docxcore::model::{Align, Block};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
@@ -318,6 +319,212 @@ impl Session {
         copied
     }
 
+    // ---- agent control surface (`docx_ctl`) --------------------------------
+    //
+    // Routes one control verb (see `docs/agent-control.md`) against this
+    // session's live document. The reply shape is byte-for-byte the same as
+    // docxy's control server (`docxy/src/control.rs`): the verb result object
+    // plus `"ok":true` on success, or `{"ok":false,"error":"…"}` on failure.
+    // Mutating verbs call straight into `docxcore::agent`, which edits via
+    // `Editor::paste`/`Editor::insert_str` etc — the very same path
+    // `dispatch`'s interactive `paste`/`insert` commands use — so an agent
+    // edit lands on the same undo stack as a keystroke and unwinds with the
+    // same `self.editor.undo()`. This also dirties the session exactly like a
+    // mutating `dispatch` command does.
+
+    /// Route one JSON control request (`{"verb":…,"args":{…}}`) and return the
+    /// JSON reply. See the module note above for the reply envelope.
+    pub fn ctl(&mut self, request_json: &str) -> String {
+        let req = match json::Json::parse(request_json) {
+            Ok(v) => v,
+            Err(e) => return ctl_err(&format!("bad request: {e}")),
+        };
+        let verb = req.get_str("verb").unwrap_or("");
+        let no_args = json::Json::Null;
+        let args = req.get("args").unwrap_or(&no_args);
+        let result = match verb {
+            "doc.outline" => Ok(self.ctl_outline()),
+            "doc.read" => self.ctl_read(args),
+            "doc.find" => self.ctl_find(args),
+            "doc.replace-range" => self.ctl_replace_range(args),
+            "doc.insert" => self.ctl_insert(args),
+            "doc.append" => self.ctl_append(args),
+            "doc.blocks" => Ok(self.ctl_blocks()),
+            other => Err(format!("unknown verb: {other}")),
+        };
+        match result {
+            Ok(body) => ctl_ok(body),
+            Err(e) => ctl_err(&e),
+        }
+    }
+
+    /// `{"headings":[{"index","level","text"}]}`
+    fn ctl_outline(&self) -> String {
+        let mut out = String::from("{\"headings\":[");
+        for (i, h) in agent::outline(&self.editor.doc).into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"index\":");
+            out.push_str(&h.index.to_string());
+            out.push_str(",\"level\":");
+            out.push_str(&h.level.to_string());
+            out.push_str(",\"text\":");
+            json::push_str(&mut out, &h.text);
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// `{start?, end?, range?}` -> `{total, start, end, text, blocks:[…]}`
+    fn ctl_read(&self, args: &json::Json) -> Result<String, String> {
+        let n = self.editor.doc.body.len();
+        let (start, end) = ctl_range_args(args, n)?;
+        let blocks = agent::read(&self.editor.doc, start, end)?;
+        let joined = blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut out = String::from("{\"total\":");
+        out.push_str(&n.to_string());
+        out.push_str(",\"start\":");
+        out.push_str(&start.to_string());
+        out.push_str(",\"end\":");
+        out.push_str(&end.to_string());
+        out.push_str(",\"text\":");
+        json::push_str(&mut out, &joined);
+        out.push_str(",\"blocks\":[");
+        for (i, b) in blocks.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"index\":");
+            out.push_str(&b.index.to_string());
+            out.push_str(",\"kind\":");
+            json::push_str(&mut out, b.kind);
+            out.push_str(",\"text\":");
+            json::push_str(&mut out, &b.text);
+            if let Some(level) = b.heading {
+                out.push_str(",\"heading\":");
+                out.push_str(&level.to_string());
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// `{query, case_sensitive?}` -> `{query, count, matches:[{path,start,end,block?,text?}]}`
+    fn ctl_find(&self, args: &json::Json) -> Result<String, String> {
+        let query = args.get_str("query").ok_or("doc.find needs a 'query'")?;
+        let case_sensitive = args
+            .get("case_sensitive")
+            .and_then(json::Json::as_bool)
+            .unwrap_or(false);
+        let body = &self.editor.doc.body;
+        let matches = agent::find(&self.editor.doc, query, case_sensitive);
+        let mut out = String::from("{\"query\":");
+        json::push_str(&mut out, query);
+        out.push_str(",\"count\":");
+        out.push_str(&matches.len().to_string());
+        out.push_str(",\"matches\":[");
+        for (i, m) in matches.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"path\":[");
+            for (pi, p) in m.path.iter().enumerate() {
+                if pi > 0 {
+                    out.push(',');
+                }
+                out.push_str(&p.to_string());
+            }
+            out.push_str("],\"start\":");
+            out.push_str(&m.start.to_string());
+            out.push_str(",\"end\":");
+            out.push_str(&m.end.to_string());
+            // Top-level paragraph matches carry a direct block index + full
+            // text, which a client can feed straight back to replace-range.
+            if m.path.len() == 1 {
+                out.push_str(",\"block\":");
+                out.push_str(&m.path[0].to_string());
+                if let Some(Block::Paragraph(p)) = body.get(m.path[0]) {
+                    out.push_str(",\"text\":");
+                    json::push_str(&mut out, &p.plain_text());
+                }
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// `{start, end?, text}` -> `{replaced, total}`
+    fn ctl_replace_range(&mut self, args: &json::Json) -> Result<String, String> {
+        let start = args
+            .get_usize("start")
+            .ok_or("doc.replace-range needs a 'start' index")?;
+        let end = args.get_usize("end").unwrap_or(start);
+        let text = args
+            .get_str("text")
+            .ok_or("doc.replace-range needs 'text'")?;
+        let replaced = agent::replace_range(&mut self.editor, start, end, text)?;
+        self.finish_ctl_edit();
+        let mut out = String::from("{\"replaced\":");
+        out.push_str(&replaced.to_string());
+        out.push_str(",\"total\":");
+        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{at, text}` -> `{total}`
+    fn ctl_insert(&mut self, args: &json::Json) -> Result<String, String> {
+        let at = args
+            .get_usize("at")
+            .ok_or("doc.insert needs an 'at' index")?;
+        let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
+        agent::insert(&mut self.editor, at, text)?;
+        self.finish_ctl_edit();
+        let mut out = String::from("{\"total\":");
+        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{text}` -> `{total}`
+    fn ctl_append(&mut self, args: &json::Json) -> Result<String, String> {
+        let text = args.get_str("text").ok_or("doc.append needs 'text'")?;
+        agent::append(&mut self.editor, text);
+        self.finish_ctl_edit();
+        let mut out = String::from("{\"total\":");
+        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{}` -> `{total, modified}` (the host composes this with URI info for
+    /// its own `doc.path`-equivalent reply).
+    fn ctl_blocks(&self) -> String {
+        let mut out = String::from("{\"total\":");
+        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(",\"modified\":");
+        out.push_str(if self.dirty { "true" } else { "false" });
+        out.push('}');
+        out
+    }
+
+    /// Post-mutation bookkeeping shared by every ctl edit verb: clear the
+    /// transient selection, re-validate the caret, and mark the session dirty
+    /// — the same bookkeeping `dispatch`'s mutating commands perform.
+    fn finish_ctl_edit(&mut self) {
+        self.editor.clear_selection();
+        self.editor.clamp();
+        self.dirty = true;
+    }
+
     /// Toggle a bulleted/numbered list on the selected paragraphs, or clear it.
     /// Mirrors the terminal app: `ensure_list` provisions a numbering definition
     /// in the package, then the paragraphs join or leave it; the numbering is
@@ -415,6 +622,64 @@ impl Session {
     #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+}
+
+/// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
+/// completing the success envelope.
+fn ctl_ok(body: String) -> String {
+    let mut s = body;
+    s.pop(); // trailing '}'
+    s.push_str(",\"ok\":true}");
+    s
+}
+
+/// The ctl failure envelope: `{"ok":false,"error":"…"}`.
+fn ctl_err(msg: &str) -> String {
+    let mut out = String::from("{\"ok\":false,\"error\":");
+    json::push_str(&mut out, msg);
+    out.push('}');
+    out
+}
+
+/// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
+/// defaulting to the whole document. Mirrors `docxy::control`'s `range_args`.
+fn ctl_range_args(args: &json::Json, n: usize) -> Result<(usize, usize), String> {
+    if n == 0 {
+        return Err("document is empty".into());
+    }
+    let mut start = args.get_usize("start");
+    let mut end = args.get_usize("end");
+    if let Some(r) = args.get_str("range") {
+        let (a, b) = ctl_parse_range_str(r)?;
+        start = start.or(a);
+        end = end.or(b);
+    }
+    let start = start.unwrap_or(0);
+    let end = end.unwrap_or(n - 1);
+    agent::bounds(start, end, n)?;
+    Ok((start, end))
+}
+
+/// Parse `"a..b"`, `"a.."`, `"..b"`, or `"a"` into optional bounds.
+fn ctl_parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String> {
+    let s = s.trim();
+    let parse = |t: &str| -> Result<Option<usize>, String> {
+        let t = t.trim();
+        if t.is_empty() {
+            Ok(None)
+        } else {
+            t.parse::<usize>()
+                .map(Some)
+                .map_err(|_| format!("bad range bound '{t}'"))
+        }
+    };
+    match s.split_once("..") {
+        Some((a, b)) => Ok((parse(a)?, parse(b)?)),
+        None => {
+            let v = parse(s)?;
+            Ok((v, v))
+        }
     }
 }
 
@@ -677,6 +942,79 @@ mod tests {
         assert!(
             v.contains("\"selection\":1"),
             "expected active selection: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_outline_and_read_match_contract() {
+        let mut s = Session::open(&sample_docx("Hello world")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.read","args":{}}"#);
+        assert!(
+            out.contains("\"ok\":true")
+                && out.contains("Hello world")
+                && out.contains("\"kind\":\"paragraph\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_replace_range_edits_and_is_undoable() {
+        let mut s = Session::open(&sample_docx("first")).expect("open");
+        s.ctl(r#"{"verb":"doc.append","args":{"text":"second"}}"#);
+        let out = s.ctl(r#"{"verb":"doc.replace-range","args":{"start":1,"text":"better"}}"#);
+        assert!(out.contains("\"replaced\":1"), "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        // A replace-range is a delete-then-insert over a selection (same as an
+        // interactive paste), so it unwinds in the same two native undo steps
+        // documented by `docxcore::agent`'s and `docxy::control`'s own tests.
+        s.dispatch("undo");
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("second") && !v.contains("better"), "{v}");
+    }
+
+    #[test]
+    fn ctl_rejects_unknown_verbs_and_bad_args() {
+        let mut s = Session::open(&sample_docx("x")).expect("open");
+        assert!(
+            s.ctl(r#"{"verb":"doc.nope","args":{}}"#)
+                .contains("\"ok\":false")
+        );
+        assert!(
+            s.ctl(r#"{"verb":"doc.replace-range","args":{"start":99,"text":"y"}}"#)
+                .contains("out of bounds")
+        );
+    }
+
+    #[test]
+    fn ctl_insert_and_append_and_blocks() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.append","args":{"text":"B"}}"#);
+        assert!(
+            out.contains("\"total\":2") && out.contains("\"ok\":true"),
+            "{out}"
+        );
+        let out = s.ctl(r#"{"verb":"doc.insert","args":{"at":1,"text":"X"}}"#);
+        assert!(out.contains("\"total\":3"), "{out}");
+        let out = s.ctl(r#"{"verb":"doc.blocks","args":{}}"#);
+        assert!(
+            out.contains("\"total\":3")
+                && out.contains("\"modified\":true")
+                && out.contains("\"ok\":true"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_find_reports_block_and_text() {
+        let bytes = sample_docx("hello world");
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.find","args":{"query":"world"}}"#);
+        assert!(
+            out.contains("\"count\":1")
+                && out.contains("\"block\":0")
+                && out.contains("\"ok\":true"),
+            "{out}"
         );
     }
 }
