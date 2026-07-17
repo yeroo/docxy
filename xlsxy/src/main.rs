@@ -5817,7 +5817,10 @@ mod tests {
         // The left menu is rendered at x=0, first item at y=2. "Open" is item 1.
         app.bs_menu_rect = Rect::new(0, 2, 16, backstage::ITEMS.len() as u16);
         assert!(!app.backstage_mouse(click(3, 3))); // click "Open"
-        assert_eq!(app.backstage.as_ref().unwrap().pane, backstage::Pane::Browser);
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Browser
+        );
 
         // Entries: ".." (parent) then "a.xlsx". The list lives in the right pane
         // (x past the 16-wide menu), starting at y=4.
