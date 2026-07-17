@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { StringDecoder } from 'string_decoder';
 
 /** What a `CtlServer` needs from its embedding provider to answer requests.
  *  One implementation per open document (docx/xlsx), wired up in the
@@ -175,8 +176,17 @@ export class CtlServer {
 
   private handleConnection(socket: net.Socket): void {
     let buffer = '';
+    // A stateful decoder, not `chunk.toString('utf8')` per chunk: TCP can
+    // split a multi-byte UTF-8 character (é, €, emoji, CJK) across two
+    // `data` events. Decoding each chunk independently would turn the
+    // straddling bytes into U+FFFD replacement characters — silent text
+    // corruption on large doc.insert/append/replace-range payloads (the
+    // JSON itself still parses fine, so nothing else catches it).
+    // `StringDecoder` holds back incomplete trailing byte sequences across
+    // `write` calls until enough bytes arrive to complete the character.
+    const decoder = new StringDecoder('utf8');
     socket.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
+      buffer += decoder.write(chunk);
       let idx: number;
       while ((idx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, idx).trim();
