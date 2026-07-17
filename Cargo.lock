@@ -273,7 +273,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "ctlcore"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "darling"
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "docxcore"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "opccore",
@@ -329,14 +329,14 @@ dependencies = [
 
 [[package]]
 name = "docxwasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "docxcore",
 ]
 
 [[package]]
 name = "docxy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arboard",
  "ctlcore",
