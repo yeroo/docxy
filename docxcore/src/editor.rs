@@ -1096,38 +1096,50 @@ impl Editor {
 
     // ---- find / replace ----
 
-    /// All matches of `query` (non-overlapping), in document order.
+    /// All matches of `query` (non-overlapping), in document order. The
+    /// search itself lives in [`crate::agent::find`] (a pure `Document`
+    /// function, reusable by hosts that only have a bare document); this is a
+    /// thin wrapper over `self.doc`.
     pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<Match> {
-        if query.is_empty() {
-            return Vec::new();
-        }
-        let q: Vec<char> = query.chars().collect();
-        let mut out = Vec::new();
-        for path in all_paragraph_paths(&self.doc.body) {
-            let Some(p) = resolve_para(&self.doc.body, &path) else {
-                continue;
-            };
-            let t: Vec<char> = p.plain_text().chars().collect();
-            if t.len() < q.len() {
-                continue;
-            }
-            let mut i = 0;
-            while i + q.len() <= t.len() {
-                if (0..q.len()).all(|j| char_eq(t[i + j], q[j], case_sensitive)) {
-                    out.push(Match {
-                        path: path.clone(),
-                        start: i,
-                        end: i + q.len(),
-                    });
-                    i += q.len();
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        out
+        crate::agent::find(&self.doc, query, case_sensitive)
     }
+}
 
+/// The search core behind [`Editor::find_all`] — a free function over
+/// `&[Block]` so [`crate::agent::find`] can call it without needing a live
+/// `Editor`.
+pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q: Vec<char> = query.chars().collect();
+    let mut out = Vec::new();
+    for path in all_paragraph_paths(body) {
+        let Some(p) = resolve_para(body, &path) else {
+            continue;
+        };
+        let t: Vec<char> = p.plain_text().chars().collect();
+        if t.len() < q.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + q.len() <= t.len() {
+            if (0..q.len()).all(|j| char_eq(t[i + j], q[j], case_sensitive)) {
+                out.push(Match {
+                    path: path.clone(),
+                    start: i,
+                    end: i + q.len(),
+                });
+                i += q.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+impl Editor {
     /// The next match relative to the caret (wrapping), forward or backward.
     pub fn find_next(&self, query: &str, case_sensitive: bool, reverse: bool) -> Option<Match> {
         let all = self.find_all(query, case_sensitive);

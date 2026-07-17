@@ -27,7 +27,7 @@
 
 use crate::{App, DocFormat};
 use ctlcore::json::Json;
-use docxcore::editor::{Caret, Clip};
+use docxcore::agent;
 use docxcore::model::Block;
 use std::path::Path;
 
@@ -105,46 +105,42 @@ fn path_info(app: &App) -> Json {
 }
 
 fn outline(app: &App) -> Json {
-    let mut items = Vec::new();
-    for (i, b) in app.editor.doc.body.iter().enumerate() {
-        if let Block::Paragraph(p) = b {
-            if let Some(level) = p.props.heading_level {
-                items.push(Json::obj(vec![
-                    ("index", Json::Num(i as f64)),
-                    ("level", Json::Num(level as f64)),
-                    ("text", Json::Str(p.plain_text())),
-                ]));
-            }
-        }
-    }
+    let items = agent::outline(&app.editor.doc)
+        .into_iter()
+        .map(|h| {
+            Json::obj(vec![
+                ("index", Json::Num(h.index as f64)),
+                ("level", Json::Num(h.level as f64)),
+                ("text", Json::Str(h.text)),
+            ])
+        })
+        .collect();
     Json::obj(vec![("headings", Json::Arr(items))])
 }
 
 fn read(app: &App, args: &Json) -> Result<Json, String> {
-    let body = &app.editor.doc.body;
-    let n = body.len();
+    let n = app.editor.doc.body.len();
     let (start, end) = range_args(args, n)?;
-    let mut arr = Vec::new();
-    let mut joined = String::new();
-    for i in start..=end {
-        let b = &body[i];
-        let text = b.plain_text();
-        if i > start {
-            joined.push_str("\n\n");
-        }
-        joined.push_str(&text);
-        let mut fields = vec![
-            ("index", Json::Num(i as f64)),
-            ("kind", Json::Str(block_kind(b).to_string())),
-            ("text", Json::Str(text)),
-        ];
-        if let Block::Paragraph(p) = b {
-            if let Some(level) = p.props.heading_level {
+    let blocks = agent::read(&app.editor.doc, start, end)?;
+    let joined = blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let arr = blocks
+        .into_iter()
+        .map(|b| {
+            let mut fields = vec![
+                ("index", Json::Num(b.index as f64)),
+                ("kind", Json::Str(b.kind.to_string())),
+                ("text", Json::Str(b.text)),
+            ];
+            if let Some(level) = b.heading {
                 fields.push(("heading", Json::Num(level as f64)));
             }
-        }
-        arr.push(Json::obj(fields));
-    }
+            Json::obj(fields)
+        })
+        .collect();
     Ok(Json::obj(vec![
         ("total", Json::Num(n as f64)),
         ("start", Json::Num(start as f64)),
@@ -162,7 +158,7 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         .unwrap_or(false);
     let body = &app.editor.doc.body;
     let mut matches = Vec::new();
-    for m in app.editor.find_all(query, case_sensitive) {
+    for m in agent::find(&app.editor.doc, query, case_sensitive) {
         let mut f = vec![
             (
                 "path",
@@ -193,7 +189,6 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
 // ---------------------------------------------------------------------------
 
 fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
-    let n = app.editor.doc.body.len();
     let start = args
         .get_usize("start")
         .ok_or("doc.replace-range needs a 'start' index")?;
@@ -201,45 +196,20 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")
         .ok_or("doc.replace-range needs 'text'")?;
-    bounds(start, end, n)?;
-    require_para(&app.editor.doc.body, start)?;
-    require_para(&app.editor.doc.body, end)?;
-
-    // Select paragraphs [start..=end] (anchor at the head, caret at the true end
-    // of the last, in the editor's own offset units) then paste — `paste` deletes
-    // the selection first, so this is one undoable replace.
-    app.editor.anchor = None;
-    app.editor.caret = Caret::top(end, 0);
-    app.editor.move_end();
-    app.editor.anchor = Some(Caret::top(start, 0));
-    app.editor.paste(&Clip::from_text(text));
+    let replaced = agent::replace_range(&mut app.editor, start, end, text)?;
     finish_edit(app);
-
     Ok(Json::obj(vec![
-        ("replaced", Json::Num((end - start + 1) as f64)),
+        ("replaced", Json::Num(replaced as f64)),
         ("total", Json::Num(app.editor.doc.body.len() as f64)),
     ]))
 }
 
 fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
-    let n = app.editor.doc.body.len();
     let at = args
         .get_usize("at")
         .ok_or("doc.insert needs an 'at' index")?;
     let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
-    if at > n {
-        return Err(format!("'at' {at} out of bounds (0..={n})"));
-    }
-    if at == n {
-        // Insert at the very end == append.
-        return append(app, args);
-    }
-    require_para(&app.editor.doc.body, at)?;
-    // Paste `text\n` at the head of block `at`: the trailing newline pushes the
-    // original paragraph down, so `text` lands as its own paragraph(s) before it.
-    app.editor.anchor = None;
-    app.editor.caret = Caret::top(at, 0);
-    app.editor.paste(&Clip::from_text(&format!("{text}\n")));
+    agent::insert(&mut app.editor, at, text)?;
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
@@ -249,11 +219,7 @@ fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
 
 fn append(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args.get_str("text").ok_or("doc.append needs 'text'")?;
-    // Paste `\ntext` at the document end: the leading newline starts a fresh
-    // paragraph, so `text` lands as new paragraph(s) after the current last one.
-    app.editor.anchor = None;
-    app.editor.move_doc_end();
-    app.editor.paste(&Clip::from_text(&format!("\n{text}")));
+    agent::append(&mut app.editor, text);
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
@@ -265,14 +231,6 @@ fn append(app: &mut App, args: &Json) -> Result<Json, String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn block_kind(b: &Block) -> &'static str {
-    match b {
-        Block::Paragraph(_) => "paragraph",
-        Block::Table(_) => "table",
-        Block::Raw(_) => "raw",
-    }
-}
-
 /// Clear the transient selection, re-validate the caret, and mark the document
 /// modified after a mutating edit.
 fn finish_edit(app: &mut App) {
@@ -280,27 +238,6 @@ fn finish_edit(app: &mut App) {
     app.editor.clamp();
     app.modified = true;
     app.dirty = true;
-}
-
-fn require_para(body: &[Block], i: usize) -> Result<(), String> {
-    match body.get(i) {
-        Some(Block::Paragraph(_)) => Ok(()),
-        Some(_) => Err(format!("block {i} is not a paragraph; edit verbs need one")),
-        None => Err(format!("block {i} out of bounds")),
-    }
-}
-
-fn bounds(start: usize, end: usize, n: usize) -> Result<(), String> {
-    if n == 0 {
-        return Err("document is empty".into());
-    }
-    if start >= n || end >= n {
-        return Err(format!("range {start}..{end} out of bounds (0..{})", n - 1));
-    }
-    if start > end {
-        return Err(format!("start {start} is after end {end}"));
-    }
-    Ok(())
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -318,7 +255,7 @@ fn range_args(args: &Json, n: usize) -> Result<(usize, usize), String> {
     }
     let start = start.unwrap_or(0);
     let end = end.unwrap_or(n - 1);
-    bounds(start, end, n)?;
+    agent::bounds(start, end, n)?;
     Ok((start, end))
 }
 
