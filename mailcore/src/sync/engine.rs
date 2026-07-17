@@ -47,6 +47,12 @@ pub enum SyncCommand {
     Delete { id: String },
     /// Fetch and store a message body, then emit [`SyncEvent::BodyReady`].
     FetchBody { id: String },
+    /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
+    /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
+    /// `Store::put_attachments` is otherwise never populated in production
+    /// (only test fixtures write it directly), so the attachments popup has
+    /// nothing to show on a real mailbox until this runs.
+    FetchAttachments { message_id: String },
     /// Fetch an attachment's bytes (`GraphClient::get_attachment_bytes`) and
     /// write them to `dest`, then emit [`SyncEvent::AttachmentSaved`]. `dest`
     /// is a full file path (the UI has already resolved the Downloads
@@ -80,6 +86,9 @@ pub enum SyncEvent {
     MessagesUpdated { folder_id: String },
     /// A message body was fetched and stored; re-read `Store::get_body`.
     BodyReady { id: String },
+    /// Attachment metadata for `message_id` was fetched and stored;
+    /// re-read `Store::attachments(message_id)`.
+    AttachmentsUpdated { message_id: String },
     /// An attachment's bytes were fetched and written to `path` (the `dest`
     /// from the triggering [`SyncCommand::SaveAttachment`]).
     AttachmentSaved { path: PathBuf },
@@ -328,6 +337,7 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::Delete { id });
             }
             SyncCommand::FetchBody { id } => self.fetch_body(&id),
+            SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
                 message_id,
                 attachment_id,
@@ -571,6 +581,35 @@ impl Engine {
             Ok(body) => {
                 let _ = self.store.put_body(id, &body);
                 self.emit(SyncEvent::BodyReady { id: id.to_string() });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch attachment metadata for `message_id` (`GraphClient::list_attachments`)
+    /// and store it (`Store::put_attachments`, which replaces the full set for
+    /// that message), then emit `SyncEvent::AttachmentsUpdated`. Same
+    /// signed-in guard and `with_auth` retry-on-401 as `fetch_body`; a store
+    /// write failure is surfaced rather than silently dropped, since it's the
+    /// only way the UI would ever find out the popup has nothing to show.
+    fn fetch_attachments(&mut self, message_id: &str) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.list_attachments(message_id)) {
+            Ok(metas) => {
+                if let Err(e) = self.store.put_attachments(message_id, &metas) {
+                    self.emit(SyncEvent::Error(format!(
+                        "failed to store attachments for {message_id}: {e}"
+                    )));
+                    return;
+                }
+                self.emit(SyncEvent::AttachmentsUpdated {
+                    message_id: message_id.to_string(),
+                });
             }
             Err(e) => {
                 self.react(e);
@@ -1475,6 +1514,68 @@ mod tests {
             |e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest)
         ));
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_attachments_populates_store_and_emits_updated() {
+        // Nothing in production ever calls `list_attachments`/`put_attachments`
+        // otherwise, so this is the only path that ever gets real attachment
+        // metadata into the store for a real mailbox.
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1/attachments".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"A1","name":"f.txt","contentType":"text/plain","size":3,"isInline":false}]}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("fetch-attachments");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Let the backfill land first so M1 exists locally.
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+        });
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchAttachments {
+                message_id: "M1".into(),
+            })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::AttachmentsUpdated { .. })
+        });
+        assert!(events.iter().any(
+            |e| matches!(e, SyncEvent::AttachmentsUpdated { message_id } if message_id == "M1")
+        ));
+
+        let store = Store::open(&store_path).unwrap();
+        let atts = store.attachments("M1").unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "f.txt");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

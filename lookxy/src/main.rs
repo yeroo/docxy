@@ -122,9 +122,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 /// currently visible folder (an update to some other folder doesn't need to
 /// disturb what's on screen); `BodyReady` re-reads the body from the store
 /// only when it names the currently open message (`App::open_message`
-/// already sent the `FetchBody` that led here); `AttachmentSaved` reports
-/// the saved path (and opens it with the OS handler, if `o` rather than
-/// Enter triggered the save — see `App::finish_attachment_save`).
+/// already sent the `FetchBody` that led here); `AttachmentsUpdated` fills
+/// in the attachments popup once its metadata fetch lands (see
+/// `App::open_attachments_popup`/`reload_attachments`); `AttachmentSaved`
+/// reports the saved path (and opens it with the OS handler, if `o` rather
+/// than Enter triggered that particular save — see
+/// `App::finish_attachment_save`).
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
         match evt {
@@ -138,6 +141,7 @@ fn drain_events(app: &mut App) {
             SyncEvent::BodyReady { id } if app.selected_msg.as_deref() == Some(id.as_str()) => {
                 app.reload_body();
             }
+            SyncEvent::AttachmentsUpdated { message_id } => app.reload_attachments(&message_id),
             SyncEvent::AttachmentSaved { path } => app.finish_attachment_save(path),
             _ => {}
         }

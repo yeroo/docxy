@@ -557,6 +557,53 @@ mod tests {
     }
 
     #[test]
+    fn a_key_fetches_attachment_metadata_when_graph_has_some_but_none_are_stored_yet() {
+        use mailcore::graph::model::{Message, Recipient};
+
+        let mut app = App::for_test_with_seeded_store();
+        // "m1" has `has_attachments = true` per Graph but no local rows —
+        // `Store::put_attachments` is otherwise only ever written by the
+        // sync engine's `FetchAttachments` handler, never by the initial
+        // message backfill, so this is the realistic "just synced, never
+        // opened the popup before" state.
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m1".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Hello".into(),
+                    from: Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: "2026-07-16T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: true,
+                    importance: "normal".into(),
+                    preview: "hi there".into(),
+                },
+            )
+            .expect("update message to has_attachments=true");
+        app.reload_messages();
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+
+        let popup = app.attachments.as_ref().expect("popup opens in a loading state");
+        assert!(popup.loading);
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::FetchAttachments { message_id }) if message_id == "m1"
+        ));
+    }
+
+    #[test]
     fn empty_store_renders_and_handles_keys_without_panicking() {
         let mut app = App::for_test_with_empty_store();
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();

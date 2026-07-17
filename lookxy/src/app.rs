@@ -61,10 +61,14 @@ pub struct App {
     /// The last attachment save/open outcome (e.g. "Saved: C:\...\f.txt"),
     /// for the status bar to show. `None` until the first save completes.
     pub attachment_notice: Option<String>,
-    /// Set by `save_and_open_attachment` (`o`) so that once the matching
-    /// `SyncEvent::AttachmentSaved` lands, `finish_attachment_save` opens the
-    /// file with the OS handler instead of only reporting the saved path.
-    open_after_save: bool,
+    /// In-flight `SaveAttachment` requests keyed by their `dest` path, each
+    /// mapped to whether it should be opened once it completes (`o`) or
+    /// merely reported (Enter). Keyed per-request (rather than one shared
+    /// flag) so that saving attachment A with `o` and attachment B with
+    /// Enter before A's `SyncEvent::AttachmentSaved` lands can't cross-wire
+    /// — each completion looks up (and removes) its own path's intent. See
+    /// `finish_attachment_save`.
+    pending_saves: std::collections::HashMap<PathBuf, bool>,
     /// Test-only: counts calls to the OS-open seam (`open_with_os_handler`),
     /// which is a no-op under `cfg(test)` — see that function's doc comment.
     /// `None` for a production `App`.
@@ -100,10 +104,14 @@ pub struct SearchState {
 /// State for the attachments popup opened by `a`: the message it lists
 /// attachments for, the attachment metadata (`Store::attachments`), and
 /// which one is highlighted — same captured-up-front shape as `MovePicker`.
+/// `loading` is set when the popup opened before local metadata existed and
+/// a `SyncCommand::FetchAttachments` is in flight (`items` is empty then,
+/// too) — see `open_attachments_popup`/`reload_attachments`.
 pub struct AttachmentsPopup {
     pub message_id: String,
     pub items: Vec<AttachmentMeta>,
     pub index: usize,
+    pub loading: bool,
 }
 
 /// How many messages `reload_messages` pulls per folder. Paging further back
@@ -133,7 +141,7 @@ impl App {
             search: None,
             attachments: None,
             attachment_notice: None,
-            open_after_save: false,
+            pending_saves: std::collections::HashMap::new(),
             #[cfg(test)]
             open_invocations: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -442,27 +450,82 @@ impl App {
 
     // --- Attachments ----------------------------------------------------
 
-    /// `a`: opens the attachments popup over the highlighted message,
-    /// listing `store.attachments(id)`. A no-op if nothing is highlighted,
-    /// or the message has no stored attachments — same "don't open a popup
-    /// that can't work" pattern as `open_move_picker`.
+    /// `a`: opens the attachments popup over the highlighted message. If
+    /// `Store::attachments(id)` already has rows (the common case once
+    /// they've been fetched at least once), shows them immediately.
+    /// Otherwise, if the row's `has_attachments` flag says Graph has some,
+    /// opens the popup in a loading state and fires
+    /// `SyncCommand::FetchAttachments` — `reload_attachments` (called from
+    /// `main::drain_events` on `SyncEvent::AttachmentsUpdated`) fills it in
+    /// once that lands. If the message genuinely has no attachments, this
+    /// is a no-op — same "don't open a popup that can't work" pattern as
+    /// `open_move_picker`.
     pub fn open_attachments_popup(&mut self) {
-        let Some(id) = self.highlighted_message_id() else {
+        let Some((id, has_attachments)) = self
+            .messages
+            .get(self.msg_index)
+            .map(|m| (m.id.clone(), m.has_attachments))
+        else {
             return;
         };
         let items = self.store.attachments(&id).unwrap_or_default();
-        if items.is_empty() {
+        if !items.is_empty() {
+            self.attachments = Some(AttachmentsPopup {
+                message_id: id,
+                items,
+                index: 0,
+                loading: false,
+            });
+            return;
+        }
+        if !has_attachments {
             return;
         }
         self.attachments = Some(AttachmentsPopup {
-            message_id: id,
-            items,
+            message_id: id.clone(),
+            items: Vec::new(),
             index: 0,
+            loading: true,
         });
+        let _ = self
+            .sync
+            .cmd_tx
+            .send(SyncCommand::FetchAttachments { message_id: id });
+    }
+
+    /// Called from `main::drain_events` when `SyncEvent::AttachmentsUpdated`
+    /// lands: re-reads `Store::attachments` into the popup, if it's still
+    /// open for that same message (a no-op otherwise — the popup may have
+    /// been closed, or reopened for a different message, before the fetch
+    /// completed). If the store still has nothing for it (an empty result,
+    /// or the fetch failed and never updated it), closes the popup rather
+    /// than leaving it stuck showing "Loading…" forever.
+    pub fn reload_attachments(&mut self, message_id: &str) {
+        let is_open_for_this_message = self
+            .attachments
+            .as_ref()
+            .is_some_and(|p| p.message_id == message_id);
+        if !is_open_for_this_message {
+            return;
+        }
+        let items = self.store.attachments(message_id).unwrap_or_default();
+        if items.is_empty() {
+            self.attachments = None;
+            return;
+        }
+        if let Some(popup) = &mut self.attachments {
+            popup.loading = false;
+            let len = items.len();
+            popup.items = items;
+            if popup.index >= len {
+                popup.index = len.saturating_sub(1);
+            }
+        }
     }
 
     /// Moves the popup's highlighted attachment by `delta`, wrapping — same
-    /// shape as `move_picker_select`. A no-op if the popup isn't open.
+    /// shape as `move_picker_select`. A no-op if the popup isn't open (or has
+    /// nothing in it yet, e.g. still loading).
     pub fn attachments_select(&mut self, delta: isize) {
         if let Some(popup) = &mut self.attachments {
             let len = popup.items.len();
@@ -480,7 +543,8 @@ impl App {
     }
 
     /// Enter: saves the highlighted attachment's bytes to the Downloads
-    /// directory. A no-op if the popup isn't open or has no highlighted row.
+    /// directory. A no-op if the popup isn't open or has no highlighted row
+    /// (e.g. still loading).
     pub fn save_attachment(&mut self) {
         self.send_save_attachment_command(false);
     }
@@ -493,8 +557,11 @@ impl App {
     }
 
     /// Resolves the highlighted attachment's destination path (Downloads
-    /// dir + a sanitized filename) and fires `SyncCommand::SaveAttachment`;
-    /// records whether the file should be opened once it lands.
+    /// dir + a sanitized filename), records whether *this* save should open
+    /// the file once it completes (keyed by `dest`, so a second save started
+    /// before the first completes can't steal or lose the first one's
+    /// open-intent — see `finish_attachment_save`), and fires
+    /// `SyncCommand::SaveAttachment`.
     fn send_save_attachment_command(&mut self, open_after: bool) {
         let Some(popup) = &self.attachments else {
             return;
@@ -505,7 +572,7 @@ impl App {
         let message_id = popup.message_id.clone();
         let attachment_id = att.id.clone();
         let dest = downloads_dir().join(sanitize_filename(&att.name));
-        self.open_after_save = open_after;
+        self.pending_saves.insert(dest.clone(), open_after);
         let _ = self.sync.cmd_tx.send(SyncCommand::SaveAttachment {
             message_id,
             attachment_id,
@@ -514,16 +581,22 @@ impl App {
     }
 
     /// Called from `main::drain_events` when `SyncEvent::AttachmentSaved`
-    /// lands: opens the file with the OS handler if this save was triggered
-    /// by `o` (`save_and_open_attachment`), records a status notice either
-    /// way, and closes the popup.
+    /// lands: looks up (and removes) `path`'s own open-intent from
+    /// `pending_saves` — so an unrelated in-flight save's completion can
+    /// never trigger *this* one's open handler, or vice versa — opens the
+    /// file with the OS handler iff that intent was `o`, and records a
+    /// status notice. The popup only auto-closes once every in-flight save
+    /// has resolved, so one save finishing can't yank the popup out from
+    /// under another that's still pending.
     pub fn finish_attachment_save(&mut self, path: PathBuf) {
-        if self.open_after_save {
-            self.open_after_save = false;
+        let open_after = self.pending_saves.remove(&path).unwrap_or(false);
+        if open_after {
             self.open_with_os_handler(&path);
         }
         self.attachment_notice = Some(format!("Saved: {}", path.display()));
-        self.attachments = None;
+        if self.pending_saves.is_empty() {
+            self.attachments = None;
+        }
     }
 
     /// Shells out to the OS's "open" handler for `path` (`cmd /c start` on
@@ -693,18 +766,23 @@ pub fn downloads_dir() -> PathBuf {
 }
 
 /// Sanitizes an attachment's `name` so it's safe to use as a single path
-/// component under `downloads_dir()`: path separators (`/`, `\`), drive/ADS
-/// colons, and control characters become `_`, and any `..` (which would
-/// otherwise still read as a parent-directory reference even with
-/// separators stripped, e.g. on a `..` bare component) is neutralized too.
-/// Falls back to a fixed name if nothing usable is left, so a malicious or
-/// empty attachment name can never escape Downloads or produce a path
-/// `std::fs::write` would choke on.
+/// component under `downloads_dir()`, and as an argument to the `o` open
+/// handler: path separators (`/`, `\`), drive/ADS colons, and control
+/// characters become `_`; `%` is stripped too, since `cmd /c start` (the
+/// Windows opener) expands `%VAR%` in its arguments and that expansion is
+/// NOT protected by cmd's quoting — an attachment named e.g.
+/// `%USERPROFILE%\x` could otherwise rewrite the path that ends up opened.
+/// Any `..` (which would otherwise still read as a parent-directory
+/// reference even with separators stripped, e.g. on a bare `..` component)
+/// is neutralized too. Falls back to a fixed name if nothing usable is
+/// left, so a malicious or empty attachment name can never escape
+/// Downloads, rewrite the opened path, or produce a path `std::fs::write`
+/// would choke on.
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' => '_',
+            '/' | '\\' | ':' | '%' => '_',
             c if c.is_control() => '_',
             c => c,
         })
@@ -803,6 +881,15 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_strips_percent_to_block_cmd_var_expansion() {
+        // `cmd /c start` (the Windows `o` opener) expands `%VAR%` in its
+        // argument unprotected by quoting, so `%` must never survive into a
+        // path handed to it.
+        assert_eq!(sanitize_filename("%USERPROFILE%\\x"), "_USERPROFILE__x");
+        assert_eq!(sanitize_filename("100%.txt"), "100_.txt");
+    }
+
+    #[test]
     fn downloads_dir_ends_with_downloads() {
         let d = downloads_dir();
         assert_eq!(d.file_name().unwrap(), "Downloads");
@@ -885,7 +972,7 @@ mod tests {
 
         app.save_attachment();
 
-        match cmd_rx.try_recv() {
+        let dest = match cmd_rx.try_recv() {
             Ok(SyncCommand::SaveAttachment {
                 message_id,
                 attachment_id,
@@ -895,12 +982,14 @@ mod tests {
                 assert_eq!(attachment_id, "a1");
                 assert_eq!(dest.file_name().unwrap(), "notes.txt");
                 assert!(dest.starts_with(downloads_dir()));
+                dest
             }
             other => panic!("expected a SaveAttachment command, got {other:?}"),
-        }
+        };
         // `save_attachment` (Enter, not `o`) must not schedule an open once
         // the save completes.
-        assert!(!app.open_after_save);
+        app.finish_attachment_save(dest);
+        assert_eq!(app.open_invocations.get(), 0);
     }
 
     #[test]
@@ -921,15 +1010,15 @@ mod tests {
         app.open_attachments_popup();
 
         app.save_and_open_attachment();
-        assert!(app.open_after_save);
+        let dest = downloads_dir().join("notes.txt");
+        assert_eq!(app.pending_saves.get(&dest), Some(&true));
 
         // Once the sync engine reports the save, `finish_attachment_save`
         // must reach the (test-mode, no-op) OS-open seam exactly once — and
         // never a real process, since that would hang/pop up in CI.
-        let dest = std::path::PathBuf::from("C:/tmp/notes.txt");
         app.finish_attachment_save(dest.clone());
 
-        assert!(!app.open_after_save);
+        assert!(app.pending_saves.is_empty());
         assert!(app.attachments.is_none());
         assert_eq!(app.open_invocations.get(), 1);
         assert_eq!(
@@ -956,8 +1045,166 @@ mod tests {
         app.open_attachments_popup();
 
         app.save_attachment();
-        app.finish_attachment_save(std::path::PathBuf::from("C:/tmp/notes.txt"));
+        app.finish_attachment_save(downloads_dir().join("notes.txt"));
 
         assert_eq!(app.open_invocations.get(), 0);
+    }
+
+    #[test]
+    fn overlapping_saves_resolve_independent_open_intents() {
+        // Saving attachment #1 with `o` and attachment #2 with Enter, before
+        // #1's SyncEvent lands, must not cross-wire: #2 finishing first must
+        // not open anything (its own intent was Enter) or close the popup
+        // out from under #1, which is still pending; #1 finishing must open
+        // (its own intent), and only then can the popup close.
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[
+                    AttachmentMeta {
+                        id: "a1".into(),
+                        name: "one.txt".into(),
+                        content_type: "text/plain".into(),
+                        size: 1,
+                        is_inline: false,
+                    },
+                    AttachmentMeta {
+                        id: "a2".into(),
+                        name: "two.txt".into(),
+                        content_type: "text/plain".into(),
+                        size: 1,
+                        is_inline: false,
+                    },
+                ],
+            )
+            .expect("seed attachments");
+        app.open_attachments_popup();
+
+        app.save_and_open_attachment(); // #1: "one.txt", open-after = true
+        app.attachments_select(1);
+        app.save_attachment(); // #2: "two.txt", open-after = false
+
+        let dest1 = downloads_dir().join("one.txt");
+        let dest2 = downloads_dir().join("two.txt");
+
+        app.finish_attachment_save(dest2);
+        assert_eq!(app.open_invocations.get(), 0);
+        assert!(
+            app.attachments.is_some(),
+            "popup must stay open while save #1 is still pending"
+        );
+
+        app.finish_attachment_save(dest1);
+        assert_eq!(app.open_invocations.get(), 1);
+        assert!(app.attachments.is_none());
+    }
+
+    /// Builds a seeded-store `App` whose message "m1" has `has_attachments`
+    /// set (via a re-upsert — `for_test_with_seeded_store`'s fixture starts
+    /// with it `false`), with no local attachment rows for it — the "Graph
+    /// says there are attachments, but we haven't fetched metadata yet"
+    /// state `open_attachments_popup`'s fetch-on-demand path targets.
+    fn seed_message_with_has_attachments_but_no_local_rows(app: &mut App) {
+        use mailcore::graph::model::{Message, Recipient};
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m1".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Hello".into(),
+                    from: Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: "2026-07-16T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: true,
+                    importance: "normal".into(),
+                    preview: "hi there".into(),
+                },
+            )
+            .expect("update message to has_attachments=true");
+        app.reload_messages();
+    }
+
+    #[test]
+    fn a_fetches_attachment_metadata_when_none_stored_locally_but_graph_has_some() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_message_with_has_attachments_but_no_local_rows(&mut app);
+        assert!(app.messages[0].has_attachments);
+        assert!(app.store.attachments("m1").unwrap().is_empty());
+
+        app.open_attachments_popup();
+
+        let popup = app
+            .attachments
+            .as_ref()
+            .expect("popup should open in a loading state");
+        assert!(popup.loading);
+        assert!(popup.items.is_empty());
+
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::FetchAttachments { message_id }) if message_id == "m1"
+        ));
+    }
+
+    #[test]
+    fn reload_attachments_fills_in_the_popup_once_metadata_lands() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_message_with_has_attachments_but_no_local_rows(&mut app);
+        app.open_attachments_popup();
+        assert!(app.attachments.as_ref().unwrap().loading);
+
+        // The sync engine's fetch has now landed and stored the metadata.
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "f.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 3,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+
+        app.reload_attachments("m1");
+
+        let popup = app.attachments.as_ref().expect("popup stays open");
+        assert!(!popup.loading);
+        assert_eq!(popup.items.len(), 1);
+        assert_eq!(popup.items[0].name, "f.txt");
+    }
+
+    #[test]
+    fn reload_attachments_ignores_updates_for_a_different_message() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "f.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 3,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed attachment");
+        app.open_attachments_popup();
+        assert!(app.attachments.is_some());
+
+        app.reload_attachments("some-other-message-id");
+
+        assert_eq!(app.attachments.as_ref().unwrap().items.len(), 1);
     }
 }
