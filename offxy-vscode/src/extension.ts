@@ -54,6 +54,14 @@ const EDITORS: EditorSpec[] = [
       '“{name}” is empty — it isn\'t a Word document yet. Create a new Word document in its place?',
     mintEmpty: (ctx) => markdownToDocx(ctx, ''),
   },
+  {
+    viewType: 'offxy.gridEditor',
+    label: 'Excel workbook',
+    script: 'grid.js',
+    style: 'grid.css',
+    wasm: 'gridwasm.wasm',
+    // emptyPrompt/mintEmpty land in Task 9
+  },
 ];
 
 function register(context: vscode.ExtensionContext): vscode.Disposable {

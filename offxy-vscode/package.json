@@ -38,6 +38,16 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "offxy.gridEditor",
+        "displayName": "Offxy Spreadsheet",
+        "selector": [
+          {
+            "filenamePattern": "*.xlsx"
+          }
+        ],
+        "priority": "default"
       }
     ],
     "commands": [
@@ -86,7 +96,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build:wasm": "cargo build -p docxwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
+    "build:wasm": "cargo build -p docxwasm -p gridwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
     "build": "npm run build:wasm && npm run build:ext",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",

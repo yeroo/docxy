@@ -1,0 +1,65 @@
+/* Offxy spreadsheet webview. Theme-driven: all colors from VS Code vars. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 13px);
+  color: var(--vscode-editor-foreground);
+  background: var(--vscode-editor-background); }
+
+#fbar { display: flex; align-items: center; gap: 6px; height: 28px;
+  padding: 0 8px; border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }
+#cellref { min-width: 64px; text-align: center; padding: 2px 6px;
+  border: 1px solid var(--vscode-editorWidget-border, #0003);
+  color: var(--vscode-descriptionForeground); }
+#fsrc { flex: 1; padding: 2px 6px; font: inherit;
+  color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent); outline: none; }
+
+#gridwrap { position: absolute; top: 28px; bottom: 24px; left: 0; right: 0; overflow: auto; }
+#spacer { position: absolute; top: 0; left: 0; width: 1px; height: 1px; }
+#cells { position: absolute; top: 0; left: 0; }
+.cell { position: absolute; overflow: hidden; white-space: pre;
+  padding: 0 4px; line-height: 22px; height: 22px;
+  border-right: 1px solid var(--vscode-editorWidget-border, #0002);
+  border-bottom: 1px solid var(--vscode-editorWidget-border, #0002); }
+.cell.num { text-align: right; }
+.cell.ctr { text-align: center; }
+.cell.b { font-weight: bold; }
+.cell.i { font-style: italic; }
+
+#colhdr, #rowhdr { position: absolute; z-index: 3; overflow: hidden;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  color: var(--vscode-descriptionForeground); }
+#colhdr { top: 28px; left: 44px; right: 0; height: 22px;
+  border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }
+#rowhdr { top: 50px; left: 0; bottom: 24px; width: 44px;
+  border-right: 1px solid var(--vscode-editorWidget-border, #0003); }
+#corner { position: absolute; top: 28px; left: 0; width: 44px; height: 22px; z-index: 4;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-right: 1px solid var(--vscode-editorWidget-border, #0003);
+  border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }
+.hcell { position: absolute; text-align: center; line-height: 22px; height: 22px;
+  border-right: 1px solid var(--vscode-editorWidget-border, #0002); }
+.hcell.on { color: var(--vscode-editor-foreground); font-weight: bold; }
+
+#selbox { position: absolute; pointer-events: none; z-index: 2;
+  border: 2px solid var(--vscode-focusBorder, #007acc);
+  background: color-mix(in srgb, var(--vscode-editor-selectionBackground, #264f78) 35%, transparent); }
+#curbox { position: absolute; pointer-events: none; z-index: 2;
+  border: 2px solid var(--vscode-focusBorder, #007acc); }
+
+#tabs { position: absolute; bottom: 0; left: 0; right: 0; height: 24px;
+  display: flex; align-items: stretch; gap: 2px; padding: 0 6px; overflow-x: auto;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-top: 1px solid var(--vscode-editorWidget-border, #0003); }
+#tabs button { font: inherit; border: none; cursor: pointer; padding: 0 10px;
+  color: var(--vscode-descriptionForeground); background: transparent; }
+#tabs button.on { color: var(--vscode-editor-foreground);
+  border-bottom: 2px solid var(--vscode-focusBorder, #007acc); }
+
+.empty-state { display: flex; flex-direction: column; align-items: center;
+  gap: 12px; padding: 48px 24px; font-family: var(--vscode-font-family); }
+.empty-state p { color: var(--vscode-descriptionForeground); }
+.empty-state button { padding: 6px 14px; font: inherit; cursor: pointer;
+  color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+  border: none; border-radius: 2px; }
