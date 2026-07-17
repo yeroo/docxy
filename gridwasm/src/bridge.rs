@@ -2,20 +2,40 @@
 //! written as plain Rust so it can be unit-tested natively
 //! (`cargo test -p gridwasm`). Mirrors `docxwasm::bridge` in shape.
 
+use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
-use gridcore::sheet::{Align, CellValue, cell_name, format_with};
+use gridcore::sheet::{Align, Cell, CellValue, DefinedName, Sheet, cell_name, format_with};
 use gridcore::xlsx::{SheetPackage, load_xlsx};
 
 use crate::json;
+
+/// One undoable action: cell states before/after, per address.
+struct UndoGroup {
+    sheet: usize,
+    changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
+}
+
+/// Sheets + defined names — snapshotted around structural edits whose inverse
+/// is not expressible as per-cell changes (Task 3 uses this).
+#[derive(Clone)]
+struct WbSnapshot {
+    sheets: Vec<Sheet>,
+    names: Vec<DefinedName>,
+}
+
+enum UndoAction {
+    Cells(UndoGroup),
+    Structural {
+        before: WbSnapshot,
+        after: WbSnapshot,
+    },
+}
 
 /// A live editing session over one `.xlsx`.
 pub struct Session {
     /// Whole package retained — save regenerates only modeled cell data and
     /// preserves every other part byte-for-byte.
     pkg: SheetPackage,
-    // Unread until Task 2 wires `dispatch` edits through `recalc_from`; kept
-    // now so `open` builds the dependency graph once, at load time.
-    #[allow(dead_code)]
     engine: Engine,
     /// Active sheet index (what the webview is looking at).
     active: usize,
@@ -27,6 +47,8 @@ pub struct Session {
     dirty: bool,
     /// One-shot status/error line for the next view (formula errors etc.).
     err: Option<String>,
+    undo: Vec<UndoAction>,
+    redo: Vec<UndoAction>,
 }
 
 impl Session {
@@ -43,16 +65,13 @@ impl Session {
             window: (0, 0, 60, 20),
             dirty: false,
             err: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         })
     }
 
     /// Apply one tab-delimited command. Returns `Some(text)` when the host
-    /// should copy `text` to the OS clipboard. (Commands grow over Tasks 2–4;
-    /// this task implements only `view`.)
-    // A `match` with one real arm reads as a plain `if` today, but Tasks 2–4
-    // add many more ops here (mirroring `docxwasm::bridge::dispatch`) — keep
-    // the shape it will grow into rather than fighting the lint twice.
-    #[allow(clippy::single_match)]
+    /// should copy `text` to the OS clipboard. (Commands grow over Tasks 2–4.)
     pub fn dispatch(&mut self, cmd: &str) -> Option<String> {
         let mut it = cmd.splitn(2, '\t');
         let op = it.next().unwrap_or("");
@@ -73,9 +92,174 @@ impl Session {
                     );
                 }
             }
+            "clock" => {
+                if let Ok(serial) = rest.parse::<f64>() {
+                    self.engine.clock = Some(serial);
+                }
+            }
+            "select" => {
+                let p: Vec<&str> = rest.split('\t').collect();
+                if p.len() >= 2 {
+                    let r = p[0].parse().unwrap_or(0);
+                    let c = p[1].parse().unwrap_or(0);
+                    self.cur = (r, c);
+                    self.anchor = if p.len() == 4 {
+                        Some((p[2].parse().unwrap_or(r), p[3].parse().unwrap_or(c)))
+                    } else {
+                        None
+                    };
+                }
+            }
+            "set" => {
+                let p: Vec<&str> = rest.splitn(3, '\t').collect();
+                if p.len() == 3 {
+                    let (r, c) = (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    let text = p[2];
+                    if let Some(body) = text.strip_prefix('=') {
+                        if !body.is_empty() {
+                            if let Err(e) = Engine::validate(body) {
+                                self.err = Some(format!("formula error: {e}"));
+                                return None;
+                            }
+                        }
+                    }
+                    let style = self.pkg.workbook.sheets[self.active]
+                        .cell(r, c)
+                        .map(|x| x.style)
+                        .unwrap_or(0);
+                    let mut cell = parse_input(text);
+                    cell.style = style;
+                    self.apply(vec![(r, c, cell)]);
+                }
+            }
+            "clear" => {
+                let p: Vec<&str> = rest.split('\t').collect();
+                if p.len() == 4 {
+                    let (r1, c1): (u32, u32) =
+                        (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    let (r2, c2): (u32, u32) =
+                        (p[2].parse().unwrap_or(0), p[3].parse().unwrap_or(0));
+                    let mut changes = Vec::new();
+                    for r in r1..=r2 {
+                        for c in c1..=c2 {
+                            if let Some(cell) = self.pkg.workbook.sheets[self.active].cell(r, c) {
+                                if !cell.is_blank() {
+                                    let style = cell.style;
+                                    let mut blank = Cell::default();
+                                    blank.style = style;
+                                    changes.push((r, c, blank));
+                                }
+                            }
+                        }
+                    }
+                    self.apply(changes);
+                }
+            }
+            "undo" => self.do_undo(),
+            "redo" => self.do_redo(),
             _ => {}
         }
         None
+    }
+
+    /// Apply cell changes as one undo group, through the engine.
+    fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
+        if changes.is_empty() {
+            return;
+        }
+        let sheet_idx = self.active;
+        let mut group = UndoGroup {
+            sheet: sheet_idx,
+            changes: Vec::with_capacity(changes.len()),
+        };
+        for (r, c, cell) in changes {
+            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
+            self.engine
+                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
+            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
+            group.changes.push((r, c, before, after));
+        }
+        self.undo.push(UndoAction::Cells(group));
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    fn do_undo(&mut self) {
+        match self.undo.pop() {
+            Some(UndoAction::Cells(group)) => {
+                self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
+                for &(r, c, ref before, _) in group.changes.iter().rev() {
+                    let cell = before.clone().unwrap_or_default();
+                    self.engine
+                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                }
+                self.redo.push(UndoAction::Cells(group));
+                self.dirty = true;
+            }
+            Some(UndoAction::Structural { before, after }) => {
+                self.restore(&before);
+                self.redo.push(UndoAction::Structural { before, after });
+            }
+            None => {}
+        }
+    }
+
+    fn do_redo(&mut self) {
+        match self.redo.pop() {
+            Some(UndoAction::Cells(group)) => {
+                self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
+                for &(r, c, _, ref after) in group.changes.iter() {
+                    let cell = after.clone().unwrap_or_default();
+                    self.engine
+                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                }
+                self.undo.push(UndoAction::Cells(group));
+                self.dirty = true;
+            }
+            Some(UndoAction::Structural { before, after }) => {
+                self.restore(&after);
+                self.undo.push(UndoAction::Structural { before, after });
+            }
+            None => {}
+        }
+    }
+
+    /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
+    /// the inverse isn't per-cell, so undo restores the whole grid state.
+    /// (Unused until Task 3 wires structural dispatch ops through it.)
+    #[allow(dead_code)]
+    fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
+        let before = WbSnapshot {
+            sheets: self.pkg.workbook.sheets.clone(),
+            names: self.pkg.workbook.defined_names.clone(),
+        };
+        op(&mut self.pkg.workbook);
+        self.rebuild_engine();
+        let after = WbSnapshot {
+            sheets: self.pkg.workbook.sheets.clone(),
+            names: self.pkg.workbook.defined_names.clone(),
+        };
+        self.undo.push(UndoAction::Structural { before, after });
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    fn restore(&mut self, snap: &WbSnapshot) {
+        self.pkg.workbook.sheets = snap.sheets.clone();
+        self.pkg.workbook.defined_names = snap.names.clone();
+        self.rebuild_engine();
+        self.dirty = true;
+    }
+
+    /// Formulas changed wholesale — reparse the graph and refresh values.
+    fn rebuild_engine(&mut self) {
+        let clock = self.engine.clock;
+        let seed = self.engine.seed;
+        let mut engine = Engine::new(&self.pkg.workbook);
+        engine.clock = clock;
+        engine.seed = seed;
+        engine.recalc_all(&mut self.pkg.workbook);
+        self.engine = engine;
     }
 
     /// The raw editable source of a cell: `=FORMULA` or the raw value text.
@@ -247,5 +431,67 @@ mod tests {
     #[test]
     fn open_rejects_garbage() {
         assert!(Session::open(b"not an xlsx").is_none());
+    }
+
+    #[test]
+    fn set_recalculates_dependents_and_marks_dirty() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t1\t1\t10"); // B2: 1.25 -> 10
+        let v = s.view_json();
+        assert!(v.contains("12.5"), "SUM must update: {v}");
+        assert!(v.contains("\"dirty\":true"), "{v}");
+    }
+
+    #[test]
+    fn set_formula_validates_and_reports_errors() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t5\t0\t=SUM(");
+        let v = s.view_json();
+        assert!(
+            v.contains("\"err\":"),
+            "invalid formula must surface err: {v}"
+        );
+        // and the cell must not have been written
+        s.dispatch("select\t5\t0");
+        let v = s.view_json();
+        assert!(v.contains("\"src\":\"\""), "cell should stay empty: {v}");
+    }
+
+    #[test]
+    fn undo_redo_round_trip() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t1\t1\t10");
+        s.dispatch("undo");
+        let v = s.view_json();
+        assert!(v.contains("3.75"), "undo must restore SUM: {v}");
+        s.dispatch("redo");
+        let v = s.view_json();
+        assert!(v.contains("12.5"), "redo must reapply: {v}");
+    }
+
+    #[test]
+    fn clear_range_clears_as_one_undo_group() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("clear\t0\t0\t2\t1"); // wipe rows 0..=2
+        let v = s.view_json();
+        assert!(!v.contains("Apple"), "{v}");
+        s.dispatch("undo");
+        let v = s.view_json();
+        assert!(
+            v.contains("Apple") && v.contains("3.75"),
+            "one undo restores all: {v}"
+        );
+    }
+
+    #[test]
+    fn select_extends_selection_and_moves_cur() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t1\t0\t2\t1");
+        let v = s.view_json();
+        assert!(
+            v.contains("\"sel\":{\"r\":1,\"c\":0,\"r2\":2,\"c2\":1}"),
+            "{v}"
+        );
+        assert!(v.contains("\"ref\":\"A2\""), "{v}");
     }
 }

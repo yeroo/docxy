@@ -19,6 +19,7 @@ mod backstage;
 mod ribbon;
 
 use gridcore::comments::Comment;
+use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
@@ -3650,52 +3651,6 @@ impl App {
         }
         Some(s)
     }
-}
-
-/// Interpret typed input as Excel would: formulas, numbers (incl. percent),
-/// booleans, error constants, text.
-fn parse_input(text: &str) -> Cell {
-    if let Some(body) = text.strip_prefix('=') {
-        if !body.is_empty() {
-            return Cell::formula(body);
-        }
-    }
-    if text.is_empty() {
-        return Cell::default();
-    }
-    let t = text.trim();
-    if let Ok(n) = t.parse::<f64>() {
-        if n.is_finite() {
-            return Cell::number(n);
-        }
-    }
-    if let Some(pct) = t.strip_suffix('%') {
-        if let Ok(n) = pct.trim().parse::<f64>() {
-            let v = n / 100.0;
-            if v.is_finite() {
-                return Cell::number(v);
-            }
-        }
-    }
-    if t.eq_ignore_ascii_case("TRUE") {
-        return Cell {
-            value: CellValue::Bool(true),
-            ..Cell::default()
-        };
-    }
-    if t.eq_ignore_ascii_case("FALSE") {
-        return Cell {
-            value: CellValue::Bool(false),
-            ..Cell::default()
-        };
-    }
-    if gridcore::formula::ExcelError::from_code(t).is_some() {
-        return Cell {
-            value: CellValue::Error(t.to_ascii_uppercase()),
-            ..Cell::default()
-        };
-    }
-    Cell::text(text)
 }
 
 // ---------------------------------------------------------------------------
