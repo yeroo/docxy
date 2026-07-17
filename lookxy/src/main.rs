@@ -19,6 +19,11 @@ mod config;
 // are only exercised by `control`'s own tests, so silence dead_code here.
 #[allow(dead_code)]
 mod control;
+// The MCP stdio bridge (thin client of a running lookxy's control surface).
+// Wiring the `--mcp` CLI dispatch is a separate later task; until then `run`
+// is only reachable from `mcp`'s own tests, so silence dead_code here too.
+#[allow(dead_code)]
+mod mcp;
 mod ui;
 
 use std::io;
