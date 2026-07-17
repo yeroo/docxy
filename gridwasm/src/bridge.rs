@@ -5,9 +5,14 @@
 use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
 use gridcore::sheet::{Align, Cell, CellValue, DefinedName, Sheet, cell_name, format_with};
-use gridcore::xlsx::{SheetPackage, load_xlsx};
+use gridcore::xlsx::{SheetPackage, load_xlsx, save_xlsx};
 
 use crate::json;
+
+/// Bytes of a fresh empty workbook (the host's empty-file create flow).
+pub fn new_workbook() -> Vec<u8> {
+    save_xlsx(&gridcore::xlsx::new_xlsx())
+}
 
 /// One undoable action: cell states before/after, per address.
 struct UndoGroup {
@@ -150,6 +155,39 @@ impl Session {
                                     changes.push((r, c, blank));
                                 }
                             }
+                        }
+                    }
+                    self.apply(changes);
+                }
+            }
+            "copy" => return Some(self.selection_tsv()),
+            "cut" => {
+                let tsv = self.selection_tsv();
+                let (ar, ac) = self.anchor.unwrap_or(self.cur);
+                let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
+                let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+                // reuse the clear path as one undo group
+                let cmd = format!("clear\t{r1}\t{c1}\t{r2}\t{c2}");
+                self.dispatch(&cmd);
+                return Some(tsv);
+            }
+            "paste" => {
+                // rest = "<r>\t<c>\t<tsv...>" — split only twice, TSV keeps its tabs.
+                let p: Vec<&str> = rest.splitn(3, '\t').collect();
+                if p.len() == 3 {
+                    let (r0, c0): (u32, u32) =
+                        (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    let mut changes = Vec::new();
+                    for (dr, line) in p[2].split('\n').enumerate() {
+                        for (dc, text) in line.split('\t').enumerate() {
+                            let (r, c) = (r0 + dr as u32, c0 + dc as u32);
+                            let style = self.pkg.workbook.sheets[self.active]
+                                .cell(r, c)
+                                .map(|x| x.style)
+                                .unwrap_or(0);
+                            let mut cell = parse_input(text);
+                            cell.style = style;
+                            changes.push((r, c, cell));
                         }
                     }
                     self.apply(changes);
@@ -335,8 +373,35 @@ impl Session {
         }
     }
 
-    /// Render the current viewport to the JSON the webview consumes.
-    pub fn view_json(&mut self) -> String {
+    /// Serialize the current workbook. Lossless: only modeled cell data is
+    /// regenerated; every other part is preserved byte-for-byte.
+    pub fn save(&mut self) -> Vec<u8> {
+        let out = save_xlsx(&self.pkg);
+        self.dirty = false;
+        out
+    }
+
+    /// The selection as TSV of raw cell sources (formulas as `=...`), rows by
+    /// `\n`, cells by `\t` — round-trips through `paste`.
+    fn selection_tsv(&self) -> String {
+        let (ar, ac) = self.anchor.unwrap_or(self.cur);
+        let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
+        let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+        let mut rows = Vec::new();
+        for r in r1..=r2 {
+            let mut cells = Vec::new();
+            for c in c1..=c2 {
+                cells.push(self.cell_src(r, c));
+            }
+            rows.push(cells.join("\t"));
+        }
+        rows.join("\n")
+    }
+
+    /// Render the current viewport to the JSON the webview consumes. `copied`,
+    /// when set, carries text the host should place on the OS clipboard (from
+    /// a copy or cut command).
+    pub fn view_json(&mut self, copied: Option<&str>) -> String {
         let wb = &self.pkg.workbook;
         let sh = &wb.sheets[self.active];
         let (top, left, nrows, ncols) = self.window;
@@ -432,6 +497,10 @@ impl Session {
             out.push_str(",\"err\":");
             json::push_str(&mut out, &e);
         }
+        if let Some(t) = copied {
+            out.push_str(",\"copied\":");
+            json::push_str(&mut out, t);
+        }
         out.push('}');
         out
     }
@@ -461,7 +530,7 @@ mod tests {
     #[test]
     fn opens_and_renders_viewport() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
         assert!(v.contains("Apple"), "{v}");
         assert!(v.contains("3.75"), "formula not recalculated: {v}");
@@ -473,7 +542,7 @@ mod tests {
     fn viewport_clips_to_window() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("view\t0\t0\t0\t2\t1"); // rows 0..2, col 0 only
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("Item") && v.contains("Apple"), "{v}");
         assert!(!v.contains("Price"), "col 1 must be clipped: {v}");
         assert!(!v.contains("Pear"), "row 2 must be clipped: {v}");
@@ -490,7 +559,7 @@ mod tests {
     fn set_recalculates_dependents_and_marks_dirty() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("set\t1\t1\t10"); // B2: 1.25 -> 10
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("12.5"), "SUM must update: {v}");
         assert!(v.contains("\"dirty\":true"), "{v}");
     }
@@ -499,14 +568,14 @@ mod tests {
     fn set_formula_validates_and_reports_errors() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("set\t5\t0\t=SUM(");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(
             v.contains("\"err\":"),
             "invalid formula must surface err: {v}"
         );
         // and the cell must not have been written
         s.dispatch("select\t5\t0");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("\"src\":\"\""), "cell should stay empty: {v}");
     }
 
@@ -515,10 +584,10 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("set\t1\t1\t10");
         s.dispatch("undo");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("3.75"), "undo must restore SUM: {v}");
         s.dispatch("redo");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("12.5"), "redo must reapply: {v}");
     }
 
@@ -526,10 +595,10 @@ mod tests {
     fn clear_range_clears_as_one_undo_group() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("clear\t0\t0\t2\t1"); // wipe rows 0..=2
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
         s.dispatch("undo");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(
             v.contains("Apple") && v.contains("3.75"),
             "one undo restores all: {v}"
@@ -540,7 +609,7 @@ mod tests {
     fn select_extends_selection_and_moves_cur() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("select\t1\t0\t2\t1");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(
             v.contains("\"sel\":{\"r\":1,\"c\":0,\"r2\":2,\"c2\":1}"),
             "{v}"
@@ -553,7 +622,7 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("insrow\t1\t1"); // push data rows down: SUM(B1:B3) -> SUM(B1:B4)
         s.dispatch("select\t4\t1");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(
             v.contains("\"src\":\"=SUM(B1:B4)\""),
             "refs must rewrite: {v}"
@@ -561,7 +630,7 @@ mod tests {
         assert!(v.contains("3.75"), "total unchanged: {v}");
         s.dispatch("undo");
         s.dispatch("select\t3\t1");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(
             v.contains("\"src\":\"=SUM(B1:B3)\""),
             "undo restores refs: {v}"
@@ -572,29 +641,83 @@ mod tests {
     fn delete_col_and_undo() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("delcol\t0\t1"); // drop the Item column; Price shifts to col 0
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
         assert!(v.contains("3.75"), "sum column survives: {v}");
         s.dispatch("undo");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("Apple"), "undo restores: {v}");
+    }
+
+    #[test]
+    fn copy_returns_tsv_and_paste_round_trips() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t0\t0\t1\t1");
+        let tsv = s.dispatch("copy").expect("copy returns tsv");
+        assert_eq!(tsv, "Item\tPrice\nApple\t1.25");
+        s.dispatch("paste\t5\t0\tItem\tPrice\nApple\t1.25");
+        s.dispatch("select\t6\t1");
+        let v = s.view_json(None);
+        assert!(v.contains("\"src\":\"1.25\""), "pasted number: {v}");
+        s.dispatch("undo");
+        s.dispatch("select\t6\t1");
+        let v = s.view_json(None);
+        assert!(v.contains("\"src\":\"\""), "paste is one undo group: {v}");
+    }
+
+    #[test]
+    fn copy_preserves_formulas_as_source() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t3\t1");
+        let tsv = s.dispatch("copy").expect("copy");
+        assert_eq!(tsv, "=SUM(B1:B3)");
+    }
+
+    #[test]
+    fn cut_copies_then_clears() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t1\t0");
+        let tsv = s.dispatch("cut").expect("cut");
+        assert_eq!(tsv, "Apple");
+        let v = s.view_json(None);
+        assert!(!v.contains("Apple"), "{v}");
+    }
+
+    #[test]
+    fn save_round_trips_losslessly_and_clears_dirty() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t1\t1\t10");
+        let out = s.save();
+        let v = s.view_json(None);
+        assert!(v.contains("\"dirty\":false"), "{v}");
+        let mut s2 = Session::open(&out).expect("reopen");
+        let v2 = s2.view_json(None);
+        assert!(v2.contains("12.5"), "edit persisted through save: {v2}");
+    }
+
+    #[test]
+    fn new_workbook_bytes_open() {
+        let bytes = new_workbook();
+        let mut s = Session::open(&bytes).expect("open fresh workbook");
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
     }
 
     #[test]
     fn sheet_add_rename_switch() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("sheet\tadd\tData");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\",\"Data\"]"), "{v}");
         assert!(
             v.contains("\"active\":1"),
             "add switches to the new sheet: {v}"
         );
         s.dispatch("sheet\trename\t1\tFacts");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("Facts"), "{v}");
         s.dispatch("sheet\tswitch\t0");
-        let v = s.view_json();
+        let v = s.view_json(None);
         assert!(v.contains("\"active\":0") && v.contains("Apple"), "{v}");
     }
 }
