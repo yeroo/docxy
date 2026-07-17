@@ -265,16 +265,36 @@ impl Session {
                         }
                     }
                     (Some("add"), Some(name)) if !name.is_empty() => {
-                        // add_sheet also creates the worksheet part; snapshot-undo won't
-                        // remove the part (accepted, same as the TUI's semantics).
+                        // add_sheet operates on the whole SheetPackage (parts,
+                        // not just Workbook), so it can't go through
+                        // `structural`; snapshot-wrap it inline instead of
+                        // clearing undo/redo (which would desync the host's
+                        // undo stack — the host registers one undo step per
+                        // mutating command, so an engine no-op undo walks it
+                        // back to a false-clean state).
+                        //
+                        // Undo restores workbook.sheets minus the new sheet;
+                        // the orphaned worksheet PART stays in pkg.parts
+                        // (accepted — same class as the documented
+                        // rename-undo imperfection). Redo re-restores the
+                        // after-snapshot, whose sheet entry still points at
+                        // that same part, so it's consistent either way.
+                        let before = WbSnapshot {
+                            sheets: self.pkg.workbook.sheets.clone(),
+                            names: self.pkg.workbook.defined_names.clone(),
+                        };
                         let idx = self.pkg.add_sheet(name);
                         self.rebuild_engine();
+                        let after = WbSnapshot {
+                            sheets: self.pkg.workbook.sheets.clone(),
+                            names: self.pkg.workbook.defined_names.clone(),
+                        };
+                        self.undo.push(UndoAction::Structural { before, after });
+                        self.redo.clear();
                         self.active = idx;
                         self.cur = (0, 0);
                         self.anchor = None;
                         self.dirty = true;
-                        self.undo.clear();
-                        self.redo.clear();
                     }
                     (Some("rename"), Some(rest2)) => {
                         if let Some((i, name)) = rest2.split_once('\t') {
@@ -329,6 +349,9 @@ impl Session {
             }
             Some(UndoAction::Structural { before, after }) => {
                 self.restore(&before);
+                // Sheet count can shrink (undoing a sheet add) — keep the
+                // active index in bounds, same clamp as the Cells case above.
+                self.active = self.active.min(self.pkg.workbook.sheets.len() - 1);
                 self.redo.push(UndoAction::Structural { before, after });
             }
             None => {}
@@ -349,6 +372,9 @@ impl Session {
             }
             Some(UndoAction::Structural { before, after }) => {
                 self.restore(&after);
+                // Sheet count can grow back (redoing a sheet add) — same
+                // bounds clamp as the undo side.
+                self.active = self.active.min(self.pkg.workbook.sheets.len() - 1);
                 self.undo.push(UndoAction::Structural { before, after });
             }
             None => {}
@@ -799,5 +825,54 @@ mod tests {
         s.dispatch("sheet\tswitch\t0");
         let v = s.view_json(None);
         assert!(v.contains("\"active\":0") && v.contains("Apple"), "{v}");
+    }
+
+    #[test]
+    fn sheet_add_is_undoable_in_lockstep() {
+        // The host registers one undo step per mutating command; if sheet
+        // add clears the engine's undo/redo stacks instead of pushing onto
+        // them, the two stacks desync and VS Code's undo can walk the
+        // document back past a point the engine can actually reach.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t5\t0\thello");
+        s.dispatch("sheet\tadd\tData");
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\",\"Data\"]"), "{v}");
+
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\"]"),
+            "first undo removes the added sheet: {v}"
+        );
+        s.dispatch("select\t5\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"hello\""),
+            "the cell edit is a separate, still-undone step: {v}"
+        );
+
+        s.dispatch("undo");
+        s.dispatch("select\t5\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"\""),
+            "second undo reverts the cell edit: {v}"
+        );
+
+        s.dispatch("redo");
+        s.dispatch("select\t5\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"hello\""),
+            "first redo reapplies the cell edit: {v}"
+        );
+
+        s.dispatch("redo");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\",\"Data\"]"),
+            "second redo re-adds the sheet: {v}"
+        );
     }
 }
