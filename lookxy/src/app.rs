@@ -157,6 +157,24 @@ impl App {
 
         App::new(store, sync)
     }
+
+    /// Builds an `App` over an empty in-memory `Store` — no folders, no
+    /// messages — wired to inert `SyncHandle` channels like
+    /// `for_test_with_seeded_store` (no sync thread spawned). For tests
+    /// asserting the UI degrades gracefully on the empty-mailbox state: the
+    /// #1 TUI crash risk (a `.get()`/`nonzero` check swapped for direct
+    /// indexing on an empty `folders`/`messages` list) has no coverage
+    /// otherwise.
+    #[cfg(test)]
+    pub fn for_test_with_empty_store() -> App {
+        use std::sync::mpsc;
+
+        let store = Store::open_in_memory().expect("in-memory store");
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (_evt_tx, evt_rx) = mpsc::channel();
+        let sync = SyncHandle { cmd_tx, evt_rx };
+        App::new(store, sync)
+    }
 }
 
 /// `%LOCALAPPDATA%\lookxy` (or, off Windows, `$HOME/.local/share/lookxy`).

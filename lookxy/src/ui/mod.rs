@@ -141,6 +141,7 @@ pub(crate) fn truncate_width(s: &str, w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailcore::graph::model::{MailFolder, Message, Recipient};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -176,14 +177,138 @@ mod tests {
         assert_eq!(app.focus, Pane::Reading);
     }
 
+    /// Adds a second message to the "inbox" folder seeded by
+    /// `for_test_with_seeded_store`, older than "m1" so it sorts second
+    /// (newest first) — giving a 2-message list wrap-around tests can
+    /// actually exercise (a 1-message list wraps to itself no matter what,
+    /// so it can't distinguish a real wrap from a broken no-op).
+    fn seed_second_message(app: &mut App) {
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m2".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Second".into(),
+                    from: Recipient {
+                        name: "Bob".into(),
+                        address: "bob@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-15T09:00:00Z".into(),
+                    sent: "2026-07-15T08:00:00Z".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "second preview".into(),
+                },
+            )
+            .expect("seed second message");
+        app.reload_messages();
+    }
+
     #[test]
-    fn down_then_up_on_list_wraps_selection() {
+    fn list_selection_wraps_at_both_ends() {
         let mut app = App::for_test_with_seeded_store();
+        seed_second_message(&mut app);
         app.focus = Pane::List;
-        // Only one seeded message: moving either way should stay at index 0.
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.msg_index, 0);
+
+        // Up from the first row wraps to the last row.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.msg_index, app.messages.len() - 1);
+
+        // Down from the last row wraps back to the first.
         handle_key(&mut app, KeyEvent::from(KeyCode::Down));
         assert_eq!(app.msg_index, 0);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Up));
+    }
+
+    #[test]
+    fn moving_folder_selection_reloads_visible_messages() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "sent".into(),
+                display_name: "Sent Items".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 0,
+                well_known_name: Some("sentitems".into()),
+            })
+            .expect("seed second folder");
+        app.store
+            .upsert_message(
+                "sent",
+                &Message {
+                    id: "m2".into(),
+                    conversation_id: "c2".into(),
+                    subject: "From Sent".into(),
+                    from: Recipient {
+                        name: "Bob".into(),
+                        address: "bob@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-15T09:00:00Z".into(),
+                    sent: "2026-07-15T08:00:00Z".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "sent preview".into(),
+                },
+            )
+            .expect("seed message in second folder");
+        app.reload_folders();
+
+        // Well-known ordering (Store::folders) puts inbox before sentitems;
+        // the seeded selection stays on "inbox" across the reload.
+        assert_eq!(app.folders.len(), 2);
+        assert_eq!(app.selected_folder.as_deref(), Some("inbox"));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].id, "m1");
+
+        app.focus = Pane::Folders;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+
+        assert_eq!(app.selected_folder.as_deref(), Some("sent"));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].id, "m2");
+    }
+
+    #[test]
+    fn empty_store_renders_and_handles_keys_without_panicking() {
+        let mut app = App::for_test_with_empty_store();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+
+        // Drive every navigation key, through every pane (Tab cycles focus
+        // in between), with nothing to select. None of this should panic,
+        // and nothing should get selected out of thin air.
+        let keys = [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Tab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Enter,
+            KeyCode::Down,
+        ];
+        for code in keys {
+            handle_key(&mut app, KeyEvent::from(code));
+            term.draw(|f| draw(f, &app)).unwrap();
+        }
+
+        assert!(app.selected_folder.is_none());
+        assert!(app.selected_msg.is_none());
+        assert_eq!(app.folder_index, 0);
         assert_eq!(app.msg_index, 0);
     }
 }

@@ -59,12 +59,15 @@ fn line(m: &MessageRow, width: usize) -> Line<'static> {
 }
 
 /// Shortens an ISO-8601 `receivedDateTime` (`2026-07-16T10:00:00Z`) down to
-/// `MM-DD HH:MM` for the list column; falls back to the raw string if it's
-/// shorter than expected (e.g. empty, in a test fixture).
+/// `MM-DD HH:MM` for the list column; falls back to the raw string if it
+/// doesn't have both slices (e.g. empty, in a test fixture, or — despite
+/// Graph's `receivedDateTime` always being plain ASCII — any stray non-ASCII
+/// byte that would otherwise land mid-character). `str::get` checks UTF-8
+/// char boundaries as well as bounds, so this can never panic the way a
+/// direct `&received_at[5..10]` byte-slice could.
 fn short_time(received_at: &str) -> String {
-    if received_at.len() >= 16 {
-        format!("{} {}", &received_at[5..10], &received_at[11..16])
-    } else {
-        received_at.to_string()
+    match (received_at.get(5..10), received_at.get(11..16)) {
+        (Some(date), Some(time)) => format!("{date} {time}"),
+        _ => received_at.to_string(),
     }
 }
