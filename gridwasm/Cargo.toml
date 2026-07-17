@@ -1,0 +1,22 @@
+[package]
+name = "gridwasm"
+description = "WebAssembly bridge for gridcore: open, render (viewport grid), edit with Excel-compatible recalculation, and losslessly save .xlsx from a browser/webview host (e.g. the Offxy VS Code extension)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# `cdylib` is the wasm artifact the extension loads; `rlib` lets the bridge's
+# render/serialize/dispatch logic be unit-tested natively with `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Std-only, like the rest of the core stack — the only dependency is our own
+# spreadsheet engine.
+gridcore = { version = "0.1.0", path = "../gridcore" }

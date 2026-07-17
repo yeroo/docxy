@@ -12,8 +12,54 @@
 
 use std::collections::BTreeMap;
 
-use crate::formula::{EditShift, adjust_formula_for_edit, rename_sheet_in_formula};
-use crate::sheet::{MAX_COLS, MAX_ROWS, Sheet, Workbook};
+use crate::formula::{EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula};
+use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook};
+
+/// Interpret typed input as Excel would: formulas, numbers (incl. percent),
+/// booleans, error constants, text.
+pub fn parse_input(text: &str) -> Cell {
+    if let Some(body) = text.strip_prefix('=') {
+        if !body.is_empty() {
+            return Cell::formula(body);
+        }
+    }
+    if text.is_empty() {
+        return Cell::default();
+    }
+    let t = text.trim();
+    if let Ok(n) = t.parse::<f64>() {
+        if n.is_finite() {
+            return Cell::number(n);
+        }
+    }
+    if let Some(pct) = t.strip_suffix('%') {
+        if let Ok(n) = pct.trim().parse::<f64>() {
+            let v = n / 100.0;
+            if v.is_finite() {
+                return Cell::number(v);
+            }
+        }
+    }
+    if t.eq_ignore_ascii_case("TRUE") {
+        return Cell {
+            value: CellValue::Bool(true),
+            ..Cell::default()
+        };
+    }
+    if t.eq_ignore_ascii_case("FALSE") {
+        return Cell {
+            value: CellValue::Bool(false),
+            ..Cell::default()
+        };
+    }
+    if ExcelError::from_code(t).is_some() {
+        return Cell {
+            value: CellValue::Error(t.to_ascii_uppercase()),
+            ..Cell::default()
+        };
+    }
+    Cell::text(text)
+}
 
 /// Insert `count` blank rows before 0-based row `at` on sheet `idx`.
 pub fn insert_rows(wb: &mut Workbook, idx: usize, at: u32, count: u32) {

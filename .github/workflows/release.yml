@@ -113,9 +113,10 @@ jobs:
           node-version: 20
 
       - name: Build the .vsix
-        working-directory: docxy-vscode
-        # `vsce package` runs the vscode:prepublish script, which builds the
-        # docxwasm wasm (cargo) and bundles the extension before packaging.
+        working-directory: offxy-vscode
+        # `vsce package` runs the vscode:prepublish script, which builds both
+        # the docxwasm and gridwasm wasm crates (cargo) and bundles the
+        # extension before packaging.
         run: |
           npm ci
           npx --yes @vscode/vsce@latest package --no-dependencies
@@ -123,14 +124,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: docxy-vscode-vsix
-          path: docxy-vscode/*.vsix
+          name: offxy-vsix
+          path: offxy-vscode/*.vsix
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: docxy-vscode/*.vsix
+          files: offxy-vscode/*.vsix
 
   publish:
     name: publish to crates.io

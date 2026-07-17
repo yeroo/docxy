@@ -445,7 +445,7 @@
 
   // ---- boot ----------------------------------------------------------------
   async function boot() {
-    const resp = await fetch(window.__DOCXY__.wasmUri);
+    const resp = await fetch(window.__OFFXY__.wasmUri);
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
     ex = instance.exports;
     buildToolbar();
