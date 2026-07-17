@@ -176,6 +176,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         state: SyncState::Idle,
         next_retry: None,
         backoff: BACKOFF_MIN,
+        backfill_done: false,
     };
     engine.startup();
     engine.main_loop(cmd_rx);
@@ -196,6 +197,12 @@ struct Engine {
     next_retry: Option<Instant>,
     /// Current offline back-off, doubled on each consecutive transport error.
     backoff: Duration,
+    /// Whether an initial folder enumeration has ever completed successfully.
+    /// False at startup, after a failed first backfill (e.g. launched
+    /// offline), and after a quarantine reconverge — while false, ticks run a
+    /// FULL pass (re-enumerate folders) so the client can recover instead of
+    /// running incremental deltas over an empty/stale folder set forever.
+    backfill_done: bool,
 }
 
 impl Engine {
@@ -247,7 +254,11 @@ impl Engine {
     }
 
     /// Periodic tick: skip while signed out or inside a back-off window,
-    /// otherwise re-run every folder's delta and drain the outbox.
+    /// otherwise re-run every folder's delta and drain the outbox. When the
+    /// initial backfill never completed (launched offline, or a quarantine
+    /// reconverge reset it) — or the folder set is empty — run a FULL pass so
+    /// the client keeps re-attempting folder enumeration under back-off rather
+    /// than idling forever on an empty/stale folder set.
     fn on_tick(&mut self) {
         if self.token.is_none() {
             return;
@@ -257,7 +268,9 @@ impl Engine {
                 return;
             }
         }
-        self.sync_pass(false);
+        let needs_full = !self.backfill_done
+            || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
+        self.sync_pass(needs_full);
     }
 
     /// Dispatches one UI command.
@@ -274,9 +287,11 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::SetFlag { id, flagged });
             }
             SyncCommand::Move { id, dest } => {
-                // No local folder-move helper on `Store`, and none is needed:
-                // the next delta reconciles the move (it reports the old id
-                // `@removed` and the new id added), so we only queue the op.
+                // Optimistic local re-file, same pattern as MarkRead/SetFlag/
+                // Delete. Graph mints a new id on move; the next delta
+                // reconciles it (old id `@removed`, new id added), so we keep
+                // the local id and only update its folder here.
+                let _ = self.store.move_message(&id, &dest);
                 self.enqueue_and_drain(OutboxOp::Move { id, dest });
             }
             SyncCommand::Delete { id } => {
@@ -331,6 +346,9 @@ impl Engine {
                 for f in &folders {
                     let _ = self.store.upsert_folder(f);
                 }
+                // The initial enumeration has now succeeded at least once, so
+                // ticks can safely drop to incremental deltas.
+                self.backfill_done = true;
                 self.emit(SyncEvent::FoldersUpdated);
                 true
             }
@@ -461,6 +479,16 @@ impl Engine {
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
                         self.store.drop_op(row.seq);
+                        // Reconverge with server truth: the op's optimistic
+                        // local write (e.g. a Delete that hid a message Graph
+                        // still has) would otherwise linger, and an unchanged
+                        // message is never re-reported by delta. Rather than
+                        // tracking prior state to revert precisely, clear all
+                        // delta links and reset `backfill_done` so the next
+                        // tick runs a full re-enumeration + re-upsert, re-adding
+                        // anything the dropped op wrongly removed locally.
+                        let _ = self.store.clear_delta_links();
+                        self.backfill_done = false;
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
@@ -813,11 +841,11 @@ mod tests {
 
     // Routes for: top-level folders (F1/Inbox), F1's (empty) child folders, and
     // F1's first messages/delta page (one message + a deltaLink). The deltaLink
-    // is stored but not followed within a single backfill, so it needn't point
-    // back at this server — the folder-scoped first delta call is what matters.
-    // Order matters: the fake server matches the FIRST route whose prefix
-    // matches, so the specific `/me/mailFolders/F1/...` routes precede the
-    // generic `/me/mailFolders`.
+    // is a *relative* path on purpose: `GraphClient` joins any non-http link
+    // onto its injected base, so a follow-up (incremental) delta lands back on
+    // this fake server rather than a real host. Order matters: the fake server
+    // matches the FIRST route whose prefix matches, so the specific
+    // `/me/mailFolders/F1/...` routes precede the generic `/me/mailFolders`.
     fn backfill_routes() -> Vec<Route> {
         vec![
             Route {
@@ -832,7 +860,7 @@ mod tests {
                 path_prefix: "/me/mailFolders/F1/messages/delta".into(),
                 status: 200,
                 headers: vec![],
-                body: r#"{"value":[{"id":"M1","conversationId":"C1","subject":"Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"2026-07-16T09:00:00Z","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"hi"}],"@odata.deltaLink":"https://graph.invalid/me/mailFolders/F1/messages/delta?token=D1"}"#.into(),
+                body: r#"{"value":[{"id":"M1","conversationId":"C1","subject":"Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"2026-07-16T09:00:00Z","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"hi"}],"@odata.deltaLink":"/me/mailFolders/F1/messages/delta?token=D1"}"#.into(),
             },
             Route {
                 method: "GET".into(),
@@ -949,6 +977,246 @@ mod tests {
         // Local row reflects the optimistic write immediately.
         let store = Store::open(&store_path).unwrap();
         assert!(store.messages_in_folder("F1", 50, 0).unwrap()[0].is_read);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Routes for a two-folder mailbox (F1 + DEST) plus a `/move` endpoint, so a
+    // Move command's optimistic local re-file has a real destination folder to
+    // land in (the schema FKs `messages.folder_id` to `folders.id`).
+    fn move_routes() -> Vec<Route> {
+        vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/M1/move".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"M1-NEW"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"M1","conversationId":"C1","subject":"Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"2026-07-16T09:00:00Z","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"hi"}],"@odata.deltaLink":"/me/mailFolders/F1/messages/delta?token=D1"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/DEST/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/DEST/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[],"@odata.deltaLink":"/me/mailFolders/DEST/messages/delta?token=D2"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":1,"wellKnownName":"inbox"},{"id":"DEST","displayName":"Archive","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"archive"}]}"#.into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn move_command_optimistically_refiles_locally() {
+        let srv = FakeServer::start(move_routes());
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("move");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Wait for the backfill of F1 so M1 exists locally.
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+        });
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::Move {
+                id: "M1".into(),
+                dest: "DEST".into(),
+            })
+            .unwrap();
+
+        // The optimistic local re-file happens before the outbox drain POSTs
+        // the move, so once the POST is observed the local row is already in
+        // DEST.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if srv
+                .requests()
+                .iter()
+                .any(|r| r.method == "POST" && r.path.starts_with("/me/messages/M1/move"))
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("no move POST observed; requests: {:?}", srv.requests());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.messages_in_folder("F1", 50, 0).unwrap().is_empty());
+        assert_eq!(store.messages_in_folder("DEST", 50, 0).unwrap()[0].id, "M1");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_drops_op_and_clears_delta_links_for_reconverge() {
+        // A Delete op whose Graph call always 404s (a non-retryable 4xx). After
+        // MAX_OP_ATTEMPTS drains it must be quarantined (dropped + Error), and
+        // the reconverge must clear stored delta links so the next full pass
+        // re-fetches server truth.
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("quarantine");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Backfill first, so F1 gets a stored (followable) delta link.
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+        });
+
+        // The Delete command drains once (attempt 1); each Refresh drains again
+        // (attempts 2..5). The 4th Refresh is the 5th failed drain and
+        // quarantines. Exactly 4 Refreshes on purpose: a trailing Refresh would
+        // re-store F1's delta link (its folder-delta step precedes the drain
+        // that clears links), defeating the reconverge assertion below.
+        handle
+            .cmd_tx
+            .send(SyncCommand::Delete { id: "M1".into() })
+            .unwrap();
+        for _ in 0..4 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))),
+            "expected a quarantine Error event, saw: {events:?}"
+        );
+
+        // The op was dropped and every folder's delta link was nulled so the
+        // next pass reconverges from the server.
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert!(store.get_delta_link("F1").unwrap().is_none());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tick_reenumerates_folders_when_folder_set_is_empty() {
+        // Fix 2 decision-logic coverage: when the local folder set is empty
+        // (the observable proxy for "initial backfill never landed", e.g.
+        // launched offline), a periodic tick must run a FULL pass and re-hit
+        // `/me/mailFolders` rather than the incremental delta path. A server
+        // that returns an empty folder list keeps `folders()` empty across
+        // ticks, so `/me/mailFolders` should be requested more than once.
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[]}"#.into(),
+        }]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("reenum");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Short tick so ticks fire quickly; no error path means no back-off
+        // gate, so ticks run steadily.
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_millis(100),
+        );
+
+        // Startup enumeration lands first.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        // At least one tick must re-request the folder list (>1 total).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = srv
+                .requests()
+                .iter()
+                .filter(|r| r.method == "GET" && r.path.starts_with("/me/mailFolders"))
+                .count();
+            if n >= 2 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("tick did not re-enumerate folders; requests: {:?}", srv.requests());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

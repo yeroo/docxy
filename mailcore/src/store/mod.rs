@@ -345,6 +345,22 @@ impl Store {
         );
     }
 
+    /// Locally re-files a message under `dest_folder_id` — the optimistic
+    /// half of a triage move (the sync engine's outbox is what tells Graph).
+    /// Unlike `set_read`/`set_flag` this returns a `Result`: the sync engine
+    /// applies it in the same spot it enqueues the outbox op, where a store
+    /// failure is worth surfacing. A mismatched/already-gone `id` just changes
+    /// zero rows (not an error). Graph mints a *new* id on move, but that's
+    /// reconciled by the next delta (old id `@removed`, new id added), so the
+    /// local id is left as-is here.
+    pub fn move_message(&self, id: &str, dest_folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET folder_id = ?2 WHERE id = ?1",
+            params![id, dest_folder_id],
+        )?;
+        Ok(())
+    }
+
     /// The stored delta link for a folder, if any (`None` before the first
     /// sync, or if the folder doesn't exist).
     pub fn get_delta_link(&self, folder_id: &str) -> Result<Option<String>, StoreError> {
@@ -371,6 +387,17 @@ impl Store {
             "UPDATE folders SET delta_link = ?1 WHERE id = ?2",
             params![link, folder_id],
         )?;
+        Ok(())
+    }
+
+    /// Clears every folder's stored delta link, so the next sync re-fetches
+    /// each folder from scratch (a fresh `DeltaCursor::Folder`) rather than
+    /// resuming from a token. Used by the sync engine to reconverge the local
+    /// store with server truth after it has quarantined a bad outbox op (whose
+    /// optimistic local write would otherwise linger).
+    pub fn clear_delta_links(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute("UPDATE folders SET delta_link = NULL", [])?;
         Ok(())
     }
 
@@ -682,6 +709,46 @@ mod tests {
         s.set_read("10", true);
         let rows = s.messages_in_folder("F", 50, 0).unwrap();
         assert!(rows[0].is_read);
+    }
+
+    #[test]
+    fn move_message_refiles_locally() {
+        let s = Store::open_in_memory().unwrap();
+        for id in ["F", "DEST"] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: id.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        }
+        s.upsert_message("F", &msg("10", false)).unwrap();
+        s.move_message("10", "DEST").unwrap();
+        assert!(s.messages_in_folder("F", 50, 0).unwrap().is_empty());
+        assert_eq!(s.messages_in_folder("DEST", 50, 0).unwrap()[0].id, "10");
+    }
+
+    #[test]
+    fn clear_delta_links_nulls_all_links() {
+        let s = Store::open_in_memory().unwrap();
+        for id in ["F1", "F2"] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: id.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+            s.set_delta_link(id, "LINK").unwrap();
+        }
+        s.clear_delta_links().unwrap();
+        assert!(s.get_delta_link("F1").unwrap().is_none());
+        assert!(s.get_delta_link("F2").unwrap().is_none());
     }
 
     #[test]
