@@ -763,7 +763,12 @@ impl Engine {
                 return;
             }
         };
-        let redirect_uri = format!("http://localhost:{port}");
+        // The redirect host must match the bind (`127.0.0.1`), NOT `localhost`:
+        // if `localhost` resolved to `::1` (IPv6) first, the browser redirect
+        // would hit nothing (the listener is IPv4-only) and sign-in would hang
+        // to the timeout. `127.0.0.1` is an equally valid Entra public-client
+        // loopback redirect host.
+        let redirect_uri = format!("http://127.0.0.1:{port}");
         let req = auth::begin_auth(&self.config.cfg, &redirect_uri);
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
@@ -787,6 +792,13 @@ impl Engine {
                 let _ = tokencache::save(&self.config.token_path, &t);
                 self.token = Some(t);
                 self.clear_backoff();
+                // Emit an explicit past-sign-in signal BEFORE the first sync
+                // pass. If that pass fails transiently it only emits `Offline`
+                // (never `Idle`/`FoldersUpdated`), and the UI clears the
+                // sign-in modal on any non-`SignInRequired` state — so this
+                // `Syncing` guarantees the modal clears the moment auth
+                // succeeded, rather than staying stuck if the first sync fails.
+                self.set_state(SyncState::Syncing);
                 self.sync_pass(true);
             }
             Err(e) => {

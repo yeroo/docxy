@@ -33,14 +33,22 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         app.folders.len(),
         app.visible_message_count()
     );
-    if let Some(notice) = &app.attachment_notice {
+    // An error notice takes precedence over the attachment (success) notice
+    // and is drawn in a distinct red style — a failed save must never look
+    // like a success. Otherwise the normal dark-gray bar shows the last
+    // attachment save/open outcome, if any.
+    let style = if let Some(err) = &app.error_notice {
         line.push_str(" — ");
-        line.push_str(notice);
-    }
-    f.render_widget(
-        Paragraph::new(line).style(Style::new().fg(Color::White).bg(Color::DarkGray)),
-        area,
-    );
+        line.push_str(err);
+        Style::new().fg(Color::White).bg(Color::Red)
+    } else {
+        if let Some(notice) = &app.attachment_notice {
+            line.push_str(" — ");
+            line.push_str(notice);
+        }
+        Style::new().fg(Color::White).bg(Color::DarkGray)
+    };
+    f.render_widget(Paragraph::new(line).style(style), area);
 }
 
 #[cfg(test)]
@@ -69,5 +77,16 @@ mod tests {
         let text = render(&app);
         assert!(text.contains("1 folder(s)"));
         assert!(text.contains("1 message(s)"));
+    }
+
+    #[test]
+    fn error_notice_is_shown_and_takes_precedence_over_the_success_notice() {
+        let mut app = App::for_test_with_seeded_store();
+        app.attachment_notice = Some("Saved: ok.txt".into());
+        app.error_notice = Some("save failed".into());
+        let text = render(&app);
+        assert!(text.contains("save failed"));
+        // The success notice is suppressed while an error is showing.
+        assert!(!text.contains("Saved: ok.txt"));
     }
 }

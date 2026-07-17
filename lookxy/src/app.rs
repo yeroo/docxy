@@ -61,6 +61,14 @@ pub struct App {
     /// The last attachment save/open outcome (e.g. "Saved: C:\...\f.txt"),
     /// for the status bar to show. `None` until the first save completes.
     pub attachment_notice: Option<String>,
+    /// The last surfaced `SyncEvent::Error` message (a failed attachment save,
+    /// a quarantined triage op, a per-folder sync failure, …), for the status
+    /// bar to show in a distinct error style — taking precedence over
+    /// `attachment_notice` so a failure can't masquerade as a success. Set on
+    /// `SyncEvent::Error`, cleared on the next user key press (see
+    /// `main::run`) or the next successful sync state (`State(Idle)`/
+    /// `FoldersUpdated`) — see `on_sync_event`.
+    pub error_notice: Option<String>,
     /// In-flight `SaveAttachment` requests keyed by their `dest` path, each
     /// mapped to whether it should be opened once it completes (`o`) or
     /// merely reported (Enter). Keyed per-request (rather than one shared
@@ -180,6 +188,7 @@ impl App {
             search: None,
             attachments: None,
             attachment_notice: None,
+            error_notice: None,
             pending_saves: std::collections::HashMap::new(),
             token_path,
             account: None,
@@ -221,13 +230,24 @@ impl App {
     pub fn on_sync_event(&mut self, evt: SyncEvent) {
         match evt {
             SyncEvent::State(s) => {
-                if matches!(s, SyncState::Idle) {
+                // Any state that isn't `SignInRequired` means we're past
+                // sign-in — auth already succeeded — so clear the modal. This
+                // covers the transient case where the first sync pass right
+                // after a successful redeem fails (engine emits `Syncing` then
+                // `Offline`, never `Idle`/`FoldersUpdated`): the modal would
+                // otherwise stay stuck blocking all keys forever. A resting
+                // `Idle` additionally clears any error notice.
+                if !matches!(s, SyncState::SignInRequired) {
                     self.signin_modal = None;
+                }
+                if matches!(s, SyncState::Idle) {
+                    self.error_notice = None;
                 }
                 self.status = s;
             }
             SyncEvent::FoldersUpdated => {
                 self.signin_modal = None;
+                self.error_notice = None;
                 self.reload_account();
                 self.reload_folders();
             }
@@ -246,10 +266,17 @@ impl App {
                 self.open_url_with_os_handler(&authorize_url);
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
-            SyncEvent::MessagesUpdated { .. }
-            | SyncEvent::BodyReady { .. }
-            | SyncEvent::Error(_) => {}
+            SyncEvent::Error(msg) => self.error_notice = Some(msg),
+            SyncEvent::MessagesUpdated { .. } | SyncEvent::BodyReady { .. } => {}
         }
+    }
+
+    /// Whether a text-input context is currently capturing keystrokes — today
+    /// only the search prompt (`/`). The event loop consults this so a global
+    /// hotkey like `q`-to-quit doesn't steal a character the user is typing
+    /// into the query (searching for "quarterly" must not quit the app).
+    pub fn is_capturing_text(&self) -> bool {
+        self.search.is_some()
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt
@@ -950,21 +977,14 @@ pub fn lookxy_dir() -> PathBuf {
         .join("lookxy")
 }
 
-/// The per-account mail database path: `<lookxy_dir>\<sanitized-account>\mail.db`.
-/// The account (a UPN like `me@epam.com`) is sanitized so it's a valid single
-/// path component: `@`, `\`, and `/` become `_`.
-pub fn store_path_for(account: &str) -> PathBuf {
-    let sanitized: String = account
-        .chars()
-        .map(|c| {
-            if matches!(c, '@' | '\\' | '/') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    lookxy_dir().join(sanitized).join("mail.db")
+/// The single mail database path: `<lookxy_dir>\mail.db`. v1 is single-account
+/// (the token cache `token.bin` is likewise not per-account), so the store is
+/// one fixed file rather than keyed on the signed-in account — the account is
+/// only a status-bar display detail read from the token, never a DB-path key.
+/// Per-account DBs (a subdirectory per account) are a future multi-account
+/// concern, deliberately out of scope for v1.
+pub fn store_path_for() -> PathBuf {
+    lookxy_dir().join("mail.db")
 }
 
 /// The OS "Downloads" directory attachments are saved into:
@@ -1031,12 +1051,16 @@ mod tests {
     }
 
     #[test]
-    fn store_path_is_under_local_appdata_per_account() {
-        let p = store_path_for("me@epam.com");
+    fn store_path_is_the_single_fixed_db_under_local_appdata() {
+        // v1 is single-account: one fixed DB file, no per-account component.
+        let p = store_path_for();
         let s = p.to_string_lossy();
         assert!(s.contains("lookxy"));
         assert!(s.ends_with("mail.db"));
-        assert!(s.contains("me_epam.com") || s.contains("me@epam.com"));
+        assert!(!s.contains("me_epam.com"));
+        assert!(!s.contains('@'));
+        // The DB sits directly under `lookxy_dir()`, with no extra path segment.
+        assert_eq!(p, lookxy_dir().join("mail.db"));
     }
 
     #[test]
@@ -1498,5 +1522,60 @@ mod tests {
         let app = App::for_test_with_empty_store();
         assert!(app.account.is_none());
         assert!(app.signin_modal.is_none());
+    }
+
+    #[test]
+    fn sync_error_is_surfaced_and_rendered_in_the_status_bar() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::Error("boom".into()));
+        assert_eq!(app.error_notice.as_deref(), Some("boom"));
+        assert!(app.render_contains("boom"));
+    }
+
+    #[test]
+    fn a_successful_sync_state_clears_a_prior_error_notice() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::Error("boom".into()));
+        assert!(app.error_notice.is_some());
+        app.on_sync_event(SyncEvent::State(SyncState::Idle));
+        assert!(app.error_notice.is_none());
+    }
+
+    #[test]
+    fn a_non_signin_state_after_sign_in_clears_the_modal() {
+        // A transient failure right after a successful redeem emits `Syncing`
+        // then `Offline` — neither is `Idle`/`FoldersUpdated`, but both mean
+        // auth already succeeded, so the modal must clear rather than stay
+        // stuck blocking all keys.
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/x?y=1".into(),
+        });
+        assert!(app.signin_modal.is_some());
+
+        app.on_sync_event(SyncEvent::State(SyncState::Syncing));
+        assert!(app.signin_modal.is_none());
+    }
+
+    #[test]
+    fn state_signin_required_keeps_the_modal_showing() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInRequired);
+        assert!(app.signin_modal.is_some());
+
+        // The `State(SignInRequired)` that `enter_signin` emits alongside the
+        // `SignInRequired` event must NOT clear the modal it just opened.
+        app.on_sync_event(SyncEvent::State(SyncState::SignInRequired));
+        assert!(app.signin_modal.is_some());
+    }
+
+    #[test]
+    fn search_prompt_captures_text_so_q_is_not_a_global_quit() {
+        let mut app = App::for_test_with_seeded_store();
+        assert!(!app.is_capturing_text());
+        app.start_search();
+        assert!(app.is_capturing_text());
+        app.cancel_search();
+        assert!(!app.is_capturing_text());
     }
 }

@@ -38,16 +38,13 @@ fn main() -> io::Result<()> {
     let local_appdata = app::lookxy_dir();
     let token_path = local_appdata.join("token.bin");
 
-    // The account isn't known until sign-in completes; reuse whatever a
-    // previously cached token names, or fall back to a placeholder store
-    // until then.
-    let account = mailcore::tokencache::load(&token_path)
-        .ok()
-        .flatten()
-        .map(|t| t.account)
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    let store_path = app::store_path_for(&account);
+    // v1 is single-account: one fixed store DB alongside the single token
+    // cache, rather than a per-account subdirectory. Resolving the account
+    // before sign-in used to guess "default", opening a throwaway DB whose
+    // first-run backfill was discarded once the real account was known — a
+    // fixed path avoids that. (Per-account DBs are a future multi-account
+    // concern; see `store_path_for`.)
+    let store_path = app::store_path_for();
     if let Some(dir) = store_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -114,9 +111,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    let ctrl_c =
-                        k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
-                    if ctrl_c || k.code == KeyCode::Char('q') {
+                    // Any key press acknowledges (and clears) a transient error
+                    // notice — same lifecycle as the sync states that clear it.
+                    app.error_notice = None;
+                    if is_global_quit(app, &k) {
                         app.quit = true;
                     } else {
                         ui::handle_key(app, k);
@@ -133,6 +131,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     }
 }
 
+/// Whether `k` should quit the whole app. Ctrl-C always quits. `q` quits
+/// only when no text-input context is capturing keystrokes (`App::
+/// is_capturing_text`) — otherwise `q` is a character the user is typing into
+/// the search prompt (searching for "quarterly"/"query" must not quit), so it
+/// falls through to `ui::handle_key` instead.
+fn is_global_quit(app: &App, k: &event::KeyEvent) -> bool {
+    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+    let q_quit = k.code == KeyCode::Char('q') && !app.is_capturing_text();
+    ctrl_c || q_quit
+}
+
 /// Drains every pending `SyncEvent` without blocking, handing each to
 /// `App::on_sync_event` — which reloads whatever cached state it
 /// invalidated (folders/messages/body/attachments), tracks the sync status,
@@ -141,5 +150,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
         app.on_sync_event(evt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyEvent;
+
+    #[test]
+    fn q_in_the_search_prompt_types_into_the_query_rather_than_quitting() {
+        let mut app = App::for_test_with_seeded_store();
+        app.start_search();
+        let k = KeyEvent::from(KeyCode::Char('q'));
+        // The event loop must not treat this `q` as a global quit...
+        assert!(!is_global_quit(&app, &k));
+        // ...it falls through to the search input handler, appending 'q'.
+        ui::handle_key(&mut app, k);
+        assert_eq!(app.search.as_ref().unwrap().query, "q");
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn q_still_quits_when_no_text_input_is_active() {
+        let app = App::for_test_with_seeded_store();
+        let k = KeyEvent::from(KeyCode::Char('q'));
+        assert!(is_global_quit(&app, &k));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_the_search_prompt_is_capturing_text() {
+        let mut app = App::for_test_with_seeded_store();
+        app.start_search();
+        let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(is_global_quit(&app, &k));
     }
 }
