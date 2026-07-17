@@ -4,6 +4,7 @@
 //! (Microsoft Graph REST client), `store` (SQLite), `sync` (background engine).
 
 pub mod auth;
+pub mod graph;
 pub mod json;
 pub mod pkce;
 pub mod tokencache;
