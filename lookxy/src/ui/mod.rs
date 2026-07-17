@@ -467,16 +467,19 @@ mod tests {
         // Well-known order puts "inbox" before "archive"; move down onto it.
         handle_key(&mut app, KeyEvent::from(KeyCode::Down));
         assert_eq!(
-            app.move_picker.as_ref().unwrap().folders
-                [app.move_picker.as_ref().unwrap().index]
-                .id,
+            app.move_picker.as_ref().unwrap().folders[app.move_picker.as_ref().unwrap().index].id,
             "archive"
         );
 
         handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
 
         assert!(app.move_picker.is_none());
-        assert!(app.store.messages_in_folder("inbox", 50, 0).unwrap().is_empty());
+        assert!(
+            app.store
+                .messages_in_folder("inbox", 50, 0)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             app.store.messages_in_folder("archive", 50, 0).unwrap()[0].id,
             "m1"
@@ -495,7 +498,10 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
 
         assert!(app.move_picker.is_none());
-        assert_eq!(app.store.messages_in_folder("inbox", 50, 0).unwrap().len(), 1);
+        assert_eq!(
+            app.store.messages_in_folder("inbox", 50, 0).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -617,7 +623,10 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
 
-        let popup = app.attachments.as_ref().expect("popup opens in a loading state");
+        let popup = app
+            .attachments
+            .as_ref()
+            .expect("popup opens in a loading state");
         assert!(popup.loading);
         let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
         assert!(matches!(

@@ -373,8 +373,7 @@ impl<'a> Parser<'a> {
         }
         let span = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
             .map_err(|_| self.err("invalid unicode escape"))?;
-        let cp =
-            u16::from_str_radix(span, 16).map_err(|_| self.err("invalid unicode escape"))?;
+        let cp = u16::from_str_radix(span, 16).map_err(|_| self.err("invalid unicode escape"))?;
         self.pos += 4;
         Ok(cp)
     }
@@ -504,7 +503,10 @@ mod tests {
         let v = parse(src).unwrap();
         let out = v.to_string();
         let v2 = parse(&out).unwrap();
-        assert_eq!(v2.get("b").unwrap().as_array().unwrap()[1].as_str(), Some("x"));
+        assert_eq!(
+            v2.get("b").unwrap().as_array().unwrap()[1].as_str(),
+            Some("x")
+        );
     }
 
     #[test]

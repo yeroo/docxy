@@ -145,7 +145,11 @@ pub fn redeem_code(
 /// rotated); when it does, the caller's `refresh_token` is carried forward
 /// into the returned `TokenSet` rather than being silently replaced with
 /// an empty string.
-pub fn refresh(cfg: &AuthConfig, http_base: &str, refresh_token: &str) -> Result<TokenSet, AuthError> {
+pub fn refresh(
+    cfg: &AuthConfig,
+    http_base: &str,
+    refresh_token: &str,
+) -> Result<TokenSet, AuthError> {
     let body = pkce::form_urlencode(&[
         ("grant_type", "refresh_token"),
         ("client_id", cfg.client_id.as_str()),
@@ -266,12 +270,18 @@ mod tests {
     #[test]
     fn begin_auth_builds_authorize_url_with_challenge_and_state() {
         let req = begin_auth(&cfg(), "http://localhost:8400");
-        assert!(req.authorize_url.contains("/organizations/oauth2/v2.0/authorize"));
+        assert!(
+            req.authorize_url
+                .contains("/organizations/oauth2/v2.0/authorize")
+        );
         assert!(req.authorize_url.contains("client_id=cid"));
         assert!(req.authorize_url.contains("code_challenge="));
         assert!(req.authorize_url.contains("code_challenge_method=S256"));
         assert!(req.authorize_url.contains(&format!("state={}", req.state)));
-        assert!(req.authorize_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8400"));
+        assert!(
+            req.authorize_url
+                .contains("redirect_uri=http%3A%2F%2Flocalhost%3A8400")
+        );
     }
 
     #[test]

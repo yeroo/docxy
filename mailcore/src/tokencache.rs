@@ -71,8 +71,8 @@ pub fn load(path: &Path) -> io::Result<Option<TokenSet>> {
         Err(e) => return Err(e),
     };
     let plaintext = unprotect(&ciphertext)?;
-    let text = String::from_utf8(plaintext)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let text =
+        String::from_utf8(plaintext).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let v = json::parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let access_token = v
@@ -116,7 +116,7 @@ pub fn load(path: &Path) -> io::Result<Option<TokenSet>> {
 fn protect(bytes: &[u8]) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
     };
 
     // `CryptProtectData` takes a non-const in-blob pointer at the FFI
@@ -160,7 +160,7 @@ fn protect(bytes: &[u8]) -> io::Result<Vec<u8>> {
 fn unprotect(bytes: &[u8]) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
 
     let mut input = bytes.to_vec();

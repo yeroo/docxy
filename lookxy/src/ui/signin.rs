@@ -89,8 +89,8 @@ mod tests {
     fn started_modal_renders_the_browser_message_and_fallback_url() {
         let mut app = App::for_test_with_seeded_store();
         app.signin_modal = Some(SignInModal::Started {
-            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
-                .into(),
+            authorize_url:
+                "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1".into(),
         });
 
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();

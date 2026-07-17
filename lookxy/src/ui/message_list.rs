@@ -64,7 +64,10 @@ fn line(m: &MessageRow, width: usize) -> Line<'static> {
     let flagged = if m.is_flagged { "!" } else { " " };
     let attached = if m.has_attachments { "@" } else { " " };
     let time = short_time(&m.received_at);
-    let text = format!("{flagged}{attached} {time}  {} — {}", m.from_name, m.subject);
+    let text = format!(
+        "{flagged}{attached} {time}  {} — {}",
+        m.from_name, m.subject
+    );
     let truncated = truncate_width(&text, width);
 
     let mut style = Style::default();

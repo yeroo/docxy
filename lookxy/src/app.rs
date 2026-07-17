@@ -246,7 +246,9 @@ impl App {
                 self.open_url_with_os_handler(&authorize_url);
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
-            SyncEvent::MessagesUpdated { .. } | SyncEvent::BodyReady { .. } | SyncEvent::Error(_) => {}
+            SyncEvent::MessagesUpdated { .. }
+            | SyncEvent::BodyReady { .. }
+            | SyncEvent::Error(_) => {}
         }
     }
 
@@ -509,7 +511,10 @@ impl App {
         let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
             return;
         };
-        let results = self.store.search(&query, SEARCH_PAGE_SIZE).unwrap_or_default();
+        let results = self
+            .store
+            .search(&query, SEARCH_PAGE_SIZE)
+            .unwrap_or_default();
         if let Some(search) = &mut self.search {
             search.results = Some(results);
         }
@@ -951,7 +956,13 @@ pub fn lookxy_dir() -> PathBuf {
 pub fn store_path_for(account: &str) -> PathBuf {
     let sanitized: String = account
         .chars()
-        .map(|c| if matches!(c, '@' | '\\' | '/') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '@' | '\\' | '/') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     lookxy_dir().join(sanitized).join("mail.db")
 }
@@ -1054,13 +1065,22 @@ mod tests {
     fn opening_a_message_with_a_cached_body_renders_it_without_fetching() {
         let mut app = App::for_test_with_seeded_store();
         app.store
-            .put_body("m1", &Body { content_type: "text".into(), content: "hello body".into() })
+            .put_body(
+                "m1",
+                &Body {
+                    content_type: "text".into(),
+                    content: "hello body".into(),
+                },
+            )
             .expect("seed body");
 
         app.open_message("m1");
 
         assert!(!app.body_loading);
-        assert_eq!(app.body.as_ref().map(|b| b.content.as_str()), Some("hello body"));
+        assert_eq!(
+            app.body.as_ref().map(|b| b.content.as_str()),
+            Some("hello body")
+        );
     }
 
     #[test]
@@ -1428,8 +1448,8 @@ mod tests {
         let mut app = App::for_test_with_seeded_store();
         // in test mode the browser-open is stubbed (a flag), not actually launched
         app.on_sync_event(SyncEvent::SignInStarted {
-            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
-                .into(),
+            authorize_url:
+                "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1".into(),
         });
         assert!(app.render_contains("browser"));
         assert!(app.browser_open_was_requested());
@@ -1442,8 +1462,8 @@ mod tests {
         // than re-triggering the sign-in command.
         let mut app = App::for_test_with_seeded_store();
         app.on_sync_event(SyncEvent::SignInStarted {
-            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
-                .into(),
+            authorize_url:
+                "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1".into(),
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());

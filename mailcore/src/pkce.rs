@@ -17,7 +17,10 @@ impl Pkce {
     pub fn generate() -> Pkce {
         let verifier = base64url_encode(&random_bytes(32));
         let challenge = base64url_encode(&sha256(verifier.as_bytes()));
-        Pkce { verifier, challenge }
+        Pkce {
+            verifier,
+            challenge,
+        }
     }
 }
 
@@ -25,7 +28,7 @@ impl Pkce {
 #[cfg(windows)]
 fn random_bytes(n: usize) -> Vec<u8> {
     use windows_sys::Win32::Security::Cryptography::{
-        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
 
     let mut buf = vec![0u8; n];
@@ -71,7 +74,8 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     // Padding: a single 1-bit (0x80 byte), zeros, then the 64-bit
@@ -145,8 +149,7 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     out
 }
 
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Base64url (RFC 4648 section 5), no padding.
 pub fn base64url_encode(bytes: &[u8]) -> String {
@@ -245,8 +248,13 @@ mod pkce_tests {
     #[test]
     fn challenge_is_base64url_of_sha256_of_verifier() {
         let p = Pkce::generate();
-        assert_eq!(p.challenge, base64url_encode(&sha256(p.verifier.as_bytes())));
-        assert!(!p.verifier.contains('=') && !p.verifier.contains('+') && !p.verifier.contains('/'));
+        assert_eq!(
+            p.challenge,
+            base64url_encode(&sha256(p.verifier.as_bytes()))
+        );
+        assert!(
+            !p.verifier.contains('=') && !p.verifier.contains('+') && !p.verifier.contains('/')
+        );
     }
     #[test]
     fn base64url_roundtrips() {

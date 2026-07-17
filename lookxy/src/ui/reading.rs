@@ -40,10 +40,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.extend(body_lines(app, inner_width));
             lines
         }
-        None => vec![Line::from("(no message selected — press Enter on a message)")],
+        None => vec![Line::from(
+            "(no message selected — press Enter on a message)",
+        )],
     };
 
-    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The message named by `App::selected_msg`, if it's still in the currently
@@ -69,11 +76,15 @@ fn body_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     match (&app.body, app.body_loading) {
         (_, true) => vec![Line::from("loading…")],
         (Some(body), false) if body.content_type.eq_ignore_ascii_case("html") => {
-            htmlrender::render_html(&body.content, width).iter().map(to_ratatui_line).collect()
+            htmlrender::render_html(&body.content, width)
+                .iter()
+                .map(to_ratatui_line)
+                .collect()
         }
-        (Some(body), false) => {
-            htmlrender::render_text(&body.content, width).iter().map(to_ratatui_line).collect()
-        }
+        (Some(body), false) => htmlrender::render_text(&body.content, width)
+            .iter()
+            .map(to_ratatui_line)
+            .collect(),
         (None, false) => vec![Line::from("(no body)")],
     }
 }

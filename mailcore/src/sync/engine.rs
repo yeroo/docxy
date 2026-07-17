@@ -309,8 +309,8 @@ impl Engine {
                 return;
             }
         }
-        let needs_full = !self.backfill_done
-            || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
+        let needs_full =
+            !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
         self.sync_pass(needs_full);
     }
 
@@ -924,9 +924,7 @@ fn listen_for_code(listener: &TcpListener, expected_state: &str) -> Result<Strin
             Ok((stream, _addr)) => return handle_redirect(stream, expected_state),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Err(
-                        "timed out waiting for the browser to complete sign-in".to_string()
-                    );
+                    return Err("timed out waiting for the browser to complete sign-in".to_string());
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -978,9 +976,7 @@ fn read_request_line(
             .map_err(|e| format!("could not set read timeout: {e}"))?;
         match stream.read(&mut byte) {
             Ok(0) => {
-                return Err(
-                    "connection closed before a full request line was read".to_string()
-                );
+                return Err("connection closed before a full request line was read".to_string());
             }
             Ok(_) => {
                 let b = byte[0];
@@ -1120,18 +1116,16 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push((h << 4) | l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h << 4) | l);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -1203,7 +1197,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lookxy-sync-{tag}-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lookxy-sync-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1312,9 +1307,10 @@ mod tests {
         );
 
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         let store = Store::open(&store_path).unwrap();
         let msgs = store.messages_in_folder("F1", 50, 0).unwrap();
@@ -1358,9 +1354,10 @@ mod tests {
         );
 
         // Let the backfill land first so M1 exists locally.
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         handle
             .cmd_tx
@@ -1472,9 +1469,10 @@ mod tests {
         );
 
         // Wait for the backfill of F1 so M1 exists locally.
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         handle
             .cmd_tx
@@ -1546,9 +1544,10 @@ mod tests {
         );
 
         // Backfill first, so F1 gets a stored (followable) delta link.
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         // The Delete command drains once (attempt 1); each Refresh drains again
         // (attempts 2..5). The 4th Refresh is the 5th failed drain and
@@ -1563,9 +1562,10 @@ mod tests {
             handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
         }
 
-        let events = wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))
-        });
+        let events = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
         assert!(
             events
                 .iter()
@@ -1644,9 +1644,10 @@ mod tests {
         );
 
         // Backfill lands (M1 skipped as too old — the store is empty).
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
         assert!(
             Store::open(&store_path)
                 .unwrap()
@@ -1666,9 +1667,10 @@ mod tests {
         for _ in 0..5 {
             handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
         }
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
 
         // The reconverge pass ignores the cutoff and re-adds the old M1.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1741,7 +1743,10 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!("tick did not re-enumerate folders; requests: {:?}", srv.requests());
+                panic!(
+                    "tick did not re-enumerate folders; requests: {:?}",
+                    srv.requests()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1788,9 +1793,10 @@ mod tests {
         // Let the backfill land first so M1 exists locally (not strictly
         // required for the Graph fetch itself, but keeps the fixture
         // realistic and lets us wait on a well-defined signal first).
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         handle
             .cmd_tx
@@ -1804,9 +1810,11 @@ mod tests {
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::AttachmentSaved { .. })
         });
-        assert!(events.iter().any(
-            |e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest)
-        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest))
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
@@ -1848,9 +1856,10 @@ mod tests {
         );
 
         // Let the backfill land first so M1 exists locally.
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
 
         handle
             .cmd_tx
@@ -2030,7 +2039,8 @@ mod tests {
 
         // Simulate the browser landing on the loopback redirect.
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
-        let request = format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let request =
+            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         client.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();

@@ -23,7 +23,10 @@ impl MailFolder {
             display_name: str_field(v, "displayName"),
             parent_id: opt_str_field(v, "parentFolderId"),
             total_count: v.get("totalItemCount").and_then(Value::as_i64).unwrap_or(0),
-            unread_count: v.get("unreadItemCount").and_then(Value::as_i64).unwrap_or(0),
+            unread_count: v
+                .get("unreadItemCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
             well_known_name: opt_str_field(v, "wellKnownName"),
         })
     }
@@ -71,14 +74,20 @@ impl Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
             subject: str_field(v, "subject"),
-            from: v.get("from").and_then(Recipient::from_json).unwrap_or_default(),
+            from: v
+                .get("from")
+                .and_then(Recipient::from_json)
+                .unwrap_or_default(),
             to: recipient_list(v, "toRecipients"),
             cc: recipient_list(v, "ccRecipients"),
             received: str_field(v, "receivedDateTime"),
             sent: str_field(v, "sentDateTime"),
             is_read: v.get("isRead").and_then(Value::as_bool).unwrap_or(false),
             is_flagged: parse_flag(v),
-            has_attachments: v.get("hasAttachments").and_then(Value::as_bool).unwrap_or(false),
+            has_attachments: v
+                .get("hasAttachments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             importance: str_field(v, "importance"),
             preview: str_field(v, "bodyPreview"),
         })
@@ -199,7 +208,8 @@ mod tests {
 
     #[test]
     fn parses_message() {
-        let v = parse(r#"{
+        let v = parse(
+            r#"{
           "id":"AAA","conversationId":"CID","subject":"Hi",
           "from":{"emailAddress":{"name":"A","address":"a@x"}},
           "toRecipients":[{"emailAddress":{"name":"B","address":"b@x"}}],
@@ -208,7 +218,9 @@ mod tests {
           "isRead":false,"hasAttachments":true,"importance":"normal",
           "bodyPreview":"hello",
           "flag":{"flagStatus":"flagged"}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let m = Message::from_json(&v).unwrap();
         assert_eq!(m.id, "AAA");
         assert_eq!(m.from.address, "a@x");
@@ -230,7 +242,10 @@ mod tests {
         let page = DeltaPage::from_json(&v).unwrap();
         assert_eq!(page.items.len(), 2);
         assert!(matches!(page.items[1], DeltaItem::Delete(ref id) if id == "M2"));
-        assert_eq!(page.delta_link.as_deref(), Some("https://graph/delta?token=xyz"));
+        assert_eq!(
+            page.delta_link.as_deref(),
+            Some("https://graph/delta?token=xyz")
+        );
         assert!(page.next_link.is_none());
     }
 

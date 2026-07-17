@@ -775,17 +775,26 @@ mod outbox_tests {
     #[test]
     fn enqueue_and_read_back_in_order() {
         let s = Store::open_in_memory().unwrap();
-        s.enqueue_op(&OutboxOp::MarkRead{id:"1".into(),read:true}).unwrap();
-        s.enqueue_op(&OutboxOp::Delete{id:"2".into()}).unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "1".into(),
+            read: true,
+        })
+        .unwrap();
+        s.enqueue_op(&OutboxOp::Delete { id: "2".into() }).unwrap();
         let ops = s.pending_ops().unwrap();
         assert_eq!(ops.len(), 2);
-        assert!(matches!(ops[0].op, OutboxOp::MarkRead{..}));
-        assert!(matches!(ops[1].op, OutboxOp::Delete{..}));
+        assert!(matches!(ops[0].op, OutboxOp::MarkRead { .. }));
+        assert!(matches!(ops[1].op, OutboxOp::Delete { .. }));
     }
     #[test]
     fn drop_removes_op() {
         let s = Store::open_in_memory().unwrap();
-        let seq = s.enqueue_op(&OutboxOp::SetFlag{id:"1".into(),flagged:true}).unwrap();
+        let seq = s
+            .enqueue_op(&OutboxOp::SetFlag {
+                id: "1".into(),
+                flagged: true,
+            })
+            .unwrap();
         s.drop_op(seq);
         assert!(s.pending_ops().unwrap().is_empty());
     }
@@ -793,9 +802,7 @@ mod outbox_tests {
     #[test]
     fn bump_op_attempts_increments_and_records_error() {
         let s = Store::open_in_memory().unwrap();
-        let seq = s
-            .enqueue_op(&OutboxOp::Delete { id: "1".into() })
-            .unwrap();
+        let seq = s.enqueue_op(&OutboxOp::Delete { id: "1".into() }).unwrap();
         s.bump_op_attempts(seq, "throttled");
         s.bump_op_attempts(seq, "throttled again");
         let ops = s.pending_ops().unwrap();
@@ -871,14 +878,44 @@ mod search_tests {
     #[test]
     fn search_matches_subject_and_body() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_folder(&MailFolder{id:"F".into(),display_name:"I".into(),parent_id:None,total_count:0,unread_count:0,well_known_name:None}).unwrap();
-        let mut m = Message{ id:"1".into(), conversation_id:"C".into(), subject:"Quarterly budget".into(),
-            from:Recipient{name:"A".into(),address:"a@x".into()}, to:vec![], cc:vec![],
-            received:"2026-07-10T00:00:00Z".into(), sent:"".into(), is_read:false, is_flagged:false,
-            has_attachments:false, importance:"normal".into(), preview:"".into() };
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "I".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+        let mut m = Message {
+            id: "1".into(),
+            conversation_id: "C".into(),
+            subject: "Quarterly budget".into(),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-07-10T00:00:00Z".into(),
+            sent: "".into(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "".into(),
+        };
         s.upsert_message("F", &m).unwrap();
-        s.put_body("1", &Body{content_type:"text".into(), content:"the pizza party is friday".into()}).unwrap();
-        m.id = "2".into(); m.subject = "Unrelated".into();
+        s.put_body(
+            "1",
+            &Body {
+                content_type: "text".into(),
+                content: "the pizza party is friday".into(),
+            },
+        )
+        .unwrap();
+        m.id = "2".into();
+        m.subject = "Unrelated".into();
         s.upsert_message("F", &m).unwrap();
         assert_eq!(s.search("budget", 50).unwrap().len(), 1);
         assert_eq!(s.search("pizza", 50).unwrap()[0].id, "1");

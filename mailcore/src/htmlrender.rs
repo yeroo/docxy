@@ -115,7 +115,9 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                         bold: bold > 0,
                         italic: italic > 0,
                         underline: underline > 0,
-                        link: link_stack.last().and_then(|(h, n)| (*n > 0).then(|| h.clone())),
+                        link: link_stack
+                            .last()
+                            .and_then(|(h, n)| (*n > 0).then(|| h.clone())),
                     });
                 }
             }
@@ -140,7 +142,10 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                     }
                     "li" => {
                         flush(&mut lines, &mut words, indent, width);
-                        words.push(Word { text: "-".to_string(), ..Default::default() });
+                        words.push(Word {
+                            text: "-".to_string(),
+                            ..Default::default()
+                        });
                     }
                     "table" => flush(&mut lines, &mut words, indent, width),
                     "tr" => {
@@ -149,7 +154,10 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                     }
                     "td" | "th" => {
                         if cells_in_row > 0 {
-                            words.push(Word { text: "|".to_string(), ..Default::default() });
+                            words.push(Word {
+                                text: "|".to_string(),
+                                ..Default::default()
+                            });
                         }
                         cells_in_row += 1;
                     }
@@ -255,14 +263,23 @@ pub fn render_text(plain: &str, width: usize) -> Vec<StyledLine> {
         let effective = width.saturating_sub(depth as usize * INDENT_SPACES).max(1);
         let words: Vec<Word> = rest
             .split_whitespace()
-            .map(|w| Word { text: w.to_string(), ..Default::default() })
+            .map(|w| Word {
+                text: w.to_string(),
+                ..Default::default()
+            })
             .collect();
         if words.is_empty() {
-            lines.push(StyledLine { spans: vec![], indent: depth });
+            lines.push(StyledLine {
+                spans: vec![],
+                indent: depth,
+            });
             continue;
         }
         for spans in wrap_words(&words, effective) {
-            lines.push(StyledLine { spans, indent: depth });
+            lines.push(StyledLine {
+                spans,
+                indent: depth,
+            });
         }
     }
     lines
@@ -299,7 +316,11 @@ fn wrap_words(words: &[Word], width: usize) -> Vec<Vec<StyledSpan>> {
             out.push(std::mem::take(&mut cur));
             cur_len = 0;
         }
-        let text = if cur.is_empty() { w.text.clone() } else { format!(" {}", w.text) };
+        let text = if cur.is_empty() {
+            w.text.clone()
+        } else {
+            format!(" {}", w.text)
+        };
         cur_len += text.chars().count();
         cur.push(StyledSpan {
             text,
@@ -337,8 +358,14 @@ fn trim_trailing_blank(lines: &mut Vec<StyledLine>) {
 /// than an XML one — see [`Tokenizer`].
 #[derive(Debug, PartialEq)]
 enum Token {
-    TagOpen { name: String, attrs: Vec<(String, String)>, self_close: bool },
-    TagClose { name: String },
+    TagOpen {
+        name: String,
+        attrs: Vec<(String, String)>,
+        self_close: bool,
+    },
+    TagClose {
+        name: String,
+    },
     Text(String),
     Eof,
 }
@@ -380,7 +407,10 @@ fn is_ws(c: u8) -> bool {
 
 impl<'a> Tokenizer<'a> {
     fn new(src: &'a str) -> Self {
-        Tokenizer { bytes: src.as_bytes(), pos: 0 }
+        Tokenizer {
+            bytes: src.as_bytes(),
+            pos: 0,
+        }
     }
 
     fn slice(&self, a: usize, b: usize) -> &'a str {
@@ -388,14 +418,20 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn find_from(&self, from: usize, byte: u8) -> Option<usize> {
-        self.bytes[from..].iter().position(|&c| c == byte).map(|x| from + x)
+        self.bytes[from..]
+            .iter()
+            .position(|&c| c == byte)
+            .map(|x| from + x)
     }
 
     fn find_seq(&self, from: usize, seq: &[u8]) -> Option<usize> {
         if from >= self.bytes.len() {
             return None;
         }
-        self.bytes[from..].windows(seq.len()).position(|w| w == seq).map(|x| from + x)
+        self.bytes[from..]
+            .windows(seq.len())
+            .position(|w| w == seq)
+            .map(|x| from + x)
     }
 
     fn next(&mut self) -> Token {
@@ -445,7 +481,8 @@ impl<'a> Tokenizer<'a> {
             if c == b'/' {
                 self.pos += 2; // consume "</"
                 let start = self.pos;
-                while self.pos < len && !is_ws(self.bytes[self.pos]) && self.bytes[self.pos] != b'>' {
+                while self.pos < len && !is_ws(self.bytes[self.pos]) && self.bytes[self.pos] != b'>'
+                {
                     self.pos += 1;
                 }
                 let name = self.slice(start, self.pos).to_ascii_lowercase();
@@ -504,7 +541,9 @@ impl<'a> Tokenizer<'a> {
                     while self.pos < len && is_ws(self.bytes[self.pos]) {
                         self.pos += 1;
                     }
-                    if self.pos < len && (self.bytes[self.pos] == b'"' || self.bytes[self.pos] == b'\'') {
+                    if self.pos < len
+                        && (self.bytes[self.pos] == b'"' || self.bytes[self.pos] == b'\'')
+                    {
                         let q = self.bytes[self.pos];
                         self.pos += 1;
                         let vs = self.pos;
@@ -515,7 +554,10 @@ impl<'a> Tokenizer<'a> {
                         // Unquoted value: stops at whitespace or '>' only —
                         // NOT '/', which is common inside a bare URL.
                         let vs = self.pos;
-                        while self.pos < len && !is_ws(self.bytes[self.pos]) && self.bytes[self.pos] != b'>' {
+                        while self.pos < len
+                            && !is_ws(self.bytes[self.pos])
+                            && self.bytes[self.pos] != b'>'
+                        {
                             self.pos += 1;
                         }
                         attrs.push((aname, decode_entities(self.slice(vs, self.pos))));
@@ -530,7 +572,11 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                 }
             };
-            return Token::TagOpen { name, attrs, self_close };
+            return Token::TagOpen {
+                name,
+                attrs,
+                self_close,
+            };
         }
     }
 }
@@ -564,10 +610,12 @@ fn decode_entities(raw: &str) -> String {
                     "quot" => out.push('"'),
                     "apos" => out.push('\''),
                     "nbsp" => out.push(' '),
-                    _ if ent.starts_with('#') => match parse_numeric_entity(ent).and_then(char::from_u32) {
-                        Some(ch) => out.push(ch),
-                        None => out.push_str(&raw[i..semi + 1]),
-                    },
+                    _ if ent.starts_with('#') => {
+                        match parse_numeric_entity(ent).and_then(char::from_u32) {
+                            Some(ch) => out.push(ch),
+                            None => out.push_str(&raw[i..semi + 1]),
+                        }
+                    }
                     _ => out.push_str(&raw[i..semi + 1]),
                 }
                 i = semi + 1;
@@ -586,14 +634,19 @@ fn decode_entities(raw: &str) -> String {
 /// full entity name including the leading `#`).
 fn parse_numeric_entity(ent: &str) -> Option<u32> {
     let digits = &ent[1..];
-    let (radix, digits) = match digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+    let (radix, digits) = match digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
         Some(hex) => (16, hex),
         None => (10, digits),
     };
     if digits.is_empty() {
         return None;
     }
-    u32::from_str_radix(digits, radix).ok().filter(|&cp| cp != 0)
+    u32::from_str_radix(digits, radix)
+        .ok()
+        .filter(|&cp| cp != 0)
 }
 
 fn utf8_len(b: u8) -> usize {
@@ -619,13 +672,21 @@ mod tests {
     #[test]
     fn bold_and_paragraphs() {
         let lines = render_html("<p>Hello <b>world</b></p><p>Next</p>", 80);
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("world") && s.bold)));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("world") && s.bold))
+        );
         assert!(lines.len() >= 2);
     }
     #[test]
     fn links_become_footnotes() {
         let lines = render_html(r#"<a href="https://x">click</a>"#, 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains("click"));
         assert!(joined.contains("https://x"));
     }
@@ -648,7 +709,11 @@ mod tests {
         let lines = render_html("<i>slanted</i> <u>lined</u>", 80);
         let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
         assert!(spans.iter().any(|s| s.text.contains("slanted") && s.italic));
-        assert!(spans.iter().any(|s| s.text.contains("lined") && s.underline));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text.contains("lined") && s.underline)
+        );
     }
 
     #[test]
@@ -673,20 +738,36 @@ mod tests {
     fn nested_blockquote_indents_more() {
         let lines = render_html("<blockquote>a<blockquote>b</blockquote></blockquote>", 80);
         let max_indent = lines.iter().map(|l| l.indent).max().unwrap_or(0);
-        assert!(max_indent >= 2, "expected nested indent, got lines {:?}", lines);
+        assert!(
+            max_indent >= 2,
+            "expected nested indent, got lines {:?}",
+            lines
+        );
     }
 
     #[test]
     fn list_items_get_bullets_and_indent() {
         let lines = render_html("<ul><li>first</li><li>second</li></ul>", 80);
-        assert!(lines.iter().any(|l| l.indent > 0 && l.spans.iter().any(|s| s.text.contains("first"))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("second"))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.indent > 0 && l.spans.iter().any(|s| s.text.contains("first")))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("second")))
+        );
     }
 
     #[test]
     fn table_row_cells_are_joined() {
         let lines = render_html("<table><tr><td>a</td><td>b</td></tr></table>", 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains('|'));
         assert!(joined.contains('a') && joined.contains('b'));
     }
@@ -694,7 +775,11 @@ mod tests {
     #[test]
     fn multiple_links_get_distinct_footnote_numbers() {
         let lines = render_html(r#"<a href="https://a">A</a> <a href="https://b">B</a>"#, 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains("A[1]"));
         assert!(joined.contains("B[2]"));
         assert!(joined.contains("[1] https://a"));
@@ -704,7 +789,11 @@ mod tests {
     #[test]
     fn unknown_tags_are_transparent() {
         let lines = render_html("<div><span>hi <b>there</b></span></div>", 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains("hi there"));
     }
 
@@ -714,21 +803,33 @@ mod tests {
             "<style>body { color: red; }</style><script>var x = 1;</script><p>real</p>",
             80,
         );
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert_eq!(joined, "real");
     }
 
     #[test]
     fn nbsp_and_numeric_entities_decode() {
         let lines = render_html("<p>a&nbsp;b &#65; &#x42;</p>", 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains("a b A B"));
     }
 
     #[test]
     fn unquoted_href_with_slashes_does_not_hang() {
         let lines = render_html(r#"<a href=https://example.com/path?a=1>link</a>"#, 80);
-        let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.text.clone()).collect();
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
         assert!(joined.contains("link"));
         assert!(joined.contains("https://example.com/path?a=1"));
     }

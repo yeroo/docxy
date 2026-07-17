@@ -137,12 +137,15 @@ fn handle_connection(
     }
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-    requests.lock().expect("requests lock").push(RecordedRequest {
-        method: method.clone(),
-        path: path.clone(),
-        headers,
-        body,
-    });
+    requests
+        .lock()
+        .expect("requests lock")
+        .push(RecordedRequest {
+            method: method.clone(),
+            path: path.clone(),
+            headers,
+            body,
+        });
 
     let route = routes
         .iter()

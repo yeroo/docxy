@@ -181,7 +181,8 @@ impl GraphClient {
             &[("Prefer", "odata.maxpagesize=50")],
         )?;
         let v = parse_body(resp)?;
-        DeltaPage::from_json(&v).ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))
+        DeltaPage::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))
     }
 
     /// GET `/me/messages/{id}?$select=body`. When `prefer_text` is set,
@@ -251,7 +252,10 @@ impl GraphClient {
         let status = if flagged { "flagged" } else { "notFlagged" };
         let body = Value::Object(vec![(
             "flag".to_string(),
-            Value::Object(vec![("flagStatus".to_string(), Value::Str(status.to_string()))]),
+            Value::Object(vec![(
+                "flagStatus".to_string(),
+                Value::Str(status.to_string()),
+            )]),
         )])
         .to_string();
         self.send(Method::Patch, &path, Some(body), &[])?;
@@ -454,21 +458,28 @@ mod tests {
 
     #[test]
     fn throttle_maps_to_retry_after() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders".into(), status:429,
-            headers:vec![("Retry-After".into(),"7".into())], body:"{}".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 429,
+            headers: vec![("Retry-After".into(), "7".into())],
+            body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         match c.list_folders() {
-            Err(GraphError::Throttled{retry_after_secs}) => assert_eq!(retry_after_secs, 7),
+            Err(GraphError::Throttled { retry_after_secs }) => assert_eq!(retry_after_secs, 7),
             other => panic!("expected throttled, got {other:?}"),
         }
     }
 
     #[test]
     fn unauthorized_maps() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders".into(), status:401, headers:vec![], body:"{}".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(c.list_folders(), Err(GraphError::Unauthorized)));
@@ -476,19 +487,32 @@ mod tests {
 
     #[test]
     fn sends_bearer_header() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders".into(), status:200, headers:vec![], body:r#"{"value":[]}"#.into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[]}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "SECRET");
         c.list_folders().unwrap();
         let reqs = srv.requests();
-        assert!(reqs[0].headers.iter().any(|(k,v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer SECRET"));
+        assert!(
+            reqs[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer SECRET")
+        );
     }
 
     #[test]
     fn not_found_maps() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/messages/".into(), status:404, headers:vec![], body:"{}".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/".into(),
+            status: 404,
+            headers: vec![],
+            body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(c.get_body("X", false), Err(GraphError::NotFound)));
@@ -496,27 +520,43 @@ mod tests {
 
     #[test]
     fn other_status_maps_to_http_with_body() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders".into(), status:500, headers:vec![], body:"boom".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 500,
+            headers: vec![],
+            body: "boom".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         match c.list_folders() {
-            Err(GraphError::Http{status, body}) => { assert_eq!(status, 500); assert_eq!(body, "boom"); }
+            Err(GraphError::Http { status, body }) => {
+                assert_eq!(status, 500);
+                assert_eq!(body, "boom");
+            }
             other => panic!("expected Http, got {other:?}"),
         }
     }
 
     #[test]
     fn get_body_sends_prefer_text_header_and_parses() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/messages/M1".into(), status:200, headers:vec![],
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
             body: r#"{"body":{"contentType":"text","content":"hi"}}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let body = c.get_body("M1", true).unwrap();
         assert_eq!(body.content, "hi");
         let reqs = srv.requests();
-        assert!(reqs[0].headers.iter().any(|(k,v)| k.eq_ignore_ascii_case("prefer") && v == "outlook.body-content-type=\"text\""));
+        assert!(
+            reqs[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("prefer")
+                    && v == "outlook.body-content-type=\"text\"")
+        );
     }
 
     #[test]
@@ -533,8 +573,11 @@ mod tests {
 
     #[test]
     fn get_attachment_bytes_decodes_base64() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/messages/M1/attachments/A1".into(), status:200, headers:vec![],
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1/attachments/A1".into(),
+            status: 200,
+            headers: vec![],
             body: r#"{"id":"A1","contentBytes":"aGVsbG8="}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
@@ -544,8 +587,12 @@ mod tests {
 
     #[test]
     fn mark_read_sends_patch_body() {
-        let srv = FakeServer::start(vec![Route{
-            method:"PATCH".into(), path_prefix:"/me/messages/M1".into(), status:200, headers:vec![], body:"{}".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         c.mark_read("M1", true).unwrap();
@@ -555,8 +602,12 @@ mod tests {
 
     #[test]
     fn set_flag_sends_patch_body() {
-        let srv = FakeServer::start(vec![Route{
-            method:"PATCH".into(), path_prefix:"/me/messages/M1".into(), status:200, headers:vec![], body:"{}".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         c.set_flag("M1", true).unwrap();
@@ -566,8 +617,11 @@ mod tests {
 
     #[test]
     fn move_message_posts_and_returns_new_id() {
-        let srv = FakeServer::start(vec![Route{
-            method:"POST".into(), path_prefix:"/me/messages/M1/move".into(), status:200, headers:vec![],
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/move".into(),
+            status: 200,
+            headers: vec![],
             body: r#"{"id":"M1-NEW"}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
@@ -579,8 +633,12 @@ mod tests {
 
     #[test]
     fn delete_message_sends_delete() {
-        let srv = FakeServer::start(vec![Route{
-            method:"DELETE".into(), path_prefix:"/me/messages/M1".into(), status:204, headers:vec![], body:"".into(),
+        let srv = FakeServer::start(vec![Route {
+            method: "DELETE".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 204,
+            headers: vec![],
+            body: "".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         c.delete_message("M1").unwrap();
@@ -590,8 +648,11 @@ mod tests {
 
     #[test]
     fn delta_folder_first_call_sends_maxpagesize_prefer_and_parses() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders/F1/messages/delta".into(), status:200, headers:vec![],
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders/F1/messages/delta".into(),
+            status: 200,
+            headers: vec![],
             body: r#"{"value":[],"@odata.deltaLink":"http://x/delta?token=abc"}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
@@ -599,16 +660,27 @@ mod tests {
         assert_eq!(page.delta_link.as_deref(), Some("http://x/delta?token=abc"));
         let reqs = srv.requests();
         assert!(reqs[0].path.contains("$select="));
-        assert!(reqs[0].headers.iter().any(|(k,v)| k.eq_ignore_ascii_case("prefer") && v == "odata.maxpagesize=50"));
+        assert!(
+            reqs[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("prefer") && v == "odata.maxpagesize=50")
+        );
     }
 
     #[test]
     fn delta_link_cursor_uses_url_as_is() {
-        let srv = FakeServer::start(vec![Route{
-            method:"GET".into(), path_prefix:"/me/mailFolders/F1/messages/delta".into(), status:200, headers:vec![],
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders/F1/messages/delta".into(),
+            status: 200,
+            headers: vec![],
             body: r#"{"value":[],"@odata.nextLink":"IGNORED"}"#.into(),
         }]);
-        let link = format!("{}/me/mailFolders/F1/messages/delta?$skiptoken=xyz", srv.base_url);
+        let link = format!(
+            "{}/me/mailFolders/F1/messages/delta?$skiptoken=xyz",
+            srv.base_url
+        );
         let c = GraphClient::new(&srv.base_url, "AT");
         let page = c.delta(DeltaCursor::Link(link.clone())).unwrap();
         assert!(page.delta_link.is_none());
@@ -687,8 +759,16 @@ mod tests {
         let c = GraphClient::new(&srv.base_url, "AT");
         let folders = c.list_folders().unwrap();
         assert_eq!(folders.len(), 2);
-        assert!(folders.iter().any(|f| f.id == "F1" && f.display_name == "Inbox"));
-        assert!(folders.iter().any(|f| f.id == "F2" && f.display_name == "Sub"));
+        assert!(
+            folders
+                .iter()
+                .any(|f| f.id == "F1" && f.display_name == "Inbox")
+        );
+        assert!(
+            folders
+                .iter()
+                .any(|f| f.id == "F2" && f.display_name == "Sub")
+        );
     }
 
     #[test]
