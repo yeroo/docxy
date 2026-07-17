@@ -108,11 +108,15 @@ pub struct App {
 /// `Required` right after `SyncEvent::SignInRequired` (Enter sends
 /// `SyncCommand::SignIn`); `Started` once `SyncEvent::SignInStarted` has
 /// opened the browser (nothing left for the user to press — just a "go
-/// finish it over there" message).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// finish it over there" message). `Started` carries the `authorize_url` so
+/// the modal can also show it as a fallback (`ui::signin::draw`) — the
+/// browser-open is a best-effort, fire-and-forget shell-out, so if it
+/// silently fails to launch anything, the user still has something to copy
+/// into a browser by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInModal {
     Required,
-    Started,
+    Started { authorize_url: String },
 }
 
 /// State for the move-folder popup opened by `v`: the candidate folders (as
@@ -240,7 +244,7 @@ impl App {
             SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
             SyncEvent::SignInStarted { authorize_url } => {
                 self.open_url_with_os_handler(&authorize_url);
-                self.signin_modal = Some(SignInModal::Started);
+                self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
             SyncEvent::MessagesUpdated { .. } | SyncEvent::BodyReady { .. } | SyncEvent::Error(_) => {}
         }
@@ -706,17 +710,29 @@ impl App {
         }
     }
 
-    /// Shells out to the OS's "open" handler for `path` (`cmd /c start` on
-    /// Windows, `open` on macOS, `xdg-open` elsewhere), fire-and-forget.
-    /// Compiled out under `cfg(test)` in favor of a counter
-    /// (`open_invocations`) — so a test exercising `o` can assert the seam
-    /// was reached without ever launching a real OS handler.
+    /// Shells out to the OS's "open" handler for `path` (`rundll32.exe
+    /// url.dll,FileProtocolHandler` on Windows, `open` on macOS, `xdg-open`
+    /// elsewhere), fire-and-forget. Compiled out under `cfg(test)` in favor
+    /// of a counter (`open_invocations`) — so a test exercising `o` can
+    /// assert the seam was reached without ever launching a real OS handler.
+    ///
+    /// On Windows this deliberately does NOT go through `cmd /c start`:
+    /// `std::process::Command` only quotes an argument for the *target*
+    /// process if it contains a space/tab/quote, so a path or URL with none
+    /// of those (but containing `&`, `|`, `^`, etc.) reaches `cmd.exe`
+    /// unquoted — and cmd.exe's own shell parsing then splits on `&` as a
+    /// command separator, silently truncating the argument (reproduced: an
+    /// authorize URL's query string got cut at its first `&`). `rundll32`
+    /// is not a shell — it receives `path`/`url` as a single literal argv
+    /// element with no re-parsing — so this is safe for any path or URL,
+    /// including ones `sanitize_filename` still allows to contain `&`. It
+    /// also has no `%VAR%` env-expansion behavior, unlike `cmd /c start`.
     #[cfg(not(test))]
     fn open_with_os_handler(&self, path: &Path) {
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", ""])
+            let _ = std::process::Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler"])
                 .arg(path)
                 .spawn();
         }
@@ -736,22 +752,27 @@ impl App {
         self.open_invocations.set(self.open_invocations.get() + 1);
     }
 
-    /// Shells out to the OS's "open" handler for a URL (`cmd /c start` on
-    /// Windows, `open` on macOS, `xdg-open` elsewhere) — the sign-in flow's
-    /// equivalent of `open_with_os_handler`, called from `on_sync_event` when
+    /// Shells out to the OS's "open" handler for a URL — the sign-in flow's
+    /// equivalent of `open_with_os_handler` (see its doc comment for why
+    /// Windows goes through `rundll32.exe url.dll,FileProtocolHandler`
+    /// rather than `cmd /c start`: an authorize URL's query string is full
+    /// of `&`, which `cmd.exe` would otherwise treat as a command
+    /// separator and truncate). Called from `on_sync_event` when
     /// `SyncEvent::SignInStarted` lands. Fire-and-forget: the browser is
     /// launched detached, and whether it actually got there isn't something
     /// this process can (or needs to) observe — the loopback listener on the
-    /// engine side is what actually completes the flow. Compiled out under
-    /// `cfg(test)` in favor of a counter (`browser_open_invocations`), same
-    /// pattern as `open_with_os_handler` — so no test run ever pops open a
-    /// real browser.
+    /// engine side is what actually completes the flow, and the modal also
+    /// shows the raw URL as a fallback (see `ui::signin::draw`) in case the
+    /// browser never opens. Compiled out under `cfg(test)` in favor of a
+    /// counter (`browser_open_invocations`), same pattern as
+    /// `open_with_os_handler` — so no test run ever pops open a real
+    /// browser.
     #[cfg(not(test))]
     fn open_url_with_os_handler(&self, url: &str) {
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", ""])
+            let _ = std::process::Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler"])
                 .arg(url)
                 .spawn();
         }

@@ -23,7 +23,7 @@ use crate::graph::model::DeltaItem;
 use crate::store::{OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -935,22 +935,83 @@ fn listen_for_code(listener: &TcpListener, expected_state: &str) -> Result<Strin
     }
 }
 
+/// The largest request line `read_request_line` will accept before giving
+/// up — generously past any real loopback redirect (Entra ID's own query
+/// string, plus `GET `/`HTTP/1.1`, is a few hundred bytes at most), but
+/// small enough that a misbehaving connection can't grow the buffer
+/// unboundedly.
+const SIGNIN_REQUEST_LINE_MAX: usize = 8192;
+
+/// Reads one HTTP request line (up to and including its terminating `\n`)
+/// off `stream`, byte at a time, bounded by BOTH `max_bytes` and an overall
+/// wall-clock `deadline` — not just a per-`read()` timeout. A per-read
+/// timeout alone doesn't bound total elapsed time: a connection that
+/// trickles one byte every few seconds keeps each individual `read()` call
+/// under any fixed per-call timeout, so `read_line` (or repeated `read`
+/// calls with the timeout reset each time) could otherwise be strung along
+/// indefinitely. Instead, the socket's read timeout is re-set on every
+/// iteration to whatever remains of `deadline`, so the *last* read a slow
+/// client could provoke still expires exactly when the overall budget runs
+/// out. Reading a byte at a time is deliberately simple rather than
+/// efficient — this is a one-time, at-most-few-hundred-byte request line on
+/// a loopback socket, not a hot path.
+fn read_request_line(
+    stream: &TcpStream,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<String, String> {
+    let mut stream = stream
+        .try_clone()
+        .map_err(|e| format!("could not clone loopback stream: {e}"))?;
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if buf.len() >= max_bytes {
+            return Err("redirect request line exceeded the size limit".to_string());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out reading the redirect request".to_string());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| format!("could not set read timeout: {e}"))?;
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(
+                    "connection closed before a full request line was read".to_string()
+                );
+            }
+            Ok(_) => {
+                let b = byte[0];
+                buf.push(b);
+                if b == b'\n' {
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("timed out reading the redirect request".to_string());
+            }
+            Err(e) => return Err(format!("could not read redirect request: {e}")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Reads the HTTP request line off one accepted loopback connection, pulls
 /// `code`/`state` (or `error`) out of its query string, writes back a small
 /// HTML page, and returns the code (or an error — see [`listen_for_code`]).
 fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, String> {
-    stream
-        .set_read_timeout(Some(SIGNIN_READ_TIMEOUT))
-        .map_err(|e| format!("could not set read timeout: {e}"))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| format!("could not clone loopback stream: {e}"))?,
-    );
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|e| format!("could not read redirect request: {e}"))?;
+    let request_line = read_request_line(
+        &stream,
+        SIGNIN_REQUEST_LINE_MAX,
+        Instant::now() + SIGNIN_READ_TIMEOUT,
+    )?;
     let path = request_line
         .split_whitespace()
         .nth(1)
@@ -982,8 +1043,11 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
 /// Writes a minimal `HTTP/1.1 200` HTML response and closes the connection
 /// (`Connection: close`, then the stream is dropped) — best-effort; a write
 /// failure here (the user already closed the tab) doesn't change the code
-/// that was already parsed.
+/// that was already parsed. Drains whatever's left unread on the socket
+/// first (see `drain_remaining_request`), so closing right after doesn't
+/// look like a dropped connection to the client.
 fn write_html_response(mut stream: TcpStream, body: &str) {
+    drain_remaining_request(&stream);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -991,6 +1055,43 @@ fn write_html_response(mut stream: TcpStream, body: &str) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// Best-effort: discards whatever request bytes are still unread on the
+/// socket after `read_request_line` stops at the first `\n` (the header
+/// lines and any body we deliberately never parse). Reading the request
+/// line one byte at a time only consumes exactly those bytes from the
+/// kernel's socket receive buffer — anything the browser sent in the same
+/// packet after that (e.g. `Host:`/`Connection:` headers) is left queued.
+/// Some platforms (Windows in particular) respond to a `close()` on a
+/// socket that still has unread inbound data queued with a hard RST instead
+/// of a graceful FIN, which would make the client's read of our perfectly
+/// well-formed response fail with a connection-reset error — even though
+/// the code was parsed correctly and the response was written. Draining
+/// first avoids that. Bounded by both a short read timeout and a byte cap,
+/// so a client that keeps streaming data forever can't turn this into
+/// another unbounded read; giving up quietly either way just means we might
+/// still occasionally race a slow/unusual client, which is no worse than
+/// today's behavior.
+fn drain_remaining_request(stream: &TcpStream) {
+    let Ok(mut stream) = stream.try_clone() else {
+        return;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .is_err()
+    {
+        return;
+    }
+    let mut buf = [0u8; 1024];
+    let mut total = 0usize;
+    while total < 64 * 1024 {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => break, // timed out (nothing more pending) or otherwise: give up quietly
+        }
+    }
 }
 
 /// Parses an `application/x-www-form-urlencoded` query string into
@@ -1094,7 +1195,6 @@ mod tests {
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
-    use std::io::Read;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1790,9 +1890,9 @@ mod tests {
     #[test]
     fn handle_redirect_errors_on_a_connection_closed_before_any_request_line() {
         // A client that connects and disappears without ever sending a
-        // request line (EOF on the very first read) must be reported as an
-        // error rather than panicking — `read_line` returning `Ok(0)` is
-        // exactly this case.
+        // request line (EOF on the very first byte read) must be reported
+        // as an error rather than panicking — `read_request_line` seeing
+        // `Ok(0)` on its very first read is exactly this case.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -1802,6 +1902,59 @@ mod tests {
         let (stream, _addr) = listener.accept().unwrap();
         let result = handle_redirect(stream, "expected-state");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_request_line_times_out_on_a_stalled_partial_line() {
+        // A client that sends a partial request line (no trailing `\n`) and
+        // then simply stops — without closing the connection — must not
+        // hang past the overall deadline. A per-`read()` timeout alone
+        // wouldn't catch this if it were reset to a fresh window on every
+        // successful read; `read_request_line`'s `deadline` parameter must
+        // still expire the read once the total budget runs out, regardless
+        // of how many individual bytes trickled in before then.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(b"GET /?code=AB").unwrap(); // no newline; stays open
+
+        let (stream, _addr) = listener.accept().unwrap();
+        let start = Instant::now();
+        let result = read_request_line(
+            &stream,
+            SIGNIN_REQUEST_LINE_MAX,
+            Instant::now() + Duration::from_millis(200),
+        );
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "read_request_line did not respect its deadline: took {:?}",
+            start.elapsed()
+        );
+
+        drop(client); // keep the connection alive until the assertions above run
+    }
+
+    #[test]
+    fn read_request_line_errors_when_the_size_limit_is_exceeded() {
+        // A connection that keeps sending bytes with no `\n` must be capped
+        // by `max_bytes`, not just by the deadline — otherwise a fast,
+        // never-terminating stream could grow the buffer unboundedly for as
+        // long as the deadline allows.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(&[b'a'; 20]).unwrap(); // no newline
+
+        let (stream, _addr) = listener.accept().unwrap();
+        // A generous deadline, so the size cap (not the deadline) is what's
+        // actually under test here.
+        let result = read_request_line(&stream, 10, Instant::now() + Duration::from_secs(5));
+        assert!(result.is_err());
+
+        drop(client);
     }
 
     #[test]

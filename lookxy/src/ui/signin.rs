@@ -7,7 +7,11 @@
 //!   browser" (`App::on_key_enter` sends `SyncCommand::SignIn`).
 //! - `Started` — the engine's `begin_auth` succeeded and the browser has
 //!   already been opened (`App::on_sync_event`'s `SignInStarted` handler);
-//!   nothing left to press, just "finish it over there".
+//!   nothing left to press, just "finish it over there". Also shows the
+//!   `authorize_url` itself as a fallback: `open_url_with_os_handler` is a
+//!   fire-and-forget shell-out with no way to observe whether a browser
+//!   actually launched, so a user whose OS-open silently no-ops still has a
+//!   URL they can copy into a browser by hand.
 //!
 //! The modal blocks every other key while it's open (same as the other
 //! popups — see `ui::handle_key`), since there's nothing useful the rest of
@@ -31,19 +35,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 30, f.area());
     f.render_widget(Clear, area);
 
-    let (title, body) = match modal {
-        SignInModal::Required => (
-            "Sign in",
-            "Not signed in.\n\nPress Enter to sign in with your browser.",
-        ),
-        SignInModal::Started => (
-            "Sign in",
-            "Signing in via your browser…\n\ncomplete it in the window that opened.",
+    let body = match modal {
+        SignInModal::Required => {
+            "Not signed in.\n\nPress Enter to sign in with your browser.".to_string()
+        }
+        SignInModal::Started { authorize_url } => format!(
+            "Signing in via your browser…\n\ncomplete it in the window that opened.\n\n\
+             If your browser didn't open, visit:\n{authorize_url}"
         ),
     };
 
     let block = Block::default()
-        .title(title)
+        .title("Sign in")
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow));
     f.render_widget(
@@ -83,14 +86,20 @@ mod tests {
     }
 
     #[test]
-    fn started_modal_renders_the_browser_message() {
+    fn started_modal_renders_the_browser_message_and_fallback_url() {
         let mut app = App::for_test_with_seeded_store();
-        app.signin_modal = Some(SignInModal::Started);
+        app.signin_modal = Some(SignInModal::Started {
+            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
+                .into(),
+        });
 
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.to_lowercase().contains("browser"));
+        // The fallback URL is shown verbatim so a user can copy it by hand
+        // if the OS-open silently failed to launch anything.
+        assert!(text.contains("login.microsoftonline.com"));
     }
 }
