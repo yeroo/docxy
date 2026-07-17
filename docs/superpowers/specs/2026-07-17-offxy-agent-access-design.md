@@ -1,10 +1,10 @@
 # Offxy Agent Access (VS Code ctl bridge + bundled MCP) — Design
 
 **Date:** 2026-07-17
-**Status:** Approved (design review with Boris, this session). **Implementation
-parked** until the concurrent session's xlsxy/yppxy ctl+MCP work merges — layer
-1 must adopt (not collide with) any verb-core extraction that work performs,
-and layer 4 adopts its verb/tool/naming scheme verbatim.
+**Status:** Approved (design review with Boris, this session). **Unparked:**
+PR #20 (xlsxy/yppxy agent bridges) has merged; it kept verb logic per-app in
+the TUIs (no docxcore/gridcore-level extraction), so Layer 1's extraction has
+no collision, and Layer 4's xlsxy verb/tool set is now pinned (see Layer 4).
 
 ## Summary
 
@@ -125,13 +125,25 @@ New `offxy-vscode/mcp/server.mjs` (bundled in the vsix, no dependencies):
 
 ## Layer 4 — Excel (and later Project) parity
 
-After the concurrent session merges:
+PR #20's xlsxy surface, adopted verbatim:
 
-- Adopt their xlsxy verb set verbatim: `gridwasm` gains `grid_ctl` bound to
-  the shared sheet-verb core; Excel tabs advertise under xlsxy's instance
-  prefix in xlsxy's ctl dir; the bundled MCP server mirrors `xlsxy_*` tools.
-- yppxy has no VS Code editor — nothing to bridge; its terminal ctl+MCP is
-  the other session's deliverable.
+- Verbs: `wb.path`, `sheet.list`, `sheet.read {sheet?, range?}`,
+  `cell.get {ref}`, `cell.set {ref, text}` (leading `=` = formula, validated
+  + recalculated), `range.clear {range}`, `find {query}`, `wb.recalc`,
+  `wb.save`, `wb.reload`, `wb.open {path}`. A1-style refs; `sheet` by index
+  or name.
+- `gridwasm` gains `grid_ctl(handle, ptr, len)` implementing the wasm-side
+  verbs directly over its `Session` (the sheet verbs are thin over the
+  engine — `cell.set` is the existing `set` path — so no gridcore extraction
+  is warranted; parity with `xlsxy/src/control.rs` semantics is asserted by
+  tests instead). `wb.save`/`wb.reload`/`wb.open`/`wb.path` are host verbs,
+  like their docx counterparts.
+- Excel tabs advertise as `xlsxy-vscode-<basename>-<n>` in xlsxy's ctl dir
+  (`%APPDATA%\xlsxy\ctl`); the bundled MCP server mirrors the ten `xlsxy_*`
+  tools schema-identically to `xlsxy --mcp` (built on the same framing
+  `ctlcore::mcp` established).
+- yppxy has no VS Code editor — nothing to bridge; its terminal ctl+MCP
+  shipped in PR #20.
 
 ## Security posture
 
