@@ -12,6 +12,13 @@
 
 mod app;
 mod config;
+// The control-surface verb dispatcher (mail read + triage against the live
+// App). Wiring it into the run loop (ctlcore::serve + draining its request
+// channel each tick, and the `--mcp`/`install skill` entry points) is a
+// separate later task; until then `dispatch`/`control_dir`/`instance_name`
+// are only exercised by `control`'s own tests, so silence dead_code here.
+#[allow(dead_code)]
+mod control;
 mod ui;
 
 use std::io;

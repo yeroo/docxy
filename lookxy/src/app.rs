@@ -1015,7 +1015,10 @@ pub fn downloads_dir() -> PathBuf {
 /// left, so a malicious or empty attachment name can never escape
 /// Downloads, rewrite the opened path, or produce a path `std::fs::write`
 /// would choke on.
-fn sanitize_filename(name: &str) -> String {
+///
+/// `pub(crate)` (rather than private) so `control.rs`'s `mail.save-attachment`
+/// verb can reuse this exact sanitization instead of duplicating it.
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
