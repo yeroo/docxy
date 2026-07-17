@@ -187,7 +187,8 @@ bottom, mouse + keyboard):
 - Network down: sync thread flips to offline state, retries with back-off;
   UI stays fully functional on the local store.
 - Graph throttling (429/503): honor `Retry-After`; never tight-loop.
-- Auth expiry: "sign in again" banner + device code; store untouched.
+- Auth expiry: "sign in again" banner that re-runs the browser (auth-code)
+  flow; store untouched.
 - DB corruption: detected on open (integrity check); offer rebuild
   (delete + full resync) rather than limping.
 - Any sync error is a status-line state + log line, never a panic; the
@@ -220,7 +221,7 @@ bottom, mouse + keyboard):
 
 ## 11. Build order (for the implementation plan)
 
-1. Spike: device-code token + list inbox (throwaway, proves §2).
+1. Spike: auth-code + PKCE token + list inbox (throwaway, proves §2). DONE.
 2. `mailcore::json`.
 3. `mailcore::auth` (+ token cache).
 4. `mailcore::graph` client + fake-server test rig.
