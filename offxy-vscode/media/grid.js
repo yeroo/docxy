@@ -71,7 +71,7 @@
     for (let i = 0; i < colX.length - 1; i++) {
       if (x < acc + colX[i + 1]) return left + i;
     }
-    return left + colX.length - 1;
+    return left + colX.length - 2; // last valid fetched column (colX has ncols+1 entries)
   }
 
   function win() {
@@ -135,12 +135,29 @@
     for (let c = sel.c; c <= sel.c2; c++) wsum += colWidthPx(c);
     selEl.style.width = wsum + 'px';
     frag.appendChild(selEl);
+    // active-cell outline: a tighter box than the (possibly multi-cell) selEl.
+    const curEl = document.createElement('div');
+    curEl.id = 'curbox';
+    const curR = rowOfRef(), curC = refCol();
+    curEl.style.top = curR * ROW_H + 'px';
+    curEl.style.left = originX + (colX[curC - left] ?? 0) + 'px';
+    curEl.style.height = ROW_H + 'px';
+    curEl.style.width = colWidthPx(curC) + 'px';
+    frag.appendChild(curEl);
     $('cells').replaceChildren(frag);
 
     paintHeaders(top, left, nrows, ncols, originX);
     paintTabs();
     $('cellref').textContent = view.cur.ref;
     if (document.activeElement !== $('fsrc')) $('fsrc').value = view.cur.src;
+    // one-shot error from the wasm side (e.g. an invalid formula on `set`):
+    // surface it as a tooltip on the cell reference box and a brief red flash
+    // on the formula bar's border.
+    $('cellref').title = view.err || '';
+    if (view.err) {
+      $('fsrc').style.borderColor = '#f14c4c';
+      setTimeout(() => { $('fsrc').style.borderColor = ''; }, 600);
+    }
   }
 
   /** Repaint just the sticky headers against the *current* scroll position,
@@ -197,9 +214,47 @@
       b.textContent = name;
       if (i === view.active) b.classList.add('on');
       b.addEventListener('click', () => cmd(`sheet\tswitch\t${i}`) && requestView());
+      b.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        startSheetRename(b, i, name);
+      });
       bar.appendChild(b);
     });
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.textContent = '+';
+    add.title = 'Add sheet';
+    add.addEventListener('click', () => {
+      userCmd('sheet\tadd\tSheet' + (view.sheets.length + 1));
+      requestView();
+    });
+    bar.appendChild(add);
     $('tabs').replaceChildren(bar);
+  }
+
+  /** Swap a sheet tab's button for an inline rename `<input>`. Enter commits
+   *  `sheet\trename`; Escape (or losing the value) just repaints the tabs,
+   *  which restores the original button since nothing was committed. */
+  function startSheetRename(button, i, name) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = name;
+    input.style.font = 'inherit';
+    input.style.width = Math.max(40, button.offsetWidth) + 'px';
+    button.replaceWith(input);
+    input.focus();
+    input.select();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        userCmd(`sheet\trename\t${i}\t${input.value}`);
+        requestView();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        requestView();
+      }
+      e.stopPropagation();
+    });
   }
 
   function colName(c) {
@@ -283,7 +338,78 @@
         return mod ? cmd('select\t0\t0') && ensureVisible() : move(0, -refCol(), ext);
       default: break;
     }
+    if (e.key === 'F2') { e.preventDefault(); return startEdit(null); }
+    if (e.key === 'Enter') { e.preventDefault(); return startEdit(null); }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      const s = view.sel;
+      return userCmd(`clear\t${s.r}\t${s.c}\t${s.r2}\t${s.c2}`);
+    }
+    if (!mod && e.key.length === 1 && !e.altKey) {
+      e.preventDefault();
+      return startEdit(e.key); // type-through starts a fresh edit
+    }
     if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); return void cmd('copy'); }
+    if (mod && e.key.toLowerCase() === 'x') { e.preventDefault(); return void userCmd('cut'); }
+    if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); return void requestPaste(); }
+    if (mod && e.key.toLowerCase() === 'a') {
+      e.preventDefault();
+      return void cmd(`select\t0\t0\t${Math.max(0, view.dims.rows - 1)}\t${Math.max(0, view.dims.cols - 1)}`);
+    }
+  }
+
+  // ---- editing ---------------------------------------------------------------
+  const MUTATING = /^(set|clear|cut|paste|insrow|delrow|inscol|delcol|sheet\t(add|rename))/;
+  /** Run a user-initiated command and, if it mutates the workbook, tell the
+   *  host so VS Code lights the dirty dot and can drive undo/redo. */
+  function userCmd(str) {
+    cmd(str);
+    if (MUTATING.test(str)) vscode.postMessage({ type: 'edit' });
+  }
+
+  let editEl = null;
+  function startEdit(initial) {
+    if (editEl) return;
+    const r = rowOfRef(), c = refCol();
+    const wrap = $('gridwrap');
+    editEl = document.createElement('input');
+    editEl.id = 'celledit';
+    editEl.value = initial != null ? initial : view.cur.src;
+    editEl.style.position = 'absolute';
+    editEl.style.top = r * ROW_H + 'px';
+    editEl.style.left = c * defW + 'px';
+    editEl.style.height = ROW_H + 'px';
+    editEl.style.minWidth = defW + 'px';
+    editEl.style.font = 'inherit';
+    editEl.style.zIndex = 5;
+    editEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitEdit(); move(1, 0, false); }
+      else if (e.key === 'Tab') { e.preventDefault(); commitEdit(); move(0, 1, false); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+      e.stopPropagation();
+    });
+    $('cells').appendChild(editEl);
+    editEl.focus();
+    if (initial != null) editEl.setSelectionRange(initial.length, initial.length);
+    else editEl.select();
+  }
+  function commitEdit() {
+    if (!editEl) return;
+    const text = editEl.value;
+    cancelEdit();
+    userCmd(`set\t${rowOfRef()}\t${refCol()}\t${text}`);
+  }
+  function cancelEdit() {
+    if (editEl) { editEl.remove(); editEl = null; $('gridwrap').focus(); }
+  }
+
+  // ---- clipboard through the host --------------------------------------------
+  let pasteSeq = 0;
+  const pastePending = new Map();
+  function requestPaste() {
+    const requestId = ++pasteSeq;
+    pastePending.set(requestId, true);
+    vscode.postMessage({ type: 'readClipboard', requestId });
   }
 
   // ---- host messages -------------------------------------------------------
@@ -317,6 +443,11 @@
         vscode.postMessage({ type: 'bytes', requestId: msg.requestId, data: bytesToBase64(bytes) });
         break;
       }
+      case 'clipboardText':
+        if (pastePending.delete(msg.requestId) && msg.text) {
+          userCmd(`paste\t${rowOfRef()}\t${refCol()}\t${msg.text}`);
+        }
+        break;
     }
   });
 
@@ -343,6 +474,29 @@
     <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="cells"></div></div>
     <div id="tabs"></div>`;
 
+  /** Right-click context menu for a row/col header: insert/delete at `at`. */
+  function headerMenu(e, kind, at) {
+    $('hmenu')?.remove();
+    const m = document.createElement('div');
+    m.id = 'hmenu';
+    m.style.cssText = `position:fixed;left:${e.clientX}px;top:${e.clientY}px;z-index:10;` +
+      'background:var(--vscode-menu-background,#252526);color:var(--vscode-menu-foreground,#ccc);' +
+      'border:1px solid var(--vscode-editorWidget-border,#454545);padding:4px 0;';
+    const items = kind === 'col'
+      ? [[`Insert column`, `inscol\t${at}\t1`], [`Delete column`, `delcol\t${at}\t1`]]
+      : [[`Insert row`, `insrow\t${at}\t1`], [`Delete row`, `delrow\t${at}\t1`]];
+    for (const [label, op] of items) {
+      const it = document.createElement('div');
+      it.textContent = label;
+      it.style.cssText = 'padding:2px 14px;cursor:pointer;';
+      it.addEventListener('mouseenter', () => (it.style.background = 'var(--vscode-menu-selectionBackground,#04395e)'));
+      it.addEventListener('mouseleave', () => (it.style.background = ''));
+      it.addEventListener('click', () => { m.remove(); userCmd(op); requestView(); });
+      m.appendChild(it);
+    }
+    document.body.appendChild(m);
+  }
+
   async function boot() {
     const resp = await fetch(window.__OFFXY__.wasmUri);
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
@@ -353,7 +507,33 @@
     window.addEventListener('mousemove', onMousemove);
     window.addEventListener('mouseup', onMouseup);
     wrap.addEventListener('keydown', onKeydown);
+    wrap.addEventListener('dblclick', () => startEdit(null));
     window.addEventListener('resize', onScroll);
+    $('fsrc').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        userCmd(`set\t${rowOfRef()}\t${refCol()}\t${$('fsrc').value}`);
+        $('gridwrap').focus();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        $('fsrc').value = view.cur.src;
+        $('gridwrap').focus();
+      }
+      e.stopPropagation();
+    });
+    $('colhdr').addEventListener('contextmenu', (e) => {
+      const t = e.target.closest('.hcell');
+      if (!t) return;
+      e.preventDefault();
+      headerMenu(e, 'col', parseInt(t.dataset.col, 10));
+    });
+    $('rowhdr').addEventListener('contextmenu', (e) => {
+      const t = e.target.closest('.hcell');
+      if (!t) return;
+      e.preventDefault();
+      headerMenu(e, 'row', parseInt(t.dataset.row, 10));
+    });
+    document.addEventListener('click', () => $('hmenu')?.remove());
     vscode.postMessage({ type: 'ready' });
   }
   boot().catch((err) => {
