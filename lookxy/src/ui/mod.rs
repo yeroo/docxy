@@ -37,18 +37,44 @@ pub fn draw(f: &mut Frame, app: &App) {
     message_list::draw(f, app, cols[1]);
     reading::draw(f, app, cols[2]);
     status_bar::draw(f, app, rows[1]);
+
+    // Drawn last (and over the full frame, not just the list column) so the
+    // move-folder popup (`v`) sits on top of everything else.
+    message_list::draw_move_picker(f, app);
 }
 
-/// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k), or
-/// opens/activates the current selection (Enter). The sole place keyboard
-/// input turns into `App` state changes; `main`'s event loop routes
-/// non-global keys (everything but `q`/Ctrl-C) here.
+/// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k),
+/// opens/activates the current selection (Enter), or — while the move-folder
+/// popup (`v`) is open — routes to its own key handling instead. The sole
+/// place keyboard input turns into `App` state changes; `main`'s event loop
+/// routes non-global keys (everything but `q`/Ctrl-C) here. Triage keys
+/// (`m`/`u`/`f`/`d`/`v`) fall through to `App::on_key_char`/`Del` to
+/// `App::delete_selected` — see `app.rs` for what each one does.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.move_picker.is_some() {
+        handle_move_picker_key(app, key);
+        return;
+    }
     match key.code {
         KeyCode::Tab => cycle_focus(app),
         KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1),
         KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1),
         KeyCode::Enter => activate(app),
+        KeyCode::Delete => app.delete_selected(),
+        KeyCode::Char(c) => app.on_key_char(c),
+        _ => {}
+    }
+}
+
+/// Keys while the move-folder popup is open: ↑/↓/j/k pick a folder, Enter
+/// confirms the move, Esc cancels. Nothing else (pane navigation, other
+/// triage keys) reaches the app while the popup has focus.
+fn handle_move_picker_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_move_picker(),
+        KeyCode::Up | KeyCode::Char('k') => app.move_picker_select(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_picker_select(1),
+        KeyCode::Enter => app.confirm_move(),
         _ => {}
     }
 }
@@ -142,6 +168,7 @@ pub(crate) fn truncate_width(s: &str, w: usize) -> String {
 mod tests {
     use super::*;
     use mailcore::graph::model::{MailFolder, Message, Recipient};
+    use mailcore::sync::engine::SyncCommand;
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -280,14 +307,123 @@ mod tests {
     }
 
     #[test]
+    fn flag_key_toggles_the_highlighted_row_and_sends_set_flag() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::List;
+        assert!(!app.messages[0].is_flagged);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('f')));
+
+        assert!(app.messages[0].is_flagged);
+        let rows = app.store.messages_in_folder("inbox", 50, 0).unwrap();
+        assert!(rows[0].is_flagged);
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::SetFlag { flagged: true, .. })
+        ));
+    }
+
+    #[test]
+    fn delete_key_removes_the_row_and_clamps_selection() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_second_message(&mut app);
+        app.focus = Pane::List;
+        assert_eq!(app.messages.len(), 2);
+        // "m1" (the newest) sorts first; select the last row so the clamp is
+        // actually exercised (deleting the only remaining row would trivially
+        // land msg_index at 0 either way).
+        app.msg_index = 1;
+        let doomed_id = app.messages[1].id.clone();
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete));
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages.iter().all(|m| m.id != doomed_id));
+        assert_eq!(app.msg_index, 0); // clamped, not left pointing past the end
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(last, Ok(SyncCommand::Delete { .. })));
+
+        // 'd' does the same thing as the Delete key.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.messages.is_empty());
+        assert_eq!(app.msg_index, 0);
+    }
+
+    #[test]
+    fn move_picker_opens_selects_and_confirms_a_move() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "archive".into(),
+                display_name: "Archive".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("archive".into()),
+            })
+            .expect("seed archive folder");
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.move_picker.is_some());
+        // Well-known order puts "inbox" before "archive"; move down onto it.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            app.move_picker.as_ref().unwrap().folders
+                [app.move_picker.as_ref().unwrap().index]
+                .id,
+            "archive"
+        );
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.move_picker.is_none());
+        assert!(app.store.messages_in_folder("inbox", 50, 0).unwrap().is_empty());
+        assert_eq!(
+            app.store.messages_in_folder("archive", 50, 0).unwrap()[0].id,
+            "m1"
+        );
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(last, Ok(SyncCommand::Move { .. })));
+    }
+
+    #[test]
+    fn esc_cancels_the_move_picker_without_moving_anything() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.move_picker.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.move_picker.is_none());
+        assert_eq!(app.store.messages_in_folder("inbox", 50, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn move_picker_does_not_open_with_nothing_highlighted() {
+        // The empty store has no messages, so there's nothing `v` could move
+        // — it must be a no-op rather than opening a popup with no target.
+        let mut app = App::for_test_with_empty_store();
+        app.focus = Pane::List;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('v')));
+
+        assert!(app.move_picker.is_none());
+    }
+
+    #[test]
     fn empty_store_renders_and_handles_keys_without_panicking() {
         let mut app = App::for_test_with_empty_store();
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
 
-        // Drive every navigation key, through every pane (Tab cycles focus
-        // in between), with nothing to select. None of this should panic,
-        // and nothing should get selected out of thin air.
+        // Drive every navigation and triage key, through every pane (Tab
+        // cycles focus in between), with nothing to select. None of this
+        // should panic, and nothing should get selected out of thin air —
+        // including `v`, which must not open a popup with no message and no
+        // folders to populate it from.
         let keys = [
             KeyCode::Down,
             KeyCode::Up,
@@ -300,6 +436,13 @@ mod tests {
             KeyCode::Tab,
             KeyCode::Enter,
             KeyCode::Down,
+            KeyCode::Char('m'),
+            KeyCode::Char('u'),
+            KeyCode::Char('f'),
+            KeyCode::Char('d'),
+            KeyCode::Delete,
+            KeyCode::Char('v'),
+            KeyCode::Esc,
         ];
         for code in keys {
             handle_key(&mut app, KeyEvent::from(code));

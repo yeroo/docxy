@@ -1,7 +1,6 @@
 //! `App` — the TUI's in-memory state: the local mail store, the background
-//! sync handle, and where the three panes (folders/list/reading) currently
-//! point. The three-pane layout and its navigation land in a later task;
-//! this is just the skeleton the run loop drives.
+//! sync handle, where the three panes (folders/list/reading) currently
+//! point, and the triage actions (`m`/`u`/`f`/`d`/`v`) that mutate them.
 
 use std::path::PathBuf;
 
@@ -51,6 +50,25 @@ pub struct App {
     pub body_loading: bool,
     pub status: SyncState,
     pub quit: bool,
+    /// The open move-folder popup (`v`), if any — see `open_move_picker`.
+    pub move_picker: Option<MovePicker>,
+    /// Test-only: sees every `SyncCommand` this `App` has sent, so tests can
+    /// assert on it (see `last_sent_command_is_mark_read`). `None` for a
+    /// production `App`; `for_test_with_seeded_store`/`for_test_with_empty_store`
+    /// populate it by keeping the receiver end of a fresh channel instead of
+    /// dropping it.
+    #[cfg(test)]
+    pub test_cmd_rx: Option<std::sync::mpsc::Receiver<SyncCommand>>,
+}
+
+/// State for the move-folder popup opened by `v`: the candidate folders (as
+/// read from `Store::folders` when the picker opened), which one is
+/// highlighted, and the message being moved — captured up front so that
+/// navigating the popup with ↑/↓ can't retarget it mid-pick.
+pub struct MovePicker {
+    pub folders: Vec<FolderRow>,
+    pub index: usize,
+    pub message_id: String,
 }
 
 /// How many messages `reload_messages` pulls per folder. Paging further back
@@ -73,6 +91,9 @@ impl App {
             body_loading: false,
             status: SyncState::Idle,
             quit: false,
+            move_picker: None,
+            #[cfg(test)]
+            test_cmd_rx: None,
         };
         app.reload_folders();
         app
@@ -152,6 +173,149 @@ impl App {
         }
     }
 
+    // --- Triage actions ---------------------------------------------------
+
+    /// Dispatches a single-character triage key against the message
+    /// currently highlighted in the list pane (`messages[msg_index]`):
+    /// `m`/`u` mark read/unread, `f` toggles the flag, `d` deletes. `v`
+    /// (move) is handled separately by `open_move_picker`, since it needs a
+    /// folder choice before anything can be sent. Unrecognized characters
+    /// are ignored. Called from `ui::handle_key` for every `KeyCode::Char`
+    /// not already claimed by pane navigation.
+    pub fn on_key_char(&mut self, c: char) {
+        match c {
+            'm' => self.mark_read(true),
+            'u' => self.mark_read(false),
+            'f' => self.toggle_flag(),
+            'd' => self.delete_selected(),
+            'v' => self.open_move_picker(),
+            _ => {}
+        }
+    }
+
+    /// The id of the message currently highlighted in the list pane, if any
+    /// (empty list, or nothing loaded yet, yield `None` — every triage
+    /// action is then a no-op rather than a panic).
+    fn highlighted_message_id(&self) -> Option<String> {
+        self.messages.get(self.msg_index).map(|m| m.id.clone())
+    }
+
+    /// Marks the highlighted message read/unread: writes it to the store
+    /// (so `reload_messages` reflects it immediately, without waiting on the
+    /// sync engine), then fires `SyncCommand::MarkRead` so the engine
+    /// enqueues the matching outbox op and pushes it to Graph.
+    pub fn mark_read(&mut self, read: bool) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        self.store.set_read(&id, read);
+        self.reload_messages();
+        let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead { id, read });
+    }
+
+    /// Toggles the highlighted message's flag, same optimistic-store +
+    /// fire-and-forget-command pattern as `mark_read`.
+    pub fn toggle_flag(&mut self) {
+        let Some(row) = self.messages.get(self.msg_index) else {
+            return;
+        };
+        let id = row.id.clone();
+        let flagged = !row.is_flagged;
+        self.store.set_flag(&id, flagged);
+        self.reload_messages();
+        let _ = self.sync.cmd_tx.send(SyncCommand::SetFlag { id, flagged });
+    }
+
+    /// Deletes the highlighted message: removes it from the store, then
+    /// `reload_messages` re-reads the (now shorter) list and clamps
+    /// `msg_index` so the selection can't point past the end — the same
+    /// bounds-safe pattern `reload_messages` already uses when a folder
+    /// switch shrinks the list.
+    pub fn delete_selected(&mut self) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        let _ = self.store.delete_message(&id);
+        self.reload_messages();
+        let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+    }
+
+    /// Opens the move-folder popup over the highlighted message. A no-op if
+    /// nothing is highlighted, or there are no folders to move it to (an
+    /// empty picker would have nothing to select and nowhere for Enter to
+    /// land) — so this can never open a popup `confirm_move` can't act on.
+    pub fn open_move_picker(&mut self) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        let folders = self.store.folders().unwrap_or_default();
+        if folders.is_empty() {
+            return;
+        }
+        self.move_picker = Some(MovePicker {
+            folders,
+            index: 0,
+            message_id: id,
+        });
+    }
+
+    /// Moves the picker's highlighted folder by `delta`, wrapping — the same
+    /// wrap-around shape as `ui::wrapped`, kept as a tiny standalone copy
+    /// here since the picker lives in `App` state and that helper is
+    /// private to the `ui` module. A no-op if the picker isn't open or (in
+    /// principle) has no folders.
+    pub fn move_picker_select(&mut self, delta: isize) {
+        if let Some(picker) = &mut self.move_picker {
+            let len = picker.folders.len();
+            if len == 0 {
+                return;
+            }
+            let len = len as isize;
+            picker.index = (((picker.index as isize + delta) % len + len) % len) as usize;
+        }
+    }
+
+    /// Esc: closes the popup without moving anything.
+    pub fn cancel_move_picker(&mut self) {
+        self.move_picker = None;
+    }
+
+    /// Enter: re-files the captured message into the highlighted folder —
+    /// store write, list reload, then `SyncCommand::Move` — and closes the
+    /// popup either way. A local store failure (e.g. a stale/foreign folder
+    /// id) skips the reload and the command send, since nothing downstream
+    /// could act on it either; the popup still closes rather than getting
+    /// stuck on a destination that can't work.
+    pub fn confirm_move(&mut self) {
+        let Some(picker) = self.move_picker.take() else {
+            return;
+        };
+        let Some(dest) = picker.folders.get(picker.index).map(|f| f.id.clone()) else {
+            return;
+        };
+        if self.store.move_message(&picker.message_id, &dest).is_ok() {
+            self.reload_messages();
+            let _ = self.sync.cmd_tx.send(SyncCommand::Move {
+                id: picker.message_id,
+                dest,
+            });
+        }
+    }
+
+    /// Test-only: drains `test_cmd_rx` and reports whether the last command
+    /// seen was a `MarkRead`. Always `false` when nothing populated the
+    /// channel (a production `App`, or a test that hasn't wired it up).
+    #[cfg(test)]
+    pub fn last_sent_command_is_mark_read(&self) -> bool {
+        let mut last = None;
+        if let Some(rx) = &self.test_cmd_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                last = Some(cmd);
+            }
+        }
+        matches!(last, Some(SyncCommand::MarkRead { .. }))
+    }
+
     /// Builds an `App` over an in-memory `Store` seeded with a folder
     /// "Inbox" and one message, wired to a `SyncHandle` whose channels are
     /// inert (no sync thread spawned) — for render/navigation tests that
@@ -196,14 +360,18 @@ impl App {
             )
             .expect("seed message");
 
-        // Inert channels: nothing in a render/navigation test drives the sync
-        // thread (there isn't one), so the peer ends (`_cmd_rx`/`_evt_tx`) are
-        // simply dropped at the end of this function.
-        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        // Nothing in a render/navigation test drives a real sync thread (there
+        // isn't one), so `_evt_tx` is simply dropped at the end of this
+        // function. `cmd_rx` is kept, though, and wired into `test_cmd_rx` so
+        // triage-action tests can inspect what got sent (see
+        // `last_sent_command_is_mark_read`).
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_evt_tx, evt_rx) = mpsc::channel();
         let sync = SyncHandle { cmd_tx, evt_rx };
 
-        App::new(store, sync)
+        let mut app = App::new(store, sync);
+        app.test_cmd_rx = Some(cmd_rx);
+        app
     }
 
     /// Builds an `App` over an empty in-memory `Store` — no folders, no
@@ -218,10 +386,12 @@ impl App {
         use std::sync::mpsc;
 
         let store = Store::open_in_memory().expect("in-memory store");
-        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_evt_tx, evt_rx) = mpsc::channel();
         let sync = SyncHandle { cmd_tx, evt_rx };
-        App::new(store, sync)
+        let mut app = App::new(store, sync);
+        app.test_cmd_rx = Some(cmd_rx);
+        app
     }
 }
 
@@ -256,6 +426,20 @@ pub fn store_path_for(account: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mark_read_updates_store_and_enqueues_command() {
+        let mut app = App::for_test_with_seeded_store(); // has one unread message selected
+        app.on_key_char('m');
+        // store row now read
+        let rows = app
+            .store
+            .messages_in_folder(app.selected_folder.as_ref().unwrap(), 50, 0)
+            .unwrap();
+        assert!(rows[0].is_read);
+        // a MarkRead command was sent to the (test) sync handle
+        assert!(app.last_sent_command_is_mark_read());
+    }
+
     #[test]
     fn store_path_is_under_local_appdata_per_account() {
         let p = store_path_for("me@epam.com");
