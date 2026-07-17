@@ -77,7 +77,11 @@ impl std::error::Error for AuthError {}
 
 /// The tenant segment for the `/oauth2/v2.0/...` endpoints: the last path
 /// segment of `authority` (e.g. `.../organizations` -> `organizations`).
+/// `authority` is user-overridable, so tolerate a trailing slash (which
+/// would otherwise yield an empty tenant and a malformed `//oauth2/...`
+/// URL) by trimming it first.
 fn tenant_of(authority: &str) -> &str {
+    let authority = authority.trim_end_matches('/');
     authority.rsplit('/').next().unwrap_or(authority)
 }
 
@@ -131,10 +135,16 @@ pub fn redeem_code(
         ("code_verifier", req.pkce.verifier.as_str()),
         ("scope", cfg.scope.as_str()),
     ]);
-    post_token(cfg, http_base, &body)
+    // No prior refresh token exists yet on this path, so there's nothing
+    // to fall back to if the server omits one.
+    post_token(cfg, http_base, &body, "")
 }
 
-/// Exchanges a refresh token for a fresh token set.
+/// Exchanges a refresh token for a fresh token set. Entra ID may omit
+/// `refresh_token` from the response (refresh tokens aren't always
+/// rotated); when it does, the caller's `refresh_token` is carried forward
+/// into the returned `TokenSet` rather than being silently replaced with
+/// an empty string.
 pub fn refresh(cfg: &AuthConfig, http_base: &str, refresh_token: &str) -> Result<TokenSet, AuthError> {
     let body = pkce::form_urlencode(&[
         ("grant_type", "refresh_token"),
@@ -142,10 +152,15 @@ pub fn refresh(cfg: &AuthConfig, http_base: &str, refresh_token: &str) -> Result
         ("refresh_token", refresh_token),
         ("scope", cfg.scope.as_str()),
     ]);
-    post_token(cfg, http_base, &body)
+    post_token(cfg, http_base, &body, refresh_token)
 }
 
-fn post_token(cfg: &AuthConfig, http_base: &str, body: &str) -> Result<TokenSet, AuthError> {
+fn post_token(
+    cfg: &AuthConfig,
+    http_base: &str,
+    body: &str,
+    fallback_refresh_token: &str,
+) -> Result<TokenSet, AuthError> {
     let tenant = tenant_of(&cfg.authority);
     let url = format!("{http_base}/{tenant}/oauth2/v2.0/token");
 
@@ -163,7 +178,7 @@ fn post_token(cfg: &AuthConfig, http_base: &str, body: &str) -> Result<TokenSet,
         Err(ureq::Error::Transport(t)) => return Err(AuthError::Http(t.to_string())),
     };
 
-    parse_token_response(&response_body)
+    parse_token_response(&response_body, fallback_refresh_token)
 }
 
 /// Interprets a non-2xx token-endpoint response. Entra ID error bodies are
@@ -183,7 +198,7 @@ fn classify_error(status: u16, body: &str) -> AuthError {
     AuthError::Http(format!("HTTP {status}: {body}"))
 }
 
-fn parse_token_response(body: &str) -> Result<TokenSet, AuthError> {
+fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<TokenSet, AuthError> {
     let v = json::parse(body).map_err(|e| AuthError::Parse(e.to_string()))?;
 
     let access_token = v
@@ -191,10 +206,13 @@ fn parse_token_response(body: &str) -> Result<TokenSet, AuthError> {
         .and_then(|x| x.as_str())
         .ok_or_else(|| AuthError::Parse("response has no access_token".to_string()))?
         .to_string();
+    // Entra ID doesn't always rotate/re-send `refresh_token` on a refresh
+    // response; when it's absent, keep whatever refresh token the caller
+    // already had rather than overwriting it with an empty string.
     let refresh_token = v
         .get("refresh_token")
         .and_then(|x| x.as_str())
-        .unwrap_or("")
+        .unwrap_or(fallback_refresh_token)
         .to_string();
     let expires_in = v
         .get("expires_in")
@@ -289,5 +307,27 @@ mod tests {
         let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
         assert_eq!(t.access_token, "AT2");
         assert_eq!(t.refresh_token, "RT2");
+    }
+
+    #[test]
+    fn refresh_missing_refresh_token_reuses_old() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"access_token":"AT2","expires_in":3600}"#.into(),
+        }]);
+        let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
+        assert_eq!(t.access_token, "AT2");
+        assert_eq!(t.refresh_token, "RT1");
+    }
+
+    #[test]
+    fn tenant_of_trims_trailing_slash() {
+        assert_eq!(
+            tenant_of("https://login.microsoftonline.com/organizations/"),
+            "organizations"
+        );
     }
 }
