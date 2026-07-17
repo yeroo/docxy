@@ -24,6 +24,12 @@ mod control;
 // is only reachable from `mcp`'s own tests, so silence dead_code here too.
 #[allow(dead_code)]
 mod mcp;
+// The bundled agent SKILL.md (self-onboarding for the MCP/control surface).
+// Wiring the `install skill` CLI dispatch is a separate later task; until
+// then `install` is only reachable from `skill`'s own tests, so silence
+// dead_code here too.
+#[allow(dead_code)]
+mod skill;
 mod ui;
 
 use std::io;
