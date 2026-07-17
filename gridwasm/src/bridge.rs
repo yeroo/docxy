@@ -157,6 +157,61 @@ impl Session {
             }
             "undo" => self.do_undo(),
             "redo" => self.do_redo(),
+            "insrow" | "delrow" | "inscol" | "delcol" => {
+                let p: Vec<&str> = rest.split('\t').collect();
+                if p.len() == 2 {
+                    let at: u32 = p[0].parse().unwrap_or(0);
+                    let n: u32 = p[1].parse().unwrap_or(1).max(1);
+                    let idx = self.active;
+                    match op {
+                        "insrow" => {
+                            self.structural(|wb| gridcore::edit::insert_rows(wb, idx, at, n))
+                        }
+                        "delrow" => {
+                            self.structural(|wb| gridcore::edit::delete_rows(wb, idx, at, n))
+                        }
+                        "inscol" => {
+                            self.structural(|wb| gridcore::edit::insert_cols(wb, idx, at, n))
+                        }
+                        _ => self.structural(|wb| gridcore::edit::delete_cols(wb, idx, at, n)),
+                    }
+                }
+            }
+            "sheet" => {
+                let p: Vec<&str> = rest.splitn(2, '\t').collect();
+                match (p.first().copied(), p.get(1).copied()) {
+                    (Some("switch"), Some(i)) => {
+                        let i: usize = i.parse().unwrap_or(0);
+                        if i < self.pkg.workbook.sheets.len() {
+                            self.active = i;
+                            self.cur = (0, 0);
+                            self.anchor = None;
+                        }
+                    }
+                    (Some("add"), Some(name)) if !name.is_empty() => {
+                        // add_sheet also creates the worksheet part; snapshot-undo won't
+                        // remove the part (accepted, same as the TUI's semantics).
+                        let idx = self.pkg.add_sheet(name);
+                        self.rebuild_engine();
+                        self.active = idx;
+                        self.cur = (0, 0);
+                        self.anchor = None;
+                        self.dirty = true;
+                        self.undo.clear();
+                        self.redo.clear();
+                    }
+                    (Some("rename"), Some(rest2)) => {
+                        if let Some((i, name)) = rest2.split_once('\t') {
+                            let i: usize = i.parse().unwrap_or(usize::MAX);
+                            if i < self.pkg.workbook.sheets.len() && !name.is_empty() {
+                                let n = name.to_string();
+                                self.structural(|wb| gridcore::edit::rename_sheet(wb, i, &n));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
         None
@@ -226,8 +281,6 @@ impl Session {
 
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
     /// the inverse isn't per-cell, so undo restores the whole grid state.
-    /// (Unused until Task 3 wires structural dispatch ops through it.)
-    #[allow(dead_code)]
     fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
         let before = WbSnapshot {
             sheets: self.pkg.workbook.sheets.clone(),
@@ -493,5 +546,55 @@ mod tests {
             "{v}"
         );
         assert!(v.contains("\"ref\":\"A2\""), "{v}");
+    }
+
+    #[test]
+    fn insert_row_rewrites_references_and_undoes() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("insrow\t1\t1"); // push data rows down: SUM(B1:B3) -> SUM(B1:B4)
+        s.dispatch("select\t4\t1");
+        let v = s.view_json();
+        assert!(
+            v.contains("\"src\":\"=SUM(B1:B4)\""),
+            "refs must rewrite: {v}"
+        );
+        assert!(v.contains("3.75"), "total unchanged: {v}");
+        s.dispatch("undo");
+        s.dispatch("select\t3\t1");
+        let v = s.view_json();
+        assert!(
+            v.contains("\"src\":\"=SUM(B1:B3)\""),
+            "undo restores refs: {v}"
+        );
+    }
+
+    #[test]
+    fn delete_col_and_undo() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("delcol\t0\t1"); // drop the Item column; Price shifts to col 0
+        let v = s.view_json();
+        assert!(!v.contains("Apple"), "{v}");
+        assert!(v.contains("3.75"), "sum column survives: {v}");
+        s.dispatch("undo");
+        let v = s.view_json();
+        assert!(v.contains("Apple"), "undo restores: {v}");
+    }
+
+    #[test]
+    fn sheet_add_rename_switch() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("sheet\tadd\tData");
+        let v = s.view_json();
+        assert!(v.contains("\"sheets\":[\"Sheet1\",\"Data\"]"), "{v}");
+        assert!(
+            v.contains("\"active\":1"),
+            "add switches to the new sheet: {v}"
+        );
+        s.dispatch("sheet\trename\t1\tFacts");
+        let v = s.view_json();
+        assert!(v.contains("Facts"), "{v}");
+        s.dispatch("sheet\tswitch\t0");
+        let v = s.view_json();
+        assert!(v.contains("\"active\":0") && v.contains("Apple"), "{v}");
     }
 }
