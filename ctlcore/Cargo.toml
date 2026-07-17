@@ -1,0 +1,14 @@
+[package]
+name = "ctlcore"
+description = "Ctlcore — a tiny, dependency-free control surface for the office TUIs: a loopback-TCP, newline-delimited-JSON request/response server plus a discovery file, so an external agent (e.g. Claude Code in a sibling pane) can drive the live editor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["ipc", "control", "tui", "json", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints]
+workspace = true

@@ -20,7 +20,10 @@ workspace = true
 
 [dependencies]
 # Path + version so `docxy` can be published once `docxcore` is on crates.io.
-docxcore = { version = "0.3.0", path = "../docxcore" }
+docxcore = { version = "0.4.0", path = "../docxcore" }
+# The agent control surface (loopback-TCP + newline-JSON), used to drive the
+# live document from a sibling agwinterm pane.
+ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
 ratatui = "0.29"
 # OS clipboard bridge (copy/paste across applications).
