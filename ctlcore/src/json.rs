@@ -223,7 +223,10 @@ impl Parser<'_> {
             self.i += 1;
         }
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            && matches!(
+                self.b[self.i],
+                b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+            )
         {
             self.i += 1;
         }
@@ -408,7 +411,10 @@ mod tests {
     fn parses_unicode_and_surrogate_pairs() {
         assert_eq!(Json::parse("\"\\u00e9\"").unwrap().as_str(), Some("é"));
         // U+1F600 GRINNING FACE as a surrogate pair.
-        assert_eq!(Json::parse("\"\\ud83d\\ude00\"").unwrap().as_str(), Some("😀"));
+        assert_eq!(
+            Json::parse("\"\\ud83d\\ude00\"").unwrap().as_str(),
+            Some("😀")
+        );
     }
 
     #[test]

@@ -73,7 +73,10 @@ pub fn discover(dir: &Path) -> Vec<Instance> {
 
 /// Discovery records whose server currently accepts a connection.
 pub fn discover_live(dir: &Path) -> Vec<Instance> {
-    discover(dir).into_iter().filter(Instance::is_live).collect()
+    discover(dir)
+        .into_iter()
+        .filter(Instance::is_live)
+        .collect()
 }
 
 /// A request/response client. Each [`call`](Client::call) opens a fresh
@@ -91,11 +94,10 @@ impl Client {
     /// `Err` carrying either a transport failure or the server's own
     /// `{ok:false,error}` message.
     pub fn call(&self, verb: &str, args: Json) -> Result<Json, String> {
-        let mut stream = TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
-            .map_err(|e| format!("connect failed: {e}"))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .ok();
+        let mut stream =
+            TcpStream::connect_timeout(&self.instance.addr(), Duration::from_millis(500))
+                .map_err(|e| format!("connect failed: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
         let mut line = Json::obj(vec![
             ("token", Json::Str(self.instance.token.clone())),

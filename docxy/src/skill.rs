@@ -81,8 +81,8 @@ fn home() -> Option<PathBuf> {
 /// (`~/.claude`); also installs for any other agent root that already exists
 /// (`~/.codex`). Returns a human-readable summary of where it wrote.
 pub fn install() -> std::io::Result<String> {
-    let home =
-        home().ok_or_else(|| std::io::Error::other("no home directory (USERPROFILE/HOME unset)"))?;
+    let home = home()
+        .ok_or_else(|| std::io::Error::other("no home directory (USERPROFILE/HOME unset)"))?;
     install_to(&home)
 }
 
@@ -147,12 +147,13 @@ mod tests {
         // With ~/.codex present, it installs there too.
         std::fs::create_dir_all(tmp.join(".codex")).unwrap();
         install_to(&tmp).unwrap();
-        assert!(tmp
-            .join(".codex")
-            .join("skills")
-            .join("docxy")
-            .join("SKILL.md")
-            .exists());
+        assert!(
+            tmp.join(".codex")
+                .join("skills")
+                .join("docxy")
+                .join("SKILL.md")
+                .exists()
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

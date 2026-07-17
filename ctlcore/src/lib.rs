@@ -205,7 +205,9 @@ fn sweep_stale(dir: &Path, own: &Path) {
             continue;
         };
         // Leave anything we can't parse as a discovery record untouched.
-        let Ok(doc) = Json::parse(&text) else { continue };
+        let Ok(doc) = Json::parse(&text) else {
+            continue;
+        };
         let Some(port) = doc.get("port").and_then(Json::as_i64) else {
             continue;
         };
@@ -387,7 +389,10 @@ mod tests {
         assert!(path.exists());
         let doc = Json::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc.get_str("instance"), Some("docxy-abc"));
-        assert_eq!(doc.get("port").unwrap().as_i64(), Some(server.port() as i64));
+        assert_eq!(
+            doc.get("port").unwrap().as_i64(),
+            Some(server.port() as i64)
+        );
         assert_eq!(doc.get_str("token"), Some(server.token()));
         drop(rx);
         drop(server);
@@ -405,7 +410,10 @@ mod tests {
             server.token()
         );
         let reply = roundtrip(server.port(), &line);
-        assert_eq!(reply, "{\"ok\":true,\"result\":{\"verb\":\"doc.read\",\"n\":5},\"id\":9}");
+        assert_eq!(
+            reply,
+            "{\"ok\":true,\"result\":{\"verb\":\"doc.read\",\"n\":5},\"id\":9}"
+        );
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -464,7 +472,9 @@ mod tests {
         let stale = dir.join("docxy-dead.json");
         std::fs::write(
             &stale,
-            format!("{{\"instance\":\"docxy-dead\",\"port\":{dead_port},\"token\":\"x\",\"pid\":1}}"),
+            format!(
+                "{{\"instance\":\"docxy-dead\",\"port\":{dead_port},\"token\":\"x\",\"pid\":1}}"
+            ),
         )
         .unwrap();
         // A second server starting up runs the sweep.
@@ -487,8 +497,10 @@ mod tests {
         let tok = server.token();
         for i in 0..3 {
             s.write_all(
-                format!("{{\"token\":\"{tok}\",\"verb\":\"v\",\"args\":{{\"n\":{i}}},\"id\":{i}}}\n")
-                    .as_bytes(),
+                format!(
+                    "{{\"token\":\"{tok}\",\"verb\":\"v\",\"args\":{{\"n\":{i}}},\"id\":{i}}}\n"
+                )
+                .as_bytes(),
             )
             .unwrap();
         }

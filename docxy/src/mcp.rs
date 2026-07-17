@@ -184,7 +184,10 @@ fn tool_result(text: String, is_error: bool) -> Json {
 fn initialize_result() -> Json {
     Json::obj(vec![
         ("protocolVersion", Json::Str(PROTOCOL_VERSION.into())),
-        ("capabilities", Json::obj(vec![("tools", Json::obj(vec![]))])),
+        (
+            "capabilities",
+            Json::obj(vec![("tools", Json::obj(vec![]))]),
+        ),
         (
             "serverInfo",
             Json::obj(vec![
@@ -252,7 +255,10 @@ fn tool_defs() -> Json {
              defaults to the whole document, or pass a block range.",
             vec![
                 ("start", prop("integer", "First block index (default 0).")),
-                ("end", prop("integer", "Last block index, inclusive (default: last).")),
+                (
+                    "end",
+                    prop("integer", "Last block index, inclusive (default: last)."),
+                ),
                 target(),
             ],
             &[],
@@ -262,7 +268,10 @@ fn tool_defs() -> Json {
             "Find all occurrences of a query in the live document; returns match positions and the containing paragraph.",
             vec![
                 ("query", prop("string", "Text to search for.")),
-                ("case_sensitive", prop("boolean", "Match case (default false).")),
+                (
+                    "case_sensitive",
+                    prop("boolean", "Match case (default false)."),
+                ),
                 target(),
             ],
             &["query"],
@@ -272,9 +281,21 @@ fn tool_defs() -> Json {
             "Replace paragraphs [start..=end] with new text (\\n separates paragraphs). Undoable; \
              endpoints must be paragraphs.",
             vec![
-                ("start", prop("integer", "First paragraph block index to replace.")),
-                ("end", prop("integer", "Last paragraph block index, inclusive (default: start).")),
-                ("text", prop("string", "Replacement text; \\n starts a new paragraph.")),
+                (
+                    "start",
+                    prop("integer", "First paragraph block index to replace."),
+                ),
+                (
+                    "end",
+                    prop(
+                        "integer",
+                        "Last paragraph block index, inclusive (default: start).",
+                    ),
+                ),
+                (
+                    "text",
+                    prop("string", "Replacement text; \\n starts a new paragraph."),
+                ),
                 target(),
             ],
             &["start", "text"],
@@ -283,8 +304,17 @@ fn tool_defs() -> Json {
             "docxy_insert",
             "Insert text as new paragraph(s) before the block at `at` (\\n separates paragraphs). Undoable.",
             vec![
-                ("at", prop("integer", "Block index to insert before (== block count to append).")),
-                ("text", prop("string", "Text to insert; \\n starts a new paragraph.")),
+                (
+                    "at",
+                    prop(
+                        "integer",
+                        "Block index to insert before (== block count to append).",
+                    ),
+                ),
+                (
+                    "text",
+                    prop("string", "Text to insert; \\n starts a new paragraph."),
+                ),
                 target(),
             ],
             &["at", "text"],
@@ -293,7 +323,10 @@ fn tool_defs() -> Json {
             "docxy_append",
             "Append text as new paragraph(s) at the end of the document (\\n separates paragraphs). Undoable.",
             vec![
-                ("text", prop("string", "Text to append; \\n starts a new paragraph.")),
+                (
+                    "text",
+                    prop("string", "Text to append; \\n starts a new paragraph."),
+                ),
                 target(),
             ],
             &["text"],
@@ -335,7 +368,13 @@ mod tests {
     #[test]
     fn tools_list_includes_the_edit_verbs() {
         let r = handle(&req("tools/list", 2)).unwrap();
-        let tools = r.get("result").unwrap().get("tools").unwrap().as_array().unwrap();
+        let tools = r
+            .get("result")
+            .unwrap()
+            .get("tools")
+            .unwrap()
+            .as_array()
+            .unwrap();
         let names: Vec<&str> = tools.iter().filter_map(|t| t.get_str("name")).collect();
         for expected in [
             "docxy_list",
@@ -349,7 +388,10 @@ mod tests {
         }
         // Every tool carries an object input schema.
         for t in tools {
-            assert_eq!(t.get("inputSchema").unwrap().get_str("type"), Some("object"));
+            assert_eq!(
+                t.get("inputSchema").unwrap().get_str("type"),
+                Some("object")
+            );
         }
     }
 

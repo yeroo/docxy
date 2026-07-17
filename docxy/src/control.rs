@@ -271,7 +271,9 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
 
 fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
     let n = app.editor.doc.body.len();
-    let at = args.get_usize("at").ok_or("doc.insert needs an 'at' index")?;
+    let at = args
+        .get_usize("at")
+        .ok_or("doc.insert needs an 'at' index")?;
     let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
     if at > n {
         return Err(format!("'at' {at} out of bounds (0..={n})"));
@@ -393,7 +395,7 @@ fn parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use docxcore::model::{Block, Document, Paragraph, ParProps, Run, RunProps};
+    use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps};
     use docxcore::package::new_package;
 
     /// A document of simple text paragraphs.
@@ -418,12 +420,7 @@ mod tests {
     }
 
     fn paras(app: &App) -> Vec<String> {
-        app.editor
-            .doc
-            .body
-            .iter()
-            .map(|b| b.plain_text())
-            .collect()
+        app.editor.doc.body.iter().map(|b| b.plain_text()).collect()
     }
 
     fn args(pairs: Vec<(&str, Json)>) -> Json {
@@ -443,7 +440,11 @@ mod tests {
     #[test]
     fn read_returns_range_text_and_blocks() {
         let app = app_with(&["Alpha", "Beta", "Gamma"]);
-        let r = read(&app, &args(vec![("start", Json::Num(1.0)), ("end", Json::Num(2.0))])).unwrap();
+        let r = read(
+            &app,
+            &args(vec![("start", Json::Num(1.0)), ("end", Json::Num(2.0))]),
+        )
+        .unwrap();
         assert_eq!(r.get_str("text"), Some("Beta\n\nGamma"));
         assert_eq!(r.get("blocks").unwrap().as_array().unwrap().len(), 2);
         // Whole-document default range.
@@ -462,7 +463,13 @@ mod tests {
     #[test]
     fn read_out_of_bounds_errors() {
         let app = app_with(&["A"]);
-        assert!(read(&app, &args(vec![("start", Json::Num(0.0)), ("end", Json::Num(9.0))])).is_err());
+        assert!(
+            read(
+                &app,
+                &args(vec![("start", Json::Num(0.0)), ("end", Json::Num(9.0))])
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -489,7 +496,10 @@ mod tests {
         let mut app = app_with(&["A", "B", "C"]);
         let r = replace_range(
             &mut app,
-            &args(vec![("start", Json::Num(1.0)), ("text", Json::Str("X".into()))]),
+            &args(vec![
+                ("start", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "X", "C"]);
@@ -533,7 +543,10 @@ mod tests {
         let mut app = app_with(&["A", "B", "C"]);
         insert(
             &mut app,
-            &args(vec![("at", Json::Num(1.0)), ("text", Json::Str("X".into()))]),
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "X", "B", "C"]);
@@ -544,7 +557,10 @@ mod tests {
         let mut app = app_with(&["A", "B"]);
         insert(
             &mut app,
-            &args(vec![("at", Json::Num(1.0)), ("text", Json::Str("X\nY".into()))]),
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("X\nY".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "X", "Y", "B"]);
@@ -555,7 +571,10 @@ mod tests {
         let mut app = app_with(&["A", "B"]);
         insert(
             &mut app,
-            &args(vec![("at", Json::Num(2.0)), ("text", Json::Str("C".into()))]),
+            &args(vec![
+                ("at", Json::Num(2.0)),
+                ("text", Json::Str("C".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "B", "C"]);
@@ -573,7 +592,10 @@ mod tests {
         let mut app = app_with(&["A", "B", "C"]);
         replace_range(
             &mut app,
-            &args(vec![("start", Json::Num(1.0)), ("text", Json::Str("X".into()))]),
+            &args(vec![
+                ("start", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "X", "C"]);
@@ -590,7 +612,10 @@ mod tests {
         let mut app = app_with(&["A", "B"]);
         insert(
             &mut app,
-            &args(vec![("at", Json::Num(1.0)), ("text", Json::Str("X".into()))]),
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+            ]),
         )
         .unwrap();
         assert_eq!(paras(&app), vec!["A", "X", "B"]);
@@ -612,8 +637,26 @@ mod tests {
     #[test]
     fn edit_verbs_reject_non_paragraph_and_oob() {
         let mut app = app_with(&["A"]);
-        assert!(replace_range(&mut app, &args(vec![("start", Json::Num(5.0)), ("text", Json::Str("x".into()))])).is_err());
-        assert!(insert(&mut app, &args(vec![("at", Json::Num(9.0)), ("text", Json::Str("x".into()))])).is_err());
+        assert!(
+            replace_range(
+                &mut app,
+                &args(vec![
+                    ("start", Json::Num(5.0)),
+                    ("text", Json::Str("x".into()))
+                ])
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                &mut app,
+                &args(vec![
+                    ("at", Json::Num(9.0)),
+                    ("text", Json::Str("x".into()))
+                ])
+            )
+            .is_err()
+        );
     }
 
     #[test]
