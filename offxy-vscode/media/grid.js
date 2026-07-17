@@ -151,8 +151,10 @@
     // in-cell editor is open). replaceChildren() above would otherwise
     // silently detach editEl, permanently tripping startEdit's `if (editEl)
     // return;` guard for the rest of the session — re-append it, same pattern
-    // as the docx webview's placeCaret() in media/webview.js.
-    if (editEl) $('cells').appendChild(editEl);
+    // as the docx webview's placeCaret() in media/webview.js. Removal from the
+    // DOM also blurs it, so restore focus too — otherwise it floats on screen
+    // while #gridwrap (and its onKeydown) silently owns the keyboard.
+    if (editEl) { $('cells').appendChild(editEl); editEl.focus(); }
 
     paintHeaders(top, left, nrows, ncols, originX);
     paintTabs();
@@ -340,6 +342,15 @@
   }
 
   function onKeydown(e) {
+    // Belt-and-braces alongside paint()'s focus restore above: while the
+    // in-cell editor is open, the grid-level handler must do nothing — the
+    // editor's own keydown listener owns the keyboard. Without this, a
+    // repaint that lands mid-edit without going through a caret click (e.g.
+    // the debounced requestView() after scroll settles, or a host 'do'
+    // undo/redo) could still leave focus on #gridwrap in some edge case,
+    // and Delete/Backspace here would `clear` the selected range instead of
+    // editing the floating input.
+    if (editEl) return;
     if (!handle) return;
     const mod = e.ctrlKey || e.metaKey;
     if (mod && ['z', 'y', 's'].includes(e.key.toLowerCase())) return; // VS Code owns
