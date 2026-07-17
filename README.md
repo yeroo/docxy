@@ -238,6 +238,32 @@ outline/link tables and link lag remain to be reversed.
 The design, the CPM engine, resource leveling, and the format landscape are
 written up in [PROJECT.md](PROJECT.md).
 
+## Lookxy — Outlook/Exchange mail too
+
+The workspace also ships **`lookxy`**, a terminal client for **Outlook /
+Exchange Online mail** built on `mailcore`, a headless engine over Microsoft
+Graph: OAuth2 **authorization-code + PKCE** sign-in (a system-browser
+round trip via a loopback redirect — no password ever touches `lookxy`
+itself), a SQLite local store with **FTS5 full-text search**, and a
+background sync thread that keeps folders and messages current (per-folder
+delta sync, an outbox of pending mutations with retry/back-off, and
+automatic token refresh) — all fully testable against an in-process fake
+Graph server, no network or secrets required. The TUI is a three-pane
+Outlook-like layout — folders | message list | reading pane — with triage
+keys (mark read/unread, flag, delete, move), attachment save/open, and
+full-text search, all optimistic-local-write-then-sync so the UI never
+blocks on the network.
+
+```sh
+lookxy   # sign in once (opens your browser), then read and triage mail
+```
+
+`client_id`/`backfill_days`/`refresh_secs` are configurable via
+`%APPDATA%\lookxy\config.json` or `LOOKXY_*` environment variables. Sign-in,
+keybindings, storage locations, configuration, and the security/privacy
+model (DPAPI-encrypted token cache, plaintext local mail store like
+Outlook's own OST) are written up in [LOOKXY.md](LOOKXY.md).
+
 ## Docxy in VS Code — the same engine, in an editor tab
 
 Because `docxcore` is pure `std` with no third-party crates, it compiles straight
@@ -263,6 +289,7 @@ events stay in lockstep with the engine's own undo stack — is written up in
 cargo install docxy   # the document editor
 cargo install xlsxy   # the spreadsheet editor
 cargo install yppxy   # the project scheduler
+cargo install lookxy  # the mail client
 ```
 
 Or grab prebuilt binaries (Linux / Windows / macOS) from the
@@ -290,7 +317,7 @@ cargo build --release
 cargo test
 ```
 
-The workspace has eight crates:
+The workspace has ten crates:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
   DEFLATE, XML pull parser) shared by every engine.
@@ -308,6 +335,12 @@ The workspace has eight crates:
 - **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).
 - **`yppxy`** — the project-scheduler TUI with a live terminal Gantt chart
   (ratatui).
+- **`mailcore`** — the headless mail engine: OAuth2 auth-code+PKCE, a
+  Microsoft Graph REST client, SQLite storage with FTS5 full-text search,
+  and a background sync thread (no UI dependency; `ureq`/rustls for HTTP,
+  bundled `rusqlite` for storage, DPAPI on Windows for the token cache).
+- **`lookxy`** — the mail TUI (ratatui) over `mailcore`: folder tree,
+  message list, reading pane, and triage keys.
 
 ### Examples
 

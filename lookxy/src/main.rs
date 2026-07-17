@@ -11,12 +11,14 @@
 //! keyboard input to it (`ui::handle_key`), and quits on `q`/Ctrl-C.
 
 mod app;
+mod config;
 mod ui;
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app::App;
+use config::Config;
 
 use mailcore::auth::AuthConfig;
 use mailcore::store::Store;
@@ -30,10 +32,9 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-/// How many days of mail history the sync engine backfills on first run.
-const BACKFILL_DAYS: i64 = 30;
-
 fn main() -> io::Result<()> {
+    let config = Config::load_from(None);
+
     let local_appdata = app::lookxy_dir();
     let token_path = local_appdata.join("token.bin");
 
@@ -51,25 +52,29 @@ fn main() -> io::Result<()> {
         let _ = std::fs::create_dir_all(dir);
     }
 
+    let auth_config = AuthConfig {
+        client_id: config.client_id.clone(),
+        ..AuthConfig::default()
+    };
     let store = Store::open(&store_path).map_err(io::Error::other)?;
     let handle = sync_engine::spawn(
         store_path,
         token_path.clone(),
-        AuthConfig::default(),
-        BACKFILL_DAYS,
+        auth_config,
+        config.backfill_days,
     );
     // `App` keeps its own copy of `token_path` too, so it can re-read the
     // account name for the status bar once a sign-in completes (see
     // `App::reload_account`) — the engine owns writing it, not the UI.
     let mut app = App::new(store, handle, token_path);
 
-    run_tui(&mut app)
+    run_tui(&mut app, Duration::from_secs(config.refresh_secs))
 }
 
 /// Sets up the alternate screen + raw mode, runs the event loop, and tears
 /// the terminal back down — even on panic, so a crash never leaves the
 /// user's shell in raw mode / the alternate screen.
-fn run_tui(app: &mut App) -> io::Result<()> {
+fn run_tui(app: &mut App, refresh_interval: Duration) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -85,7 +90,7 @@ fn run_tui(app: &mut App) -> io::Result<()> {
         default_hook(info);
     }));
 
-    let res = run(&mut terminal, app);
+    let res = run(&mut terminal, app, refresh_interval);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -95,8 +100,17 @@ fn run_tui(app: &mut App) -> io::Result<()> {
 
 /// The event loop: render the three-pane layout, poll for input without
 /// blocking forever (so `SyncEvent`s get drained every tick), route
-/// non-global keys to `ui::handle_key`, and quit on `q`/Ctrl-C.
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+/// non-global keys to `ui::handle_key`, quit on `q`/Ctrl-C, and — every
+/// `refresh_interval` — nudge the sync engine with an explicit
+/// `SyncCommand::Refresh` (the `Config::refresh_secs` knob; the engine also
+/// ticks on its own fixed internal timer regardless, so this only shortens
+/// the effective interval when configured below that default).
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    refresh_interval: Duration,
+) -> io::Result<()> {
+    let mut last_refresh = Instant::now();
     loop {
         drain_events(app);
 
@@ -105,8 +119,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                        && k.code == KeyCode::Char('c');
+                    let ctrl_c =
+                        k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
                     if ctrl_c || k.code == KeyCode::Char('q') {
                         app.quit = true;
                     } else {
@@ -120,6 +134,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         if app.quit {
             let _ = app.sync.cmd_tx.send(SyncCommand::Shutdown);
             return Ok(());
+        }
+
+        if last_refresh.elapsed() >= refresh_interval {
+            let _ = app.sync.cmd_tx.send(SyncCommand::Refresh);
+            last_refresh = Instant::now();
         }
     }
 }
