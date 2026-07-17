@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod graph;
+pub mod htmlrender;
 pub mod json;
 pub mod pkce;
 pub mod store;

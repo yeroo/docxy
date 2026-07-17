@@ -120,7 +120,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 /// update `app.status`; `FoldersUpdated` reloads the folder list;
 /// `MessagesUpdated` reloads the message list only when it names the
 /// currently visible folder (an update to some other folder doesn't need to
-/// disturb what's on screen).
+/// disturb what's on screen); `BodyReady` re-reads the body from the store
+/// only when it names the currently open message (`App::open_message`
+/// already sent the `FetchBody` that led here).
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
         match evt {
@@ -130,6 +132,9 @@ fn drain_events(app: &mut App) {
                 if app.selected_folder.as_deref() == Some(folder_id.as_str()) =>
             {
                 app.reload_messages();
+            }
+            SyncEvent::BodyReady { id } if app.selected_msg.as_deref() == Some(id.as_str()) => {
+                app.reload_body();
             }
             _ => {}
         }

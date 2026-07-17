@@ -5,8 +5,9 @@
 
 use std::path::PathBuf;
 
+use mailcore::graph::model::Body;
 use mailcore::store::{FolderRow, MessageRow, Store};
-use mailcore::sync::engine::{SyncHandle, SyncState};
+use mailcore::sync::engine::{SyncCommand, SyncHandle, SyncState};
 
 /// Which pane currently has keyboard focus. Tab cycles `Folders` → `List` →
 /// `Reading` → `Folders` (see `ui::handle_key`).
@@ -39,6 +40,15 @@ pub struct App {
     pub msg_index: usize,
     pub selected_folder: Option<String>,
     pub selected_msg: Option<String>,
+    /// The opened (`selected_msg`) message's body, once it's in the store.
+    /// `None` while nothing is opened, or while it's opened but not yet
+    /// fetched — see `body_loading` to tell those two apart.
+    pub body: Option<Body>,
+    /// `true` from the moment a message is opened whose body isn't yet in
+    /// the store (a `SyncCommand::FetchBody` has been sent for it) until
+    /// `SyncEvent::BodyReady` lands and `reload_body` re-reads the store.
+    /// The reading pane shows a "loading…" placeholder while this is set.
+    pub body_loading: bool,
     pub status: SyncState,
     pub quit: bool,
 }
@@ -59,6 +69,8 @@ impl App {
             msg_index: 0,
             selected_folder: None,
             selected_msg: None,
+            body: None,
+            body_loading: false,
             status: SyncState::Idle,
             quit: false,
         };
@@ -101,6 +113,42 @@ impl App {
         };
         if self.msg_index >= self.messages.len() {
             self.msg_index = self.messages.len().saturating_sub(1);
+        }
+    }
+
+    /// Opens message `id` in the reading pane: records it as `selected_msg`
+    /// and loads its body (see `reload_body`).
+    pub fn open_message(&mut self, id: &str) {
+        self.selected_msg = Some(id.to_string());
+        self.reload_body();
+    }
+
+    /// Re-reads the opened message's body from the store. If it's already
+    /// cached there, it's shown immediately; otherwise a
+    /// `SyncCommand::FetchBody` is sent and `body_loading` is set so the
+    /// reading pane can show a placeholder until `SyncEvent::BodyReady`
+    /// (handled in `main::drain_events`) prompts another call to this.
+    pub fn reload_body(&mut self) {
+        let Some(id) = self.selected_msg.clone() else {
+            self.body = None;
+            self.body_loading = false;
+            return;
+        };
+        match self.store.get_body(&id) {
+            Ok(Some(body)) => {
+                self.body = Some(body);
+                self.body_loading = false;
+            }
+            Ok(None) => {
+                self.body = None;
+                self.body_loading = true;
+                let _ = self.sync.cmd_tx.send(SyncCommand::FetchBody { id });
+            }
+            Err(_) => {
+                // The store itself is broken; nothing a re-fetch can fix.
+                self.body = None;
+                self.body_loading = false;
+            }
         }
     }
 
@@ -215,5 +263,53 @@ mod tests {
         assert!(s.contains("lookxy"));
         assert!(s.ends_with("mail.db"));
         assert!(s.contains("me_epam.com") || s.contains("me@epam.com"));
+    }
+
+    #[test]
+    fn opening_a_message_with_no_cached_body_requests_a_fetch() {
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_seeded_store();
+        // `for_test_with_seeded_store` wires up an inert channel pair (its
+        // receiver is dropped immediately), so a send would just fail
+        // silently. Swap in one whose receiver we keep, to observe what
+        // `open_message` sends down it.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+
+        app.open_message("m1");
+
+        assert!(app.body_loading);
+        assert!(app.body.is_none());
+        match cmd_rx.try_recv() {
+            Ok(SyncCommand::FetchBody { id }) => assert_eq!(id, "m1"),
+            other => panic!("expected a FetchBody command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_a_message_with_a_cached_body_renders_it_without_fetching() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_body("m1", &Body { content_type: "text".into(), content: "hello body".into() })
+            .expect("seed body");
+
+        app.open_message("m1");
+
+        assert!(!app.body_loading);
+        assert_eq!(app.body.as_ref().map(|b| b.content.as_str()), Some("hello body"));
+    }
+
+    #[test]
+    fn reload_body_clears_state_when_nothing_is_selected() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_message("m1");
+        assert!(app.body_loading);
+
+        app.selected_msg = None;
+        app.reload_body();
+
+        assert!(!app.body_loading);
+        assert!(app.body.is_none());
     }
 }

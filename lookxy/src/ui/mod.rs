@@ -92,8 +92,8 @@ fn activate(app: &mut App) {
     match app.focus {
         Pane::Folders => app.focus = Pane::List,
         Pane::List => {
-            if let Some(m) = app.messages.get(app.msg_index) {
-                app.selected_msg = Some(m.id.clone());
+            if let Some(id) = app.messages.get(app.msg_index).map(|m| m.id.clone()) {
+                app.open_message(&id);
             }
             app.focus = Pane::Reading;
         }
