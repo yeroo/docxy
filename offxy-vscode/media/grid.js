@@ -87,6 +87,7 @@
 
   let viewTimer = 0;
   function requestView() {
+    if (!handle) return; // no open workbook (e.g. empty-state showing) — nothing to fetch
     const { top, left, nrows, ncols } = win();
     cmd(`view\t${view ? view.active : 0}\t${top}\t${left}\t${nrows}\t${ncols}`);
   }
@@ -490,6 +491,8 @@
   /** Empty file: offer to turn it into a real workbook right here. */
   function showEmptyState() {
     setChromeVisible(false);
+    $('emptyState')?.remove(); // idempotent: a second empty `open` (e.g. File: Revert File
+    // on the still-0-byte file) must replace, not stack, the box.
     const box = document.createElement('div');
     box.id = 'emptyState';
     box.className = 'empty-state';
