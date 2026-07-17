@@ -3,15 +3,15 @@
 //! The sync engine (a later task) writes Graph data in here via
 //! `upsert_folder`/`upsert_message`/delta-link bookkeeping; the TUI reads
 //! only from here (offline-first). This module owns the schema (see
-//! `schema.rs`) and the folders/messages/meta surface; bodies,
-//! attachments, outbox, and full-text search are later tasks' concern even
-//! though their tables already exist (see `schema.rs`'s module doc).
+//! `schema.rs`) and the folders/messages/meta surface, plus bodies,
+//! attachments, and full-text search; the outbox is a later task's concern
+//! even though its table already exists (see `schema.rs`'s module doc).
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Row, params};
 
-use crate::graph::model::{MailFolder, Message, Recipient};
+use crate::graph::model::{AttachmentMeta, Body, MailFolder, Message, Recipient};
 
 mod schema;
 
@@ -226,25 +226,7 @@ impl Store {
              LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![folder_id, limit, offset], |row| {
-                Ok(MessageRow {
-                    id: row.get(0)?,
-                    folder_id: row.get(1)?,
-                    conversation_id: row.get(2)?,
-                    subject: row.get(3)?,
-                    from_name: row.get(4)?,
-                    from_addr: row.get(5)?,
-                    to_recipients: row.get(6)?,
-                    cc_recipients: row.get(7)?,
-                    received_at: row.get(8)?,
-                    sent_at: row.get(9)?,
-                    is_read: row.get(10)?,
-                    is_flagged: row.get(11)?,
-                    has_attachments: row.get(12)?,
-                    importance: row.get(13)?,
-                    preview: row.get(14)?,
-                })
-            })?
+            .query_map(params![folder_id, limit, offset], map_message_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -298,6 +280,129 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Inserts or replaces the body of a message. The schema's `bodies_fts_*`
+    /// triggers (see `schema.rs`) keep `messages_fts` in step with this
+    /// automatically, so `search` sees the new content right away.
+    pub fn put_body(&self, message_id: &str, b: &Body) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, ?2, ?3)
+             ON CONFLICT(message_id) DO UPDATE SET
+                 content_type = excluded.content_type,
+                 content = excluded.content",
+            params![message_id, b.content_type, b.content],
+        )?;
+        Ok(())
+    }
+
+    /// The stored body of a message, if any (`None` before `put_body` is
+    /// ever called for it).
+    pub fn get_body(&self, message_id: &str) -> Result<Option<Body>, StoreError> {
+        let body = self
+            .conn
+            .query_row(
+                "SELECT content_type, content FROM bodies WHERE message_id = ?1",
+                params![message_id],
+                |row| {
+                    Ok(Body {
+                        content_type: row.get(0)?,
+                        content: row.get(1)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(body)
+    }
+
+    /// Replaces the full set of attachment metadata stored for a message
+    /// (no bytes — those are fetched separately, later, on demand).
+    pub fn put_attachments(
+        &self,
+        message_id: &str,
+        atts: &[AttachmentMeta],
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM attachments WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        for a in atts {
+            self.conn.execute(
+                "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    a.id,
+                    message_id,
+                    a.name,
+                    a.content_type,
+                    a.size,
+                    a.is_inline
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The attachment metadata stored for a message, in insertion order.
+    pub fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, content_type, size, is_inline
+             FROM attachments
+             WHERE message_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![message_id], |row| {
+                Ok(AttachmentMeta {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get(3)?,
+                    is_inline: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Full-text search over subject, sender, and body (via `messages_fts`),
+    /// newest matching message first.
+    ///
+    /// `query` is free-form user input: it's tokenized on whitespace and
+    /// each token is individually quoted as an FTS5 string literal (with
+    /// embedded `"` doubled) before being handed to `MATCH`. FTS5 would
+    /// otherwise parse bare characters like `"`, `*`, `:`, `(`, `)`, `-`,
+    /// `^`, or the bareword operators `AND`/`OR`/`NOT` as query syntax,
+    /// so a search like `foo(bar` or `a & b` (an unbalanced paren, a lone
+    /// `&`) could throw a syntax error instead of matching literally.
+    /// Quoting every token turns it into a plain string match, and the
+    /// tokens are still joined with an implicit `AND`, so multi-word
+    /// queries keep working as "all of these words appear".
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<MessageRow>, StoreError> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
+                    to_recipients, cc_recipients, received_at, sent_at,
+                    is_read, is_flagged, has_attachments, importance, preview
+             FROM messages
+             WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
+             ORDER BY received_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![sanitized, limit], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// Encodes a list of recipients into the flat text form stored in
@@ -310,6 +415,47 @@ fn encode_recipients(list: &[Recipient]) -> String {
         .map(|r| format!("{} <{}>", r.name, r.address))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Maps one row of a `SELECT id, folder_id, ..., preview FROM messages ...`
+/// query (that exact column order) to a `MessageRow`. Shared by
+/// `messages_in_folder` and `search`, which both select those columns in
+/// that order from `messages`, so there's only one place mapping can drift
+/// out of sync with the column list.
+fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        subject: row.get(3)?,
+        from_name: row.get(4)?,
+        from_addr: row.get(5)?,
+        to_recipients: row.get(6)?,
+        cc_recipients: row.get(7)?,
+        received_at: row.get(8)?,
+        sent_at: row.get(9)?,
+        is_read: row.get(10)?,
+        is_flagged: row.get(11)?,
+        has_attachments: row.get(12)?,
+        importance: row.get(13)?,
+        preview: row.get(14)?,
+    })
+}
+
+/// Sanitizes free-form user input into an FTS5 `MATCH` query string that
+/// can't throw a syntax error: splits on whitespace and wraps each token in
+/// double quotes (doubling any embedded `"`), turning operator characters
+/// (`*`, `:`, `(`, `)`, `-`, `^`) and bareword operators (`AND`/`OR`/`NOT`)
+/// into inert literal text. Tokens stay implicitly `AND`-ed together, so
+/// multi-word queries still mean "all of these words". Returns an empty
+/// string for input with no tokens (e.g. all whitespace) — callers should
+/// treat that as "no results" rather than passing it to `MATCH`.
+fn sanitize_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -390,5 +536,28 @@ mod tests {
         assert!(s.get_delta_link("F").unwrap().is_none());
         s.set_delta_link("F", "LINK").unwrap();
         assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("LINK"));
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::graph::model::{Body, MailFolder, Message, Recipient};
+    // reuse msg() helper pattern from Task 8 tests (duplicate locally)
+
+    #[test]
+    fn search_matches_subject_and_body() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder{id:"F".into(),display_name:"I".into(),parent_id:None,total_count:0,unread_count:0,well_known_name:None}).unwrap();
+        let mut m = Message{ id:"1".into(), conversation_id:"C".into(), subject:"Quarterly budget".into(),
+            from:Recipient{name:"A".into(),address:"a@x".into()}, to:vec![], cc:vec![],
+            received:"2026-07-10T00:00:00Z".into(), sent:"".into(), is_read:false, is_flagged:false,
+            has_attachments:false, importance:"normal".into(), preview:"".into() };
+        s.upsert_message("F", &m).unwrap();
+        s.put_body("1", &Body{content_type:"text".into(), content:"the pizza party is friday".into()}).unwrap();
+        m.id = "2".into(); m.subject = "Unrelated".into();
+        s.upsert_message("F", &m).unwrap();
+        assert_eq!(s.search("budget", 50).unwrap().len(), 1);
+        assert_eq!(s.search("pizza", 50).unwrap()[0].id, "1");
     }
 }
