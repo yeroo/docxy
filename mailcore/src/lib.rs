@@ -8,6 +8,7 @@ pub mod graph;
 pub mod json;
 pub mod pkce;
 pub mod store;
+pub mod sync;
 pub mod tokencache;
 
 #[cfg(test)]

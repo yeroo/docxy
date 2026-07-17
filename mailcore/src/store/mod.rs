@@ -1,17 +1,18 @@
 //! The local SQLite mail store — the single source of truth for the TUI.
 //!
-//! The sync engine (a later task) writes Graph data in here via
+//! The sync engine writes Graph data in here via
 //! `upsert_folder`/`upsert_message`/delta-link bookkeeping; the TUI reads
 //! only from here (offline-first). This module owns the schema (see
 //! `schema.rs`) and the folders/messages/meta surface, plus bodies,
-//! attachments, and full-text search; the outbox is a later task's concern
-//! even though its table already exists (see `schema.rs`'s module doc).
+//! attachments, full-text search, and the outbox queue (triage mutations
+//! queued here for `sync::outbox::apply_op` to push to Graph later).
 
 use std::path::Path;
 
 use rusqlite::{Connection, Row, params};
 
 use crate::graph::model::{AttachmentMeta, Body, MailFolder, Message, Recipient};
+use crate::json::{self, Value};
 
 mod schema;
 
@@ -20,12 +21,17 @@ mod schema;
 #[derive(Debug)]
 pub enum StoreError {
     Sql(String),
+    /// A stored `outbox.payload` value wasn't valid JSON, or wasn't a
+    /// recognized `OutboxOp` shape. This should only happen if the row was
+    /// written by something other than `enqueue_op`.
+    Decode(String),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::Sql(msg) => write!(f, "sqlite error: {msg}"),
+            StoreError::Decode(msg) => write!(f, "outbox decode error: {msg}"),
         }
     }
 }
@@ -69,6 +75,93 @@ pub struct MessageRow {
     pub has_attachments: bool,
     pub importance: String,
     pub preview: String,
+}
+
+/// A queued local mutation, awaiting a push to Microsoft Graph by
+/// `sync::outbox::apply_op`. Serializes to/from JSON via `to_json`/
+/// `from_json` (`crate::json`, no `serde`) as `{"kind":"...","id":"...",...}`
+/// — `kind` is the tag (`markRead`/`setFlag`/`move`/`delete`), the rest are
+/// this variant's fields.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutboxOp {
+    MarkRead { id: String, read: bool },
+    SetFlag { id: String, flagged: bool },
+    Move { id: String, dest: String },
+    Delete { id: String },
+}
+
+impl OutboxOp {
+    /// The `kind` tag stored alongside the JSON payload (used for the
+    /// `outbox.op` column, which is `NOT NULL`; the payload itself is the
+    /// source of truth when reading a row back).
+    fn kind(&self) -> &'static str {
+        match self {
+            OutboxOp::MarkRead { .. } => "markRead",
+            OutboxOp::SetFlag { .. } => "setFlag",
+            OutboxOp::Move { .. } => "move",
+            OutboxOp::Delete { .. } => "delete",
+        }
+    }
+
+    /// Serializes this op to a JSON `Value` (`.to_string()` for the wire/
+    /// storage form — see the module-level docs on `crate::json::Value`).
+    pub fn to_json(&self) -> Value {
+        match self {
+            OutboxOp::MarkRead { id, read } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("read".to_string(), Value::Bool(*read)),
+            ]),
+            OutboxOp::SetFlag { id, flagged } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("flagged".to_string(), Value::Bool(*flagged)),
+            ]),
+            OutboxOp::Move { id, dest } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("dest".to_string(), Value::Str(dest.clone())),
+            ]),
+            OutboxOp::Delete { id } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+            ]),
+        }
+    }
+
+    /// Parses a JSON `Value` (as produced by `to_json`) back into an
+    /// `OutboxOp`. Returns `None` on an unrecognized `kind` or missing/
+    /// mistyped fields, rather than panicking on a corrupt row.
+    pub fn from_json(v: &Value) -> Option<OutboxOp> {
+        let kind = v.get("kind")?.as_str()?;
+        let id = || v.get("id").and_then(Value::as_str).map(str::to_string);
+        match kind {
+            "markRead" => Some(OutboxOp::MarkRead {
+                id: id()?,
+                read: v.get("read")?.as_bool()?,
+            }),
+            "setFlag" => Some(OutboxOp::SetFlag {
+                id: id()?,
+                flagged: v.get("flagged")?.as_bool()?,
+            }),
+            "move" => Some(OutboxOp::Move {
+                id: id()?,
+                dest: v.get("dest")?.as_str()?.to_string(),
+            }),
+            "delete" => Some(OutboxOp::Delete { id: id()? }),
+            _ => None,
+        }
+    }
+}
+
+/// An `outbox` row, as read back from the store: the op to apply, its
+/// queue position (`seq`, for ordering), and how many times applying it has
+/// already failed (`attempts`, bumped by `bump_op_attempts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxRow {
+    pub seq: i64,
+    pub op: OutboxOp,
+    pub attempts: i64,
 }
 
 /// The local mail database. Single-threaded access is assumed (the sync
@@ -417,6 +510,62 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Queues a local mutation for the sync engine to push to Graph,
+    /// returning its `seq` (the `outbox.seq` autoincrement rowid) so a
+    /// caller could reference this exact queued op later if needed.
+    pub fn enqueue_op(&self, op: &OutboxOp) -> Result<i64, StoreError> {
+        let payload = op.to_json().to_string();
+        self.conn.execute(
+            "INSERT INTO outbox (op, payload) VALUES (?1, ?2)",
+            params![op.kind(), payload],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// All queued ops, oldest (lowest `seq`) first — the order the sync
+    /// engine should drain them in.
+    pub fn pending_ops(&self) -> Result<Vec<OutboxRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, payload, attempts FROM outbox ORDER BY seq ASC")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let seq: i64 = row.get(0)?;
+                let payload: String = row.get(1)?;
+                let attempts: i64 = row.get(2)?;
+                Ok((seq, payload, attempts))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(seq, payload, attempts)| {
+                let v = json::parse(&payload).map_err(|e| StoreError::Decode(e.to_string()))?;
+                let op = OutboxOp::from_json(&v).ok_or_else(|| {
+                    StoreError::Decode(format!("unrecognized outbox payload: {payload}"))
+                })?;
+                Ok(OutboxRow { seq, op, attempts })
+            })
+            .collect()
+    }
+
+    /// Removes a queued op by `seq` — called once it's been applied
+    /// successfully. See `set_read` for why this doesn't return a `Result`
+    /// (a `seq` that's already gone just means zero rows change).
+    pub fn drop_op(&self, seq: i64) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM outbox WHERE seq = ?1", params![seq]);
+    }
+
+    /// Records a failed attempt to apply a queued op: increments
+    /// `attempts` and stores `err` as `last_error`, for retry backoff and
+    /// diagnostics. See `set_read` for why this doesn't return a `Result`.
+    pub fn bump_op_attempts(&self, seq: i64, err: &str) {
+        let _ = self.conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1, last_error = ?1 WHERE seq = ?2",
+            params![err, seq],
+        );
+    }
 }
 
 /// Encodes a list of recipients into the flat text form stored in
@@ -550,6 +699,99 @@ mod tests {
         assert!(s.get_delta_link("F").unwrap().is_none());
         s.set_delta_link("F", "LINK").unwrap();
         assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("LINK"));
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    #[test]
+    fn enqueue_and_read_back_in_order() {
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead{id:"1".into(),read:true}).unwrap();
+        s.enqueue_op(&OutboxOp::Delete{id:"2".into()}).unwrap();
+        let ops = s.pending_ops().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].op, OutboxOp::MarkRead{..}));
+        assert!(matches!(ops[1].op, OutboxOp::Delete{..}));
+    }
+    #[test]
+    fn drop_removes_op() {
+        let s = Store::open_in_memory().unwrap();
+        let seq = s.enqueue_op(&OutboxOp::SetFlag{id:"1".into(),flagged:true}).unwrap();
+        s.drop_op(seq);
+        assert!(s.pending_ops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bump_op_attempts_increments_and_records_error() {
+        let s = Store::open_in_memory().unwrap();
+        let seq = s
+            .enqueue_op(&OutboxOp::Delete { id: "1".into() })
+            .unwrap();
+        s.bump_op_attempts(seq, "throttled");
+        s.bump_op_attempts(seq, "throttled again");
+        let ops = s.pending_ops().unwrap();
+        assert_eq!(ops[0].attempts, 2);
+    }
+
+    #[test]
+    fn op_json_matches_expected_wire_shape() {
+        assert_eq!(
+            OutboxOp::MarkRead {
+                id: "1".into(),
+                read: true
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"markRead","id":"1","read":true}"#
+        );
+        assert_eq!(
+            OutboxOp::SetFlag {
+                id: "1".into(),
+                flagged: false
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"setFlag","id":"1","flagged":false}"#
+        );
+        assert_eq!(
+            OutboxOp::Move {
+                id: "1".into(),
+                dest: "F2".into()
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"move","id":"1","dest":"F2"}"#
+        );
+        assert_eq!(
+            OutboxOp::Delete { id: "1".into() }.to_json().to_string(),
+            r#"{"kind":"delete","id":"1"}"#
+        );
+    }
+
+    #[test]
+    fn op_json_round_trips_exactly() {
+        let ops = vec![
+            OutboxOp::MarkRead {
+                id: "M1".into(),
+                read: false,
+            },
+            OutboxOp::SetFlag {
+                id: "M2".into(),
+                flagged: true,
+            },
+            OutboxOp::Move {
+                id: "M3".into(),
+                dest: "Archive".into(),
+            },
+            OutboxOp::Delete { id: "M4".into() },
+        ];
+        for op in ops {
+            let encoded = op.to_json().to_string();
+            let decoded = OutboxOp::from_json(&json::parse(&encoded).unwrap()).unwrap();
+            assert_eq!(decoded, op);
+        }
     }
 }
 
