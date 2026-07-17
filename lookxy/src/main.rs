@@ -6,11 +6,12 @@
 //! kept live by a background sync thread talking to Microsoft Graph.
 //!
 //! This is the crate skeleton: terminal setup/teardown, the `App` state
-//! (see `app.rs`), and a minimal run loop that spawns the sync engine,
-//! drains its events each tick, and quits on `q`/Ctrl-C. The three-pane
-//! layout and its navigation land in a later task.
+//! (see `app.rs`), and a run loop that spawns the sync engine, drains its
+//! events each tick, renders the three-pane layout (`ui::draw`), routes
+//! keyboard input to it (`ui::handle_key`), and quits on `q`/Ctrl-C.
 
 mod app;
+mod ui;
 
 use std::io;
 use std::time::Duration;
@@ -28,7 +29,6 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::widgets::Paragraph;
 
 /// How many days of mail history the sync engine backfills on first run.
 const BACKFILL_DAYS: i64 = 30;
@@ -85,16 +85,14 @@ fn run_tui(app: &mut App) -> io::Result<()> {
     res
 }
 
-/// The minimal event loop: draw a placeholder, poll for input without
-/// blocking forever (so `SyncEvent`s get drained every tick), and quit on
-/// `q`/Ctrl-C.
+/// The event loop: render the three-pane layout, poll for input without
+/// blocking forever (so `SyncEvent`s get drained every tick), route
+/// non-global keys to `ui::handle_key`, and quit on `q`/Ctrl-C.
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         drain_events(app);
 
-        terminal.draw(|f| {
-            f.render_widget(Paragraph::new(placeholder_line(app)), f.area());
-        })?;
+        terminal.draw(|f| ui::draw(f, app))?;
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -103,6 +101,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         && k.code == KeyCode::Char('c');
                     if ctrl_c || k.code == KeyCode::Char('q') {
                         app.quit = true;
+                    } else {
+                        ui::handle_key(app, k);
                     }
                 }
                 _ => {}
@@ -116,27 +116,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     }
 }
 
-/// The single line drawn while the real three-pane layout (Task 13) isn't
-/// wired up yet: how many folders are cached locally, the current focus, and
-/// the selection — proof that `App`'s fields are already live, not just
-/// declared.
-fn placeholder_line(app: &App) -> String {
-    let folders = app.store.folders().map(|v| v.len()).unwrap_or(0);
-    format!(
-        "lookxy — {folders} folder(s) cached — focus: {:?} — folder: {} — msg: {} — press q to quit",
-        app.focus,
-        app.selected_folder.as_deref().unwrap_or("(none)"),
-        app.selected_msg.as_deref().unwrap_or("(none)"),
-    )
-}
-
-/// Drains every pending `SyncEvent` without blocking, updating `app.status`
-/// on status transitions. Panes (folders/list/reading) start reacting to the
-/// rest of the events in a later task.
+/// Drains every pending `SyncEvent` without blocking: status transitions
+/// update `app.status`; `FoldersUpdated` reloads the folder list;
+/// `MessagesUpdated` reloads the message list only when it names the
+/// currently visible folder (an update to some other folder doesn't need to
+/// disturb what's on screen).
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
-        if let SyncEvent::State(s) = evt {
-            app.status = s;
+        match evt {
+            SyncEvent::State(s) => app.status = s,
+            SyncEvent::FoldersUpdated => app.reload_folders(),
+            SyncEvent::MessagesUpdated { folder_id }
+                if app.selected_folder.as_deref() == Some(folder_id.as_str()) =>
+            {
+                app.reload_messages();
+            }
+            _ => {}
         }
     }
 }
