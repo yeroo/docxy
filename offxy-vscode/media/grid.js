@@ -294,6 +294,14 @@
   let dragging = false;
   function onMousedown(e) {
     if (!handle) return;
+    // Clicking another cell commits the in-progress edit first (Excel
+    // semantics), then proceeds to select the clicked cell. editEl's own
+    // mousedown listener stops propagation, so this handler only ever sees
+    // clicks outside the editor. This also compensates for the
+    // e.preventDefault() below: it suppresses the browser's native
+    // focus-shift-on-mousedown, so editEl would otherwise stay natively
+    // focused (and never blur) even though the user clicked elsewhere.
+    if (editEl) { commitEdit(); $('gridwrap').focus(); }
     const { r, c } = cellFromEvent(e);
     if (e.shiftKey) cmd(`select\t${rowOfRef()}\t${refCol()}\t${r}\t${c}`);
     else cmd(`select\t${r}\t${c}`);
@@ -396,10 +404,16 @@
   }
 
   let editEl = null;
+  // True once commitEdit()/cancelEdit() has settled the current edit. Guards
+  // re-entrancy the same way startSheetRename()'s `done` flag does: removing
+  // a focused element from the DOM fires a synchronous `blur`, so every path
+  // that removes editEl (Enter/Tab/Escape, a grid mousedown elsewhere, the
+  // blur handler itself) needs this to avoid double-committing.
+  let editDone = false;
   function startEdit(initial) {
     if (editEl) return;
     const r = rowOfRef(), c = refCol();
-    const wrap = $('gridwrap');
+    editDone = false;
     editEl = document.createElement('input');
     editEl.id = 'celledit';
     editEl.value = initial != null ? initial : view.cur.src;
@@ -409,9 +423,9 @@
     editEl.style.minWidth = defW + 'px';
     editEl.style.zIndex = 5;
     editEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commitEdit(); move(1, 0, false); }
-      else if (e.key === 'Tab') { e.preventDefault(); commitEdit(); move(0, 1, false); }
-      else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+      if (e.key === 'Enter') { e.preventDefault(); commitEdit(); $('gridwrap').focus(); move(1, 0, false); }
+      else if (e.key === 'Tab') { e.preventDefault(); commitEdit(); $('gridwrap').focus(); move(0, 1, false); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); $('gridwrap').focus(); }
       e.stopPropagation();
     });
     // Clicking inside the input to move the caret must not bubble to the
@@ -419,19 +433,35 @@
     // and repaint — editEl survives that now, but there's no reason to pay
     // for a wasm round trip just to place a text caret).
     editEl.addEventListener('mousedown', (e) => e.stopPropagation());
+    // Excel commits an in-progress edit the moment the cell loses focus for
+    // any real reason — clicking the formula bar, a sheet tab, a header
+    // menu, anywhere. The one blur to ignore is the repaint detach/re-append
+    // cycle: paint() removes editEl from the DOM (firing this same blur) and
+    // then synchronously re-appends + refocuses it — `!editEl.isConnected`
+    // catches exactly that window, before the re-append has run.
+    editEl.addEventListener('blur', () => {
+      if (editDone) return;
+      if (!editEl.isConnected) return; // mid-repaint detach; refocus follows synchronously
+      commitEdit(); // do NOT force focus back to #gridwrap — respect wherever it went
+    });
     $('cells').appendChild(editEl);
     editEl.focus();
     if (initial != null) editEl.setSelectionRange(initial.length, initial.length);
     else editEl.select();
   }
   function commitEdit() {
-    if (!editEl) return;
+    if (!editEl || editDone) return;
+    editDone = true;
     const text = editEl.value;
-    cancelEdit();
+    editEl.remove();
+    editEl = null;
     userCmd(`set\t${rowOfRef()}\t${refCol()}\t${text}`);
   }
   function cancelEdit() {
-    if (editEl) { editEl.remove(); editEl = null; $('gridwrap').focus(); }
+    if (!editEl || editDone) return;
+    editDone = true;
+    editEl.remove();
+    editEl = null;
   }
 
   // ---- clipboard through the host --------------------------------------------
