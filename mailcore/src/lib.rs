@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod json;
 pub mod pkce;
+pub mod tokencache;
 
 #[cfg(test)]
 mod testserver;
