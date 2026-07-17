@@ -6,6 +6,7 @@ use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
 use gridcore::sheet::{
     Align, Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS, Sheet, cell_name, format_with,
+    parse_cell_name, parse_range_name,
 };
 use gridcore::xlsx::{SheetPackage, load_xlsx, save_xlsx};
 
@@ -588,6 +589,374 @@ impl Session {
     }
 }
 
+// -----------------------------------------------------------------------
+// Agent control surface (`grid_ctl`)
+// -----------------------------------------------------------------------
+//
+// Routes one control verb against this session's live workbook. The reply
+// shape is byte-for-byte the same as xlsxy's control server
+// (`xlsxy/src/control.rs`, the semantic contract this mirrors): the verb
+// result object plus `"ok":true` on success, or `{"ok":false,"error":"…"}`
+// on failure. `cell.set`/`range.clear` route through `dispatch`'s existing
+// `"set"`/`"clear"` command paths — the very same ones interactive edits
+// use — so an agent edit lands on the same undo stack, recalculates
+// dependents, and marks the session dirty exactly like a keystroke.
+//
+// `wb.save`/`wb.reload`/`wb.open`/`wb.path` are HOST verbs (the host owns
+// the file on disk in the VS Code extension model) and are not implemented
+// here; `wb.info` gives the host the in-session shape it needs
+// (`sheets`/`active`/`modified`) to compose its own `wb.path`-equivalent
+// reply with URI info the host — not this crate — has.
+
+/// The most cells one `sheet.read` returns (non-empty cells in the window);
+/// larger reads set `truncated: true` so a client narrows the range.
+const CTL_READ_CAP: usize = 5000;
+/// The most matches one `find` returns.
+const CTL_FIND_CAP: usize = 200;
+
+impl Session {
+    /// Route one JSON control request (`{"verb":…,"args":{…}}`) and return the
+    /// JSON reply. See the module note above for the reply envelope.
+    pub fn ctl(&mut self, request_json: &str) -> String {
+        let req = match json::Json::parse(request_json) {
+            Ok(v) => v,
+            Err(e) => return ctl_err(&format!("bad request: {e}")),
+        };
+        let verb = req.get_str("verb").unwrap_or("");
+        let no_args = json::Json::Null;
+        let args = req.get("args").unwrap_or(&no_args);
+        let result = match verb {
+            "sheet.list" => Ok(self.ctl_sheet_list()),
+            "sheet.read" => self.ctl_sheet_read(args),
+            "cell.get" => self.ctl_cell_get(args),
+            "cell.set" => self.ctl_cell_set(args),
+            "range.clear" => self.ctl_range_clear(args),
+            "find" => self.ctl_find(args),
+            "wb.recalc" => {
+                self.engine.recalc_all(&mut self.pkg.workbook);
+                Ok("{\"recalculated\":true}".to_string())
+            }
+            "wb.info" => Ok(self.ctl_wb_info()),
+            other => Err(format!("unknown verb '{other}'")),
+        };
+        match result {
+            Ok(body) => ctl_ok(body),
+            Err(e) => ctl_err(&e),
+        }
+    }
+
+    /// `{active, sheets:[{index, name, rows, cols}]}`
+    fn ctl_sheet_list(&self) -> String {
+        let mut out = String::from("{\"active\":");
+        out.push_str(&self.active.to_string());
+        out.push_str(",\"sheets\":[");
+        for (i, s) in self.pkg.workbook.sheets.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let (rows, cols) = s.used_size();
+            out.push_str("{\"index\":");
+            out.push_str(&i.to_string());
+            out.push_str(",\"name\":");
+            json::push_str(&mut out, &s.name);
+            out.push_str(",\"rows\":");
+            out.push_str(&rows.to_string());
+            out.push_str(",\"cols\":");
+            out.push_str(&cols.to_string());
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// `{sheet?, range?}` -> `{sheet, name, rows, cols, cells:[…], truncated}`
+    fn ctl_sheet_read(&self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let s = &self.pkg.workbook.sheets[si];
+        let (used_r, used_c) = s.used_size();
+        let (r1, c1, r2, c2) = match args.get_str("range") {
+            Some(rg) => ctl_parse_range(rg)?,
+            // Whole used range (empty sheet -> the single cell A1).
+            None => (0, 0, used_r.saturating_sub(1), used_c.saturating_sub(1)),
+        };
+        let mut cells = String::new();
+        let mut count = 0usize;
+        let mut truncated = false;
+        for (&(r, c), cell) in s.cells.range((r1, 0)..=(r2, u32::MAX)) {
+            if c < c1 || c > c2 || cell.is_blank() {
+                continue;
+            }
+            if count >= CTL_READ_CAP {
+                truncated = true;
+                break;
+            }
+            if count > 0 {
+                cells.push(',');
+            }
+            cells.push_str(&self.ctl_cell_json(r, c, cell));
+            count += 1;
+        }
+        let mut out = String::from("{\"sheet\":");
+        out.push_str(&si.to_string());
+        out.push_str(",\"name\":");
+        json::push_str(&mut out, &s.name);
+        out.push_str(",\"rows\":");
+        out.push_str(&used_r.to_string());
+        out.push_str(",\"cols\":");
+        out.push_str(&used_c.to_string());
+        out.push_str(",\"cells\":[");
+        out.push_str(&cells);
+        out.push_str("],\"truncated\":");
+        out.push_str(if truncated { "true" } else { "false" });
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{ref, sheet?}` -> `{ref, row, col, value, formula?, text}`
+    fn ctl_cell_get(&self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let (r, c) = ctl_ref_arg(args)?;
+        let s = &self.pkg.workbook.sheets[si];
+        Ok(match s.cell(r, c) {
+            Some(cell) => self.ctl_cell_json(r, c, cell),
+            None => {
+                let mut out = String::from("{\"ref\":");
+                json::push_str(&mut out, &cell_name(r, c));
+                out.push_str(",\"row\":");
+                out.push_str(&r.to_string());
+                out.push_str(",\"col\":");
+                out.push_str(&c.to_string());
+                out.push_str(",\"value\":null,\"text\":\"\"}");
+                out
+            }
+        })
+    }
+
+    /// `{ref, text, sheet?}` -> `{ref, value, text, …}`. Reuses `dispatch`'s
+    /// `"set"` command path, so this shares the interactive edit's formula
+    /// validation, undo group, and recalculation.
+    fn ctl_cell_set(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let (r, c) = ctl_ref_arg(args)?;
+        let text = args.get_str("text").ok_or("cell.set needs 'text'")?;
+        let prev_active = self.active;
+        self.active = si;
+        self.dispatch(&format!("set\t{r}\t{c}\t{text}"));
+        self.active = prev_active;
+        if let Some(e) = self.err.take() {
+            return Err(e);
+        }
+        let s = &self.pkg.workbook.sheets[si];
+        Ok(match s.cell(r, c) {
+            Some(cell) => self.ctl_cell_json(r, c, cell),
+            None => {
+                let mut out = String::from("{\"ref\":");
+                json::push_str(&mut out, &cell_name(r, c));
+                out.push('}');
+                out
+            }
+        })
+    }
+
+    /// `{range, sheet?}` -> `{cleared}`. Reuses `dispatch`'s `"clear"`
+    /// command path — one undo group for the whole range.
+    fn ctl_range_clear(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let rg = args.get_str("range").ok_or("range.clear needs a 'range'")?;
+        let (r1, c1, r2, c2) = ctl_parse_range(rg)?;
+        let cleared = self.pkg.workbook.sheets[si]
+            .cells
+            .range((r1, 0)..=(r2, u32::MAX))
+            .filter(|(pos, cell)| pos.1 >= c1 && pos.1 <= c2 && !cell.is_blank())
+            .count();
+        let prev_active = self.active;
+        self.active = si;
+        self.dispatch(&format!("clear\t{r1}\t{c1}\t{r2}\t{c2}"));
+        self.active = prev_active;
+        let mut out = String::from("{\"cleared\":");
+        out.push_str(&cleared.to_string());
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{query, sheet?}` -> `{query, count, matches:[…]}`
+    fn ctl_find(&self, args: &json::Json) -> Result<String, String> {
+        let query = args.get_str("query").ok_or("find needs a 'query'")?;
+        if query.is_empty() {
+            return Err("empty query".into());
+        }
+        let needle = query.to_lowercase();
+        // A `sheet` arg restricts the search; default is every sheet.
+        let only: Option<usize> = match args.get("sheet") {
+            Some(_) => Some(self.ctl_sheet_arg(args)?),
+            None => None,
+        };
+        let mut matches = String::new();
+        let mut count = 0usize;
+        'outer: for (si, s) in self.pkg.workbook.sheets.iter().enumerate() {
+            if only.is_some_and(|o| o != si) {
+                continue;
+            }
+            for (&(r, c), cell) in &s.cells {
+                let text_hit = self.ctl_cell_text(cell).to_lowercase().contains(&needle);
+                let formula_hit = cell
+                    .formula
+                    .as_deref()
+                    .is_some_and(|f| f.to_lowercase().contains(&needle));
+                if !text_hit && !formula_hit {
+                    continue;
+                }
+                if count >= CTL_FIND_CAP {
+                    break 'outer;
+                }
+                if count > 0 {
+                    matches.push(',');
+                }
+                matches.push_str("{\"sheet\":");
+                matches.push_str(&si.to_string());
+                matches.push_str(",\"sheet_name\":");
+                json::push_str(&mut matches, &s.name);
+                matches.push(',');
+                // Splice in the rest of `cell_json`'s fields (dropping its
+                // leading '{', which we already opened above) so `sheet`
+                // and `sheet_name` lead, exactly like xlsxy's `find`.
+                let cj = self.ctl_cell_json(r, c, cell);
+                matches.push_str(&cj[1..]);
+                count += 1;
+            }
+        }
+        let mut out = String::from("{\"query\":");
+        json::push_str(&mut out, query);
+        out.push_str(",\"count\":");
+        out.push_str(&count.to_string());
+        out.push_str(",\"matches\":[");
+        out.push_str(&matches);
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// `{}` -> `{sheets, active, modified}` (the host composes this with its
+    /// own URI info for its `wb.path`-equivalent reply).
+    fn ctl_wb_info(&self) -> String {
+        let mut out = String::from("{\"sheets\":");
+        out.push_str(&self.pkg.workbook.sheets.len().to_string());
+        out.push_str(",\"active\":");
+        out.push_str(&self.active.to_string());
+        out.push_str(",\"modified\":");
+        out.push_str(if self.dirty { "true" } else { "false" });
+        out.push('}');
+        out
+    }
+
+    /// One cell as JSON: `ref`, coordinates, the typed `value`, the formula
+    /// source (with `=`), and `text` — rendered through the same style-aware
+    /// `format_with` path `view_json` uses, so an agent sees the same display
+    /// text the webview does (dates, currency, etc. formatted, not just the
+    /// raw general-format number).
+    fn ctl_cell_json(&self, row: u32, col: u32, cell: &Cell) -> String {
+        let mut out = String::from("{\"ref\":");
+        json::push_str(&mut out, &cell_name(row, col));
+        out.push_str(",\"row\":");
+        out.push_str(&row.to_string());
+        out.push_str(",\"col\":");
+        out.push_str(&col.to_string());
+        out.push_str(",\"value\":");
+        ctl_push_value(&mut out, &cell.value);
+        out.push_str(",\"text\":");
+        json::push_str(&mut out, &self.ctl_cell_text(cell));
+        if let Some(f) = &cell.formula {
+            out.push_str(",\"formula\":");
+            json::push_str(&mut out, &format!("={f}"));
+        }
+        out.push('}');
+        out
+    }
+
+    /// The style-aware display text of a cell, via the same `format_with`
+    /// path `view_json` renders the grid through.
+    fn ctl_cell_text(&self, cell: &Cell) -> String {
+        let wb = &self.pkg.workbook;
+        let xf = wb.styles.xf(cell.style);
+        format_with(&xf, &cell.value, wb.date1904)
+    }
+
+    /// Resolve the `sheet` arg (index or name) to a sheet index; default =
+    /// active.
+    fn ctl_sheet_arg(&self, args: &json::Json) -> Result<usize, String> {
+        let wb = &self.pkg.workbook;
+        match args.get("sheet") {
+            None | Some(json::Json::Null) => Ok(self.active),
+            Some(json::Json::Num(_)) => {
+                let i = args.get_usize("sheet").ok_or("bad sheet index")?;
+                if i < wb.sheets.len() {
+                    Ok(i)
+                } else {
+                    Err(format!(
+                        "sheet {i} out of bounds ({} sheets)",
+                        wb.sheets.len()
+                    ))
+                }
+            }
+            Some(json::Json::Str(name)) => wb
+                .sheets
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("no sheet named '{name}'")),
+            Some(_) => Err("'sheet' must be an index or a name".into()),
+        }
+    }
+}
+
+/// Append a cell value as JSON: `Empty` -> `null`, `Number` -> a JSON number,
+/// `Text`/`Error` -> a JSON string, `Bool` -> `true`/`false`.
+fn ctl_push_value(out: &mut String, v: &CellValue) {
+    match v {
+        CellValue::Empty => out.push_str("null"),
+        CellValue::Number(n) => json::push_num(out, *n),
+        CellValue::Text(s) => json::push_str(out, s),
+        CellValue::Bool(true) => out.push_str("true"),
+        CellValue::Bool(false) => out.push_str("false"),
+        CellValue::Error(e) => json::push_str(out, e),
+    }
+}
+
+/// Parse the `ref` arg (`"B4"`) into (row, col).
+fn ctl_ref_arg(args: &json::Json) -> Result<(u32, u32), String> {
+    let r = args
+        .get_str("ref")
+        .ok_or("needs a cell 'ref' like \"B4\"")?;
+    parse_cell_name(r.trim()).ok_or_else(|| format!("bad cell ref '{r}'"))
+}
+
+/// Parse `"A1:C10"` (or a single `"B4"`) into (r1, c1, r2, c2), normalized.
+fn ctl_parse_range(s: &str) -> Result<(u32, u32, u32, u32), String> {
+    let t = s.trim();
+    if let Some((r1, c1, r2, c2)) = parse_range_name(t) {
+        return Ok((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)));
+    }
+    if let Some((r, c)) = parse_cell_name(t) {
+        return Ok((r, c, r, c));
+    }
+    Err(format!("bad range '{s}' (use A1 or A1:C10)"))
+}
+
+/// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
+/// completing the success envelope.
+fn ctl_ok(body: String) -> String {
+    let mut s = body;
+    s.pop(); // trailing '}'
+    s.push_str(",\"ok\":true}");
+    s
+}
+
+/// The ctl failure envelope: `{"ok":false,"error":"…"}`.
+fn ctl_err(msg: &str) -> String {
+    let mut out = String::from("{\"ok\":false,\"error\":");
+    json::push_str(&mut out, msg);
+    out.push('}');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +1291,131 @@ mod tests {
         assert!(
             v.contains("\"sheets\":[\"Sheet1\"]"),
             "the undone sheet must not resurrect on reopen: {v}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: `grid_ctl` agent control surface
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ctl_sheet_read_and_cell_get() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"sheet.read","args":{}}"#);
+        assert!(
+            out.contains("\"ok\":true") && out.contains("Apple"),
+            "{out}"
+        );
+        let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4"}}"#);
+        assert!(out.contains("SUM(B1:B3)"), "{out}");
+    }
+
+    #[test]
+    fn ctl_cell_set_recalculates_and_undoes() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B2","text":"10"}}"#);
+        let v = s.view_json(None);
+        assert!(v.contains("12.5"), "recalc: {v}");
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("3.75"), "one undo restores: {v}");
+    }
+
+    #[test]
+    fn ctl_invalid_formula_and_bad_ref_error() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        assert!(
+            s.ctl(r#"{"verb":"cell.set","args":{"ref":"B2","text":"=SUM("}}"#)
+                .contains("\"ok\":false")
+        );
+        assert!(
+            s.ctl(r#"{"verb":"cell.get","args":{"ref":"NOPE99X"}}"#)
+                .contains("\"ok\":false")
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_list_and_wb_info() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"sheet.list","args":{}}"#);
+        assert!(
+            out.contains("\"active\":0") && out.contains("\"name\":\"Sheet1\""),
+            "{out}"
+        );
+        let out = s.ctl(r#"{"verb":"wb.info","args":{}}"#);
+        assert!(
+            out.contains("\"sheets\":1")
+                && out.contains("\"active\":0")
+                && out.contains("\"modified\":false")
+                && out.contains("\"ok\":true"),
+            "{out}"
+        );
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"x"}}"#);
+        let out = s.ctl(r#"{"verb":"wb.info","args":{}}"#);
+        assert!(
+            out.contains("\"modified\":true"),
+            "edits must flip modified: {out}"
+        );
+    }
+
+    #[test]
+    fn ctl_range_clear_is_undoable() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"range.clear","args":{"range":"A1:B1"}}"#);
+        assert!(
+            out.contains("\"cleared\":2") && out.contains("\"ok\":true"),
+            "{out}"
+        );
+        let v = s.view_json(None);
+        assert!(!v.contains("Item") && !v.contains("Price"), "{v}");
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("Item") && v.contains("Price"), "{v}");
+    }
+
+    #[test]
+    fn ctl_find_scans_values_and_formulas() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"find","args":{"query":"apple"}}"#);
+        assert!(
+            out.contains("\"count\":1") && out.contains("\"ref\":\"A2\""),
+            "{out}"
+        );
+        let out = s.ctl(r#"{"verb":"find","args":{"query":"sum"}}"#);
+        assert!(
+            out.contains("\"count\":1") && out.contains("\"ref\":\"B4\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_arg_accepts_index_and_name() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"sheet.read","args":{"sheet":"Sheet1"}}"#);
+        assert!(
+            out.contains("\"ok\":true") && out.contains("Apple"),
+            "{out}"
+        );
+        let out = s.ctl(r#"{"verb":"sheet.read","args":{"sheet":9}}"#);
+        assert!(out.contains("\"ok\":false"), "{out}");
+    }
+
+    #[test]
+    fn ctl_unknown_verb_and_bad_json() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"wb.frobnicate","args":{}}"#);
+        assert!(out.contains("unknown verb 'wb.frobnicate'"), "{out}");
+        let out = s.ctl("not json");
+        assert!(out.contains("\"ok\":false"), "{out}");
+    }
+
+    #[test]
+    fn ctl_wb_recalc() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"wb.recalc","args":{}}"#);
+        assert!(
+            out.contains("\"recalculated\":true") && out.contains("\"ok\":true"),
+            "{out}"
         );
     }
 
