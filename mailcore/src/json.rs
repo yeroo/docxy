@@ -143,12 +143,18 @@ fn write_escaped_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// Maximum nesting depth (objects/arrays inside objects/arrays) `parse` will
+/// descend before giving up. Guards against stack overflow on maliciously
+/// or accidentally deeply-nested input (this module parses external
+/// OAuth/Graph responses) — a `JsonError` is returned instead of a crash.
+const MAX_DEPTH: usize = 128;
+
 /// Parses a JSON document from `input`.
 pub fn parse(input: &str) -> Result<Value, JsonError> {
     let bytes = input.as_bytes();
     let mut p = Parser { bytes, pos: 0 };
     p.skip_ws();
-    let value = p.parse_value()?;
+    let value = p.parse_value(0)?;
     p.skip_ws();
     if p.pos != bytes.len() {
         return Err(p.err("trailing data after JSON value"));
@@ -192,12 +198,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<Value, JsonError> {
+    fn parse_value(&mut self, depth: usize) -> Result<Value, JsonError> {
+        if depth > MAX_DEPTH {
+            return Err(self.err("maximum nesting depth exceeded"));
+        }
         self.skip_ws();
         match self.peek() {
             None => Err(self.err("unexpected end of input")),
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
             Some(b'"') => Ok(Value::Str(self.parse_string()?)),
             Some(b't') => self.parse_literal("true", Value::Bool(true)),
             Some(b'f') => self.parse_literal("false", Value::Bool(false)),
@@ -370,7 +379,7 @@ impl<'a> Parser<'a> {
         Ok(cp)
     }
 
-    fn parse_array(&mut self) -> Result<Value, JsonError> {
+    fn parse_array(&mut self, depth: usize) -> Result<Value, JsonError> {
         self.expect_byte(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -379,7 +388,7 @@ impl<'a> Parser<'a> {
             return Ok(Value::Array(items));
         }
         loop {
-            let v = self.parse_value()?;
+            let v = self.parse_value(depth + 1)?;
             items.push(v);
             self.skip_ws();
             match self.peek() {
@@ -399,7 +408,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<Value, JsonError> {
+    fn parse_object(&mut self, depth: usize) -> Result<Value, JsonError> {
         self.expect_byte(b'{')?;
         let mut entries = Vec::new();
         self.skip_ws();
@@ -415,7 +424,7 @@ impl<'a> Parser<'a> {
             let key = self.parse_string()?;
             self.skip_ws();
             self.expect_byte(b':')?;
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             entries.push((key, value));
             self.skip_ws();
             match self.peek() {
@@ -462,6 +471,31 @@ mod tests {
         assert!(parse(r#"{"a":}"#).is_err());
         assert!(parse(r#"{"a":1,}"#).is_err());
         assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn decodes_unicode_escapes() {
+        // Basic BMP escape: é is 'é'. Written as a literal `\u` escape
+        // (unlike the existing raw-UTF-8-byte `é` in
+        // `handles_escapes_and_unicode`), so this actually exercises
+        // `parse_hex4` / the non-surrogate branch.
+        let v = parse(r#"{"s":"A\u00e9"}"#).unwrap();
+        assert_eq!(v.get("s").unwrap().as_str(), Some("Aé"));
+
+        // Surrogate pair 😀 == U+1F600 'grinning face', outside
+        // the BMP — exercises the high/low surrogate combining logic.
+        let v = parse(r#"{"s":"\uD83D\uDE00"}"#).unwrap();
+        assert_eq!(v.get("s").unwrap().as_str(), Some("😀"));
+
+        // Lone/unpaired surrogates are rejected.
+        assert!(parse(r#"{"s":"\uD83D"}"#).is_err());
+        assert!(parse(r#"{"s":"\uDE00x"}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_nesting() {
+        let s = "[".repeat(1000);
+        assert!(parse(&s).is_err());
     }
 
     #[test]
