@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["opccore", "docxcore", "gridcore", "docxy", "xlsxy", "projcore", "yppxy", "mppread", "mailcore", "docxwasm", "lookxy"]
+members = ["opccore", "docxcore", "gridcore", "docxy", "xlsxy", "projcore", "yppxy", "mppread", "ctlcore", "mailcore", "docxwasm", "lookxy"]
 
 [workspace.package]
 version = "0.3.0"
