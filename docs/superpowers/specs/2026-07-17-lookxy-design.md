@@ -12,8 +12,9 @@ IMAP is typically disabled in corporate tenants; neither is targeted.
 
 **Goals (v1)**
 
-- Sign in once via OAuth2 device-code flow; stay signed in via cached
-  refresh tokens (DPAPI-encrypted on Windows).
+- Sign in once via OAuth2 authorization-code + PKCE flow (system browser +
+  loopback redirect); stay signed in via cached refresh tokens
+  (DPAPI-encrypted on Windows).
 - Sync mail to a local SQLite store with Graph delta queries; the UI reads
   only from the local store and is fully usable offline.
 - Outlook-like three-pane TUI: folder tree | message list | reading pane.
@@ -32,16 +33,36 @@ IMAP is typically disabled in corporate tenants; neither is targeted.
 - Pixel-faithful HTML rendering; the reading pane is a reduced, readable
   view (same philosophy as docxy's document rendering).
 
-## 2. Existential risk to validate first
+## 2. Existential risk — VALIDATED 2026-07-17
 
-Everything depends on EPAM's conditional-access policies issuing a token to
-a public client via device-code flow. **Task zero is a throwaway spike**:
-request a device code with a well-known pre-consented first-party client ID
-(the approach Thunderbird and other terminal mail tools use), complete the
-login, call `GET /me/messages?$top=5`, print subjects. If the tenant blocks
-it, try alternative known client IDs; if all fail, stop and reassess (an own
-app registration with admin consent would be the fallback conversation).
-No production code before the spike passes.
+Everything depended on EPAM's conditional-access policies issuing a delegated
+mail token. This was validated by throwaway spikes before any code:
+
+- **Device-code flow is BLOCKED** by EPAM Conditional Access. The Microsoft
+  Office first-party client is not installed in the tenant at all
+  (`AADSTS700016`); other public clients (Graph CLI, Azure CLI) issue a
+  device code, but completing the browser login returns *"sign-in was
+  successful but … an authentication flow that is restricted by your admin"*
+  — the classic **"Block device code flow"** CA control.
+- **Authorization-code + PKCE (interactive system browser + loopback
+  redirect) PASSES.** Using the **Microsoft Graph CLI** public client
+  (`14d82eec-204b-4c2f-b7e8-296a70dab67e`) with a `http://localhost:<port>`
+  redirect, the flow returned an access token carrying `Mail.ReadWrite` plus
+  a refresh token, and `GET /me/messages?$top=5` listed the real inbox. The
+  Azure CLI client (`04b07795-…`) fails this flow with `AADSTS65002`
+  (not preauthorized for Graph), so the Graph CLI client is the one to use.
+
+**Consequence for the design:** lookxy authenticates via **auth-code + PKCE
+with a loopback redirect**, not device-code. See §4.
+
+**Security caveat surfaced by the spike:** the Graph CLI client comes with a
+very broad pre-consented scope set (Directory.ReadWrite.All,
+Group.ReadWrite.All, and more). lookxy only ever *calls* mail endpoints, but
+the cached token nominally carries those rights. A dedicated EPAM app
+registration scoped to just `Mail.ReadWrite` (delegated) is the cleaner
+long-term option and is noted as a v2/hardening item; using the Graph CLI
+client is acceptable for the personal-use v1 since the token only ever grants
+the user's own existing privileges.
 
 ## 3. Crate layout
 
@@ -50,9 +71,10 @@ Follows the house pattern (core engine crate + TUI crate):
 - **`mailcore`** — headless engine, no TUI dependencies:
   - `json` — hand-rolled JSON parser/serializer (same spirit as docxcore's
     XML; keeps serde out of the tree).
-  - `auth` — OAuth2 device-code flow, token refresh, token cache
-    (DPAPI-encrypted file on Windows via `windows-sys`; mode-0600 plain file
-    on Unix).
+  - `auth` — OAuth2 authorization-code + PKCE flow (opens the system browser,
+    runs a transient `http://localhost:<port>` loopback listener to catch the
+    redirect), token refresh, token cache (DPAPI-encrypted file on Windows via
+    `windows-sys`; mode-0600 plain file on Unix).
   - `graph` — thin Graph REST client over `ureq` (blocking, `rustls` TLS):
     typed wrappers for the endpoints we use, paging, `Prefer:
     outlook.body-content-type` handling, throttling/429 back-off.
@@ -72,17 +94,26 @@ protocol, sync) stays from-scratch.
 
 ## 4. Auth
 
-- Device-code flow against
-  `https://login.microsoftonline.com/organizations/oauth2/v2.0/…` with
-  scopes `Mail.ReadWrite offline_access` (delegated).
-- Client ID: a well-known first-party public client, chosen/validated by the
-  spike (§2); configurable so users in other tenants can substitute their
-  own app registration.
+- **Authorization-code + PKCE** flow against
+  `https://login.microsoftonline.com/organizations/oauth2/v2.0/{authorize,token}`
+  with scopes `Mail.ReadWrite offline_access` (delegated). Device-code flow is
+  NOT used — EPAM Conditional Access blocks it (§2).
+- Interactive step: generate a PKCE `code_verifier`/`code_challenge` (S256),
+  bind a transient loopback listener on `http://localhost:<ephemeral-port>`,
+  open the system browser at the `/authorize` URL
+  (`response_type=code`, `redirect_uri=http://localhost:<port>`,
+  `code_challenge`, `state`), capture the redirect's `code`, and POST it to
+  `/token` with the `code_verifier` to obtain the token set. `state` is
+  verified; the listener serves a small "you can close this tab" page and
+  shuts down.
+- Client ID: **`14d82eec-204b-4c2f-b7e8-296a70dab67e`** (Microsoft Graph CLI
+  public client — validated in §2). Overridable via `LOOKXY_CLIENT_ID` so
+  users in other tenants can substitute their own app registration.
 - Token cache: JSON blob `{refresh_token, access_token, expiry, account}`
   encrypted with `CryptProtectData` (per-user DPAPI) at
   `%LOCALAPPDATA%\lookxy\token.bin`. Access tokens refreshed proactively by
   the sync thread; an invalid/expired refresh token surfaces in the UI as a
-  "sign in again" banner with a fresh device code, never a crash.
+  "sign in again" banner that re-runs the browser flow, never a crash.
 
 ## 5. Storage (SQLite)
 
