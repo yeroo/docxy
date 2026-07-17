@@ -473,28 +473,71 @@
     vscode.postMessage({ type: 'readClipboard', requestId });
   }
 
+  // ---- open / empty-state ----------------------------------------------------
+  // Grid chrome (formula bar, headers, grid body, sheet tabs) is built once at
+  // boot() time, before the host even knows whether the file is empty. The
+  // empty state needs to hide that chrome rather than coexist with it: the
+  // chrome's elements are all `position: absolute`, so within body's stacking
+  // context they'd paint over a plain (non-positioned) `.empty-state` box
+  // regardless of DOM order.
+  const CHROME_IDS = ['fbar', 'corner', 'colhdr', 'rowhdr', 'gridwrap', 'tabs'];
+  function setChromeVisible(visible) {
+    for (const id of CHROME_IDS) {
+      const el = $(id);
+      if (el) el.style.display = visible ? '' : 'none';
+    }
+  }
+  /** Empty file: offer to turn it into a real workbook right here. */
+  function showEmptyState() {
+    setChromeVisible(false);
+    const box = document.createElement('div');
+    box.id = 'emptyState';
+    box.className = 'empty-state';
+    const note = document.createElement('p');
+    note.textContent = 'This file is empty — it isn’t an Excel workbook yet.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Create new workbook';
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      vscode.postMessage({ type: 'createNew' });
+    });
+    box.append(note, btn);
+    document.body.appendChild(box);
+  }
+  function hideEmptyState() {
+    $('emptyState')?.remove();
+    setChromeVisible(true);
+  }
+  function openBytes(u8) {
+    if (handle) { ex.grid_close(handle); handle = 0; }
+    if (u8.length === 0) {
+      showEmptyState();
+      return;
+    }
+    hideEmptyState();
+    const p = writeBytes(u8);
+    handle = ex.grid_open(p, u8.length);
+    ex.grid_free(p, u8.length);
+    if (!handle) {
+      document.body.textContent = 'Offxy could not read this .xlsx file.';
+      return;
+    }
+    // Excel serial for NOW()/TODAY(): days since 1899-12-30, local time.
+    const now = new Date();
+    const serial = 25569 + (now.getTime() - now.getTimezoneOffset() * 60000) / 86400000;
+    cmd(`clock\t${serial}`);
+    requestView();
+    $('gridwrap').focus();
+  }
+
   // ---- host messages -------------------------------------------------------
   window.addEventListener('message', (event) => {
     const msg = event.data;
     switch (msg.type) {
-      case 'open': {
-        const u8 = base64ToBytes(msg.data);
-        if (handle) ex.grid_close(handle);
-        const p = writeBytes(u8);
-        handle = ex.grid_open(p, u8.length);
-        ex.grid_free(p, u8.length);
-        if (!handle) {
-          document.body.textContent = 'Offxy could not read this .xlsx file.';
-          return;
-        }
-        // Excel serial for NOW()/TODAY(): days since 1899-12-30, local time.
-        const now = new Date();
-        const serial = 25569 + (now.getTime() - now.getTimezoneOffset() * 60000) / 86400000;
-        cmd(`clock\t${serial}`);
-        requestView();
-        $('gridwrap').focus();
+      case 'open':
+        openBytes(base64ToBytes(msg.data));
         break;
-      }
       case 'do':
         cmd(msg.op === 'redo' ? 'redo' : 'undo');
         requestView();

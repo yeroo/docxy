@@ -12,6 +12,7 @@
 
 import * as vscode from 'vscode';
 import { docxToMarkdown, markdownToDocx } from './engine';
+import { newWorkbook } from './gridengine';
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(register(context));
@@ -60,7 +61,9 @@ const EDITORS: EditorSpec[] = [
     script: 'grid.js',
     style: 'grid.css',
     wasm: 'gridwasm.wasm',
-    // emptyPrompt/mintEmpty land in Task 9
+    emptyPrompt:
+      '“{name}” is empty — it isn\'t an Excel workbook yet. Create a new workbook in its place?',
+    mintEmpty: (ctx) => newWorkbook(ctx),
   },
 ];
 
