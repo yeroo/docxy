@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Renamed:** the extension is now **offxy** (`yeroo.offxy`) — one extension
+  for Word and (soon in this version) Excel. Uninstall `yeroo.docxy-vscode`
+  and install the `offxy-*.vsix`. Command ids changed `docxy.*` → `offxy.*`
+  (update any custom keybindings).
 - Opening an empty (0-byte) `.docx` — e.g. a file just created in the
   explorer — now offers to create a new Word document in its place.
 - Fixed the caret visually jumping to the document start when typing a

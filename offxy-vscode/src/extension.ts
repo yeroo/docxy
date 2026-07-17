@@ -67,7 +67,7 @@ class DocxDocument implements vscode.CustomDocument {
 }
 
 class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
-  private static readonly viewType = 'docxy.docxEditor';
+  private static readonly viewType = 'offxy.docxEditor';
 
   /** The most recently focused Docxy panel, so command-palette actions target
    *  the editor the user is looking at. */
@@ -96,22 +96,22 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     // Register the command-palette actions once; each posts a bridge command
     // string (tab-delimited) to the active panel's webview.
     const COMMANDS: Array<[string, string]> = [
-      ['docxy.toggleBold', 'bold'],
-      ['docxy.toggleItalic', 'italic'],
-      ['docxy.toggleUnderline', 'underline'],
-      ['docxy.toggleStrike', 'strike'],
-      ['docxy.heading1', 'heading\t1'],
-      ['docxy.heading2', 'heading\t2'],
-      ['docxy.heading3', 'heading\t3'],
-      ['docxy.normalStyle', 'heading\t0'],
-      ['docxy.bulletList', 'list\tbullet'],
-      ['docxy.numberedList', 'list\tnumber'],
-      ['docxy.alignLeft', 'align\tleft'],
-      ['docxy.alignCenter', 'align\tcenter'],
-      ['docxy.alignRight', 'align\tright'],
-      ['docxy.alignJustify', 'align\tjustify'],
-      ['docxy.fontBigger', 'fontsize\t2'],
-      ['docxy.fontSmaller', 'fontsize\t-2'],
+      ['offxy.toggleBold', 'bold'],
+      ['offxy.toggleItalic', 'italic'],
+      ['offxy.toggleUnderline', 'underline'],
+      ['offxy.toggleStrike', 'strike'],
+      ['offxy.heading1', 'heading\t1'],
+      ['offxy.heading2', 'heading\t2'],
+      ['offxy.heading3', 'heading\t3'],
+      ['offxy.normalStyle', 'heading\t0'],
+      ['offxy.bulletList', 'list\tbullet'],
+      ['offxy.numberedList', 'list\tnumber'],
+      ['offxy.alignLeft', 'align\tleft'],
+      ['offxy.alignCenter', 'align\tcenter'],
+      ['offxy.alignRight', 'align\tright'],
+      ['offxy.alignJustify', 'align\tjustify'],
+      ['offxy.fontBigger', 'fontsize\t2'],
+      ['offxy.fontSmaller', 'fontsize\t-2'],
     ];
     for (const [cmd, op] of COMMANDS) {
       disposables.push(
@@ -122,14 +122,14 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     }
     // Replace… prompts for the terms, then drives the engine's replace-all.
     disposables.push(
-      vscode.commands.registerCommand('docxy.replace', () => provider.runReplace()),
+      vscode.commands.registerCommand('offxy.replace', () => provider.runReplace()),
     );
     // Markdown ⇄ docx conversion (runs the wasm in the extension host).
     disposables.push(
-      vscode.commands.registerCommand('docxy.convertMarkdown', (uri?: vscode.Uri) =>
+      vscode.commands.registerCommand('offxy.convertMarkdown', (uri?: vscode.Uri) =>
         convertMarkdownToDocx(context, uri),
       ),
-      vscode.commands.registerCommand('docxy.exportMarkdown', () =>
+      vscode.commands.registerCommand('offxy.exportMarkdown', () =>
         provider.runExportMarkdown(context),
       ),
     );
@@ -426,7 +426,7 @@ async function convertMarkdownToDocx(
   const docx = await markdownToDocx(context, md);
   const target = withExtension(source, '.docx');
   await vscode.workspace.fs.writeFile(target, docx);
-  await vscode.commands.executeCommand('vscode.openWith', target, 'docxy.docxEditor');
+  await vscode.commands.executeCommand('vscode.openWith', target, 'offxy.docxEditor');
   void vscode.window.showInformationMessage(`Docxy: created ${basename(target)}`);
 }
 
