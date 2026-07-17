@@ -64,10 +64,11 @@ impl Config {
     }
 
     /// Overlays whichever of `client_id`/`backfill_days`/`refresh_secs` are
-    /// present with the right shape in the parsed JSON object; anything
-    /// else in the file (unknown keys, wrong types, or the file failing to
-    /// parse as JSON at all) is silently ignored rather than treated as an
-    /// error.
+    /// present with the right shape (and pass [`is_sane_backfill_days`]/
+    /// [`is_sane_refresh_secs`]) in the parsed JSON object; anything else in
+    /// the file (unknown keys, wrong types, out-of-range numbers, or the
+    /// file failing to parse as JSON at all) is silently ignored rather than
+    /// treated as an error — the current (lower-precedence) value is kept.
     fn overlay_json(&mut self, text: &str) {
         let Ok(value) = mailcore::json::parse(text) else {
             return;
@@ -75,17 +76,27 @@ impl Config {
         if let Some(s) = value.get("client_id").and_then(|v| v.as_str()) {
             self.client_id = s.to_string();
         }
-        if let Some(n) = value.get("backfill_days").and_then(|v| v.as_i64()) {
+        if let Some(n) = value
+            .get("backfill_days")
+            .and_then(|v| v.as_i64())
+            .filter(|n| is_sane_backfill_days(*n))
+        {
             self.backfill_days = n;
         }
-        if let Some(n) = value.get("refresh_secs").and_then(|v| v.as_i64()) {
+        if let Some(n) = value
+            .get("refresh_secs")
+            .and_then(|v| v.as_i64())
+            .filter(|n| is_sane_refresh_secs_i64(*n))
+        {
             self.refresh_secs = n as u64;
         }
     }
 
     /// Overlays `LOOKXY_CLIENT_ID`/`LOOKXY_BACKFILL_DAYS`/`LOOKXY_REFRESH_SECS`
-    /// if set and (for the numeric ones) parseable; an empty/unparsable
-    /// value leaves whatever the file/default overlay already set.
+    /// if set, parseable, and (for the numeric ones) sane per
+    /// [`is_sane_backfill_days`]/[`is_sane_refresh_secs`]; an empty,
+    /// unparsable, or out-of-range value leaves whatever the file/default
+    /// overlay already set.
     fn overlay_env(&mut self) {
         if let Ok(v) = std::env::var("LOOKXY_CLIENT_ID")
             && !v.is_empty()
@@ -94,15 +105,39 @@ impl Config {
         }
         if let Ok(v) = std::env::var("LOOKXY_BACKFILL_DAYS")
             && let Ok(n) = v.parse::<i64>()
+            && is_sane_backfill_days(n)
         {
             self.backfill_days = n;
         }
         if let Ok(v) = std::env::var("LOOKXY_REFRESH_SECS")
             && let Ok(n) = v.parse::<u64>()
+            && is_sane_refresh_secs(n)
         {
             self.refresh_secs = n;
         }
     }
+}
+
+/// A backfill window only makes sense as at least one day; zero or negative
+/// is meaningless (and would otherwise silently disable backfill or, worse,
+/// underflow downstream date arithmetic).
+fn is_sane_backfill_days(n: i64) -> bool {
+    n >= 1
+}
+
+/// A refresh interval of zero (or negative) isn't a faster poll — it would
+/// either busy-loop or, cast to `u64` from a negative `i64`, wrap around to
+/// an astronomically large value that effectively never refreshes. Only
+/// strictly-positive values are accepted.
+fn is_sane_refresh_secs(n: u64) -> bool {
+    n > 0
+}
+
+/// [`is_sane_refresh_secs`], but for the raw `i64` the JSON overlay reads
+/// (checked *before* the `as u64` cast, so a negative value is rejected
+/// outright instead of wrapping first).
+fn is_sane_refresh_secs_i64(n: i64) -> bool {
+    n > 0
 }
 
 /// `%APPDATA%\lookxy\config.json` (or, off Windows,
@@ -139,7 +174,19 @@ mod tests {
     /// can observe one left set by another test running concurrently.
     /// Taking this lock up front and clearing all three vars (see
     /// `clear_env`) makes every test below see a clean, private view.
+    ///
+    /// `unwrap_or_else(|e| e.into_inner())` rather than a plain `.unwrap()`:
+    /// if some future test panics while holding the lock, the mutex is
+    /// "poisoned" and a bare `.unwrap()` on every later test's `lock()` call
+    /// would panic too, cascading one failure into every other env test in
+    /// the suite. Recovering the guard instead lets the rest of the module
+    /// run (and fail independently, if they do) rather than all going red
+    /// together.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn clear_env() {
         unsafe {
@@ -151,7 +198,7 @@ mod tests {
 
     #[test]
     fn defaults_when_no_file_and_env_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
         clear_env();
         let c = Config::load_from(None);
         assert_eq!(c.backfill_days, 180);
@@ -175,7 +222,7 @@ mod tests {
 
     #[test]
     fn file_overlay_wins_over_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
         clear_env();
         let dir = std::env::temp_dir().join(format!(
             "lookxy-config-test-{}-file-overlay-wins-over-defaults",
@@ -200,7 +247,7 @@ mod tests {
 
     #[test]
     fn missing_file_falls_back_to_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
         clear_env();
         let path = std::env::temp_dir().join("lookxy-config-test-does-not-exist.json");
         let _ = std::fs::remove_file(&path);
@@ -212,7 +259,7 @@ mod tests {
 
     #[test]
     fn env_overlay_wins_over_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
         clear_env();
         let dir = std::env::temp_dir().join(format!(
             "lookxy-config-test-{}-env-overlay-wins-over-file",
@@ -233,5 +280,96 @@ mod tests {
         assert_eq!(c.backfill_days, 99);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn negative_refresh_secs_in_file_falls_back_to_default() {
+        let _guard = lock_env();
+        clear_env();
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-config-test-{}-negative-refresh-secs-in-file",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("config.json");
+        // `-5` would wrap to a huge `u64` if cast unchecked — must be
+        // rejected outright and fall back to the default (60), not wrap.
+        std::fs::write(&path, r#"{"refresh_secs":-5}"#).expect("write fixture config");
+
+        let c = Config::load_from(Some(&path));
+
+        assert_eq!(c.refresh_secs, 60);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_backfill_days_in_file_falls_back_to_default() {
+        let _guard = lock_env();
+        clear_env();
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-config-test-{}-zero-backfill-days-in-file",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"backfill_days":0}"#).expect("write fixture config");
+
+        let c = Config::load_from(Some(&path));
+
+        assert_eq!(c.backfill_days, 180);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_refresh_secs_env_is_rejected() {
+        let _guard = lock_env();
+        clear_env();
+        unsafe {
+            std::env::set_var("LOOKXY_REFRESH_SECS", "0");
+        }
+        let c = Config::load_from(Some(Path::new(
+            "lookxy-config-test-does-not-exist-either.json",
+        )));
+        unsafe {
+            std::env::remove_var("LOOKXY_REFRESH_SECS");
+        }
+
+        assert_eq!(c.refresh_secs, 60);
+    }
+
+    #[test]
+    fn negative_backfill_days_env_is_rejected() {
+        let _guard = lock_env();
+        clear_env();
+        unsafe {
+            std::env::set_var("LOOKXY_BACKFILL_DAYS", "-1");
+        }
+        let c = Config::load_from(Some(Path::new(
+            "lookxy-config-test-does-not-exist-either.json",
+        )));
+        unsafe {
+            std::env::remove_var("LOOKXY_BACKFILL_DAYS");
+        }
+
+        assert_eq!(c.backfill_days, 180);
+    }
+
+    #[test]
+    fn zero_backfill_days_env_is_rejected() {
+        let _guard = lock_env();
+        clear_env();
+        unsafe {
+            std::env::set_var("LOOKXY_BACKFILL_DAYS", "0");
+        }
+        let c = Config::load_from(Some(Path::new(
+            "lookxy-config-test-does-not-exist-either.json",
+        )));
+        unsafe {
+            std::env::remove_var("LOOKXY_BACKFILL_DAYS");
+        }
+
+        assert_eq!(c.backfill_days, 180);
     }
 }

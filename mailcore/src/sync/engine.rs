@@ -113,8 +113,6 @@ pub struct SyncHandle {
     pub evt_rx: Receiver<SyncEvent>,
 }
 
-/// How long to wait for a command before running a periodic sync tick.
-const DEFAULT_TICK: Duration = Duration::from_secs(60);
 /// Refresh the access token when it's within this window of expiring.
 const EXPIRY_SKEW_SECS: u64 = 300;
 /// Quarantine an outbox op after this many failed attempts on a non-retryable
@@ -133,13 +131,19 @@ const SIGNIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// accepted connection once the browser has connected.
 const SIGNIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Spawns the sync thread with production Graph/auth endpoints and the default
-/// 60s tick, returning the channels to drive it.
+/// Spawns the sync thread with production Graph/auth endpoints, returning
+/// the channels to drive it. `tick` is how long the thread waits for a
+/// command before running a periodic sync pass on its own (an explicit
+/// [`SyncCommand::Refresh`] also runs one immediately, regardless of how
+/// much of the tick has elapsed) — lookxy passes its `Config::refresh_secs`
+/// here, so the configured interval genuinely governs how often the engine
+/// syncs on its own.
 pub fn spawn(
     store_path: PathBuf,
     token_path: PathBuf,
     cfg: AuthConfig,
     backfill_days: i64,
+    tick: Duration,
 ) -> SyncHandle {
     spawn_with_bases(
         store_path,
@@ -148,7 +152,7 @@ pub fn spawn(
         backfill_days,
         "https://graph.microsoft.com/v1.0".to_string(),
         "https://login.microsoftonline.com".to_string(),
-        DEFAULT_TICK,
+        tick,
     )
 }
 

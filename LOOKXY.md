@@ -105,11 +105,16 @@ default. If you want to override one, create
 |-------|---------|---------|
 | `client_id` | Microsoft Graph CLI's client id | The Entra ID app registration `lookxy` authenticates as. |
 | `backfill_days` | `180` | How many days of mail history the sync engine backfills on first run. |
-| `refresh_secs` | `60` | How often (seconds) the app nudges the sync engine to re-check Exchange for changes. |
+| `refresh_secs` | `60` | The background sync engine's poll interval (seconds): how often it re-checks Exchange for changes on its own, with no user action needed. Raising or lowering it takes effect immediately at the next launch — it sets the real interval, not just a floor. |
 
 The file is entirely optional — a missing or unparsable file (or an unknown
 key in it) is silently ignored, and `lookxy` falls back to the built-in
-defaults rather than refusing to start.
+defaults rather than refusing to start. `backfill_days` and `refresh_secs`
+are also range-checked: a non-positive `refresh_secs` (which would otherwise
+busy-loop, or silently disable refresh entirely if cast unchecked from a
+negative number) or a `backfill_days` less than `1` (a zero/negative backfill
+window is meaningless) is rejected the same way an unparsable value is — the
+next-lower-precedence value (file, then default) is kept instead.
 
 Every field can also be overridden by an environment variable, which wins
 over both the file and the defaults:

@@ -15,7 +15,7 @@ mod config;
 mod ui;
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use app::App;
 use config::Config;
@@ -62,19 +62,20 @@ fn main() -> io::Result<()> {
         token_path.clone(),
         auth_config,
         config.backfill_days,
+        Duration::from_secs(config.refresh_secs),
     );
     // `App` keeps its own copy of `token_path` too, so it can re-read the
     // account name for the status bar once a sign-in completes (see
     // `App::reload_account`) — the engine owns writing it, not the UI.
     let mut app = App::new(store, handle, token_path);
 
-    run_tui(&mut app, Duration::from_secs(config.refresh_secs))
+    run_tui(&mut app)
 }
 
 /// Sets up the alternate screen + raw mode, runs the event loop, and tears
 /// the terminal back down — even on panic, so a crash never leaves the
 /// user's shell in raw mode / the alternate screen.
-fn run_tui(app: &mut App, refresh_interval: Duration) -> io::Result<()> {
+fn run_tui(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -90,7 +91,7 @@ fn run_tui(app: &mut App, refresh_interval: Duration) -> io::Result<()> {
         default_hook(info);
     }));
 
-    let res = run(&mut terminal, app, refresh_interval);
+    let res = run(&mut terminal, app);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -100,17 +101,11 @@ fn run_tui(app: &mut App, refresh_interval: Duration) -> io::Result<()> {
 
 /// The event loop: render the three-pane layout, poll for input without
 /// blocking forever (so `SyncEvent`s get drained every tick), route
-/// non-global keys to `ui::handle_key`, quit on `q`/Ctrl-C, and — every
-/// `refresh_interval` — nudge the sync engine with an explicit
-/// `SyncCommand::Refresh` (the `Config::refresh_secs` knob; the engine also
-/// ticks on its own fixed internal timer regardless, so this only shortens
-/// the effective interval when configured below that default).
-fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    refresh_interval: Duration,
-) -> io::Result<()> {
-    let mut last_refresh = Instant::now();
+/// non-global keys to `ui::handle_key`, and quit on `q`/Ctrl-C. The sync
+/// engine's own periodic tick (set from `Config::refresh_secs` at spawn
+/// time, in `main`) is what keeps folders/messages current on its own — this
+/// loop doesn't need to nudge it itself.
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         drain_events(app);
 
@@ -134,11 +129,6 @@ fn run(
         if app.quit {
             let _ = app.sync.cmd_tx.send(SyncCommand::Shutdown);
             return Ok(());
-        }
-
-        if last_refresh.elapsed() >= refresh_interval {
-            let _ = app.sync.cmd_tx.send(SyncCommand::Refresh);
-            last_refresh = Instant::now();
         }
     }
 }
