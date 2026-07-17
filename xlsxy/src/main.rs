@@ -869,6 +869,15 @@ struct App {
     vis_rows: Vec<u32>,             // sheet row per screen line (freeze-aware)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
+    // Backstage (File) geometry + click tracking, captured during draw for mouse
+    // hit-testing.
+    bs_menu_rect: Rect,
+    bs_list_rect: Rect,
+    bs_list_top: usize,
+    bs_preview_rect: Rect,
+    bs_name_rect: Rect,
+    /// Last file-list click (entry index + time) for double-click-to-open.
+    bs_click: Option<(usize, std::time::Instant)>,
 }
 
 impl App {
@@ -933,6 +942,12 @@ impl App {
             vis_rows: Vec::new(),
             tab_spans: Vec::new(),
             ribbon_rows: 1,
+            bs_menu_rect: Rect::default(),
+            bs_list_rect: Rect::default(),
+            bs_list_top: 0,
+            bs_preview_rect: Rect::default(),
+            bs_name_rect: Rect::default(),
+            bs_click: None,
         }
     }
 
@@ -2721,6 +2736,96 @@ impl App {
         false
     }
 
+    /// Route a mouse event to the File backstage. Returns true to exit (e.g. a
+    /// click on the Exit menu item). Menu items activate on a single click; file
+    /// rows select on a single click and open on a double click.
+    fn backstage_mouse(&mut self, m: MouseEvent) -> bool {
+        use backstage::{Item, Pane};
+        let hit = |r: Rect, col: u16, row: u16| {
+            r.height > 0 && row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width
+        };
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = matches!(m.kind, MouseEventKind::ScrollDown);
+                let in_prev = hit(self.bs_preview_rect, m.column, m.row);
+                if let Some(bs) = &mut self.backstage {
+                    if in_prev && !bs.preview.is_empty() {
+                        bs.preview_scroll = if down {
+                            (bs.preview_scroll + 3).min(bs.preview.len().saturating_sub(1))
+                        } else {
+                            bs.preview_scroll.saturating_sub(3)
+                        };
+                    } else if !bs.entries.is_empty() {
+                        // The list view follows the selection, so scrolling moves it.
+                        for _ in 0..3 {
+                            bs.move_sel(down);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (col, row) = (m.column, m.row);
+                // 1) Left menu — single click selects and activates the item.
+                if hit(self.bs_menu_rect, col, row) {
+                    let idx = (row - self.bs_menu_rect.y) as usize;
+                    if idx < backstage::ITEMS.len() {
+                        if let Some(bs) = &mut self.backstage {
+                            bs.item = backstage::ITEMS[idx];
+                            bs.pane = Pane::Menu;
+                            bs.preview_path = None;
+                        }
+                        return self.bs_activate_item();
+                    }
+                    return false;
+                }
+                // 2) Save As name field — clicking focuses it for typing.
+                if hit(self.bs_name_rect, col, row) {
+                    if let Some(bs) = &mut self.backstage {
+                        bs.name_focus = true;
+                    }
+                    return false;
+                }
+                // 3) File list — single click selects, double click opens/enters.
+                if hit(self.bs_list_rect, col, row) {
+                    let idx = self.bs_list_top + (row - self.bs_list_rect.y) as usize;
+                    let now = std::time::Instant::now();
+                    let dbl = matches!(self.bs_click, Some((i, t))
+                        if i == idx && now.duration_since(t) < std::time::Duration::from_millis(500));
+                    self.bs_click = Some((idx, now));
+                    let mut open_path = None;
+                    if let Some(bs) = &mut self.backstage {
+                        if idx < bs.entries.len() {
+                            if bs.pane == Pane::SaveAs {
+                                bs.name_focus = false;
+                            } else {
+                                bs.pane = Pane::Browser;
+                            }
+                            bs.sel = idx;
+                            if dbl {
+                                open_path = bs.enter();
+                            }
+                        }
+                    }
+                    if let Some(p) = open_path {
+                        let p = p.to_string_lossy().into_owned();
+                        self.open_workbook(&p);
+                    }
+                    return false;
+                }
+                // 4) Preview pane — clicking focuses it so the wheel/keys scroll it.
+                if hit(self.bs_preview_rect, col, row) {
+                    if let Some(bs) = &mut self.backstage {
+                        if bs.item != Item::Info && bs.pane == Pane::Browser {
+                            bs.pane = Pane::Preview;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     /// Save As pane: type a name (or browse to a folder) then commit.
     fn bs_saveas_key(&mut self, code: KeyCode) -> bool {
         use backstage::Pane;
@@ -4175,7 +4280,7 @@ fn draw_start_screen(app: &App, f: &mut Frame, area: Rect) {
 
 /// The File backstage: a left menu, plus a folder browser + workbook preview
 /// (or the Info screen).
-fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
+fn draw_backstage(app: &mut App, f: &mut Frame, area: Rect) {
     use backstage::{Item, Pane};
     let Some(bs) = &app.backstage else { return };
     f.render_widget(Clear, area);
@@ -4211,16 +4316,17 @@ fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
     );
 
     let right = Rect::new(area.x + menu_w + 1, body_y, area.width - menu_w - 1, body_h);
-    if bs.item == Item::Info {
+    let (list_rect, list_top, preview_rect, name_rect) = if bs.item == Item::Info {
         draw_bs_info(app, f, right);
+        (Rect::default(), 0usize, Rect::default(), Rect::default())
     } else {
-        draw_bs_browser(f, right, bs);
-    }
+        draw_bs_browser(f, right, bs)
+    };
 
     let hint = match bs.pane {
-        Pane::Menu => "↑↓ menu · Enter choose · Esc close",
-        Pane::Browser => "↑↓ files · Enter open · ← up · Tab menu · Esc back",
-        Pane::Preview => "↑↓ scroll · Esc back",
+        Pane::Menu => "↑↓/click menu · Enter choose · Esc close",
+        Pane::Browser => "↑↓/click files · Enter/2×click open · ← up · Tab menu · Esc back",
+        Pane::Preview => "↑↓/wheel scroll · Esc back",
         Pane::SaveAs => "type name · Tab switch field · Enter save · Esc back",
     };
     f.render_widget(
@@ -4230,6 +4336,19 @@ fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
         )),
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
     );
+
+    // Record on-screen geometry so mouse clicks can be hit-tested. The `bs`
+    // borrow ends at the hint match above, freeing `app` for these writes.
+    app.bs_menu_rect = Rect::new(
+        area.x,
+        body_y,
+        menu_w,
+        (backstage::ITEMS.len() as u16).min(body_h),
+    );
+    app.bs_list_rect = list_rect;
+    app.bs_list_top = list_top;
+    app.bs_preview_rect = preview_rect;
+    app.bs_name_rect = name_rect;
 }
 
 fn draw_bs_info(app: &App, f: &mut Frame, area: Rect) {
@@ -4264,7 +4383,15 @@ fn draw_bs_info(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
+/// Renders the Open/Save-As browser and returns the geometry needed for mouse
+/// hit-testing: `(file_list, first_visible_entry, preview, saveas_name_field)`.
+/// Rects are `Rect::default()` (zero height) when the corresponding element is
+/// not shown.
+fn draw_bs_browser(
+    f: &mut Frame,
+    area: Rect,
+    bs: &backstage::Backstage,
+) -> (Rect, usize, Rect, Rect) {
     use backstage::Pane;
     let list_w = (area.width * 4 / 10).clamp(18, area.width.saturating_sub(10));
     let mut y = area.y;
@@ -4278,18 +4405,20 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
     );
     y += 1;
     // Save As name field.
+    let mut name_rect = Rect::default();
     if bs.pane == Pane::SaveAs {
         let field_style = if bs.name_focus {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
             Style::new()
         };
+        name_rect = Rect::new(area.x, y, list_w, 1);
         f.render_widget(
             Paragraph::new(RLine::from(vec![
                 RSpan::styled("name: ", Style::new().add_modifier(Modifier::DIM)),
                 RSpan::styled(bs.name_input.clone(), field_style),
             ])),
-            Rect::new(area.x, y, list_w, 1),
+            name_rect,
         );
         y += 1;
     }
@@ -4346,6 +4475,8 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
         plines.push(RLine::from(RSpan::raw(fit(l, prev.width as usize, false))));
     }
     f.render_widget(Paragraph::new(plines), prev);
+
+    (list, top, prev, name_rect)
 }
 
 /// The sheet-picker popup: every sheet, the highlighted one selected.
@@ -4849,10 +4980,7 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
         Event::Key(key) => handle_key(app, key),
-        Event::Mouse(m) => {
-            handle_mouse(app, m);
-            false
-        }
+        Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => false,
         _ => false,
     }
@@ -5251,7 +5379,12 @@ fn char_index(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn handle_mouse(app: &mut App, m: MouseEvent) {
+fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // The File backstage is a full-screen surface: it owns the mouse while open,
+    // so clicks never leak through to the grid underneath.
+    if app.backstage.is_some() {
+        return app.backstage_mouse(m);
+    }
     match m.kind {
         MouseEventKind::ScrollUp => {
             app.top = app.top.saturating_sub(3);
@@ -5278,7 +5411,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     }
                     ribbon::Hit::Outside => {}
                 }
-                return;
+                return false;
             }
             // Sheet tabs live on the line right below the grid.
             let tabs_y = app.grid_area.y + app.grid_area.height;
@@ -5290,15 +5423,15 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                         } else if i != app.sheet {
                             app.goto_sheet(i);
                         }
-                        return;
+                        return false;
                     }
                 }
-                return;
+                return false;
             }
             // Grid?
             let g = app.grid_area;
             if m.row < g.y || m.row >= g.y + g.height || m.column < g.x + app.gutter_w {
-                return;
+                return false;
             }
             // Map the screen line to a sheet row via the freeze-aware table.
             let vy = (m.row - g.y) as usize;
@@ -5315,11 +5448,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     break;
                 }
             }
-            let Some(col) = col else { return };
+            let Some(col) = col else { return false };
             if app.edit.is_some() {
                 // Clicking outside while editing commits first.
                 if !app.commit_edit() {
-                    return;
+                    return false;
                 }
             }
             if drag {
@@ -5336,6 +5469,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         _ => {}
     }
+    false
 }
 
 /// Only http/https links may be opened, and only via a direct process exec (no
@@ -5652,6 +5786,84 @@ mod tests {
         assert_eq!(app.path, "untitled.xlsx");
         assert!(app.sheet().cell(0, 0).is_none());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn backstage_mouse_selects_and_opens() {
+        // A temp folder holding one saved workbook.
+        let dir = std::env::temp_dir().join("xlsxy_bs_mouse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.xlsx");
+        {
+            let mut src = App::new(new_xlsx(), file.to_str().unwrap());
+            src.os_clip = None;
+            src.start_edit(Some('9'));
+            assert!(src.commit_edit());
+            src.save();
+        }
+
+        let mut app = App::new(new_xlsx(), "other.xlsx");
+        app.os_clip = None;
+        app.backstage = Some(backstage::Backstage::open(dir.clone()));
+
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // The left menu is rendered at x=0, first item at y=2. "Open" is item 1.
+        app.bs_menu_rect = Rect::new(0, 2, 16, backstage::ITEMS.len() as u16);
+        assert!(!app.backstage_mouse(click(3, 3))); // click "Open"
+        assert_eq!(app.backstage.as_ref().unwrap().pane, backstage::Pane::Browser);
+
+        // Entries: ".." (parent) then "a.xlsx". The list lives in the right pane
+        // (x past the 16-wide menu), starting at y=4.
+        app.bs_list_rect = Rect::new(18, 4, 18, 10);
+        app.bs_list_top = 0;
+        let a_idx = app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.name == "a.xlsx")
+            .unwrap();
+        let a_row = 4 + a_idx as u16;
+
+        // Single click selects but does not open.
+        assert!(!app.backstage_mouse(click(20, a_row)));
+        assert_eq!(app.backstage.as_ref().unwrap().sel, a_idx);
+        assert_eq!(app.path, "other.xlsx");
+
+        // A second click on the same row (double click) opens it.
+        assert!(!app.backstage_mouse(click(20, a_row)));
+        assert!(app.backstage.is_none());
+        assert_eq!(app.path, file.to_str().unwrap());
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(9.0))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backstage_mouse_exit_item_quits() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.backstage = Some(backstage::Backstage::open(std::env::temp_dir()));
+        app.bs_menu_rect = Rect::new(0, 2, 16, backstage::ITEMS.len() as u16);
+        // "Exit" is the last item; on an unmodified workbook it exits the app.
+        let exit_row = 2 + (backstage::ITEMS.len() as u16 - 1);
+        assert!(app.backstage_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: exit_row,
+            modifiers: KeyModifiers::empty(),
+        }));
     }
 
     #[test]
