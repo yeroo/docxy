@@ -39,8 +39,9 @@ pub enum SyncCommand {
     MarkRead { id: String, read: bool },
     /// Flag/unflag a message (optimistic local write + queued Graph op).
     SetFlag { id: String, flagged: bool },
-    /// Move a message to another folder (queued Graph op; the local row is
-    /// reconciled by the next delta — see the note in [`Engine::drain_outbox`]).
+    /// Move a message to another folder: optimistic local re-file plus a queued
+    /// Graph op. Graph mints a new id on move, which the next delta reconciles
+    /// (old id `@removed`, new id added).
     Move { id: String, dest: String },
     /// Delete a message (optimistic local delete + queued Graph op).
     Delete { id: String },
@@ -177,6 +178,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         next_retry: None,
         backoff: BACKOFF_MIN,
         backfill_done: false,
+        reconverge_pending: false,
     };
     engine.startup();
     engine.main_loop(cmd_rx);
@@ -203,6 +205,12 @@ struct Engine {
     /// FULL pass (re-enumerate folders) so the client can recover instead of
     /// running incremental deltas over an empty/stale folder set forever.
     backfill_done: bool,
+    /// Set when an outbox op is quarantined: the next full backfill pass must
+    /// re-fetch *all* current server messages regardless of age (ignore the
+    /// `backfill_days` cutoff) so it re-adds anything the dropped op wrongly
+    /// removed locally — including messages that have since aged past the
+    /// sliding window. Cleared once that reconverge pass completes.
+    reconverge_pending: bool,
 }
 
 impl Engine {
@@ -290,8 +298,16 @@ impl Engine {
                 // Optimistic local re-file, same pattern as MarkRead/SetFlag/
                 // Delete. Graph mints a new id on move; the next delta
                 // reconciles it (old id `@removed`, new id added), so we keep
-                // the local id and only update its folder here.
-                let _ = self.store.move_message(&id, &dest);
+                // the local id and only update its folder here. Graph stays the
+                // source of truth, so we enqueue regardless — but a local
+                // failure (e.g. `dest` isn't a stored folder yet: `folder_id`
+                // is a NOT NULL foreign key) must be surfaced, not swallowed.
+                // `id`/`dest` are message/folder ids, never secrets.
+                if let Err(e) = self.store.move_message(&id, &dest) {
+                    self.emit(SyncEvent::Error(format!(
+                        "local move of {id} to {dest} failed: {e}"
+                    )));
+                }
                 self.enqueue_and_drain(OutboxOp::Move { id, dest });
             }
             SyncCommand::Delete { id } => {
@@ -332,6 +348,11 @@ impl Engine {
                 return;
             }
         }
+        // Every folder's delta just completed without a hard failure, so any
+        // pending reconverge (upsert-everything, cutoff ignored) is satisfied.
+        // Clear it before draining: if the drain quarantines a fresh op it will
+        // re-arm reconverge for the next pass.
+        self.reconverge_pending = false;
         self.drain_outbox();
         // A full pass without a hard failure clears any offline back-off.
         self.clear_backoff();
@@ -359,12 +380,19 @@ impl Engine {
     /// Delta-sync one folder: page through from the stored `deltaLink` (or a
     /// fresh folder cursor on first sync), upserting/deleting messages and
     /// saving the new `deltaLink`. On the initial backfill, messages older
-    /// than the `backfill_days` cutoff are skipped. Returns `false` if the
-    /// whole pass should abort.
+    /// than the `backfill_days` cutoff are skipped — except during a
+    /// quarantine reconverge (`reconverge_pending`), which upserts every item
+    /// regardless of age so a wrongly-removed message is restored even if it
+    /// has aged past the sliding window. Returns `false` if the whole pass
+    /// should abort.
     fn sync_folder_delta(&mut self, folder_id: &str) -> bool {
         let stored = self.store.get_delta_link(folder_id).ok().flatten();
         let is_backfill = stored.is_none();
-        let cutoff = if is_backfill { self.cutoff_iso() } else { None };
+        let cutoff = if is_backfill && !self.reconverge_pending {
+            self.cutoff_iso()
+        } else {
+            None
+        };
         let mut cursor = match stored {
             Some(link) => DeltaCursor::Link(link),
             None => DeltaCursor::Folder(folder_id.to_string()),
@@ -486,9 +514,14 @@ impl Engine {
                         // tracking prior state to revert precisely, clear all
                         // delta links and reset `backfill_done` so the next
                         // tick runs a full re-enumeration + re-upsert, re-adding
-                        // anything the dropped op wrongly removed locally.
+                        // anything the dropped op wrongly removed locally. The
+                        // reconverge must ignore the `backfill_days` age cutoff
+                        // (see `reconverge_pending`) so it restores the message
+                        // even if it has aged past the window during the retry
+                        // back-off.
                         let _ = self.store.clear_delta_links();
                         self.backfill_done = false;
+                        self.reconverge_pending = true;
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
@@ -1159,6 +1192,115 @@ mod tests {
         let store = Store::open(&store_path).unwrap();
         assert!(store.pending_ops().unwrap().is_empty());
         assert!(store.get_delta_link("F1").unwrap().is_none());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconverge_ignores_age_cutoff_and_restores_old_message() {
+        // Fix A: a windowed backfill skips messages older than `now -
+        // backfill_days`, but the quarantine reconverge must restore a
+        // wrongly-removed message of ANY age. Here F1's delta always returns a
+        // 2020-dated M1 with NO deltaLink, so every ordinary pass is a windowed
+        // backfill that SKIPS M1 (older than a 30-day cutoff). Only the
+        // reconverge pass (cutoff ignored) upserts it — so M1 appearing locally
+        // proves the reconverge ran with the cutoff disabled.
+        let routes = vec![
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                // Old message, and no deltaLink → every pass stays a first-time
+                // (windowed) backfill.
+                body: r#"{"value":[{"id":"M1","conversationId":"C1","subject":"Ancient","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2020-01-01T00:00:00Z","sentDateTime":"2020-01-01T00:00:00Z","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"old"}]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":1,"wellKnownName":"inbox"}]}"#.into(),
+            },
+        ];
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("reconverge");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // 30-day window: the 2020 message is far outside it.
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            30,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Backfill lands (M1 skipped as too old — the store is empty).
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+        });
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .messages_in_folder("F1", 50, 0)
+                .unwrap()
+                .is_empty(),
+            "windowed backfill should have skipped the 2020 message"
+        );
+
+        // Delete op always 404s → quarantine after 5 failed drains (Delete +
+        // 4 Refreshes). A 5th Refresh then runs the reconverge pass. No stored
+        // deltaLink means a trailing Refresh is safe (nothing to re-store).
+        handle
+            .cmd_tx
+            .send(SyncCommand::Delete { id: "M1".into() })
+            .unwrap();
+        for _ in 0..5 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))
+        });
+
+        // The reconverge pass ignores the cutoff and re-adds the old M1.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let restored = Store::open(&store_path)
+                .unwrap()
+                .messages_in_folder("F1", 50, 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == "M1");
+            if restored {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("reconverge did not restore the aged-out message");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
