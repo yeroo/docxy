@@ -4,3 +4,6 @@
 //! (Microsoft Graph REST client), `store` (SQLite), `sync` (background engine).
 
 pub mod json;
+
+#[cfg(test)]
+mod testserver;
