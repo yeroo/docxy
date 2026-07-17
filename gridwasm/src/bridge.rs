@@ -4,7 +4,9 @@
 
 use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
-use gridcore::sheet::{Align, Cell, CellValue, DefinedName, Sheet, cell_name, format_with};
+use gridcore::sheet::{
+    Align, Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS, Sheet, cell_name, format_with,
+};
 use gridcore::xlsx::{SheetPackage, load_xlsx, save_xlsx};
 
 use crate::json;
@@ -118,7 +120,10 @@ impl Session {
             "set" => {
                 let p: Vec<&str> = rest.splitn(3, '\t').collect();
                 if p.len() == 3 {
-                    let (r, c) = (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    let (r, c): (u32, u32) = (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    if r >= MAX_ROWS || c >= MAX_COLS {
+                        return None;
+                    }
                     let text = p[2];
                     if let Some(body) = text.strip_prefix('=') {
                         if !body.is_empty() {
@@ -177,20 +182,53 @@ impl Session {
                 if p.len() == 3 {
                     let (r0, c0): (u32, u32) =
                         (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    // Cap the paste so a hostile/huge clipboard can't lock the
+                    // UI in per-cell recalcs (mirrors the TUI's external-paste
+                    // guard in xlsxy::main::paste).
+                    const MAX_PASTE_CELLS: usize = 100_000;
                     let mut changes = Vec::new();
-                    for (dr, line) in p[2].split('\n').enumerate() {
-                        for (dc, text) in line.split('\t').enumerate() {
+                    let mut truncated = false;
+                    // Excel-on-Windows clipboards are CRLF and end with a
+                    // trailing newline; strip both so a naive split doesn't
+                    // (a) leave a stray \r on the last field of every row and
+                    // (b) manufacture a phantom empty row past the paste that
+                    // would clear whatever was already there.
+                    'outer: for (dr, line) in p[2].trim_end_matches('\n').split('\n').enumerate() {
+                        for (dc, text) in line.trim_end_matches('\r').split('\t').enumerate() {
+                            if changes.len() >= MAX_PASTE_CELLS {
+                                truncated = true;
+                                break 'outer;
+                            }
                             let (r, c) = (r0 + dr as u32, c0 + dc as u32);
+                            if r >= MAX_ROWS || c >= MAX_COLS {
+                                continue;
+                            }
                             let style = self.pkg.workbook.sheets[self.active]
                                 .cell(r, c)
                                 .map(|x| x.style)
                                 .unwrap_or(0);
                             let mut cell = parse_input(text);
+                            // A pasted `=…` that doesn't parse would freeze as
+                            // an unsupported cell (never evaluates, renders
+                            // blank); demote it to literal text instead, same
+                            // as the TUI's external paste.
+                            if let Some(f) = &cell.formula {
+                                if Engine::validate(f).is_err() {
+                                    cell = Cell {
+                                        value: CellValue::Text(text.to_string()),
+                                        style,
+                                        ..Cell::default()
+                                    };
+                                }
+                            }
                             cell.style = style;
                             changes.push((r, c, cell));
                         }
                     }
                     self.apply(changes);
+                    if truncated {
+                        self.err = Some(format!("Pasted (clipped to {MAX_PASTE_CELLS} cells)"));
+                    }
                 }
             }
             "undo" => self.do_undo(),
@@ -701,6 +739,48 @@ mod tests {
         let mut s = Session::open(&bytes).expect("open fresh workbook");
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
+    }
+
+    #[test]
+    fn paste_strips_crlf_and_trailing_newline() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // Pre-existing value at row index 7, col 0 — must survive the paste.
+        // A naive `split('\n')` over a trailing-newline TSV yields a phantom
+        // empty last line one row past the pasted data, which would clear it.
+        s.dispatch("set\t7\t0\tsentinel");
+        s.dispatch("paste\t5\t0\ta\t1\r\nb\t2\r\n");
+        s.dispatch("select\t5\t0");
+        let v = s.view_json(None);
+        assert!(v.contains("\"src\":\"a\""), "A6 must be clean 'a': {v}");
+        s.dispatch("select\t6\t1");
+        let v = s.view_json(None);
+        assert!(v.contains("\"src\":\"2\""), "B7 must be clean '2': {v}");
+        s.dispatch("select\t7\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"sentinel\""),
+            "phantom empty last line must not clear row 7: {v}"
+        );
+    }
+
+    #[test]
+    fn paste_demotes_invalid_formula_to_text() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("paste\t6\t0\t=BOGUS((");
+        let v = s.view_json(None);
+        // An unparseable formula must not be stored as a formula (which
+        // would render blank/frozen since it never evaluates) — it must be
+        // demoted to literal text so the cell actually shows something.
+        assert!(
+            v.contains("\"r\":6,\"c\":0,\"t\":\"=BOGUS((\""),
+            "invalid formula must demote to visible literal text: {v}"
+        );
+        s.dispatch("select\t6\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"=BOGUS((\""),
+            "src should read back the literal text: {v}"
+        );
     }
 
     #[test]
