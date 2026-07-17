@@ -16,6 +16,7 @@ mod control;
 mod mcp;
 mod metafile;
 mod ribbon;
+mod skill;
 
 use std::collections::HashMap;
 use std::io;
@@ -160,6 +161,21 @@ fn main() -> ExitCode {
             }
         };
     }
+    // `docxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -265,6 +281,7 @@ fn print_usage() {
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
+           docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx name converts between the two formats;\n   \
             View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \

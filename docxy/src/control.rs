@@ -93,8 +93,46 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     // additionally mark the document modified (inside their handlers).
     if out.is_ok() {
         app.dirty = true;
+        // A content edit flashes this pane's agent-status dot, so a watcher sees
+        // the document being worked on.
+        if matches!(verb, "doc.replace-range" | "doc.insert" | "doc.append") {
+            signal_activity();
+        }
     }
     out
+}
+
+/// Best-effort: flash this pane's agwinterm agent-status dot to "active"
+/// (auto-resetting), so someone watching sees the document being edited. A no-op
+/// outside agwinterm or when `agwintermctl` isn't found; it spawns the CLI
+/// detached and never blocks or fails the edit.
+fn signal_activity() {
+    if std::env::var_os("AGWINTERM_SESSION_ID").is_none() {
+        return;
+    }
+    use std::process::{Command, Stdio};
+    // Try the CLI on PATH first, then the default install location.
+    let mut candidates: Vec<std::ffi::OsString> = vec!["agwintermctl".into()];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            std::path::Path::new(&local)
+                .join("Programs")
+                .join("agwinterm")
+                .join("agwintermctl.exe")
+                .into_os_string(),
+        );
+    }
+    for cand in candidates {
+        let spawned = Command::new(&cand)
+            .args(["session", "status", "active", "--auto-reset"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
