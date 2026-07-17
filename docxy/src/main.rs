@@ -13,6 +13,7 @@
 
 mod backstage;
 mod control;
+mod mcp;
 mod metafile;
 mod ribbon;
 
@@ -148,6 +149,17 @@ fn source_lines_to_doc(md: &str) -> Document {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running docxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -252,6 +264,7 @@ fn print_usage() {
            docxy <file> --pdf <out>        export to PDF and exit\n  \
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
+           docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            (Save As to a .md/.docx name converts between the two formats;\n   \
             View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \

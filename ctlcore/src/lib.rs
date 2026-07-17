@@ -31,6 +31,7 @@
 //! back to the socket by the connection thread. A request dropped without a reply
 //! answers the client with a generic error, so a client never hangs.
 
+pub mod client;
 pub mod json;
 
 use json::Json;

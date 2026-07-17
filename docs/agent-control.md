@@ -78,6 +78,26 @@ Notes:
 - A `doc.replace-range` is a delete-then-insert — the same two undo steps as a
   paste over a selection in the UI.
 
+## MCP (native tools in Claude Code)
+
+`docxy --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
+stdio server that exposes the verbs as native tools — no shell glue, and Claude
+Code's own permission prompts apply. It is a thin client of a running docxy
+(discovered via the ctl directory above); it opens no document itself.
+
+```bash
+claude mcp add docxy -- docxy --mcp
+```
+
+Tools: `docxy_list`, `docxy_status`, `docxy_outline`, `docxy_read`, `docxy_find`,
+`docxy_replace_range`, `docxy_insert`, `docxy_append`, `docxy_save`. Each edit
+tool maps to the matching verb; results come back as JSON text. When several
+docxy editors are open, pass `target` (a substring of the instance/pane id) to
+pick one — `docxy_list` shows what's running. So the whole flow is: split the
+pane, open a document in docxy, and ask Claude to "tighten the second paragraph
+of my open document" — it calls `docxy_read` then `docxy_replace_range`, and you
+watch the pane change live.
+
 ## Example (shell)
 
 ```bash
