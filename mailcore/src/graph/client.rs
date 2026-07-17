@@ -97,6 +97,10 @@ impl GraphClient {
     /// hierarchy later). A `visited` guard skips any folder id already
     /// collected, so a server that (erroneously, or via test-double route
     /// reuse) reports a folder as its own descendant can't recurse forever.
+    ///
+    /// The top-level call's error always propagates (can't list folders at
+    /// all is a real failure). Each folder's `childFolders` sub-call has a
+    /// looser policy — see `collect_folder_and_children`.
     pub fn list_folders(&self) -> Result<Vec<MailFolder>, GraphError> {
         let resp = self.send(Method::Get, "/me/mailFolders?$top=100", None, &[])?;
         let v = parse_body(resp)?;
@@ -113,6 +117,16 @@ impl GraphClient {
 
     /// Pushes `folder` onto `out`, then fetches and recurses into its
     /// `/childFolders`. See `list_folders` for the `visited` cycle guard.
+    ///
+    /// Error policy for the `childFolders` sub-call: `Unauthorized` and
+    /// `Throttled` are global conditions the sync engine must handle
+    /// centrally (refresh the token / back off), so those propagate out of
+    /// `list_folders` same as before. Anything else (`NotFound`, `Http`,
+    /// `Transport`, malformed-JSON `Parse`) is treated as "no discoverable
+    /// children for this folder" and skipped — a transient failure or a 404
+    /// on one deep, obscure subfolder must not discard the folders already
+    /// collected (Inbox, Sent, etc.), which is what propagating via `?`
+    /// unconditionally would do.
     fn collect_folder_and_children(
         &self,
         folder: MailFolder,
@@ -128,14 +142,25 @@ impl GraphClient {
         );
         out.push(folder);
 
-        let resp = self.send(Method::Get, &path, None, &[])?;
-        let v = parse_body(resp)?;
-        let items = value_array(&v, "value")?;
-        let children: Vec<MailFolder> = items.iter().filter_map(MailFolder::from_json).collect();
+        let children = match self.fetch_child_folders(&path) {
+            Ok(children) => children,
+            Err(e @ (GraphError::Unauthorized | GraphError::Throttled { .. })) => return Err(e),
+            Err(_) => return Ok(()),
+        };
         for child in children {
             self.collect_folder_and_children(child, out, visited)?;
         }
         Ok(())
+    }
+
+    /// GET a `childFolders` page and parse it into `MailFolder`s. Split out
+    /// of `collect_folder_and_children` so that method's error-tolerance
+    /// match has a single fallible call to match on.
+    fn fetch_child_folders(&self, path: &str) -> Result<Vec<MailFolder>, GraphError> {
+        let resp = self.send(Method::Get, path, None, &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?;
+        Ok(items.iter().filter_map(MailFolder::from_json).collect())
     }
 
     /// GET a folder's `/messages/delta` (first call, `DeltaCursor::Folder`)
@@ -664,5 +689,51 @@ mod tests {
         assert_eq!(folders.len(), 2);
         assert!(folders.iter().any(|f| f.id == "F1" && f.display_name == "Inbox"));
         assert!(folders.iter().any(|f| f.id == "F2" && f.display_name == "Sub"));
+    }
+
+    #[test]
+    fn child_folders_404_is_tolerated_top_level_folders_still_returned() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":0,"wellKnownName":"inbox"}]}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let folders = c.list_folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, "F1");
+    }
+
+    #[test]
+    fn child_folders_401_propagates_unauthorized() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 401,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":0,"wellKnownName":"inbox"}]}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.list_folders(), Err(GraphError::Unauthorized)));
     }
 }
