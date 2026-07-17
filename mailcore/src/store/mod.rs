@@ -323,17 +323,29 @@ impl Store {
 
     /// Replaces the full set of attachment metadata stored for a message
     /// (no bytes — those are fetched separately, later, on demand).
+    ///
+    /// The delete-then-insert runs inside a single transaction (per spec §5
+    /// on multi-row writes): `Store` only holds a shared `&Connection`
+    /// (`put_attachments` takes `&self`, not `&mut self`, to match the
+    /// rest of this type's methods), so this uses
+    /// `Connection::unchecked_transaction` — rusqlite's transaction handle
+    /// for exactly that shared-borrow case — rather than
+    /// `Connection::transaction`, which needs `&mut Connection`. If any
+    /// statement fails, the `?` drops the transaction before `commit()`
+    /// runs, which rolls it back and leaves the prior attachments
+    /// untouched instead of leaving the row set half-replaced.
     pub fn put_attachments(
         &self,
         message_id: &str,
         atts: &[AttachmentMeta],
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM attachments WHERE message_id = ?1",
             params![message_id],
         )?;
         for a in atts {
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -346,10 +358,12 @@ impl Store {
                 ],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
-    /// The attachment metadata stored for a message, in insertion order.
+    /// The attachment metadata stored for a message, ordered by attachment
+    /// id (not insertion order).
     pub fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, content_type, size, is_inline
