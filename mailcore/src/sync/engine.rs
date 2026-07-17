@@ -23,6 +23,8 @@ use crate::graph::model::DeltaItem;
 use crate::store::{OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -121,6 +123,15 @@ const MAX_OP_ATTEMPTS: i64 = 5;
 /// Offline back-off bounds (exponential between them).
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// How long `listen_for_code` waits for the browser to complete the
+/// loopback redirect before giving up. Long enough for a human to actually
+/// finish an interactive sign-in (pick an account, enter a password, maybe
+/// MFA), short enough that the sync thread can't hang forever on a user who
+/// never comes back to the browser tab.
+const SIGNIN_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long the loopback listener waits to read the redirect request off an
+/// accepted connection once the browser has connected.
+const SIGNIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawns the sync thread with production Graph/auth endpoints and the default
 /// 60s tick, returning the channels to drive it.
@@ -719,24 +730,53 @@ impl Engine {
         }
     }
 
-    /// The interactive sign-in seam. `begin_auth` + `SignInStarted` are wired;
-    /// the loopback listener that captures the redirect `code` is Task 17's
-    /// job (the UI owns the browser + TCP listener), so `listen_for_code` is a
-    /// clearly-marked stub here. Once it returns `Some(code)`, the redeem +
-    /// cache-save + resync path below runs unchanged.
+    /// The interactive sign-in seam. Binds a loopback listener on
+    /// `127.0.0.1:0` FIRST so the OS-assigned port can be baked into the
+    /// `redirect_uri` handed to `begin_auth` — there's no race between
+    /// emitting `SignInStarted` (which the UI reacts to by opening the
+    /// browser) and the listener being ready to accept the redirect, because
+    /// the bind happens before either. `listen_for_code` then blocks (with a
+    /// timeout) for the browser to land on that port; once it returns a code,
+    /// the redeem + cache-save + resync path runs unchanged from Task 11.
     fn sign_in(&mut self) {
-        // Task 17 binds a loopback listener on `127.0.0.1:0` and uses its
-        // assigned port verbatim here; until then this is a placeholder.
-        let redirect_uri = "http://localhost:0".to_string();
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(e) => {
+                self.emit(SyncEvent::Error(format!(
+                    "could not open sign-in listener: {e}"
+                )));
+                self.set_state(SyncState::SignInRequired);
+                return;
+            }
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                self.emit(SyncEvent::Error(format!(
+                    "could not read sign-in listener port: {e}"
+                )));
+                self.set_state(SyncState::SignInRequired);
+                return;
+            }
+        };
+        let redirect_uri = format!("http://localhost:{port}");
         let req = auth::begin_auth(&self.config.cfg, &redirect_uri);
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
         });
 
-        let Some(code) = self.listen_for_code() else {
-            // Headless engine can't capture the code itself; stay in the
-            // sign-in-required state for the UI to complete the flow.
-            return;
+        let code = match listen_for_code(&listener, &req.state) {
+            Ok(code) => code,
+            Err(e) => {
+                // A timeout, a malformed redirect, a state mismatch, or the
+                // provider reporting `?error=...` all land here. None of
+                // them are secrets, so the message is safe to surface as-is.
+                // Re-entering sign-in-required lets the UI offer another
+                // attempt rather than leaving the engine silently stuck.
+                self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
+                self.enter_signin();
+                return;
+            }
         };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
             Ok(t) => {
@@ -750,14 +790,6 @@ impl Engine {
                 self.enter_signin();
             }
         }
-    }
-
-    /// STUB for Task 17: bind a loopback TCP listener, open the browser, and
-    /// read the `code` query param off the redirect. Not implemented in the
-    /// headless engine; returns `None` so the engine stays signed out until the
-    /// UI layer drives the redeem itself.
-    fn listen_for_code(&self) -> Option<String> {
-        None
     }
 
     // --- State transitions ----------------------------------------------
@@ -860,6 +892,167 @@ impl Engine {
     }
 }
 
+/// The HTML served back to the browser once the redirect carried a valid
+/// `code`. No script, no external resources — just enough for the user to
+/// see it's safe to switch back to the terminal.
+const SIGNIN_SUCCESS_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: sign-in complete</h3><p>You can close this tab and return to the terminal.</p></body></html>";
+/// Served instead when the redirect carried `?error=...`, had no `code`, or
+/// its `state` didn't match — so the browser tab tells the user something
+/// went wrong rather than just going blank.
+const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: sign-in failed</h3><p>You can close this tab and try again from the terminal.</p></body></html>";
+
+/// Blocks (with [`SIGNIN_TIMEOUT`]) for the browser to land on the loopback
+/// redirect `listener` is already bound to, accepts exactly one connection,
+/// and extracts the authorization `code` from its request line — or an
+/// error, on a timeout, a malformed request, a provider-reported
+/// `?error=...`, or a `state` that doesn't match `expected_state` (the
+/// anti-CSRF check `begin_auth` set up). Never logs the code or any secret;
+/// the returned `Err` messages are diagnostic text only (parse failures,
+/// the provider's own `error` value, or "timed out"), safe to surface via
+/// `SyncEvent::Error`.
+///
+/// Uses a non-blocking `accept` polled against a deadline rather than a
+/// dedicated timeout API (std's `TcpListener` has none) — simple, and the
+/// listener is only ever used for this one accept.
+fn listen_for_code(listener: &TcpListener, expected_state: &str) -> Result<String, String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("could not configure sign-in listener: {e}"))?;
+    let deadline = Instant::now() + SIGNIN_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => return handle_redirect(stream, expected_state),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "timed out waiting for the browser to complete sign-in".to_string()
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("sign-in listener accept failed: {e}")),
+        }
+    }
+}
+
+/// Reads the HTTP request line off one accepted loopback connection, pulls
+/// `code`/`state` (or `error`) out of its query string, writes back a small
+/// HTML page, and returns the code (or an error — see [`listen_for_code`]).
+fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, String> {
+    stream
+        .set_read_timeout(Some(SIGNIN_READ_TIMEOUT))
+        .map_err(|e| format!("could not set read timeout: {e}"))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| format!("could not clone loopback stream: {e}"))?,
+    );
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| format!("could not read redirect request: {e}"))?;
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "malformed redirect request".to_string())?;
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params = parse_query(query);
+
+    if let Some(err) = params.iter().find(|(k, _)| k == "error").map(|(_, v)| v) {
+        write_html_response(stream, SIGNIN_ERROR_HTML);
+        return Err(format!("authorization denied: {err}"));
+    }
+    let state = params.iter().find(|(k, _)| k == "state").map(|(_, v)| v);
+    if state.map(String::as_str) != Some(expected_state) {
+        write_html_response(stream, SIGNIN_ERROR_HTML);
+        return Err("redirect state did not match".to_string());
+    }
+    let Some(code) = params
+        .iter()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.clone())
+    else {
+        write_html_response(stream, SIGNIN_ERROR_HTML);
+        return Err("redirect had no authorization code".to_string());
+    };
+    write_html_response(stream, SIGNIN_SUCCESS_HTML);
+    Ok(code)
+}
+
+/// Writes a minimal `HTTP/1.1 200` HTML response and closes the connection
+/// (`Connection: close`, then the stream is dropped) — best-effort; a write
+/// failure here (the user already closed the tab) doesn't change the code
+/// that was already parsed.
+fn write_html_response(mut stream: TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Parses an `application/x-www-form-urlencoded` query string into
+/// `(key, value)` pairs, percent-decoding each. A tiny local counterpart to
+/// `pkce::form_urlencode` (which only encodes) — kept here rather than
+/// shared, since this is the one place anything in `mailcore` decodes a
+/// query string.
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+/// Percent-decodes a query-string component (`%XX` → byte, `+` → space).
+/// Invalid `%` escapes (not followed by two hex digits) pass through
+/// literally rather than erroring — this is best-effort parsing of a
+/// browser redirect, not a strict validator.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h << 4) | l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Current wall-clock time as a Unix timestamp (seconds).
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -901,6 +1094,7 @@ mod tests {
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
+    use std::io::Read;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1576,6 +1770,193 @@ mod tests {
         let atts = store.attachments("M1").unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "f.txt");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_query_decodes_pairs() {
+        let params = parse_query("code=ABC%2FDEF&state=xyz");
+        assert_eq!(
+            params,
+            vec![
+                ("code".to_string(), "ABC/DEF".to_string()),
+                ("state".to_string(), "xyz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn handle_redirect_errors_on_a_connection_closed_before_any_request_line() {
+        // A client that connects and disappears without ever sending a
+        // request line (EOF on the very first read) must be reported as an
+        // error rather than panicking — `read_line` returning `Ok(0)` is
+        // exactly this case.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        drop(client); // closes before writing anything
+
+        let (stream, _addr) = listener.accept().unwrap();
+        let result = handle_redirect(stream, "expected-state");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sign_in_completes_via_loopback_redirect_and_caches_token() {
+        // End-to-end proof of the port/redirect wiring: `begin_auth` must be
+        // called with the SAME port `listen_for_code` accepts on, or this
+        // "browser" (a raw TcpStream) would have nowhere to connect to.
+        let routes = vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+        ];
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("signin-loopback");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin"); // no seed_token: starts signed out
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInStarted { .. })
+        });
+        let authorize_url = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
+                _ => None,
+            })
+            .expect("SignInStarted carries the authorize_url");
+
+        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let redirect_uri = params
+            .iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .map(|(_, v)| v.clone())
+            .expect("authorize_url carries redirect_uri");
+        let state = params
+            .iter()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.clone())
+            .expect("authorize_url carries state");
+        let port: u16 = redirect_uri
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("redirect_uri ends with the loopback port");
+
+        // Simulate the browser landing on the loopback redirect.
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
+        let request = format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.to_lowercase().contains("close this tab"));
+
+        // The redeem + cache-save + resync path then runs to completion.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let cached = tokencache::load(&token_path)
+            .unwrap()
+            .expect("token cached after sign-in");
+        assert_eq!(cached.access_token, "AT");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_in_reenters_signin_required_when_the_redirect_state_mismatches() {
+        // A redirect whose `state` doesn't match must be rejected rather
+        // than redeemed — otherwise the loopback listener would accept a
+        // code from anyone who can hit 127.0.0.1 during the sign-in window.
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+        }]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("signin-state-mismatch");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInStarted { .. })
+        });
+        let authorize_url = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let redirect_uri = parse_query(query)
+            .into_iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .map(|(_, v)| v)
+            .unwrap();
+        let port: u16 = redirect_uri.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(b"GET /?code=THECODE&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.to_lowercase().contains("failed"));
+
+        // No token was ever cached, and the engine falls back to
+        // sign-in-required rather than getting stuck.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        assert!(tokencache::load(&token_path).unwrap().is_none());
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

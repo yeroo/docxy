@@ -20,7 +20,7 @@ use app::App;
 
 use mailcore::auth::AuthConfig;
 use mailcore::store::Store;
-use mailcore::sync::engine::{self as sync_engine, SyncCommand, SyncEvent};
+use mailcore::sync::engine::{self as sync_engine, SyncCommand};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -52,8 +52,16 @@ fn main() -> io::Result<()> {
     }
 
     let store = Store::open(&store_path).map_err(io::Error::other)?;
-    let handle = sync_engine::spawn(store_path, token_path, AuthConfig::default(), BACKFILL_DAYS);
-    let mut app = App::new(store, handle);
+    let handle = sync_engine::spawn(
+        store_path,
+        token_path.clone(),
+        AuthConfig::default(),
+        BACKFILL_DAYS,
+    );
+    // `App` keeps its own copy of `token_path` too, so it can re-read the
+    // account name for the status bar once a sign-in completes (see
+    // `App::reload_account`) — the engine owns writing it, not the UI.
+    let mut app = App::new(store, handle, token_path);
 
     run_tui(&mut app)
 }
@@ -116,34 +124,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     }
 }
 
-/// Drains every pending `SyncEvent` without blocking: status transitions
-/// update `app.status`; `FoldersUpdated` reloads the folder list;
-/// `MessagesUpdated` reloads the message list only when it names the
-/// currently visible folder (an update to some other folder doesn't need to
-/// disturb what's on screen); `BodyReady` re-reads the body from the store
-/// only when it names the currently open message (`App::open_message`
-/// already sent the `FetchBody` that led here); `AttachmentsUpdated` fills
-/// in the attachments popup once its metadata fetch lands (see
-/// `App::open_attachments_popup`/`reload_attachments`); `AttachmentSaved`
-/// reports the saved path (and opens it with the OS handler, if `o` rather
-/// than Enter triggered that particular save — see
-/// `App::finish_attachment_save`).
+/// Drains every pending `SyncEvent` without blocking, handing each to
+/// `App::on_sync_event` — which reloads whatever cached state it
+/// invalidated (folders/messages/body/attachments), tracks the sync status,
+/// and drives the sign-in modal (`SignInRequired`/`SignInStarted`, cleared
+/// again on the next successful sync).
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
-        match evt {
-            SyncEvent::State(s) => app.status = s,
-            SyncEvent::FoldersUpdated => app.reload_folders(),
-            SyncEvent::MessagesUpdated { folder_id }
-                if app.selected_folder.as_deref() == Some(folder_id.as_str()) =>
-            {
-                app.reload_messages();
-            }
-            SyncEvent::BodyReady { id } if app.selected_msg.as_deref() == Some(id.as_str()) => {
-                app.reload_body();
-            }
-            SyncEvent::AttachmentsUpdated { message_id } => app.reload_attachments(&message_id),
-            SyncEvent::AttachmentSaved { path } => app.finish_attachment_save(path),
-            _ => {}
-        }
+        app.on_sync_event(evt);
     }
 }

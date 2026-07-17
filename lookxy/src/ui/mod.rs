@@ -9,6 +9,7 @@ mod folders;
 mod message_list;
 mod reading;
 mod search;
+mod signin;
 mod status_bar;
 
 use crate::app::{App, Pane};
@@ -48,9 +49,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     status_bar::draw(f, app, rows[1]);
 
     // Drawn last (and over the full frame, not just the list column) so
-    // popups sit on top of everything else.
+    // popups sit on top of everything else. The sign-in modal is drawn
+    // last of all — it's the one popup that can be showing with no
+    // mailbox behind it at all (first run, no token), and it should win
+    // over any other popup that somehow got left open.
     message_list::draw_move_picker(f, app);
     attachments::draw(f, app);
+    signin::draw(f, app);
 }
 
 /// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k),
@@ -63,6 +68,13 @@ pub fn draw(f: &mut Frame, app: &App) {
 /// (`m`/`u`/`f`/`d`/`v`/`a`/`/`) fall through to `App::on_key_char`/`Del` to
 /// `App::delete_selected` — see `app.rs` for what each one does.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    // Checked before every other popup: while sign-in is required (or
+    // already under way), there's nothing else the rest of the UI can
+    // usefully do without a token.
+    if app.signin_modal.is_some() {
+        handle_signin_key(app, key);
+        return;
+    }
     if app.move_picker.is_some() {
         handle_move_picker_key(app, key);
         return;
@@ -83,6 +95,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Delete => app.delete_selected(),
         KeyCode::Char(c) => app.on_key_char(c),
         _ => {}
+    }
+}
+
+/// Keys while the sign-in modal is open: Enter drives `App::on_key_enter`
+/// (sends `SyncCommand::SignIn` from the `Required` state; a no-op once
+/// `Started`, since the browser is already open). Nothing else is handled —
+/// there's no folder tree or message list to navigate without a token yet,
+/// and no way to cancel out of a mandatory sign-in.
+fn handle_signin_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Enter {
+        app.on_key_enter();
     }
 }
 

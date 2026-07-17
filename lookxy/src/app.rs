@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use mailcore::graph::model::{AttachmentMeta, Body};
 use mailcore::store::{FolderRow, MessageRow, Store};
-use mailcore::sync::engine::{SyncCommand, SyncHandle, SyncState};
+use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 
 /// Which pane currently has keyboard focus. Tab cycles `Folders` → `List` →
 /// `Reading` → `Folders` (see `ui::handle_key`).
@@ -69,11 +69,32 @@ pub struct App {
     /// — each completion looks up (and removes) its own path's intent. See
     /// `finish_attachment_save`.
     pending_saves: std::collections::HashMap<PathBuf, bool>,
+    /// Path to the on-disk token cache. The engine is the one that actually
+    /// writes it (on sign-in and on refresh); the UI keeps this only so it
+    /// can re-read the account name for the status bar once a sync pass
+    /// completes (`reload_account`, called from `on_sync_event`) — nothing
+    /// else in `SyncEvent` carries it.
+    token_path: PathBuf,
+    /// The signed-in account (a UPN like `me@epam.com`), once known. `None`
+    /// before the first sign-in ever completes (or if the token cache can't
+    /// be read) — the status bar shows a placeholder then.
+    pub account: Option<String>,
+    /// The sign-in modal's state, if it's currently showing: `Some` from the
+    /// moment `SyncEvent::SignInRequired`/`SignInStarted` lands until the
+    /// next successful sync (`FoldersUpdated` or `State(Idle)`) clears it —
+    /// see `on_sync_event`.
+    pub signin_modal: Option<SignInModal>,
     /// Test-only: counts calls to the OS-open seam (`open_with_os_handler`),
     /// which is a no-op under `cfg(test)` — see that function's doc comment.
     /// `None` for a production `App`.
     #[cfg(test)]
     pub open_invocations: std::cell::Cell<u32>,
+    /// Test-only: counts calls to the browser-open seam
+    /// (`open_url_with_os_handler`), a no-op under `cfg(test)` — the
+    /// sign-in equivalent of `open_invocations`. See
+    /// `browser_open_was_requested`.
+    #[cfg(test)]
+    pub browser_open_invocations: std::cell::Cell<u32>,
     /// Test-only: sees every `SyncCommand` this `App` has sent, so tests can
     /// assert on it (see `last_sent_command_is_mark_read`). `None` for a
     /// production `App`; `for_test_with_seeded_store`/`for_test_with_empty_store`
@@ -81,6 +102,17 @@ pub struct App {
     /// dropping it.
     #[cfg(test)]
     pub test_cmd_rx: Option<std::sync::mpsc::Receiver<SyncCommand>>,
+}
+
+/// Which sign-in modal is currently showing (see `App::signin_modal`):
+/// `Required` right after `SyncEvent::SignInRequired` (Enter sends
+/// `SyncCommand::SignIn`); `Started` once `SyncEvent::SignInStarted` has
+/// opened the browser (nothing left for the user to press — just a "go
+/// finish it over there" message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInModal {
+    Required,
+    Started,
 }
 
 /// State for the move-folder popup opened by `v`: the candidate folders (as
@@ -122,7 +154,10 @@ const MESSAGE_PAGE_SIZE: i64 = 200;
 const SEARCH_PAGE_SIZE: i64 = 200;
 
 impl App {
-    pub fn new(store: Store, sync: SyncHandle) -> App {
+    /// `token_path` is only kept for `reload_account` (see `App::token_path`'s
+    /// doc comment) — the engine itself is handed its own copy separately at
+    /// spawn time and is the only thing that ever writes it.
+    pub fn new(store: Store, sync: SyncHandle, token_path: PathBuf) -> App {
         let mut app = App {
             store,
             sync,
@@ -142,13 +177,85 @@ impl App {
             attachments: None,
             attachment_notice: None,
             pending_saves: std::collections::HashMap::new(),
+            token_path,
+            account: None,
+            signin_modal: None,
             #[cfg(test)]
             open_invocations: std::cell::Cell::new(0),
+            #[cfg(test)]
+            browser_open_invocations: std::cell::Cell::new(0),
             #[cfg(test)]
             test_cmd_rx: None,
         };
         app.reload_folders();
+        app.reload_account();
         app
+    }
+
+    /// Re-reads the account name from the token cache (`None` if it can't be
+    /// read yet, e.g. before the first sign-in ever completes). Called on
+    /// construction and whenever a sync pass completes successfully — see
+    /// `on_sync_event`.
+    fn reload_account(&mut self) {
+        self.account = mailcore::tokencache::load(&self.token_path)
+            .ok()
+            .flatten()
+            .map(|t| t.account)
+            .filter(|a| !a.is_empty());
+    }
+
+    /// Dispatches one `SyncEvent` from the background sync engine: reloads
+    /// whatever cached state it invalidated, and drives the sign-in modal
+    /// (`signin_modal`). `main::drain_events` calls this for every event the
+    /// sync handle's channel yields; tests call it directly to drive the
+    /// sign-in flow without a real sync thread.
+    ///
+    /// The sign-in modal opens on `SignInRequired`/`SignInStarted` and
+    /// clears on the next successful sync — `FoldersUpdated` (a full pass
+    /// just completed) or `State(Idle)` (the resting state once signed in
+    /// with nothing pending) both mean "we're past sign-in now".
+    pub fn on_sync_event(&mut self, evt: SyncEvent) {
+        match evt {
+            SyncEvent::State(s) => {
+                if matches!(s, SyncState::Idle) {
+                    self.signin_modal = None;
+                }
+                self.status = s;
+            }
+            SyncEvent::FoldersUpdated => {
+                self.signin_modal = None;
+                self.reload_account();
+                self.reload_folders();
+            }
+            SyncEvent::MessagesUpdated { folder_id }
+                if self.selected_folder.as_deref() == Some(folder_id.as_str()) =>
+            {
+                self.reload_messages();
+            }
+            SyncEvent::BodyReady { id } if self.selected_msg.as_deref() == Some(id.as_str()) => {
+                self.reload_body();
+            }
+            SyncEvent::AttachmentsUpdated { message_id } => self.reload_attachments(&message_id),
+            SyncEvent::AttachmentSaved { path } => self.finish_attachment_save(path),
+            SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
+            SyncEvent::SignInStarted { authorize_url } => {
+                self.open_url_with_os_handler(&authorize_url);
+                self.signin_modal = Some(SignInModal::Started);
+            }
+            SyncEvent::MessagesUpdated { .. } | SyncEvent::BodyReady { .. } | SyncEvent::Error(_) => {}
+        }
+    }
+
+    /// Enter, while the sign-in modal is showing: only the `Required` prompt
+    /// has anything for Enter to do (send `SyncCommand::SignIn`); `Started`
+    /// is purely informational (the browser is already open) so Enter is a
+    /// no-op there. A no-op too if the modal isn't open at all — callers
+    /// (`ui::handle_key`) only reach this while it is, but tests call it
+    /// directly.
+    pub fn on_key_enter(&mut self) {
+        if matches!(self.signin_modal, Some(SignInModal::Required)) {
+            let _ = self.sync.cmd_tx.send(SyncCommand::SignIn);
+        }
     }
 
     /// Re-reads the folder list from the store (well-known folders already
@@ -629,6 +736,50 @@ impl App {
         self.open_invocations.set(self.open_invocations.get() + 1);
     }
 
+    /// Shells out to the OS's "open" handler for a URL (`cmd /c start` on
+    /// Windows, `open` on macOS, `xdg-open` elsewhere) — the sign-in flow's
+    /// equivalent of `open_with_os_handler`, called from `on_sync_event` when
+    /// `SyncEvent::SignInStarted` lands. Fire-and-forget: the browser is
+    /// launched detached, and whether it actually got there isn't something
+    /// this process can (or needs to) observe — the loopback listener on the
+    /// engine side is what actually completes the flow. Compiled out under
+    /// `cfg(test)` in favor of a counter (`browser_open_invocations`), same
+    /// pattern as `open_with_os_handler` — so no test run ever pops open a
+    /// real browser.
+    #[cfg(not(test))]
+    fn open_url_with_os_handler(&self, url: &str) {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(url)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let _ = std::process::Command::new(opener).arg(url).spawn();
+        }
+    }
+
+    #[cfg(test)]
+    fn open_url_with_os_handler(&self, _url: &str) {
+        self.browser_open_invocations
+            .set(self.browser_open_invocations.get() + 1);
+    }
+
+    /// Test-only: whether `open_url_with_os_handler` has been reached at
+    /// least once (see `browser_open_invocations`) — `SyncEvent::SignInStarted`
+    /// is the only thing that calls it.
+    #[cfg(test)]
+    pub fn browser_open_was_requested(&self) -> bool {
+        self.browser_open_invocations.get() > 0
+    }
+
     /// Test-only: drains `test_cmd_rx` and reports whether the last command
     /// seen was a `MarkRead`. Always `false` when nothing populated the
     /// channel (a production `App`, or a test that hasn't wired it up).
@@ -641,6 +792,37 @@ impl App {
             }
         }
         matches!(last, Some(SyncCommand::MarkRead { .. }))
+    }
+
+    /// Test-only: same as `last_sent_command_is_mark_read`, but for
+    /// `SyncCommand::SignIn` — what `on_key_enter` sends while the
+    /// `Required` sign-in modal is showing.
+    #[cfg(test)]
+    pub fn last_sent_command_is_signin(&self) -> bool {
+        let mut last = None;
+        if let Some(rx) = &self.test_cmd_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                last = Some(cmd);
+            }
+        }
+        matches!(last, Some(SyncCommand::SignIn))
+    }
+
+    /// Test-only: renders the whole UI (`ui::draw`) to an off-screen buffer
+    /// and reports whether `needle` appears anywhere in it, case-insensitively
+    /// (so a test doesn't have to match the exact capitalization the UI
+    /// happens to use). A generously-sized buffer (120x40) so nothing the
+    /// sign-in modal or status bar draws gets clipped out of the check.
+    #[cfg(test)]
+    pub fn render_contains(&self, needle: &str) -> bool {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
+        term.draw(|f| crate::ui::draw(f, self)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        text.to_lowercase().contains(&needle.to_lowercase())
     }
 
     /// Builds an `App` over an in-memory `Store` seeded with a folder
@@ -696,7 +878,10 @@ impl App {
         let (_evt_tx, evt_rx) = mpsc::channel();
         let sync = SyncHandle { cmd_tx, evt_rx };
 
-        let mut app = App::new(store, sync);
+        // No real token cache backs a test `App`; `reload_account` reading
+        // nothing just leaves `account` as `None`, which is what a
+        // never-signed-in test fixture should show anyway.
+        let mut app = App::new(store, sync, PathBuf::new());
         app.test_cmd_rx = Some(cmd_rx);
         app
     }
@@ -716,7 +901,7 @@ impl App {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_evt_tx, evt_rx) = mpsc::channel();
         let sync = SyncHandle { cmd_tx, evt_rx };
-        let mut app = App::new(store, sync);
+        let mut app = App::new(store, sync, PathBuf::new());
         app.test_cmd_rx = Some(cmd_rx);
         app
     }
@@ -1206,5 +1391,71 @@ mod tests {
         app.reload_attachments("some-other-message-id");
 
         assert_eq!(app.attachments.as_ref().unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn signin_required_shows_prompt_and_enter_sends_signin() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInRequired);
+        assert!(app.render_contains("sign in"));
+        app.on_key_enter();
+        assert!(app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn signin_started_shows_browser_message() {
+        let mut app = App::for_test_with_seeded_store();
+        // in test mode the browser-open is stubbed (a flag), not actually launched
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
+                .into(),
+        });
+        assert!(app.render_contains("browser"));
+        assert!(app.browser_open_was_requested());
+    }
+
+    #[test]
+    fn enter_on_the_started_modal_does_not_resend_signin() {
+        // Only the `Required` prompt has anything for Enter to do; once the
+        // browser is already open (`Started`), Enter must be a no-op rather
+        // than re-triggering the sign-in command.
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?x=1"
+                .into(),
+        });
+        app.on_key_enter();
+        assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn folders_updated_clears_the_signin_modal() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInRequired);
+        assert!(app.signin_modal.is_some());
+
+        app.on_sync_event(SyncEvent::FoldersUpdated);
+
+        assert!(app.signin_modal.is_none());
+    }
+
+    #[test]
+    fn idle_state_clears_the_signin_modal() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/x?y=1".into(),
+        });
+        assert!(app.signin_modal.is_some());
+
+        app.on_sync_event(SyncEvent::State(SyncState::Idle));
+
+        assert!(app.signin_modal.is_none());
+    }
+
+    #[test]
+    fn empty_store_app_has_no_account_and_no_signin_modal() {
+        let app = App::for_test_with_empty_store();
+        assert!(app.account.is_none());
+        assert!(app.signin_modal.is_none());
     }
 }
