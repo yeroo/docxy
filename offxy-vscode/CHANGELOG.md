@@ -11,6 +11,23 @@
 - Fixed the caret visually jumping to the document start when typing a
   space at a soft-wrap margin (the wrapped-away space made the caret's
   position unmappable); it now stays pinned at the wrap margin.
+- **New: Excel `.xlsx` editing** (`offxy.gridEditor`), powered by a new
+  `gridwasm` bridge over `gridcore`:
+  - Virtualized grid with sticky headers and a formula bar, rendered at the
+    editor's font/size and honoring the color theme.
+  - Full recalculation on edit via `gridcore`'s dependency-graph engine,
+    with Excel-faithful semantics.
+  - Cell editing (type-to-replace, `F2`, navigation, range selection),
+    clipboard (copy/cut/paste as TSV through the OS clipboard, relative-
+    reference translation), and structural edits (insert/delete rows and
+    columns, rewriting affected formulas).
+  - Sheet tabs — switch, add, and rename worksheets.
+  - Native dirty state, undo/redo, Save, Save As, and hot-exit backup, in
+    lockstep with the wasm engine's own undo stack.
+  - **Lossless save** — unmodeled parts (charts, pivots, conditional
+    formatting…) are preserved byte-for-byte.
+  - Opening an empty (0-byte) `.xlsx` offers to create a new workbook in
+    its place, matching the `.docx` empty-file flow.
 
 ## 0.3.0
 

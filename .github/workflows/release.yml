@@ -123,7 +123,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: docxy-vscode-vsix
+          name: offxy-vsix
           path: offxy-vscode/*.vsix
 
       - name: Attach to release

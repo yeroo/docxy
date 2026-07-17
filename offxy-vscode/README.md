@@ -1,26 +1,28 @@
-# Docxy for VS Code
+# Offxy for VS Code
 
-Open, read, and **edit** Microsoft Word `.docx` files right in a VS Code editor
-tab — a faithful, monospace-grid view that uses the editor's own font, size, and
-theme colors, so a Word document reads like text in your editor instead of an
-embedded Word canvas. **No ribbon**: the keyboard and command palette drive
-everything, exactly like editing code.
+Open, read, and **edit** Microsoft Word `.docx` **and** Excel `.xlsx` files right
+in a VS Code editor tab — one extension, two faithful editors that use the
+editor's own font, size, and theme colors instead of embedding a Word/Excel
+canvas. **No ribbon**: the keyboard and command palette drive everything,
+exactly like editing code.
 
-It's powered by [`docxwasm`](../docxwasm) — a WebAssembly build of the
-dependency-free [`docxcore`](../docxcore) engine that also backs the `docxy`
-terminal app. The *entire* pipeline — parse → render → edit → **lossless save** —
-runs in the webview as one ~650 KB `.wasm`. There is no JavaScript docx library,
-no server, and no external process.
+It's powered by [`docxwasm`](../docxwasm) and [`gridwasm`](../gridwasm) —
+WebAssembly builds of the dependency-free [`docxcore`](../docxcore) and
+[`gridcore`](../gridcore) engines that also back the `docxy` and `xlsxy`
+terminal apps. For each format, the *entire* pipeline — parse → render → edit
+→ **lossless save** — runs in the webview as a small `.wasm`. There is no
+JavaScript docx/xlsx library, no server, and no external process.
 
 ## Why it's different
 
-Most `.docx` extensions either only *view* (mammoth.js / docx-preview, read-only)
-or *edit through HTML* (open → HTML → re-serialize), which quietly degrades
-styles, numbering, tables, and headers on save. Docxy edits the **real OOXML
-model** and preserves every unmodeled part of the original package byte-for-
-faithful — so a document you open, edit, and save comes back structurally intact.
-That lossless round-trip is `docxcore`'s core guarantee, carried straight into
-the editor tab.
+Most `.docx`/`.xlsx` extensions either only *view* (read-only preview) or
+*edit through a lossy intermediate* (open → convert → re-serialize), which
+quietly degrades formatting, formulas, and unmodeled parts on save. Offxy
+edits the **real OOXML model** for both formats and preserves every
+unmodeled part of the original package byte-for-faithful — so a document or
+workbook you open, edit, and save comes back structurally intact. That
+lossless round-trip is `docxcore`'s and `gridcore`'s core guarantee, carried
+straight into the editor tab.
 
 ## Build
 
@@ -28,22 +30,23 @@ Prerequisites: a Rust toolchain with the wasm target, and Node ≥ 18.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cd docxy-vscode
+cd offxy-vscode
 npm install
-npm run build          # builds the wasm, copies it into media/, bundles the extension
+npm run build          # builds both wasm bridges, copies them into media/, bundles the extension
 ```
 
 `npm run build` runs two steps you can also invoke separately:
 
-- `npm run build:wasm` — `cargo build -p docxwasm --target wasm32-unknown-unknown
-  --release` and copies the artifact to `media/docxwasm.wasm`.
+- `npm run build:wasm` — `cargo build -p docxwasm -p gridwasm --target
+  wasm32-unknown-unknown --release` and copies the artifacts to
+  `media/docxwasm.wasm` and `media/gridwasm.wasm`.
 - `npm run build:ext` — bundles `src/extension.ts` to `out/extension.js` with
   esbuild.
 
 Then press <kbd>F5</kbd> in VS Code (Run ▸ Start Debugging) to launch an Extension
-Development Host, and open any `.docx` file.
+Development Host, and open any `.docx` or `.xlsx` file.
 
-## What works
+## Word — what works
 
 - **Faithful rendering** — paragraphs, runs (bold / italic / underline / strike /
   color), headings, lists, tables (with borders), hyperlinks, and **embedded
@@ -71,15 +74,49 @@ Development Host, and open any `.docx` file.
   events. Edits stay lockstep with the wasm engine's own undo stack.
 - **Lossless save** — the original package is preserved; only the document part
   is re-serialized from the edited model.
+- **Empty-file create flow** — opening a 0-byte `.docx` offers to create a new
+  Word document in its place.
+
+## Spreadsheet — what works
+
+- **Virtualized grid** — a sticky-header, virtualized HTML grid renders only
+  the visible viewport (rows/columns are fetched from the engine as you
+  scroll), so large workbooks stay responsive, at the editor's font and size,
+  honoring the active color theme.
+- **Formula bar** — shows the selected cell's formula or literal, editable in
+  place; `=` starts a formula, <kbd>Enter</kbd>/<kbd>Tab</kbd> commits and
+  advances the selection.
+- **Recalculation via `gridcore`** — the same dependency-graph recalc engine
+  behind `xlsxy` runs in the webview: editing a cell recalculates every
+  formula that depends on it, with Excel-faithful semantics.
+- **Cell editing** — type-to-replace, <kbd>F2</kbd> to edit in place,
+  navigation (arrows, <kbd>Tab</kbd>, <kbd>Enter</kbd>), range selection by
+  click-drag or <kbd>Shift</kbd>+move, and clear/delete.
+- **Clipboard** — copy/cut/paste as TSV mediated through the OS clipboard, so
+  ranges round-trip with Excel and other spreadsheet apps; fill and paste
+  translate relative references like Excel.
+- **Structural edits** — insert/delete rows and columns, rewriting every
+  affected formula in the workbook.
+- **Sheets** — sheet tabs to switch, add, and rename worksheets.
+- **Native integration** — the VS Code **dirty indicator**, **undo/redo**,
+  **Save**, **Save As**, and **hot-exit backup**, driven through the standard
+  `CustomEditor` edit events, in lockstep with the wasm engine's own undo
+  stack.
+- **Lossless save** — anything the engine doesn't model (charts, pivots,
+  conditional formatting…) is preserved byte-for-byte; only touched parts are
+  re-serialized.
+- **Empty-file create flow** — opening a 0-byte `.xlsx` offers to create a new
+  workbook in its place.
 
 ## Architecture
 
 | Layer | Where | Role |
 |-------|-------|------|
-| `docxcore` | Rust crate | the DOCX engine (parse/model/render/edit/save) |
-| `docxwasm` | Rust `cdylib` → `.wasm` | a hand-written C-ABI seam (no wasm-bindgen): `docx_open/render/cmd/save/close` over length-prefixed buffers |
-| `src/extension.ts` | extension host | binary `CustomEditorProvider`: opens files, relays undo/redo & save, writes bytes; owns dirty state |
-| `media/webview.js` | webview | loads the wasm, paints the grid, captures keyboard/mouse, and serializes on save |
+| `docxcore` / `gridcore` | Rust crates | the DOCX/XLSX engines (parse/model/render/edit/save) |
+| `docxwasm` / `gridwasm` | Rust `cdylib` → `.wasm` | hand-written C-ABI seams (no wasm-bindgen) over each engine, over length-prefixed buffers |
+| `src/extension.ts` | extension host | a registration table of binary `CustomEditorProvider`s: opens files, relays undo/redo & save, writes bytes; owns dirty state |
+| `media/webview.js` | webview (Word) | loads `docxwasm`, paints the document grid, captures keyboard/mouse, and serializes on save |
+| `media/grid.js` | webview (Excel) | loads `gridwasm`, paints the virtualized spreadsheet grid + formula bar + sheet tabs, and serializes on save |
 
 The webview owns the live editing session (low latency, no host round-trip per
 keystroke); the host owns the file lifecycle. They talk over a small
@@ -87,3 +124,12 @@ keystroke); the host owns the file lifecycle. They talk over a small
 light the dirty dot and route undo/redo back into the wasm editor.
 
 See [../VSCODE.md](../VSCODE.md) for the full design.
+
+## Install
+
+Grab the `offxy-*.vsix` from the [latest release](https://github.com/yeroo/docxy/releases/latest)
+and install it:
+
+```sh
+code --install-extension offxy-0.3.0.vsix
+```
