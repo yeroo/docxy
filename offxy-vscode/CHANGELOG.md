@@ -15,12 +15,14 @@
   `gridwasm` bridge over `gridcore`:
   - Virtualized grid with sticky headers and a formula bar, rendered at the
     editor's font/size and honoring the color theme.
-  - Full recalculation on edit via `gridcore`'s dependency-graph engine,
-    with Excel-faithful semantics.
+  - Full recalculation on edit via `gridcore`'s dependency-graph engine, with
+    Excel-faithful semantics: a formula the engine can't parse or evaluate
+    keeps Excel's cached value untouched — Excel-faithful for what it
+    computes, conservative for what it can't.
   - Cell editing (type-to-replace, `F2`, navigation, range selection),
-    clipboard (copy/cut/paste as TSV through the OS clipboard, relative-
-    reference translation), and structural edits (insert/delete rows and
-    columns, rewriting affected formulas).
+    clipboard (copy/cut/paste as TSV through the OS clipboard, round-tripping
+    raw cell content including formula source), and structural edits
+    (insert/delete rows and columns, rewriting affected formulas).
   - Sheet tabs — switch, add, and rename worksheets.
   - Native dirty state, undo/redo, Save, Save As, and hot-exit backup, in
     lockstep with the wasm engine's own undo stack.

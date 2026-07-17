@@ -114,8 +114,9 @@ jobs:
 
       - name: Build the .vsix
         working-directory: offxy-vscode
-        # `vsce package` runs the vscode:prepublish script, which builds the
-        # docxwasm wasm (cargo) and bundles the extension before packaging.
+        # `vsce package` runs the vscode:prepublish script, which builds both
+        # the docxwasm and gridwasm wasm crates (cargo) and bundles the
+        # extension before packaging.
         run: |
           npm ci
           npx --yes @vscode/vsce@latest package --no-dependencies

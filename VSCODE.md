@@ -183,9 +183,14 @@ Word next steps, roughly in order:
 ### Excel (`offxy.gridEditor`)
 
 Working today: a virtualized grid with sticky headers and a formula bar,
-recalculation on edit via `gridcore`'s dependency graph, cell editing
-(type-to-replace, `F2`, navigation, range selection), TSV clipboard (copy/
-cut/paste, relative-reference translation on paste/fill), structural edits
+recalculation on edit via `gridcore`'s dependency graph (a formula the engine
+can't parse or evaluate keeps Excel's cached value untouched instead of
+guessing — Excel-faithful for what it computes, conservative for what it
+can't), cell editing (type-to-replace, `F2`, navigation, range selection),
+TSV clipboard (copy/cut/paste round-tripping each cell's raw content,
+including formula source, so ranges are interoperable with Excel and other
+spreadsheet apps — there is no fill handle, and paste re-enters formula text
+verbatim rather than translating relative references), structural edits
 (insert/delete rows and columns, rewriting affected formulas), sheet tabs
 (switch/add/rename), and native dirty / undo-redo / save / Save As / backup
 with lossless round-trip. Opening an empty (0-byte) `.xlsx` offers to create
@@ -193,8 +198,9 @@ a new workbook in its place.
 
 Excel next steps, roughly in order:
 
-1. **Sheet delete** (currently switch/add/rename only, matching the TUI's
-   undo-model parity for sheet-add).
+1. **Sheet delete** (currently switch/add/rename only; when added it will
+   need the same structural-snapshot undo treatment sheet-add now has, so
+   the host's undo stack stays in lockstep).
 2. Formula-bar autocomplete / function help.
 3. Formatting surface (number formats, fills, borders) beyond what the
    source workbook already carries.

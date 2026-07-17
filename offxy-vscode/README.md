@@ -88,13 +88,18 @@ Development Host, and open any `.docx` or `.xlsx` file.
   advances the selection.
 - **Recalculation via `gridcore`** — the same dependency-graph recalc engine
   behind `xlsxy` runs in the webview: editing a cell recalculates every
-  formula that depends on it, with Excel-faithful semantics.
+  formula that depends on it, with Excel-faithful semantics. A formula the
+  engine can't parse or evaluate keeps Excel's cached value untouched instead
+  of guessing — Excel-faithful for what it computes, conservative for what it
+  can't.
 - **Cell editing** — type-to-replace, <kbd>F2</kbd> to edit in place,
   navigation (arrows, <kbd>Tab</kbd>, <kbd>Enter</kbd>), range selection by
   click-drag or <kbd>Shift</kbd>+move, and clear/delete.
-- **Clipboard** — copy/cut/paste as TSV mediated through the OS clipboard, so
-  ranges round-trip with Excel and other spreadsheet apps; fill and paste
-  translate relative references like Excel.
+- **Clipboard** — copy/cut/paste as TSV mediated through the OS clipboard,
+  round-tripping each cell's raw content (including formula source) so
+  ranges are interoperable with Excel and other spreadsheet apps. There is
+  no fill handle, and paste re-enters formula text verbatim — it does not
+  translate relative references the way Excel's paste does.
 - **Structural edits** — insert/delete rows and columns, rewriting every
   affected formula in the workbook.
 - **Sheets** — sheet tabs to switch, add, and rename worksheets.
