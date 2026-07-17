@@ -1,0 +1,28 @@
+[package]
+name = "lookxy"
+description = "Lookxy — a terminal (TUI) Outlook/Exchange mail client over Microsoft Graph."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["email", "outlook", "exchange", "graph", "tui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "lookxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Path + version so `lookxy` can be published once `mailcore` is on crates.io.
+mailcore = { version = "0.1.0", path = "../mailcore" }
+# ratatui re-exports crossterm, so we don't depend on crossterm separately.
+ratatui = "0.29"
+# Display-column widths for correct alignment + truncation with wide glyphs.
+unicode-width = "0.2"
