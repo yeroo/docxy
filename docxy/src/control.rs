@@ -31,31 +31,16 @@ use docxcore::editor::{Caret, Clip};
 use docxcore::model::Block;
 use std::path::Path;
 
-/// The directory where docxy publishes its control discovery files, alongside
-/// its other config: `<config>/docxy/ctl` (`%APPDATA%` on Windows, else
-/// `$XDG_CONFIG_HOME` / `~/.config`). An agent reads `<dir>/<instance>.json` to
-/// find the port + token.
+/// The directory where docxy publishes its control discovery files:
+/// `<config>/docxy/ctl` (see [`ctlcore::config_ctl_dir`]).
 pub fn control_dir() -> Option<std::path::PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-            })
-    }?;
-    Some(base.join("docxy").join("ctl"))
+    ctlcore::config_ctl_dir("docxy")
 }
 
-/// This editor's control instance name. Inside an agwinterm pane it is
-/// `docxy-<AGWINTERM_SESSION_ID>` — the pane id an agent sees in `agwintermctl
-/// tree`, so it can address exactly this editor — otherwise `docxy-<pid>`.
+/// This editor's control instance name: `docxy-<AGWINTERM_SESSION_ID|pid>`
+/// (see [`ctlcore::instance_name`]).
 pub fn instance_name() -> String {
-    match std::env::var("AGWINTERM_SESSION_ID") {
-        Ok(id) if !id.is_empty() => format!("docxy-{id}"),
-        _ => format!("docxy-{}", std::process::id()),
-    }
+    ctlcore::instance_name("docxy")
 }
 
 /// Route one control verb against the live document, returning the JSON result
@@ -96,43 +81,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         // A content edit flashes this pane's agent-status dot, so a watcher sees
         // the document being worked on.
         if matches!(verb, "doc.replace-range" | "doc.insert" | "doc.append") {
-            signal_activity();
+            ctlcore::signal_activity();
         }
     }
     out
-}
-
-/// Best-effort: flash this pane's agwinterm agent-status dot to "active"
-/// (auto-resetting), so someone watching sees the document being edited. A no-op
-/// outside agwinterm or when `agwintermctl` isn't found; it spawns the CLI
-/// detached and never blocks or fails the edit.
-fn signal_activity() {
-    if std::env::var_os("AGWINTERM_SESSION_ID").is_none() {
-        return;
-    }
-    use std::process::{Command, Stdio};
-    // Try the CLI on PATH first, then the default install location.
-    let mut candidates: Vec<std::ffi::OsString> = vec!["agwintermctl".into()];
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(
-            std::path::Path::new(&local)
-                .join("Programs")
-                .join("agwinterm")
-                .join("agwintermctl.exe")
-                .into_os_string(),
-        );
-    }
-    for cand in candidates {
-        let spawned = Command::new(&cand)
-            .args(["session", "status", "active", "--auto-reset"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if spawned.is_ok() {
-            return;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

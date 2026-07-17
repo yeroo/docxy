@@ -16,7 +16,10 @@ use std::process::ExitCode;
 use std::time::SystemTime;
 
 mod backstage;
+mod control;
+mod mcp;
 mod ribbon;
+mod skill;
 
 use gridcore::comments::Comment;
 use gridcore::engine::Engine;
@@ -51,6 +54,32 @@ use ratatui_image::{Image, Resize};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running xlsxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `xlsxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -353,7 +382,9 @@ fn print_usage() {
            xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
-           xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n\n\
+           xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
+           xlsxy --mcp                      run the MCP bridge to drive a live xlsxy\n  \
+           xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \
            type to replace · F2 edit in place · = starts a formula\n  \
            Enter/Tab commit (move down/right) · Esc cancel · Del clear\n  \
@@ -1036,19 +1067,25 @@ impl App {
         self.edit = None;
     }
 
-    /// Apply cell changes as one undo group, through the engine.
+    /// Apply cell changes to the current sheet as one undo group.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
+        self.apply_on(self.sheet, changes);
+    }
+
+    /// Apply cell changes to sheet `sheet_idx` as one undo group, through the
+    /// engine. This is the shared edit path for keyboard edits (via [`Self::apply`])
+    /// and agent control edits (which may target a non-active sheet).
+    fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) {
         if changes.is_empty() {
             return;
         }
         self.engine.clock = now_serial();
-        let sheet_idx = self.sheet;
         let mut group = UndoGroup {
             sheet: sheet_idx,
             changes: Vec::with_capacity(changes.len()),
         };
         for (r, c, cell) in changes {
-            let before = self.sheet().cell(r, c).cloned();
+            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
             let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
@@ -5530,8 +5567,56 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
     let mut last_title = String::new();
+
+    // Bring up the agent control surface. Best-effort: if the config directory or
+    // the loopback bind fails, the editor runs exactly as before, just without a
+    // control channel. `ctl_server` is held for the whole session — its Drop
+    // removes the discovery file.
+    let ctl_instance = ctlcore::instance_name("xlsxy");
+    let (ctl_server, ctl_rx) = match ctlcore::config_ctl_dir("xlsxy") {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // One message stream drives the loop: terminal input (read on its own thread
+    // so the loop can block cheaply) and control requests. The main thread stays
+    // the sole owner of the workbook, so applying a request needs no locking.
+    enum Msg {
+        Term(Event),
+        Ctl(ctlcore::Request),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("xlsxy-input".into())
+            .spawn(move || {
+                while let Ok(ev) = event::read() {
+                    if tx.send(Msg::Term(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    if let Some(ctl_rx) = ctl_rx {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("xlsxy-ctl".into())
+            .spawn(move || {
+                for req in ctl_rx {
+                    if tx.send(Msg::Ctl(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(tx); // only the reader/forwarder threads keep the channel open now
+
     let result = loop {
-        // Reflect the file + dirty state in the terminal window title.
+        // Reflect the file + unsaved state in the terminal window title.
         let title = window_title("xlsxy", &app.path, app.modified);
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
@@ -5540,50 +5625,37 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
             break Err(e);
         }
-        // Same frame pacing as docxy: batch fast input into ~30fps redraws,
-        // block when idle.
-        let drawn = std::time::Instant::now();
-        let frame = std::time::Duration::from_millis(33);
+
+        // Block until something arrives (no busy polling), then drain anything
+        // already queued so a burst — fast scrolling, or a run of agent edits —
+        // collapses into a single repaint.
+        let mut next = match rx.recv() {
+            Ok(m) => Some(m),
+            Err(_) => break Ok(()), // every input source is gone
+        };
         let mut quit = false;
-        let mut got_event = false;
-        let mut err = None;
-        loop {
-            let timeout = if got_event {
-                match frame.checked_sub(drawn.elapsed()) {
-                    Some(rem) if !rem.is_zero() => rem,
-                    _ => break,
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Term(ev) => {
+                    if handle_event(&mut app, ev) {
+                        quit = true;
+                    }
                 }
-            } else {
-                std::time::Duration::from_secs(3600)
-            };
-            match event::poll(timeout) {
-                Ok(false) => break,
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        got_event = true;
-                        if handle_event(&mut app, ev) {
-                            quit = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
-                    }
+                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
                 },
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
             }
-        }
-        if let Some(e) = err {
-            break Err(e);
+            if quit {
+                break;
+            }
+            next = rx.try_recv().ok();
         }
         if quit {
             break Ok(());
         }
     };
+    drop(ctl_server); // remove the discovery file
 
     app.save_view_prefs();
     disable_raw_mode()?;

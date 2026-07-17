@@ -18,7 +18,10 @@ use std::io;
 use std::process::ExitCode;
 
 mod backstage;
+mod control;
+mod mcp;
 mod ribbon;
+mod skill;
 
 use backstage::{Backstage, Item, Pane};
 use ribbon::{Act, Ribbon};
@@ -55,6 +58,32 @@ const WEEKEND: Color = Color::Rgb(90, 100, 110);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running yppxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `yppxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(m) => {
@@ -1152,6 +1181,53 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
     let mut app = App::new(proj, path, vim);
     let mut title = String::new();
 
+    // Bring up the agent control surface. Best-effort: if the config directory or
+    // the loopback bind fails, the editor runs exactly as before, just without a
+    // control channel. `ctl_server` is held for the whole session — its Drop
+    // removes the discovery file.
+    let ctl_instance = ctlcore::instance_name("yppxy");
+    let (ctl_server, ctl_rx) = match ctlcore::config_ctl_dir("yppxy") {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // One message stream drives the loop: terminal input (read on its own thread
+    // so the loop can block cheaply) and control requests. The main thread stays
+    // the sole owner of the project, so applying a request needs no locking.
+    enum Msg {
+        Term(Event),
+        Ctl(ctlcore::Request),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("yppxy-input".into())
+            .spawn(move || {
+                while let Ok(ev) = event::read() {
+                    if tx.send(Msg::Term(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    if let Some(ctl_rx) = ctl_rx {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("yppxy-ctl".into())
+            .spawn(move || {
+                for req in ctl_rx {
+                    if tx.send(Msg::Ctl(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(tx); // only the reader/forwarder threads keep the channel open now
+
     let res = loop {
         // Keep the terminal window title in sync: [* ]yppxy - filename.
         let want = window_title(&app.path, app.dirty);
@@ -1162,16 +1238,32 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
         if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
             break Err(e);
         }
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
-            Ok(Event::Mouse(m)) => on_mouse(&mut app, m),
-            Ok(_) => {}
-            Err(e) => break Err(e),
+        // Block until something arrives, then drain the queue so a burst of
+        // agent edits collapses into a single repaint.
+        let mut next = match rx.recv() {
+            Ok(m) => Some(m),
+            Err(_) => break Ok(()), // every input source is gone
+        };
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
+                Msg::Term(Event::Mouse(m)) => on_mouse(&mut app, m),
+                Msg::Term(_) => {}
+                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
+                },
+            }
+            if app.quit {
+                break;
+            }
+            next = rx.try_recv().ok();
         }
         if app.quit {
             break Ok(());
         }
     };
+    drop(ctl_server); // remove the discovery file
 
     disable_raw_mode()?;
     execute!(
