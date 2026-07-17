@@ -34,13 +34,29 @@ pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
     let plaintext = v.to_string().into_bytes();
     let ciphertext = protect(&plaintext)?;
 
+    // note: assumes a single writer — a concurrent `save` would race on
+    // this deterministic tmp name; `rename` below is still atomic, so a
+    // race can only lose an update, never corrupt the file.
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, &ciphertext)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        // On unix `protect` is the identity transform (see `unprotect`
+        // below), so `ciphertext` is the plaintext token JSON: the file
+        // must never exist world/group-readable, even momentarily. Create
+        // it already restricted to 0600 rather than writing plaintext at
+        // default umask perms and tightening afterward.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&ciphertext)?;
     }
+    #[cfg(not(unix))]
+    fs::write(&tmp_path, &ciphertext)?;
     fs::rename(&tmp_path, path)?;
     Ok(())
 }
