@@ -1541,6 +1541,7 @@ name = "xlsxy"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "ctlcore",
  "gridcore",
  "image",
  "ratatui",
@@ -1552,6 +1553,7 @@ dependencies = [
 name = "yppxy"
 version = "0.1.0"
 dependencies = [
+ "ctlcore",
  "mppread",
  "projcore",
  "ratatui",

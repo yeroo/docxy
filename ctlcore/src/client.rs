@@ -125,6 +125,51 @@ impl Client {
     }
 }
 
+/// The running instances of `app` (discovery files under `dir` whose instance
+/// name starts with `<app>-` and whose server accepts a connection), as a JSON
+/// tool result: `{"running":[{instance,port,pid},…]}`.
+pub fn list_running(dir: &Path, app: &str) -> Json {
+    let prefix = format!("{app}-");
+    let running = discover_live(dir)
+        .into_iter()
+        .filter(|i| i.instance.starts_with(&prefix))
+        .map(|i| {
+            Json::obj(vec![
+                ("instance", Json::Str(i.instance)),
+                ("port", Json::Num(i.port as f64)),
+                ("pid", Json::Num(i.pid as f64)),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("running", Json::Arr(running))])
+}
+
+/// Find the single `app` instance to act on: the only one running, or the one
+/// selected by a `target` substring of its instance/pane id.
+pub fn resolve_target(dir: &Path, app: &str, target: Option<&str>) -> Result<Client, String> {
+    let prefix = format!("{app}-");
+    let mut live: Vec<_> = discover_live(dir)
+        .into_iter()
+        .filter(|i| i.instance.starts_with(&prefix))
+        .collect();
+    if let Some(target) = target {
+        live.retain(|i| i.instance.contains(target));
+    }
+    match live.len() {
+        0 => Err(format!(
+            "no running {app} found — open a document in a {app} pane first"
+        )),
+        1 => Ok(live.remove(0).client()),
+        _ => {
+            let names: Vec<&str> = live.iter().map(|i| i.instance.as_str()).collect();
+            Err(format!(
+                "several {app} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

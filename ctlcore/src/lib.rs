@@ -33,6 +33,7 @@
 
 pub mod client;
 pub mod json;
+pub mod mcp;
 
 use json::Json;
 use std::io::{BufRead, BufReader, Write};
@@ -334,6 +335,101 @@ fn mint_token(port: u16) -> String {
         ^ addr.rotate_left(29)
         ^ addr.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     format!("{mixed:032x}")
+}
+
+// ---------------------------------------------------------------------------
+// Shared host helpers (used by every editor that grows a control surface)
+// ---------------------------------------------------------------------------
+
+/// The directory where `app` publishes its control discovery files, alongside
+/// its other config: `<config>/<app>/ctl` (`%APPDATA%` on Windows, else
+/// `$XDG_CONFIG_HOME` / `~/.config`). An agent reads `<dir>/<instance>.json` to
+/// find the port + token.
+pub fn config_ctl_dir(app: &str) -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    }?;
+    Some(base.join(app).join("ctl"))
+}
+
+/// This editor's control instance name. Inside an agwinterm pane it is
+/// `<app>-<AGWINTERM_SESSION_ID>` — the pane id an agent sees in `agwintermctl
+/// tree`, so it can address exactly this editor — otherwise `<app>-<pid>`.
+pub fn instance_name(app: &str) -> String {
+    match std::env::var("AGWINTERM_SESSION_ID") {
+        Ok(id) if !id.is_empty() => format!("{app}-{id}"),
+        _ => format!("{app}-{}", std::process::id()),
+    }
+}
+
+/// Best-effort: flash this pane's agwinterm agent-status dot to "active"
+/// (auto-resetting), so someone watching sees the document being worked on. A
+/// no-op outside agwinterm or when `agwintermctl` isn't found; it spawns the CLI
+/// detached and never blocks or fails the edit.
+pub fn signal_activity() {
+    if std::env::var_os("AGWINTERM_SESSION_ID").is_none() {
+        return;
+    }
+    use std::process::{Command, Stdio};
+    // Try the CLI on PATH first, then the default install location.
+    let mut candidates: Vec<std::ffi::OsString> = vec!["agwintermctl".into()];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            Path::new(&local)
+                .join("Programs")
+                .join("agwinterm")
+                .join("agwintermctl.exe")
+                .into_os_string(),
+        );
+    }
+    for cand in candidates {
+        let spawned = Command::new(&cand)
+            .args(["session", "status", "active", "--auto-reset"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
+}
+
+/// Install an agent skill for self-discovery. Always installs for Claude Code
+/// (`~/.claude/skills/<app>/SKILL.md`); also installs for any other agent root
+/// that already exists (`~/.codex`). Returns a human-readable summary.
+pub fn install_skill(app: &str, skill_md: &str) -> std::io::Result<String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("no home directory (USERPROFILE/HOME unset)"))?;
+    install_skill_to(&home, app, skill_md)
+}
+
+/// The install logic, parameterized by home directory so tests need not mutate
+/// process-global environment variables.
+pub fn install_skill_to(home: &Path, app: &str, skill_md: &str) -> std::io::Result<String> {
+    let mut written = Vec::new();
+    for root in [".claude", ".codex"] {
+        let root_dir = home.join(root);
+        // Claude Code is the primary target; create its tree even if absent.
+        // Only touch other agents' roots when the user already uses them.
+        if root != ".claude" && !root_dir.exists() {
+            continue;
+        }
+        let dir = root_dir.join("skills").join(app);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), skill_md)?;
+        written.push(dir.display().to_string());
+    }
+    Ok(format!(
+        "installed {app} agent skill to:\n  {}",
+        written.join("\n  ")
+    ))
 }
 
 #[cfg(test)]

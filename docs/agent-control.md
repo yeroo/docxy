@@ -1,15 +1,19 @@
-# Driving docxy from an agent (the control surface)
+# Driving the editors from an agent (the control surface)
 
-docxy exposes a small **control surface** so an external agent — e.g. Claude Code
-running in a sibling [agwinterm](https://github.com/yeroo/agwinterm) pane — can
-read and edit the *live* open document. Edits go through docxy's own editor, so
-they land on the **undo stack** and repaint the view instantly; reads reflect
-**unsaved** changes, because they serialize the in-memory buffer, never the file
-on disk.
+All three TUIs — **docxy** (Word), **xlsxy** (Excel), and **yppxy** (Project) —
+expose a **control surface** so an external agent — e.g. Claude Code running in
+a sibling [agwinterm](https://github.com/yeroo/agwinterm) pane — can read and
+edit the *live* open document. Edits go through each editor's own edit path, so
+they land on the **undo stack** (and, for xlsxy/yppxy, recalculate/reschedule)
+and repaint the view instantly; reads reflect **unsaved** changes, because they
+serialize the in-memory state, never the file on disk.
 
-The transport is loopback TCP speaking **newline-delimited JSON**, implemented by
-the dependency-free [`ctlcore`](../ctlcore) crate (shared, so xlsxy/yppxy can
-adopt it later).
+The transport is loopback TCP speaking **newline-delimited JSON**, implemented
+by the dependency-free [`ctlcore`](../ctlcore) crate, which the three editors
+share (server, discovery, MCP scaffolding, skill installer, status signal).
+This page documents docxy's verbs in full; xlsxy and yppxy follow the same
+pattern with their own verbs (see "The other editors" below and each editor's
+`SKILL.md` via `<app> install skill`).
 
 ## Two panes in one agwinterm session
 
@@ -26,14 +30,15 @@ new pane. (`agwintermctl session new` makes a *separate* session, not a split.)
 
 ## Discovery
 
-On startup docxy writes a discovery file to
-`%APPDATA%\docxy\ctl\<instance>.json` (Windows) or
-`$XDG_CONFIG_HOME/docxy/ctl/<instance>.json` (Unix), where the instance is:
+On startup each editor writes a discovery file to
+`%APPDATA%\<app>\ctl\<instance>.json` (Windows) or
+`$XDG_CONFIG_HOME/<app>/ctl/<instance>.json` (Unix) — `<app>` being `docxy`,
+`xlsxy`, or `yppxy` — where the instance is:
 
-- `docxy-<AGWINTERM_SESSION_ID>` inside an agwinterm pane — and
+- `<app>-<AGWINTERM_SESSION_ID>` inside an agwinterm pane — and
   `AGWINTERM_SESSION_ID` **is the pane id** shown in `agwintermctl tree`, so an
-  agent that knows docxy's pane id knows its discovery file exactly; or
-- `docxy-<pid>` otherwise.
+  agent that knows the editor's pane id knows its discovery file exactly; or
+- `<app>-<pid>` otherwise.
 
 The file is `{"instance","port","token","pid"}`. Connect to `127.0.0.1:<port>`
 and present `token` on every request. Stale files (editor gone) are swept the
@@ -110,3 +115,27 @@ send doc.read '{"start":1,"end":2}'
 send doc.replace-range '{"start":1,"text":"A tighter second paragraph."}'
 send doc.save '{}'
 ```
+
+## The other editors
+
+**xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` by index or name):
+`wb.path`, `sheet.list`, `sheet.read {sheet?, range?}`, `cell.get {ref}`,
+`cell.set {ref, text}` (leading `=` = formula, validated + recalculated),
+`range.clear {range}`, `find {query}`, `wb.recalc`, `wb.save`, `wb.reload`,
+`wb.open {path}`. MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`,
+`xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`,
+`xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. Skill:
+`xlsxy install skill`.
+
+**yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
+`proj.path`, `task.list` (scheduled dates, critical path, slack, links),
+`task.get/set/add/del`, `link.add {uid, pred, type?, lag?}` / `link.del`,
+`find {query}`, `proj.save {path?}`, `proj.reload`, `proj.open {path}`. Edits
+reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
+`yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
+`yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`, `yppxy_find`,
+`yppxy_save`. Skill: `yppxy install skill`.
+
+Everything else — discovery, the wire protocol, tokens, `target`
+disambiguation, the status-dot flash on agent edits — works identically across
+the three.

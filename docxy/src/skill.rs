@@ -3,8 +3,6 @@
 //! `docxy install skill` writes it to `~/.claude/skills/docxy/` (and
 //! `~/.codex/skills/docxy/` when that root exists) so an LLM self-discovers it.
 
-use std::path::PathBuf;
-
 /// The skill document installed for agents to self-onboard.
 pub const SKILL_MD: &str = r#"---
 name: docxy
@@ -71,41 +69,9 @@ Ctrl+D and run docxy there). Now you sit beside the document and edit it live.
   document being worked on.
 "#;
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-}
-
-/// Install `SKILL.md` for self-discovery. Always installs for Claude Code
-/// (`~/.claude`); also installs for any other agent root that already exists
-/// (`~/.codex`). Returns a human-readable summary of where it wrote.
+/// Install `SKILL.md` for self-discovery (see [`ctlcore::install_skill`]).
 pub fn install() -> std::io::Result<String> {
-    let home = home()
-        .ok_or_else(|| std::io::Error::other("no home directory (USERPROFILE/HOME unset)"))?;
-    install_to(&home)
-}
-
-/// The install logic, parameterized by home directory so tests need not mutate
-/// process-global environment variables.
-fn install_to(home: &std::path::Path) -> std::io::Result<String> {
-    let mut written = Vec::new();
-    for root in [".claude", ".codex"] {
-        let root_dir = home.join(root);
-        // Claude Code is the primary target; create its tree even if absent.
-        // Only touch other agents' roots when the user already uses them.
-        if root != ".claude" && !root_dir.exists() {
-            continue;
-        }
-        let dir = root_dir.join("skills").join("docxy");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("SKILL.md"), SKILL_MD)?;
-        written.push(dir.display().to_string());
-    }
-    Ok(format!(
-        "installed docxy agent skill to:\n  {}",
-        written.join("\n  ")
-    ))
+    ctlcore::install_skill("docxy", SKILL_MD)
 }
 
 #[cfg(test)]
@@ -132,7 +98,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let msg = install_to(&tmp).unwrap();
+        let msg = ctlcore::install_skill_to(&tmp, "docxy", SKILL_MD).unwrap();
         let claude_skill = tmp
             .join(".claude")
             .join("skills")
@@ -146,7 +112,7 @@ mod tests {
 
         // With ~/.codex present, it installs there too.
         std::fs::create_dir_all(tmp.join(".codex")).unwrap();
-        install_to(&tmp).unwrap();
+        ctlcore::install_skill_to(&tmp, "docxy", SKILL_MD).unwrap();
         assert!(
             tmp.join(".codex")
                 .join("skills")
