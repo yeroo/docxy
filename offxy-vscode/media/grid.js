@@ -71,7 +71,9 @@
     for (let i = 0; i < colX.length - 1; i++) {
       if (x < acc + colX[i + 1]) return left + i;
     }
-    return left + colX.length - 2; // last valid fetched column (colX has ncols+1 entries)
+    // last valid fetched column (colX has ncols+1 entries); clamp so an empty
+    // window (colX.length === 1, i.e. no columns fetched yet) can't go below `left`.
+    return Math.max(left, left + colX.length - 2);
   }
 
   function win() {
@@ -145,6 +147,12 @@
     curEl.style.width = colWidthPx(curC) + 'px';
     frag.appendChild(curEl);
     $('cells').replaceChildren(frag);
+    // A repaint can land mid-edit (e.g. any select/scroll that fires while the
+    // in-cell editor is open). replaceChildren() above would otherwise
+    // silently detach editEl, permanently tripping startEdit's `if (editEl)
+    // return;` guard for the rest of the session — re-append it, same pattern
+    // as the docx webview's placeCaret() in media/webview.js.
+    if (editEl) $('cells').appendChild(editEl);
 
     paintHeaders(top, left, nrows, ncols, originX);
     paintTabs();
@@ -244,17 +252,26 @@
     button.replaceWith(input);
     input.focus();
     input.select();
+    // Enter/Escape settle the rename synchronously; `done` keeps the blur
+    // that follows (removing a focused input from the DOM fires one) from
+    // triggering a redundant second requestView().
+    let done = false;
+    const restore = () => { if (!done) { done = true; requestView(); } };
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
+        done = true;
         userCmd(`sheet\trename\t${i}\t${input.value}`);
         requestView();
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        requestView();
+        restore();
       }
       e.stopPropagation();
     });
+    // Clicking away must not leave the stale rename input stranded in the
+    // tab strip — restore the normal tab buttons.
+    input.addEventListener('blur', restore);
   }
 
   function colName(c) {
@@ -375,12 +392,10 @@
     editEl = document.createElement('input');
     editEl.id = 'celledit';
     editEl.value = initial != null ? initial : view.cur.src;
-    editEl.style.position = 'absolute';
     editEl.style.top = r * ROW_H + 'px';
     editEl.style.left = c * defW + 'px';
     editEl.style.height = ROW_H + 'px';
     editEl.style.minWidth = defW + 'px';
-    editEl.style.font = 'inherit';
     editEl.style.zIndex = 5;
     editEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); commitEdit(); move(1, 0, false); }
@@ -388,6 +403,11 @@
       else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
       e.stopPropagation();
     });
+    // Clicking inside the input to move the caret must not bubble to the
+    // grid's own mousedown handler (it would re-`select` the underlying cell
+    // and repaint — editEl survives that now, but there's no reason to pay
+    // for a wasm round trip just to place a text caret).
+    editEl.addEventListener('mousedown', (e) => e.stopPropagation());
     $('cells').appendChild(editEl);
     editEl.focus();
     if (initial != null) editEl.setSelectionRange(initial.length, initial.length);

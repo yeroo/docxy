@@ -26,6 +26,9 @@ html, body { height: 100%; overflow: hidden;
 .cell.ctr { text-align: center; }
 .cell.b { font-weight: bold; }
 .cell.i { font-style: italic; }
+#celledit { position: absolute; padding: 0 4px; font: inherit;
+  color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent); outline: none; }
 
 #colhdr, #rowhdr { position: absolute; z-index: 3; overflow: hidden;
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
