@@ -13,26 +13,19 @@
 mod app;
 mod config;
 // The control-surface verb dispatcher (mail read + triage against the live
-// App). Wiring it into the run loop (ctlcore::serve + draining its request
-// channel each tick, and the `--mcp`/`install skill` entry points) is a
-// separate later task; until then `dispatch`/`control_dir`/`instance_name`
-// are only exercised by `control`'s own tests, so silence dead_code here.
-#[allow(dead_code)]
+// App), wired into the run loop below via `ctlcore::serve` and its request
+// channel.
 mod control;
-// The MCP stdio bridge (thin client of a running lookxy's control surface).
-// Wiring the `--mcp` CLI dispatch is a separate later task; until then `run`
-// is only reachable from `mcp`'s own tests, so silence dead_code here too.
-#[allow(dead_code)]
+// The MCP stdio bridge (thin client of a running lookxy's control surface),
+// reached via the `--mcp` CLI early-return in `main`.
 mod mcp;
-// The bundled agent SKILL.md (self-onboarding for the MCP/control surface).
-// Wiring the `install skill` CLI dispatch is a separate later task; until
-// then `install` is only reachable from `skill`'s own tests, so silence
-// dead_code here too.
-#[allow(dead_code)]
+// The bundled agent SKILL.md (self-onboarding for the MCP/control surface),
+// reached via the `install skill` CLI early-return in `main`.
 mod skill;
 mod ui;
 
 use std::io;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use app::App;
@@ -50,7 +43,59 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
+/// Which of lookxy's CLI entry points a given argument vector selects. Kept
+/// as a pure decision separate from what each mode actually does — `--mcp`
+/// runs a stdio server and `install skill` writes files, neither of which is
+/// practical to exercise in a unit test, so the decision itself is what gets
+/// tested (see the `cli_mode` tests below).
+#[derive(Debug, PartialEq, Eq)]
+enum CliMode {
+    /// Run the MCP stdio bridge instead of the TUI (`lookxy --mcp`).
+    Mcp,
+    /// Install the bundled agent SKILL.md and exit (`lookxy install skill`).
+    InstallSkill,
+    /// The ordinary TUI mail client.
+    Tui,
+}
+
+fn cli_mode(args: &[String]) -> CliMode {
+    if args.iter().any(|a| a == "--mcp") {
+        return CliMode::Mcp;
+    }
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return CliMode::InstallSkill;
+    }
+    CliMode::Tui
+}
+
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` and `install skill` are headless entry points unrelated to the
+    // TUI mail client — handle them before any terminal setup or sync-engine
+    // spawn.
+    match cli_mode(&args) {
+        CliMode::Mcp => {
+            if let Err(e) = mcp::run() {
+                eprintln!("mcp: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        CliMode::InstallSkill => match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                std::process::exit(1);
+            }
+        },
+        CliMode::Tui => {}
+    }
+
     let config = Config::load_from(None);
 
     let local_appdata = app::lookxy_dir();
@@ -84,13 +129,29 @@ fn main() -> io::Result<()> {
     // `App::reload_account`) — the engine owns writing it, not the UI.
     let mut app = App::new(store, handle, token_path);
 
-    run_tui(&mut app)
+    // Bring up the agent control surface. Best-effort: if the config
+    // directory can't be resolved or the loopback bind fails, lookxy runs
+    // exactly as before, just without a control channel — no panic, no
+    // user-visible error. `ctl_server` is held for the whole session so its
+    // `Drop` (which removes the discovery file) runs when `main` returns.
+    let ctl_instance = control::instance_name();
+    let (ctl_server, ctl_rx) = match control::control_dir() {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    let res = run_tui(&mut app, ctl_rx);
+    drop(ctl_server); // remove the discovery file
+    res
 }
 
 /// Sets up the alternate screen + raw mode, runs the event loop, and tears
 /// the terminal back down — even on panic, so a crash never leaves the
 /// user's shell in raw mode / the alternate screen.
-fn run_tui(app: &mut App) -> io::Result<()> {
+fn run_tui(app: &mut App, ctl_rx: Option<Receiver<ctlcore::Request>>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -106,7 +167,7 @@ fn run_tui(app: &mut App) -> io::Result<()> {
         default_hook(info);
     }));
 
-    let res = run(&mut terminal, app);
+    let res = run(&mut terminal, app, ctl_rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -119,10 +180,17 @@ fn run_tui(app: &mut App) -> io::Result<()> {
 /// non-global keys to `ui::handle_key`, and quit on `q`/Ctrl-C. The sync
 /// engine's own periodic tick (set from `Config::refresh_secs` at spawn
 /// time, in `main`) is what keeps folders/messages current on its own — this
-/// loop doesn't need to nudge it itself.
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+/// loop doesn't need to nudge it itself. It also drains any pending agent
+/// control requests (`ctl_rx`, `None` when the control server failed to
+/// bind) each tick, same cadence as the sync events.
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    ctl_rx: Option<Receiver<ctlcore::Request>>,
+) -> io::Result<()> {
     loop {
         drain_events(app);
+        drain_ctl(app, ctl_rx.as_ref());
 
         terminal.draw(|f| ui::draw(f, app))?;
 
@@ -171,6 +239,23 @@ fn drain_events(app: &mut App) {
     }
 }
 
+/// Drains every pending agent control [`ctlcore::Request`] without blocking
+/// (a no-op when `ctl_rx` is `None`, i.e. the control server never bound),
+/// routing each through `control::dispatch` against the live `App` — the
+/// same optimistic `Store` write + `SyncCommand` a UI triage key would make —
+/// and replying with its JSON result or error message. The loop's
+/// unconditional per-tick redraw is what shows the change; there's no
+/// separate "mark dirty" step needed here.
+fn drain_ctl(app: &mut App, ctl_rx: Option<&Receiver<ctlcore::Request>>) {
+    let Some(rx) = ctl_rx else { return };
+    while let Ok(req) = rx.try_recv() {
+        match control::dispatch(app, &req.verb, &req.args) {
+            Ok(result) => req.reply_ok(result),
+            Err(e) => req.reply_err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +287,36 @@ mod tests {
         app.start_search();
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(is_global_quit(&app, &k));
+    }
+
+    fn strs(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cli_mode_mcp_flag_selects_mcp() {
+        assert_eq!(cli_mode(&strs(&["--mcp"])), CliMode::Mcp);
+    }
+
+    #[test]
+    fn cli_mode_install_skill_selects_install_skill() {
+        assert_eq!(
+            cli_mode(&strs(&["install", "skill"])),
+            CliMode::InstallSkill
+        );
+    }
+
+    #[test]
+    fn cli_mode_defaults_to_tui() {
+        assert_eq!(cli_mode(&[]), CliMode::Tui);
+        assert_eq!(cli_mode(&strs(&["install"])), CliMode::Tui);
+        assert_eq!(cli_mode(&strs(&["skill"])), CliMode::Tui);
+        assert_eq!(cli_mode(&strs(&["some-other-flag"])), CliMode::Tui);
+    }
+
+    #[test]
+    fn cli_mode_mcp_flag_wins_regardless_of_position() {
+        // `--mcp` is detected anywhere in argv, not just as args[0].
+        assert_eq!(cli_mode(&strs(&["install", "--mcp"])), CliMode::Mcp);
     }
 }

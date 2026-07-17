@@ -68,6 +68,58 @@ sync engine also re-syncs on its own on a timer (`refresh_secs`, see
 [Configuration](#configuration)), so folders and messages refresh even if
 you never touch anything.
 
+## Agent control (MCP)
+
+`lookxy` exposes the **live** mailbox — the same `Store` the TUI reads and the
+same sync engine it queues triage through — to an external agent (typically
+Claude Code in a sibling `agwinterm` pane), so an agent can read and triage
+mail without opening a Graph session of its own and without racing the file
+on disk.
+
+**Control surface.** While running, `lookxy` opens a loopback-only
+(`127.0.0.1`) TCP listener speaking newline-delimited JSON, and drops a
+discovery file at `%APPDATA%\lookxy\ctl\<instance>.json`
+(`{instance, port, token, pid}`) where `instance` is
+`lookxy-<AGWINTERM_SESSION_ID|pid>`. A client reads the discovery file, opens
+the port, and sends `{"token":"…","verb":"mail.list","args":{…}}` lines,
+getting back `{"ok":true,"result":{…}}` (or `{"ok":false,"error":"…"}`). This
+is best-effort: if the port can't be bound (or the config directory can't be
+resolved), `lookxy` runs exactly as before, just without a control channel —
+no crash, no user-visible error.
+
+**MCP.** Register the bridge once:
+
+```sh
+claude mcp add lookxy -- lookxy --mcp
+```
+
+`lookxy --mcp` runs a thin MCP stdio server that discovers the running
+`lookxy` (via the same ctl directory) and forwards tool calls to it. It opens
+no mailbox of its own. Tools:
+
+- `lookxy_list` — which lookxy instances are running
+- `lookxy_status` — account, sync state, folder/unread counts, pending
+  outbox ops, current selection
+- `lookxy_folders` — the folder tree
+- `lookxy_messages` `{folder?, limit?, offset?}` — list messages, newest first
+- `lookxy_read` `{id}` — full metadata + rendered plain-text body
+- `lookxy_search` `{query, limit?}` — local full-text search
+- `lookxy_mark` `{id, read}`, `lookxy_flag` `{id, flagged}`,
+  `lookxy_move` `{id, dest}`, `lookxy_delete` `{id}` — triage
+- `lookxy_attachments` `{id}`, `lookxy_save_attachment` `{id, attachment, dest?}`
+- `lookxy_select` `{folder?, id?}` — move the TUI's own selection
+- `lookxy_refresh` — trigger a background sync
+
+Run `lookxy install skill` to write a `SKILL.md` under `~/.claude/skills/lookxy/`
+(and `~/.codex/skills/lookxy/` when that root exists), so an agent
+self-discovers when and how to use these tools.
+
+**Live, not out-of-band.** An agent's triage goes through the exact same
+optimistic-write-then-outbox path as a keypress (`m`/`u`/`f`/`v`/`d`): the
+local `Store` is updated immediately, the change is queued to Exchange in
+the background, and the open TUI pane repaints live — the human sees the
+agent's work as it happens, not after the fact.
+
 ## Storage locations
 
 Everything lives under your Windows user profile, like Outlook's own OST:
