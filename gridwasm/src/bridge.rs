@@ -36,6 +36,19 @@ enum UndoAction {
         before: WbSnapshot,
         after: WbSnapshot,
     },
+    /// A sheet-add: its inverse is the real `SheetPackage::remove_sheet`
+    /// (part + content-type override + workbook rel + workbook.xml entry),
+    /// not a `WbSnapshot` restore. A `Structural` snapshot only rolls back
+    /// `workbook.sheets`, leaving the minted worksheet part and its
+    /// `<sheet>` element in `xl/workbook.xml` behind; that count mismatch
+    /// makes `patch_sheet_names` bail on save (see
+    /// `gridcore::xlsx::patch_sheet_names`), so an add→undo→save round trip
+    /// would resurrect the "undone" sheet empty and silently drop any
+    /// rename saved in between.
+    SheetAdd {
+        idx: usize,
+        name: String,
+    },
 }
 
 /// A live editing session over one `.xlsx`.
@@ -266,30 +279,25 @@ impl Session {
                     }
                     (Some("add"), Some(name)) if !name.is_empty() => {
                         // add_sheet operates on the whole SheetPackage (parts,
-                        // not just Workbook), so it can't go through
-                        // `structural`; snapshot-wrap it inline instead of
-                        // clearing undo/redo (which would desync the host's
-                        // undo stack — the host registers one undo step per
-                        // mutating command, so an engine no-op undo walks it
-                        // back to a false-clean state).
-                        //
-                        // Undo restores workbook.sheets minus the new sheet;
-                        // the orphaned worksheet PART stays in pkg.parts
-                        // (accepted — same class as the documented
-                        // rename-undo imperfection). Redo re-restores the
-                        // after-snapshot, whose sheet entry still points at
-                        // that same part, so it's consistent either way.
-                        let before = WbSnapshot {
-                            sheets: self.pkg.workbook.sheets.clone(),
-                            names: self.pkg.workbook.defined_names.clone(),
-                        };
+                        // not just Workbook), so its undo can't be a
+                        // `Structural` before/after snapshot — that only
+                        // rolls back `workbook.sheets`, leaving the minted
+                        // worksheet part and its `<sheet>` entry in
+                        // xl/workbook.xml behind (see the doc comment on
+                        // `UndoAction::SheetAdd`). Nor can undo/redo simply
+                        // be cleared here — that would desync the host's
+                        // undo stack, since it registers one undo step per
+                        // mutating command and an engine no-op undo would
+                        // walk it back to a false-clean state. `remove_sheet`
+                        // is the real inverse: it drops the part, the
+                        // content-type override, the workbook rel, and the
+                        // workbook.xml entry together.
                         let idx = self.pkg.add_sheet(name);
                         self.rebuild_engine();
-                        let after = WbSnapshot {
-                            sheets: self.pkg.workbook.sheets.clone(),
-                            names: self.pkg.workbook.defined_names.clone(),
-                        };
-                        self.undo.push(UndoAction::Structural { before, after });
+                        self.undo.push(UndoAction::SheetAdd {
+                            idx,
+                            name: name.to_string(),
+                        });
                         self.redo.clear();
                         self.active = idx;
                         self.cur = (0, 0);
@@ -349,10 +357,16 @@ impl Session {
             }
             Some(UndoAction::Structural { before, after }) => {
                 self.restore(&before);
-                // Sheet count can shrink (undoing a sheet add) — keep the
-                // active index in bounds, same clamp as the Cells case above.
-                self.active = self.active.min(self.pkg.workbook.sheets.len() - 1);
                 self.redo.push(UndoAction::Structural { before, after });
+            }
+            Some(UndoAction::SheetAdd { idx, name }) => {
+                self.pkg.remove_sheet(idx);
+                self.rebuild_engine();
+                // Sheet count shrinks — keep the active index in bounds,
+                // same clamp as the Cells case above.
+                self.active = self.active.min(self.pkg.workbook.sheets.len() - 1);
+                self.dirty = true;
+                self.redo.push(UndoAction::SheetAdd { idx, name });
             }
             None => {}
         }
@@ -372,10 +386,14 @@ impl Session {
             }
             Some(UndoAction::Structural { before, after }) => {
                 self.restore(&after);
-                // Sheet count can grow back (redoing a sheet add) — same
-                // bounds clamp as the undo side.
-                self.active = self.active.min(self.pkg.workbook.sheets.len() - 1);
                 self.undo.push(UndoAction::Structural { before, after });
+            }
+            Some(UndoAction::SheetAdd { idx: _, name }) => {
+                let new_idx = self.pkg.add_sheet(&name);
+                self.rebuild_engine();
+                self.active = new_idx;
+                self.dirty = true;
+                self.undo.push(UndoAction::SheetAdd { idx: new_idx, name });
             }
             None => {}
         }
@@ -774,13 +792,21 @@ mod tests {
         // A naive `split('\n')` over a trailing-newline TSV yields a phantom
         // empty last line one row past the pasted data, which would clear it.
         s.dispatch("set\t7\t0\tsentinel");
-        s.dispatch("paste\t5\t0\ta\t1\r\nb\t2\r\n");
+        // B7's field is text ("x"), not numeric: parse_input trims whitespace
+        // (which \r counts as) before parsing a number, so a numeric field
+        // would still read back clean even without the fix and mask the bug.
+        // A text field takes the untrimmed literal, so it's the only field
+        // that actually proves the per-line \r is stripped.
+        s.dispatch("paste\t5\t0\ta\t1\r\nb\tx\r\n");
         s.dispatch("select\t5\t0");
         let v = s.view_json(None);
         assert!(v.contains("\"src\":\"a\""), "A6 must be clean 'a': {v}");
         s.dispatch("select\t6\t1");
         let v = s.view_json(None);
-        assert!(v.contains("\"src\":\"2\""), "B7 must be clean '2': {v}");
+        assert!(
+            v.contains("\"src\":\"x\""),
+            "B7 must be clean 'x', no \\r: {v}"
+        );
         s.dispatch("select\t7\t0");
         let v = s.view_json(None);
         assert!(
@@ -873,6 +899,49 @@ mod tests {
         assert!(
             v.contains("\"sheets\":[\"Sheet1\",\"Data\"]"),
             "second redo re-adds the sheet: {v}"
+        );
+    }
+
+    #[test]
+    fn sheet_add_undo_survives_save() {
+        // A `Structural` before/after snapshot only rolls back
+        // `workbook.sheets` — it doesn't remove the minted worksheet part or
+        // its <sheet> entry in xl/workbook.xml. That leftover entry outlives
+        // the undo, so on save the model has 1 sheet but workbook.xml still
+        // has 2 `<sheet>` elements; `patch_sheet_names` bails on the count
+        // mismatch (see gridcore::xlsx::patch_sheet_names) and the saved
+        // file still lists the "undone" sheet, which resurrects (empty) on
+        // reopen. `SheetAdd`'s inverse (`remove_sheet`) must remove the part
+        // and its workbook.xml entry for real, not just the model entry.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("sheet\tadd\tData");
+        s.dispatch("undo");
+        let out = s.save();
+        let mut reopened = Session::open(&out).expect("reopen");
+        let v = reopened.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\"]"),
+            "the undone sheet must not resurrect on reopen: {v}"
+        );
+    }
+
+    #[test]
+    fn sheet_add_undo_then_rename_persists_through_save() {
+        // Same root cause as `sheet_add_undo_survives_save`, but the fallout
+        // is worse: with the model/workbook.xml <sheet>-count mismatch left
+        // behind by an unremoved part, `patch_sheet_names` bails on *every*
+        // name in the workbook, not just the orphaned one — so a rename
+        // saved during the mismatched session was silently dropped too.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("sheet\tadd\tData");
+        s.dispatch("undo");
+        s.dispatch("sheet\trename\t0\tRenamed");
+        let out = s.save();
+        let mut reopened = Session::open(&out).expect("reopen");
+        let v = reopened.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Renamed\"]"),
+            "the rename must persist through save: {v}"
         );
     }
 }
