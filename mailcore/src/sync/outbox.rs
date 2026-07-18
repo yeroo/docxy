@@ -77,27 +77,55 @@ fn ensure_draft_on_graph(
 }
 
 /// Parses the flat recipient text `MessageRow.to_recipients`/`cc_recipients`
-/// holds for a draft (compose stores whatever the user typed there, e.g.
-/// `bob@x` or `bob@x; carol@x` — unlike a synced message's columns, there's
-/// no `Name <addr>` structure to preserve since compose never captured a
-/// display name) back into `Recipient`s for `create_draft`/`update_draft`.
-/// Splits on both `;` and `,` since compose doesn't mandate one separator,
-/// trims whitespace, and drops empty tokens (a trailing separator, or an
-/// empty field) rather than sending a blank recipient to Graph.
+/// holds for a draft back into `Recipient`s for `create_draft`/`update_draft`
+/// — the exact inverse of `store::encode_recipients` (`"{name} <{addr}>"`
+/// joined by `"; "`), which is what a reply/forward draft's columns look
+/// like (`sync::engine::store_composed_draft` files it via
+/// `Store::upsert_message`, same as any synced message). A from-scratch
+/// local draft's columns, on the other hand, are whatever `update_draft_fields`
+/// was given directly (compose's flat `to`/`cc` input, e.g. `bob@x` or
+/// `bob@x; carol@x` — no `Name <addr>` structure, since compose never
+/// captured a display name there). Splits on both `;` and `,` since compose
+/// doesn't mandate one separator, trims whitespace, and drops empty tokens
+/// (a trailing separator, or an empty field) rather than sending a blank
+/// recipient to Graph. Each non-empty part is then parsed by
+/// `parse_one_recipient`, which handles both shapes.
 fn parse_recipients(raw: &str) -> Vec<Recipient> {
     raw.split([';', ','])
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|addr| Recipient {
-            name: String::new(),
-            address: addr.to_string(),
-        })
+        .map(parse_one_recipient)
         .collect()
+}
+
+/// Parses one recipient part, in either of the two shapes `parse_recipients`
+/// can see: `Name <addr>` (a synced message's — or a reply/forward draft's —
+/// column, from `store::encode_recipients`) or a bare `addr` (a from-scratch
+/// local draft's flat compose input). Recognized as the former only when
+/// `<` is followed later by a `>` (`part.find('<')` before `part.rfind('>')`)
+/// — anything else (including a lone `<` or `>`, which a real address never
+/// contains) falls back to treating the whole trimmed part as a bare
+/// address with an empty name, same as before this parsed the wrapped form
+/// at all.
+fn parse_one_recipient(part: &str) -> Recipient {
+    if let (Some(open), Some(close)) = (part.find('<'), part.rfind('>')) {
+        if open < close {
+            return Recipient {
+                name: part[..open].trim().to_string(),
+                address: part[open + 1..close].trim().to_string(),
+            };
+        }
+    }
+    Recipient {
+        name: String::new(),
+        address: part.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::model::{Body, MailFolder, Message};
     use crate::json::{self, Value};
     use crate::testserver::{FakeServer, Route};
 
@@ -408,5 +436,106 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(GraphError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_recipients_splits_name_and_address_and_bare_addresses() {
+        let recipients = parse_recipients("Alice <alice@x>; bob@y");
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0].name, "Alice");
+        assert_eq!(recipients[0].address, "alice@x");
+        assert_eq!(recipients[1].name, "");
+        assert_eq!(recipients[1].address, "bob@y");
+    }
+
+    #[test]
+    fn apply_op_save_draft_strips_the_name_wrapper_for_a_reply_style_draft() {
+        // Regression test for the bug the coordinator's review caught: a
+        // reply/forward draft (`sync::engine::store_composed_draft`) files
+        // its message via `Store::upsert_message`, which encodes recipients
+        // as `"Name <addr>; Name <addr>"` (`store::encode_recipients`) —
+        // NOT the flat bare-address format a from-scratch local draft's
+        // `update_draft_fields` produces. `parse_recipients` must strip that
+        // wrapper, or Graph gets `"address":"Alice <alice@x>"` and rejects
+        // it (400).
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/DRAFT1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+
+        store
+            .upsert_folder(&MailFolder {
+                id: "DRAFTS".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        // Same shape `create_reply`/`create_forward` hands `store_composed_
+        // draft`: a Graph-minted id (not `local:`), `to`/`cc` as `Recipient`s
+        // with a display name — `upsert_message` is what turns those into
+        // the `"Name <addr>"` text this test is really exercising.
+        let draft = Message {
+            id: "DRAFT1".into(),
+            conversation_id: "C1".into(),
+            subject: "Re: Hi".into(),
+            from: Recipient {
+                name: "Me".into(),
+                address: "me@x".into(),
+            },
+            to: vec![Recipient {
+                name: "Alice".into(),
+                address: "alice@x".into(),
+            }],
+            cc: vec![],
+            received: "".into(),
+            sent: "".into(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "".into(),
+            is_draft: true,
+        };
+        store.upsert_message("DRAFTS", &draft).unwrap();
+        store
+            .put_body(
+                "DRAFT1",
+                &Body {
+                    content_type: "html".into(),
+                    content: "<p>quoted</p>".into(),
+                },
+            )
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SaveDraft {
+                id: "DRAFT1".into(),
+            },
+        )
+        .unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let to = sent.get("toRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            to[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("alice@x"),
+            "expected the bare address, not the \"Name <addr>\" wrapper: {}",
+            reqs[0].body
+        );
     }
 }
