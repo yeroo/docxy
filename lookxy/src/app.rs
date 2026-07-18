@@ -10,7 +10,7 @@ use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::model::{AttachmentMeta, Body};
-use mailcore::store::{FolderRow, MessageRow, Store};
+use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 
 /// Which pane currently has keyboard focus. Tab cycles `Folders` → `List` →
@@ -20,6 +20,17 @@ pub enum Pane {
     Folders,
     List,
     Reading,
+}
+
+/// The top-level view: the mail three-pane layout, or the calendar agenda +
+/// detail view (`ui::calendar`). `g` toggles between the two (see
+/// `App::toggle_mode`) — free to bind: unlike the brief's forward key
+/// (bare `f`, already claimed by flag-toggle — see `App::compose_forward`'s
+/// doc comment), no existing triage/pane key already uses `g`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Mail,
+    Calendar,
 }
 
 /// All in-memory TUI state: the local store, the sync channels, the cached
@@ -129,6 +140,26 @@ pub struct App {
     /// the request here; it never performs the action or closes `compose`
     /// itself. `None` in the steady state.
     pub compose_action: Option<crate::ui::compose::ComposeAction>,
+    /// The top-level view — mail three-pane, or the calendar agenda +
+    /// detail (`ui::calendar`). Toggled by `g` (see `toggle_mode`).
+    pub mode: Mode,
+    /// The events in the current agenda window (`ui::calendar::agenda_window`),
+    /// as read from `Store::events_in_window` — the calendar's equivalent of
+    /// `messages`. Reloaded on entering Calendar mode and whenever
+    /// `SyncEvent::CalendarUpdated` lands (see `reload_agenda`).
+    pub agenda: Vec<EventRow>,
+    /// Index into `agenda` of the currently highlighted row — the calendar's
+    /// equivalent of `msg_index`. Navigated with clamped (not wrapping)
+    /// bounds (see `move_agenda_selection`), since headers aren't part of
+    /// this vec at all (`ui::calendar::agenda_lines` inserts them purely for
+    /// display), this can index straight into `agenda` without needing to
+    /// skip anything.
+    pub agenda_index: usize,
+    /// The event opened in the detail pane (Enter on the agenda), if any —
+    /// the calendar's equivalent of `selected_msg`. Independent of
+    /// `agenda_index`, same as the reading pane's `selected_msg` doesn't
+    /// track `msg_index` — see `open_selected_event`.
+    pub selected_event: Option<String>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -220,6 +251,10 @@ impl App {
             test_cmd_rx: None,
             compose: None,
             compose_action: None,
+            mode: Mode::Mail,
+            agenda: Vec::new(),
+            agenda_index: 0,
+            selected_event: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -292,6 +327,13 @@ impl App {
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
             SyncEvent::Error(msg) => self.error_notice = Some(msg),
+            // The events store changed (a `RefreshCalendar`/`RespondEvent`
+            // just landed) — re-read the agenda window so the calendar view
+            // reflects it. Unlike `MessagesUpdated`'s folder check, this
+            // doesn't gate on `mode == Calendar`: reloading a view that
+            // isn't currently showing is harmless, and keeps `agenda` correct
+            // for the moment `g` shows it again rather than reloading late.
+            SyncEvent::CalendarUpdated => self.reload_agenda(),
             // `Sent` has no TUI consumer yet: the composer already closes
             // optimistically the moment Send is pressed (`apply_compose_action`),
             // before the engine's outbox drain even reaches Graph, so by the
@@ -300,15 +342,9 @@ impl App {
             // Folded into the existing catch-all rather than given a
             // dedicated arm so this compiles now without inventing a
             // toast/notice mechanism the brief doesn't ask for.
-            // `CalendarUpdated` (from `SyncCommand::RefreshCalendar`/
-            // `RespondEvent`) has no TUI consumer yet — the calendar view
-            // lands in a later task. Folded into this catch-all for the same
-            // reason `Sent` is: compiles now without inventing a view this
-            // brief doesn't ask for.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
-            | SyncEvent::Sent { .. }
-            | SyncEvent::CalendarUpdated => {}
+            | SyncEvent::Sent { .. } => {}
         }
     }
 
@@ -406,6 +442,62 @@ impl App {
                 self.body_loading = false;
             }
         }
+    }
+
+    // --- Calendar -----------------------------------------------------
+
+    /// `g`: switches between the mail three-pane view and the calendar
+    /// agenda + detail view (`ui::calendar::draw_calendar`). Entering
+    /// Calendar reloads the agenda from whatever's already in the store and
+    /// fires a fire-and-forget `SyncCommand::RefreshCalendar` so the view
+    /// feels responsive right when it's opened, rather than waiting on the
+    /// engine's own periodic tick — the same "show cached state, kick off a
+    /// refresh" shape `open_message`/`reload_body` already use for mail
+    /// bodies. Leaving Calendar is a plain mode flip: the agenda/selection
+    /// state is left as-is so re-entering doesn't lose the user's place.
+    pub fn toggle_mode(&mut self) {
+        match self.mode {
+            Mode::Mail => {
+                self.mode = Mode::Calendar;
+                self.reload_agenda();
+                let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
+            }
+            Mode::Calendar => self.mode = Mode::Mail,
+        }
+    }
+
+    /// Re-reads the agenda window (`ui::calendar::agenda_window`, anchored at
+    /// `SystemTime::now()`) from the store, clamping `agenda_index` if the
+    /// list got shorter — the calendar equivalent of `reload_messages`.
+    /// Called on entering Calendar mode (`toggle_mode`) and whenever
+    /// `SyncEvent::CalendarUpdated` lands.
+    pub fn reload_agenda(&mut self) {
+        let (from, to) = crate::ui::calendar::agenda_window();
+        self.agenda = self.store.events_in_window(&from, &to).unwrap_or_default();
+        if self.agenda_index >= self.agenda.len() {
+            self.agenda_index = self.agenda.len().saturating_sub(1);
+        }
+    }
+
+    /// ↑/↓/j/k while in Calendar mode: moves `agenda_index` by `delta`,
+    /// clamped (not wrapping) into `[0, agenda.len())` — a no-op on an empty
+    /// agenda, so this can never index past the end. Clamped rather than
+    /// wrapped (unlike the mail list's `ui::wrapped`) per the brief's
+    /// bounds-safety note; nothing about the agenda calls for wrap-around.
+    pub fn move_agenda_selection(&mut self, delta: isize) {
+        if self.agenda.is_empty() {
+            return;
+        }
+        let last = self.agenda.len() as isize - 1;
+        let next = (self.agenda_index as isize + delta).clamp(0, last);
+        self.agenda_index = next as usize;
+    }
+
+    /// Enter, in Calendar mode: opens the detail pane on the currently
+    /// highlighted agenda row. A no-op (`selected_event` stays `None`) on an
+    /// empty agenda.
+    pub fn open_selected_event(&mut self) {
+        self.selected_event = self.agenda.get(self.agenda_index).map(|e| e.id.clone());
     }
 
     // --- Triage actions ---------------------------------------------------

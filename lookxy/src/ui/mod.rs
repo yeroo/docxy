@@ -5,6 +5,7 @@
 //! `folders`/`messages` (see `app.rs`) — never by querying the store mid-draw.
 
 mod attachments;
+pub(crate) mod calendar;
 pub(crate) mod compose;
 mod folders;
 mod message_list;
@@ -13,7 +14,7 @@ mod search;
 mod signin;
 mod status_bar;
 
-use crate::app::{App, Pane};
+use crate::app::{App, Mode, Pane};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -33,6 +34,10 @@ use ratatui::style::{Color, Style};
 pub fn draw(f: &mut Frame, app: &App) {
     if app.compose.is_some() {
         compose::draw_compose(f, app);
+        return;
+    }
+    if app.mode == Mode::Calendar {
+        calendar::draw_calendar(f, app);
         return;
     }
 
@@ -99,6 +104,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.apply_compose_action();
         return;
     }
+    if app.mode == Mode::Calendar {
+        calendar::handle_key(app, key);
+        return;
+    }
     if app.move_picker.is_some() {
         handle_move_picker_key(app, key);
         return;
@@ -117,6 +126,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1),
         KeyCode::Enter => activate(app),
         KeyCode::Delete => app.delete_selected(),
+        // Checked ahead of the general `on_key_char` catch-all: `g` isn't
+        // claimed by any existing triage key (unlike the brief's own bare
+        // `f`, already taken by flag-toggle — see `App::compose_forward`'s
+        // doc comment for that precedent), so it's free for the
+        // mail↔calendar toggle.
+        KeyCode::Char('g') => app.toggle_mode(),
         KeyCode::Char(c) => app.on_key_char(c),
         _ => {}
     }
