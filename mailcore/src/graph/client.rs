@@ -662,6 +662,38 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Standard base64 (RFC 4648 §4: `+`/`/` alphabet, `=` padding) — the encoding
+/// Graph expects for `fileAttachment.contentBytes`. The `pkce` module's
+/// base64*url* encoder can't be reused (different alphabet, no padding).
+///
+/// Not yet called from production code: the outbound-attachments task that
+/// wires this into a `fileAttachment` request body lands separately. Until
+/// then it's only exercised by `base64_encode_matches_known_vectors` below.
+#[allow(dead_code)]
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +956,19 @@ mod tests {
         // the mod-4-remainder-2 case: 1 output byte, distinct from
         // `base64_decode_matches_known_vector`'s remainder-3 case ("aGk=").
         assert_eq!(base64_decode("YQ==").unwrap(), b"a");
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        // round-trips with the existing decoder
+        let raw: &[u8] = &[0, 1, 2, 250, 251, 252, 253, 255];
+        assert_eq!(base64_decode(&base64_encode(raw)).unwrap(), raw);
     }
 
     #[test]
