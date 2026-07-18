@@ -803,11 +803,49 @@ impl App {
         self.messages.get(self.msg_index).map(|m| m.id.clone())
     }
 
+    /// The message ids a triage key targets in threaded mode: every message
+    /// of the conversation when the cursor is on a (collapsed or expanded)
+    /// header, or the single message when it's on a message row. `None` in
+    /// flat mode (callers fall back to the flat single-message path).
+    fn threaded_target_ids(&self) -> Option<Vec<String>> {
+        if !self.threaded_active() {
+            return None;
+        }
+        match self.selected_row()? {
+            Row::Header(t) => Some(
+                self.threads[t]
+                    .thread
+                    .messages
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect(),
+            ),
+            Row::Message(t, m) => self.threads[t]
+                .thread
+                .messages
+                .get(m)
+                .map(|msg| vec![msg.id.clone()]),
+        }
+    }
+
     /// Marks the highlighted message read/unread: writes it to the store
     /// (so `reload_messages` reflects it immediately, without waiting on the
     /// sync engine), then fires `SyncCommand::MarkRead` so the engine
-    /// enqueues the matching outbox op and pushes it to Graph.
+    /// enqueues the matching outbox op and pushes it to Graph. In threaded
+    /// mode, when the cursor is on a conversation header, this acts on every
+    /// message of the conversation instead of just the highlighted one.
     pub fn mark_read(&mut self, read: bool) {
+        if let Some(ids) = self.threaded_target_ids() {
+            for id in &ids {
+                self.store.set_read(id, read);
+                let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
+                    id: id.clone(),
+                    read,
+                });
+            }
+            self.reload_messages();
+            return;
+        }
         let Some(id) = self.highlighted_message_id() else {
             return;
         };
@@ -817,8 +855,28 @@ impl App {
     }
 
     /// Toggles the highlighted message's flag, same optimistic-store +
-    /// fire-and-forget-command pattern as `mark_read`.
+    /// fire-and-forget-command pattern as `mark_read`. In threaded mode, when
+    /// the cursor is on a conversation header, this flags/unflags every
+    /// message of the conversation instead of just the highlighted one.
     pub fn toggle_flag(&mut self) {
+        if let Some(ids) = self.threaded_target_ids() {
+            // Flag the whole thread ON if any is currently unflagged, else clear
+            // it — so one keypress makes the thread's flag state uniform.
+            let want = match self.selected_row() {
+                Some(Row::Header(t)) => !self.threads[t].thread.any_flagged,
+                Some(Row::Message(t, m)) => !self.threads[t].thread.messages[m].is_flagged,
+                None => return,
+            };
+            for id in &ids {
+                self.store.set_flag(id, want);
+                let _ = self.sync.cmd_tx.send(SyncCommand::SetFlag {
+                    id: id.clone(),
+                    flagged: want,
+                });
+            }
+            self.reload_messages();
+            return;
+        }
         let Some(row) = self.messages.get(self.msg_index) else {
             return;
         };
@@ -1726,6 +1784,41 @@ pub(crate) mod tests {
         assert!(rows[0].is_read);
         // a MarkRead command was sent to the (test) sync handle
         assert!(app.last_sent_command_is_mark_read());
+    }
+
+    #[test]
+    fn mark_read_on_a_collapsed_header_marks_the_whole_thread() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = m1 + m2, both unread
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        app.mark_read(true);
+
+        // Both messages are now read in the store-backed (reloaded) thread...
+        let hpos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        if let Row::Header(t) = app.visible_rows[hpos] {
+            assert!(app.threads[t].thread.messages.iter().all(|m| m.is_read));
+        }
+        // ...and one MarkRead command was enqueued per message.
+        let mut count = 0;
+        while let Ok(SyncCommand::MarkRead { read: true, .. }) =
+            app.test_cmd_rx.as_ref().unwrap().try_recv()
+        {
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 
     #[test]
