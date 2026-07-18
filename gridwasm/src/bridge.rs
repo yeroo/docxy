@@ -1235,10 +1235,12 @@ impl Session {
     //     `ctl_sheet_remove_inverse_recreates_a_sheet_by_name_lossily`.
     // -----------------------------------------------------------------
 
-    /// `{ref,text,author?,sheet?}` -> `{sheet,ref}` — plus the internal
-    /// `inverse` (`comment.remove` on the same ref/sheet). Not pushed onto
-    /// the undo stack: comment data lives in package parts
+    /// `{ref,text,author?,sheet?}` -> `{sheet,ref,undoSteps:0}` — plus the
+    /// internal `inverse` (`comment.remove` on the same ref/sheet). Not
+    /// pushed onto the undo stack: comment data lives in package parts
     /// (`xl/threadedComments/…`, `xl/persons/…`) outside `Cell`/`Sheet`.
+    /// `undoSteps` is unconditionally present (see `ctl_comment_remove`'s
+    /// doc comment for why).
     fn ctl_comment_add(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg(args)?;
         let (r, c) = ctl_ref_arg(args)?;
@@ -1259,14 +1261,18 @@ impl Session {
         json::push_str(&mut out, &cref);
         out.push_str(",\"sheet\":");
         out.push_str(&si.to_string());
-        out.push_str("}}}");
+        out.push_str("}},\"undoSteps\":0}");
         Ok(out)
     }
 
-    /// `{ref,sheet?}` -> `{removed:bool}` — plus, only when something was
-    /// actually removed, the internal `inverse` (`comment.add` with the same
-    /// ref/text/author/sheet the removed comment carried — a byte-exact
-    /// reversal). Not on the undo stack, same reasoning as `comment.add`.
+    /// `{ref,sheet?}` -> `{removed:bool,undoSteps:0}` — plus, only when
+    /// something was actually removed, the internal `inverse` (`comment.add`
+    /// with the same ref/text/author/sheet the removed comment carried — a
+    /// byte-exact reversal). Not on the undo stack, same reasoning as
+    /// `comment.add`. `undoSteps` is unconditionally present (always `0`
+    /// here) so every mutating verb's reply carries it uniformly — Task 7
+    /// can check it first regardless of bucket, falling back to `inverse`
+    /// only when it's `0` and an `inverse` is actually present.
     fn ctl_comment_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg(args)?;
         let (r, c) = ctl_ref_arg(args)?;
@@ -1293,7 +1299,7 @@ impl Session {
             out.push_str(&si.to_string());
             out.push_str("}}");
         }
-        out.push('}');
+        out.push_str(",\"undoSteps\":0}");
         Ok(out)
     }
 
@@ -2403,6 +2409,10 @@ mod tests {
             out.contains("\"inverse\":{\"verb\":\"comment.remove\""),
             "{out}"
         );
+        assert!(
+            out.contains("\"undoSteps\":0"),
+            "not-on-the-stack verbs still carry undoSteps, for a uniform Task 7 contract: {out}"
+        );
         let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
         assert!(
             list.contains("\"author\":\"Ana\"") && list.contains("\"text\":\"Check this\""),
@@ -2435,6 +2445,7 @@ mod tests {
                 && out.contains("\"author\":\"Bo\""),
             "{out}"
         );
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
         let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
         assert!(list.contains("\"comments\":[]"), "{list}");
 
@@ -2455,7 +2466,9 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"comment.remove","args":{"ref":"A1"}}"#);
         assert!(
-            out.contains("\"removed\":false") && !out.contains("\"inverse\""),
+            out.contains("\"removed\":false")
+                && !out.contains("\"inverse\"")
+                && out.contains("\"undoSteps\":0"),
             "{out}"
         );
     }
