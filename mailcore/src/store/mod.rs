@@ -76,6 +76,7 @@ pub struct MessageRow {
     pub importance: String,
     pub preview: String,
     pub is_draft: bool,
+    pub bcc_recipients: String,
 }
 
 /// A `contacts` row — one per normalized (lowercased) email address, the
@@ -393,6 +394,15 @@ impl Store {
             "ALTER TABLE events ADD COLUMN body_html TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Same idempotent-migration pattern as `is_draft`/`body_html` above:
+        // `messages` already includes `bcc_recipients` for freshly-created
+        // databases; this brings an existing database up to date, erroring
+        // (and being swallowed) on every database that already has the
+        // column.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN bcc_recipients TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -517,7 +527,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                    bcc_recipients
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
@@ -547,6 +558,7 @@ impl Store {
                  SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                         to_recipients, cc_recipients, received_at, sent_at,
                         is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                        bcc_recipients,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -561,7 +573,8 @@ impl Store {
              )
              SELECT k.id, k.folder_id, k.conversation_id, k.subject, k.from_name, k.from_addr,
                     k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
-                    k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft
+                    k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft,
+                    k.bcc_recipients
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -751,13 +764,14 @@ impl Store {
         subject: &str,
         to: &str,
         cc: &str,
+        bcc: &str,
         body_html: &str,
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4
+            "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5
              WHERE id = ?1",
-            params![id, subject, to, cc],
+            params![id, subject, to, cc, bcc],
         )?;
         tx.execute(
             "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, 'html', ?2)
@@ -804,7 +818,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                    bcc_recipients
              FROM messages
              WHERE id = ?1",
         )?;
@@ -967,7 +982,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                    bcc_recipients
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
@@ -1553,6 +1569,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         importance: row.get(13)?,
         preview: row.get(14)?,
         is_draft: row.get(15)?,
+        bcc_recipients: row.get(16)?,
     })
 }
 
@@ -2447,7 +2464,7 @@ mod draft_tests {
     fn update_draft_fields_changes_subject_and_body() {
         let s = Store::open_in_memory().unwrap();
         let id = s.create_local_draft("Old", "a@x", "", "old body").unwrap();
-        s.update_draft_fields(&id, "New", "b@x", "c@x", "new body")
+        s.update_draft_fields(&id, "New", "b@x", "c@x", "", "new body")
             .unwrap();
 
         let (row, body) = s.draft(&id).unwrap().expect("draft should still exist");
@@ -2455,6 +2472,18 @@ mod draft_tests {
         assert_eq!(row.to_recipients, "b@x");
         assert_eq!(row.cc_recipients, "c@x");
         assert_eq!(body.content, "new body");
+    }
+
+    #[test]
+    fn update_draft_fields_persists_bcc() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("", "", "", "").unwrap();
+        s.update_draft_fields(&id, "Sub", "to@x", "cc@x", "bcc@x", "body")
+            .unwrap();
+        let (row, _) = s.draft(&id).unwrap().expect("draft should still exist");
+        assert_eq!(row.to_recipients, "to@x");
+        assert_eq!(row.cc_recipients, "cc@x");
+        assert_eq!(row.bcc_recipients, "bcc@x");
     }
 
     #[test]

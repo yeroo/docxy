@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS messages (
     from_addr       TEXT NOT NULL DEFAULT '',
     to_recipients   TEXT NOT NULL DEFAULT '',
     cc_recipients   TEXT NOT NULL DEFAULT '',
+    bcc_recipients  TEXT NOT NULL DEFAULT '',
     received_at     TEXT NOT NULL DEFAULT '',
     sent_at         TEXT NOT NULL DEFAULT '',
     is_read         INTEGER NOT NULL DEFAULT 0,

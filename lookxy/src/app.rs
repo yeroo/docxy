@@ -1228,6 +1228,7 @@ impl App {
             &compose.subject,
             &compose.to,
             &compose.cc,
+            "",
             &html,
         );
         let cmd = if action == ComposeAction::Send {

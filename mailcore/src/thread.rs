@@ -114,6 +114,7 @@ mod tests {
             importance: "normal".into(),
             preview: String::new(),
             is_draft: false,
+            bcc_recipients: String::new(),
         }
     }
 
