@@ -201,6 +201,69 @@ pub struct OutboxRow {
     pub attempts: i64,
 }
 
+/// An `events` row, as read back from the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRow {
+    pub id: String,
+    pub subject: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub organizer_name: String,
+    pub organizer_addr: String,
+    pub response_status: String,
+}
+
+/// An `event_attendees` row, as read back from the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttendeeRow {
+    pub name: String,
+    pub addr: String,
+    pub r#type: String,
+    pub response: String,
+}
+
+/// The field set `upsert_event` writes to an `events` row.
+///
+/// The Task-2 sync engine will introduce a Graph-facing `Event` model
+/// (mirroring `graph::model::Message`) with a `from_json` constructor; this
+/// task's brief calls for `upsert_event` to take that type directly, but it
+/// doesn't exist yet (Task 2 hasn't landed). `NewEvent` stands in for it now
+/// — same field set as `EventRow` plus the extra columns
+/// (`series_master_id`, `body_preview`, `web_link`, `last_modified`) that
+/// `EventRow` doesn't surface — so this task compiles and tests standalone.
+/// When Task 2's `Event` lands, either it should have this exact shape (in
+/// which case `upsert_event` can take `&Event` directly and this struct goes
+/// away) or a `From<&Event> for NewEvent` conversion bridges the two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEvent {
+    pub id: String,
+    pub subject: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub organizer_name: String,
+    pub organizer_addr: String,
+    pub response_status: String,
+    pub series_master_id: Option<String>,
+    pub body_preview: String,
+    pub web_link: String,
+    pub last_modified: String,
+}
+
+/// The field set `put_event_attendees` writes for one `event_attendees` row.
+/// Stands in for the Task-2 `Attendee` model the same way `NewEvent` stands
+/// in for `Event` — see `NewEvent`'s doc comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAttendee {
+    pub name: String,
+    pub addr: String,
+    pub r#type: String,
+    pub response: String,
+}
+
 /// The local mail database. Single-threaded access is assumed (the sync
 /// engine and TUI serialize their access through it); no internal locking.
 pub struct Store {
@@ -836,6 +899,167 @@ impl Store {
             params![err, seq],
         );
     }
+
+    /// Inserts or updates an `events` row by `id`. See `NewEvent`'s doc
+    /// comment for why this takes that stand-in type rather than a
+    /// Task-2 `Event` (which doesn't exist yet).
+    pub fn upsert_event(&self, e: &NewEvent) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO events (
+                 id, subject, start_utc, end_utc, is_all_day, location,
+                 organizer_name, organizer_addr, response_status,
+                 series_master_id, body_preview, web_link, last_modified
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+                 subject = excluded.subject,
+                 start_utc = excluded.start_utc,
+                 end_utc = excluded.end_utc,
+                 is_all_day = excluded.is_all_day,
+                 location = excluded.location,
+                 organizer_name = excluded.organizer_name,
+                 organizer_addr = excluded.organizer_addr,
+                 response_status = excluded.response_status,
+                 series_master_id = excluded.series_master_id,
+                 body_preview = excluded.body_preview,
+                 web_link = excluded.web_link,
+                 last_modified = excluded.last_modified",
+            params![
+                e.id,
+                e.subject,
+                e.start_utc,
+                e.end_utc,
+                e.is_all_day,
+                e.location,
+                e.organizer_name,
+                e.organizer_addr,
+                e.response_status,
+                e.series_master_id,
+                e.body_preview,
+                e.web_link,
+                e.last_modified,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces the full set of attendees stored for an event. See
+    /// `put_attachments` for why the delete-then-insert runs in one
+    /// transaction via `unchecked_transaction` (same shared-`&self`
+    /// reasoning applies here).
+    pub fn put_event_attendees(&self, id: &str, a: &[NewAttendee]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM event_attendees WHERE event_id = ?1",
+            params![id],
+        )?;
+        for att in a {
+            tx.execute(
+                "INSERT INTO event_attendees (event_id, name, addr, type, response)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, att.name, att.addr, att.r#type, att.response],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Events overlapping `[from_utc, to_utc)`: `start_utc < to_utc AND
+    /// end_utc > from_utc`, so multi-day/ongoing events that started before
+    /// the window (or end after it) still show, not just ones fully
+    /// contained in it. Ordered `start_utc ASC`.
+    pub fn events_in_window(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+    ) -> Result<Vec<EventRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject, start_utc, end_utc, is_all_day, location,
+                    organizer_name, organizer_addr, response_status
+             FROM events
+             WHERE start_utc < ?2 AND end_utc > ?1
+             ORDER BY start_utc ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![from_utc, to_utc], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    start_utc: row.get(2)?,
+                    end_utc: row.get(3)?,
+                    is_all_day: row.get(4)?,
+                    location: row.get(5)?,
+                    organizer_name: row.get(6)?,
+                    organizer_addr: row.get(7)?,
+                    response_status: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The attendees stored for an event, in insertion order (the order
+    /// `put_event_attendees` last wrote them in).
+    pub fn event_attendees(&self, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, addr, type, response FROM event_attendees WHERE event_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![id], |row| {
+                Ok(AttendeeRow {
+                    name: row.get(0)?,
+                    addr: row.get(1)?,
+                    r#type: row.get(2)?,
+                    response: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Locally sets an event's RSVP response status (`"accepted"`,
+    /// `"declined"`, `"tentativelyAccepted"`, ...) — the optimistic half of
+    /// an RSVP a later task's outbox will push to Graph. See `set_read` for
+    /// why this doesn't return a `Result`.
+    pub fn set_event_response(&self, id: &str, status: &str) {
+        let _ = self.conn.execute(
+            "UPDATE events SET response_status = ?1 WHERE id = ?2",
+            params![status, id],
+        );
+    }
+
+    /// The stored delta link for the calendar, if any (`None` before the
+    /// first calendar sync). Unlike `get_delta_link` (one per folder), the
+    /// calendar has exactly one, so it's kept in `meta` rather than a
+    /// dedicated column.
+    pub fn calendar_delta_link(&self) -> Result<Option<String>, StoreError> {
+        let link = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'calendar_delta_link'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(link)
+    }
+
+    /// Stores the calendar's delta link (used to resume delta sync). See
+    /// `calendar_delta_link` for why this lives in `meta`.
+    pub fn set_calendar_delta_link(&self, link: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('calendar_delta_link', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![link],
+        )?;
+        Ok(())
+    }
 }
 
 /// The local `folders.id` a new draft is filed under when the real Drafts
@@ -1035,6 +1259,154 @@ mod tests {
         assert!(s.get_delta_link("F").unwrap().is_none());
         s.set_delta_link("F", "LINK").unwrap();
         assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("LINK"));
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    fn ev(id: &str, start: &str, end: &str) -> NewEvent {
+        NewEvent {
+            id: id.into(),
+            subject: format!("s{id}"),
+            start_utc: start.into(),
+            end_utc: end.into(),
+            is_all_day: false,
+            location: "".into(),
+            organizer_name: "Org".into(),
+            organizer_addr: "org@x".into(),
+            response_status: "none".into(),
+            series_master_id: None,
+            body_preview: "".into(),
+            web_link: "".into(),
+            last_modified: "".into(),
+        }
+    }
+
+    #[test]
+    fn upserts_and_lists_events_in_window_ordered_by_start() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("2", "2026-07-18T10:00:00Z", "2026-07-18T11:00:00Z"))
+            .unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "1");
+        assert_eq!(rows[1].id, "2");
+    }
+
+    #[test]
+    fn events_in_window_excludes_events_outside_range() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-10T00:00:00Z", "2026-07-10T01:00:00Z"))
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn events_in_window_includes_ongoing_multi_day_events() {
+        // An event that started before `from` and ends after `to` should
+        // still show (start_utc < to AND end_utc > from), even though
+        // neither endpoint falls inside the window.
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-01T00:00:00Z", "2026-07-31T00:00:00Z"))
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "1");
+    }
+
+    #[test]
+    fn upsert_event_is_idempotent() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        let mut updated = ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z");
+        updated.subject = "changed".into();
+        s.upsert_event(&updated).unwrap();
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "changed");
+    }
+
+    #[test]
+    fn set_event_response_flips_status() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        s.set_event_response("1", "accepted");
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows[0].response_status, "accepted");
+    }
+
+    #[test]
+    fn attendees_round_trip() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        s.put_event_attendees(
+            "1",
+            &[
+                NewAttendee {
+                    name: "Bob".into(),
+                    addr: "bob@x".into(),
+                    r#type: "required".into(),
+                    response: "accepted".into(),
+                },
+                NewAttendee {
+                    name: "Carol".into(),
+                    addr: "carol@x".into(),
+                    r#type: "optional".into(),
+                    response: "none".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let attendees = s.event_attendees("1").unwrap();
+        assert_eq!(attendees.len(), 2);
+        assert_eq!(attendees[0].name, "Bob");
+        assert_eq!(attendees[0].r#type, "required");
+        assert_eq!(attendees[1].name, "Carol");
+    }
+
+    #[test]
+    fn put_event_attendees_replaces_the_prior_set() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        s.put_event_attendees(
+            "1",
+            &[NewAttendee {
+                name: "Bob".into(),
+                addr: "bob@x".into(),
+                r#type: "required".into(),
+                response: "accepted".into(),
+            }],
+        )
+        .unwrap();
+        s.put_event_attendees("1", &[]).unwrap();
+        assert!(s.event_attendees("1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn calendar_delta_link_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.calendar_delta_link().unwrap().is_none());
+        s.set_calendar_delta_link("LINK").unwrap();
+        assert_eq!(s.calendar_delta_link().unwrap().as_deref(), Some("LINK"));
     }
 }
 

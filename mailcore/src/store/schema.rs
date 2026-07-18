@@ -77,6 +77,47 @@ CREATE TABLE IF NOT EXISTS meta (
 
 INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
 
+-- v2 calendar: a read-only mirror of Graph calendar events, synced the same
+-- way `messages` is (see `Store::upsert_event`). Per the Task-1 brief, event
+-- bodies are meant to reuse the existing `bodies` table keyed by
+-- `event:<id>` — not wired up in this task (no store method here calls
+-- `put_body`/`get_body` for an event), and note for Task 2/3: `bodies.
+-- message_id` has `REFERENCES messages(id) ON DELETE CASCADE`, so an
+-- `event:<id>` key will need that FK relaxed (or a lookup table) before it
+-- can actually be used that way. The calendar's delta link (and, later, its
+-- sync window bounds) live in `meta` alongside `schema_version` rather than
+-- getting dedicated columns, since (unlike folders) there's only ever one
+-- calendar.
+CREATE TABLE IF NOT EXISTS events (
+    id               TEXT PRIMARY KEY,
+    subject          TEXT NOT NULL DEFAULT '',
+    start_utc        TEXT NOT NULL DEFAULT '',
+    end_utc          TEXT NOT NULL DEFAULT '',
+    is_all_day       INTEGER NOT NULL DEFAULT 0,
+    location         TEXT NOT NULL DEFAULT '',
+    organizer_name   TEXT NOT NULL DEFAULT '',
+    organizer_addr   TEXT NOT NULL DEFAULT '',
+    response_status  TEXT NOT NULL DEFAULT '',
+    series_master_id TEXT,
+    body_preview     TEXT NOT NULL DEFAULT '',
+    web_link         TEXT NOT NULL DEFAULT '',
+    last_modified    TEXT NOT NULL DEFAULT ''
+);
+
+-- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
+-- range filter, ordered by `start_utc`.
+CREATE INDEX IF NOT EXISTS idx_events_window ON events(start_utc, end_utc);
+
+CREATE TABLE IF NOT EXISTS event_attendees (
+    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    name     TEXT NOT NULL DEFAULT '',
+    addr     TEXT NOT NULL DEFAULT '',
+    type     TEXT NOT NULL DEFAULT '',
+    response TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_attendees_event ON event_attendees(event_id);
+
 -- Full-text index over subject/sender/body, kept in step with `messages`
 -- and `bodies` by the triggers below (Task 9 exercises search itself).
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
