@@ -160,6 +160,13 @@ pub struct App {
     /// `agenda_index`, same as the reading pane's `selected_msg` doesn't
     /// track `msg_index` — see `open_selected_event`.
     pub selected_event: Option<String>,
+    /// The in-progress RSVP comment prompt (`a`/`d`/`t` on the highlighted
+    /// agenda row), if any — see `start_rsvp`. Captures which event and
+    /// which response kind up front (same "capture the target before the
+    /// popup can be renavigated out from under it" shape as `MovePicker`),
+    /// so typing into the comment can never end up attached to a different
+    /// event than the one the key was pressed on.
+    pub rsvp_prompt: Option<RsvpPrompt>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -206,6 +213,17 @@ pub struct AttachmentsPopup {
     pub items: Vec<AttachmentMeta>,
     pub index: usize,
     pub loading: bool,
+}
+
+/// State for the RSVP comment prompt opened by `a`/`d`/`t` in Calendar mode:
+/// the event being responded to, the response kind already decided by which
+/// key was pressed (one of `"accepted"`/`"declined"`/`"tentativelyAccepted"`
+/// — the exact `Store::set_event_response`/`SyncCommand::RespondEvent`
+/// vocabulary), and the in-progress one-line comment text.
+pub struct RsvpPrompt {
+    pub event_id: String,
+    pub kind: String,
+    pub comment: String,
 }
 
 /// How many messages `reload_messages` pulls per folder. Paging further back
@@ -255,6 +273,7 @@ impl App {
             agenda: Vec::new(),
             agenda_index: 0,
             selected_event: None,
+            rsvp_prompt: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -349,13 +368,15 @@ impl App {
     }
 
     /// Whether a text-input context is currently capturing keystrokes — the
-    /// search prompt (`/`), or the compose view's fields/body. The event
-    /// loop consults this so a global hotkey like `q`-to-quit doesn't steal
-    /// a character the user is typing into the query or a compose field
-    /// (searching for "quarterly", or composing a message that mentions
-    /// "quit", must not quit the app).
+    /// search prompt (`/`), the compose view's fields/body, or the RSVP
+    /// comment prompt (`a`/`d`/`t` in Calendar mode). The event loop consults
+    /// this so a global hotkey like `q`-to-quit doesn't steal a character the
+    /// user is typing into the query, a compose field, or an RSVP comment
+    /// (searching for "quarterly", composing a message that mentions "quit",
+    /// or declining with a comment like "can't make it, quick call instead"
+    /// must not quit the app).
     pub fn is_capturing_text(&self) -> bool {
-        self.search.is_some() || self.compose.is_some()
+        self.search.is_some() || self.compose.is_some() || self.rsvp_prompt.is_some()
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt
@@ -498,6 +519,86 @@ impl App {
     /// empty agenda.
     pub fn open_selected_event(&mut self) {
         self.selected_event = self.agenda.get(self.agenda_index).map(|e| e.id.clone());
+    }
+
+    /// The id of the event currently highlighted in the agenda, if any (an
+    /// empty agenda yields `None` — the RSVP keys are then a no-op rather
+    /// than a panic) — the calendar equivalent of `highlighted_message_id`.
+    fn highlighted_event_id(&self) -> Option<String> {
+        self.agenda.get(self.agenda_index).map(|e| e.id.clone())
+    }
+
+    /// `a`/`d`/`t` in Calendar mode: opens the RSVP comment prompt over the
+    /// highlighted agenda row, with `kind` (one of `"accepted"`/
+    /// `"declined"`/`"tentativelyAccepted"`) already decided by which key was
+    /// pressed. A no-op on an empty agenda. Nothing is written to the store
+    /// or sent to the sync engine yet — that happens on submit
+    /// (`submit_rsvp`/`cancel_rsvp_comment`), once the (optional) comment is
+    /// known.
+    pub fn start_rsvp(&mut self, kind: &str) {
+        let Some(event_id) = self.highlighted_event_id() else {
+            return;
+        };
+        self.rsvp_prompt = Some(RsvpPrompt {
+            event_id,
+            kind: kind.to_string(),
+            comment: String::new(),
+        });
+    }
+
+    /// Appends `s` to the in-progress RSVP comment; a no-op if the prompt
+    /// isn't open. Same shape as `type_query`.
+    pub fn type_rsvp_comment(&mut self, s: &str) {
+        if let Some(prompt) = &mut self.rsvp_prompt {
+            prompt.comment.push_str(s);
+        }
+    }
+
+    /// Removes the last character of the in-progress RSVP comment, if any.
+    /// A no-op if the prompt isn't open or the comment is already empty.
+    pub fn backspace_rsvp_comment(&mut self) {
+        if let Some(prompt) = &mut self.rsvp_prompt {
+            prompt.comment.pop();
+        }
+    }
+
+    /// Enter, on the RSVP comment prompt: submits with whatever comment was
+    /// typed (empty means no comment). A no-op if the prompt isn't open.
+    pub fn submit_rsvp(&mut self) {
+        let Some(prompt) = self.rsvp_prompt.take() else {
+            return;
+        };
+        let comment = (!prompt.comment.is_empty()).then_some(prompt.comment);
+        self.apply_rsvp(prompt.event_id, prompt.kind, comment);
+    }
+
+    /// Esc, on the RSVP comment prompt: sends the RSVP anyway, but with no
+    /// comment — Esc cancels *the comment*, not the whole response (per the
+    /// design brief: "an optional one-line comment prompt (Esc = no
+    /// comment)"). A no-op if the prompt isn't open.
+    pub fn cancel_rsvp_comment(&mut self) {
+        let Some(prompt) = self.rsvp_prompt.take() else {
+            return;
+        };
+        self.apply_rsvp(prompt.event_id, prompt.kind, None);
+    }
+
+    /// The shared tail of `submit_rsvp`/`cancel_rsvp_comment`: writes the
+    /// response optimistically (`Store::set_event_response`, immediately
+    /// reflected in the store — before Graph is even reached), reloads the
+    /// agenda so the response glyph updates right away, and fires
+    /// `SyncCommand::RespondEvent` so the engine enqueues the matching
+    /// outbox op and drains it — the same optimistic-store +
+    /// fire-and-forget-command pattern `mark_read`/`toggle_flag` already use
+    /// for mail triage. The UI never enqueues the outbox op itself; that's
+    /// the engine's job once this command lands.
+    fn apply_rsvp(&mut self, id: String, kind: String, comment: Option<String>) {
+        self.store.set_event_response(&id, &kind);
+        self.reload_agenda();
+        let _ = self
+            .sync
+            .cmd_tx
+            .send(SyncCommand::RespondEvent { id, kind, comment });
     }
 
     // --- Triage actions ---------------------------------------------------

@@ -1,7 +1,7 @@
 //! The bottom, single-row status bar: signed-in account, sync state,
 //! folder/message counts, and the last attachment save/open notice.
 
-use crate::app::App;
+use crate::app::{App, Mode};
 
 use mailcore::sync::engine::SyncState;
 
@@ -19,20 +19,30 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         SyncState::PendingOps(n) => format!("{n} pending"),
         SyncState::SignInRequired => "Sign-in required".to_string(),
     };
-    let folder = app
-        .selected_folder
-        .as_ref()
-        .and_then(|id| app.folders.iter().find(|f| &f.id == id))
-        .map(|f| f.display_name.as_str())
-        .unwrap_or("(no folder)");
-    // `visible_message_count` (not `app.messages.len()`) so the count
-    // reflects the search results while a query is active, not the
-    // underlying folder's real size.
-    let mut line = format!(
-        "{account} — {status} — {folder} — {} folder(s), {} message(s)",
-        app.folders.len(),
-        app.visible_message_count()
-    );
+    // In Calendar mode the folder/message counts don't apply — show the
+    // agenda's own count instead, same sync-state prefix either way, so the
+    // account/status portion of the bar reads identically in both modes.
+    let mut line = if app.mode == Mode::Calendar {
+        format!(
+            "{account} — {status} — Calendar — {} event(s)",
+            app.agenda.len()
+        )
+    } else {
+        let folder = app
+            .selected_folder
+            .as_ref()
+            .and_then(|id| app.folders.iter().find(|f| &f.id == id))
+            .map(|f| f.display_name.as_str())
+            .unwrap_or("(no folder)");
+        // `visible_message_count` (not `app.messages.len()`) so the count
+        // reflects the search results while a query is active, not the
+        // underlying folder's real size.
+        format!(
+            "{account} — {status} — {folder} — {} folder(s), {} message(s)",
+            app.folders.len(),
+            app.visible_message_count()
+        )
+    };
     // An error notice takes precedence over the attachment (success) notice
     // and is drawn in a distinct red style — a failed save must never look
     // like a success. Otherwise the normal dark-gray bar shows the last
@@ -88,5 +98,44 @@ mod tests {
         assert!(text.contains("save failed"));
         // The success notice is suppressed while an error is showing.
         assert!(!text.contains("Saved: ok.txt"));
+    }
+
+    #[test]
+    fn calendar_mode_shows_sync_state_and_event_count_instead_of_the_folder_line() {
+        use mailcore::store::NewEvent;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_event(&NewEvent {
+                id: "e1".into(),
+                subject: "Standup".into(),
+                start_utc: "2020-01-05T12:00:00Z".into(),
+                end_utc: "2020-01-05T13:00:00Z".into(),
+                is_all_day: false,
+                location: "".into(),
+                organizer_name: "".into(),
+                organizer_addr: "".into(),
+                response_status: "none".into(),
+                series_master_id: None,
+                body_preview: "".into(),
+                web_link: "".into(),
+                last_modified: "2020-01-01T00:00:00Z".into(),
+                body_html: "".into(),
+            })
+            .unwrap();
+        // Directly populate `agenda` — this module doesn't own the reload
+        // logic (`App::reload_agenda`/`toggle_mode` do), so it only needs to
+        // render whatever's already there.
+        app.agenda = app
+            .store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        app.mode = crate::app::Mode::Calendar;
+
+        let text = render(&app);
+        assert!(text.contains("Idle"), "still shows the sync state");
+        assert!(text.contains("1 event(s)"));
+        // The mail-mode folder/message counts must not leak into this line.
+        assert!(!text.contains("message(s)"));
     }
 }

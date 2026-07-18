@@ -53,13 +53,45 @@ pub(crate) fn agenda_window() -> (String, String) {
 /// Keys while `App::mode` is `Calendar`: ↑/↓/j/k move the agenda selection
 /// (bounds-safe, clamped rather than wrapping — see
 /// `App::move_agenda_selection`), Enter opens the detail pane on whatever's
-/// highlighted, `g`/Esc return to the mail view.
+/// highlighted, `g`/Esc return to the mail view, and `a`/`d`/`t` start an
+/// RSVP (accept/decline/tentative) on the highlighted row — routed here
+/// (rather than through `App::on_key_char`, the Mail-mode dispatch) so they
+/// can never clobber `a` (attachments) / `d` (delete)'s Mail-mode meanings;
+/// see `RsvpPrompt`. While the RSVP comment prompt is open, every key
+/// instead goes to `handle_rsvp_prompt_key` — checked first, ahead of the
+/// normal calendar keys, the same "prompt/popup takes over key handling"
+/// precedence `ui::handle_key` already gives the move-folder/attachments/
+/// search prompts over plain pane navigation.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.rsvp_prompt.is_some() {
+        handle_rsvp_prompt_key(app, key);
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('g') => app.toggle_mode(),
         KeyCode::Up | KeyCode::Char('k') => app.move_agenda_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_agenda_selection(1),
         KeyCode::Enter => app.open_selected_event(),
+        KeyCode::Char('a') => app.start_rsvp("accepted"),
+        KeyCode::Char('d') => app.start_rsvp("declined"),
+        KeyCode::Char('t') => app.start_rsvp("tentativelyAccepted"),
+        _ => {}
+    }
+}
+
+/// Keys while the RSVP comment prompt is open: every printable character
+/// types into the comment (so a comment containing `g`/`j`/`k`/`a`/`d`/`t`
+/// still works, the same "the prompt owns every letter" reasoning
+/// `ui::handle_search_key` already documents for the search query), Enter
+/// submits with whatever was typed, Backspace edits it, and Esc submits with
+/// no comment (see `App::cancel_rsvp_comment`'s doc comment for why that's
+/// not "cancel the whole RSVP").
+fn handle_rsvp_prompt_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => app.submit_rsvp(),
+        KeyCode::Esc => app.cancel_rsvp_comment(),
+        KeyCode::Backspace => app.backspace_rsvp_comment(),
+        KeyCode::Char(c) => app.type_rsvp_comment(&c.to_string()),
         _ => {}
     }
 }
@@ -69,13 +101,54 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 /// both degrade to an empty list / a placeholder line rather than indexing
 /// anything directly.
 pub fn draw_calendar(f: &mut Frame, app: &App) {
+    // Same vertical split as the mail three-pane layout (`ui::draw`): the
+    // main area on top, a 1-row status bar pinned to the bottom — so
+    // Calendar mode gets the same status surface (sync state + `error_notice`)
+    // instead of losing it entirely while this view is showing.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(f.area());
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(f.area());
+        .split(rows[0]);
 
     draw_agenda(f, app, cols[0]);
     draw_detail(f, app, cols[1]);
+    crate::ui::status_bar::draw(f, app, rows[1]);
+    draw_rsvp_prompt(f, app);
+}
+
+/// Renders the RSVP comment prompt as a centered overlay (same shape as the
+/// attachments/move-folder popups — see `ui::attachments::draw`) when
+/// `app.rsvp_prompt` is open; a no-op otherwise. Drawn last, on top of the
+/// agenda/detail panes.
+fn draw_rsvp_prompt(f: &mut Frame, app: &App) {
+    use ratatui::widgets::Clear;
+
+    let Some(prompt) = &app.rsvp_prompt else {
+        return;
+    };
+    let verb = match prompt.kind.as_str() {
+        "accepted" => "Accept",
+        "declined" => "Decline",
+        "tentativelyAccepted" => "Tentative",
+        other => other,
+    };
+    let area = crate::ui::centered_rect(60, 20, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(
+            "{verb} \u{2014} comment (Enter: send, Esc: send without)"
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow));
+    f.render_widget(
+        Paragraph::new(format!("{}_", prompt.comment)).block(block),
+        area,
+    );
 }
 
 /// One line the agenda list renders: either a day header (a pure display
@@ -816,5 +889,141 @@ mod tests {
         app.on_sync_event(mailcore::sync::engine::SyncEvent::CalendarUpdated);
 
         assert_eq!(app.agenda.len(), 1);
+    }
+
+    // --- RSVP keys + comment prompt + optimistic/outbox wiring --------------
+
+    /// Seeds one event ("e1", starting tomorrow) with `response_status`
+    /// "none" (unlike `sample_event`'s default "accepted" — starting from
+    /// "none" makes an accept/decline transition actually observable) and
+    /// enters Calendar mode with it highlighted. Returns the event's id.
+    fn seed_one_event_in_calendar_mode(app: &mut App) -> String {
+        let day1 = days_from_now(1);
+        let mut e = sample_event("e1", &day1, &an_hour_after(&day1), "Standup");
+        e.response_status = "none".into();
+        app.store.upsert_event(&e).unwrap();
+        app.toggle_mode();
+        assert_eq!(app.agenda.len(), 1);
+        assert_eq!(app.agenda_index, 0);
+        "e1".to_string()
+    }
+
+    #[test]
+    fn accept_key_opens_a_comment_prompt_and_enter_submits_it_with_the_comment() {
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_seeded_store();
+        let id = seed_one_event_in_calendar_mode(&mut app);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(
+            app.rsvp_prompt.is_some(),
+            "'a' must open the comment prompt"
+        );
+
+        for c in "sounds good".chars() {
+            crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.rsvp_prompt.is_none());
+        // Optimistic local write landed immediately.
+        let row = app
+            .store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
+        assert_eq!(row.response_status, "accepted");
+        // The agenda (and therefore the rendered glyph) reflects it too.
+        assert_eq!(app.agenda[0].response_status, "accepted");
+
+        match cmd_rx.try_recv() {
+            Ok(SyncCommand::RespondEvent {
+                id: sent_id,
+                kind,
+                comment,
+            }) => {
+                assert_eq!(sent_id, id);
+                assert_eq!(kind, "accepted");
+                assert_eq!(comment.as_deref(), Some("sounds good"));
+            }
+            other => panic!("expected a RespondEvent command, got {other:?}"),
+        }
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw_calendar(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains('✓'), "the glyph must reflect the new status");
+    }
+
+    #[test]
+    fn esc_on_the_comment_prompt_submits_the_rsvp_with_no_comment() {
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_seeded_store();
+        let id = seed_one_event_in_calendar_mode(&mut app);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.rsvp_prompt.is_some());
+        for c in "never mind".chars() {
+            crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.rsvp_prompt.is_none());
+        assert_eq!(app.agenda[0].response_status, "declined");
+        match cmd_rx.try_recv() {
+            Ok(SyncCommand::RespondEvent {
+                id: sent_id,
+                kind,
+                comment,
+            }) => {
+                assert_eq!(sent_id, id);
+                assert_eq!(kind, "declined");
+                assert_eq!(comment, None, "Esc must send with no comment");
+            }
+            other => panic!("expected a RespondEvent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tentative_key_sets_the_tentative_status() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_one_event_in_calendar_mode(&mut app);
+
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('t')));
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(app.agenda[0].response_status, "tentativelyAccepted");
+    }
+
+    #[test]
+    fn rsvp_keys_on_an_empty_agenda_are_no_ops() {
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_empty_store();
+        app.toggle_mode();
+        assert!(app.agenda.is_empty());
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+
+        for key in ['a', 'd', 't'] {
+            crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)));
+            assert!(
+                app.rsvp_prompt.is_none(),
+                "no event to respond to — must not open a prompt"
+            );
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no command should have been sent"
+        );
     }
 }

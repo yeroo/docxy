@@ -112,6 +112,47 @@ message to the local store and queues it to Exchange in the background,
 retrying automatically on a transient failure. Once delivered, it appears in
 your **Sent Items** the same as if you'd sent it from Outlook.
 
+## Calendar
+
+Press `g` to switch between Mail and your Exchange **calendar**, and `g`
+again (or `Esc`) to switch back. Entering Calendar shows whatever's already
+synced locally and kicks off a background refresh, so it feels current right
+away rather than waiting on the next periodic sync.
+
+Calendar mode is a two-pane view — an **agenda** (left) and an **event
+detail** pane (right) — mirroring the mail list/reading split:
+
+| Keys | Action |
+|------|--------|
+| `↑`/`↓`, `j`/`k` | move the agenda selection (clamped at the top/bottom, not wrapping) |
+| `Enter` | open the detail pane for the highlighted event |
+| `a` / `d` / `t` | **accept** / **decline** / **tentatively accept** the highlighted event's invite |
+| `g`, `Esc` | back to Mail |
+
+The **agenda** groups events by local day (Today, Tomorrow, then
+weekday+date), each row showing its time (or "all day"), subject, location,
+and a response glyph — `✓` accepted, `✗` declined, `?` tentative, `•`
+no response yet. The **detail** pane shows the full time range, organizer,
+location, the attendee list with each attendee's own response, and the
+event body.
+
+**Responding to an invite.** `a`/`d`/`t` on the highlighted event opens a
+one-line **comment prompt**: type an optional note, `Enter` sends the RSVP
+with it. `Esc` sends the RSVP too, just without a comment — it cancels the
+comment, not the response. Either way, the response is applied immediately
+(the glyph updates right there in the agenda) and **rides the outbox** to
+Exchange the same way triage actions do: queued locally, pushed in the
+background, retried automatically on a transient failure. An event with no
+RSVP recorded yet, or an empty agenda, makes `a`/`d`/`t` a no-op — there's
+nothing to respond to.
+
+The status bar shows the calendar's own sync state and event count while
+this view is open, in place of the folder/message counts.
+
+**Scope.** Calendar is read + RSVP only: creating, editing, or deleting
+events, and responding to a recurring series as a whole (rather than the
+specific instance shown), are out of scope.
+
 ## Agent control (MCP)
 
 `lookxy` exposes the **live** mailbox — the same `Store` the TUI reads and the
