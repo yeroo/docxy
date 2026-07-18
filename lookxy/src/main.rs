@@ -129,6 +129,7 @@ fn main() -> io::Result<()> {
     // `App::reload_account`) — the engine owns writing it, not the UI.
     let mut app = App::new(store, handle, token_path);
     app.threaded = config.threaded;
+    app.signature = config.signature.clone();
     app.config_path = crate::config::config_file_path();
     app.reload_messages();
 

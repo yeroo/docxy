@@ -60,6 +60,10 @@ pub struct App {
     /// write); `Some` in production (set by `main`). Read by
     /// `toggle_threaded` when persisting the `t`-keybinding choice.
     pub config_path: Option<PathBuf>,
+    /// Seeded from `Config::signature`. Appended to a brand-new message's
+    /// body by `compose_new` (via `signature_body_html`); reply/forward
+    /// bodies come from Graph untouched, so nothing else reads this.
+    pub signature: String,
     /// The threaded view-model, built by `reload_messages` when `threaded`.
     pub threads: Vec<ThreadView>,
     /// Flattened header+message rows for render + navigation in threaded mode.
@@ -299,6 +303,7 @@ impl App {
             msg_index: 0,
             threaded: false,
             config_path: None,
+            signature: String::new(),
             threads: Vec::new(),
             visible_rows: Vec::new(),
             row_index: 0,
@@ -1135,7 +1140,8 @@ impl App {
     /// A no-op if the store write itself fails (e.g. disk full) — nothing
     /// downstream could open anyway.
     pub fn compose_new(&mut self) {
-        if let Ok(id) = self.store.create_local_draft("", "", "", "") {
+        let body = signature_body_html(&self.signature);
+        if let Ok(id) = self.store.create_local_draft("", "", "", &body) {
             self.open_draft(&id);
         }
     }
@@ -1778,6 +1784,24 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Builds the initial body HTML for a new message: empty when the signature is
+/// blank; otherwise an empty first paragraph (where the cursor lands), a `--`
+/// separator, then one paragraph per signature line (HTML-escaped). Only new
+/// messages get this — reply/forward bodies come from Graph untouched.
+fn signature_body_html(sig: &str) -> String {
+    if sig.trim().is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<p></p><p>--</p>");
+    for line in sig.lines() {
+        html.push_str(&format!(
+            "<p>{}</p>",
+            mailcore::compose_html::escape_html(line)
+        ));
+    }
+    html
 }
 
 #[cfg(test)]
@@ -2864,6 +2888,25 @@ pub(crate) mod tests {
             id: "no-such-draft".into(),
         });
         assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn signature_body_html_wraps_lines_and_is_empty_when_blank() {
+        assert_eq!(signature_body_html(""), "");
+        assert_eq!(signature_body_html("   "), "");
+        let html = signature_body_html("Boris\nEPAM");
+        assert!(html.contains("<p>--</p>"));
+        assert!(html.contains("<p>Boris</p>"));
+        assert!(html.contains("<p>EPAM</p>"));
+    }
+
+    #[test]
+    fn compose_new_seeds_the_signature_into_the_draft_body() {
+        let mut app = App::for_test_with_seeded_store();
+        app.signature = "Boris".into();
+        app.compose_new();
+        let editor_text = app.compose.as_ref().unwrap().editor.text.plain();
+        assert!(editor_text.contains("Boris")); // signature landed in the composer body
     }
 
     #[test]

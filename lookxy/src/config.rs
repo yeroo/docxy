@@ -4,7 +4,7 @@
 //! and every field has a sane built-in default. Precedence, highest wins:
 //!
 //! 1. environment variables (`LOOKXY_CLIENT_ID`, `LOOKXY_BACKFILL_DAYS`,
-//!    `LOOKXY_REFRESH_SECS`, `LOOKXY_THREADED`)
+//!    `LOOKXY_REFRESH_SECS`, `LOOKXY_THREADED`, `LOOKXY_SIGNATURE`)
 //! 2. `%APPDATA%\lookxy\config.json` (if present and parseable)
 //! 3. the built-in defaults below
 //!
@@ -25,6 +25,11 @@ pub struct Config {
     /// Whether the folder message-list is grouped into conversations. Toggled
     /// at runtime with `t` (persisted via `persist_threaded`).
     pub threaded: bool,
+    /// Text appended (as `--` + one paragraph per line) to a brand-new
+    /// message's body when composing (`App::compose_new`). Read-only from
+    /// config — there's no runtime toggle or persistence for this, unlike
+    /// `threaded`. Empty (the default) means no signature is appended.
+    pub signature: String,
 }
 
 impl Default for Config {
@@ -38,6 +43,7 @@ impl Default for Config {
             backfill_days: 180,
             refresh_secs: 60,
             threaded: true,
+            signature: String::new(),
         }
     }
 }
@@ -97,6 +103,9 @@ impl Config {
         if let Some(b) = value.get("threaded").and_then(|v| v.as_bool()) {
             self.threaded = b;
         }
+        if let Some(s) = value.get("signature").and_then(|v| v.as_str()) {
+            self.signature = s.to_string();
+        }
     }
 
     /// Overlays `LOOKXY_CLIENT_ID`/`LOOKXY_BACKFILL_DAYS`/`LOOKXY_REFRESH_SECS`
@@ -129,6 +138,9 @@ impl Config {
             } else if v.eq_ignore_ascii_case("false") || v == "0" {
                 self.threaded = false;
             }
+        }
+        if let Ok(v) = std::env::var("LOOKXY_SIGNATURE") {
+            self.signature = v;
         }
     }
 }
@@ -235,6 +247,7 @@ mod tests {
             std::env::remove_var("LOOKXY_BACKFILL_DAYS");
             std::env::remove_var("LOOKXY_REFRESH_SECS");
             std::env::remove_var("LOOKXY_THREADED");
+            std::env::remove_var("LOOKXY_SIGNATURE");
         }
     }
 
@@ -429,6 +442,19 @@ mod tests {
         std::fs::write(&path, r#"{"threaded":false}"#).unwrap();
         let c = Config::load_from(Some(&path));
         assert!(!c.threaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signature_defaults_empty_and_file_overlay_sets_it() {
+        assert_eq!(Config::default().signature, "");
+        let _guard = lock_env();
+        clear_env();
+        let dir = std::env::temp_dir().join(format!("lookxy-config-{}-sig", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"signature":"--\nBoris"}"#).unwrap();
+        assert_eq!(Config::load_from(Some(&path)).signature, "--\nBoris");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

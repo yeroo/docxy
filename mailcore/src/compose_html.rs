@@ -104,7 +104,11 @@ fn render_runs(runs: &[Run]) -> String {
 
 /// Entity-escapes the handful of characters that matter in email HTML text
 /// content and (quoted) attribute values: `& < > "`.
-fn escape_html(s: &str) -> String {
+///
+/// `pub` (rather than module-private) so `lookxy::app`'s
+/// `signature_body_html` can reuse this exact escaping for signature lines
+/// rather than duplicating it.
+pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
