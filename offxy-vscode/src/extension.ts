@@ -13,6 +13,7 @@
 import * as vscode from 'vscode';
 import { docxToMarkdown, markdownToDocx } from './engine';
 import { newWorkbook } from './gridengine';
+import { CtlHost, CtlServer } from './ctlserver';
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(register(context));
@@ -42,6 +43,16 @@ interface EditorSpec {
   /** Mint a fresh empty document's bytes for the empty-file create flow (both
    *  the open-time modal and the webview's in-tab `createNew` message). */
   mintEmpty?: (context: vscode.ExtensionContext) => Promise<Uint8Array>;
+  /** Agent control-surface identity for this editor's tabs: which terminal
+   *  app they masquerade as on the ctl wire (`docs/agent-control.md`), plus
+   *  the wasm verb sets `CtlServer` needs — which verbs route to
+   *  `docx_ctl`/`grid_ctl` at all, and which of those mark the document
+   *  modified / drive the VS Code undo stack. */
+  ctl: {
+    app: 'docxy' | 'xlsxy';
+    wasmVerbs: Set<string>;
+    mutatingVerbs: Set<string>;
+  };
 }
 
 const EDITORS: EditorSpec[] = [
@@ -54,6 +65,19 @@ const EDITORS: EditorSpec[] = [
     emptyPrompt:
       '“{name}” is empty — it isn\'t a Word document yet. Create a new Word document in its place?',
     mintEmpty: (ctx) => markdownToDocx(ctx, ''),
+    ctl: {
+      app: 'docxy',
+      wasmVerbs: new Set([
+        'doc.outline',
+        'doc.read',
+        'doc.find',
+        'doc.replace-range',
+        'doc.insert',
+        'doc.append',
+        'doc.blocks',
+      ]),
+      mutatingVerbs: new Set(['doc.replace-range', 'doc.insert', 'doc.append']),
+    },
   },
   {
     viewType: 'offxy.gridEditor',
@@ -64,8 +88,66 @@ const EDITORS: EditorSpec[] = [
     emptyPrompt:
       '“{name}” is empty — it isn\'t an Excel workbook yet. Create a new workbook in its place?',
     mintEmpty: (ctx) => newWorkbook(ctx),
+    ctl: {
+      app: 'xlsxy',
+      wasmVerbs: new Set([
+        'sheet.list',
+        'sheet.read',
+        'cell.get',
+        'cell.set',
+        'range.clear',
+        'find',
+        'wb.recalc',
+        'wb.info',
+      ]),
+      mutatingVerbs: new Set(['cell.set', 'range.clear']),
+    },
   },
 ];
+
+/** Every ctl server this extension host has started, across both editor
+ *  providers — so extension deactivate can tear all of them down even if a
+ *  panel's own dispose somehow didn't run first (VS Code normally disposes
+ *  every webview panel before deactivating, so this is a safety net). */
+const activeCtlServers = new Set<CtlServer>();
+
+/** Monotonic counter backing each ctl instance's suffix, so two tabs with the
+ *  same basename (e.g. `report.docx` opened from two different folders) get
+ *  distinct discovery filenames instead of colliding. */
+let ctlInstanceSeq = 0;
+
+/** Build a `CtlServer` instance suffix: a filesystem-safe basename plus a
+ *  per-extension-session sequence number. */
+function nextCtlSuffix(uri: vscode.Uri): string {
+  const safe = basename(uri).replace(/[^A-Za-z0-9._-]/g, '_') || 'doc';
+  return `${safe}-${++ctlInstanceSeq}`;
+}
+
+/** Pull the `verb` string out of a ctl request JSON string (as sent to
+ *  `CtlHost.callWasm`), or `undefined` if it doesn't parse / isn't a string —
+ *  used to decide whether a webview repaint is needed after the call. */
+function ctlVerbOf(requestJson: string): string | undefined {
+  try {
+    const verb = JSON.parse(requestJson)?.verb;
+    return typeof verb === 'string' ? verb : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Parse a raw wasm ctl reply (`docx_ctl`/`grid_ctl`'s flat
+ *  `{...fields,"ok":true}` / `{"ok":false,"error":…}` envelope) and return its
+ *  fields when it succeeded, or `undefined` on failure or a parse error. Used
+ *  by the provider's own internal `doc.blocks`/`wb.info`/`sheet.list` calls
+ *  that compose `pathInfo()`/`save()`/`reload()` replies. */
+function ctlOkResult(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && parsed.ok === true ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function register(context: vscode.ExtensionContext): vscode.Disposable {
   const disposables: vscode.Disposable[] = [];
@@ -85,6 +167,19 @@ function register(context: vscode.ExtensionContext): vscode.Disposable {
       docxProvider = provider;
     }
   }
+
+  // Tear down every open tab's ctl server (TCP listener + discovery file) on
+  // extension deactivate. Each panel's own dispose already does this when the
+  // user closes a tab; this covers whatever's still open when VS Code shuts
+  // the extension host down.
+  disposables.push(
+    new vscode.Disposable(() => {
+      for (const server of activeCtlServers) {
+        server.dispose();
+      }
+      activeCtlServers.clear();
+    }),
+  );
 
   if (docxProvider) {
     // Register the command-palette actions once; each posts a bridge command
@@ -142,6 +237,16 @@ class BinaryDocument implements vscode.CustomDocument {
   /** Set once the editor panel is resolved; used to message the webview. */
   panel?: vscode.WebviewPanel;
 
+  /** This document's agent control-surface server (one per open tab),
+   *  constructed in `resolveCustomEditor` and started once the webview's
+   *  first `ready` message arrives. */
+  ctlServer?: CtlServer;
+  /** Guards `start()` against firing twice if `ready` somehow arrives more
+   *  than once for the same document. */
+  ctlServerStarted = false;
+  private readonly ctlPending = new Map<number, (value: string) => void>();
+  private ctlReqSeq = 0;
+
   constructor(
     public readonly uri: vscode.Uri,
     /** Last-known serialized bytes; replaced when an empty file is seeded with
@@ -151,6 +256,7 @@ class BinaryDocument implements vscode.CustomDocument {
 
   dispose(): void {
     this.pending.clear();
+    this.ctlPending.clear();
   }
 
   /** Ask the webview to serialize the current document and resolve with the
@@ -176,6 +282,40 @@ class BinaryDocument implements vscode.CustomDocument {
       this.pending.delete(requestId);
       resolve(bytes);
     }
+  }
+
+  /** Forward one ctl wasm request to the webview (`docx_ctl`/`grid_ctl`'s
+   *  marshalling lives there) and resolve with its raw reply JSON string.
+   *  Same requestId-map pattern as `requestBytes`. `repaint` rides along on
+   *  the message so the webview knows whether to redraw after an ok reply. */
+  requestCtl(payload: string, repaint: boolean): Promise<string> {
+    const panel = this.panel;
+    if (!panel) {
+      return Promise.resolve('{"ok":false,"error":"no active webview"}');
+    }
+    const requestId = ++this.ctlReqSeq;
+    return new Promise<string>((resolve) => {
+      this.ctlPending.set(requestId, resolve);
+      panel.webview.postMessage({ type: 'ctl', requestId, payload, repaint });
+    });
+  }
+
+  /** Resolve a pending `requestCtl` call with the reply the webview posted
+   *  back as `ctlResult`. */
+  fulfillCtl(requestId: number, payload: string): void {
+    const resolve = this.ctlPending.get(requestId);
+    if (resolve) {
+      this.ctlPending.delete(requestId);
+      resolve(payload);
+    }
+  }
+
+  /** Stop the ctl server (closes its listener, deletes its discovery file)
+   *  and clear the reference so a stray late message can't restart it. */
+  disposeCtlServer(): void {
+    this.ctlServer?.dispose();
+    this.ctlServer = undefined;
+    this.ctlServerStarted = false;
   }
 }
 
@@ -248,6 +388,20 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     };
     panel.webview.html = this.html(panel.webview);
 
+    // Construct (but don't yet start) this tab's ctl server: every open
+    // docx/xlsx tab gets one, so it can be driven by the same terminal
+    // agents/MCP clients that talk to a running docxy/xlsxy pane. `start()`
+    // happens once the webview confirms it's ready (see `onMessage`) — the
+    // listener and discovery file shouldn't come up before there's a session
+    // behind them to answer wasm verbs.
+    document.ctlServer = new CtlServer(
+      this.spec.ctl.app,
+      nextCtlSuffix(document.uri),
+      this.makeCtlHost(document),
+      this.spec.ctl.wasmVerbs,
+      this.spec.ctl.mutatingVerbs,
+    );
+
     const sub = panel.webview.onDidReceiveMessage((msg) =>
       this.onMessage(document, panel, msg),
     );
@@ -263,6 +417,10 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
       sub.dispose();
       viewSub.dispose();
       this.panelDocs.delete(panel);
+      if (document.ctlServer) {
+        activeCtlServers.delete(document.ctlServer);
+      }
+      document.disposeCtlServer();
       if (document.panel === panel) {
         document.panel = undefined;
       }
@@ -270,6 +428,147 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
         this.activePanel = undefined;
       }
     });
+  }
+
+  /** Start `document`'s already-constructed ctl server, once. Called from the
+   *  webview's first `ready` message (Step 3 of the wiring: the server has no
+   *  live session to answer wasm verbs against before then). */
+  private async startCtlServer(document: BinaryDocument): Promise<void> {
+    const server = document.ctlServer;
+    if (!server || document.ctlServerStarted) {
+      return;
+    }
+    document.ctlServerStarted = true;
+    try {
+      await server.start();
+      activeCtlServers.add(server);
+    } catch (err) {
+      console.error(`offxy: failed to start the ${this.spec.label} control server:`, err);
+    }
+  }
+
+  /** Build the `CtlHost` one `CtlServer` uses to answer host verbs
+   *  (`${prefix}.path/save/reload/open`) and forward wasm verbs into the live
+   *  webview session. One instance per document, closed over `document` so
+   *  every callback reaches the right panel even if it's replaced. */
+  private makeCtlHost(document: BinaryDocument): CtlHost {
+    return {
+      callWasm: (requestJson: string) => {
+        const verb = ctlVerbOf(requestJson);
+        const repaint = verb !== undefined && this.spec.ctl.mutatingVerbs.has(verb);
+        return document.requestCtl(requestJson, repaint);
+      },
+
+      pathInfo: () => this.fullPathInfo(document),
+
+      save: async () => {
+        // The full save pipeline (dirty flag, hot-exit backup cleanup, …),
+        // not just a raw file write — `saveCustomDocument` alone wouldn't
+        // clear VS Code's dirty indicator.
+        await vscode.workspace.save(document.uri);
+        return this.fullPathInfo(document);
+      },
+
+      reload: async () => {
+        const bytes = await vscode.workspace.fs.readFile(document.uri);
+        document.initialContent = bytes;
+        document.panel?.webview.postMessage({
+          type: 'open',
+          data: Buffer.from(bytes).toString('base64'),
+        });
+        // Intentionally fires no `_onDidChange` edit event: this is a revert
+        // (drop unsaved edits back to the on-disk file), not an undoable
+        // edit. Quirk: unlike VS Code's own "Revert File" command, this does
+        // NOT clear VS Code's dirty indicator — there's no public API to do
+        // that for a custom document short of the edit-event path, which
+        // would wrongly put "reload" on the undo stack.
+        return this.fullPathInfo(document);
+      },
+
+      open: async (path: string) => {
+        // VS Code's per-tab document model has no equivalent to the terminal
+        // apps' single mutable "current document" — `${prefix}.open` here
+        // opens the target file in its own new tab (its own independent ctl
+        // instance) rather than swapping this tab's content.
+        await vscode.commands.executeCommand(
+          'vscode.openWith',
+          vscode.Uri.file(path),
+          this.spec.viewType,
+        );
+        return { path };
+      },
+
+      onMutated: (verbLabel: string) => {
+        // `doc.replace-range` is a delete-then-insert at the wasm/Editor
+        // level (see `docxcore::agent::replace_range` and
+        // `docs/agent-control.md`) — two undo checkpoints, not one. Every
+        // other mutating verb here (`doc.insert`, `doc.append`, `cell.set`,
+        // `range.clear`) checkpoints exactly once. Firing a single VS Code
+        // edit event whose undo/redo replays *both* wasm steps keeps a
+        // single Ctrl+Z fully reverting one agent action, instead of landing
+        // on the intermediate post-delete/pre-insert state.
+        const steps =
+          this.spec.ctl.app === 'docxy' && verbLabel === 'doc.replace-range' ? 2 : 1;
+        this._onDidChange.fire({
+          document,
+          label: `Agent: ${verbLabel}`,
+          undo: () => {
+            for (let i = 0; i < steps; i++) {
+              void document.panel?.webview.postMessage({ type: 'do', op: 'undo' });
+            }
+          },
+          redo: () => {
+            for (let i = 0; i < steps; i++) {
+              void document.panel?.webview.postMessage({ type: 'do', op: 'redo' });
+            }
+          },
+        });
+      },
+    };
+  }
+
+  /** Compose the full `${prefix}.path`-shaped reply — the URI-derived half
+   *  plus whatever only the live wasm session knows — for `pathInfo()`
+   *  (merged again by `CtlServer` with its own `doc.blocks`/`wb.info` call,
+   *  harmlessly duplicating a field or two) and for `save()`/`reload()`/
+   *  `open()`, which return their result as-is with no such merge. */
+  private async fullPathInfo(document: BinaryDocument): Promise<Record<string, unknown>> {
+    const filePath = document.uri.fsPath;
+    if (this.spec.ctl.app === 'docxy') {
+      // `doc.blocks`'s own field is named "total" (it doubles as the count
+      // `doc.insert`/`doc.append` report), but `doc.path`'s documented shape
+      // calls it "blocks" — relabel here so the reply that actually leaves
+      // this process matches `docs/agent-control.md`.
+      const blocks = ctlOkResult(
+        await document.requestCtl(JSON.stringify({ verb: 'doc.blocks', args: null }), false),
+      );
+      return {
+        path: filePath,
+        format: 'docx',
+        modified: blocks?.modified ?? false,
+        blocks: blocks?.total ?? 0,
+      };
+    }
+    // xlsxy: `wb.path`'s documented shape includes `active_name`, which
+    // `wb.info` doesn't carry — pull it from `sheet.list` and merge in.
+    const info = ctlOkResult(
+      await document.requestCtl(JSON.stringify({ verb: 'wb.info', args: null }), false),
+    );
+    const list = ctlOkResult(
+      await document.requestCtl(JSON.stringify({ verb: 'sheet.list', args: null }), false),
+    );
+    const sheets = Array.isArray(list?.sheets)
+      ? (list!.sheets as Array<{ index: number; name: string }>)
+      : [];
+    const active = typeof info?.active === 'number' ? (info.active as number) : 0;
+    const activeName = sheets.find((s) => s.index === active)?.name ?? '';
+    return {
+      path: filePath,
+      modified: info?.modified ?? false,
+      sheets: typeof info?.sheets === 'number' ? (info.sheets as number) : sheets.length,
+      active,
+      active_name: activeName,
+    };
   }
 
   /** Export the active Docxy document's current content to a sibling `.md`. */
@@ -332,6 +631,9 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
       case 'ready':
         // Hand the webview the file bytes (base64) to open in wasm.
         void this.openInWebview(document, panel);
+        // Bring this tab's ctl server up now that there's a live session
+        // behind it to answer wasm verbs against.
+        void this.startCtlServer(document);
         break;
 
       case 'edit':
@@ -362,6 +664,10 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
 
       case 'bytes':
         document.fulfillBytes(msg.requestId, new Uint8Array(Buffer.from(msg.data, 'base64')));
+        break;
+
+      case 'ctlResult':
+        document.fulfillCtl(msg.requestId, msg.payload);
         break;
 
       case 'clipboard':

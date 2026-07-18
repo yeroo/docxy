@@ -371,6 +371,21 @@
           data: bytesToBase64(saveBytes()),
         });
         break;
+      case 'ctl': {
+        // One agent control verb (docs/agent-control.md), routed through the
+        // same docx_ctl marshalling callBytes() already uses for docx_cmd.
+        const raw = dec.decode(callBytes(ex.docx_ctl, enc.encode(msg.payload)));
+        vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
+        // The host already knows (from its mutating-verb set) whether this
+        // call *could* have changed the document; only repaint if it also
+        // actually succeeded.
+        if (msg.repaint) {
+          let ok = false;
+          try { ok = JSON.parse(raw).ok === true; } catch { /* leave ok false */ }
+          if (ok) render();
+        }
+        break;
+      }
       case 'clipboardText':
         if (pastePending.delete(msg.requestId) && msg.text) {
           userCmd('paste\t' + msg.text);

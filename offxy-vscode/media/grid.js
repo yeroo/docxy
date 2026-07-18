@@ -550,6 +550,25 @@
         vscode.postMessage({ type: 'bytes', requestId: msg.requestId, data: bytesToBase64(bytes) });
         break;
       }
+      case 'ctl': {
+        // One agent control verb (docs/agent-control.md), routed through the
+        // same grid_ctl marshalling cmd() already uses for grid_cmd.
+        const u8 = enc.encode(msg.payload);
+        const p = writeBytes(u8);
+        const r = ex.grid_ctl(handle, p, u8.length);
+        ex.grid_free(p, u8.length);
+        const raw = dec.decode(readResult(r));
+        vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
+        // The host already knows (from its mutating-verb set) whether this
+        // call *could* have changed the workbook; only repaint if it also
+        // actually succeeded.
+        if (msg.repaint) {
+          let ok = false;
+          try { ok = JSON.parse(raw).ok === true; } catch { /* leave ok false */ }
+          if (ok) requestView();
+        }
+        break;
+      }
       case 'clipboardText':
         if (pastePending.delete(msg.requestId) && msg.text) {
           userCmd(`paste\t${rowOfRef()}\t${refCol()}\t${msg.text}`);
