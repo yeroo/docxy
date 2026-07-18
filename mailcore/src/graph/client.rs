@@ -336,8 +336,9 @@ impl GraphClient {
         subject: &str,
         to: &[Recipient],
         cc: &[Recipient],
+        bcc: &[Recipient],
     ) -> Result<Message, GraphError> {
-        let body = draft_body_json(body_html, subject, to, cc);
+        let body = draft_body_json(body_html, subject, to, cc, bcc);
         let resp = self.send(Method::Post, "/me/messages", Some(body), &[])?;
         let v = parse_body(resp)?;
         Message::from_json(&v).ok_or_else(|| GraphError::Parse("malformed draft".to_string()))
@@ -352,10 +353,11 @@ impl GraphClient {
         subject: &str,
         to: &[Recipient],
         cc: &[Recipient],
+        bcc: &[Recipient],
     ) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
-        let body = draft_body_json(body_html, subject, to, cc);
+        let body = draft_body_json(body_html, subject, to, cc, bcc);
         self.send(Method::Patch, &path, Some(body), &[])?;
         Ok(())
     }
@@ -553,8 +555,14 @@ fn value_array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], GraphError> {
 
 /// Builds the JSON body shared by `create_draft` and `update_draft`:
 /// `{"subject":…, "body":{"contentType":"HTML","content":…},
-/// "toRecipients":[…], "ccRecipients":[…]}`.
-fn draft_body_json(body_html: &str, subject: &str, to: &[Recipient], cc: &[Recipient]) -> String {
+/// "toRecipients":[…], "ccRecipients":[…], "bccRecipients":[…]}`.
+fn draft_body_json(
+    body_html: &str,
+    subject: &str,
+    to: &[Recipient],
+    cc: &[Recipient],
+    bcc: &[Recipient],
+) -> String {
     Value::Object(vec![
         ("subject".to_string(), Value::Str(subject.to_string())),
         (
@@ -566,6 +574,7 @@ fn draft_body_json(body_html: &str, subject: &str, to: &[Recipient], cc: &[Recip
         ),
         ("toRecipients".to_string(), recipients_json(to)),
         ("ccRecipients".to_string(), recipients_json(cc)),
+        ("bccRecipients".to_string(), recipients_json(bcc)),
     ])
     .to_string()
 }
@@ -1108,7 +1117,7 @@ mod tests {
             name: "Cara".to_string(),
             address: "cara@x".to_string(),
         }];
-        let draft = c.create_draft("<p>hi</p>", "Hello", &to, &cc).unwrap();
+        let draft = c.create_draft("<p>hi</p>", "Hello", &to, &cc, &[]).unwrap();
         assert_eq!(draft.id, "NEWDRAFT");
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "POST");
@@ -1146,6 +1155,38 @@ mod tests {
     }
 
     #[test]
+    fn create_draft_includes_bcc_recipients() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages".into(),
+            status: 201,
+            headers: vec![],
+            body: sample_message_json("NEWDRAFT"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let to = [Recipient {
+            name: "B".into(),
+            address: "b@x".into(),
+        }];
+        let bcc = [Recipient {
+            name: "S".into(),
+            address: "secret@x".into(),
+        }];
+        let _ = c.create_draft("<p>hi</p>", "Sub", &to, &[], &bcc);
+        let reqs = srv.requests();
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let bccs = sent.get("bccRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(bccs.len(), 1);
+        assert_eq!(
+            bccs[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("secret@x")
+        );
+    }
+
+    #[test]
     fn update_draft_patches_body_and_returns_unit() {
         let srv = FakeServer::start(vec![Route {
             method: "PATCH".into(),
@@ -1155,7 +1196,7 @@ mod tests {
             body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.update_draft("M1", "<p>edit</p>", "Subj", &[], &[])
+        c.update_draft("M1", "<p>edit</p>", "Subj", &[], &[], &[])
             .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "PATCH");
@@ -1221,7 +1262,7 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(
-            c.create_draft("x", "y", &[], &[]),
+            c.create_draft("x", "y", &[], &[], &[]),
             Err(GraphError::Unauthorized)
         ));
     }

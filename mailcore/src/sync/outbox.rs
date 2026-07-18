@@ -92,15 +92,16 @@ fn ensure_draft_on_graph(
         .ok_or_else(|| GraphError::Parse(format!("no local draft stored for {id}")))?;
     let to = parse_recipients(&row.to_recipients);
     let cc = parse_recipients(&row.cc_recipients);
+    let bcc = parse_recipients(&row.bcc_recipients);
 
     if let Some(local_id) = id.strip_prefix("local:") {
-        let created = client.create_draft(&body.content, &row.subject, &to, &cc)?;
+        let created = client.create_draft(&body.content, &row.subject, &to, &cc, &bcc)?;
         store
             .reconcile_id(&format!("local:{local_id}"), &created.id)
             .map_err(|e| GraphError::Parse(e.to_string()))?;
         Ok(created.id)
     } else {
-        client.update_draft(id, &body.content, &row.subject, &to, &cc)?;
+        client.update_draft(id, &body.content, &row.subject, &to, &cc, &bcc)?;
         Ok(id.to_string())
     }
 }
