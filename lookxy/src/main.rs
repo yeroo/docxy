@@ -128,6 +128,9 @@ fn main() -> io::Result<()> {
     // account name for the status bar once a sign-in completes (see
     // `App::reload_account`) — the engine owns writing it, not the UI.
     let mut app = App::new(store, handle, token_path);
+    app.threaded = config.threaded;
+    app.config_path = crate::config::config_file_path();
+    app.reload_messages();
 
     // Bring up the agent control surface. Best-effort: if the config
     // directory can't be resolved or the loopback bind fails, lookxy runs

@@ -57,10 +57,8 @@ pub struct App {
     /// from `Config::threaded`; toggled by `t`.
     pub threaded: bool,
     /// Path used to persist the `threaded` toggle. `None` in tests (no disk
-    /// write); `Some` in production (set by `main`). Nothing reads this yet —
-    /// the `t`-keybinding persistence is a later task's wiring. Silences
-    /// `dead_code`, which can't see across tasks.
-    #[allow(dead_code)]
+    /// write); `Some` in production (set by `main`). Read by
+    /// `toggle_threaded` when persisting the `t`-keybinding choice.
     pub config_path: Option<PathBuf>,
     /// The threaded view-model, built by `reload_messages` when `threaded`.
     pub threads: Vec<ThreadView>,
@@ -780,7 +778,21 @@ impl App {
             // already uses for reply vs. reply-all (`r`/`R`). See
             // `compose_forward`'s doc comment for the same note.
             'F' => self.compose_forward(),
+            't' => self.toggle_threaded(),
             _ => {}
+        }
+    }
+
+    /// `t`: flips threaded/flat, rebuilds the folder view for the new mode,
+    /// resets both cursors to the top, and persists the choice (best-effort;
+    /// a `None` `config_path`, as in tests, just skips the write).
+    pub fn toggle_threaded(&mut self) {
+        self.threaded = !self.threaded;
+        self.row_index = 0;
+        self.msg_index = 0;
+        self.reload_messages();
+        if let Some(path) = &self.config_path {
+            let _ = crate::config::persist_threaded_to(path, self.threaded);
         }
     }
 
@@ -2336,5 +2348,22 @@ mod tests {
             id: "no-such-draft".into(),
         });
         assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn t_key_toggles_threaded_and_rebuilds() {
+        let mut app = App::for_test_with_seeded_store();
+        // starts flat by construction default; config_path is None → no disk write
+        seed_second_in_c1(&app);
+        app.reload_messages();
+        assert!(!app.messages.is_empty()); // flat list populated
+
+        app.on_key_char('t');
+        assert!(app.threaded);
+        assert!(!app.visible_rows.is_empty()); // threaded view built
+
+        app.on_key_char('t');
+        assert!(!app.threaded);
+        assert!(!app.messages.is_empty()); // back to flat
     }
 }
