@@ -11,7 +11,7 @@
 //! ([`xf_format_fields`]) returns typed [`FormatValue`]s that a host
 //! serializes into its own JSON for `cell.get`-style read-back.
 
-use crate::sheet::{Align, Xf, classify_format_code};
+use crate::sheet::{Align, NumFmt, Xf, classify_format_code};
 
 /// A `cell.format` patch: each field `Some` means the wire patch set that
 /// key; `None` means the key was absent from the patch, so that aspect of
@@ -139,21 +139,47 @@ pub enum FormatValue {
 }
 
 /// The reverse of [`FormatPatch::parse`] / [`apply_patch_to_xf`]: every wire
-/// key whose value in `xf` differs from [`Xf::default`], in patch order
-/// (`numFmt`, `bold`, `italic`, `fontColor`, `fillColor`, `align`) — the
-/// `cell.get` `format` read-back shape. An unstyled `Xf` (equal to
-/// [`Xf::default`] in every field this patch covers) yields an empty vec,
-/// i.e. no `format` key on the wire.
+/// key whose value in `xf` differs from the workbook's default rendering, in
+/// patch order (`numFmt`, `bold`, `italic`, `fontColor`, `fillColor`,
+/// `align`) — the `cell.get` `format` read-back shape. An unstyled `Xf`
+/// yields an empty vec, i.e. no `format` key on the wire.
 ///
-/// Note: `numFmt` only round-trips when [`Xf::code`] carries the raw format
-/// string (as it does for anything `apply_patch_to_xf` itself wrote); a cell
-/// whose `numfmt` classification came from a built-in format id with no
-/// stored code string has no wire-representable `numFmt` to echo, and is
-/// skipped here even if its classification differs from `NumFmt::General`.
+/// `bold`/`italic`/`fontColor`/`fillColor`/`align` are compared against
+/// [`Xf::default`] (`false`/`false`/`None`/`None`/`Align::General`): nothing
+/// in `crate::xlsx`'s `<cellXfs>` parser synthesizes a non-default value for
+/// these five when the XML doesn't specify one — a `<font>` with no `<b/>`/
+/// `<i/>`/`<color>` element, an unset/`"none"` fill, and a missing
+/// `horizontal` attribute all parse to exactly their `Xf::default()` value,
+/// loaded or not.
+///
+/// `numFmt` is different, and handled by its OWN rule rather than a
+/// `Xf::code`/`Xf::default().code` comparison: `crate::xlsx`'s parser
+/// SYNTHESIZES `Xf::code = Some("General")` for the extremely common
+/// `numFmtId="0"` (via `crate::numfmt::builtin_code(0)`), purely so
+/// `save_xlsx` can round-trip the numFmtId reference byte-faithfully — that
+/// is a save-fidelity concern, not a sign the cell is "styled". Comparing
+/// `code` against `Xf::default().code == None` would therefore treat EVERY
+/// loaded workbook's untouched cells (and every `cell.format` patch that
+/// didn't touch `numFmt`, since [`apply_patch_to_xf`] clones the base
+/// `code`) as carrying an explicit numFmt, which they don't. The correct
+/// rule instead keys off [`Xf::numfmt`]'s CLASSIFICATION: a code is only
+/// wire-representable/meaningful when it classifies as something other than
+/// [`NumFmt::General`] (`classify_format_code` maps `"General"`/`"general"`/
+/// an empty code to `General` too, so this also makes an agent's own
+/// `numFmt:"General"` patch — a no-op deliberate reset — correctly echo
+/// nothing afterward, matching how the other five fields already behave
+/// when explicitly reset to their default). `numFmt` still only round-trips
+/// when [`Xf::code`] carries the raw format string (as it does for anything
+/// [`apply_patch_to_xf`] itself wrote, or that the loader mapped via
+/// `crate::numfmt::builtin_code`); a cell whose non-General `numfmt`
+/// classification came from a built-in format id with no stored code string
+/// (outside `builtin_code`'s table) has no wire-representable `numFmt` and
+/// is silently skipped — a known, narrower, pre-existing gap, unrelated to
+/// this rule.
 pub fn xf_format_fields(xf: &Xf) -> Vec<(&'static str, FormatValue)> {
     let default = Xf::default();
     let mut out = Vec::new();
-    if xf.code != default.code {
+    if xf.numfmt != NumFmt::General {
         if let Some(code) = &xf.code {
             out.push(("numFmt", FormatValue::Str(code.clone())));
         }
@@ -292,6 +318,75 @@ mod tests {
                 ("fontColor", FormatValue::Str("#123ABC".to_string())),
                 ("align", FormatValue::Str("right".to_string())),
             ]
+        );
+    }
+
+    #[test]
+    fn xf_format_fields_treats_an_explicit_general_numfmt_patch_as_a_no_op_echo() {
+        // An agent deliberately resetting numFmt to General is, semantically,
+        // resetting to the default — it should echo nothing afterward, same
+        // as any of the other five fields explicitly reset to their default.
+        let patch = FormatPatch::parse(&[("numFmt".to_string(), "General".to_string())]).unwrap();
+        let xf = apply_patch_to_xf(&Xf::default(), &patch);
+        assert!(
+            xf_format_fields(&xf).is_empty(),
+            "explicit numFmt:General must echo nothing: {xf:?}"
+        );
+    }
+
+    /// The bug this test pins (see `xf_format_fields`'s doc comment):
+    /// `crate::xlsx`'s `<cellXfs>` parser synthesizes `Xf::code =
+    /// Some("General")` for `numFmtId="0"` (round-trip fidelity), which
+    /// differs from `Xf::default().code == None`. Comparing raw `code`
+    /// against `Xf::default()` would spuriously echo `numFmt:"General"` for
+    /// every untouched cell of EVERY real loaded `.xlsx` (not just this
+    /// crate's own in-memory `new_xlsx()`, which never round-trips and so
+    /// never surfaced this).
+    #[test]
+    fn xf_format_fields_is_empty_for_a_loaded_workbooks_untouched_default_style() {
+        let pkg = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&crate::xlsx::new_xlsx()))
+            .expect("round trip");
+        let default_style = pkg.workbook.styles.xf(0);
+        assert_eq!(
+            default_style.code.as_deref(),
+            Some("General"),
+            "sanity check: confirms the loader really does synthesize this code"
+        );
+        assert!(
+            xf_format_fields(&default_style).is_empty(),
+            "an untouched cell's style, read back from a REAL loaded workbook, \
+             must yield no format fields: {default_style:?}"
+        );
+    }
+
+    #[test]
+    fn xf_format_fields_still_echoes_a_genuinely_non_general_numfmt() {
+        // Only the General/builtin-id-0 case is treated as absent — a
+        // genuinely different number format (e.g. a loaded date format)
+        // must still echo its code.
+        let xf = Xf {
+            numfmt: crate::sheet::NumFmt::Date,
+            code: Some("m/d/yyyy".to_string()),
+            ..Xf::default()
+        };
+        assert_eq!(
+            xf_format_fields(&xf),
+            vec![("numFmt", FormatValue::Str("m/d/yyyy".to_string()))]
+        );
+    }
+
+    #[test]
+    fn xf_format_fields_a_bold_only_patch_over_a_loaded_default_style_does_not_leak_general() {
+        let pkg = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&crate::xlsx::new_xlsx()))
+            .expect("round trip");
+        let base = pkg.workbook.styles.xf(0);
+        let patch = FormatPatch::parse(&[("bold".to_string(), "true".to_string())]).unwrap();
+        let xf = apply_patch_to_xf(&base, &patch);
+        assert_eq!(
+            xf_format_fields(&xf),
+            vec![("bold", FormatValue::Bool(true))],
+            "a patch that never touches numFmt must not inherit the loaded \
+             default style's synthesized 'General' code: {xf:?}"
         );
     }
 }

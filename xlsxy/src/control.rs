@@ -2187,6 +2187,63 @@ mod tests {
         assert!(g.get("format").is_none());
     }
 
+    /// Unlike `app()` (built from an in-memory `new_xlsx()` directly, never
+    /// round-tripped through `load_xlsx`), this proves the "no format key
+    /// for an unstyled cell" contract through the ACTUAL load path every
+    /// real `.xlsx` goes through — the path that exposed
+    /// `gridcore::format::xf_format_fields`'s "General" numFmt leak (see
+    /// gridcore's `xf_format_fields` doc comment and its
+    /// `xf_format_fields_is_empty_for_a_loaded_workbooks_untouched_default_style`
+    /// test). `App::new(new_xlsx(), …)`'s in-memory `Xf::default()` has
+    /// `code: None`, so it never surfaced the bug in the first place; a
+    /// genuinely loaded workbook's style index 0 has `code:
+    /// Some("General")` (synthesized by `crate::xlsx`'s `<cellXfs>` parser
+    /// for round-trip fidelity) and is exactly what regressed before the
+    /// fix.
+    #[test]
+    fn cell_get_reports_no_format_key_for_an_unstyled_cell_on_a_loaded_workbook() {
+        let bytes = gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx());
+        let pkg = gridcore::xlsx::load_xlsx(&bytes).expect("round trip");
+        let mut a = App::new(pkg, "loaded-test.xlsx");
+        a.os_clip = None;
+        set(&mut a, "A1", "plain");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert!(
+            g.get("format").is_none(),
+            "an untouched cell on a REAL loaded workbook must have no format key: {g:?}"
+        );
+    }
+
+    #[test]
+    fn cell_format_on_a_loaded_workbook_does_not_leak_a_general_numfmt() {
+        let bytes = gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx());
+        let pkg = gridcore::xlsx::load_xlsx(&bytes).expect("round trip");
+        let mut a = App::new(pkg, "loaded-test.xlsx");
+        a.os_clip = None;
+        let r = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("formatted"), Some(1));
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        let fmt = g.get("format").expect("format key present");
+        assert_eq!(
+            fmt.get("bold").and_then(Json::as_bool),
+            Some(true),
+            "{fmt:?}"
+        );
+        assert!(
+            fmt.get("numFmt").is_none(),
+            "a patch that never touches numFmt must not inherit the loaded \
+             default style's synthesized 'General' code: {fmt:?}"
+        );
+    }
+
     #[test]
     fn cell_format_unknown_key_names_it_and_applies_nothing() {
         let mut a = app();

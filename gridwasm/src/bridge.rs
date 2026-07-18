@@ -3653,42 +3653,18 @@ mod tests {
 
     // -- cell.format: Task 3's bucket A carries over (true wasm-undo-stack) -
     //
-    // PRE-EXISTING GRIDCORE GAP (see task-4-report.md, "Concerns"): every
-    // cell.get in THIS test module carries a `"numFmt":"General"` entry even
-    // for a genuinely unstyled cell. Root cause, empirically isolated: any
-    // real `.xlsx` byte stream that goes through `load_xlsx` (which every
-    // `Session::open` call does — there is no in-memory-only constructor)
-    // has style index 0's `Xf::code` populated as `Some("General")` by
-    // `xlsx.rs`'s cellXfs parser (`crate::numfmt::builtin_code(0)` ==
-    // `"General"`, used as the code fallback for `numFmtId="0"`). That
-    // differs from `Xf::default().code == None`, so
-    // `gridcore::format::xf_format_fields` — reused unmodified, per this
-    // task's contract — sees a spurious diff and echoes `numFmt:"General"`
-    // on every cell whose style traces back to index 0 (which is EVERY
-    // cell.format-authored style too, since `apply_patch_to_xf` clones that
-    // base xf and a patch that doesn't touch `numFmt` leaves `code`
-    // untouched). xlsxy's own Task 3 tests never caught this because their
-    // fixture (`App::new(new_xlsx(), …)`) is used directly, in-memory,
-    // WITHOUT a save/load round trip — `new_xlsx()`'s own in-memory
-    // `Xf::default()` has `code: None`. A real, disk-loaded `.xlsx` (which
-    // is 100% of xlsxy's real-world usage too, not just gridwasm's) would
-    // exhibit the identical leak; Task 3's suite just never exercised the
-    // load path. This can't be fixed HERE: filtering the spurious
-    // `numFmt:"General"` locally in gridwasm's `ctl_format_json` would
-    // restore THIS task's literal "no format key for an unstyled cell"
-    // clause but would then break the OTHER locked clause — byte-parity
-    // with xlsxy control.rs's `format_json`, which has the same bug on any
-    // real file and is out of this task's file scope (`gridwasm/src/
-    // bridge.rs` only) to fix. The tests below pin the ACTUAL wire behavior
-    // (including the artifact) rather than assert an unreachable ideal —
-    // flagged prominently in the report as a coordinator-level finding: the
-    // correct fix is a small, precisely-scoped change to
-    // `gridcore::format::xf_format_fields`'s default-baseline comparison
-    // (e.g. treat `code == Some("General")` as equivalent to `None`),
-    // applied once, benefiting BOTH xlsxy and gridwasm identically.
+    // NOTE: these tests previously PINNED a pre-existing gridcore bug (a
+    // spurious `"numFmt":"General"` leaking into every `cell.get` on any
+    // real loaded workbook — see task-4-report.md's original "CRITICAL
+    // FINDING" section for the full root-cause writeup). That bug is now
+    // FIXED in `gridcore::format::xf_format_fields` (see that function's
+    // doc comment: the `numFmt` gate now keys off `Xf::numfmt !=
+    // NumFmt::General` rather than a raw `Xf::code` comparison), so these
+    // tests below assert the CORRECT contract — an unstyled cell has no
+    // `format` key at all.
 
     #[test]
-    fn ctl_cell_format_bold_and_fill_is_one_undo_group_and_undo_clears_the_agent_set_format() {
+    fn ctl_cell_format_bold_and_fill_is_one_undo_group_and_undo_clears_the_format_key() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(
             r##"{"verb":"cell.format","args":{"range":"A1:B2","patch":{"bold":true,"fillColor":"#FFFF00"}}}"##,
@@ -3698,31 +3674,26 @@ mod tests {
             "{out}"
         );
 
-        // Value preserved, format visible per-cell via cell.get (the leading
-        // `numFmt:"General"` is the pre-existing gap documented above, not
-        // this patch's doing — the patch itself only set bold/fillColor).
+        // Value preserved, format visible per-cell via cell.get.
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A2"}}"#);
         assert!(cell.contains("\"text\":\"Apple\""), "{cell}");
         assert!(
-            cell.contains(r##""format":{"numFmt":"General","bold":true,"fillColor":"#FFFF00"}"##),
+            cell.contains(r##""format":{"bold":true,"fillColor":"#FFFF00"}"##),
             "{cell}"
         );
 
         s.dispatch("undo"); // the declared mechanism: ONE dispatch("undo")
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A2"}}"#);
         assert!(
-            !cell.contains("\"bold\"") && !cell.contains("\"fillColor\""),
-            "one undo must clear the AGENT-SET format fields on every cell in the range: {cell}"
+            !cell.contains("\"format\""),
+            "one undo must clear the format key on every cell in the range: {cell}"
         );
         assert!(
             cell.contains("\"text\":\"Apple\""),
             "value untouched: {cell}"
         );
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B2"}}"#);
-        assert!(
-            !cell.contains("\"bold\"") && !cell.contains("\"fillColor\""),
-            "{cell}"
-        );
+        assert!(!cell.contains("\"format\""), "{cell}");
     }
 
     #[test]
@@ -3733,7 +3704,7 @@ mod tests {
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4"}}"#);
         assert!(cell.contains("\"formula\":\"=SUM(B1:B3)\""), "{cell}");
         assert!(cell.contains("\"value\":3.75"), "{cell}");
-        assert!(cell.contains("\"bold\":true"), "{cell}");
+        assert!(cell.contains("\"format\":{\"bold\":true}"), "{cell}");
     }
 
     #[test]
@@ -3743,8 +3714,6 @@ mod tests {
             r#"{"verb":"cell.format","args":{"range":"B2","patch":{"numFmt":"0.00","italic":true,"align":"right"}}}"#,
         );
         let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B2"}}"#);
-        // The patch itself sets numFmt, so this one is genuinely agent-set,
-        // not the pre-existing "General" artifact.
         assert!(
             out.contains(r#""format":{"numFmt":"0.00","italic":true,"align":"right"}"#),
             "{out}"
@@ -3752,15 +3721,21 @@ mod tests {
     }
 
     #[test]
-    fn ctl_cell_get_format_has_only_the_pre_existing_general_numfmt_for_an_unstyled_cell() {
+    fn ctl_cell_get_reports_no_format_key_for_an_unstyled_cell() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        // See the pre-existing-gap note above the section header: this
-        // SHOULD be `!out.contains("\"format\"")` per the spec's "unstyled
-        // cell has NO format key" clause, but the shared gridcore helper
-        // this task must reuse unmodified leaks a baseline artifact on any
-        // real loaded workbook. Pinned here as the actual wire behavior.
-        assert!(out.contains("\"format\":{\"numFmt\":\"General\"}"), "{out}");
+        assert!(!out.contains("\"format\""), "{out}");
+    }
+
+    #[test]
+    fn ctl_cell_format_reset_to_general_numfmt_echoes_nothing() {
+        // An agent explicitly resetting numFmt to General is, semantically,
+        // resetting to the default — cell.get must not echo it afterward
+        // (gridcore::format::xf_format_fields's documented rule).
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{"numFmt":"General"}}}"#);
+        let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(!out.contains("\"format\""), "{out}");
     }
 
     #[test]
@@ -3769,7 +3744,7 @@ mod tests {
         s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{"bold":true}}}"#);
 
         let get = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(get.contains("\"bold\":true"), "{get}");
+        assert!(get.contains("\"format\":{\"bold\":true}"), "{get}");
 
         let read = s.ctl(r#"{"verb":"sheet.read","args":{"range":"A1"}}"#);
         assert!(
@@ -3790,7 +3765,7 @@ mod tests {
         );
         // ...even though the style survived the rewrite (still bold via cell.get).
         let get = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(get.contains("\"bold\":true"), "{get}");
+        assert!(get.contains("\"format\":{\"bold\":true}"), "{get}");
     }
 
     #[test]
@@ -3815,12 +3790,8 @@ mod tests {
             "{out}"
         );
         assert_eq!(s.undo.len(), undo_before, "a rejected patch must not apply");
-        // Only the pre-existing baseline artifact, nothing agent-set.
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(
-            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
-            "{cell}"
-        );
+        assert!(!cell.contains("\"format\""), "{cell}");
     }
 
     #[test]
@@ -3849,10 +3820,7 @@ mod tests {
             "{out}"
         );
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(
-            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
-            "{cell}"
-        );
+        assert!(!cell.contains("\"format\""), "{cell}");
     }
 
     #[test]
@@ -3866,10 +3834,7 @@ mod tests {
             "{out}"
         );
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(
-            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
-            "{cell}"
-        );
+        assert!(!cell.contains("\"format\""), "{cell}");
     }
 
     #[test]
@@ -3882,10 +3847,7 @@ mod tests {
             "{out}"
         );
         let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
-        assert!(
-            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
-            "{cell}"
-        );
+        assert!(!cell.contains("\"format\""), "{cell}");
     }
 
     // -- col.width: NOT on the undo stack; inverse carries prior width -----
