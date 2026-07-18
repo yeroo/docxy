@@ -180,6 +180,9 @@ pub struct App {
     /// so typing into the comment can never end up attached to a different
     /// event than the one the key was pressed on.
     pub rsvp_prompt: Option<RsvpPrompt>,
+    /// A pending destructive-action confirmation, if any (whole-thread delete
+    /// or move). `Some` blocks other keys until answered — see `ui::handle_key`.
+    pub confirm: Option<ConfirmModal>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -245,6 +248,17 @@ pub struct ThreadView {
     pub expanded: bool,
 }
 
+/// A pending destructive confirmation (whole-conversation delete/move).
+pub struct ConfirmModal {
+    pub prompt: String,
+    pub action: ConfirmAction,
+}
+
+pub enum ConfirmAction {
+    DeleteThread(Vec<String>),
+    MoveThread(Vec<String>, String), // (message ids, destination folder id)
+}
+
 /// One visible line in the threaded list: a collapsible conversation header,
 /// or (only under an expanded header) one of its messages. A single-message
 /// conversation is represented directly as a `Message` row with no header.
@@ -307,6 +321,7 @@ impl App {
             agenda_index: 0,
             selected_event: None,
             rsvp_prompt: None,
+            confirm: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -891,12 +906,58 @@ impl App {
         let _ = self.sync.cmd_tx.send(SyncCommand::SetFlag { id, flagged });
     }
 
+    /// A human count like `5 messages (incl. 2 in Sent)` for a confirm prompt.
+    fn describe_thread_scope(&self, ids: &[String]) -> String {
+        let sent_id = self
+            .store
+            .folders()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|f| f.well_known_name.as_deref() == Some("sentitems"))
+            .map(|f| f.id);
+        let in_sent = match (&sent_id, self.selected_row()) {
+            (Some(sid), Some(Row::Header(t))) => self.threads[t]
+                .thread
+                .messages
+                .iter()
+                .filter(|m| &m.folder_id == sid)
+                .count(),
+            _ => 0,
+        };
+        let n = ids.len();
+        if in_sent > 0 {
+            format!("{n} messages (incl. {in_sent} in Sent)")
+        } else {
+            format!("{n} messages")
+        }
+    }
+
     /// Deletes the highlighted message: removes it from the store, then
     /// `reload_messages` re-reads the (now shorter) list and clamps
     /// `msg_index` so the selection can't point past the end — the same
     /// bounds-safe pattern `reload_messages` already uses when a folder
-    /// switch shrinks the list.
+    /// switch shrinks the list. In threaded mode, a multi-message conversation
+    /// selected via its header opens the confirm modal instead of deleting
+    /// outright (see `confirm_yes`); a threaded singleton/message row deletes
+    /// directly, same as the flat path.
     pub fn delete_selected(&mut self) {
+        if let Some(ids) = self.threaded_target_ids() {
+            if ids.len() > 1 {
+                let prompt = format!("Delete {}?", self.describe_thread_scope(&ids));
+                self.confirm = Some(ConfirmModal {
+                    prompt,
+                    action: ConfirmAction::DeleteThread(ids),
+                });
+                return;
+            }
+            // A singleton / single message row: delete directly.
+            if let Some(id) = ids.into_iter().next() {
+                let _ = self.store.delete_message(&id);
+                self.reload_messages();
+                let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+            }
+            return;
+        }
         let Some(id) = self.highlighted_message_id() else {
             return;
         };
@@ -905,12 +966,53 @@ impl App {
         let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
     }
 
+    /// Esc on the confirm modal: dismiss it, doing nothing.
+    pub fn cancel_confirm(&mut self) {
+        self.confirm = None;
+    }
+
+    /// Enter on the confirm modal: carry out the pending action (per-message
+    /// optimistic store write + `SyncCommand`), then close it and reload.
+    pub fn confirm_yes(&mut self) {
+        let Some(modal) = self.confirm.take() else {
+            return;
+        };
+        match modal.action {
+            ConfirmAction::DeleteThread(ids) => {
+                for id in ids {
+                    let _ = self.store.delete_message(&id);
+                    let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+                }
+            }
+            ConfirmAction::MoveThread(ids, dest) => {
+                for id in ids {
+                    if self.store.move_message(&id, &dest).is_ok() {
+                        let _ = self.sync.cmd_tx.send(SyncCommand::Move {
+                            id,
+                            dest: dest.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.reload_messages();
+    }
+
     /// Opens the move-folder popup over the highlighted message. A no-op if
     /// nothing is highlighted, or there are no folders to move it to (an
     /// empty picker would have nothing to select and nowhere for Enter to
     /// land) — so this can never open a popup `confirm_move` can't act on.
+    /// In threaded mode, captures the threaded target id (`threaded_target_ids`)
+    /// rather than the flat `highlighted_message_id`, since the flat
+    /// `messages` list is empty while threaded — see `confirm_move`, which
+    /// re-derives the full thread-id list for a multi-message conversation
+    /// and ignores `message_id` in that case.
     pub fn open_move_picker(&mut self) {
-        let Some(id) = self.highlighted_message_id() else {
+        let Some(id) = self
+            .threaded_target_ids()
+            .and_then(|v| v.into_iter().next())
+            .or_else(|| self.highlighted_message_id())
+        else {
             return;
         };
         let folders = self.store.folders().unwrap_or_default();
@@ -958,6 +1060,18 @@ impl App {
         let Some(dest) = picker.folders.get(picker.index).map(|f| f.id.clone()) else {
             return;
         };
+        // In threaded mode with a multi-message conversation selected, confirm
+        // the whole-thread move; otherwise move the single captured message.
+        if let Some(ids) = self.threaded_target_ids() {
+            if ids.len() > 1 {
+                let scope = self.describe_thread_scope(&ids);
+                self.confirm = Some(ConfirmModal {
+                    prompt: format!("Move {scope} to this folder?"),
+                    action: ConfirmAction::MoveThread(ids, dest),
+                });
+                return;
+            }
+        }
         if self.store.move_message(&picker.message_id, &dest).is_ok() {
             self.reload_messages();
             let _ = self.sync.cmd_tx.send(SyncCommand::Move {
@@ -2501,5 +2615,53 @@ pub(crate) mod tests {
         app.on_key_char('t');
         assert!(!app.threaded);
         assert!(!app.messages.is_empty()); // back to flat
+    }
+
+    #[test]
+    fn deleting_a_thread_confirms_then_deletes_every_message() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = m1 + m2
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        // First `d` only opens the confirm modal — nothing deleted yet.
+        app.delete_selected();
+        assert!(app.confirm.is_some());
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+
+        // Confirming deletes all messages and enqueues one Delete per message.
+        app.confirm_yes();
+        assert!(app.confirm.is_none());
+        let mut count = 0;
+        while let Ok(SyncCommand::Delete { .. }) = app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn canceling_the_confirm_deletes_nothing() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app);
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+        app.delete_selected();
+        app.cancel_confirm();
+        assert!(app.confirm.is_none());
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
     }
 }

@@ -70,6 +70,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // mailbox behind it at all (first run, no token), and it should win
     // over any other popup that somehow got left open.
     message_list::draw_move_picker(f, app);
+    message_list::draw_confirm(f, app);
     attachments::draw(f, app);
     signin::draw(f, app);
 }
@@ -118,6 +119,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.search.is_some() {
         handle_search_key(app, key);
+        return;
+    }
+    if app.confirm.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_yes(),
+            KeyCode::Esc => app.cancel_confirm(),
+            _ => {}
+        }
         return;
     }
     match key.code {

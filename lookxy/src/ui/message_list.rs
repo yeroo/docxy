@@ -205,6 +205,27 @@ pub fn draw_move_picker(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// Renders the destructive-action confirmation as a centered overlay when
+/// `app.confirm` is set; a no-op otherwise. Enter confirms, Esc cancels
+/// (see `ui::handle_key`).
+pub fn draw_confirm(f: &mut Frame, app: &App) {
+    let Some(modal) = &app.confirm else {
+        return;
+    };
+    let area = centered_rect(50, 20, f.area());
+    f.render_widget(Clear, area);
+    let text = format!("{}\n\n[Enter] confirm    [Esc] cancel", modal.prompt);
+    let para = ratatui::widgets::Paragraph::new(text)
+        .block(
+            Block::default()
+                .title("Confirm")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Yellow)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(para, area);
+}
+
 /// Shortens an ISO-8601 `receivedDateTime` (`2026-07-16T10:00:00Z`) down to
 /// `MM-DD HH:MM` for the list column; falls back to the raw string if it
 /// doesn't have both slices (e.g. empty, in a test fixture, or — despite
