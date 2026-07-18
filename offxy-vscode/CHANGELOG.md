@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **New: the wave-2 agent formatting surface** — the agent control surface
+  (terminal apps, tabs, and both MCP servers) grows from 51 to **53 tools**:
+  - `doc.insert`, `doc.replace-range`, and `doc.append` (docxy) gain an
+    optional `markdown` flag: `text` is parsed as Markdown and the resulting
+    formatted blocks — headings, bold/italic/strike, links, nested bullet
+    and numbered lists, tables, blockquotes, fenced code, math, Mermaid
+    fences — are spliced into the **existing** document at the same
+    position the plain-text write would target. Referenced paragraph styles
+    (`Heading1`–`Heading6`, `Quote`, `SourceCode`) are auto-ensured in
+    `styles.xml` if the target document doesn't already define them, and
+    referenced list numbering is auto-ensured the same way, so a heading or
+    a bulleted list written into an old, styles-sparse `.docx` still renders
+    correctly in Word. `markdown:false` (the default) is byte-identical to
+    today's plain-text behavior; undo-step parity with plain text is
+    preserved. An empty/whitespace-only markdown write errors
+    `"empty markdown"` and touches nothing.
+  - Two new xlsxy verbs: `cell.format` (`xlsxy_format`) applies a patch —
+    `numFmt`, `bold`, `italic`, `fontColor`, `fillColor`, `align` — to every
+    cell in a range as one undo group; `col.width` (`xlsxy_col_width`) sets
+    a column's width (a fractional Excel column-width number), undoable via
+    a prior-width inverse rather than a wasm undo-stack entry (like
+    `comment.add`/`comment.remove`).
+  - `cell.get`'s reply gains an additive, present-if-set `format` object
+    echoing the cell's current style for the six `cell.format` keys above —
+    scoped to `cell.get` only; `sheet.read`, `find`, and `cell.set` don't
+    carry it. An unstyled cell has no `format` key.
+  - See [docs/agent-control.md](../docs/agent-control.md) for the full
+    construct table, patch-key table, and error family.
 - **New: the wave-1 agent verb surface** — every tab (Word and Excel) and both
   terminal apps (`docxy`, `xlsxy`) gain ~30 new control-surface verbs exposed
   as MCP tools, growing the bundled server (and both terminal `--mcp`

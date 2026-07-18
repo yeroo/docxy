@@ -160,21 +160,24 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (51
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (53
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
   `docxy_comments`, `docxy_notes`, `docxy_header`, `docxy_footer`,
   `docxy_metadata`, `docxy_stats`, `docxy_replace_all`, `docxy_undo`,
-  `docxy_redo` (21), and `xlsxy_list`, `xlsxy_new`, `xlsxy_status`,
-  `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,
+  `docxy_redo` (21) — `docxy_replace_range`/`docxy_insert`/`docxy_append` each
+  take an optional `markdown` flag to splice formatted Markdown (headings,
+  bold, lists, tables, links) into the document instead of plain text — and
+  `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`,
+  `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,
   `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
   `xlsxy_comment_add`, `xlsxy_comment_remove`, `xlsxy_range_set`,
   `xlsxy_export_csv`, `xlsxy_import_csv`, `xlsxy_pivot`, `xlsxy_replace_all`,
   `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
   `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
   `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-  `xlsxy_pivots` (30). It's
+  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width` (32). It's
   a thin bridge — it opens no document itself, only forwards to whichever
   `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
   running (the `_new` tools are the exception: they create the file on disk

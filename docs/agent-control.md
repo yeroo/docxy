@@ -67,9 +67,9 @@ One JSON object per line; one reply line per request:
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
 | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` |
-| `doc.replace-range` | `{start, end?, text}` | `{replaced, total}` |
-| `doc.insert` | `{at, text}` | `{total}` |
-| `doc.append` | `{text}` | `{total}` |
+| `doc.replace-range` | `{start, end?, text, markdown?}` | `{replaced, total}` |
+| `doc.insert` | `{at, text, markdown?}` | `{total}` |
+| `doc.append` | `{text, markdown?}` | `{total}` |
 | `doc.save` | — | `{path, …}` |
 | `doc.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `doc.open` | `{path}` | `{path, …}` |
@@ -107,6 +107,56 @@ Notes:
   matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
   `done:false` and does **not** mark the document modified or flash the
   agent-status dot — nothing actually changed.
+
+### Markdown-formatted writes
+
+`doc.insert`, `doc.replace-range`, and `doc.append` all take an optional
+`markdown` boolean (default `false`). `markdown:false` (or the arg omitted)
+is byte-identical to today's plain-text behavior — `text` becomes one
+paragraph per `\n`-separated line. `markdown:true` parses `text` as Markdown
+and splices the resulting **blocks** (headings, styled runs, lists, tables,
+…) into the body at the same position the plain-text form would target, into
+the document's **existing** content — not a fresh package. Replies are
+unchanged (`{total}` / `{replaced, total}`); undo-step parity with the
+plain-text form is preserved (`insert`/`append` = one undo step;
+`replace-range` = two steps when the replaced range is non-empty, one when
+it's empty — same as plain text on the same range). An empty/whitespace-only
+`text` that parses to zero blocks errors `"empty markdown"` and touches
+nothing (no splice, no undo entry, no dirty flag).
+
+Every construct below was verified spliced into an **existing** document
+(not just a freshly generated one), including its round-trip through
+`doc.export {format:"markdown"}`:
+
+| Construct | Result |
+|---|---|
+| Headings `#`..`######` | Works — styles auto-ensured. |
+| Bold / italic / strike | Works. |
+| Inline code | Works structurally (round-trips); the `Code` character style is **not** auto-ensured (see below) — inline code never renders monospace in the TUI or PDF today regardless, a pre-existing, unrelated gap. |
+| Links | Works. |
+| Nested bullet lists | Works — numbering definitions ensured automatically. |
+| Nested ordered lists | Works — numbering definitions ensured automatically. |
+| Tables | Works. |
+| Blockquote | Works — styles auto-ensured. |
+| Horizontal rule | Works. |
+| Fenced code (generic) | Works — styles auto-ensured. |
+| Fenced code with a language tag | Same as generic fenced code; the language tag itself isn't preserved (pre-existing `from_markdown` limitation, unrelated to this feature). |
+| `$inline math$` | Works. |
+| `$$display math$$` | Works. |
+| ` ```mermaid ` fences | Works. |
+
+All 15 constructs land correctly — nothing degrades silently. "Styles
+auto-ensured" means: when a markdown write references a paragraph style the
+target `.docx` doesn't already define (`Heading1`–`Heading6`, `Quote`,
+`SourceCode`), the write injects that style's definition into `styles.xml`
+first (strictly additive — an existing definition with the same id is left
+byte-untouched), so headings/blockquotes/fenced code render correctly in
+Word even when spliced into a package that never had those styles, not just
+one built fresh from Markdown. The one deliberate exception is `Code`: it's
+a run-level *character* style (`w:rStyle`), not a paragraph style, so it
+falls outside this auto-ensure mechanism — inline code's `<w:rStyle
+w:val="Code"/>` reference is written on save regardless, but the style
+definition itself is only ensured for the six paragraph styles above.
 
 ## MCP (native tools in Claude Code)
 
@@ -238,6 +288,26 @@ worth knowing:
   **absolute** `path`: a relative one absolutizes against the serving process's
   cwd, which differs between a terminal instance and the extension host.
 
+**Wave-2 additions on tabs** — markdown-formatted writes and the two new
+xlsxy formatting verbs behave exactly like their terminal counterparts, with
+one undo-mechanics distinction worth knowing:
+
+- **Markdown writes and `cell.format` are true undo-stack entries** — a
+  markdown `doc.insert`/`doc.append`/`doc.replace-range` and a `cell.format`
+  both land on the same wasm undo-stack group their plain-text/`range.set`
+  counterparts do, so a single <kbd>Ctrl+Z</kbd> undoes the whole write (one
+  step for insert/append, matching the plain-text step count for
+  replace-range; one step for `cell.format` regardless of how many cells the
+  range covered).
+- **`col.width` undoes via an inverse, like `comment.add`/`comment.remove`**
+  — it is not on the wasm undo stack at all (matching the TUI's own `F7`/`F8`
+  width keys), so the tab drives it the same host-orchestrated way Wave-1's
+  comment verbs work: the wasm reply carries the prior width as a
+  self-describing inverse `col.width` call, and the tab's "Agent: col.width"
+  edit event's own undo/redo applies that inverse (and the inverse's own
+  reply carries a fresh inverse back to the width just replaced, so redo
+  keeps working indefinitely) — rather than an on-stack undo replay.
+
 `docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
 **new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
 file is still created on disk but nothing opens (`"opened":false`). The
@@ -260,9 +330,11 @@ name and defaults to the active sheet):
 | `wb.path` | — | `{path, modified, sheets, active, active_name}` |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
-| `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |
+| `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text, format?}` — `format` is present only if the cell has non-default styling (see below) |
 | `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — leading `=` is a formula, validated + recalculated |
 | `range.clear` | `{range, sheet?}` | `{cleared}` |
+| `cell.format` | `{range, patch, sheet?}` | `{formatted}` — cell count; ONE undo group over every cell in `range` |
+| `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
 | `wb.save` | — | `{path, …}` |
@@ -301,6 +373,58 @@ Notes:
   the active sheet) — a destructive or renaming op shouldn't silently land on
   "whichever sheet happens to be showing".
 
+### Cell formatting
+
+`cell.format`'s `patch` is an object with at least one of these six optional
+keys — an empty or all-unknown-key patch is an error (below), and setting a
+key applies it to every cell in `range`; keys left out of the patch leave
+that aspect of each cell's existing style untouched:
+
+| Key | Type | Notes |
+|---|---|---|
+| `numFmt` | string | a number-format code, as `numfmt::parse_format` accepts |
+| `bold` | boolean | |
+| `italic` | boolean | |
+| `fontColor` | string | `"#RRGGBB"` |
+| `fillColor` | string | `"#RRGGBB"` |
+| `align` | string | `"left"` \| `"center"` \| `"right"` |
+
+Errors: an empty patch → `"patch needs at least one key"`; an unknown key →
+`"unknown patch key '<key>'"` naming the offending key; a malformed value for
+a known key → a key-specific message (e.g. `"bad numFmt code '<code>'"`,
+`"bad color '<value>' (want \"#RRGGBB\")"`). A rejected patch applies
+nothing. `col.width`'s `width` is a fractional **number** (Excel
+column-width units, e.g. `20.5`), not an integer; a non-positive width
+errors `"col.width: 'width' must be positive"`.
+
+`col.width`'s undo behavior differs from `cell.format`'s: `cell.format` lands
+on the same true undo-stack group `range.set` uses (one undo step, all
+formatted cells restored together). `col.width` is **not** on the undo
+stack at all (matching the TUI's own `F7`/`F8` width keys) — the wasm/tab
+surfaces instead carry the prior width as a self-describing inverse (see
+"VS Code tabs" below), the same pattern Wave-1 used for `comment.add`/
+`comment.remove`.
+
+### Format read-back (`cell.get` only)
+
+`cell.get`'s reply gains an additive, present-if-set `format` object echoing
+whichever of the six `patch` keys above differ from the cell's style
+defaults — an unstyled cell (or one explicitly reset back to the default for
+every key it touched) has **no** `format` key at all, not an empty object.
+This read-back is deliberately scoped to `cell.get` **only**: `sheet.read`,
+`find`, and `cell.set`'s own reply never carry a `format` key, even for a
+heavily styled cell, to keep bulk reads and the busiest mutating verb lean.
+
+The "differs from default" rule has one subtlety: `numFmt` compares by
+**classification**, not by raw stored code string, specifically so a real
+loaded `.xlsx`'s implicit `numFmtId="0"` ("General") — present on every
+unstyled cell in any file Excel actually wrote — never echoes as
+`numFmt:"General"`. The other five fields have no equivalent implicit
+default-but-present value, so they compare directly against the workbook's
+default style. One consequence: explicitly patching `numFmt:"General"` as a
+deliberate reset also echoes nothing afterward, matching how the other five
+fields already behave when reset to their default.
+
 MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`,
 `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
@@ -309,7 +433,9 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-`xlsxy_pivots` (30 total). Skill: `xlsxy install skill`.
+`xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width` (32 total; docxy's 21 +
+xlsxy's 32 = **53 tools** total across both apps). Skill:
+`xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
 `proj.path`, `task.list` (scheduled dates, critical path, slack, links),
