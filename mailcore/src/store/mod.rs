@@ -515,6 +515,49 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every message belonging to the `limit` most-recent conversations that
+    /// have at least one message in `folder_id` — including their messages in
+    /// *other* folders (Sent/Archive), so the folder view can show whole
+    /// cross-folder conversations. Grouping key is `conversation_id`, or
+    /// `msg:<id>` when it's blank (a blank-conversation message is its own
+    /// singleton). Ordered `(conversation latest received DESC, message
+    /// received ASC)`.
+    pub fn conversations_in_folder(
+        &self,
+        folder_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<MessageRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "WITH keyed AS (
+                 SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
+                        to_recipients, cc_recipients, received_at, sent_at,
+                        is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                        CASE WHEN conversation_id <> '' THEN conversation_id
+                             ELSE 'msg:' || id END AS conv_key
+                 FROM messages
+             ),
+             ranked AS (
+                 SELECT conv_key, MAX(received_at) AS latest
+                 FROM keyed
+                 WHERE conv_key IN (SELECT DISTINCT conv_key FROM keyed WHERE folder_id = ?1)
+                 GROUP BY conv_key
+                 ORDER BY latest DESC
+                 LIMIT ?2 OFFSET ?3
+             )
+             SELECT k.id, k.folder_id, k.conversation_id, k.subject, k.from_name, k.from_addr,
+                    k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
+                    k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft
+             FROM keyed k
+             JOIN ranked r ON k.conv_key = r.conv_key
+             ORDER BY r.latest DESC, k.received_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![folder_id, limit, offset], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Locally marks a message read/unread. This is a local-only mutation
     /// of the row (the sync engine's outbox is what tells Graph); it's
     /// deliberately infallible-looking (no `Result`) since a mismatched or
@@ -1428,6 +1471,80 @@ mod tests {
         let rows = s.messages_in_folder("F", 50, 0).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "11"); // received 07-11 > 07-10
+    }
+
+    #[test]
+    fn conversations_in_folder_gathers_the_thread_across_folders() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "inbox".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "sent".into(),
+                display_name: "Sent".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("sentitems".into()),
+            })
+            .unwrap();
+
+        // Conversation c1: an inbox message + a reply the user sent (in Sent).
+        let mut inbound = msg("10", false); // helper sets received "2026-07-10T..."
+        inbound.conversation_id = "c1".into();
+        inbound.from = Recipient {
+            name: "Ann".into(),
+            address: "ann@x".into(),
+        };
+        let mut reply = msg("12", true);
+        reply.conversation_id = "c1".into();
+        // A conversation c2 that lives only in Sent (must NOT appear in inbox view).
+        let mut sent_only = msg("11", true);
+        sent_only.conversation_id = "c2".into();
+
+        store.upsert_message("inbox", &inbound).unwrap();
+        store.upsert_message("sent", &reply).unwrap();
+        store.upsert_message("sent", &sent_only).unwrap();
+
+        let rows = store.conversations_in_folder("inbox", 50, 0).unwrap();
+        // c1 only: both its messages, including the one filed under Sent.
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"10"));
+        assert!(ids.contains(&"12")); // cross-folder: the Sent reply is included
+        assert!(!ids.contains(&"11")); // c2 has no inbox message → excluded
+    }
+
+    #[test]
+    fn conversations_in_folder_singletons_blank_conversation_ids() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "inbox".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+        let mut a = msg("20", false);
+        a.conversation_id = "".into();
+        let mut b = msg("21", false);
+        b.conversation_id = "".into();
+        store.upsert_message("inbox", &a).unwrap();
+        store.upsert_message("inbox", &b).unwrap();
+
+        let rows = store.conversations_in_folder("inbox", 50, 0).unwrap();
+        assert_eq!(rows.len(), 2); // two independent singletons, not one merged group
     }
 
     #[test]
