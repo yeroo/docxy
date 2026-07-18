@@ -1622,6 +1622,27 @@ impl App {
         }
     }
 
+    /// Removes the most-recently-added attachment (the last in attach order) from
+    /// the open draft: deletes it in the store, then re-reads `compose.attachments`
+    /// from the store so the in-memory list can't drift from the stored truth even
+    /// if the delete fails. No-op if nothing is attached / no composer open.
+    pub fn remove_last_attachment(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let draft_id = compose.draft_id.clone();
+        let Some(last) = compose.attachments.last().map(|a| a.path.clone()) else {
+            return;
+        };
+        let _ = self.store.remove_outbound_attachment(&draft_id, &last);
+        if let Some(compose) = self.compose.as_mut() {
+            compose.attachments = self
+                .store
+                .outbound_attachments(&draft_id)
+                .unwrap_or_default();
+        }
+    }
+
     /// Test-only: whether `open_url_with_os_handler` has been reached at
     /// least once (see `browser_open_invocations`) — `SyncEvent::SignInStarted`
     /// is the only thing that calls it.
@@ -2975,6 +2996,55 @@ pub(crate) mod tests {
         assert_eq!(app.store.outbound_attachments(&draft_id).unwrap().len(), 1);
         assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
         assert_eq!(app.compose.as_ref().unwrap().attachments[0].name, "r.pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_last_attachment_removes_the_most_recent_and_stays_consistent() {
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new(); // opens a fresh local draft
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+
+        // two real temp files, attached in a known order
+        let dir = std::env::temp_dir().join(format!("lookxy-remove-last-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a.txt");
+        let file_b = dir.join("b.txt");
+        std::fs::write(&file_a, b"aaa").unwrap();
+        std::fs::write(&file_b, b"bbb").unwrap();
+
+        app.attach_file(&file_a);
+        app.attach_file(&file_b);
+
+        // the most-recently-attached file is last in attach order
+        assert_eq!(
+            app.compose
+                .as_ref()
+                .unwrap()
+                .attachments
+                .last()
+                .unwrap()
+                .name,
+            "b.txt"
+        );
+
+        app.remove_last_attachment();
+
+        // gone from the in-memory list...
+        let names: Vec<String> = app
+            .compose
+            .as_ref()
+            .unwrap()
+            .attachments
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(names, vec!["a.txt"]);
+        // ...and from the store, and the two stay in agreement.
+        let stored = app.store.outbound_attachments(&draft_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "a.txt");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

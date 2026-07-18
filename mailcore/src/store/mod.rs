@@ -806,13 +806,16 @@ impl Store {
         Ok(())
     }
 
-    /// The files attached to `draft_id`, ordered by name.
+    /// The files attached to `draft_id`, in attach (insertion) order — SQLite's
+    /// implicit `rowid` tracks insertion order, and callers (compose's
+    /// attachment list, Ctrl+R's LIFO removal) rely on the last element being
+    /// the most-recently-added attachment.
     pub fn outbound_attachments(
         &self,
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ?1 ORDER BY name",
+            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ?1 ORDER BY rowid",
         )?;
         let rows = stmt
             .query_map(params![draft_id], |r| {
@@ -2630,16 +2633,21 @@ mod draft_tests {
     #[test]
     fn outbound_attachment_crud_and_dedup() {
         let s = Store::open_in_memory().unwrap();
-        s.add_outbound_attachment("local:d1", "/tmp/a.pdf", "a.pdf", 10)
+        // Insert in an order that is NOT alphabetical, to prove
+        // `outbound_attachments` returns insertion order (rowid), not name
+        // order — the last element must be the most-recently-added one for
+        // Ctrl+R's LIFO removal to work.
+        s.add_outbound_attachment("local:d1", "/tmp/z.pdf", "z.pdf", 10)
             .unwrap();
-        s.add_outbound_attachment("local:d1", "/tmp/b.txt", "b.txt", 20)
+        s.add_outbound_attachment("local:d1", "/tmp/a.txt", "a.txt", 20)
             .unwrap();
-        s.add_outbound_attachment("local:d1", "/tmp/a.pdf", "a.pdf", 10)
+        s.add_outbound_attachment("local:d1", "/tmp/z.pdf", "z.pdf", 10)
             .unwrap(); // dup path → no-op
         let got = s.outbound_attachments("local:d1").unwrap();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].name, "a.pdf"); // ordered by name
-        s.remove_outbound_attachment("local:d1", "/tmp/a.pdf")
+        let names: Vec<&str> = got.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["z.pdf", "a.txt"]); // insertion order, not name order
+        s.remove_outbound_attachment("local:d1", "/tmp/z.pdf")
             .unwrap();
         assert_eq!(s.outbound_attachments("local:d1").unwrap().len(), 1);
         s.clear_outbound_attachments("local:d1").unwrap();

@@ -593,13 +593,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
-        if let Some(compose) = app.compose.as_mut() {
-            if let Some(att) = compose.attachments.pop() {
-                let _ = app
-                    .store
-                    .remove_outbound_attachment(&compose.draft_id, &att.path);
-            }
-        }
+        app.remove_last_attachment();
         return;
     }
 
