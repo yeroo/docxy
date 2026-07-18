@@ -863,7 +863,11 @@ impl App {
             // Flag the whole thread ON if any is currently unflagged, else clear
             // it — so one keypress makes the thread's flag state uniform.
             let want = match self.selected_row() {
-                Some(Row::Header(t)) => !self.threads[t].thread.any_flagged,
+                Some(Row::Header(t)) => self.threads[t]
+                    .thread
+                    .messages
+                    .iter()
+                    .any(|m| !m.is_flagged),
                 Some(Row::Message(t, m)) => !self.threads[t].thread.messages[m].is_flagged,
                 None => return,
             };
@@ -1814,6 +1818,43 @@ pub(crate) mod tests {
         // ...and one MarkRead command was enqueued per message.
         let mut count = 0;
         while let Ok(SyncCommand::MarkRead { read: true, .. }) =
+            app.test_cmd_rx.as_ref().unwrap().try_recv()
+        {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn toggle_flag_on_mixed_thread_flags_all() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = m1 + m2, both start unflagged
+        app.store.set_flag("m1", true); // now MIXED: m1 flagged, m2 not
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        app.toggle_flag();
+
+        // The mixed thread must be completed (every message flagged), not
+        // stripped — this is the regression the `!any_flagged` bug got wrong.
+        let hpos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        if let Row::Header(t) = app.visible_rows[hpos] {
+            assert!(app.threads[t].thread.messages.iter().all(|m| m.is_flagged));
+        }
+        // ...and one SetFlag { flagged: true } command was enqueued per message.
+        let mut count = 0;
+        while let Ok(SyncCommand::SetFlag { flagged: true, .. }) =
             app.test_cmd_rx.as_ref().unwrap().try_recv()
         {
             count += 1;
