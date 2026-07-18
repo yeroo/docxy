@@ -22,6 +22,13 @@
 //! | `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` |
 //! | `range.clear` | `{range, sheet?}` | `{cleared}` |
 //! | `find` | `{query, sheet?}` | `{count, matches:[…]}` |
+//! | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` |
+//! | `wb.export-csv` | `{sheet?}` | `{sheet, csv}` (display-formatted) |
+//! | `sheet.pivot` | `{range,rows,cols?,values,sheet?}` | `{table:[[string]]}` — read-only |
+//! | `formula.eval` | `{formula,ref?,sheet?}` | `{value,text}` — side-effect-free |
+//! | `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
+//! | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
+//! | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.save` | — | `{path, …}` |
 //! | `wb.reload` | — | `{path, …}` |
@@ -29,8 +36,13 @@
 
 use crate::{App, parse_input};
 use ctlcore::json::Json;
-use gridcore::engine::Engine;
-use gridcore::sheet::{Cell, CellValue, cell_name, fmt_general, parse_cell_name, parse_range_name};
+use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
+use gridcore::formula::Value;
+use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
+use gridcore::sheet::{
+    Cell, CellValue, DrawingKind, cell_name, fmt_general, parse_cell_name, parse_range_name,
+    sheet_to_csv,
+};
 
 /// The most cells one `sheet.read` returns (non-empty cells in the window);
 /// larger reads set `truncated: true` so a client narrows the range.
@@ -49,6 +61,13 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "cell.set" => cell_set(app, args),
         "range.clear" => range_clear(app, args),
         "find" => find(app, args),
+        "comment.list" => Ok(comment_list(app)),
+        "wb.export-csv" => wb_export_csv(app, args),
+        "sheet.pivot" => sheet_pivot(app, args),
+        "formula.eval" => formula_eval(app, args),
+        "sheet.stats" => sheet_stats(app, args),
+        "chart.list" => Ok(chart_list(app)),
+        "pivot.list" => Ok(pivot_list(app)),
         "wb.recalc" => {
             app.recalc_and_refresh();
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
@@ -244,6 +263,227 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         ("count", Json::Num(matches.len() as f64)),
         ("matches", Json::Arr(matches)),
     ]))
+}
+
+/// Every comment in the workbook, flattened in `SheetPackage::comments`'s
+/// reply order (sheet, then row, then column).
+fn comment_list(app: &App) -> Json {
+    let comments = app
+        .pkg
+        .comments()
+        .iter()
+        .map(|c| {
+            Json::obj(vec![
+                ("sheet", Json::Num(c.sheet as f64)),
+                ("ref", Json::Str(cell_name(c.row, c.col))),
+                ("author", Json::Str(c.author.clone())),
+                ("text", Json::Str(c.text.clone())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("comments", Json::Arr(comments))])
+}
+
+fn wb_export_csv(app: &App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let wb = &app.pkg.workbook;
+    let csv = sheet_to_csv(&wb.sheets[si], &wb.styles, wb.date1904);
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("csv", Json::Str(csv)),
+    ]))
+}
+
+/// One `{col, agg}` pair from `sheet.pivot`'s `values` array.
+fn parse_measure_arg(v: &Json) -> Result<(String, Agg), String> {
+    let col = v
+        .get_str("col")
+        .ok_or("sheet.pivot: each value needs a 'col'")?
+        .to_string();
+    let agg_s = v
+        .get_str("agg")
+        .ok_or("sheet.pivot: each value needs an 'agg'")?;
+    let agg =
+        Agg::from_verb_name(agg_s).ok_or_else(|| format!("sheet.pivot: unknown agg '{agg_s}'"))?;
+    Ok((col, agg))
+}
+
+/// An array of header-name strings (`rows`/`cols`), defaulting to empty when
+/// the key is absent.
+fn names_arg(args: &Json, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ad-hoc, read-only pivot over `range`: no workbook mutation, computed
+/// straight from a [`Frame`] snapshot via [`gridcore::frame::pivot`].
+fn sheet_pivot(app: &App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let rg = args.get_str("range").ok_or("sheet.pivot needs a 'range'")?;
+    let (r1, c1, r2, c2) = parse_range(rg)?;
+    let frame = Frame::from_range(&app.pkg.workbook, si, (r1, c1, r2, c2));
+
+    let rows = names_arg(args, "rows");
+    let cols = names_arg(args, "cols");
+    let values_json = args
+        .get("values")
+        .and_then(Json::as_array)
+        .ok_or("sheet.pivot needs a 'values' array")?;
+    let values = values_json
+        .iter()
+        .map(parse_measure_arg)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let spec = pivot_spec_from_names(&frame, &rows, &cols, &values)
+        .map_err(|col| format!("sheet.pivot: unknown column '{col}'"))?;
+    let out = pivot(&frame, &spec);
+    let table = pivot_table_strings(&out)
+        .into_iter()
+        .map(|row| Json::Arr(row.into_iter().map(Json::Str).collect()))
+        .collect();
+    Ok(Json::obj(vec![("table", Json::Arr(table))]))
+}
+
+/// The typed result and general-format display text of a formula value.
+fn formula_value_json(v: &Value) -> Json {
+    match v {
+        Value::Empty => Json::Null,
+        Value::Num(n) => Json::Num(*n),
+        Value::Str(s) => Json::Str(s.clone()),
+        Value::Bool(b) => Json::Bool(*b),
+        Value::Err(e) => Json::Str(e.code().to_string()),
+    }
+}
+
+fn formula_value_text(v: &Value) -> String {
+    match v {
+        Value::Empty => String::new(),
+        Value::Num(n) => fmt_general(*n),
+        Value::Str(s) => s.clone(),
+        Value::Bool(true) => "TRUE".to_string(),
+        Value::Bool(false) => "FALSE".to_string(),
+        Value::Err(e) => e.code().to_string(),
+    }
+}
+
+/// Side-effect-free formula preview: evaluates `formula` against the live
+/// workbook at `ref` (default A1) without writing anywhere.
+fn formula_eval(app: &App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let formula = args
+        .get_str("formula")
+        .ok_or("formula.eval needs a 'formula'")?;
+    let body = formula.strip_prefix('=').unwrap_or(formula);
+    let (r, c) = match args.get_str("ref") {
+        Some(rf) => parse_cell_name(rf.trim()).ok_or_else(|| format!("bad cell ref '{rf}'"))?,
+        None => (0, 0),
+    };
+    let v = eval_formula_at(&app.pkg.workbook, si, r, c, body);
+    Ok(Json::obj(vec![
+        ("value", formula_value_json(&v)),
+        ("text", Json::Str(formula_value_text(&v))),
+    ]))
+}
+
+/// Summary statistics (sum/count/countNums/average/min/max) over `range`.
+fn sheet_stats(app: &App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let rg = args.get_str("range").ok_or("sheet.stats needs a 'range'")?;
+    let (r1, c1, r2, c2) = parse_range(rg)?;
+    let s = &app.pkg.workbook.sheets[si];
+    let mut vals = Vec::new();
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            vals.push(
+                s.cell(r, c)
+                    .map(|cl| cell_to_value(&cl.value))
+                    .unwrap_or(Value::Empty),
+            );
+        }
+    }
+    let st = range_stats(&vals);
+    Ok(Json::obj(vec![
+        ("sum", Json::Num(st.sum)),
+        ("count", Json::Num(st.count as f64)),
+        ("countNums", Json::Num(st.count_nums as f64)),
+        ("average", Json::Num(st.average)),
+        ("min", Json::Num(st.min)),
+        ("max", Json::Num(st.max)),
+    ]))
+}
+
+/// Every chart on the workbook, read from each sheet's already-parsed
+/// `drawings` (populated at load time by `drawing::parse_drawings`) — the
+/// same source the TUI's overlay reads to render chart boxes over the grid.
+fn chart_list(app: &App) -> Json {
+    let mut charts = Vec::new();
+    for s in &app.pkg.workbook.sheets {
+        for d in &s.drawings {
+            let DrawingKind::Chart(cd) = &d.kind else {
+                continue;
+            };
+            let mut fields = vec![("kind", Json::Str(cd.kind.clone()))];
+            if !cd.title.is_empty() {
+                fields.push(("title", Json::Str(cd.title.clone())));
+            }
+            fields.push((
+                "categories",
+                Json::Arr(cd.categories.iter().cloned().map(Json::Str).collect()),
+            ));
+            let series = cd
+                .series
+                .iter()
+                .map(|ser| {
+                    let mut sf = Vec::new();
+                    if !ser.name.is_empty() {
+                        sf.push(("name", Json::Str(ser.name.clone())));
+                    }
+                    sf.push((
+                        "values",
+                        Json::Arr(ser.values.iter().map(|v| Json::Num(*v)).collect()),
+                    ));
+                    Json::obj(sf)
+                })
+                .collect();
+            fields.push(("series", Json::Arr(series)));
+            charts.push(Json::obj(fields));
+        }
+    }
+    Json::obj(vec![("charts", Json::Arr(charts))])
+}
+
+/// Every persistent pivot table, summarized: row/column field names and
+/// value (data field) display names, from `workbook.pivots`.
+fn pivot_list(app: &App) -> Json {
+    let pivots = app
+        .pkg
+        .workbook
+        .pivots
+        .iter()
+        .map(|p| {
+            let field_name = |i: &usize| p.fields.get(*i).cloned().unwrap_or_default();
+            let rows: Vec<Json> = p.row_fields.iter().map(field_name).map(Json::Str).collect();
+            let cols: Vec<Json> = p.col_fields.iter().map(field_name).map(Json::Str).collect();
+            let values: Vec<Json> = p
+                .data_fields
+                .iter()
+                .map(|df| Json::Str(df.name.clone()))
+                .collect();
+            Json::obj(vec![
+                ("sheet", Json::Num(p.sheet as f64)),
+                ("rows", Json::Arr(rows)),
+                ("cols", Json::Arr(cols)),
+                ("values", Json::Arr(values)),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("pivots", Json::Arr(pivots))])
 }
 
 // ---------------------------------------------------------------------------
@@ -516,5 +756,253 @@ mod tests {
         // Reversed corners normalize.
         assert_eq!(parse_range("C10:A1").unwrap(), (0, 0, 9, 2));
         assert!(parse_range("junk!").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-1 read verbs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn comment_list_flattens_comments_in_reply_order() {
+        let mut a = app();
+        a.pkg.set_comment(0, 1, 2, "Reviewer", "Check this value");
+        a.pkg
+            .add_threaded_comment(0, 3, 0, "Ana", "A note", "2024-01-02T03:04:05Z");
+        let r = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        let comments = r.get("comments").unwrap().as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].get_usize("sheet"), Some(0));
+        assert_eq!(comments[0].get_str("ref"), Some("C2"));
+        assert_eq!(comments[0].get_str("author"), Some("Reviewer"));
+        assert_eq!(comments[0].get_str("text"), Some("Check this value"));
+        assert_eq!(comments[1].get_str("ref"), Some("A4"));
+        assert_eq!(comments[1].get_str("author"), Some("Ana"));
+    }
+
+    #[test]
+    fn comment_list_empty_on_plain_fixture() {
+        let mut a = app();
+        let r = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        assert_eq!(r.get("comments").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wb_export_csv_returns_display_formatted_text() {
+        let mut a = app();
+        set(&mut a, "A1", "name");
+        set(&mut a, "B1", "amount");
+        set(&mut a, "A2", "Alice");
+        set(&mut a, "B2", "30");
+        let r = dispatch(&mut a, "wb.export-csv", &Json::Null).unwrap();
+        assert_eq!(r.get_usize("sheet"), Some(0));
+        assert_eq!(r.get_str("csv"), Some("name,amount\nAlice,30\n"));
+    }
+
+    fn pivot_fixture(a: &mut App) {
+        set(a, "A1", "name");
+        set(a, "B1", "amount");
+        set(a, "A2", "Alice");
+        set(a, "B2", "10");
+        set(a, "A3", "Bob");
+        set(a, "B3", "20");
+        set(a, "A4", "Alice");
+        set(a, "B4", "20");
+    }
+
+    #[test]
+    fn sheet_pivot_sums_by_group_including_header_row() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r = dispatch(
+            &mut a,
+            "sheet.pivot",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B4".into())),
+                ("rows", Json::Arr(vec![Json::Str("name".into())])),
+                (
+                    "values",
+                    Json::Arr(vec![Json::obj(vec![
+                        ("col", Json::Str("amount".into())),
+                        ("agg", Json::Str("sum".into())),
+                    ])]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let table = r.get("table").unwrap().as_array().unwrap();
+        let row_strs: Vec<Vec<&str>> = table
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(row_strs[0], vec!["name", "Sum of amount"]);
+        assert_eq!(row_strs[1], vec!["Alice", "30"]);
+        assert_eq!(row_strs[2], vec!["Bob", "20"]);
+    }
+
+    #[test]
+    fn sheet_pivot_unknown_header_names_the_column() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let err = dispatch(
+            &mut a,
+            "sheet.pivot",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B4".into())),
+                ("rows", Json::Arr(vec![Json::Str("nope".into())])),
+                ("values", Json::Arr(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("nope"), "error should name the column: {err}");
+    }
+
+    #[test]
+    fn formula_eval_returns_value_and_text_without_mutating() {
+        let mut a = app();
+        set(&mut a, "A1", "10");
+        let modified_before = a.modified;
+        let r = dispatch(
+            &mut a,
+            "formula.eval",
+            &Json::obj(vec![
+                ("formula", Json::Str("=A1+1".into())),
+                ("ref", Json::Str("B5".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get("value").unwrap().as_f64(), Some(11.0));
+        assert_eq!(r.get_str("text"), Some("11"));
+        // Nothing was written at the context ref or anywhere else.
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("B5".into()))])).unwrap();
+        assert_eq!(g.get("value"), Some(&Json::Null));
+        // formula.eval itself flips nothing beyond the prior cell.set.
+        assert_eq!(a.modified, modified_before);
+    }
+
+    #[test]
+    fn formula_eval_defaults_ref_to_a1_and_reports_errors() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "formula.eval",
+            &Json::obj(vec![("formula", Json::Str("=1/0".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_str("text"), Some("#DIV/0!"));
+    }
+
+    #[test]
+    fn sheet_stats_returns_all_six_keys_over_numeric_range() {
+        let mut a = app();
+        set(&mut a, "A1", "10");
+        set(&mut a, "A2", "20");
+        set(&mut a, "A3", "-5");
+        let r = dispatch(
+            &mut a,
+            "sheet.stats",
+            &Json::obj(vec![("range", Json::Str("A1:A3".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("sum").unwrap().as_f64(), Some(25.0));
+        assert_eq!(r.get_usize("count"), Some(3));
+        assert_eq!(r.get_usize("countNums"), Some(3));
+        assert_eq!(r.get("average").unwrap().as_f64(), Some(25.0 / 3.0));
+        assert_eq!(r.get("min").unwrap().as_f64(), Some(-5.0));
+        assert_eq!(r.get("max").unwrap().as_f64(), Some(20.0));
+    }
+
+    #[test]
+    fn chart_list_empty_on_plain_fixture() {
+        let mut a = app();
+        let r = dispatch(&mut a, "chart.list", &Json::Null).unwrap();
+        assert_eq!(r.get("charts").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn chart_list_reports_kind_title_categories_and_series() {
+        use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind};
+        let mut a = app();
+        a.pkg.workbook.sheets[0].drawings.push(Drawing {
+            from: (0, 0),
+            to: (10, 5),
+            kind: DrawingKind::Chart(ChartData {
+                title: "Sales".into(),
+                kind: "bar".into(),
+                categories: vec!["North".into(), "South".into()],
+                series: vec![ChartSeries {
+                    name: "Q1".into(),
+                    values: vec![10.0, 20.0],
+                }],
+            }),
+        });
+        let r = dispatch(&mut a, "chart.list", &Json::Null).unwrap();
+        let charts = r.get("charts").unwrap().as_array().unwrap();
+        assert_eq!(charts.len(), 1);
+        assert_eq!(charts[0].get_str("kind"), Some("bar"));
+        assert_eq!(charts[0].get_str("title"), Some("Sales"));
+        let cats = charts[0].get("categories").unwrap().as_array().unwrap();
+        assert_eq!(cats[0].as_str(), Some("North"));
+        let series = charts[0].get("series").unwrap().as_array().unwrap();
+        assert_eq!(series[0].get_str("name"), Some("Q1"));
+        let vals = series[0].get("values").unwrap().as_array().unwrap();
+        assert_eq!(vals[0].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn pivot_list_empty_on_plain_fixture() {
+        let mut a = app();
+        let r = dispatch(&mut a, "pivot.list", &Json::Null).unwrap();
+        assert_eq!(r.get("pivots").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pivot_list_summarizes_rows_cols_and_values() {
+        use gridcore::pivot::{DataField, Pivot, PivotSource};
+        let mut a = app();
+        a.pkg.workbook.pivots.push(Pivot {
+            name: "P".into(),
+            sheet: 0,
+            location: (0, 3, 0, 3),
+            source: PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 3, 1),
+            },
+            fields: vec!["Region".into(), "Sales".into()],
+            row_fields: vec![0],
+            col_fields: vec![],
+            data_fields: vec![DataField {
+                name: "Sum of Sales".into(),
+                field: 1,
+                agg: gridcore::frame::Agg::Sum,
+            }],
+            field_items: Vec::new(),
+            hidden: Vec::new(),
+            page: Vec::new(),
+            items_order: Vec::new(),
+            calc_formulas: Vec::new(),
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            data_on_rows: false,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        });
+        let r = dispatch(&mut a, "pivot.list", &Json::Null).unwrap();
+        let pivots = r.get("pivots").unwrap().as_array().unwrap();
+        assert_eq!(pivots.len(), 1);
+        assert_eq!(pivots[0].get_usize("sheet"), Some(0));
+        let rows = pivots[0].get("rows").unwrap().as_array().unwrap();
+        assert_eq!(rows[0].as_str(), Some("Region"));
+        assert_eq!(pivots[0].get("cols").unwrap().as_array().unwrap().len(), 0);
+        let values = pivots[0].get("values").unwrap().as_array().unwrap();
+        assert_eq!(values[0].as_str(), Some("Sum of Sales"));
     }
 }

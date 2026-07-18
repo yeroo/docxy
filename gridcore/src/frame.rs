@@ -248,6 +248,28 @@ impl Agg {
         })
     }
 
+    /// From the wire-contract agg strings used by `sheet.pivot` and its wasm
+    /// mirror (the spec's 11 values): `sum, count, countNums, average, max,
+    /// min, product, stdDev, stdDevP, var, varP`. Distinct spellings from
+    /// [`Agg::from_subtotal`]'s OOXML attribute values (`stdDevp`/`varp`,
+    /// lowercase `p`) — this is the wire contract, not the file format.
+    pub fn from_verb_name(s: &str) -> Option<Agg> {
+        Some(match s {
+            "sum" => Agg::Sum,
+            "count" => Agg::Count,
+            "countNums" => Agg::CountNums,
+            "average" => Agg::Average,
+            "max" => Agg::Max,
+            "min" => Agg::Min,
+            "product" => Agg::Product,
+            "stdDev" => Agg::StdDev,
+            "stdDevP" => Agg::StdDevP,
+            "var" => Agg::Var,
+            "varP" => Agg::VarP,
+            _ => return None,
+        })
+    }
+
     /// The `subtotal` attribute value to store; `None` = sum (omitted).
     pub fn subtotal_code(&self) -> Option<&'static str> {
         Some(match self {
@@ -702,6 +724,109 @@ pub fn pivot(f: &Frame, spec: &PivotSpec) -> PivotOut {
     }
 }
 
+/// Build a [`PivotSpec`] from column *header names* — the wire contract
+/// shared by `sheet.pivot` (xlsxy) and its wasm mirror — resolving each name
+/// against `frame` via [`Frame::col_index`]. Value measures get an
+/// Excel-style display name ("Sum of Sales"). On the first name that doesn't
+/// match any header, returns that name as `Err` so the caller can report
+/// which column was unknown.
+pub fn pivot_spec_from_names(
+    frame: &Frame,
+    rows: &[String],
+    cols: &[String],
+    values: &[(String, Agg)],
+) -> Result<PivotSpec, String> {
+    let resolve = |name: &String| frame.col_index(name).ok_or_else(|| name.clone());
+    let rows = rows.iter().map(resolve).collect::<Result<Vec<_>, _>>()?;
+    let cols = cols.iter().map(resolve).collect::<Result<Vec<_>, _>>()?;
+    let measures = values
+        .iter()
+        .map(|(name, agg)| {
+            let idx = resolve(name)?;
+            Ok(Measure {
+                col: idx,
+                agg: *agg,
+                name: format!("{} of {}", agg.label(), frame.names[idx]),
+                calc: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PivotSpec {
+        rows,
+        cols,
+        measures,
+        ..PivotSpec::default()
+    })
+}
+
+/// The reply shape for `sheet.pivot`'s `table` field: a [`PivotOut`]'s
+/// computed grid (header rows and label columns included, as `pivot` laid
+/// them out) rendered as display strings — General-formatted numbers, error
+/// codes (`#DIV/0!`) for error cells, empty string for blank cells.
+pub fn pivot_table_strings(out: &PivotOut) -> Vec<Vec<String>> {
+    out.grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    Value::Err(e) => e.code().to_string(),
+                    other => to_text(other).unwrap_or_default(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Summary statistics for `sheet.stats`: mirrors the TUI's selection-stats
+/// status line (`count` = non-blank cells; `sum`/`average`/`min`/`max`
+/// computed over numeric cells only), plus `count_nums` (the numeric subset
+/// of `count`). All four numeric fields are `0.0` over a range with no
+/// numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RangeStats {
+    pub sum: f64,
+    pub count: usize,
+    pub count_nums: usize,
+    pub average: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Compute [`RangeStats`] over an arbitrary set of cell values (typically one
+/// `sheet.stats` range, in any order).
+pub fn range_stats(vals: &[Value]) -> RangeStats {
+    let mut count = 0usize;
+    let mut nums: Vec<f64> = Vec::new();
+    for v in vals {
+        if matches!(v, Value::Empty) {
+            continue;
+        }
+        count += 1;
+        if let Value::Num(n) = v {
+            nums.push(*n);
+        }
+    }
+    let count_nums = nums.len();
+    let sum: f64 = nums.iter().sum();
+    let (average, min, max) = if count_nums > 0 {
+        (
+            sum / count_nums as f64,
+            nums.iter().copied().fold(f64::INFINITY, f64::min),
+            nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    RangeStats {
+        sum,
+        count,
+        count_nums,
+        average,
+        min,
+        max,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,5 +1155,117 @@ mod tests {
         let f = Frame::from_csv("\"a,a\";B\nx;1\n");
         assert_eq!(f.names, vec!["a,a", "B"]);
         assert_eq!(sniff_delimiter("plain header\nrow\n"), ',');
+    }
+
+    #[test]
+    fn agg_from_verb_name_covers_all_eleven_and_rejects_unknown() {
+        let cases: &[(&str, Agg)] = &[
+            ("sum", Agg::Sum),
+            ("count", Agg::Count),
+            ("countNums", Agg::CountNums),
+            ("average", Agg::Average),
+            ("max", Agg::Max),
+            ("min", Agg::Min),
+            ("product", Agg::Product),
+            ("stdDev", Agg::StdDev),
+            ("stdDevP", Agg::StdDevP),
+            ("var", Agg::Var),
+            ("varP", Agg::VarP),
+        ];
+        for (name, agg) in cases {
+            assert_eq!(Agg::from_verb_name(name), Some(*agg), "{name}");
+        }
+        assert_eq!(Agg::from_verb_name("stdDevp"), None); // OOXML spelling, not the wire one
+        assert_eq!(Agg::from_verb_name("bogus"), None);
+    }
+
+    #[test]
+    fn pivot_spec_from_names_resolves_headers_and_builds_display_names() {
+        let wb = sales_wb();
+        let f = Frame::from_range(&wb, 0, (0, 0, 6, 3));
+        let spec = pivot_spec_from_names(
+            &f,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), Agg::Sum)],
+        )
+        .unwrap();
+        assert_eq!(spec.rows, vec![0]);
+        assert!(spec.cols.is_empty());
+        assert_eq!(spec.measures.len(), 1);
+        assert_eq!(spec.measures[0].col, 3);
+        assert_eq!(spec.measures[0].agg, Agg::Sum);
+        assert_eq!(spec.measures[0].name, "Sum of Sales");
+        // No grand totals by default — the ad-hoc pivot wire contract has no
+        // flag for them.
+        assert!(!spec.grand_rows);
+        assert!(!spec.grand_cols);
+
+        let out = pivot(&f, &spec);
+        let table = pivot_table_strings(&out);
+        assert_eq!(table[0], vec!["Region", "Sum of Sales"]);
+        assert_eq!(table[1], vec!["East", "80"]);
+        assert_eq!(table[2], vec!["West", "90"]);
+    }
+
+    #[test]
+    fn pivot_spec_from_names_errors_naming_the_unknown_column() {
+        let wb = sales_wb();
+        let f = Frame::from_range(&wb, 0, (0, 0, 6, 3));
+        let err = pivot_spec_from_names(
+            &f,
+            &["Region".to_string()],
+            &[],
+            &[("Bogus".to_string(), Agg::Sum)],
+        )
+        .unwrap_err();
+        assert_eq!(err, "Bogus");
+    }
+
+    #[test]
+    fn pivot_table_strings_renders_errors_and_blanks() {
+        let out = PivotOut {
+            grid: vec![vec![
+                Value::Str("h".into()),
+                Value::Empty,
+                Value::Err(ExcelError::Div0),
+                Value::Bool(true),
+            ]],
+            header_rows: 1,
+            label_cols: 1,
+        };
+        assert_eq!(
+            pivot_table_strings(&out)[0],
+            vec!["h", "", "#DIV/0!", "TRUE"]
+        );
+    }
+
+    #[test]
+    fn range_stats_over_mixed_values() {
+        let vals = vec![
+            n(3.0),
+            n(5.0),
+            Value::Str("text".into()),
+            Value::Empty,
+            n(-2.0),
+        ];
+        let st = range_stats(&vals);
+        assert_eq!(st.count, 4); // blanks excluded, text counted
+        assert_eq!(st.count_nums, 3);
+        assert_eq!(st.sum, 6.0);
+        assert_eq!(st.average, 2.0);
+        assert_eq!(st.min, -2.0);
+        assert_eq!(st.max, 5.0);
+    }
+
+    #[test]
+    fn range_stats_over_no_numbers_is_all_zero() {
+        let st = range_stats(&[Value::Str("x".into()), Value::Empty]);
+        assert_eq!(st.count, 1);
+        assert_eq!(st.count_nums, 0);
+        assert_eq!(st.sum, 0.0);
+        assert_eq!(st.average, 0.0);
+        assert_eq!(st.min, 0.0);
+        assert_eq!(st.max, 0.0);
     }
 }
