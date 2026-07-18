@@ -8,7 +8,7 @@
 //! (a later task) catches it, refreshes, and retries once. The bearer token
 //! is never logged (it's not `Debug`-derived into any log line here).
 
-use crate::graph::model::{AttachmentMeta, Body, DeltaPage, MailFolder};
+use crate::graph::model::{AttachmentMeta, Body, DeltaPage, MailFolder, Message, Recipient};
 use crate::json::{self, Value};
 use std::fmt;
 
@@ -290,6 +290,76 @@ impl GraphClient {
         Ok(())
     }
 
+    /// POST `/me/messages/{id}/createReply` (or `createReplyAll` when `all`
+    /// is set) — Graph creates a new draft pre-populated with quoted body,
+    /// subject prefix, and recipients, and returns it; parsed the same way
+    /// as any other `Message`.
+    pub fn create_reply(&self, id: &str, all: bool) -> Result<Message, GraphError> {
+        let id = encode_path_segment(id);
+        let action = if all { "createReplyAll" } else { "createReply" };
+        let path = format!("/me/messages/{id}/{action}");
+        let resp = self.send(Method::Post, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Message::from_json(&v).ok_or_else(|| GraphError::Parse("malformed reply draft".to_string()))
+    }
+
+    /// POST `/me/messages/{id}/createForward` — same shape as
+    /// `create_reply`, but for forwarding.
+    pub fn create_forward(&self, id: &str) -> Result<Message, GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/messages/{id}/createForward");
+        let resp = self.send(Method::Post, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Message::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed forward draft".to_string()))
+    }
+
+    /// POST `/me/messages` with a new draft's subject/body/recipients;
+    /// Graph creates it (implicitly as a draft — no `isDraft` field needed,
+    /// that's the default for a message created this way) and returns it
+    /// with its minted id, which callers need for later `update_draft` /
+    /// `send_draft` calls.
+    pub fn create_draft(
+        &self,
+        body_html: &str,
+        subject: &str,
+        to: &[Recipient],
+        cc: &[Recipient],
+    ) -> Result<Message, GraphError> {
+        let body = draft_body_json(body_html, subject, to, cc);
+        let resp = self.send(Method::Post, "/me/messages", Some(body), &[])?;
+        let v = parse_body(resp)?;
+        Message::from_json(&v).ok_or_else(|| GraphError::Parse("malformed draft".to_string()))
+    }
+
+    /// PATCH `/me/messages/{id}` with the same subject/body/recipients
+    /// shape as `create_draft`, overwriting an existing draft in place.
+    pub fn update_draft(
+        &self,
+        id: &str,
+        body_html: &str,
+        subject: &str,
+        to: &[Recipient],
+        cc: &[Recipient],
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/messages/{id}");
+        let body = draft_body_json(body_html, subject, to, cc);
+        self.send(Method::Patch, &path, Some(body), &[])?;
+        Ok(())
+    }
+
+    /// POST `/me/messages/{id}/send` — hands the draft to Graph for
+    /// delivery. Graph replies 202 (queued for sending) or occasionally 200;
+    /// both are 2xx, so `send`'s existing `Ok(resp)` path covers them with
+    /// no extra mapping here.
+    pub fn send_draft(&self, id: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/messages/{id}/send");
+        self.send(Method::Post, &path, None, &[])?;
+        Ok(())
+    }
+
     /// Builds and sends one request, applying the standard auth/accept
     /// headers plus any `extra_headers`, and maps a non-2xx result to a
     /// `GraphError`. `path` is either a path rooted at `base` (most calls)
@@ -374,6 +444,44 @@ fn value_array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], GraphError> {
     v.get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| GraphError::Parse(format!("response has no '{key}' array")))
+}
+
+/// Builds the JSON body shared by `create_draft` and `update_draft`:
+/// `{"subject":…, "body":{"contentType":"HTML","content":…},
+/// "toRecipients":[…], "ccRecipients":[…]}`.
+fn draft_body_json(body_html: &str, subject: &str, to: &[Recipient], cc: &[Recipient]) -> String {
+    Value::Object(vec![
+        ("subject".to_string(), Value::Str(subject.to_string())),
+        (
+            "body".to_string(),
+            Value::Object(vec![
+                ("contentType".to_string(), Value::Str("HTML".to_string())),
+                ("content".to_string(), Value::Str(body_html.to_string())),
+            ]),
+        ),
+        ("toRecipients".to_string(), recipients_json(to)),
+        ("ccRecipients".to_string(), recipients_json(cc)),
+    ])
+    .to_string()
+}
+
+/// Serializes recipients as Graph's `emailAddress` array shape:
+/// `[{"emailAddress":{"address":…,"name":…}}, …]`.
+fn recipients_json(recipients: &[Recipient]) -> Value {
+    Value::Array(
+        recipients
+            .iter()
+            .map(|r| {
+                Value::Object(vec![(
+                    "emailAddress".to_string(),
+                    Value::Object(vec![
+                        ("address".to_string(), Value::Str(r.address.clone())),
+                        ("name".to_string(), Value::Str(r.name.clone())),
+                    ]),
+                )])
+            })
+            .collect(),
+    )
 }
 
 /// Percent-encodes every byte except RFC 3986 unreserved characters
@@ -815,5 +923,219 @@ mod tests {
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(c.list_folders(), Err(GraphError::Unauthorized)));
+    }
+
+    fn sample_message_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","conversationId":"C1","subject":"Re: Hi",
+            "from":{{"emailAddress":{{"name":"A","address":"a@x"}}}},
+            "toRecipients":[],"ccRecipients":[],
+            "receivedDateTime":"","sentDateTime":"","isRead":false,
+            "hasAttachments":false,"importance":"normal","bodyPreview":""}}"#
+        )
+    }
+
+    #[test]
+    fn create_reply_posts_and_parses_draft() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/createReply".into(),
+            status: 200,
+            headers: vec![],
+            body: sample_message_json("DRAFT1"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let draft = c.create_reply("M1", false).unwrap();
+        assert_eq!(draft.id, "DRAFT1");
+        assert_eq!(draft.subject, "Re: Hi");
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert!(reqs[0].path.ends_with("/createReply"));
+    }
+
+    #[test]
+    fn create_reply_all_posts_to_create_reply_all() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/createReplyAll".into(),
+            status: 200,
+            headers: vec![],
+            body: sample_message_json("DRAFT2"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let draft = c.create_reply("M1", true).unwrap();
+        assert_eq!(draft.id, "DRAFT2");
+        let reqs = srv.requests();
+        assert!(reqs[0].path.ends_with("/createReplyAll"));
+    }
+
+    #[test]
+    fn create_forward_posts_and_parses_draft() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/createForward".into(),
+            status: 200,
+            headers: vec![],
+            body: sample_message_json("DRAFT3"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let draft = c.create_forward("M1").unwrap();
+        assert_eq!(draft.id, "DRAFT3");
+        let reqs = srv.requests();
+        assert!(reqs[0].path.ends_with("/createForward"));
+    }
+
+    #[test]
+    fn create_draft_posts_body_and_parses_returned_draft() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages".into(),
+            status: 201,
+            headers: vec![],
+            body: sample_message_json("NEWDRAFT"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let to = vec![Recipient {
+            name: "Bob".to_string(),
+            address: "bob@x".to_string(),
+        }];
+        let cc = vec![Recipient {
+            name: "Cara".to_string(),
+            address: "cara@x".to_string(),
+        }];
+        let draft = c.create_draft("<p>hi</p>", "Hello", &to, &cc).unwrap();
+        assert_eq!(draft.id, "NEWDRAFT");
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/messages");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Hello"));
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("contentType"))
+                .and_then(Value::as_str),
+            Some("HTML")
+        );
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(Value::as_str),
+            Some("<p>hi</p>")
+        );
+        let to_out = sent.get("toRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            to_out[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("bob@x")
+        );
+        let cc_out = sent.get("ccRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            cc_out[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("cara@x")
+        );
+    }
+
+    #[test]
+    fn update_draft_patches_body_and_returns_unit() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.update_draft("M1", "<p>edit</p>", "Subj", &[], &[])
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Subj"));
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("contentType"))
+                .and_then(Value::as_str),
+            Some("HTML")
+        );
+    }
+
+    #[test]
+    fn send_draft_posts_to_send_and_maps_202_to_ok() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/send".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.send_draft("M1").unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.ends_with("/send"));
+    }
+
+    #[test]
+    fn send_draft_maps_200_to_ok() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/send".into(),
+            status: 200,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.send_draft("M1").unwrap();
+    }
+
+    #[test]
+    fn send_draft_401_maps_to_unauthorized() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/send".into(),
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.send_draft("M1"), Err(GraphError::Unauthorized)));
+    }
+
+    #[test]
+    fn create_draft_401_maps_to_unauthorized() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages".into(),
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.create_draft("x", "y", &[], &[]),
+            Err(GraphError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn reply_forward_and_send_ids_are_percent_encoded() {
+        let raw_id = "AAMk/id+with=chars";
+        let encoded_id = "AAMk%2Fid%2Bwith%3Dchars";
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: format!("/me/messages/{encoded_id}/send"),
+            status: 200,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.send_draft(raw_id).unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.contains(encoded_id));
+        assert!(!reqs[0].path.contains(raw_id));
     }
 }
