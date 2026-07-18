@@ -28,7 +28,7 @@ impl Default for AuthConfig {
         AuthConfig {
             authority: "https://login.microsoftonline.com/organizations".to_string(),
             client_id: "14d82eec-204b-4c2f-b7e8-296a70dab67e".to_string(),
-            scope: "Mail.ReadWrite offline_access".to_string(),
+            scope: "Mail.ReadWrite People.Read offline_access".to_string(),
         }
     }
 }
@@ -263,7 +263,7 @@ mod tests {
         AuthConfig {
             authority: "x/organizations".into(),
             client_id: "cid".into(),
-            scope: "Mail.ReadWrite offline_access".into(),
+            scope: "Mail.ReadWrite People.Read offline_access".into(),
         }
     }
 

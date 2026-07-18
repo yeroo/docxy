@@ -492,7 +492,42 @@ impl Engine {
         self.drain_outbox();
         // A full pass without a hard failure clears any offline back-off.
         self.clear_backoff();
+
+        // Refresh the local contact index from whatever mail is now stored
+        // (cheap, idempotent). Best-effort: a failure here must not fail the pass.
+        let _ = self.store.refresh_local_contacts();
+
+        // On a full pass (folders were re-enumerated, e.g. after sign-in),
+        // augment contacts from the corporate directory. Best-effort and
+        // gracefully degrading: People.Read may be denied (403), blocked by
+        // Conditional Access, or offline — in every case we skip it silently
+        // and the locally-mined contacts still power autocomplete.
+        if include_folders {
+            self.sync_people();
+        }
+
         self.settle_state();
+    }
+
+    /// Best-effort `/me/people` fetch → contact upserts. Any error (insufficient
+    /// scope, Conditional Access, offline, parse) is swallowed: directory
+    /// suggestions are a bonus on top of local contacts, never a hard
+    /// dependency, so this never fails a sync pass or emits an error event.
+    fn sync_people(&mut self) {
+        let people = match self.with_auth(|c| c.people()) {
+            Ok(p) => p,
+            Err(_) => return, // graceful degradation — local contacts carry on
+        };
+        for p in people {
+            let _ = self.store.upsert_contact(&crate::store::Contact {
+                name: p.name,
+                address: p.address,
+                source: "graph".to_string(),
+                last_seen: String::new(),
+                frequency: 0,
+                relevance: Some(p.rank),
+            });
+        }
     }
 
     /// GET the folder tree, upsert every folder, emit `FoldersUpdated`.
@@ -1825,6 +1860,142 @@ mod tests {
         let store = Store::open(&store_path).unwrap();
         assert!(store.messages_in_folder("F1", 50, 0).unwrap().is_empty());
         assert_eq!(store.messages_in_folder("DEST", 50, 0).unwrap()[0].id, "M1");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Routes for the contacts tests: one folder (F1) with one message from
+    // alice@x to bob@x (so local mining captures both correspondents), plus
+    // `/me/people` — `people_status`/`people_body` let each test control what
+    // the directory endpoint answers with (a 200 with a person, or a 403).
+    fn contacts_routes(people_status: u16, people_body: &str) -> Vec<Route> {
+        vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/people".into(),
+                status: people_status,
+                headers: vec![],
+                body: people_body.to_string(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"M1","conversationId":"C1","subject":"Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[{"emailAddress":{"name":"Bob","address":"bob@x"}}],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"2026-07-16T09:00:00Z","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"hi"}],"@odata.deltaLink":"/me/mailFolders/F1/messages/delta?token=D1"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":1,"unreadItemCount":1,"wellKnownName":"inbox"}]}"#.into(),
+            },
+        ]
+    }
+
+    /// Polls the store for a contact search to return a hit. `sync_pass`
+    /// runs `refresh_local_contacts`/`sync_people` AFTER the per-folder loop
+    /// (and its `MessagesUpdated` emissions), so there's no event marking
+    /// "contacts are ready" — this is the same poll-until-observed pattern
+    /// `move_command_optimistically_refiles_locally` uses to wait for the
+    /// move POST to land.
+    fn wait_for_contact(store_path: &std::path::Path, query: &str) -> Vec<crate::store::Contact> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let store = Store::open(store_path).unwrap();
+            let hits = store.search_contacts(query, 1).unwrap();
+            if !hits.is_empty() {
+                return hits;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for a contact matching {query:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn sync_pass_populates_contacts_from_local_mail_and_people() {
+        let people_body = r#"{"value":[{"displayName":"Carol","scoredEmailAddresses":[{"address":"carol@x.com","relevanceScore":5.0}]}]}"#;
+        let srv = FakeServer::start(contacts_routes(200, people_body));
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("contacts-ok");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        // Local mining captured the correspondents.
+        assert!(!wait_for_contact(&store_path, "alice").is_empty());
+        assert!(!wait_for_contact(&store_path, "bob").is_empty());
+
+        // /me/people augmented with an org person the user never emailed.
+        let carol = wait_for_contact(&store_path, "carol");
+        assert_eq!(
+            carol.first().map(|c| c.address.as_str()),
+            Some("carol@x.com")
+        );
+        assert_eq!(carol[0].source, "graph");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn people_403_does_not_fail_the_sync_pass() {
+        let srv = FakeServer::start(contacts_routes(
+            403,
+            r#"{"error":{"code":"Authorization_RequestDenied"}}"#,
+        ));
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("contacts-403");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        // The pass still completes and local contacts are present; no panic,
+        // no error surfaced despite the 403 from `/me/people`.
+        assert!(!wait_for_contact(&store_path, "alice").is_empty());
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
