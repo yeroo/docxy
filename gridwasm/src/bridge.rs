@@ -54,6 +54,28 @@ enum UndoAction {
     },
 }
 
+/// A sheet's full content (cells, formulas, drawings, name) plus its
+/// comments, captured by `ctl_sheet_remove` just before
+/// `SheetPackage::remove_sheet` destroys them — the bridge-level stash that
+/// makes `sheet.remove`'s declared `inverse` (the internal
+/// `sheet.restore-removed` verb) a genuine, lossless reversal instead of the
+/// earlier "recreate an empty sheet by the same name" placeholder. Single
+/// slot: a second `sheet.remove` overwrites it, and a successful restore
+/// takes (clears) it.
+struct RemovedSheetStash {
+    name: String,
+    sheet: Sheet,
+    /// Every comment (threaded or legacy) anchored on the removed sheet,
+    /// captured via `SheetPackage::comments()` *before* removal — comment
+    /// data lives in package parts outside `Sheet`, so it isn't part of the
+    /// `sheet` snapshot above and would otherwise be silently dropped.
+    comments: Vec<gridcore::comments::Comment>,
+    /// Whether the removed sheet was the ACTIVE one at the moment of
+    /// removal — mirrors `sheet.remove`'s own viewport-reset rule, in
+    /// reverse, on restore (see `ctl_sheet_restore_removed`).
+    removed_active: bool,
+}
+
 /// A live editing session over one `.xlsx`.
 pub struct Session {
     /// Whole package retained — save regenerates only modeled cell data and
@@ -72,6 +94,9 @@ pub struct Session {
     err: Option<String>,
     undo: Vec<UndoAction>,
     redo: Vec<UndoAction>,
+    /// The most recently `sheet.remove`d sheet, if any — see
+    /// [`RemovedSheetStash`].
+    removed_sheet_stash: Option<RemovedSheetStash>,
 }
 
 impl Session {
@@ -90,6 +115,7 @@ impl Session {
             err: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            removed_sheet_stash: None,
         })
     }
 
@@ -657,6 +683,13 @@ impl Session {
             "wb.replace-all" => self.ctl_wb_replace_all(args),
             "sheet.add" => self.ctl_sheet_add(args),
             "sheet.remove" => self.ctl_sheet_remove(args),
+            // INTERNAL-ONLY: the host invokes this in response to
+            // `sheet.remove`'s declared `inverse`, through the same ctl
+            // channel — but Task 7 must not expose it in `wasmVerbs`, so an
+            // external agent calling it through `CtlServer` still gets
+            // "unknown verb 'sheet.restore-removed'". See
+            // `ctl_sheet_restore_removed`'s doc comment.
+            "sheet.restore-removed" => self.ctl_sheet_restore_removed(args),
             "sheet.rename" => self.ctl_sheet_rename(args),
             "row.insert" => self.ctl_row_op(args, true),
             "row.delete" => self.ctl_row_op(args, false),
@@ -1229,10 +1262,18 @@ impl Session {
     //     `"undoSteps":0` plus an `"inverse"`. `sheet.import-csv`'s inverse
     //     (`sheet.remove` of the very sheet it just created) is EXACT — the
     //     sheet never existed before, so deleting it is a full reversal.
-    //     `sheet.remove`'s inverse (`sheet.add` with the removed name) is
-    //     LOSSY by design — it recreates the sheet's existence-by-name only,
-    //     not its content — documented explicitly in the report and in
-    //     `ctl_sheet_remove_inverse_recreates_a_sheet_by_name_lossily`.
+    //     `sheet.remove`'s inverse is `sheet.restore-removed` (an
+    //     INTERNAL-ONLY verb — Task 7 must not list it in `wasmVerbs`, so an
+    //     external agent calling it through `CtlServer` still gets "unknown
+    //     verb"), backed by the bridge-level `Session::removed_sheet_stash`
+    //     ([`RemovedSheetStash`]) captured just before removal: cells,
+    //     formulas, drawings, and comments all round-trip losslessly. The
+    //     one documented gap is the sheet's numeric INDEX — see
+    //     `ctl_sheet_restore_removed`'s doc comment for why a bridge-only
+    //     change can't splice it back into its original position. (An
+    //     earlier version of this bucket used a lossy `sheet.add`-by-name
+    //     inverse instead — replaced after review flagged that it would
+    //     silently resurrect an EMPTY sheet as "undo".)
     // -----------------------------------------------------------------
 
     /// `{ref,text,author?,sheet?}` -> `{sheet,ref,undoSteps:0}` — plus the
@@ -1402,15 +1443,30 @@ impl Session {
     }
 
     /// `{sheet}` -> `{removed:true,undoSteps:0}` — plus the internal
-    /// (lossy) `inverse` (`sheet.add` with the removed sheet's name; see the
-    /// bucket-table doc comment above). Errors on the last sheet. `sheet` is
-    /// required (no default to active) — a destructive op shouldn't silently
-    /// default to "whichever one is active". Only resets `cur`/`anchor`/the
+    /// `inverse`, always the fixed, ARGLESS `{"verb":"sheet.restore-removed",
+    /// "args":{}}` (see the bucket-table doc comment above and
+    /// [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed) for
+    /// what that verb does). Before removing, snapshots the sheet's full
+    /// `Sheet` value and its comments into `Session::removed_sheet_stash`
+    /// ([`RemovedSheetStash`]), so the inverse is a genuine restore, not a
+    /// name-only placeholder. Errors on the last sheet. `sheet` is required
+    /// (no default to active) — a destructive op shouldn't silently default
+    /// to "whichever one is active". Only resets `cur`/`anchor`/the
     /// viewport when the ACTIVE sheet itself is the one removed (Task 5's
     /// xlsxy fix, mirrored here).
     fn ctl_sheet_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
         let name = self.pkg.workbook.sheets[si].name.clone();
+        let sheet_snapshot = self.pkg.workbook.sheets[si].clone();
+        // Comment data lives in package parts outside `Sheet` — must be
+        // captured now, while `sheet_parts[si]` (and thus this sheet's own
+        // `_rels`/threadedComments/persons parts) are still resolvable.
+        let comments: Vec<gridcore::comments::Comment> = self
+            .pkg
+            .comments()
+            .into_iter()
+            .filter(|cm| cm.sheet == si)
+            .collect();
         let removed_active = self.active == si;
         if !self.pkg.remove_sheet(si) {
             return Err("cannot remove the last sheet".into());
@@ -1435,10 +1491,92 @@ impl Session {
         self.redo.clear();
         self.rebuild_engine();
         self.dirty = true;
-        let mut out = String::from(
-            "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.add\",\"args\":{\"name\":",
-        );
-        json::push_str(&mut out, &name);
+        // Single-slot: a second `sheet.remove` overwrites whatever was
+        // stashed from an earlier one — only the most recent removal is
+        // restorable, by design (see `RemovedSheetStash`'s doc comment).
+        self.removed_sheet_stash = Some(RemovedSheetStash {
+            name,
+            sheet: sheet_snapshot,
+            comments,
+            removed_active,
+        });
+        Ok(
+            "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{}},\"undoSteps\":0}"
+                .to_string(),
+        )
+    }
+
+    /// `{}` -> `{sheet,name,undoSteps:0}` — plus the internal `inverse`
+    /// (`sheet.remove` on the just-restored sheet's NEW index, so a
+    /// follow-up `sheet.remove` redoes the removal). **INTERNAL-ONLY**: this
+    /// verb exists solely so the host can invoke `sheet.remove`'s declared
+    /// `inverse` through the normal ctl channel — Task 7 must NOT list it in
+    /// `wasmVerbs`, so an external agent calling it through `CtlServer`
+    /// still gets `"unknown verb 'sheet.restore-removed'"`.
+    ///
+    /// Restores the single most-recently-removed sheet from
+    /// `Session::removed_sheet_stash`: the full `Sheet` value (cells,
+    /// formulas, drawings — everything `Sheet` itself carries) plus every
+    /// comment (threaded and legacy) `ctl_sheet_remove` captured just before
+    /// deletion. The stash is single-slot — a second `sheet.remove`
+    /// overwrites it, and a successful restore takes (clears) it via
+    /// `Option::take` — so calling this with nothing stashed errors
+    /// (`"nothing to restore"`).
+    ///
+    /// Active-sheet/viewport handling mirrors `sheet.remove`'s own rule in
+    /// reverse: if the removed sheet WAS the active one, the restored sheet
+    /// becomes active again (with a fresh cursor/viewport, matching the
+    /// removal's own reset); otherwise `active`/`cur`/`anchor`/the viewport
+    /// are left completely untouched — appending a sheet at the end never
+    /// changes any other sheet's index, so no compensating shift is needed
+    /// either way (verified by the removed-before-active and removed-active
+    /// tests below).
+    ///
+    /// **Documented limitation**: the restored sheet is always appended at
+    /// the END of the sheet list, not spliced back into its original
+    /// numeric index, whenever other sheets existed after it.
+    /// `SheetPackage::sheet_parts` — which must stay in lockstep,
+    /// index-for-index, with `workbook.sheets` for `save_xlsx` to write each
+    /// sheet's regenerated cell data into the correct XML part — is
+    /// `pub(crate)` in gridcore, invisible outside that crate. Reordering
+    /// `workbook.sheets` alone (the only piece gridwasm can reach) without
+    /// also reordering `sheet_parts` would desync the two and corrupt the
+    /// next save (wrong sheet's cells written into another sheet's XML
+    /// part). True positional restore needs a small new gridcore primitive
+    /// (e.g. an `insert_sheet_at`); genuinely out of reach from
+    /// `gridwasm/src/bridge.rs` alone, which is this task's explicit scope.
+    fn ctl_sheet_restore_removed(&mut self, _args: &json::Json) -> Result<String, String> {
+        let stash = self
+            .removed_sheet_stash
+            .take()
+            .ok_or("nothing to restore")?;
+        let new_idx = self.pkg.add_sheet(&stash.name);
+        self.pkg.workbook.sheets[new_idx] = stash.sheet;
+        for cm in &stash.comments {
+            if cm.threaded {
+                let when = self.ctl_iso_now();
+                self.pkg
+                    .add_threaded_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text, &when);
+            } else {
+                self.pkg
+                    .set_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text);
+            }
+        }
+        if stash.removed_active {
+            self.active = new_idx;
+            self.cur = (0, 0);
+            self.anchor = None;
+            self.window.0 = 0;
+            self.window.1 = 0;
+        }
+        self.rebuild_engine();
+        self.dirty = true;
+        let mut out = String::from("{\"sheet\":");
+        out.push_str(&new_idx.to_string());
+        out.push_str(",\"name\":");
+        json::push_str(&mut out, &stash.name);
+        out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
+        out.push_str(&new_idx.to_string());
         out.push_str("}},\"undoSteps\":0}");
         Ok(out)
     }
@@ -2580,18 +2718,19 @@ mod tests {
         assert!(out2.contains("\"name\":\"Sheet 2\""), "{out2}");
     }
 
-    // -- sheet.remove: clears history, reports a lossy host inverse ------
+    // -- sheet.remove: clears history, reports a LOSSLESS restore inverse --
 
     #[test]
-    fn ctl_sheet_remove_clears_history_and_reports_a_lossy_inverse() {
+    fn ctl_sheet_remove_clears_history_and_reports_a_restore_inverse() {
         let mut s = two_sheet_session();
         s.dispatch("set\t5\t0\thello"); // pushes one undo entry, must be wiped
         let out = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
         assert!(out.contains("\"removed\":true"), "{out}");
         assert!(
-            out.contains("\"inverse\":{\"verb\":\"sheet.add\",\"args\":{\"name\":\"Sheet2\"}}"),
+            out.contains("\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{}}"),
             "{out}"
         );
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
 
@@ -2606,15 +2745,142 @@ mod tests {
     }
 
     #[test]
-    fn ctl_sheet_remove_inverse_recreates_a_sheet_by_name_lossily() {
+    fn ctl_sheet_remove_restore_round_trips_cells_formulas_name_and_comments() {
         let mut s = two_sheet_session();
+        s.active = 1; // Sheet2
+        s.dispatch("set\t0\t0\t10");
+        s.dispatch("set\t0\t1\t=A1*2");
+        s.active = 0;
+        s.ctl(
+            r#"{"verb":"comment.add","args":{"ref":"A1","text":"Check this","author":"Ana","sheet":1}}"#,
+        );
+
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
-        // The declared inverse recreates an EMPTY sheet with the same name —
-        // sheet.remove's data is not restored, only its existence-by-name.
-        let inv = s.ctl(r#"{"verb":"sheet.add","args":{"name":"Sheet2"}}"#);
-        assert!(inv.contains("\"name\":\"Sheet2\""), "{inv}");
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
+
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(
+            out.contains("\"sheet\":1") && out.contains("\"name\":\"Sheet2\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":1}}"),
+            "the restore's own inverse must target the NEW index, for redo: {out}"
+        );
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\",\"Sheet2\"]"), "{v}");
+
+        s.active = 1;
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(cell.contains("\"value\":10"), "{cell}");
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B1"}}"#);
+        assert!(
+            cell.contains("\"formula\":\"=A1*2\"") && cell.contains("\"value\":20"),
+            "the formula AND its recalculated value must both survive: {cell}"
+        );
+        let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
+        assert!(
+            list.contains("\"sheet\":1")
+                && list.contains("\"ref\":\"A1\"")
+                && list.contains("\"author\":\"Ana\"")
+                && list.contains("\"text\":\"Check this\""),
+            "the comment must be restored too, not silently dropped: {list}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_errors_when_nothing_is_stashed() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(out.contains("nothing to restore"), "{out}");
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_stash_is_single_slot_second_removal_overwrites_first() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"B"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#); // stash = A
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#); // stash = B, overwrites A
+
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(
+            out.contains("\"name\":\"B\""),
+            "the SECOND removal's stash wins: {out}"
+        );
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\",\"B\"]"),
+            "A is gone for good — only the latest removal is restorable: {v}"
+        );
+
+        // The stash is now empty again (restore takes/clears it).
+        let out2 = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(out2.contains("nothing to restore"), "{out2}");
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_adjusts_active_index_removed_before_active_case() {
+        // sheets = [Sheet1, Sheet2, Sheet3], active = Sheet3 (index 2).
+        // Removing Sheet2 (index 1, BELOW active) decrements active to 1,
+        // still correctly pointing at Sheet3. Restoring (append-only) must
+        // NOT touch active again — it already correctly tracks Sheet3.
+        let mut s = two_sheet_session();
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"Sheet3"}}"#);
+        s.active = 2;
+        s.cur = (0, 0);
+        s.anchor = None;
+
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        let v = s.view_json(None);
+        assert!(v.contains("\"active\":1"), "{v}"); // Sheet3 shifted down to index 1
+
+        s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"active\":1"),
+            "restoring (append-only) must not move active off Sheet3: {v}"
+        );
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\",\"Sheet3\",\"Sheet2\"]"),
+            "Sheet2 comes back at the END, not spliced into its old middle slot: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_adjusts_active_index_removed_active_case() {
+        let mut s = two_sheet_session();
+        s.active = 1; // Sheet2 is the active/visible one
+        s.cur = (2, 1);
+
+        let out = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        assert!(out.contains("\"removed\":true"), "{out}");
+        let v = s.view_json(None);
+        assert!(v.contains("\"active\":0"), "{v}");
+
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(out.contains("\"sheet\":1"), "{out}");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"active\":1") && v.contains("\"ref\":\"A1\""),
+            "restoring the sheet that WAS active brings the user back to it, freshly: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_inverse_chains_into_a_working_redo() {
+        let mut s = two_sheet_session();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        let restore = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(restore.contains("\"ok\":true"), "{restore}");
+
+        // Apply the restore's own declared inverse: sheet.remove again.
+        let redo = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":1}}"#);
+        assert!(redo.contains("\"removed\":true"), "{redo}");
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
     }
 
     #[test]
