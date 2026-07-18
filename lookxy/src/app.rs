@@ -53,6 +53,21 @@ pub struct App {
     pub messages: Vec<MessageRow>,
     /// Index into `messages` of the currently highlighted row.
     pub msg_index: usize,
+    /// Whether the folder view groups messages into conversations. Seeded
+    /// from `Config::threaded`; toggled by `t`.
+    pub threaded: bool,
+    /// Path used to persist the `threaded` toggle. `None` in tests (no disk
+    /// write); `Some` in production (set by `main`). Nothing reads this yet —
+    /// the `t`-keybinding persistence is a later task's wiring. Silences
+    /// `dead_code`, which can't see across tasks.
+    #[allow(dead_code)]
+    pub config_path: Option<PathBuf>,
+    /// The threaded view-model, built by `reload_messages` when `threaded`.
+    pub threads: Vec<ThreadView>,
+    /// Flattened header+message rows for render + navigation in threaded mode.
+    pub visible_rows: Vec<Row>,
+    /// Cursor into `visible_rows` (threaded mode's equivalent of `msg_index`).
+    pub row_index: usize,
     pub selected_folder: Option<String>,
     pub selected_msg: Option<String>,
     /// The opened (`selected_msg`) message's body, once it's in the store.
@@ -226,6 +241,21 @@ pub struct RsvpPrompt {
     pub comment: String,
 }
 
+/// A conversation in the threaded folder view, plus whether it's expanded.
+pub struct ThreadView {
+    pub thread: mailcore::thread::Thread,
+    pub expanded: bool,
+}
+
+/// One visible line in the threaded list: a collapsible conversation header,
+/// or (only under an expanded header) one of its messages. A single-message
+/// conversation is represented directly as a `Message` row with no header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Header(usize),         // index into `threads`
+    Message(usize, usize), // (thread index, message index within the thread)
+}
+
 /// How many messages `reload_messages` pulls per folder. Paging further back
 /// is a later task's concern; this is enough to fill a screen many times over.
 const MESSAGE_PAGE_SIZE: i64 = 200;
@@ -246,6 +276,11 @@ impl App {
             folder_index: 0,
             messages: Vec::new(),
             msg_index: 0,
+            threaded: false,
+            config_path: None,
+            threads: Vec::new(),
+            visible_rows: Vec::new(),
+            row_index: 0,
             selected_folder: None,
             selected_msg: None,
             body: None,
@@ -414,18 +449,78 @@ impl App {
         self.reload_messages();
     }
 
-    /// Re-reads the message list for `selected_folder` (newest first),
-    /// clamping `msg_index` if the list got shorter.
+    /// True when the threaded folder view is what's on screen: threading is on,
+    /// no search is active (search results stay flat), and we're in Mail mode.
+    /// Nothing calls this yet — the threaded rendering/key-handling wiring is
+    /// a later task. Silences `dead_code`, which can't see across tasks.
+    #[allow(dead_code)]
+    pub fn threaded_active(&self) -> bool {
+        self.threaded && self.search.is_none() && self.mode == Mode::Mail
+    }
+
+    /// Rebuilds `visible_rows` from `threads` + their expanded flags, and
+    /// clamps `row_index` into range. A single-message thread contributes one
+    /// bare `Message` row (no header); a multi-message thread contributes a
+    /// `Header` and, when expanded, its child `Message` rows.
+    pub fn rebuild_visible_rows(&mut self) {
+        let mut rows = Vec::new();
+        for (t, tv) in self.threads.iter().enumerate() {
+            if tv.thread.messages.len() == 1 {
+                rows.push(Row::Message(t, 0));
+            } else {
+                rows.push(Row::Header(t));
+                if tv.expanded {
+                    for m in 0..tv.thread.messages.len() {
+                        rows.push(Row::Message(t, m));
+                    }
+                }
+            }
+        }
+        if self.row_index >= rows.len() {
+            self.row_index = rows.len().saturating_sub(1);
+        }
+        self.visible_rows = rows;
+    }
+
+    /// Re-reads the selected folder's messages from the store. In flat mode
+    /// this fills `messages` (newest first) and clamps `msg_index`. In
+    /// threaded mode it instead builds `threads` (cross-folder conversations)
+    /// and rebuilds `visible_rows`, preserving each thread's expanded state by
+    /// conversation key across the rebuild.
     pub fn reload_messages(&mut self) {
-        self.messages = match &self.selected_folder {
-            Some(id) => self
-                .store
-                .messages_in_folder(id, MESSAGE_PAGE_SIZE, 0)
-                .unwrap_or_default(),
-            None => Vec::new(),
+        let Some(folder) = self.selected_folder.clone() else {
+            self.messages.clear();
+            self.threads.clear();
+            self.visible_rows.clear();
+            return;
         };
-        if self.msg_index >= self.messages.len() {
-            self.msg_index = self.messages.len().saturating_sub(1);
+        if self.threaded {
+            let expanded: std::collections::HashSet<String> = self
+                .threads
+                .iter()
+                .filter(|tv| tv.expanded)
+                .map(|tv| tv.thread.key.clone())
+                .collect();
+            let rows = self
+                .store
+                .conversations_in_folder(&folder, MESSAGE_PAGE_SIZE, 0)
+                .unwrap_or_default();
+            self.threads = mailcore::thread::build_threads(&rows)
+                .into_iter()
+                .map(|thread| {
+                    let expanded = expanded.contains(&thread.key);
+                    ThreadView { thread, expanded }
+                })
+                .collect();
+            self.rebuild_visible_rows();
+        } else {
+            self.messages = self
+                .store
+                .messages_in_folder(&folder, MESSAGE_PAGE_SIZE, 0)
+                .unwrap_or_default();
+            if self.msg_index >= self.messages.len() {
+                self.msg_index = self.messages.len().saturating_sub(1);
+            }
         }
     }
 
@@ -1403,6 +1498,104 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adds a second message to conversation `c1` (m1's conversation) so `c1`
+    /// becomes a 2-message thread: from Bob, newer than m1, unread.
+    fn seed_second_in_c1(app: &App) {
+        use mailcore::graph::model::{Message, Recipient};
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m2".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Re: Hello".into(),
+                    from: Recipient {
+                        name: "Bob".into(),
+                        address: "bob@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T11:00:00Z".into(), // newer than m1 (10:00)
+                    sent: "".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "re hi".into(),
+                    is_draft: false,
+                },
+            )
+            .expect("seed m2");
+    }
+
+    /// Adds a standalone message in its own conversation `c2` (a singleton).
+    fn seed_singleton_c2(app: &App) {
+        use mailcore::graph::model::{Message, Recipient};
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m3".into(),
+                    conversation_id: "c2".into(),
+                    subject: "Standalone".into(),
+                    from: Recipient {
+                        name: "Carol".into(),
+                        address: "carol@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-15T10:00:00Z".into(),
+                    sent: "".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "alone".into(),
+                    is_draft: false,
+                },
+            )
+            .expect("seed m3");
+    }
+
+    #[test]
+    fn threaded_reload_groups_into_visible_rows() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 now has m1 + m2 → a 2-message thread
+        seed_singleton_c2(&app); // c2 is a 1-message thread
+        app.reload_messages();
+
+        // The multi-message thread (c1) is a Header; the singleton (c2) a bare Message.
+        assert!(app.visible_rows.iter().any(|r| matches!(r, Row::Header(_))));
+        assert!(
+            app.visible_rows
+                .iter()
+                .any(|r| matches!(r, Row::Message(_, _)))
+        );
+    }
+
+    #[test]
+    fn threaded_reload_expands_to_show_children() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app);
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        let before = app.visible_rows.len();
+        if let Row::Header(t) = app.visible_rows[pos] {
+            app.threads[t].expanded = true;
+            app.rebuild_visible_rows();
+        }
+        assert!(app.visible_rows.len() > before); // child rows appeared
+    }
+
     #[test]
     fn mark_read_updates_store_and_enqueues_command() {
         let mut app = App::for_test_with_seeded_store(); // has one unread message selected
