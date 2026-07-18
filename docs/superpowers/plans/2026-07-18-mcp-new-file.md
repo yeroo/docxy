@@ -527,8 +527,12 @@ async function doNew(app, args) {
   if (fs.existsSync(abs)) throw new Error(`already exists: ${abs}`);
   try {
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.copyFileSync(TEMPLATES[app], abs);
+    // COPYFILE_EXCL: create-exclusive, so a file appearing between the exists
+    // check and the copy errors instead of being truncated — mirrors the
+    // create_new(true) open in ctlcore::client::new_file.
+    fs.copyFileSync(TEMPLATES[app], abs, fs.constants.COPYFILE_EXCL);
   } catch (e) {
+    if (e?.code === 'EEXIST') throw new Error(`already exists: ${abs}`);
     throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (inst === undefined) return JSON.stringify({ path: abs, opened: false });
