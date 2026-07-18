@@ -1364,14 +1364,28 @@ impl Store {
     /// against name and address). Prefix matches rank ahead of interior
     /// matches; then by Graph relevance (lower first, nulls last), then
     /// frequency (higher first), then recency, then name.
+    ///
+    /// `query` is escaped before being bound as the `LIKE` argument: `\`,
+    /// `%`, and `_` are all LIKE metacharacters (`_` matches any single
+    /// character, `%` matches any run of characters), and `_` in particular
+    /// is common in email addresses, so leaving it unescaped would make a
+    /// query like `"a_b"` match `"axb"`, `"a.b"`, etc. — far broader than the
+    /// literal substring the user typed. Escaping `\` first (so a literal
+    /// backslash in the query doesn't get mistaken for part of one of the
+    /// two escapes added after it) and pairing every `LIKE` with `ESCAPE
+    /// '\'` restores literal matching.
     pub fn search_contacts(&self, query: &str, limit: i64) -> Result<Vec<Contact>, StoreError> {
-        let q = query.to_lowercase();
+        let q = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let mut stmt = self.conn.prepare(
             "SELECT address, name, source, last_seen, frequency, relevance
              FROM contacts
-             WHERE lower(name) LIKE '%' || ?1 || '%' OR lower(address) LIKE '%' || ?1 || '%'
+             WHERE lower(name) LIKE '%' || ?1 || '%' ESCAPE '\\' OR lower(address) LIKE '%' || ?1 || '%' ESCAPE '\\'
              ORDER BY
-                 (CASE WHEN lower(name) LIKE ?1 || '%' OR lower(address) LIKE ?1 || '%' THEN 0 ELSE 1 END) ASC,
+                 (CASE WHEN lower(name) LIKE ?1 || '%' ESCAPE '\\' OR lower(address) LIKE ?1 || '%' ESCAPE '\\' THEN 0 ELSE 1 END) ASC,
                  (CASE WHEN relevance IS NULL THEN 1 ELSE 0 END) ASC,
                  relevance ASC,
                  frequency DESC,
@@ -1474,6 +1488,7 @@ impl Store {
             }
         }
 
+        let tx = self.conn.unchecked_transaction()?;
         for (address, (name, last_seen, frequency)) in agg {
             self.upsert_contact(&Contact {
                 name,
@@ -1484,6 +1499,7 @@ impl Store {
                 relevance: None,
             })?;
         }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -1876,6 +1892,44 @@ mod tests {
             s.search_contacts("ANN", 10).unwrap()[0].address,
             "ann@x.com"
         );
+    }
+
+    #[test]
+    fn search_contacts_treats_underscore_literally() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_contact(&Contact {
+            name: "Underscore Bob".into(),
+            address: "a_b@x.com".into(),
+            source: "local".into(),
+            last_seen: "2026-07-01T00:00:00Z".into(),
+            frequency: 1,
+            relevance: None,
+        })
+        .unwrap();
+        s.upsert_contact(&Contact {
+            name: "Plain Axb".into(),
+            address: "axb@x.com".into(),
+            source: "local".into(),
+            last_seen: "2026-07-01T00:00:00Z".into(),
+            frequency: 1,
+            relevance: None,
+        })
+        .unwrap();
+
+        // A literal "_" in the query must match only the literal "_" in
+        // "a_b@x.com" — NOT stand in for the "x" of "axb@x.com" as a LIKE
+        // wildcard would. Unescaped, "a_b" LIKE '%a_b%' matches both rows
+        // (the `_` matches any single character, including "x"), so this
+        // is the assertion that would fail without `ESCAPE '\'`.
+        let got = s.search_contacts("a_b", 10).unwrap();
+        let addrs: Vec<&str> = got.iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(addrs, ["a_b@x.com"]); // "axb@x.com" must NOT show up here
+
+        // The reverse query, "axb", must match only the row that literally
+        // contains "axb" — not the underscore row (a literal "_" isn't "x").
+        let got = s.search_contacts("axb", 10).unwrap();
+        let addrs: Vec<&str> = got.iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(addrs, ["axb@x.com"]);
     }
 
     #[test]
