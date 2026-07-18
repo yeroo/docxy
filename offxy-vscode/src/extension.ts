@@ -124,11 +124,17 @@ const activeCtlServers = new Set<CtlServer>();
  *  distinct discovery filenames instead of colliding. */
 let ctlInstanceSeq = 0;
 
-/** Build a `CtlServer` instance suffix: a filesystem-safe basename plus a
- *  per-extension-session sequence number. */
+/** Build a `CtlServer` instance suffix: a filesystem-safe basename, this
+ *  extension host's process id, and a per-session sequence number. The pid is
+ *  essential for cross-window uniqueness: the sequence counter is per
+ *  extension host, so two VS Code windows each opening a same-basename file
+ *  would otherwise mint identical instance ids (`report_docx-1` in both) and
+ *  clobber each other's discovery file — the loser's 30s refresh only checks
+ *  existence, so it never recovers. Interleaving the pid keeps the ids
+ *  distinct across windows. */
 function nextCtlSuffix(uri: vscode.Uri): string {
   const safe = basename(uri).replace(/[^A-Za-z0-9._-]/g, '_') || 'doc';
-  return `${safe}-${++ctlInstanceSeq}`;
+  return `${safe}-${process.pid}-${++ctlInstanceSeq}`;
 }
 
 /** Pull the `verb` string out of a ctl request JSON string (as sent to
@@ -561,17 +567,21 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
         return { path };
       },
 
-      onMutated: (verbLabel: string) => {
-        // `doc.replace-range` is a delete-then-insert at the wasm/Editor
-        // level (see `docxcore::agent::replace_range` and
-        // `docs/agent-control.md`) — two undo checkpoints, not one. Every
-        // other mutating verb here (`doc.insert`, `doc.append`, `cell.set`,
-        // `range.clear`) checkpoints exactly once. Firing a single VS Code
-        // edit event whose undo/redo replays *both* wasm steps keeps a
-        // single Ctrl+Z fully reverting one agent action, instead of landing
-        // on the intermediate post-delete/pre-insert state.
-        const steps =
-          this.spec.ctl.app === 'docxy' && verbLabel === 'doc.replace-range' ? 2 : 1;
+      onMutated: (verbLabel: string, undoSteps?: number) => {
+        // Replay exactly the number of wasm undo checkpoints the edit actually
+        // pushed, as reported by the wasm layer (`CtlServer` strips the
+        // internal `undoSteps` field off the wire and hands it here). Only
+        // `doc.replace-range` ever reports 2 — a delete-then-insert — and even
+        // it reports just 1 when the replaced range was a single *empty*
+        // paragraph (no delete happened): hard-coding 2 there would make one
+        // Ctrl+Z replay two wasm undos and silently destroy the user's prior
+        // edit (see `docxcore::agent::replace_range`). Every other mutating
+        // verb (`doc.insert`, `doc.append`, `cell.set`, `range.clear`)
+        // checkpoints once. Firing a single VS Code edit event whose undo/redo
+        // replays exactly `steps` wasm steps keeps one Ctrl+Z fully reverting
+        // one agent action, instead of landing on an intermediate state or
+        // over-unwinding.
+        const steps = undoSteps ?? 1;
         this._onDidChange.fire({
           document,
           label: `Agent: ${verbLabel}`,

@@ -91,19 +91,29 @@ pub fn find(doc: &Document, query: &str, case_sensitive: bool) -> Vec<Match> {
 // ---------------------------------------------------------------------------
 
 /// Replace paragraphs `[start..=end]` (inclusive) with `text` (newline-split
-/// into one or more paragraphs). Returns the number of paragraphs replaced.
+/// into one or more paragraphs). Returns `(replaced, undo_steps)`: the number
+/// of paragraphs replaced, and the number of native undo checkpoints this one
+/// call pushed onto the editor's stack.
 ///
 /// This selects `[start..=end]` (anchor at the head, caret at the true end of
-/// the last, in the editor's own offset units) then pastes — `paste` deletes
-/// the selection first, so this is one undoable replace. The caller is
-/// responsible for its own post-edit bookkeeping (clearing the selection,
-/// marking the document modified, etc.).
+/// the last, in the editor's own offset units) then pastes. When the selection
+/// is non-empty, `paste` deletes it first (one checkpoint) and then inserts
+/// (a second checkpoint) — **two** undo steps. But when the selection collapses
+/// to nothing — the sole case being a single **empty** paragraph, where
+/// `move_end()` leaves the caret at offset 0 exactly on the anchor — `paste`
+/// skips the delete and checkpoints only once: **one** undo step. A caller that
+/// replays undo/redo to keep a host stack in lockstep (e.g. the offxy VS Code
+/// tab) must replay exactly this many steps, not a hard-coded two, or a single
+/// host undo would over-unwind and silently destroy the user's prior edit.
+///
+/// The caller is responsible for its own post-edit bookkeeping (clearing the
+/// selection, marking the document modified, etc.).
 pub fn replace_range(
     ed: &mut Editor,
     start: usize,
     end: usize,
     text: &str,
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let n = ed.doc.body.len();
     bounds(start, end, n)?;
     require_para(&ed.doc.body, start)?;
@@ -113,9 +123,13 @@ pub fn replace_range(
     ed.caret = Caret::top(end, 0);
     ed.move_end();
     ed.anchor = Some(Caret::top(start, 0));
+    // A non-empty selection means `paste` will delete-then-insert (2
+    // checkpoints); an empty one (single empty paragraph) means insert only (1).
+    let deleted = ed.has_selection();
     ed.paste(&Clip::from_text(text));
 
-    Ok(end - start + 1)
+    let undo_steps = if deleted { 2 } else { 1 };
+    Ok((end - start + 1, undo_steps))
 }
 
 /// Insert `text` (newline-split into one or more paragraphs) before block
@@ -230,8 +244,10 @@ mod tests {
     #[test]
     fn replace_range_is_single_paste() {
         let mut ed = Editor::new(doc_with(&["A", "B", "C", "D"]));
-        let replaced = replace_range(&mut ed, 1, 2, "X\nY").unwrap();
+        let (replaced, steps) = replace_range(&mut ed, 1, 2, "X\nY").unwrap();
         assert_eq!(replaced, 2);
+        // A non-empty range is a delete-then-insert: two native undo steps.
+        assert_eq!(steps, 2);
         assert_eq!(paras(&ed.doc), vec!["A", "X", "Y", "D"]);
         // `paste` consumes the selection it started from.
         assert!(ed.anchor.is_none());
@@ -240,6 +256,26 @@ mod tests {
         assert!(ed.undo());
         assert!(ed.undo());
         assert_eq!(paras(&ed.doc), vec!["A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn replace_range_of_empty_paragraph_is_one_undo_step() {
+        // Replacing a single EMPTY paragraph collapses the selection to
+        // nothing, so `paste` inserts without a preceding delete — ONE
+        // checkpoint, not two. A host replaying `steps` undos must restore the
+        // prior document in exactly that many; replaying two would over-unwind
+        // and destroy the edit before it (regression guard for the offxy VS
+        // Code tab's undo-lockstep desync).
+        let mut ed = Editor::new(doc_with(&["keep", "", "tail"]));
+        let (replaced, steps) = replace_range(&mut ed, 1, 1, "filled").unwrap();
+        assert_eq!(replaced, 1);
+        assert_eq!(steps, 1, "empty-paragraph replace is a single checkpoint");
+        assert_eq!(paras(&ed.doc), vec!["keep", "filled", "tail"]);
+        // Exactly `steps` (== 1) undos restores the prior document; a second
+        // undo here would be a separate action, so one is both necessary and
+        // sufficient.
+        assert!(ed.undo());
+        assert_eq!(paras(&ed.doc), vec!["keep", "", "tail"]);
     }
 
     #[test]

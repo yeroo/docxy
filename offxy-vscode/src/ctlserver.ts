@@ -36,8 +36,14 @@ export interface CtlHost {
   open(path: string): Promise<object>;
   /** Fired once, right after a mutating verb's successful reply is computed,
    *  so the provider can raise the VS Code custom-document edit event (dirty
-   *  dot + undo lockstep). Not called for read-only or failed verbs. */
-  onMutated(verbLabel: string): void;
+   *  dot + undo lockstep). Not called for read-only or failed verbs.
+   *
+   *  `undoSteps` is how many native wasm undo checkpoints the edit pushed — the
+   *  provider must replay exactly this many wasm undos per one VS Code undo, or
+   *  the two stacks desync. Only `doc.replace-range` ever reports 2 (a
+   *  delete-then-insert; 1 when the range was a single empty paragraph); every
+   *  other mutating verb checkpoints once. Defaults to 1 when absent. */
+  onMutated(verbLabel: string, undoSteps?: number): void;
 }
 
 /** One control-surface instance's discovery record (`docs/agent-control.md`
@@ -95,6 +101,12 @@ export class CtlServer {
    *  onto this promise so requests across *all* connections serialize,
    *  mirroring the terminal's single-threaded consumer. */
   private queue: Promise<void> = Promise.resolve();
+  /** The undo-checkpoint count reported by the most recent wasm call, stripped
+   *  from the wire result and stashed here for `handleLine` to hand `onMutated`
+   *  (see `callWasm`). Safe as a single field: requests serialize through
+   *  `queue`, and `onMutated` runs synchronously right after the call that
+   *  sets it, with no intervening wasm call. */
+  private lastUndoSteps = 1;
 
   constructor(
     private readonly app: 'docxy' | 'xlsxy',
@@ -241,7 +253,7 @@ export class CtlServer {
     try {
       const result = await this.dispatch(verb, args);
       if (this.mutatingVerbs.has(verb)) {
-        this.host.onMutated(verb);
+        this.host.onMutated(verb, this.lastUndoSteps);
       }
       return frame(true, result, id);
     } catch (e) {
@@ -287,6 +299,14 @@ export class CtlServer {
     }
     const rest: Record<string, unknown> = { ...reply };
     delete rest.ok;
+    // `undoSteps` is an internal field docxwasm's `doc.replace-range` adds so
+    // the host can replay the right number of wasm undos (see `onMutated`). It
+    // must NEVER reach the TCP wire — a VS Code tab's reply has to be
+    // byte-for-byte a terminal instance's — so strip it here and stash the
+    // count for `handleLine` to pass `onMutated`. Reset to 1 on every call so a
+    // later non-reporting verb can't inherit a stale count.
+    this.lastUndoSteps = typeof rest.undoSteps === 'number' ? rest.undoSteps : 1;
+    delete rest.undoSteps;
     return rest;
   }
 

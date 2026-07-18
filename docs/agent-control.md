@@ -123,10 +123,14 @@ The [`offxy` VS Code extension](../offxy-vscode) gives every open `.docx`/
 (`offxy-vscode/src/ctlserver.ts`) — discoverable and drivable exactly like a
 terminal docxy/xlsxy pane: same discovery directory, same wire protocol, same
 verb tables above (`doc.*` for Word tabs, the xlsxy verbs below for Excel
-tabs). A tab's instance id is `<app>-vscode-<basename>-<n>` (e.g.
-`docxy-vscode-report_docx-1`), so it lists alongside terminal instances
-(`docxy-<pid>` / `docxy-<AGWINTERM_SESSION_ID>`) in the same discovery dir and
-in `docxy_list`/`xlsxy_list`. A tab exposes **exactly** the terminal verb
+tabs). A tab's instance id is `<app>-vscode-<basename>-<pid>-<n>` (e.g.
+`docxy-vscode-report_docx-4821-1`, where `4821` is the extension host's process
+id), so it lists alongside terminal instances (`docxy-<pid>` /
+`docxy-<AGWINTERM_SESSION_ID>`) in the same discovery dir and in
+`docxy_list`/`xlsxy_list`. The pid keeps ids distinct across two VS Code
+windows that open a same-basename file, which would otherwise mint the same
+`<basename>-<n>` in both and clobber each other's discovery file. A tab exposes
+**exactly** the terminal verb
 surface, nothing more: a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
@@ -144,7 +148,10 @@ scripting against a tab:
   terminal apps do. An agent that opens a file via one instance and keeps
   issuing verbs to that *same* instance is still operating on the **old**
   file; it needs to re-resolve `target` (e.g. via `docxy_list`/`xlsxy_list`)
-  to reach the instance for the file it just opened.
+  to reach the instance for the file it just opened. A tab's
+  `doc.open`/`wb.open` reply also carries just `{path}` (the path opened),
+  whereas a terminal instance returns its full `doc.path`/`wb.path` info for
+  the now-current document — a tab has no single "current document" to report.
 - **`doc.reload` doesn't clear VS Code's dirty flag.** It re-reads the file
   from disk and repaints the tab with the fresh content (dropping unsaved
   edits, per its documented behavior) — but unlike VS Code's own "Revert

@@ -741,6 +741,11 @@ impl Session {
         let text = args.get_str("text").ok_or("cell.set needs 'text'")?;
         let prev_active = self.active;
         self.active = si;
+        // Clear any stale error a prior interactive edit left in `self.err`
+        // (it's a one-shot channel normally drained by `view_json`), so
+        // `take()` below reads only THIS ctl edit's own error, not a false
+        // failure carried over from before.
+        self.err = None;
         self.dispatch(&format!("set\t{r}\t{c}\t{text}"));
         self.active = prev_active;
         if let Some(e) = self.err.take() {

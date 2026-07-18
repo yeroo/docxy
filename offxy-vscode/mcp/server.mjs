@@ -78,7 +78,12 @@ function discover(dir) {
     }
     if (
       typeof j.instance === 'string' &&
-      typeof j.port === 'number' &&
+      // Guard the port to a valid TCP range so a corrupt foreign discovery
+      // file (port 0, negative, non-integer, or > 65535) can't make
+      // `net.createConnection` throw and fail the whole tool call.
+      Number.isInteger(j.port) &&
+      j.port > 0 &&
+      j.port < 65536 &&
       typeof j.token === 'string'
     ) {
       out.push({ instance: j.instance, port: j.port, token: j.token, pid: typeof j.pid === 'number' ? j.pid : 0 });
@@ -173,6 +178,15 @@ function callInstance(inst, verb, args) {
       reject(new Error(message));
     };
 
+    // Decode with Node's internal StringDecoder (via setEncoding), not
+    // `chunk.toString('utf8')` per chunk: TCP can split a multi-byte UTF-8
+    // character (é, €, emoji, CJK) across two `data` events, and decoding each
+    // chunk independently would corrupt the straddling bytes to U+FFFD — the
+    // same bug fixed in ctlserver.ts (commit a74c19c). setEncoding holds back
+    // an incomplete trailing byte sequence until the rest of the character
+    // arrives, so `chunk` is always well-formed text here.
+    sock.setEncoding('utf8');
+
     connectTimer = setTimeout(() => finishErr('connect failed: timed out'), 500);
     sock.once('connect', () => {
       clearTimeout(connectTimer);
@@ -184,7 +198,7 @@ function callInstance(inst, verb, args) {
 
     let buffer = '';
     sock.on('data', (chunk) => {
-      buffer += chunk.toString('utf8');
+      buffer += chunk;
       const idx = buffer.indexOf('\n');
       if (idx < 0) return;
       let j;

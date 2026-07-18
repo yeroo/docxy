@@ -196,7 +196,10 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")
         .ok_or("doc.replace-range needs 'text'")?;
-    let replaced = agent::replace_range(&mut app.editor, start, end, text)?;
+    // The terminal app doesn't drive a host undo stack, so it ignores the
+    // checkpoint count `agent::replace_range` now also reports; its wire reply
+    // stays exactly `{replaced, total}`.
+    let (replaced, _undo_steps) = agent::replace_range(&mut app.editor, start, end, text)?;
     finish_edit(app);
     Ok(Json::obj(vec![
         ("replaced", Json::Num(replaced as f64)),

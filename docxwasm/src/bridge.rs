@@ -350,7 +350,7 @@ impl Session {
             "doc.insert" => self.ctl_insert(args),
             "doc.append" => self.ctl_append(args),
             "doc.blocks" => Ok(self.ctl_blocks()),
-            other => Err(format!("unknown verb: {other}")),
+            other => Err(format!("unknown verb '{other}'")),
         };
         match result {
             Ok(body) => ctl_ok(body),
@@ -461,7 +461,16 @@ impl Session {
         Ok(out)
     }
 
-    /// `{start, end?, text}` -> `{replaced, total}`
+    /// `{start, end?, text}` -> `{replaced, total, undoSteps}`
+    ///
+    /// `undoSteps` is an **internal** field for the extension host only: the
+    /// number of native undo checkpoints this edit pushed (2 for a normal
+    /// delete-then-insert, 1 when the replaced range was a single empty
+    /// paragraph and no delete happened). `CtlServer.callWasm` strips it before
+    /// the reply hits the TCP wire — a VS Code tab's `doc.replace-range` reply
+    /// must be byte-for-byte a terminal docxy's `{replaced, total}` — and hands
+    /// the count to `host.onMutated` so the tab replays exactly that many
+    /// wasm undos per VS Code undo (see `docxcore::agent::replace_range`).
     fn ctl_replace_range(&mut self, args: &json::Json) -> Result<String, String> {
         let start = args
             .get_usize("start")
@@ -470,12 +479,14 @@ impl Session {
         let text = args
             .get_str("text")
             .ok_or("doc.replace-range needs 'text'")?;
-        let replaced = agent::replace_range(&mut self.editor, start, end, text)?;
+        let (replaced, undo_steps) = agent::replace_range(&mut self.editor, start, end, text)?;
         self.finish_ctl_edit();
         let mut out = String::from("{\"replaced\":");
         out.push_str(&replaced.to_string());
         out.push_str(",\"total\":");
         out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(",\"undoSteps\":");
+        out.push_str(&undo_steps.to_string());
         out.push('}');
         Ok(out)
     }
@@ -964,13 +975,38 @@ mod tests {
         let out = s.ctl(r#"{"verb":"doc.replace-range","args":{"start":1,"text":"better"}}"#);
         assert!(out.contains("\"replaced\":1"), "{out}");
         assert!(out.contains("\"ok\":true"), "{out}");
-        // A replace-range is a delete-then-insert over a selection (same as an
-        // interactive paste), so it unwinds in the same two native undo steps
-        // documented by `docxcore::agent`'s and `docxy::control`'s own tests.
+        // A replace over a non-empty paragraph is a delete-then-insert: the
+        // reply reports 2 undo steps, and it unwinds in exactly two.
+        assert!(out.contains("\"undoSteps\":2"), "{out}");
         s.dispatch("undo");
         s.dispatch("undo");
         let v = s.view_json(None);
         assert!(v.contains("second") && !v.contains("better"), "{v}");
+    }
+
+    #[test]
+    fn ctl_replace_range_empty_paragraph_reports_one_undo_step() {
+        // Replacing an EMPTY paragraph is an insert with no preceding delete:
+        // one checkpoint. The reply must report `undoSteps:1` and one
+        // `dispatch("undo")` must fully restore the prior content — a host
+        // (VS Code tab) replaying two would over-unwind and destroy the edit
+        // before it. This is the exact desync guarded here.
+        let mut s = Session::open(&sample_docx("kept")).expect("open");
+        // Append an empty paragraph (block 1), then replace it.
+        s.ctl(r#"{"verb":"doc.append","args":{"text":""}}"#);
+        let out = s.ctl(r#"{"verb":"doc.replace-range","args":{"start":1,"text":"filled"}}"#);
+        assert!(out.contains("\"replaced\":1"), "{out}");
+        assert!(
+            out.contains("\"undoSteps\":1"),
+            "empty-paragraph replace must report a single undo step: {out}"
+        );
+        let v = s.view_json(None);
+        assert!(v.contains("filled"), "edit did not land: {v}");
+        // One undo (== reported steps) restores the empty-paragraph state:
+        // "filled" is gone but "kept" remains.
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("kept") && !v.contains("filled"), "{v}");
     }
 
     #[test]
