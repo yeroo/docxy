@@ -36,15 +36,38 @@ export interface CtlHost {
   open(path: string): Promise<object>;
   /** Fired once, right after a mutating verb's successful reply is computed,
    *  so the provider can raise the VS Code custom-document edit event (dirty
-   *  dot + undo lockstep). Not called for read-only or failed verbs.
+   *  dot + undo lockstep). Not called for read-only or failed verbs, nor for a
+   *  no-op `doc.undo`/`doc.redo` (`{done:false}` — nothing on the stack).
    *
    *  `undoSteps` is how many native wasm undo checkpoints the edit pushed — the
-   *  provider must replay exactly this many wasm undos per one VS Code undo, or
-   *  the two stacks desync. Only `doc.replace-range` ever reports 2 (a
-   *  delete-then-insert; 1 when the range was a single empty paragraph); every
-   *  other mutating verb checkpoints once. Defaults to 1 when absent. */
-  onMutated(verbLabel: string, undoSteps?: number): void;
+   *  provider replays exactly this many wasm undos per one VS Code undo for the
+   *  wasm-undo-stack bucket, or the two stacks desync. `doc.replace-range`
+   *  reports 2 (a delete-then-insert; 1 when the range was a single empty
+   *  paragraph); the wave-1 grid mutators (`range.set`, `sheet.rename`,
+   *  `row.*`/`col.*`, `wb.replace-all`, `sheet.add`) and the docx ones
+   *  (`doc.insert`/`append`/`replace-all`) checkpoint once; the inverse-op
+   *  bucket reports 0. Defaults to 1 when absent.
+   *
+   *  `inverse` is present only for verbs whose change is NOT on the wasm undo
+   *  stack (comment.add ⇄ comment.remove; sheet.import-csv / sheet.remove,
+   *  whose inverses are `sheet.remove` / `sheet.restore-removed`). It is the
+   *  ctl request that reverses this op; the provider drives it into the webview
+   *  as the edit event's undo(). `CtlServer` strips it off the wire (like
+   *  `undoSteps`) — it must never reach an external agent. */
+  onMutated(
+    verbLabel: string,
+    undoSteps?: number,
+    inverse?: { verb: string; args: unknown },
+  ): void;
 }
+
+/** The only keys `resolvePathInfo` may introduce into `doc.path`/`wb.path`
+ *  from the wasm `doc.blocks`/`wb.info` reply beyond the ones `host.pathInfo()`
+ *  already declares: `doc.path`'s present-if-set `protection`/`watermark`
+ *  (docxy only; `wb.info` never carries them, so the guard is a harmless no-op
+ *  for xlsxy). Deliberately narrow — see `resolvePathInfo` for why a blanket
+ *  spread of the wasm reply would leak undocumented fields onto the wire. */
+const PATHINFO_MERGE_ALLOWLIST = ['protection', 'watermark'] as const;
 
 /** One control-surface instance's discovery record (`docs/agent-control.md`
  *  → "Discovery"), written to `<ctlDir>/<instance>.json`. */
@@ -107,6 +130,14 @@ export class CtlServer {
    *  `queue`, and `onMutated` runs synchronously right after the call that
    *  sets it, with no intervening wasm call. */
   private lastUndoSteps = 1;
+  /** The host-orchestrated `inverse` request the most recent wasm call
+   *  reported (buckets B/C: comment add/remove, sheet import-csv/remove),
+   *  stripped from the wire and stashed here for `handleLine` to hand
+   *  `onMutated`. Same single-field safety as `lastUndoSteps`: requests
+   *  serialize through `queue`, and `onMutated` runs synchronously right after
+   *  the call that sets it. Reset to `undefined` on every wasm call so a later
+   *  non-reporting verb can't inherit a stale inverse. */
+  private lastInverse: { verb: string; args: unknown } | undefined;
 
   constructor(
     private readonly app: 'docxy' | 'xlsxy',
@@ -253,7 +284,26 @@ export class CtlServer {
     try {
       const result = await this.dispatch(verb, args);
       if (this.mutatingVerbs.has(verb)) {
-        this.host.onMutated(verb, this.lastUndoSteps);
+        // Fire the edit event (dirty dot + undo entry) only when the verb
+        // actually changed the document — a no-op mutating call must neither
+        // dirty the doc nor land a dead entry on VS Code's undo stack:
+        //  - `doc.undo`/`doc.redo` report `{done:bool}`; fire only on
+        //    `done:true` (a real stack pop). `done:false` = nothing to undo.
+        //  - wasm-undo-stack verbs push a checkpoint when they change
+        //    something (`undoSteps>0`); a zero-match `doc.replace-all` or an
+        //    empty-batch `range.set` reports `undoSteps:0` and leaves no wasm
+        //    tracks — skip it.
+        //  - inverse-op verbs (comment/sheet add/remove/import) report
+        //    `undoSteps:0` but a REAL change, marked by carrying an `inverse`;
+        //    a `comment.remove` that found nothing carries none, so it skips.
+        const isUndoRedo = verb === 'doc.undo' || verb === 'doc.redo';
+        const done = (result as { done?: unknown } | null)?.done;
+        const realChange = isUndoRedo
+          ? done === true
+          : this.lastUndoSteps > 0 || this.lastInverse !== undefined;
+        if (realChange) {
+          this.host.onMutated(verb, this.lastUndoSteps, this.lastInverse);
+        }
       }
       return frame(true, result, id);
     } catch (e) {
@@ -280,10 +330,72 @@ export class CtlServer {
       }
       return this.host.open(p);
     }
+    if (this.app === 'docxy' && verb === 'doc.export-pdf') {
+      return this.exportPdf(args);
+    }
     if (this.wasmVerbs.has(verb)) {
       return this.callWasm(verb, args);
     }
     throw new Error(`unknown verb '${verb}'`);
+  }
+
+  /** `doc.export-pdf` (docxy tabs), host-assisted. The wasm exporter is
+   *  std-only and can't touch the filesystem, so its ctl verb takes no `path`
+   *  and returns the rendered PDF as base64 (`pdfBase64`, an internal field);
+   *  the extension host validates the target path, decodes the bytes, and
+   *  writes the file — landing on the SAME wire reply (`{path}`) a terminal
+   *  docxy's direct write produces. The error family
+   *  (`bad path:`/`already exists:`/`create failed:`) is byte-identical to
+   *  `server.mjs`'s `doNew` (and thus to `ctlcore::client::new_file`): empty
+   *  path, existing target, and creation failures all read the same on every
+   *  surface. Precedence matches terminal `export_pdf` (control.rs): missing
+   *  path → bad path → already-exists → render → exclusive create. */
+  private async exportPdf(args: unknown): Promise<object> {
+    const p = (args as { path?: unknown } | null)?.path;
+    if (typeof p !== 'string') {
+      throw new Error("doc.export-pdf needs a 'path'");
+    }
+    // `path.resolve('')` would fall back to cwd, but Rust's
+    // `std::path::absolute("")` errors — match that (and `doNew`) explicitly.
+    if (p === '') {
+      throw new Error('bad path: cannot make an empty path absolute');
+    }
+    const abs = path.resolve(p);
+    if (fs.existsSync(abs)) {
+      throw new Error(`already exists: ${abs}`);
+    }
+    // Render only after the path is known-writable (mirrors the terminal's
+    // precedence). The wasm reply is docxwasm's flat `{pdfBase64,ok:true}`.
+    const raw = await this.host.callWasm(JSON.stringify({ verb: 'doc.export-pdf', args: {} }));
+    const reply = JSON.parse(raw) as Record<string, unknown>;
+    if (reply.ok !== true) {
+      throw new Error(typeof reply.error === 'string' ? reply.error : 'wasm call failed');
+    }
+    if (typeof reply.pdfBase64 !== 'string') {
+      throw new Error('create failed: the document engine returned no PDF data');
+    }
+    const pdf = Buffer.from(reply.pdfBase64, 'base64');
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+    } catch (e) {
+      throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      // 'wx' = exclusive create: a file appearing between the exists check
+      // above and here errors instead of being truncated (create_new(true)).
+      const fd = fs.openSync(abs, 'wx');
+      try {
+        fs.writeFileSync(fd, pdf);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === 'EEXIST') {
+        throw new Error(`already exists: ${abs}`);
+      }
+      throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return { path: abs };
   }
 
   /** Forward one verb to the wasm session and unwrap its flat `{...,"ok":…}`
@@ -307,6 +419,18 @@ export class CtlServer {
     // later non-reporting verb can't inherit a stale count.
     this.lastUndoSteps = typeof rest.undoSteps === 'number' ? rest.undoSteps : 1;
     delete rest.undoSteps;
+    // `inverse` is the sibling internal field for the host-orchestrated-inverse
+    // bucket (comment add/remove, sheet import-csv/remove). Same rule as
+    // `undoSteps`: strip it off the wire (a tab's reply must be byte-for-byte a
+    // terminal instance's `{sheet,ref}`/`{removed}`/`{sheet,name,rows,cols}`)
+    // and stash it for `handleLine` to pass `onMutated`. Reset to `undefined`
+    // first so a later verb without an inverse can't inherit a stale one.
+    const inv = rest.inverse;
+    this.lastInverse =
+      inv && typeof inv === 'object' && typeof (inv as { verb?: unknown }).verb === 'string'
+        ? (inv as { verb: string; args: unknown })
+        : undefined;
+    delete rest.inverse;
     return rest;
   }
 
@@ -328,6 +452,21 @@ export class CtlServer {
     const extra = (await this.callWasm(infoVerb, null)) as Record<string, unknown>;
     const merged: Record<string, unknown> = { ...base };
     for (const key of Object.keys(merged)) {
+      if (key in extra) {
+        merged[key] = extra[key];
+      }
+    }
+    // `doc.path` additionally carries present-if-set `protection`/`watermark`
+    // (docxwasm's `doc.blocks` reports them live, sourced from
+    // `Package::protection()`/`watermark()`). The overwrite loop above only
+    // refreshes keys `base` already declares, and `host.pathInfo()` doesn't
+    // declare these two — so introduce them from `extra` here. A fixed
+    // two-key allowlist, NOT a blanket spread of `extra`: `doc.blocks`'s own
+    // `total`/`modified` fields must never leak onto the wire, so the merge
+    // stays closed to exactly the keys the documented `doc.path` shape allows.
+    // Absent (unprotected/unwatermarked) → `doc.blocks` omits them → the
+    // `key in extra` guard omits them here too, matching terminal `path_info`.
+    for (const key of PATHINFO_MERGE_ALLOWLIST) {
       if (key in extra) {
         merged[key] = extra[key];
       }

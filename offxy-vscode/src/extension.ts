@@ -73,6 +73,12 @@ const EDITORS: EditorSpec[] = [
       // `doc.blocks` arm, so exposing it here to external agents would let a
       // VS Code tab answer a verb a terminal instance rejects as "unknown
       // verb" — breaking "indistinguishable from a terminal instance".
+      //
+      // 'doc.export-pdf' is also deliberately absent: `CtlServer` special-cases
+      // it (host-assisted write; see `CtlServer.exportPdf`) ahead of this gate,
+      // so it's reachable without being listed here — listing it would route it
+      // through the plain wasm pass-through, which returns internal `pdfBase64`
+      // instead of writing the file.
       wasmVerbs: new Set([
         'doc.outline',
         'doc.read',
@@ -80,8 +86,35 @@ const EDITORS: EditorSpec[] = [
         'doc.replace-range',
         'doc.insert',
         'doc.append',
+        // Wave-1 read verbs (no repaint, no edit event).
+        'doc.export',
+        'doc.comments',
+        'doc.notes',
+        'doc.header',
+        'doc.footer',
+        'doc.metadata',
+        'doc.stats',
+        // Wave-1 mutating verbs.
+        'doc.replace-all',
+        'doc.undo',
+        'doc.redo',
       ]),
-      mutatingVerbs: new Set(['doc.replace-range', 'doc.insert', 'doc.append']),
+      mutatingVerbs: new Set([
+        'doc.replace-range',
+        'doc.insert',
+        'doc.append',
+        // 'doc.replace-all' fires an edit event only when it actually replaced
+        // something (undoSteps>0); a zero-match run reports undoSteps:0 and the
+        // wasm leaves no undo checkpoint, so the default `undoSteps ?? 1` replay
+        // path (see `onMutated`) correctly does one wasm undo for a real
+        // replace and — because `handleLine` still fires for it — we rely on
+        // the count being 0 to make the event's undo a no-op. 'doc.undo'/'redo'
+        // get the inverse-op adaptation (see `onMutated`); `handleLine` skips
+        // firing them entirely when `{done:false}`.
+        'doc.replace-all',
+        'doc.undo',
+        'doc.redo',
+      ]),
     },
   },
   {
@@ -99,6 +132,14 @@ const EDITORS: EditorSpec[] = [
       // 'doc.blocks' above — it's an internal-only verb `fullPathInfo()`
       // calls directly to compose `wb.path`'s reply, and terminal xlsxy's
       // control.rs has no `wb.info` arm.
+      //
+      // 'sheet.restore-removed' is also deliberately absent: it's an
+      // INTERNAL-only gridwasm verb reached ONLY through a `sheet.remove`
+      // edit event's host-orchestrated inverse (see `onMutated`). Terminal
+      // xlsxy has no such verb, so an external agent calling it directly must
+      // get "unknown verb" — which omitting it from this allow-list delivers
+      // for free (the inverse path calls the webview session directly,
+      // bypassing this gate).
       wasmVerbs: new Set([
         'sheet.list',
         'sheet.read',
@@ -107,8 +148,48 @@ const EDITORS: EditorSpec[] = [
         'range.clear',
         'find',
         'wb.recalc',
+        // Wave-1 read verbs (no repaint, no edit event).
+        'comment.list',
+        'wb.export-csv',
+        'sheet.pivot',
+        'formula.eval',
+        'sheet.stats',
+        'chart.list',
+        'pivot.list',
+        // Wave-1 mutating verbs.
+        'comment.add',
+        'comment.remove',
+        'range.set',
+        'sheet.import-csv',
+        'wb.replace-all',
+        'sheet.add',
+        'sheet.remove',
+        'sheet.rename',
+        'row.insert',
+        'row.delete',
+        'col.insert',
+        'col.delete',
       ]),
-      mutatingVerbs: new Set(['cell.set', 'range.clear']),
+      mutatingVerbs: new Set([
+        'cell.set',
+        'range.clear',
+        // Bucket A — one true wasm-undo-stack entry (undoSteps replay):
+        'range.set',
+        'sheet.rename',
+        'row.insert',
+        'row.delete',
+        'col.insert',
+        'col.delete',
+        'wb.replace-all',
+        'sheet.add',
+        // Bucket B — host-orchestrated inverse (comment add ⇄ remove):
+        'comment.add',
+        'comment.remove',
+        // Bucket C — history-cleared + inverse (import-csv ⇄ remove;
+        // remove ⇄ restore-removed):
+        'sheet.import-csv',
+        'sheet.remove',
+      ]),
     },
   },
 ];
@@ -567,20 +648,120 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
         return { path };
       },
 
-      onMutated: (verbLabel: string, undoSteps?: number) => {
-        // Replay exactly the number of wasm undo checkpoints the edit actually
-        // pushed, as reported by the wasm layer (`CtlServer` strips the
-        // internal `undoSteps` field off the wire and hands it here). Only
-        // `doc.replace-range` ever reports 2 — a delete-then-insert — and even
-        // it reports just 1 when the replaced range was a single *empty*
-        // paragraph (no delete happened): hard-coding 2 there would make one
-        // Ctrl+Z replay two wasm undos and silently destroy the user's prior
-        // edit (see `docxcore::agent::replace_range`). Every other mutating
-        // verb (`doc.insert`, `doc.append`, `cell.set`, `range.clear`)
-        // checkpoints once. Firing a single VS Code edit event whose undo/redo
-        // replays exactly `steps` wasm steps keeps one Ctrl+Z fully reverting
-        // one agent action, instead of landing on an intermediate state or
-        // over-unwinding.
+      onMutated: (
+        verbLabel: string,
+        undoSteps?: number,
+        inverse?: { verb: string; args: unknown },
+      ) => {
+        // Three distinct edit-event shapes, one per undo-mechanism bucket the
+        // wasm layer verified per verb (Tasks 3/5/6). `CtlServer` has already
+        // stripped the internal `undoSteps`/`inverse` fields off the wire and
+        // handed them here.
+
+        // --- Case 1: docxy `doc.undo` / `doc.redo` — inverse-wasm-op event. --
+        // The agent's `doc.undo` ALREADY ran the wasm undo; there's no new wasm
+        // undo-stack entry to replay. So we register a NEW VS Code edit event
+        // whose own undo/redo drives the INVERSE wasm op, keeping the two
+        // stacks in lockstep. Truth table (the agent verb's wasm op is what
+        // already happened; the event's undo() must REVERSE it):
+        //
+        //   agent verb | wasm op that ran | event.undo() sends | event.redo() sends
+        //   -----------+------------------+--------------------+-------------------
+        //   doc.undo   | wasm undo        | wasm redo (reverse)| wasm undo (replay)
+        //   doc.redo   | wasm redo        | wasm undo (reverse)| wasm redo (replay)
+        //
+        // (`handleLine` only reaches here for `{done:true}`, so the wasm op
+        // genuinely happened; a `{done:false}` no-op fires no event.)
+        if (
+          this.spec.ctl.app === 'docxy' &&
+          (verbLabel === 'doc.undo' || verbLabel === 'doc.redo')
+        ) {
+          const reverseOp = verbLabel === 'doc.undo' ? 'redo' : 'undo';
+          const replayOp = verbLabel === 'doc.undo' ? 'undo' : 'redo';
+          this._onDidChange.fire({
+            document,
+            label: `Agent: ${verbLabel === 'doc.undo' ? 'undo' : 'redo'}`,
+            undo: () => {
+              void document.panel?.webview.postMessage({ type: 'do', op: reverseOp });
+            },
+            redo: () => {
+              void document.panel?.webview.postMessage({ type: 'do', op: replayOp });
+            },
+          });
+          return;
+        }
+
+        // --- Case 2: host-orchestrated inverse (buckets B/C). ---------------
+        // The change isn't on the wasm undo stack (comment parts / package
+        // parts live outside it), so the wasm reply carried an `inverse` ctl
+        // request that reverses it. We drive that inverse into the webview as
+        // the event's undo(). Each inverse call's OWN reply carries the
+        // inverse-of-the-inverse (the op that re-does the change), so we
+        // flip-flop `undoReq`/`redoReq` across repeated undo/redo without ever
+        // needing the original call's args here. This self-heals the
+        // import-csv/remove/restore chain: undoing a `sheet.import-csv` sends
+        // `sheet.remove`, whose reply's inverse is `sheet.restore-removed`
+        // (which brings the sheet back WITH its data from the bridge stash),
+        // so redo restores content, not an empty sheet.
+        if (inverse) {
+          let undoReq: { verb: string; args: unknown } | undefined = inverse;
+          let redoReq: { verb: string; args: unknown } | undefined;
+          this._onDidChange.fire({
+            document,
+            label: `Agent: ${verbLabel}`,
+            undo: async () => {
+              if (!undoReq) {
+                void vscode.window.showWarningMessage(
+                  `Offxy: couldn't undo “${verbLabel}” — nothing left to reverse.`,
+                );
+                return;
+              }
+              const res = await this.applyInverseRequest(document, undoReq);
+              if (!res.ok) {
+                // A failed inverse (e.g. the single-slot sheet-restore stash
+                // already consumed by an earlier undo — the disclosed
+                // double-remove/double-undo failure mode) must be SURFACED, not
+                // swallowed, and must NOT throw: VS Code's undo pointer advances
+                // regardless, so a silent failure would lose data invisibly.
+                void vscode.window.showWarningMessage(
+                  `Offxy: couldn't undo “${verbLabel}”: ${res.error}`,
+                );
+                return;
+              }
+              redoReq = res.inverse; // re-doing = reversing what we just undid
+              undoReq = undefined;
+            },
+            redo: async () => {
+              if (!redoReq) {
+                void vscode.window.showWarningMessage(
+                  `Offxy: couldn't redo “${verbLabel}” — nothing to reapply.`,
+                );
+                return;
+              }
+              const res = await this.applyInverseRequest(document, redoReq);
+              if (!res.ok) {
+                void vscode.window.showWarningMessage(
+                  `Offxy: couldn't redo “${verbLabel}”: ${res.error}`,
+                );
+                return;
+              }
+              undoReq = res.inverse;
+              redoReq = undefined;
+            },
+          });
+          return;
+        }
+
+        // --- Case 3 (default): wasm-undo-stack replay (bucket A). -----------
+        // Replay exactly the number of wasm undo checkpoints the edit pushed.
+        // `doc.replace-range` reports 2 (a delete-then-insert; 1 for a single
+        // empty paragraph — hard-coding 2 would over-unwind and destroy a prior
+        // edit, see `docxcore::agent::replace_range`); every other bucket-A
+        // verb (`doc.insert`/`append`/`replace-all`, `range.set`,
+        // `sheet.rename`/`add`, `row.*`/`col.*`, `wb.replace-all`, and the
+        // legacy `cell.set`/`range.clear`) checkpoints once. One VS Code edit
+        // event replaying exactly `steps` wasm steps keeps one Ctrl+Z fully
+        // reverting one agent action.
         const steps = undoSteps ?? 1;
         this._onDidChange.fire({
           document,
@@ -598,6 +779,44 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
         });
       },
     };
+  }
+
+  /** Drive one host-orchestrated inverse ctl request into `document`'s webview
+   *  session (the undo/redo of a bucket-B/C edit event; see `onMutated` Case
+   *  2), repainting after. Returns `{ok:true, inverse}` with the reply's own
+   *  inverse-of-the-inverse (the request that re-does what this one just
+   *  reversed) for the flip-flop, or `{ok:false, error}` so the caller can
+   *  surface a warning without throwing. Verbs reached this way (including the
+   *  internal-only `sheet.restore-removed`) bypass `CtlServer`'s `wasmVerbs`
+   *  gate — they go straight to the live session — which is exactly why
+   *  `sheet.restore-removed` stays off the external allow-list yet still works
+   *  here. */
+  private async applyInverseRequest(
+    document: BinaryDocument,
+    req: { verb: string; args: unknown },
+  ): Promise<{ ok: boolean; inverse?: { verb: string; args: unknown }; error?: string }> {
+    const raw = await document.requestCtl(
+      JSON.stringify({ verb: req.verb, args: req.args ?? null }),
+      true,
+    );
+    let reply: Record<string, unknown>;
+    try {
+      reply = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return { ok: false, error: 'the document returned a malformed reply' };
+    }
+    if (reply.ok !== true) {
+      return {
+        ok: false,
+        error: typeof reply.error === 'string' ? reply.error : 'the operation failed',
+      };
+    }
+    const inv = reply.inverse;
+    const inverse =
+      inv && typeof inv === 'object' && typeof (inv as { verb?: unknown }).verb === 'string'
+        ? (inv as { verb: string; args: unknown })
+        : undefined;
+    return { ok: true, inverse };
   }
 
   /** Compose the full `${prefix}.path`-shaped reply — the URI-derived half
