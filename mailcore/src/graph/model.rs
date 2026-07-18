@@ -178,6 +178,186 @@ impl DeltaPage {
     }
 }
 
+/// One attendee of a calendar event (required/optional/resource), and
+/// their RSVP status as Graph's `attendees[].status.response`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Attendee {
+    pub name: String,
+    pub addr: String,
+    pub r#type: String,
+    pub response: String,
+}
+
+impl Attendee {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let addr = v.get("emailAddress")?;
+        Some(Attendee {
+            name: str_field(addr, "name"),
+            addr: str_field(addr, "address"),
+            r#type: str_field(v, "type"),
+            response: v
+                .get("status")
+                .and_then(|s| s.get("response"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+}
+
+/// A calendar event, as returned by Graph's `/me/calendarView` and
+/// `/me/events` endpoints. `start_utc`/`end_utc` are always normalized to
+/// `YYYY-MM-DDTHH:MM:SSZ` by `to_utc` (see its docs) — callers never see
+/// Graph's raw `start`/`end` `dateTime`+`timeZone` pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    pub id: String,
+    pub subject: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub organizer_name: String,
+    pub organizer_addr: String,
+    pub response_status: String,
+    pub series_master_id: Option<String>,
+    pub body_preview: String,
+    pub web_link: String,
+    pub last_modified: String,
+    pub body_html: String,
+    pub attendees: Vec<Attendee>,
+}
+
+impl Event {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let organizer = v
+            .get("organizer")
+            .and_then(Recipient::from_json)
+            .unwrap_or_default();
+        Some(Event {
+            id: str_field(v, "id"),
+            subject: str_field(v, "subject"),
+            start_utc: v
+                .get("start")
+                .map(datetime_field_to_utc)
+                .unwrap_or_default(),
+            end_utc: v.get("end").map(datetime_field_to_utc).unwrap_or_default(),
+            is_all_day: v.get("isAllDay").and_then(Value::as_bool).unwrap_or(false),
+            location: v
+                .get("location")
+                .and_then(|l| l.get("displayName"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            organizer_name: organizer.name,
+            organizer_addr: organizer.address,
+            response_status: v
+                .get("responseStatus")
+                .and_then(|r| r.get("response"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            series_master_id: opt_str_field(v, "seriesMasterId"),
+            body_preview: str_field(v, "bodyPreview"),
+            web_link: str_field(v, "webLink"),
+            last_modified: str_field(v, "lastModifiedDateTime"),
+            body_html: v
+                .get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            attendees: v
+                .get("attendees")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Attendee::from_json).collect())
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// Reads Graph's `start`/`end` object (`{"dateTime":…, "timeZone":…}`) and
+/// normalizes it to UTC via `to_utc`. Missing/mistyped fields fall back to
+/// `""`/`"UTC"`, matching this module's usual "default rather than fail"
+/// convention for `from_json` — a malformed date is still a fixed-width
+/// string, just not a meaningful one.
+fn datetime_field_to_utc(v: &Value) -> String {
+    let dt = v.get("dateTime").and_then(Value::as_str).unwrap_or("");
+    let tz = v.get("timeZone").and_then(Value::as_str).unwrap_or("UTC");
+    to_utc(dt, tz)
+}
+
+/// Normalizes a Graph event `dateTime`+`timeZone` pair to a canonical,
+/// fixed-width UTC timestamp: exactly `YYYY-MM-DDTHH:MM:SSZ` (4-2-2 date,
+/// 2-2-2 time, always zero-padded, fractional seconds dropped). This exact
+/// shape matters beyond cosmetics: `Store::events_in_window` orders and
+/// filters events by **lexical** comparison on the stored `start_utc`/
+/// `end_utc` strings, so lexical order has to equal chronological order —
+/// which only holds if every timestamp is this same fixed width with no
+/// variation in padding, fractional digits, or `Z` suffix.
+///
+/// `calendar_view` always sends `Prefer: outlook.timezone="UTC"`, so in
+/// practice `tz` is always `"UTC"` and Graph's `dateTime` is already a UTC
+/// wall-clock time — just not in this canonical shape (Graph sends e.g.
+/// `"2026-07-18T09:00:00.0000000"`: no `Z`, 7 fractional digits). `tz` is
+/// still checked defensively: an unrecognized zone doesn't get converted
+/// (this crate carries no IANA/Windows offset table — that's out of scope
+/// while every request already asks Graph for UTC) but is *noted* by
+/// falling through the same normalization path, treating the `dateTime` as
+/// if it were UTC, rather than silently trusting the wrong offset math.
+pub fn to_utc(dt: &str, tz: &str) -> String {
+    let _ = is_utc_zone(tz); // defensive guard only — see doc comment above.
+    normalize_datetime(dt)
+}
+
+/// `true` for the zone labels Graph is expected to send back when a
+/// request carries `Prefer: outlook.timezone="UTC"`.
+fn is_utc_zone(tz: &str) -> bool {
+    matches!(tz.to_ascii_uppercase().as_str(), "UTC" | "ETC/UTC" | "Z")
+}
+
+/// Reformats an ISO-8601-ish `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]`
+/// string into exactly `YYYY-MM-DDTHH:MM:SSZ`: drops fractional seconds and
+/// any trailing `Z`/numeric offset, then zero-pads every component. Missing
+/// pieces (e.g. an empty `dt`) default to `0000`/`00` rather than panicking,
+/// same "default rather than fail" convention as the rest of `from_json`.
+fn normalize_datetime(dt: &str) -> String {
+    let s = dt.trim_end_matches('Z');
+    let (date_part, time_part) = s.split_once('T').unwrap_or((s, ""));
+    let time_no_offset = strip_offset(time_part);
+    let time_no_frac = time_no_offset.split('.').next().unwrap_or("");
+
+    let mut date_fields = date_part.splitn(3, '-');
+    let year = date_fields.next().unwrap_or("");
+    let month = date_fields.next().unwrap_or("");
+    let day = date_fields.next().unwrap_or("");
+
+    let mut time_fields = time_no_frac.splitn(3, ':');
+    let hour = time_fields.next().unwrap_or("");
+    let minute = time_fields.next().unwrap_or("");
+    let second = time_fields.next().unwrap_or("");
+
+    format!(
+        "{:0>4}-{:0>2}-{:0>2}T{:0>2}:{:0>2}:{:0>2}Z",
+        year, month, day, hour, minute, second
+    )
+}
+
+/// Strips a trailing numeric UTC offset (`+HH:MM` or `-HH:MM`) off a time
+/// component, if present. Graph shouldn't send one here (a `dateTime` next
+/// to a separate `timeZone` field is wall-clock time, not offset-suffixed),
+/// but stripping it defensively means a stray offset can't leak into the
+/// zero-padded output instead of being dropped like fractional seconds are.
+fn strip_offset(time_part: &str) -> &str {
+    if let Some(idx) = time_part.find('+') {
+        &time_part[..idx]
+    } else if let Some(idx) = time_part.rfind('-') {
+        &time_part[..idx]
+    } else {
+        time_part
+    }
+}
+
 /// Reads Graph's `flag.flagStatus` field, true when it equals `"flagged"`.
 pub fn parse_flag(v: &Value) -> bool {
     v.get("flag")
@@ -254,6 +434,93 @@ mod tests {
             Some("https://graph/delta?token=xyz")
         );
         assert!(page.next_link.is_none());
+    }
+
+    #[test]
+    fn to_utc_normalizes_graph_style_fractional_seconds() {
+        // Graph's actual wire shape when `Prefer: outlook.timezone="UTC"`
+        // is set: no `Z`, 7 fractional digits. This is the highest-risk
+        // case — `Store::events_in_window` depends on this collapsing to
+        // exactly the fixed-width canonical form.
+        assert_eq!(
+            to_utc("2026-07-18T09:00:00.0000000", "UTC"),
+            "2026-07-18T09:00:00Z"
+        );
+    }
+
+    #[test]
+    fn to_utc_passes_through_already_canonical_and_guards_non_utc_zone() {
+        assert_eq!(
+            to_utc("2026-07-18T09:00:00Z", "UTC"),
+            "2026-07-18T09:00:00Z"
+        );
+        // An unrecognized zone label is guarded defensively (treated as
+        // UTC, not converted) rather than mis-applying an offset this
+        // crate has no table for.
+        assert_eq!(
+            to_utc("2026-07-18T09:00:00.0000000", "Pacific Standard Time"),
+            "2026-07-18T09:00:00Z"
+        );
+    }
+
+    #[test]
+    fn to_utc_zero_pads_single_digit_components() {
+        assert_eq!(to_utc("2026-7-8T9:5:3", "UTC"), "2026-07-08T09:05:03Z");
+    }
+
+    #[test]
+    fn parses_event_with_attendees_organizer_and_response_status() {
+        let v = parse(
+            r#"{
+          "id":"E1","subject":"Sync",
+          "start":{"dateTime":"2026-07-18T09:00:00.0000000","timeZone":"UTC"},
+          "end":{"dateTime":"2026-07-18T10:00:00.0000000","timeZone":"UTC"},
+          "isAllDay":false,
+          "location":{"displayName":"Room 1"},
+          "organizer":{"emailAddress":{"name":"Boss","address":"boss@x"}},
+          "responseStatus":{"response":"accepted","time":"2026-07-17T00:00:00Z"},
+          "seriesMasterId":null,
+          "bodyPreview":"preview",
+          "webLink":"https://outlook/e1",
+          "lastModifiedDateTime":"2026-07-17T12:00:00Z",
+          "body":{"contentType":"html","content":"<p>hi</p>"},
+          "attendees":[{"type":"required","status":{"response":"none","time":"0001-01-01T00:00:00Z"},"emailAddress":{"name":"A","address":"a@x"}}]
+        }"#,
+        )
+        .unwrap();
+        let e = Event::from_json(&v).unwrap();
+        assert_eq!(e.id, "E1");
+        assert_eq!(e.subject, "Sync");
+        assert_eq!(e.start_utc, "2026-07-18T09:00:00Z");
+        assert_eq!(e.end_utc, "2026-07-18T10:00:00Z");
+        assert!(!e.is_all_day);
+        assert_eq!(e.location, "Room 1");
+        assert_eq!(e.organizer_name, "Boss");
+        assert_eq!(e.organizer_addr, "boss@x");
+        assert_eq!(e.response_status, "accepted");
+        assert!(e.series_master_id.is_none());
+        assert_eq!(e.body_preview, "preview");
+        assert_eq!(e.web_link, "https://outlook/e1");
+        assert_eq!(e.last_modified, "2026-07-17T12:00:00Z");
+        assert_eq!(e.body_html, "<p>hi</p>");
+        assert_eq!(e.attendees.len(), 1);
+        assert_eq!(e.attendees[0].name, "A");
+        assert_eq!(e.attendees[0].addr, "a@x");
+        assert_eq!(e.attendees[0].r#type, "required");
+        assert_eq!(e.attendees[0].response, "none");
+    }
+
+    #[test]
+    fn parses_event_series_master_id_when_present() {
+        let v = parse(
+            r#"{"id":"E2","subject":"Occurrence",
+                "start":{"dateTime":"2026-07-19T09:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-07-19T10:00:00.0000000","timeZone":"UTC"},
+                "seriesMasterId":"SERIES1"}"#,
+        )
+        .unwrap();
+        let e = Event::from_json(&v).unwrap();
+        assert_eq!(e.series_master_id.as_deref(), Some("SERIES1"));
     }
 
     #[test]

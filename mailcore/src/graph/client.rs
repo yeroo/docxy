@@ -8,7 +8,7 @@
 //! (a later task) catches it, refreshes, and retries once. The bearer token
 //! is never logged (it's not `Debug`-derived into any log line here).
 
-use crate::graph::model::{AttachmentMeta, Body, DeltaPage, MailFolder, Message, Recipient};
+use crate::graph::model::{AttachmentMeta, Body, DeltaPage, Event, MailFolder, Message, Recipient};
 use crate::json::{self, Value};
 use std::fmt;
 
@@ -65,6 +65,15 @@ pub enum DeltaCursor {
     /// for the next sync) from a prior `DeltaPage`. Already a complete URL,
     /// so it's sent as-is rather than joined with `base`.
     Link(String),
+}
+
+/// Which RSVP action `respond_event` sends, mapped to Graph's
+/// `/me/events/{id}/accept|decline|tentativelyAccept` endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsvpKind {
+    Accept,
+    Decline,
+    Tentative,
 }
 
 /// The `$select` fields covering every header field `Message::from_json`
@@ -357,6 +366,64 @@ impl GraphClient {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}/send");
         self.send(Method::Post, &path, None, &[])?;
+        Ok(())
+    }
+
+    /// GET `/me/calendarView?startDateTime=&endDateTime=&$top=50`, sending
+    /// `Prefer: outlook.timezone="UTC"` so every returned event's `start`/
+    /// `end` is already a UTC wall-clock time (see `Event::from_json` /
+    /// `model::to_utc` for the fixed-width normalization this enables), and
+    /// following `@odata.nextLink` — a relative path or a full URL, either
+    /// way `full_url` resolves it — until Graph stops sending one.
+    pub fn calendar_view(&self, from_utc: &str, to_utc: &str) -> Result<Vec<Event>, GraphError> {
+        let mut target =
+            format!("/me/calendarView?startDateTime={from_utc}&endDateTime={to_utc}&$top=50");
+        let mut events = Vec::new();
+        loop {
+            let resp = self.send(
+                Method::Get,
+                &target,
+                None,
+                &[("Prefer", "outlook.timezone=\"UTC\"")],
+            )?;
+            let v = parse_body(resp)?;
+            let items = value_array(&v, "value")?;
+            events.extend(items.iter().filter_map(Event::from_json));
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) => target = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(events)
+    }
+
+    /// POST `/me/events/{id}/accept|decline|tentativelyAccept` with
+    /// `{"comment":…, "sendResponse":…}` — `comment` defaults to `""` when
+    /// `None` rather than omitting the field, so the body shape is the same
+    /// for every call.
+    pub fn respond_event(
+        &self,
+        id: &str,
+        kind: RsvpKind,
+        comment: Option<&str>,
+        send_response: bool,
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let action = match kind {
+            RsvpKind::Accept => "accept",
+            RsvpKind::Decline => "decline",
+            RsvpKind::Tentative => "tentativelyAccept",
+        };
+        let path = format!("/me/events/{id}/{action}");
+        let body = Value::Object(vec![
+            (
+                "comment".to_string(),
+                Value::Str(comment.unwrap_or("").to_string()),
+            ),
+            ("sendResponse".to_string(), Value::Bool(send_response)),
+        ])
+        .to_string();
+        self.send(Method::Post, &path, Some(body), &[])?;
         Ok(())
     }
 
@@ -1119,6 +1186,202 @@ mod tests {
             c.create_draft("x", "y", &[], &[]),
             Err(GraphError::Unauthorized)
         ));
+    }
+
+    fn sample_event_json(id: &str, start: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","subject":"s{id}",
+            "start":{{"dateTime":"{start}.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"{start}.0000000","timeZone":"UTC"}},
+            "isAllDay":false,
+            "location":{{"displayName":"Room"}},
+            "organizer":{{"emailAddress":{{"name":"Org","address":"org@x"}}}},
+            "responseStatus":{{"response":"accepted"}},
+            "seriesMasterId":null,
+            "bodyPreview":"p","webLink":"https://x/{id}",
+            "lastModifiedDateTime":"2026-07-17T00:00:00Z",
+            "body":{{"contentType":"html","content":"b"}},
+            "attendees":[{{"type":"required","status":{{"response":"none"}},"emailAddress":{{"name":"A","address":"a@x"}}}}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn calendar_view_parses_events_with_utc_times_and_prefer_header() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/calendarView".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(
+                r#"{{"value":[{},{}]}}"#,
+                sample_event_json("E1", "2026-07-18T09:00:00"),
+                sample_event_json("E2", "2026-07-18T11:00:00")
+            ),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let events = c
+            .calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].start_utc.ends_with('Z'));
+        assert_eq!(events[0].start_utc, "2026-07-18T09:00:00Z");
+        assert_eq!(events[0].response_status, "accepted");
+        assert_eq!(events[0].attendees.len(), 1);
+        assert_eq!(events[0].organizer_addr, "org@x");
+
+        let reqs = srv.requests();
+        assert!(
+            reqs[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("prefer") && v == "outlook.timezone=\"UTC\"")
+        );
+        assert!(reqs[0].path.contains("startDateTime="));
+        assert!(reqs[0].path.contains("endDateTime="));
+    }
+
+    #[test]
+    fn calendar_view_follows_next_link_pagination() {
+        // Order matters, same as `list_folders_recurses_into_child_folders`:
+        // the fake server matches the *first* route whose path_prefix is a
+        // prefix of the request path, so the more specific second-page route
+        // must come before the generic first-page route. The nextLink is
+        // given here as a path (not a full URL) — `GraphClient::full_url`
+        // joins any target that doesn't already start with `http(s)://`
+        // onto `base`, so a bare path exercises the same "follow the link
+        // as-is" logic a real absolute nextLink would.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    sample_event_json("E2", "2026-07-18T11:00:00")
+                ),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/calendarView?$skiptoken=P2"}}"#,
+                    sample_event_json("E1", "2026-07-18T09:00:00"),
+                ),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let events = c
+            .calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "E1");
+        assert_eq!(events[1].id, "E2");
+    }
+
+    #[test]
+    fn calendar_view_401_maps_to_unauthorized() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/calendarView".into(),
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z"),
+            Err(GraphError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn respond_event_accept_posts_comment_and_send_response() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/accept".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event("E1", RsvpKind::Accept, Some("ok"), true)
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert!(reqs[0].path.ends_with("/accept"));
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            sent.get("sendResponse").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn respond_event_decline_and_tentative_hit_the_right_action() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/decline".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/tentativelyAccept".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event("E1", RsvpKind::Decline, None, false)
+            .unwrap();
+        c.respond_event("E1", RsvpKind::Tentative, None, false)
+            .unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.ends_with("/decline"));
+        assert!(reqs[1].path.ends_with("/tentativelyAccept"));
+    }
+
+    #[test]
+    fn respond_event_401_maps_to_unauthorized() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/accept".into(),
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.respond_event("E1", RsvpKind::Accept, None, true),
+            Err(GraphError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn respond_event_id_is_percent_encoded() {
+        let raw_id = "AAMk/id+with=chars";
+        let encoded_id = "AAMk%2Fid%2Bwith%3Dchars";
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: format!("/me/events/{encoded_id}/accept"),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event(raw_id, RsvpKind::Accept, None, true)
+            .unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.contains(encoded_id));
+        assert!(!reqs[0].path.contains(raw_id));
     }
 
     #[test]
