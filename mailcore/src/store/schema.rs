@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
     ON messages(folder_id, received_at DESC);
 
+CREATE TABLE IF NOT EXISTS contacts (
+    address    TEXT PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'local',
+    last_seen  TEXT NOT NULL DEFAULT '',
+    frequency  INTEGER NOT NULL DEFAULT 0,
+    relevance  INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS bodies (
     message_id   TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     content_type TEXT NOT NULL DEFAULT '',

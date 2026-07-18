@@ -78,6 +78,20 @@ pub struct MessageRow {
     pub is_draft: bool,
 }
 
+/// A `contacts` row — one per normalized (lowercased) email address, the
+/// autocomplete query surface. `source` is `local`/`graph`/`both`;
+/// `relevance` is the Graph `/me/people` rank (lower = more relevant),
+/// `None` for a purely locally-mined contact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contact {
+    pub name: String,
+    pub address: String,
+    pub source: String,
+    pub last_seen: String,
+    pub frequency: i64,
+    pub relevance: Option<i64>,
+}
+
 /// A queued local mutation, awaiting a push to Microsoft Graph by
 /// `sync::outbox::apply_op`. Serializes to/from JSON via `to_json`/
 /// `from_json` (`crate::json`, no `serde`) as `{"kind":"...","id":"...",...}`
@@ -1306,6 +1320,63 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Inserts or merges a contact keyed by `address`. Merge rules keep the
+    /// strongest signal from either source: a non-empty `name` wins over an
+    /// empty one; `source` becomes `both` once both a local and a graph upsert
+    /// have touched the row; `last_seen`/`frequency` take the MAX (so re-running
+    /// the local miner is idempotent, and a graph upsert with 0/"" never lowers
+    /// them); `relevance` takes the incoming value when present, else keeps the
+    /// stored one.
+    pub fn upsert_contact(&self, c: &Contact) -> Result<(), StoreError> {
+        let address = c.address.to_lowercase();
+        self.conn.execute(
+            "INSERT INTO contacts (address, name, source, last_seen, frequency, relevance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(address) DO UPDATE SET
+                 name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END,
+                 source = CASE WHEN contacts.source = excluded.source THEN contacts.source ELSE 'both' END,
+                 last_seen = MAX(contacts.last_seen, excluded.last_seen),
+                 frequency = MAX(contacts.frequency, excluded.frequency),
+                 relevance = COALESCE(excluded.relevance, contacts.relevance)",
+            params![address, c.name, c.source, c.last_seen, c.frequency, c.relevance],
+        )?;
+        Ok(())
+    }
+
+    /// Ranked autocomplete matches for `query` (matched case-insensitively
+    /// against name and address). Prefix matches rank ahead of interior
+    /// matches; then by Graph relevance (lower first, nulls last), then
+    /// frequency (higher first), then recency, then name.
+    pub fn search_contacts(&self, query: &str, limit: i64) -> Result<Vec<Contact>, StoreError> {
+        let q = query.to_lowercase();
+        let mut stmt = self.conn.prepare(
+            "SELECT address, name, source, last_seen, frequency, relevance
+             FROM contacts
+             WHERE lower(name) LIKE '%' || ?1 || '%' OR lower(address) LIKE '%' || ?1 || '%'
+             ORDER BY
+                 (CASE WHEN lower(name) LIKE ?1 || '%' OR lower(address) LIKE ?1 || '%' THEN 0 ELSE 1 END) ASC,
+                 (CASE WHEN relevance IS NULL THEN 1 ELSE 0 END) ASC,
+                 relevance ASC,
+                 frequency DESC,
+                 last_seen DESC,
+                 name ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![q, limit], |row| {
+                Ok(Contact {
+                    address: row.get(0)?,
+                    name: row.get(1)?,
+                    source: row.get(2)?,
+                    last_seen: row.get(3)?,
+                    frequency: row.get(4)?,
+                    relevance: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// The local `folders.id` a new draft is filed under when the real Drafts
@@ -1627,6 +1698,74 @@ mod tests {
         assert!(s.get_delta_link("F").unwrap().is_none());
         s.set_delta_link("F", "LINK").unwrap();
         assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("LINK"));
+    }
+
+    #[test]
+    fn upsert_contact_merges_local_then_graph() {
+        let s = Store::open_in_memory().unwrap();
+        // local mining: a name + frequency + recency, no relevance
+        s.upsert_contact(&Contact {
+            name: "Bob Jones".into(),
+            address: "bob@x.com".into(),
+            source: "local".into(),
+            last_seen: "2026-07-10T00:00:00Z".into(),
+            frequency: 3,
+            relevance: None,
+        })
+        .unwrap();
+        // graph sync: same address, a display name + relevance, no local signal
+        s.upsert_contact(&Contact {
+            name: "Robert Jones".into(),
+            address: "bob@x.com".into(),
+            source: "graph".into(),
+            last_seen: "".into(),
+            frequency: 0,
+            relevance: Some(2),
+        })
+        .unwrap();
+
+        let got = s.search_contacts("bob", 10).unwrap();
+        assert_eq!(got.len(), 1);
+        let c = &got[0];
+        assert_eq!(c.source, "both"); // both sources contributed
+        assert_eq!(c.relevance, Some(2)); // graph relevance kept
+        assert_eq!(c.frequency, 3); // local frequency kept (MAX, not clobbered to 0)
+        assert_eq!(c.last_seen, "2026-07-10T00:00:00Z"); // recency kept (MAX, not clobbered to "")
+        assert_eq!(c.name, "Robert Jones"); // non-empty graph name applied
+    }
+
+    #[test]
+    fn search_contacts_ranks_prefix_first_then_frequency() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_contact(&Contact {
+            name: "Ann Lee".into(),
+            address: "ann@x.com".into(),
+            source: "local".into(),
+            last_seen: "2026-07-01T00:00:00Z".into(),
+            frequency: 1,
+            relevance: None,
+        })
+        .unwrap();
+        s.upsert_contact(&Contact {
+            name: "Danny".into(),
+            address: "dan@x.com".into(),
+            source: "local".into(),
+            last_seen: "2026-07-02T00:00:00Z".into(),
+            frequency: 9,
+            relevance: None,
+        })
+        .unwrap();
+        // "an": "Ann"/"ann@" are PREFIX matches; "Danny"/"dan@" contain "an" only interior.
+        let got = s.search_contacts("an", 10).unwrap();
+        let addrs: Vec<&str> = got.iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(addrs, ["ann@x.com", "dan@x.com"]); // prefix match ranks ahead of higher-frequency interior match
+        // limit is respected
+        assert_eq!(s.search_contacts("an", 1).unwrap().len(), 1);
+        // matching is case-insensitive on both name and address
+        assert_eq!(
+            s.search_contacts("ANN", 10).unwrap()[0].address,
+            "ann@x.com"
+        );
     }
 }
 
