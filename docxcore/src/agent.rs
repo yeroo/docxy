@@ -183,6 +183,47 @@ pub fn append(ed: &mut Editor, text: &str) {
     ed.paste(&Clip::from_text(&format!("\n{text}")));
 }
 
+/// Replace every occurrence of `query` with `text` across the whole document
+/// (all paragraphs at any nesting depth, including table cells; case
+/// sensitivity per `case_sensitive`). Returns `(replaced, undo_steps)`: the
+/// number of matches replaced, and the number of native undo checkpoints this
+/// call pushed onto the editor's stack.
+///
+/// **Empirical finding** (read from [`Editor::replace_all`]'s implementation
+/// and pinned by this module's tests): it calls `checkpoint` exactly **once**,
+/// before the match-rewriting loop — not once per match — so a single call
+/// always produces **one** undo checkpoint total, regardless of whether it
+/// rewrites one match or a hundred. When there are no matches at all,
+/// `Editor::replace_all` returns early *before* checkpointing, so nothing is
+/// pushed onto the undo stack and `undo_steps` is `0` — a would-be no-op call
+/// must not report a phantom undo step. So `undo_steps` is always `1` when
+/// `replaced > 0`, and `0` when `replaced == 0`. A caller replaying undo to
+/// keep a host stack in lockstep (e.g. the offxy VS Code tab) must replay
+/// exactly this many undos, not one per replaced match.
+pub fn replace_all(
+    ed: &mut Editor,
+    query: &str,
+    text: &str,
+    case_sensitive: bool,
+) -> (usize, usize) {
+    let replaced = ed.replace_all(query, text, case_sensitive);
+    let undo_steps = if replaced > 0 { 1 } else { 0 };
+    (replaced, undo_steps)
+}
+
+/// Undo the last edit, if any. Returns whether anything was undone; on an
+/// empty undo stack (a fresh document, or one already unwound to its start)
+/// this returns `false` and leaves the document untouched.
+pub fn undo(ed: &mut Editor) -> bool {
+    ed.undo()
+}
+
+/// Redo the last undone edit, if any. Returns whether anything was redone; on
+/// an empty redo stack this returns `false` and leaves the document untouched.
+pub fn redo(ed: &mut Editor) -> bool {
+    ed.redo()
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -328,5 +369,70 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].path, vec![0]);
         assert_eq!(matches[1].path, vec![1]);
+    }
+
+    #[test]
+    fn replace_all_reports_count_and_a_single_undo_checkpoint() {
+        let mut ed = Editor::new(doc_with(&["a foo b foo c", "foo"]));
+        let (replaced, steps) = replace_all(&mut ed, "foo", "BAR", false);
+        assert_eq!(replaced, 3);
+        // Empirical finding under test: Editor::replace_all checkpoints ONCE
+        // total, not once per match, so exactly one undo (not three) must
+        // restore every rewritten paragraph.
+        assert_eq!(
+            steps, 1,
+            "replace_all checkpoints once regardless of match count"
+        );
+        assert_eq!(paras(&ed.doc), vec!["a BAR b BAR c", "BAR"]);
+        for _ in 0..steps {
+            assert!(ed.undo());
+        }
+        assert_eq!(
+            paras(&ed.doc),
+            vec!["a foo b foo c", "foo"],
+            "exactly `steps` undos must restore the original text"
+        );
+        // No further undo is available — the whole edit was one checkpoint.
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn replace_all_no_matches_pushes_no_undo_step() {
+        let mut ed = Editor::new(doc_with(&["hello world"]));
+        let (replaced, steps) = replace_all(&mut ed, "xyz", "BAR", false);
+        assert_eq!(replaced, 0);
+        assert_eq!(steps, 0, "a no-op call must not report a phantom undo step");
+        assert!(
+            !ed.undo(),
+            "no checkpoint was pushed, so there is nothing to undo"
+        );
+    }
+
+    #[test]
+    fn replace_all_is_case_insensitive_when_requested() {
+        let mut ed = Editor::new(doc_with(&["Foo and foo"]));
+        let (replaced, _) = replace_all(&mut ed, "foo", "X", false);
+        assert_eq!(replaced, 2);
+        assert_eq!(paras(&ed.doc), vec!["X and X"]);
+    }
+
+    #[test]
+    fn undo_redo_report_whether_anything_happened() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        // Fresh document: nothing to undo or redo.
+        assert!(!undo(&mut ed));
+        assert!(!redo(&mut ed));
+
+        replace_all(&mut ed, "A", "B", false);
+        assert_eq!(paras(&ed.doc), vec!["B"]);
+        assert!(undo(&mut ed));
+        assert_eq!(paras(&ed.doc), vec!["A"]);
+        // The stack is empty again.
+        assert!(!undo(&mut ed));
+
+        assert!(redo(&mut ed));
+        assert_eq!(paras(&ed.doc), vec!["B"]);
+        // The redo stack is empty again.
+        assert!(!redo(&mut ed));
     }
 }

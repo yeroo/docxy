@@ -30,10 +30,14 @@
 //! | `doc.header` / `doc.footer` | — | `{blocks:[{index,kind,text}]}` (empty if none) |
 //! | `doc.metadata` | — | present-if-set keys: `{title?,author?,subject?,keywords?,comments?,last_saved_by?,revision?,created?,modified?}` |
 //! | `doc.stats` | — | `{words, chars, paragraphs, blocks}` |
+//! | `doc.replace-all` | `{query, text, case_sensitive?}` | `{replaced}` |
+//! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
+//! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
 
 use crate::{App, DocFormat};
 use ctlcore::json::Json;
 use docxcore::agent;
+use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::model::Block;
 use std::path::Path;
 
@@ -72,6 +76,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.footer" => Ok(header_footer(&app.footers.default)),
         "doc.metadata" => Ok(metadata(app)),
         "doc.stats" => Ok(stats(app)),
+        "doc.replace-all" => replace_all(app, args),
+        "doc.undo" => Ok(undo(app)),
+        "doc.redo" => Ok(redo(app)),
+        "doc.export-pdf" => export_pdf(app, args),
         "doc.save" => {
             app.save();
             Ok(path_info(app))
@@ -97,9 +105,15 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         app.dirty = true;
         // A content edit flashes this pane's agent-status dot, so a watcher sees
         // the document being worked on.
-        if matches!(verb, "doc.replace-range" | "doc.insert" | "doc.append") {
+        if matches!(
+            verb,
+            "doc.replace-range" | "doc.insert" | "doc.append" | "doc.replace-all"
+        ) {
             ctlcore::signal_activity();
         }
+        // doc.undo/doc.redo only flash activity when something actually
+        // happened; they signal it themselves (see undo()/redo() below) since
+        // a no-op (`{done:false}`) must not look like an edit occurred.
     }
     out
 }
@@ -379,6 +393,92 @@ fn append(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![(
         "total",
         Json::Num(app.editor.doc.body.len() as f64),
+    )]))
+}
+
+/// `doc.replace-all`: replace every occurrence of `query` with `text` across
+/// the whole document (case-insensitive unless `case_sensitive:true`). The
+/// terminal app ignores the checkpoint count `agent::replace_all` also
+/// reports (see its doc comment: always 1 when something was replaced, 0
+/// otherwise) — it doesn't drive a host undo stack, so its wire reply stays
+/// exactly `{replaced}`, matching `doc.replace-range`'s convention of always
+/// finishing the edit after a successful call.
+fn replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
+    let query = args
+        .get_str("query")
+        .ok_or("doc.replace-all needs a 'query'")?;
+    let text = args.get_str("text").ok_or("doc.replace-all needs 'text'")?;
+    let case_sensitive = args
+        .get("case_sensitive")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let (replaced, _undo_steps) = agent::replace_all(&mut app.editor, query, text, case_sensitive);
+    finish_edit(app);
+    Ok(Json::obj(vec![("replaced", Json::Num(replaced as f64))]))
+}
+
+/// `doc.undo`: unwind the last edit, if any. A no-op (`{done:false}`, empty
+/// undo stack) must not mark the document modified or flash the agent-status
+/// dot — nothing actually changed.
+fn undo(app: &mut App) -> Json {
+    let done = agent::undo(&mut app.editor);
+    if done {
+        finish_edit(app);
+        ctlcore::signal_activity();
+    }
+    Json::obj(vec![("done", Json::Bool(done))])
+}
+
+/// `doc.redo`: replay the last undone edit, if any. Same no-op guard as
+/// [`undo`].
+fn redo(app: &mut App) -> Json {
+    let done = agent::redo(&mut app.editor);
+    if done {
+        finish_edit(app);
+        ctlcore::signal_activity();
+    }
+    Json::obj(vec![("done", Json::Bool(done))])
+}
+
+/// `doc.export-pdf`: render the live buffer to a PDF at `path` (absolutized
+/// against this process's cwd) and write it — refusing to overwrite an
+/// existing file. Copies the exclusive-create pattern and error-string family
+/// (`already exists:`/`bad path:`/`create failed:`) from
+/// `ctlcore::client::new_file` verbatim, since docxy doesn't depend on
+/// `ctlcore`'s fs helpers. Doesn't touch `app.editor`, so it neither marks the
+/// document modified nor is part of the undo stack.
+fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
+    let path = args
+        .get_str("path")
+        .ok_or("doc.export-pdf needs a 'path'")?;
+    let abs = std::path::absolute(Path::new(path)).map_err(|e| format!("bad path: {e}"))?;
+    if abs.exists() {
+        return Err(format!("already exists: {}", abs.display()));
+    }
+    let pdf = to_pdf(
+        &app.editor.doc,
+        &PdfOptions {
+            styles: app.styles.clone(),
+            ..PdfOptions::default()
+        },
+    );
+    // create_new: exclusive-create, so a file appearing between the exists
+    // check above and this open errors instead of being truncated.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&abs)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("already exists: {}", abs.display())
+            } else {
+                format!("create failed: {e}")
+            }
+        })?;
+    std::io::Write::write_all(&mut f, &pdf).map_err(|e| format!("create failed: {e}"))?;
+    Ok(Json::obj(vec![(
+        "path",
+        Json::Str(abs.display().to_string()),
     )]))
 }
 
@@ -843,6 +943,186 @@ mod tests {
         let r = path_info(&app);
         assert_eq!(r.get_str("protection"), Some("read-only"));
         assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL"));
+    }
+
+    #[test]
+    fn replace_all_replaces_every_occurrence_case_insensitive_by_default() {
+        let mut app = app_with(&["Foo and foo", "another foo"]);
+        let r = replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("foo".into())),
+                ("text", Json::Str("X".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("replaced"), Some(3));
+        assert_eq!(paras(&app), vec!["X and X", "another X"]);
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn replace_all_case_sensitive_flag_is_respected() {
+        let mut app = app_with(&["Foo and foo"]);
+        let r = replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("foo".into())),
+                ("text", Json::Str("X".into())),
+                ("case_sensitive", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("replaced"), Some(1));
+        assert_eq!(paras(&app), vec!["Foo and X"]);
+    }
+
+    #[test]
+    fn replace_all_is_undoable_in_exactly_the_reported_undo_steps() {
+        // agent::replace_all always reports 1 undo step when it replaces
+        // anything (see its doc comment) — pin that a single Editor::undo
+        // restores the pre-replace text, regardless of match count.
+        let mut app = app_with(&["a foo b foo c"]);
+        replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("foo".into())),
+                ("text", Json::Str("BAR".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(paras(&app), vec!["a BAR b BAR c"]);
+        assert!(app.editor.undo());
+        assert_eq!(paras(&app), vec!["a foo b foo c"]);
+    }
+
+    #[test]
+    fn undo_reports_done_false_on_fresh_doc_and_true_after_an_edit() {
+        let mut app = app_with(&["A"]);
+        let r = undo(&mut app);
+        assert_eq!(r.get("done").unwrap().as_bool(), Some(false));
+        assert!(!app.modified, "a no-op undo must not mark modified");
+
+        replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("A".into())),
+                ("text", Json::Str("B".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(paras(&app), vec!["B"]);
+        let r = undo(&mut app);
+        assert_eq!(r.get("done").unwrap().as_bool(), Some(true));
+        assert_eq!(paras(&app), vec!["A"]);
+    }
+
+    #[test]
+    fn redo_reports_done_false_without_a_prior_undo_and_true_after_one() {
+        let mut app = app_with(&["A"]);
+        let r = redo(&mut app);
+        assert_eq!(r.get("done").unwrap().as_bool(), Some(false));
+
+        replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("A".into())),
+                ("text", Json::Str("B".into())),
+            ]),
+        )
+        .unwrap();
+        undo(&mut app);
+        assert_eq!(paras(&app), vec!["A"]);
+        let r = redo(&mut app);
+        assert_eq!(r.get("done").unwrap().as_bool(), Some(true));
+        assert_eq!(paras(&app), vec!["B"]);
+        // The redo stack is empty again.
+        let r = redo(&mut app);
+        assert_eq!(r.get("done").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn export_pdf_writes_nonempty_file_and_reports_absolutized_path() {
+        let tmp = std::env::temp_dir().join(format!("docxy_ctl_pdf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("out.pdf");
+
+        let app = app_with(&["hello world"]);
+        let r = export_pdf(
+            &app,
+            &args(vec![("path", Json::Str(out.display().to_string()))]),
+        )
+        .unwrap();
+        let reported = r.get_str("path").unwrap();
+        assert!(
+            Path::new(reported).is_absolute(),
+            "reply path must be absolutized: {reported}"
+        );
+        let bytes = std::fs::read(&out).expect("pdf written");
+        assert!(!bytes.is_empty(), "exported PDF must be nonempty");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn export_pdf_refuses_to_overwrite_an_existing_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("docxy_ctl_pdf_overwrite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("existing.pdf");
+        std::fs::write(&out, b"OLD").unwrap();
+
+        let app = app_with(&["hello"]);
+        let err = export_pdf(
+            &app,
+            &args(vec![("path", Json::Str(out.display().to_string()))]),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("already exists: "), "{err}");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"OLD",
+            "existing file untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dispatch_routes_new_mutating_verbs() {
+        let tmp =
+            std::env::temp_dir().join(format!("docxy_ctl_dispatch_pdf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("dispatch.pdf");
+
+        let mut app = app_with(&["hello foo"]);
+        assert!(
+            dispatch(
+                &mut app,
+                "doc.replace-all",
+                &args(vec![
+                    ("query", Json::Str("foo".into())),
+                    ("text", Json::Str("bar".into())),
+                ]),
+            )
+            .is_ok()
+        );
+        assert!(dispatch(&mut app, "doc.undo", &Json::Null).is_ok());
+        assert!(dispatch(&mut app, "doc.redo", &Json::Null).is_ok());
+        assert!(
+            dispatch(
+                &mut app,
+                "doc.export-pdf",
+                &args(vec![("path", Json::Str(out.display().to_string()))]),
+            )
+            .is_ok()
+        );
+        assert!(out.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
