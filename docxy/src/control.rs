@@ -418,43 +418,6 @@ fn markdown_flag(args: &Json) -> bool {
         .unwrap_or(false)
 }
 
-/// The paragraph style ids (`w:pStyle` references) [`docxcore::markdown::from_markdown`]
-/// emits: `Heading1`..`Heading6`, `Quote`, `SourceCode`. (Deliberately not
-/// `Code` — that's a run-level *character* style, `w:rStyle`, applied at save
-/// time from `RunProps.code`, not a `w:pStyle` any parsed `Block` carries; see
-/// `prepare_markdown_blocks`'s doc comment.)
-const MARKDOWN_PARAGRAPH_STYLE_IDS: &[&str] = &[
-    "Heading1",
-    "Heading2",
-    "Heading3",
-    "Heading4",
-    "Heading5",
-    "Heading6",
-    "Quote",
-    "SourceCode",
-];
-
-/// Which of [`MARKDOWN_PARAGRAPH_STYLE_IDS`] the top-level paragraphs in
-/// `blocks` actually reference (`w:pStyle`), in first-seen order. Markdown
-/// table cells never carry one of these ids (`markdown.rs::parse_table`
-/// builds cell paragraphs with `ParProps::default()`), so — like the
-/// numbering scan below — only top-level `Block::Paragraph`s need checking.
-fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
-    let mut ids: Vec<&'static str> = Vec::new();
-    for b in blocks {
-        let Block::Paragraph(p) = b else { continue };
-        let Some(style) = p.props.style_id.as_deref() else {
-            continue;
-        };
-        if let Some(&known) = MARKDOWN_PARAGRAPH_STYLE_IDS.iter().find(|&&k| k == style) {
-            if !ids.contains(&known) {
-                ids.push(known);
-            }
-        }
-    }
-    ids
-}
-
 /// Parse `text` as Markdown into blocks ready to splice, ensuring this
 /// package's `Package` carries numbering/style definitions for any list or
 /// style the parsed content references before the caller splices it in.
@@ -463,7 +426,8 @@ fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
 /// bullet items `numId` 1 and ordered items `numId` 2 — ids fixed for a
 /// *fresh* markdown package (see `new_markdown_package`), which can collide
 /// with a numbering id an existing `.docx` already defines for something
-/// else. So this remaps: for each kind actually referenced, it calls
+/// else. So this remaps: [`agent::referenced_numbering_kinds`] detects which
+/// kind(s) are actually referenced, then for each one this calls
 /// [`docxcore::package::Package::ensure_list`] (the same call the
 /// Bullets/Numbering ribbon commands use), which returns a reserved high id
 /// unlikely to collide with the document's own lists, and rewrites the parsed
@@ -472,8 +436,8 @@ fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
 ///
 /// **Paragraph styles**: unlike numbering ids, `HeadingN`/`Quote`/`SourceCode`
 /// are fixed, well-known names — there's nothing to remap, only to ensure
-/// present. [`referenced_style_ids`] finds which of them the parsed blocks
-/// reference and [`docxcore::package::Package::ensure_styles`] defines
+/// present. [`agent::referenced_style_ids`] finds which of them the parsed
+/// blocks reference and [`docxcore::package::Package::ensure_styles`] defines
 /// exactly those that the target package doesn't already have, leaving any
 /// pre-existing same-named style (e.g. a third-party document's own
 /// `Heading1`) untouched. Without this, `<w:pStyle w:val="HeadingN"/>` (or
@@ -489,10 +453,7 @@ fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
     let mut blocks = agent::parse_markdown_blocks(text)?;
 
-    let is_list =
-        |b: &Block, id: i32| matches!(b, Block::Paragraph(p) if p.props.num_id == Some(id));
-    let needs_bullet = blocks.iter().any(|b| is_list(b, 1));
-    let needs_decimal = blocks.iter().any(|b| is_list(b, 2));
+    let (needs_bullet, needs_decimal) = agent::referenced_numbering_kinds(&blocks);
     if needs_bullet || needs_decimal {
         let bullet_id = needs_bullet.then(|| app.pkg.ensure_list(true));
         let decimal_id = needs_decimal.then(|| app.pkg.ensure_list(false));
@@ -509,7 +470,7 @@ fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, Stri
         app.reparse_numbering();
     }
 
-    let style_ids = referenced_style_ids(&blocks);
+    let style_ids = agent::referenced_style_ids(&blocks);
     if !style_ids.is_empty() {
         app.pkg.ensure_styles(&style_ids);
     }

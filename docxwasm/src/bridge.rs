@@ -476,7 +476,7 @@ impl Session {
         Ok(out)
     }
 
-    /// `{start, end?, text}` -> `{replaced, total, undoSteps}`
+    /// `{start, end?, text, markdown?}` -> `{replaced, total, undoSteps}`
     ///
     /// `undoSteps` is an **internal** field for the extension host only: the
     /// number of native undo checkpoints this edit pushed (2 for a normal
@@ -486,6 +486,14 @@ impl Session {
     /// must be byte-for-byte a terminal docxy's `{replaced, total}` — and hands
     /// the count to `host.onMutated` so the tab replays exactly that many
     /// wasm undos per VS Code undo (see `docxcore::agent::replace_range`).
+    ///
+    /// `markdown` (optional bool, default `false`) mirrors docxy control.rs's
+    /// flag exactly: when true, `text` is parsed as Markdown and the resulting
+    /// blocks are spliced in with the same undo-step accounting as the
+    /// plain-text path (see `docxcore::agent::replace_range_blocks`). The
+    /// splice position is validated BEFORE any numbering/style package
+    /// mutation ([`Self::prepare_markdown_blocks`]) — see
+    /// `docxcore::agent::validate_replace_range`'s doc comment for why.
     fn ctl_replace_range(&mut self, args: &json::Json) -> Result<String, String> {
         let start = args
             .get_usize("start")
@@ -494,7 +502,13 @@ impl Session {
         let text = args
             .get_str("text")
             .ok_or("doc.replace-range needs 'text'")?;
-        let (replaced, undo_steps) = agent::replace_range(&mut self.editor, start, end, text)?;
+        let (replaced, undo_steps) = if ctl_markdown_flag(args) {
+            agent::validate_replace_range(&self.editor.doc, start, end)?;
+            let blocks = self.prepare_markdown_blocks(text)?;
+            agent::replace_range_blocks(&mut self.editor, start, end, blocks)?
+        } else {
+            agent::replace_range(&mut self.editor, start, end, text)?
+        };
         self.finish_ctl_edit();
         let mut out = String::from("{\"replaced\":");
         out.push_str(&replaced.to_string());
@@ -506,13 +520,21 @@ impl Session {
         Ok(out)
     }
 
-    /// `{at, text}` -> `{total}`
+    /// `{at, text, markdown?}` -> `{total}`. `markdown` mirrors docxy
+    /// control.rs's flag exactly — see [`Self::ctl_replace_range`]'s doc
+    /// comment for the validate-before-mutate ordering this shares.
     fn ctl_insert(&mut self, args: &json::Json) -> Result<String, String> {
         let at = args
             .get_usize("at")
             .ok_or("doc.insert needs an 'at' index")?;
         let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
-        agent::insert(&mut self.editor, at, text)?;
+        if ctl_markdown_flag(args) {
+            agent::validate_insert_at(&self.editor.doc, at)?;
+            let blocks = self.prepare_markdown_blocks(text)?;
+            agent::insert_blocks(&mut self.editor, at, blocks)?;
+        } else {
+            agent::insert(&mut self.editor, at, text)?;
+        }
         self.finish_ctl_edit();
         let mut out = String::from("{\"total\":");
         out.push_str(&self.editor.doc.body.len().to_string());
@@ -520,15 +542,66 @@ impl Session {
         Ok(out)
     }
 
-    /// `{text}` -> `{total}`
+    /// `{text, markdown?}` -> `{total}`. `markdown` mirrors docxy
+    /// control.rs's flag exactly — see [`Self::ctl_replace_range`]'s doc
+    /// comment for the pattern (`append` has no position argument, so there's
+    /// no bounds check to order against).
     fn ctl_append(&mut self, args: &json::Json) -> Result<String, String> {
         let text = args.get_str("text").ok_or("doc.append needs 'text'")?;
-        agent::append(&mut self.editor, text);
+        if ctl_markdown_flag(args) {
+            let blocks = self.prepare_markdown_blocks(text)?;
+            agent::append_blocks(&mut self.editor, blocks);
+        } else {
+            agent::append(&mut self.editor, text);
+        }
         self.finish_ctl_edit();
         let mut out = String::from("{\"total\":");
         out.push_str(&self.editor.doc.body.len().to_string());
         out.push('}');
         Ok(out)
+    }
+
+    /// Parse `text` as Markdown into blocks ready to splice, ensuring this
+    /// session's `Package` carries numbering/style definitions for any list
+    /// or style the parsed content references before the caller splices it
+    /// in — the docxwasm-side counterpart to `docxy::control`'s
+    /// `prepare_markdown_blocks`, sharing its exact detection helpers
+    /// (`docxcore::agent::referenced_numbering_kinds`/`referenced_style_ids`)
+    /// and remap/ensure logic, just against `self.pkg` instead of `App::pkg`.
+    ///
+    /// **Ordering**: this only ever ADDS package parts/definitions, never
+    /// removes or rewrites unrelated ones — but callers must still validate
+    /// the splice position (`agent::validate_insert_at`/
+    /// `validate_replace_range`) BEFORE calling this, exactly like
+    /// `docxy::control::prepare_markdown_blocks` requires, so a call that's
+    /// ultimately going to be rejected for bad bounds never leaves the
+    /// mutation behind (`ctl_insert`/`ctl_replace_range` both do this).
+    fn prepare_markdown_blocks(&mut self, text: &str) -> Result<Vec<Block>, String> {
+        let mut blocks = agent::parse_markdown_blocks(text)?;
+
+        let (needs_bullet, needs_decimal) = agent::referenced_numbering_kinds(&blocks);
+        if needs_bullet || needs_decimal {
+            let bullet_id = needs_bullet.then(|| self.pkg.ensure_list(true));
+            let decimal_id = needs_decimal.then(|| self.pkg.ensure_list(false));
+            for b in blocks.iter_mut() {
+                if let Block::Paragraph(p) = b {
+                    if let (Some(id), true) = (bullet_id, p.props.num_id == Some(1)) {
+                        p.props.num_id = Some(id);
+                    }
+                    if let (Some(id), true) = (decimal_id, p.props.num_id == Some(2)) {
+                        p.props.num_id = Some(id);
+                    }
+                }
+            }
+            self.reparse_numbering();
+        }
+
+        let style_ids = agent::referenced_style_ids(&blocks);
+        if !style_ids.is_empty() {
+            self.pkg.ensure_styles(&style_ids);
+        }
+
+        Ok(blocks)
     }
 
     /// `{}` -> `{total, modified, protection?, watermark?}` (the host composes
@@ -821,6 +894,17 @@ impl Session {
             }
             _ => self.editor.set_list(None),
         }
+        self.reparse_numbering();
+    }
+
+    /// Re-read `word/numbering.xml` from the package into `self.numbering` so
+    /// the live view picks up a definition [`Package::ensure_list`] just
+    /// created or extended — without this, a freshly-provisioned list part
+    /// would render with no markers until the next reload. Shared by
+    /// [`Self::toggle_list`] (the keyboard/ribbon list commands) and
+    /// [`Self::prepare_markdown_blocks`] (the agent markdown-splice path);
+    /// mirrors `docxy::App::reparse_numbering`.
+    fn reparse_numbering(&mut self) {
         self.numbering = self
             .pkg
             .part("word/numbering.xml")
@@ -926,6 +1010,16 @@ fn ctl_err(msg: &str) -> String {
     json::push_str(&mut out, msg);
     out.push('}');
     out
+}
+
+/// Whether a `doc.insert`/`doc.replace-range`/`doc.append` ctl call opted
+/// into Markdown-formatted splicing via the optional `markdown` arg (default
+/// `false` — byte-identical to the plain-text behavior). Mirrors
+/// `docxy::control`'s `markdown_flag`.
+fn ctl_markdown_flag(args: &json::Json) -> bool {
+    args.get("markdown")
+        .and_then(json::Json::as_bool)
+        .unwrap_or(false)
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -1612,6 +1706,200 @@ mod tests {
         let out = s.ctl(r#"{"verb":"doc.blocks","args":{}}"#);
         assert!(!out.contains("\"protection\""), "{out}");
         assert!(!out.contains("\"watermark\""), "{out}");
+    }
+
+    // ---- Wave-2 markdown-formatted ctl writes (mirrors docxy control.rs) ---
+
+    #[test]
+    fn ctl_markdown_insert_round_trips_heading_list_table_link() {
+        let mut s = Session::open(&sample_docx("Existing")).expect("open");
+        let md = "# Notes\n\n- item one\n- item two\n\n\
+                  | A | B |\n| --- | --- |\n| 1 | 2 |\n\n\
+                  See [docs](https://example.com).";
+        let out = s.ctl(&format!(
+            r#"{{"verb":"doc.insert","args":{{"at":1,"text":{},"markdown":true}}}}"#,
+            json::quote(md)
+        ));
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(s.is_dirty());
+
+        let exported = s.ctl(r#"{"verb":"doc.export","args":{"format":"markdown"}}"#);
+        assert!(exported.contains("# Notes"), "heading missing: {exported}");
+        assert!(
+            exported.contains("item one") && exported.contains("item two"),
+            "list items missing: {exported}"
+        );
+        assert!(exported.contains("| A | B |"), "table missing: {exported}");
+        assert!(
+            exported.contains("| 1 | 2 |"),
+            "table row missing: {exported}"
+        );
+        assert!(
+            exported.contains("[docs](https://example.com)"),
+            "link missing: {exported}"
+        );
+        // The original paragraph stayed at index 0, ahead of the splice.
+        assert_eq!(
+            s.editor.doc.body[0].plain_text(),
+            "Existing",
+            "original paragraph must be untouched"
+        );
+    }
+
+    #[test]
+    fn ctl_markdown_flag_absent_or_false_matches_plain_text_insert() {
+        let mut plain = Session::open(&sample_docx_multi(&["A", "B", "C"])).expect("open");
+        plain.ctl(r#"{"verb":"doc.insert","args":{"at":1,"text":"X"}}"#);
+        let plain_text = doc_text(&mut plain);
+
+        let mut flag_false = Session::open(&sample_docx_multi(&["A", "B", "C"])).expect("open");
+        flag_false.ctl(r#"{"verb":"doc.insert","args":{"at":1,"text":"X","markdown":false}}"#);
+        assert_eq!(doc_text(&mut flag_false), plain_text);
+    }
+
+    #[test]
+    fn ctl_markdown_insert_is_a_single_undo_step() {
+        let mut s = Session::open(&sample_docx("existing")).expect("open");
+        let before = doc_text(&mut s);
+        let out = s.ctl(
+            r###"{"verb":"doc.insert","args":{"at":0,"text":"## Heading","markdown":true}}"###,
+        );
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(doc_text(&mut s).contains("Heading"));
+        // One dispatch("undo") fully restores the prior document.
+        s.dispatch("undo");
+        assert_eq!(doc_text(&mut s), before);
+    }
+
+    #[test]
+    fn ctl_markdown_append_is_a_single_undo_step() {
+        let mut s = Session::open(&sample_docx("existing")).expect("open");
+        let before = doc_text(&mut s);
+        let out =
+            s.ctl(r###"{"verb":"doc.append","args":{"text":"## Heading","markdown":true}}"###);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(doc_text(&mut s).contains("Heading"));
+        s.dispatch("undo");
+        assert_eq!(doc_text(&mut s), before);
+    }
+
+    #[test]
+    fn ctl_markdown_replace_range_reports_and_undoes_matching_step_counts() {
+        // Non-empty range (two populated paragraphs) -> 2 undo steps.
+        let mut s = Session::open(&sample_docx_multi(&["A", "B", "C", "D"])).expect("open");
+        let before = doc_text(&mut s);
+        let out = s.ctl(
+            r##"{"verb":"doc.replace-range","args":{"start":1,"end":2,"text":"# X\n\nY","markdown":true}}"##,
+        );
+        assert!(out.contains("\"replaced\":2"), "{out}");
+        assert!(out.contains("\"undoSteps\":2"), "{out}");
+        assert!(doc_text(&mut s).contains('X') && doc_text(&mut s).contains('Y'));
+        s.dispatch("undo");
+        s.dispatch("undo");
+        assert_eq!(doc_text(&mut s), before);
+
+        // A single EMPTY paragraph range -> 1 undo step.
+        let mut s2 = Session::open(&sample_docx_multi(&["keep", "", "tail"])).expect("open");
+        let before2 = doc_text(&mut s2);
+        let out2 = s2.ctl(
+            r#"{"verb":"doc.replace-range","args":{"start":1,"text":"filled","markdown":true}}"#,
+        );
+        assert!(out2.contains("\"replaced\":1"), "{out2}");
+        assert!(
+            out2.contains("\"undoSteps\":1"),
+            "empty-paragraph replace must report a single undo step: {out2}"
+        );
+        assert!(doc_text(&mut s2).contains("filled"));
+        s2.dispatch("undo");
+        assert_eq!(doc_text(&mut s2), before2);
+    }
+
+    #[test]
+    fn ctl_empty_markdown_insert_errors_and_leaves_no_tracks() {
+        let mut s = Session::open(&sample_docx_multi(&["A", "B"])).expect("open");
+        let before = doc_text(&mut s);
+        let was_dirty = s.is_dirty();
+        let out = s.ctl(r#"{"verb":"doc.insert","args":{"at":1,"text":"   \n","markdown":true}}"#);
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert!(out.contains("empty markdown"), "{out}");
+        assert_eq!(s.is_dirty(), was_dirty, "an errored splice must not dirty");
+        assert_eq!(doc_text(&mut s), before);
+        // Nothing was checkpointed.
+        assert_eq!(s.dispatch("undo"), None);
+        assert_eq!(doc_text(&mut s), before);
+    }
+
+    #[test]
+    fn ctl_markdown_out_of_bounds_insert_leaves_package_untouched() {
+        // Regression guard mirroring docxy control.rs's
+        // `out_of_bounds_markdown_list_insert_leaves_the_package_untouched`:
+        // validation must run before any numbering/style package mutation.
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let before: Vec<String> = s.pkg.part_names().into_iter().map(String::from).collect();
+        assert!(!before.iter().any(|n| n == "word/numbering.xml"));
+
+        let out =
+            s.ctl(r#"{"verb":"doc.insert","args":{"at":99,"text":"- item","markdown":true}}"#);
+        assert!(out.contains("out of bounds"), "{out}");
+
+        let after: Vec<String> = s.pkg.part_names().into_iter().map(String::from).collect();
+        assert_eq!(
+            after, before,
+            "a rejected splice must not mutate the package"
+        );
+        assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn ctl_markdown_list_ensures_numbering_and_remaps_off_the_bare_ids() {
+        let mut s = Session::open(&sample_docx("Existing")).expect("open");
+        assert!(
+            !s.pkg.part_names().contains(&"word/numbering.xml"),
+            "fixture must start without numbering"
+        );
+        let out = s.ctl(
+            r#"{"verb":"doc.append","args":{"text":"- one\n- two\n\n1. first\n2. second","markdown":true}}"#,
+        );
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(
+            s.pkg.part_names().contains(&"word/numbering.xml"),
+            "numbering part must be created on demand: {:?}",
+            s.pkg.part_names()
+        );
+        let num_ids: Vec<i32> = s
+            .editor
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => p.props.num_id,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(num_ids.len(), 4, "{num_ids:?}");
+        assert!(
+            num_ids.iter().all(|&id| id != 1 && id != 2),
+            "list paragraphs must be remapped off markdown's bare ids: {num_ids:?}"
+        );
+    }
+
+    #[test]
+    fn ctl_markdown_heading_into_a_fresh_package_ensures_heading1() {
+        let mut s = Session::open(&sample_docx("Existing")).expect("open");
+        let styles_before =
+            String::from_utf8_lossy(s.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(!styles_before.contains("Heading1"), "{styles_before}");
+
+        let out =
+            s.ctl(r##"{"verb":"doc.insert","args":{"at":0,"text":"# Title","markdown":true}}"##);
+        assert!(out.contains("\"ok\":true"), "{out}");
+
+        let styles_after =
+            String::from_utf8_lossy(s.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(
+            styles_after.contains("Heading1"),
+            "Heading1 must be ensured: {styles_after}"
+        );
     }
 
     #[test]

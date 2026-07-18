@@ -200,6 +200,79 @@ pub fn parse_markdown_blocks(text: &str) -> Result<Vec<Block>, String> {
     Ok(crate::markdown::from_markdown(text).body)
 }
 
+/// The paragraph style ids (`w:pStyle` references) [`crate::markdown::from_markdown`]
+/// emits: `Heading1`..`Heading6`, `Quote`, `SourceCode`. (Deliberately not
+/// `Code` — that's a run-level *character* style, `w:rStyle`, applied at save
+/// time from `RunProps.code`, not a `w:pStyle` any parsed [`Block`] carries;
+/// see [`referenced_style_ids`]'s doc comment.)
+pub const MARKDOWN_PARAGRAPH_STYLE_IDS: &[&str] = &[
+    "Heading1",
+    "Heading2",
+    "Heading3",
+    "Heading4",
+    "Heading5",
+    "Heading6",
+    "Quote",
+    "SourceCode",
+];
+
+/// Which of [`MARKDOWN_PARAGRAPH_STYLE_IDS`] the top-level paragraphs in
+/// `blocks` actually reference (`w:pStyle`), in first-seen order. Markdown
+/// table cells never carry one of these ids (`markdown.rs::parse_table`
+/// builds cell paragraphs with `ParProps::default()`), so only top-level
+/// [`Block::Paragraph`]s need checking, not a recursive scan.
+///
+/// Pure (no mutation, doesn't touch a `Package`): a control surface that owns
+/// a `Package` should call this on the parsed blocks BEFORE splicing, then
+/// pass any returned ids to [`crate::package::Package::ensure_styles`] so a
+/// target `.docx` that doesn't already define e.g. `Heading1`/`Quote`/
+/// `SourceCode` gets a definition before the reference lands — otherwise
+/// `<w:pStyle w:val="HeadingN"/>` (etc) renders as plain Normal text in Word.
+/// Every control surface (`docxy::control`, `docxwasm::bridge`) shares this
+/// exact fixed id list so behavior stays identical across surfaces.
+pub fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = Vec::new();
+    for b in blocks {
+        let Block::Paragraph(p) = b else { continue };
+        let Some(style) = p.props.style_id.as_deref() else {
+            continue;
+        };
+        if let Some(&known) = MARKDOWN_PARAGRAPH_STYLE_IDS.iter().find(|&&k| k == style) {
+            if !ids.contains(&known) {
+                ids.push(known);
+            }
+        }
+    }
+    ids
+}
+
+/// Whether the top-level paragraphs in `blocks` reference
+/// [`crate::markdown::from_markdown`]'s bare bullet (`numId` 1) / ordered
+/// (`numId` 2) list ids — `(needs_bullet, needs_decimal)`. Those bare ids
+/// only mean something in a package built by `new_markdown_package` (which
+/// defines exactly those two ids); splicing into an arbitrary EXISTING
+/// package is dangerous taken literally, since that document may already
+/// define its own `numId` 1/2 for something unrelated.
+///
+/// Pure (no mutation, doesn't touch a `Package`): a control surface should
+/// call this on the parsed blocks BEFORE splicing, then for each kind
+/// actually present call [`crate::package::Package::ensure_list`] (which
+/// returns a reserved high id unlikely to collide) and rewrite the parsed
+/// blocks' `numId` from the bare 1/2 onto the returned id — this function
+/// only detects which kinds are present, it does not remap. Markdown table
+/// cells never carry a list paragraph (`markdown.rs::parse_table` builds
+/// cell paragraphs with `ParProps::default()`), so only top-level
+/// [`Block::Paragraph`]s need checking, matching [`referenced_style_ids`]'s
+/// non-recursive shape. Every control surface shares this exact detection so
+/// behavior stays identical across surfaces.
+pub fn referenced_numbering_kinds(blocks: &[Block]) -> (bool, bool) {
+    let is_list =
+        |b: &Block, id: i32| matches!(b, Block::Paragraph(p) if p.props.num_id == Some(id));
+    let needs_bullet = blocks.iter().any(|b| is_list(b, 1));
+    let needs_decimal = blocks.iter().any(|b| is_list(b, 2));
+    (needs_bullet, needs_decimal)
+}
+
 /// Overwrite `ed.doc.body[start..start + blocks.len()]` in place with `blocks`.
 /// Used right after a placeholder [`Editor::paste`] has already opened up
 /// exactly that many paragraph slots (and taken the call's one checkpoint): a
@@ -609,6 +682,33 @@ mod tests {
         // Nothing was ever spliced or checkpointed: an editor left untouched.
         let mut ed = Editor::new(doc_with(&["A"]));
         assert!(!ed.undo());
+    }
+
+    #[test]
+    fn referenced_style_ids_finds_known_pstyles_in_first_seen_order() {
+        let blocks = parse_markdown_blocks("# Title\n\n> a quote\n\n```\ncode\n```").unwrap();
+        assert_eq!(
+            referenced_style_ids(&blocks),
+            vec!["Heading1", "Quote", "SourceCode"]
+        );
+        // Plain/bold text with no style-carrying construct references nothing.
+        let plain = parse_markdown_blocks("just **bold** text").unwrap();
+        assert!(referenced_style_ids(&plain).is_empty());
+    }
+
+    #[test]
+    fn referenced_numbering_kinds_detects_bullet_and_decimal_separately() {
+        let bullet_only = parse_markdown_blocks("- one\n- two").unwrap();
+        assert_eq!(referenced_numbering_kinds(&bullet_only), (true, false));
+
+        let decimal_only = parse_markdown_blocks("1. one\n2. two").unwrap();
+        assert_eq!(referenced_numbering_kinds(&decimal_only), (false, true));
+
+        let both = parse_markdown_blocks("- a\n\n1. b").unwrap();
+        assert_eq!(referenced_numbering_kinds(&both), (true, true));
+
+        let neither = parse_markdown_blocks("plain paragraph").unwrap();
+        assert_eq!(referenced_numbering_kinds(&neither), (false, false));
     }
 
     #[test]
