@@ -29,11 +29,12 @@ use ratatui::widgets::{Block as RBlock, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 /// Which field currently has keyboard focus in the composer. Tab cycles
-/// `To` → `Cc` → `Subject` → `Body` → `To` (see `cycle_focus`).
+/// `To` → `Cc` → `Bcc` → `Subject` → `Body` → `To` (see `cycle_focus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeField {
     To,
     Cc,
+    Bcc,
     Subject,
     Body,
 }
@@ -56,6 +57,7 @@ pub enum ComposeAction {
 pub struct Compose {
     pub to: String,
     pub cc: String,
+    pub bcc: String,
     pub subject: String,
     pub editor: Editor,
     pub focus: ComposeField,
@@ -80,6 +82,7 @@ impl Compose {
         Compose {
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
             subject: String::new(),
             editor: Editor::new(),
             focus: ComposeField::To,
@@ -90,9 +93,9 @@ impl Compose {
 
 /// Renders the full-screen composer when `app.compose` is open; a no-op
 /// otherwise (mirrors every other conditional-draw function in `ui`, e.g.
-/// `ui::signin::draw`). Layout, top to bottom: To / Cc / Subject (3 rows
-/// each), the body editor (everything else), and a 1-row action-bar
-/// footer.
+/// `ui::signin::draw`). Layout, top to bottom: To / Cc / Bcc / Subject
+/// (3 rows each), the body editor (everything else), and a 1-row
+/// action-bar footer.
 pub fn draw_compose(f: &mut Frame, app: &App) {
     let Some(compose) = &app.compose else {
         return;
@@ -101,6 +104,7 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -126,12 +130,19 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
     draw_field(
         f,
         rows[2],
+        "Bcc",
+        &compose.bcc,
+        compose.focus == ComposeField::Bcc,
+    );
+    draw_field(
+        f,
+        rows[3],
         "Subject",
         &compose.subject,
         compose.focus == ComposeField::Subject,
     );
-    draw_body(f, rows[3], compose);
-    draw_action_bar(f, rows[4]);
+    draw_body(f, rows[4], compose);
+    draw_action_bar(f, rows[5]);
 }
 
 /// One single-line To/Cc/Subject field: a bordered box, bright when
@@ -445,6 +456,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char(c) => match compose.focus {
             ComposeField::To => compose.to.push(c),
             ComposeField::Cc => compose.cc.push(c),
+            ComposeField::Bcc => compose.bcc.push(c),
             ComposeField::Subject => compose.subject.push(c),
             ComposeField::Body => compose.editor.insert_text(&c.to_string()),
         },
@@ -454,6 +466,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
             ComposeField::Cc => {
                 compose.cc.pop();
+            }
+            ComposeField::Bcc => {
+                compose.bcc.pop();
             }
             ComposeField::Subject => {
                 compose.subject.pop();
@@ -471,11 +486,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// `To` → `Cc` → `Subject` → `Body` → `To`.
+/// `To` → `Cc` → `Bcc` → `Subject` → `Body` → `To`.
 fn cycle_focus(compose: &mut Compose) {
     compose.focus = match compose.focus {
         ComposeField::To => ComposeField::Cc,
-        ComposeField::Cc => ComposeField::Subject,
+        ComposeField::Cc => ComposeField::Bcc,
+        ComposeField::Bcc => ComposeField::Subject,
         ComposeField::Subject => ComposeField::Body,
         ComposeField::Body => ComposeField::To,
     };
@@ -498,6 +514,7 @@ mod tests {
         Compose {
             to: "alice@example.com".into(),
             cc: String::new(),
+            bcc: String::new(),
             subject: "Re: Hi".into(),
             editor,
             focus: ComposeField::Body,
@@ -592,13 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_focus_to_cc_subject_body() {
+    fn tab_cycles_focus_to_cc_bcc_subject_body() {
         let mut app = App::for_test_with_seeded_store();
         app.compose = Some(Compose::new("new".into()));
         assert_eq!(app.compose.as_ref().unwrap().focus, ComposeField::To);
 
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.compose.as_ref().unwrap().focus, ComposeField::Cc);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.compose.as_ref().unwrap().focus, ComposeField::Bcc);
 
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.compose.as_ref().unwrap().focus, ComposeField::Subject);
@@ -608,6 +628,22 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.compose.as_ref().unwrap().focus, ComposeField::To);
+    }
+
+    #[test]
+    fn focus_cycle_includes_bcc_between_cc_and_subject() {
+        let mut c = Compose::new("d".into());
+        assert_eq!(c.focus, ComposeField::To);
+        cycle_focus(&mut c);
+        assert_eq!(c.focus, ComposeField::Cc);
+        cycle_focus(&mut c);
+        assert_eq!(c.focus, ComposeField::Bcc);
+        cycle_focus(&mut c);
+        assert_eq!(c.focus, ComposeField::Subject);
+        cycle_focus(&mut c);
+        assert_eq!(c.focus, ComposeField::Body);
+        cycle_focus(&mut c);
+        assert_eq!(c.focus, ComposeField::To);
     }
 
     #[test]

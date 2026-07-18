@@ -1185,6 +1185,7 @@ impl App {
         self.compose = Some(Compose {
             to: row.to_recipients,
             cc: row.cc_recipients,
+            bcc: row.bcc_recipients,
             subject: row.subject,
             editor,
             focus: ComposeField::To,
@@ -1228,7 +1229,7 @@ impl App {
             &compose.subject,
             &compose.to,
             &compose.cc,
-            "",
+            &compose.bcc,
             &html,
         );
         let cmd = if action == ComposeAction::Send {
@@ -2560,6 +2561,30 @@ pub(crate) mod tests {
         assert_eq!(compose.subject, "");
         // The composer is editing a real store row, not just UI state.
         assert!(app.store.draft(&compose.draft_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn saving_a_compose_with_bcc_persists_it_to_the_draft_row() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = app
+            .store
+            .create_local_draft("Subj", "a@x", "", "<p>body</p>")
+            .unwrap();
+        app.compose = Some(Compose {
+            to: "a@x".into(),
+            cc: "".into(),
+            bcc: "secret@x".into(),
+            subject: "Subj".into(),
+            editor: Editor::from(compose_html::from_html("<p>body</p>")),
+            focus: ComposeField::Body,
+            draft_id: id.clone(),
+        });
+        app.compose_action = Some(ComposeAction::Save);
+
+        app.apply_compose_action();
+
+        let (row, _) = app.store.draft(&id).unwrap().unwrap();
+        assert_eq!(row.bcc_recipients, "secret@x");
     }
 
     #[test]

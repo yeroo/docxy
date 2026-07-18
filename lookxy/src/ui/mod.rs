@@ -799,6 +799,7 @@ mod tests {
         app.compose = Some(Compose {
             to: "a@x".into(),
             cc: "".into(),
+            bcc: "".into(),
             subject: "Subj".into(),
             editor: Editor::from(compose_html::from_html("<p>new body</p>")),
             focus: ComposeField::Body,
