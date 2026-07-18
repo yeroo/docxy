@@ -161,10 +161,11 @@ for the two ways a tab's semantics differ from a terminal instance.
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
   the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do:
-  `docxy_list`, `docxy_status`, `docxy_outline`, `docxy_read`, `docxy_find`,
-  `docxy_replace_range`, `docxy_insert`, `docxy_append`, `docxy_save`, and
-  `xlsxy_list`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`,
-  `xlsxy_set`, `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. It's
+  `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
+  `docxy_find`, `docxy_replace_range`, `docxy_insert`, `docxy_append`,
+  `docxy_save`, and `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`,
+  `xlsxy_read`, `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`, `xlsxy_find`,
+  `xlsxy_recalc`, `xlsxy_save`. It's
   a thin bridge — it opens no document itself, only forwards to whichever
   `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
   running; pass `target` (a substring of the instance/pane id) to disambiguate

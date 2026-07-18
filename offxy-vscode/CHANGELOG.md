@@ -12,6 +12,9 @@
   `@types/vscode` devDependency) from `^1.84.0` to `^1.101.0`: the MCP
   server-definition-provider API this uses stabilized (left proposed status)
   in VS Code 1.101 (May 2025), and is not present in 1.84.
+- **New: the bundled MCP server gains `docxy_new`/`xlsxy_new`** — create a
+  blank document/workbook and open it, from a blank template shipped under
+  `mcp/templates/`.
 - **Renamed:** the extension is now **offxy** (`yeroo.offxy`) — one extension
   for Word and (soon in this version) Excel. Uninstall `yeroo.docxy-vscode`
   and install the `offxy-*.vsix`. Command ids changed `docxy.*` → `offxy.*`

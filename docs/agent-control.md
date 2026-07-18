@@ -94,8 +94,9 @@ Code's own permission prompts apply. It is a thin client of a running docxy
 claude mcp add docxy -- docxy --mcp
 ```
 
-Tools: `docxy_list`, `docxy_status`, `docxy_outline`, `docxy_read`, `docxy_find`,
-`docxy_replace_range`, `docxy_insert`, `docxy_append`, `docxy_save`. Each edit
+Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
+`docxy_find`, `docxy_replace_range`, `docxy_insert`, `docxy_append`,
+`docxy_save`. Each edit
 tool maps to the matching verb; results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
 pick one — `docxy_list` shows what's running. So the whole flow is: split the
@@ -160,6 +161,10 @@ scripting against a tab:
   the undo stack. So immediately after a `doc.reload`, the tab's title may
   still show the dirty dot even though its content now matches disk.
 
+`docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
+**new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
+file is still created on disk but nothing opens (`"opened":false`).
+
 See the [extension's README](../offxy-vscode/README.md#ai-assistants) for how
 to point an AI assistant at these tabs (Copilot: automatic; Claude Code: a
 one-liner).
@@ -171,8 +176,8 @@ one-liner).
 `cell.set {ref, text}` (leading `=` = formula, validated + recalculated),
 `range.clear {range}`, `find {query}`, `wb.recalc`, `wb.save`, `wb.reload`,
 `wb.open {path}`. MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`,
-`xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`,
-`xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. Skill:
+`xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`,
+`xlsxy_set`, `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. Skill:
 `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
