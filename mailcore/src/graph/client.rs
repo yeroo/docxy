@@ -8,7 +8,9 @@
 //! (a later task) catches it, refreshes, and retries once. The bearer token
 //! is never logged (it's not `Debug`-derived into any log line here).
 
-use crate::graph::model::{AttachmentMeta, Body, DeltaPage, Event, MailFolder, Message, Recipient};
+use crate::graph::model::{
+    AttachmentMeta, Body, DeltaPage, Event, MailFolder, Message, Person, Recipient,
+};
 use crate::json::{self, Value};
 use std::fmt;
 
@@ -425,6 +427,42 @@ impl GraphClient {
         .to_string();
         self.send(Method::Post, &path, Some(body), &[])?;
         Ok(())
+    }
+
+    /// GET `/me/people` (top 200, relevance-ordered). Each returned person's
+    /// primary address is its first `scoredEmailAddresses` entry; people with
+    /// no email address are skipped. `rank` is the entry's position in the
+    /// original response order, preserved across the skips. Requires the
+    /// `People.Read` scope — a token without it yields a 403, which surfaces
+    /// as an `Err` for the caller to degrade on.
+    pub fn people(&self) -> Result<Vec<Person>, GraphError> {
+        let resp = self.send(
+            Method::Get,
+            "/me/people?$top=200&$select=displayName,scoredEmailAddresses",
+            None,
+            &[],
+        )?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?;
+        let people = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let addr = p
+                    .get("scoredEmailAddresses")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("address"))
+                    .and_then(Value::as_str)?;
+                let name = p.get("displayName").and_then(Value::as_str).unwrap_or("");
+                Some(Person {
+                    name: name.to_string(),
+                    address: addr.to_string(),
+                    rank: i as i64,
+                })
+            })
+            .collect();
+        Ok(people)
     }
 
     /// Builds and sends one request, applying the standard auth/accept
@@ -1400,5 +1438,42 @@ mod tests {
         let reqs = srv.requests();
         assert!(reqs[0].path.contains(encoded_id));
         assert!(!reqs[0].path.contains(raw_id));
+    }
+
+    #[test]
+    fn people_parses_ranked_directory_results() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/people".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[
+                {"displayName":"Ann Lee","scoredEmailAddresses":[{"address":"ann@x.com","relevanceScore":9.0}]},
+                {"displayName":"No Email Person","scoredEmailAddresses":[]},
+                {"displayName":"Bob Jones","scoredEmailAddresses":[{"address":"bob@x.com","relevanceScore":8.0}]}
+            ]}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let people = c.people().unwrap();
+        // The address-less entry is skipped; rank is the position in the response.
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].name, "Ann Lee");
+        assert_eq!(people[0].address, "ann@x.com");
+        assert_eq!(people[0].rank, 0);
+        assert_eq!(people[1].address, "bob@x.com");
+        assert_eq!(people[1].rank, 2); // original index preserved (the skipped entry was #1)
+    }
+
+    #[test]
+    fn people_propagates_a_403_as_an_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/people".into(),
+            status: 403,
+            headers: vec![],
+            body: r#"{"error":{"code":"Authorization_RequestDenied"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.people().is_err());
     }
 }

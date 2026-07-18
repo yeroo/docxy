@@ -50,6 +50,16 @@ impl Recipient {
     }
 }
 
+/// One entry from Graph `/me/people`: a display name, the person's primary
+/// email address, and their 0-based rank in the relevance-ordered response
+/// (0 = most relevant).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Person {
+    pub name: String,
+    pub address: String,
+    pub rank: i64,
+}
+
 /// A mail message, as returned by Graph's `/messages` endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
