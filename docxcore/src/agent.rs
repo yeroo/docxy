@@ -183,6 +183,128 @@ pub fn append(ed: &mut Editor, text: &str) {
     ed.paste(&Clip::from_text(&format!("\n{text}")));
 }
 
+// ---------------------------------------------------------------------------
+// Markdown block-splice verbs (undoable, via the Editor)
+// ---------------------------------------------------------------------------
+
+/// Parse `text` as Markdown into the top-level [`Block`]s a splice verb below
+/// consumes — the same blocks [`crate::markdown::from_markdown`] would put in a
+/// fresh document's body (headings, styled runs, links, lists, tables, …).
+/// Errors `"empty markdown"` when `text` has no non-whitespace content, so a
+/// caller can reject a would-be no-op splice before touching the editor at
+/// all: nothing spliced, no undo entry pushed.
+pub fn parse_markdown_blocks(text: &str) -> Result<Vec<Block>, String> {
+    if text.trim().is_empty() {
+        return Err("empty markdown".to_string());
+    }
+    Ok(crate::markdown::from_markdown(text).body)
+}
+
+/// Overwrite `ed.doc.body[start..start + blocks.len()]` in place with `blocks`.
+/// Used right after a placeholder [`Editor::paste`] has already opened up
+/// exactly that many paragraph slots (and taken the call's one checkpoint): a
+/// direct assignment into `doc.body` doesn't itself checkpoint, so it rides on
+/// that same undo step and can turn the placeholder paragraphs into whatever
+/// `blocks` actually holds — headings, styled runs, tables — none of which
+/// `Clip`/`paste` can carry (a `Clip` is inline content only, one entry per
+/// paragraph, no block kind or paragraph-level styling).
+fn overwrite_blocks(ed: &mut Editor, start: usize, blocks: Vec<Block>) {
+    for (i, b) in blocks.into_iter().enumerate() {
+        ed.doc.body[start + i] = b;
+    }
+}
+
+/// Insert `blocks` before block `at` (or at the document end if
+/// `at == doc.body.len()`, equivalent to [`append_blocks`]) — the block-splice
+/// counterpart to [`insert`]. Pastes a placeholder clip of `blocks.len() + 1`
+/// empty paragraphs at the head of block `at` (the trailing empty entry pushes
+/// the original paragraph down intact, exactly as `insert`'s `"{text}\n"`
+/// trick does for plain text), then [`overwrite_blocks`] turns the
+/// `blocks.len()` opened slots into the real content. One [`Editor::paste`]
+/// call is made, so this is **one** undo checkpoint, matching `insert`.
+pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(), String> {
+    let n = ed.doc.body.len();
+    if at > n {
+        return Err(format!("'at' {at} out of bounds (0..={n})"));
+    }
+    if blocks.is_empty() {
+        return Err("empty markdown".to_string());
+    }
+    if at == n {
+        append_blocks(ed, blocks);
+        return Ok(());
+    }
+    require_para(&ed.doc.body, at)?;
+    let count = blocks.len();
+    ed.anchor = None;
+    ed.caret = Caret::top(at, 0);
+    ed.paste(&Clip {
+        paras: vec![Vec::new(); count + 1],
+    });
+    overwrite_blocks(ed, at, blocks);
+    Ok(())
+}
+
+/// Append `blocks` after the document's last block — the block-splice
+/// counterpart to [`append`]. Pastes a placeholder clip of `blocks.len() + 1`
+/// empty paragraphs at the document end (the leading empty entry starts a
+/// fresh run after the current last paragraph, exactly as `append`'s
+/// `"\n{text}"` trick does for plain text), then [`overwrite_blocks`] turns
+/// the opened slots into the real content. One [`Editor::paste`] call is made,
+/// so this is **one** undo checkpoint, matching `append`. A no-op (empty
+/// `blocks`) touches nothing and pushes no checkpoint.
+pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let start = ed.doc.body.len();
+    let count = blocks.len();
+    ed.anchor = None;
+    ed.move_doc_end();
+    ed.paste(&Clip {
+        paras: vec![Vec::new(); count + 1],
+    });
+    overwrite_blocks(ed, start, blocks);
+}
+
+/// Replace paragraphs `[start..=end]` (inclusive) with `blocks` — the
+/// block-splice counterpart to [`replace_range`]. Selects `[start..=end]`
+/// exactly as `replace_range` does (anchor at the head, caret at the true end
+/// of the last), then pastes a placeholder clip of `blocks.len()` empty
+/// paragraphs over that selection before [`overwrite_blocks`] fills them in.
+/// Same checkpoint accounting as `replace_range`, for the same reason (a
+/// non-empty selection is a delete-then-insert): **two** undo steps when the
+/// deleted range was non-empty, **one** when it collapsed to nothing (the sole
+/// case being a single empty paragraph). Returns `(replaced, undo_steps)`:
+/// the number of original paragraphs replaced, and the checkpoint count.
+pub fn replace_range_blocks(
+    ed: &mut Editor,
+    start: usize,
+    end: usize,
+    blocks: Vec<Block>,
+) -> Result<(usize, usize), String> {
+    if blocks.is_empty() {
+        return Err("empty markdown".to_string());
+    }
+    let n = ed.doc.body.len();
+    bounds(start, end, n)?;
+    require_para(&ed.doc.body, start)?;
+    require_para(&ed.doc.body, end)?;
+
+    ed.anchor = None;
+    ed.caret = Caret::top(end, 0);
+    ed.move_end();
+    ed.anchor = Some(Caret::top(start, 0));
+    let deleted = ed.has_selection();
+    ed.paste(&Clip {
+        paras: vec![Vec::new(); blocks.len()],
+    });
+    overwrite_blocks(ed, start, blocks);
+
+    let undo_steps = if deleted { 2 } else { 1 };
+    Ok((end - start + 1, undo_steps))
+}
+
 /// Replace every occurrence of `query` with `text` across the whole document
 /// (all paragraphs at any nesting depth, including table cells; case
 /// sensitivity per `case_sensitive`). Returns `(replaced, undo_steps)`: the
@@ -349,6 +471,104 @@ mod tests {
 
         assert_eq!(paras(&a.doc), vec!["A", "B", "C", "D"]);
         assert_eq!(paras(&a.doc), paras(&b.doc));
+    }
+
+    #[test]
+    fn markdown_insert_splices_formatted_blocks_with_one_checkpoint() {
+        let mut ed = Editor::new(doc_with(&["existing"]));
+        let blocks = parse_markdown_blocks("# Title\n\nbody with **bold**").unwrap();
+        insert_blocks(&mut ed, 0, blocks).unwrap();
+        assert_eq!(ed.doc.body.len(), 3);
+        // The heading landed as a styled paragraph — assert via the model
+        // (heading level / plain text), not just its rendered text.
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => {
+                assert_eq!(p.props.heading_level, Some(1));
+                assert_eq!(p.plain_text(), "Title");
+            }
+            other => panic!("expected a heading paragraph, got {other:?}"),
+        }
+        // The body paragraph carries a genuinely bold run, not just text
+        // that happens to contain asterisks.
+        match &ed.doc.body[1] {
+            Block::Paragraph(p) => {
+                assert!(
+                    p.content
+                        .iter()
+                        .any(|i| matches!(i, Inline::Run(r) if r.props.bold && r.text == "bold")),
+                    "{:?}",
+                    p.content
+                );
+            }
+            other => panic!("expected a body paragraph, got {other:?}"),
+        }
+        // The original paragraph is untouched and pushed to the end.
+        assert_eq!(ed.doc.body[2].plain_text(), "existing");
+
+        // One undo removes the whole splice.
+        assert!(ed.undo());
+        assert_eq!(ed.doc.body.len(), 1);
+        assert_eq!(paras(&ed.doc), vec!["existing"]);
+        // Nothing else was pushed onto the stack by this call.
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn markdown_append_is_a_single_undo_step() {
+        let mut ed = Editor::new(doc_with(&["existing"]));
+        let blocks = parse_markdown_blocks("## Heading").unwrap();
+        append_blocks(&mut ed, blocks);
+        assert_eq!(paras(&ed.doc), vec!["existing", "Heading"]);
+        match &ed.doc.body[1] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(2)),
+            other => panic!("expected a heading paragraph, got {other:?}"),
+        }
+        assert!(ed.undo());
+        assert_eq!(paras(&ed.doc), vec!["existing"]);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn markdown_replace_range_matches_text_variant_step_counts() {
+        // Non-empty range (two populated paragraphs) → 2 undo steps, mirroring
+        // `replace_range_is_single_paste`.
+        let mut ed = Editor::new(doc_with(&["A", "B", "C", "D"]));
+        let blocks = parse_markdown_blocks("# X\n\nY").unwrap();
+        let (replaced, steps) = replace_range_blocks(&mut ed, 1, 2, blocks).unwrap();
+        assert_eq!(replaced, 2);
+        assert_eq!(steps, 2);
+        assert_eq!(paras(&ed.doc), vec!["A", "X", "Y", "D"]);
+        match &ed.doc.body[1] {
+            Block::Paragraph(p) => assert_eq!(p.props.heading_level, Some(1)),
+            other => panic!("expected a heading paragraph, got {other:?}"),
+        }
+        assert!(ed.undo());
+        assert!(ed.undo());
+        assert_eq!(paras(&ed.doc), vec!["A", "B", "C", "D"]);
+        assert!(!ed.undo());
+
+        // A single EMPTY paragraph range → 1 undo step, mirroring
+        // `replace_range_of_empty_paragraph_is_one_undo_step`.
+        let mut ed2 = Editor::new(doc_with(&["keep", "", "tail"]));
+        let blocks2 = parse_markdown_blocks("filled").unwrap();
+        let (replaced2, steps2) = replace_range_blocks(&mut ed2, 1, 1, blocks2).unwrap();
+        assert_eq!(replaced2, 1);
+        assert_eq!(steps2, 1, "empty-paragraph replace is a single checkpoint");
+        assert_eq!(paras(&ed2.doc), vec!["keep", "filled", "tail"]);
+        assert!(ed2.undo());
+        assert_eq!(paras(&ed2.doc), vec!["keep", "", "tail"]);
+        assert!(!ed2.undo());
+    }
+
+    #[test]
+    fn empty_markdown_errors_and_touches_nothing() {
+        assert_eq!(
+            parse_markdown_blocks("   \n").unwrap_err(),
+            "empty markdown"
+        );
+        // Nothing was ever spliced or checkpointed: an editor left untouched.
+        let mut ed = Editor::new(doc_with(&["A"]));
+        assert!(!ed.undo());
     }
 
     #[test]

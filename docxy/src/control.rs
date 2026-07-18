@@ -18,9 +18,9 @@
 //! | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 //! | `doc.read` | `{start?, end?, range?}` | `{total, start, end, text, blocks:[…]}` |
 //! | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[…]}` |
-//! | `doc.replace-range` | `{start, end?, text}` | `{replaced, total}` |
-//! | `doc.insert` | `{at, text}` | `{total}` |
-//! | `doc.append` | `{text}` | `{total}` |
+//! | `doc.replace-range` | `{start, end?, text, markdown?}` | `{replaced, total}` |
+//! | `doc.insert` | `{at, text, markdown?}` | `{total}` |
+//! | `doc.append` | `{text, markdown?}` | `{total}` |
 //! | `doc.save` | — | `{path, …}` |
 //! | `doc.reload` | — | `{path, …}` |
 //! | `doc.open` | `{path}` | `{path, …}` |
@@ -353,9 +353,14 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
         .get_str("text")
         .ok_or("doc.replace-range needs 'text'")?;
     // The terminal app doesn't drive a host undo stack, so it ignores the
-    // checkpoint count `agent::replace_range` now also reports; its wire reply
-    // stays exactly `{replaced, total}`.
-    let (replaced, _undo_steps) = agent::replace_range(&mut app.editor, start, end, text)?;
+    // checkpoint count `agent::replace_range`/`replace_range_blocks` also
+    // report; its wire reply stays exactly `{replaced, total}` either way.
+    let replaced = if markdown_flag(args) {
+        let blocks = prepare_markdown_blocks(app, text)?;
+        agent::replace_range_blocks(&mut app.editor, start, end, blocks)?.0
+    } else {
+        agent::replace_range(&mut app.editor, start, end, text)?.0
+    };
     finish_edit(app);
     Ok(Json::obj(vec![
         ("replaced", Json::Num(replaced as f64)),
@@ -368,7 +373,12 @@ fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
         .get_usize("at")
         .ok_or("doc.insert needs an 'at' index")?;
     let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
-    agent::insert(&mut app.editor, at, text)?;
+    if markdown_flag(args) {
+        let blocks = prepare_markdown_blocks(app, text)?;
+        agent::insert_blocks(&mut app.editor, at, blocks)?;
+    } else {
+        agent::insert(&mut app.editor, at, text)?;
+    }
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
@@ -378,12 +388,63 @@ fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
 
 fn append(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args.get_str("text").ok_or("doc.append needs 'text'")?;
-    agent::append(&mut app.editor, text);
+    if markdown_flag(args) {
+        let blocks = prepare_markdown_blocks(app, text)?;
+        agent::append_blocks(&mut app.editor, blocks);
+    } else {
+        agent::append(&mut app.editor, text);
+    }
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
         Json::Num(app.editor.doc.body.len() as f64),
     )]))
+}
+
+/// Whether a `doc.insert`/`doc.replace-range`/`doc.append` call opted into
+/// Markdown-formatted splicing via the optional `markdown` arg (default
+/// `false` — byte-identical to the plain-text behavior).
+fn markdown_flag(args: &Json) -> bool {
+    args.get("markdown")
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
+}
+
+/// Parse `text` as Markdown into blocks ready to splice, ensuring this
+/// package's `Package` carries numbering definitions for any list the parsed
+/// content references before the caller splices it in.
+///
+/// [`docxcore::markdown::from_markdown`] always marks bullet items `numId` 1
+/// and ordered items `numId` 2 — ids fixed for a *fresh* markdown package (see
+/// `new_markdown_package`), which can collide with a numbering id an existing
+/// `.docx` already defines for something else. So this remaps: for each kind
+/// actually referenced, it calls [`docxcore::package::Package::ensure_list`]
+/// (the same call the Bullets/Numbering ribbon commands use), which returns a
+/// reserved high id unlikely to collide with the document's own lists, and
+/// rewrites the parsed blocks' `numId` to match — then reparses the package's
+/// numbering so the live view picks up any newly created part.
+fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
+    let mut blocks = agent::parse_markdown_blocks(text)?;
+    let is_list =
+        |b: &Block, id: i32| matches!(b, Block::Paragraph(p) if p.props.num_id == Some(id));
+    let needs_bullet = blocks.iter().any(|b| is_list(b, 1));
+    let needs_decimal = blocks.iter().any(|b| is_list(b, 2));
+    if needs_bullet || needs_decimal {
+        let bullet_id = needs_bullet.then(|| app.pkg.ensure_list(true));
+        let decimal_id = needs_decimal.then(|| app.pkg.ensure_list(false));
+        for b in blocks.iter_mut() {
+            if let Block::Paragraph(p) = b {
+                if let (Some(id), true) = (bullet_id, p.props.num_id == Some(1)) {
+                    p.props.num_id = Some(id);
+                }
+                if let (Some(id), true) = (decimal_id, p.props.num_id == Some(2)) {
+                    p.props.num_id = Some(id);
+                }
+            }
+        }
+        app.reparse_numbering();
+    }
+    Ok(blocks)
 }
 
 /// `doc.replace-all`: replace every occurrence of `query` with `text` across
@@ -765,6 +826,150 @@ mod tests {
         assert_eq!(paras(&app), vec!["A", "X", "B"]);
         assert!(app.editor.undo());
         assert_eq!(paras(&app), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn markdown_flag_absent_or_false_matches_plain_text_insert() {
+        let mut app_plain = app_with(&["A", "B", "C"]);
+        insert(
+            &mut app_plain,
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(paras(&app_plain), vec!["A", "X", "B", "C"]);
+
+        // Explicit `markdown:false` is byte-identical to the flag being absent.
+        let mut app_flag_false = app_with(&["A", "B", "C"]);
+        insert(
+            &mut app_flag_false,
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("X".into())),
+                ("markdown", Json::Bool(false)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(paras(&app_flag_false), paras(&app_plain));
+    }
+
+    #[test]
+    fn markdown_insert_round_trips_table_list_and_link() {
+        let mut app = app_with(&["Existing"]);
+        let at = app.editor.doc.body.len();
+        let md = "# Notes\n\n- item one\n- item two\n\n\
+                   | A | B |\n| --- | --- |\n| 1 | 2 |\n\n\
+                   See [docs](https://example.com).";
+        insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(at as f64)),
+                ("text", Json::Str(md.into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert!(app.modified);
+        // The original paragraph is untouched, ahead of the spliced blocks.
+        assert_eq!(app.editor.doc.body[0].plain_text(), "Existing");
+
+        let out = export(&app, &args(vec![("format", Json::Str("markdown".into()))])).unwrap();
+        let text = out.get_str("text").unwrap();
+        assert!(text.contains("# Notes"), "heading missing: {text}");
+        assert!(
+            text.contains("item one") && text.contains("item two"),
+            "list items missing: {text}"
+        );
+        assert!(text.contains("| A | B |"), "table row missing: {text}");
+        assert!(text.contains("| 1 | 2 |"), "table row missing: {text}");
+        assert!(
+            text.contains("[docs](https://example.com)"),
+            "link missing: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_markdown_insert_errors_and_leaves_doc_unmodified() {
+        let mut app = app_with(&["A", "B"]);
+        let err = insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(1.0)),
+                ("text", Json::Str("   \n".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "empty markdown");
+        assert_eq!(paras(&app), vec!["A", "B"]);
+        assert!(!app.modified, "an errored splice must not mark modified");
+        assert!(
+            !app.editor.undo(),
+            "nothing was spliced, so nothing was checkpointed"
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_markdown_via_replace_range_is_an_error_and_doc_stays_clean() {
+        let mut app = app_with(&["A"]);
+        let err = dispatch(
+            &mut app,
+            "doc.replace-range",
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("text", Json::Str("".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "empty markdown");
+        assert!(!app.modified);
+        assert_eq!(paras(&app), vec!["A"]);
+    }
+
+    #[test]
+    fn markdown_list_ensures_numbering_and_remaps_off_the_bare_ids() {
+        let mut app = app_with(&["Existing"]);
+        assert!(
+            !app.pkg.part_names().contains(&"word/numbering.xml"),
+            "fixture must start without numbering"
+        );
+        append(
+            &mut app,
+            &args(vec![
+                (
+                    "text",
+                    Json::Str("- one\n- two\n\n1. first\n2. second".into()),
+                ),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            app.pkg.part_names().contains(&"word/numbering.xml"),
+            "numbering part must be created on demand: {:?}",
+            app.pkg.part_names()
+        );
+        let num_ids: Vec<i32> = app
+            .editor
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => p.props.num_id,
+                _ => None,
+            })
+            .collect();
+        // A bullet list (2 items) and an ordered list (2 items) were both spliced.
+        assert_eq!(num_ids.len(), 4, "{num_ids:?}");
+        // Remapped away from markdown's bare 1/2 (which `ensure_list`'s reserved
+        // ids exist precisely to avoid colliding with) onto real definitions.
+        assert!(
+            num_ids.iter().all(|&id| id != 1 && id != 2),
+            "list paragraphs must be remapped onto ensure_list's ids: {num_ids:?}"
+        );
     }
 
     #[test]
