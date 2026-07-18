@@ -37,23 +37,34 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             client.send_draft(&graph_id)
         }
         OutboxOp::RespondEvent { id, kind, comment } => {
-            client.respond_event(id, rsvp_kind(kind), comment.as_deref(), true)
+            // An unrecognized `kind` must NOT silently fall back to
+            // accepting: that's the worst possible default for an action
+            // with an external, user-visible side effect (a corrupt outbox
+            // row would otherwise accept a meeting no one asked to accept).
+            // Erroring here — rather than defaulting — makes the drain
+            // loop's normal 4xx retry/quarantine policy handle it: the op
+            // is retried, then quarantined after `MAX_OP_ATTEMPTS` like any
+            // other op Graph keeps rejecting, without ever calling Graph
+            // with a guessed action.
+            let rsvp = rsvp_kind(kind)
+                .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
+            client.respond_event(id, rsvp, comment.as_deref(), true)
         }
     }
 }
 
 /// Maps the `response_status` vocabulary `Store::set_event_response` writes
 /// locally — and `OutboxOp::RespondEvent`'s `kind` field carries — to the
-/// RSVP action `GraphClient::respond_event` sends: `"declined"` → `Decline`,
-/// `"tentativelyAccepted"` → `Tentative`. Anything else (including the
-/// common case, `"accepted"`) maps to `Accept` — a safe default for an
-/// unrecognized value rather than silently dropping the RSVP (this crate's
-/// usual "default rather than fail" convention; see e.g. `Event::from_json`).
-fn rsvp_kind(kind: &str) -> RsvpKind {
+/// RSVP action `GraphClient::respond_event` sends: `"accepted"` → `Accept`,
+/// `"declined"` → `Decline`, `"tentativelyAccepted"` → `Tentative`. `None`
+/// for anything else — see `apply_op`'s `RespondEvent` arm for why an
+/// unrecognized value must error rather than silently pick one.
+fn rsvp_kind(kind: &str) -> Option<RsvpKind> {
     match kind {
-        "declined" => RsvpKind::Decline,
-        "tentativelyAccepted" => RsvpKind::Tentative,
-        _ => RsvpKind::Accept,
+        "accepted" => Some(RsvpKind::Accept),
+        "declined" => Some(RsvpKind::Decline),
+        "tentativelyAccepted" => Some(RsvpKind::Tentative),
+        _ => None,
     }
 }
 
@@ -295,6 +306,31 @@ mod tests {
         assert!(reqs[0].path.ends_with("/decline"));
         let sent = json::parse(&reqs[0].body).unwrap();
         assert_eq!(sent.get("comment").and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn apply_op_respond_event_rejects_an_unrecognized_kind_without_calling_graph() {
+        // A corrupt/unexpected outbox row (`kind` not one of the three
+        // `Store::set_event_response` vocabulary values) must NOT default to
+        // accepting the meeting — see `rsvp_kind`'s doc comment. No route is
+        // stubbed at all: if this silently defaulted to `Accept` and called
+        // `.../accept`, the fake server would 404 and the test would still
+        // catch it via the empty-requests assertion below, but the point is
+        // Graph is never even reached.
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let result = apply_op(
+            &c,
+            &store,
+            &OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "garbage".into(),
+                comment: None,
+            },
+        );
+        assert!(matches!(result, Err(GraphError::Parse(_))));
+        assert!(srv.requests().is_empty());
     }
 
     #[test]

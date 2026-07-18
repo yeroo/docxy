@@ -1044,6 +1044,103 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces every event overlapping `[from_utc, to_utc)` (the same
+    /// overlap condition `events_in_window` filters by: `start_utc < to_utc
+    /// AND end_utc > from_utc`) with `events`/`attendees` — a full
+    /// server-truth refetch for that window, which is all
+    /// `GraphClient::calendar_view` ever returns (there's no delta endpoint
+    /// to fetch only what changed). Any event previously stored in the
+    /// window that ISN'T in `events` (cancelled server-side, or moved
+    /// outside the window) is pruned rather than left stuck locally
+    /// forever; every event in `events` is upserted with its attendees
+    /// replaced from the matching entry in `attendees` (paired by id — an
+    /// event with no entry there gets none, the same "replace with empty"
+    /// semantics `put_event_attendees(id, &[])` has).
+    ///
+    /// Runs as ONE transaction (the window delete, then every event upsert
+    /// and attendee replace) so a crash mid-refresh can't leave the window
+    /// emptied without ever refilling it: either the whole replacement
+    /// commits, or none of it does and the prior window contents are
+    /// untouched. Deliberately does NOT call `upsert_event`/
+    /// `put_event_attendees` (each opens its own transaction via
+    /// `unchecked_transaction`; nesting a second `BEGIN` on the same
+    /// connection while this one is still open would error) — the same SQL
+    /// is inlined here instead. The per-event attendee `DELETE` before each
+    /// insert is technically redundant with `events`' `ON DELETE CASCADE`
+    /// for an event this call's own window-delete just removed, but not for
+    /// one that instead takes the `ON CONFLICT` update path (a boundary
+    /// mismatch between this window and the row's stored dates) — cheap
+    /// insurance against a duplicate attendee row in that edge case, and
+    /// the same delete-then-insert `put_event_attendees` itself always does.
+    pub fn replace_events_in_window(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        events: &[NewEvent],
+        attendees: &[(String, Vec<NewAttendee>)],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1",
+            params![from_utc, to_utc],
+        )?;
+        for e in events {
+            tx.execute(
+                "INSERT INTO events (
+                     id, subject, start_utc, end_utc, is_all_day, location,
+                     organizer_name, organizer_addr, response_status,
+                     series_master_id, body_preview, web_link, last_modified,
+                     body_html
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(id) DO UPDATE SET
+                     subject = excluded.subject,
+                     start_utc = excluded.start_utc,
+                     end_utc = excluded.end_utc,
+                     is_all_day = excluded.is_all_day,
+                     location = excluded.location,
+                     organizer_name = excluded.organizer_name,
+                     organizer_addr = excluded.organizer_addr,
+                     response_status = excluded.response_status,
+                     series_master_id = excluded.series_master_id,
+                     body_preview = excluded.body_preview,
+                     web_link = excluded.web_link,
+                     last_modified = excluded.last_modified,
+                     body_html = excluded.body_html",
+                params![
+                    e.id,
+                    e.subject,
+                    e.start_utc,
+                    e.end_utc,
+                    e.is_all_day,
+                    e.location,
+                    e.organizer_name,
+                    e.organizer_addr,
+                    e.response_status,
+                    e.series_master_id,
+                    e.body_preview,
+                    e.web_link,
+                    e.last_modified,
+                    e.body_html,
+                ],
+            )?;
+        }
+        for (id, atts) in attendees {
+            tx.execute(
+                "DELETE FROM event_attendees WHERE event_id = ?1",
+                params![id],
+            )?;
+            for att in atts {
+                tx.execute(
+                    "INSERT INTO event_attendees (event_id, name, addr, type, response)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, att.name, att.addr, att.r#type, att.response],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Events overlapping `[from_utc, to_utc)`: `start_utc < to_utc AND
     /// end_utc > from_utc`, so multi-day/ongoing events that started before
     /// the window (or end after it) still show, not just ones fully
@@ -1457,6 +1554,70 @@ mod calendar_tests {
             .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
             .unwrap();
         assert_eq!(rows[0].response_status, "accepted");
+    }
+
+    #[test]
+    fn replace_events_in_window_prunes_events_not_in_the_new_set() {
+        // A cancelled (or moved-out-of-window) event: `upsert_event` alone
+        // would never remove it, since it's simply never returned by a
+        // later `calendar_view` fetch — `replace_events_in_window` is what
+        // prunes it.
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("OLD", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        s.replace_events_in_window(
+            "2026-07-17T00:00:00Z",
+            "2026-07-18T00:00:00Z",
+            &[ev("NEW", "2026-07-17T12:00:00Z", "2026-07-17T13:00:00Z")],
+            &[],
+        )
+        .unwrap();
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["NEW"], "OLD should have been pruned: {ids:?}");
+    }
+
+    #[test]
+    fn replace_events_in_window_leaves_events_outside_the_window_untouched() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev(
+            "OUTSIDE",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T11:00:00Z",
+        ))
+        .unwrap();
+        s.replace_events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z", &[], &[])
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "OUTSIDE");
+    }
+
+    #[test]
+    fn replace_events_in_window_sets_attendees_for_upserted_events() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_events_in_window(
+            "2026-07-17T00:00:00Z",
+            "2026-07-18T00:00:00Z",
+            &[ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z")],
+            &[(
+                "1".to_string(),
+                vec![NewAttendee {
+                    name: "Bob".into(),
+                    addr: "bob@x".into(),
+                    r#type: "required".into(),
+                    response: "accepted".into(),
+                }],
+            )],
+        )
+        .unwrap();
+        let attendees = s.event_attendees("1").unwrap();
+        assert_eq!(attendees.len(), 1);
+        assert_eq!(attendees[0].name, "Bob");
     }
 
     #[test]

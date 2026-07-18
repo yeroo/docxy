@@ -667,10 +667,23 @@ impl Engine {
                         let _ = self.store.clear_delta_links();
                         self.backfill_done = false;
                         self.reconverge_pending = true;
+                        let is_respond_event = matches!(row.op, OutboxOp::RespondEvent { .. });
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
                         )));
+                        // A quarantined `RespondEvent` leaves the optimistic
+                        // local `response_status` wrong (Graph never got the
+                        // RSVP) — unlike mail, there's no delta re-sync to
+                        // fix that up later, and the mail reconverge above
+                        // doesn't touch the `events` table at all. Refresh
+                        // the calendar right away so `replace_events_in_
+                        // window` (see `Store::replace_events_in_window`)
+                        // pulls the true status back from the server instead
+                        // of leaving a phantom RSVP on the books.
+                        if is_respond_event {
+                            self.refresh_calendar();
+                        }
                     } else {
                         self.store.bump_op_attempts(row.seq, &other.to_string());
                     }
@@ -877,20 +890,24 @@ impl Engine {
 
     // --- Calendar ----------------------------------------------------------
 
-    /// Fetches `calendar_window(SystemTime::now())` via `calendar_view`,
-    /// upserts every returned event (`NewEvent::from`) and its attendees
-    /// (`NewAttendee::from`) into the store, and emits
-    /// `SyncEvent::CalendarUpdated`. Unlike mail's delta sync, Graph's
+    /// Fetches `calendar_window(SystemTime::now())` via `calendar_view` and
+    /// replaces the window's stored contents with it
+    /// (`Store::replace_events_in_window`) in one atomic transaction, then
+    /// emits `SyncEvent::CalendarUpdated`. Unlike mail's delta sync, Graph's
     /// `/me/calendarView` isn't a delta endpoint — there's no link to resume
-    /// from, so every call re-fetches and re-upserts the whole window;
-    /// `upsert_event`/`put_event_attendees` are idempotent, so repeating this
-    /// is harmless, just not incremental. (`Store::calendar_delta_link`/
+    /// from, so every call re-fetches the whole window; replacing (rather
+    /// than only upserting) is what prunes an event that Graph no longer
+    /// returns for the window — cancelled, or moved outside it — instead of
+    /// leaving it stuck locally forever. (`Store::calendar_delta_link`/
     /// `set_calendar_delta_link` are there for a future delta-capable
     /// endpoint; nothing here has a link to write into them.)
     ///
     /// Same signed-in guard as `fetch_body` et al.; a Graph failure goes
     /// through `react` for the standard auth/throttle/transport handling (a
-    /// 4xx/parse is surfaced via `SyncEvent::Error`, not fatal to the caller).
+    /// 4xx/parse is surfaced via `SyncEvent::Error`, not fatal to the
+    /// caller). Also called by `drain_outbox` right after a `RespondEvent`
+    /// op quarantines, to reconverge the optimistic local RSVP with server
+    /// truth (see the quarantine branch there).
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
@@ -899,11 +916,22 @@ impl Engine {
         let (from, to) = calendar_window(SystemTime::now());
         match self.with_auth(|c| c.calendar_view(&from, &to)) {
             Ok(events) => {
-                for e in &events {
-                    let _ = self.store.upsert_event(&NewEvent::from(e));
-                    let attendees: Vec<NewAttendee> =
-                        e.attendees.iter().map(NewAttendee::from).collect();
-                    let _ = self.store.put_event_attendees(&e.id, &attendees);
+                let new_events: Vec<NewEvent> = events.iter().map(NewEvent::from).collect();
+                let attendees: Vec<(String, Vec<NewAttendee>)> = events
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.id.clone(),
+                            e.attendees.iter().map(NewAttendee::from).collect(),
+                        )
+                    })
+                    .collect();
+                if let Err(e) =
+                    self.store
+                        .replace_events_in_window(&from, &to, &new_events, &attendees)
+                {
+                    self.emit(SyncEvent::Error(e.to_string()));
+                    return;
                 }
                 self.emit(SyncEvent::CalendarUpdated);
             }
@@ -3019,6 +3047,188 @@ mod tests {
                 .pending_ops()
                 .unwrap()
                 .is_empty()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_prunes_events_no_longer_in_the_fetched_window() {
+        // A cancelled (or moved-out-of-window) event: plain upserting would
+        // never remove it, since it's simply never returned by a later
+        // `calendar_view` fetch. `replace_events_in_window` (Store) is what
+        // prunes it — this proves `refresh_calendar` actually uses that
+        // replace path, not a plain upsert loop.
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                // A DIFFERENT set that does NOT include the previously-
+                // stored OLD1 event below.
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    calendar_event_json("NEW1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                ),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("refresh-calendar-prune");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Seed an "OLD" event dated to fall well inside whatever window
+        // `calendar_window(SystemTime::now())` computes at test-run time
+        // (a day from now) — computed off the real clock, not hardcoded,
+        // so this test doesn't depend on which date it happens to run on —
+        // so `replace_events_in_window`'s window-bounded DELETE actually
+        // captures it, proving the prune rather than an unrelated gap.
+        {
+            let store = Store::open(&store_path).unwrap();
+            let soon = now_unix() + 86400;
+            store
+                .upsert_event(&NewEvent {
+                    id: "OLD1".into(),
+                    subject: "Cancelled".into(),
+                    start_utc: unix_to_iso8601(soon),
+                    end_utc: unix_to_iso8601(soon + 1800),
+                    is_all_day: false,
+                    location: "".into(),
+                    organizer_name: "Org".into(),
+                    organizer_addr: "org@x".into(),
+                    response_status: "none".into(),
+                    series_master_id: None,
+                    body_preview: "".into(),
+                    web_link: "".into(),
+                    last_modified: "".into(),
+                    body_html: "".into(),
+                })
+                .unwrap();
+        }
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"NEW1"), "expected NEW1, got: {ids:?}");
+        assert!(
+            !ids.contains(&"OLD1"),
+            "the cancelled/replaced event should have been pruned, got: {ids:?}"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_event_quarantine_reconverges_local_status_from_server_truth() {
+        // The optimistic `RespondEvent` write sets `response_status` to
+        // "accepted" locally, but the Graph call always 404s, so it never
+        // actually reaches the server. Once quarantined (repeated 4xx), the
+        // engine must refresh the calendar so the local status reverts to
+        // whatever the server actually has ("none" here) — otherwise a
+        // phantom RSVP stays on the books forever with nothing to correct
+        // it (unlike mail, which reconverges via delta links).
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/accept".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                // Server truth: E1 is still unanswered ("none"), never
+                // "accepted" — the optimistic local write never landed.
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                ),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("respond-event-reconverge");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: None,
+            })
+            .unwrap();
+        for _ in 0..4 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
+        // The quarantine branch triggers a calendar refresh immediately
+        // (see `Engine::drain_outbox`), so this lands right after.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].response_status, "none",
+            "local status should have reconverged to server truth, not stayed \"accepted\""
         );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
