@@ -78,6 +78,8 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
 
 const TARGET_DESC: &str =
     "Optional: which docxy to act on (a substring of its instance/pane id) when several are open.";
+const MARKDOWN_DESC: &str =
+    "Parse text as Markdown (headings, bold, lists, tables, links) instead of plain text.";
 
 /// A minimal valid .docx: one empty paragraph in a fresh OPC package. Also the
 /// source of the committed template the bundled VS Code MCP server ships.
@@ -180,6 +182,7 @@ fn tool_defs() -> Json {
                     "text",
                     prop("string", "Replacement text; \\n starts a new paragraph."),
                 ),
+                ("markdown", prop("boolean", MARKDOWN_DESC)),
                 target(),
             ],
             &["start", "text"],
@@ -199,6 +202,7 @@ fn tool_defs() -> Json {
                     "text",
                     prop("string", "Text to insert; \\n starts a new paragraph."),
                 ),
+                ("markdown", prop("boolean", MARKDOWN_DESC)),
                 target(),
             ],
             &["at", "text"],
@@ -211,6 +215,7 @@ fn tool_defs() -> Json {
                     "text",
                     prop("string", "Text to append; \\n starts a new paragraph."),
                 ),
+                ("markdown", prop("boolean", MARKDOWN_DESC)),
                 target(),
             ],
             &["text"],
@@ -443,6 +448,45 @@ mod tests {
         assert_eq!(required_of("docxy_replace_all"), "[\"query\",\"text\"]");
         assert_eq!(required_of("docxy_undo"), "[]");
         assert_eq!(required_of("docxy_redo"), "[]");
+    }
+
+    /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
+    /// additive optional `markdown` boolean prop (character-identical
+    /// description across the three tools, and across Rust/JS) — required
+    /// arrays must be UNCHANGED from wave-1/wave-0.
+    #[test]
+    fn wave2_markdown_flag_is_additive_on_the_three_edit_verbs() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let schema_of = |name: &str| -> Json {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .get("inputSchema")
+                .unwrap()
+                .clone()
+        };
+        let expected_required = [
+            ("docxy_replace_range", "[\"start\",\"text\"]"),
+            ("docxy_insert", "[\"at\",\"text\"]"),
+            ("docxy_append", "[\"text\"]"),
+        ];
+        for (name, required) in expected_required {
+            let schema = schema_of(name);
+            assert_eq!(
+                schema.get("required").unwrap().to_string(),
+                required,
+                "{name}'s required array must be unchanged by the markdown flag"
+            );
+            let markdown_prop = schema
+                .get("properties")
+                .unwrap()
+                .get("markdown")
+                .unwrap_or_else(|| panic!("{name} missing 'markdown' prop"));
+            assert_eq!(markdown_prop.get_str("type"), Some("boolean"));
+            assert_eq!(markdown_prop.get_str("description"), Some(MARKDOWN_DESC));
+        }
     }
 
     /// Every forwarding tool → its exact spec verb string, pre-existing tools

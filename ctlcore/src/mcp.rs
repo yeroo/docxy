@@ -198,6 +198,18 @@ pub fn item_obj(props: Vec<(&str, Json)>, required: &[&str]) -> Json {
     object_schema(props, required)
 }
 
+/// A JSON-schema property for an object-typed arg: `{"type":"object",
+/// "properties":…,"required":…,"description":desc}` — [`item_obj`]'s bare
+/// object schema plus a top-level `description`, for a nested-object
+/// argument that itself needs documenting, e.g. `cell.format`'s `patch`.
+pub fn prop_obj(props: Vec<(&str, Json)>, required: &[&str], desc: &str) -> Json {
+    let Json::Obj(mut pairs) = object_schema(props, required) else {
+        unreachable!("object_schema always returns Json::Obj")
+    };
+    pairs.push(("description".to_string(), Json::Str(desc.into())));
+    Json::Obj(pairs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +373,18 @@ mod tests {
         assert!(it.get("properties").unwrap().get("agg").is_some());
         assert_eq!(it.get("required").unwrap().to_string(), "[\"col\",\"agg\"]");
         assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn prop_obj_is_item_obj_plus_a_top_level_description() {
+        let p = prop_obj(
+            vec![("bold", prop("boolean", "bold desc"))],
+            &[],
+            "patch desc",
+        );
+        assert_eq!(p.get_str("type"), Some("object"));
+        assert!(p.get("properties").unwrap().get("bold").is_some());
+        assert_eq!(p.get("required").unwrap().to_string(), "[]");
+        assert_eq!(p.get_str("description"), Some("patch desc"));
     }
 }

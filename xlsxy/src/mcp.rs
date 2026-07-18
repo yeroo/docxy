@@ -10,7 +10,7 @@
 
 use ctlcore::client;
 use ctlcore::json::Json;
-use ctlcore::mcp::{McpServer, item_array, item_obj, item_ty, prop, prop_array, tool};
+use ctlcore::mcp::{McpServer, item_array, item_obj, item_ty, prop, prop_array, prop_obj, tool};
 
 /// Serve MCP over stdio until stdin closes.
 pub fn run() -> std::io::Result<()> {
@@ -59,6 +59,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_stats" => "sheet.stats",
         "xlsxy_charts" => "chart.list",
         "xlsxy_pivots" => "pivot.list",
+        "xlsxy_format" => "cell.format",
+        "xlsxy_col_width" => "col.width",
         _ => return None,
     })
 }
@@ -477,6 +479,71 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "xlsxy_format",
+            "Apply cell formatting (number format, bold/italic, font/fill color, alignment) to \
+             every cell in a range. One undo group. `xlsxy_get`'s reply echoes a cell's current \
+             format the same way, for read-modify-write.",
+            vec![
+                ("range", prop("string", "A1-style range, e.g. \"A1:C10\".")),
+                (
+                    "patch",
+                    prop_obj(
+                        vec![
+                            (
+                                "numFmt",
+                                prop(
+                                    "string",
+                                    "Number format code, e.g. \"0.00%\" or \"m/d/yyyy\".",
+                                ),
+                            ),
+                            ("bold", prop("boolean", "Bold on/off.")),
+                            ("italic", prop("boolean", "Italic on/off.")),
+                            ("fontColor", prop("string", "Font color as \"#RRGGBB\".")),
+                            (
+                                "fillColor",
+                                prop("string", "Fill (background) color as \"#RRGGBB\"."),
+                            ),
+                            (
+                                "align",
+                                prop(
+                                    "string",
+                                    "Horizontal alignment: \"left\", \"center\", or \"right\".",
+                                ),
+                            ),
+                        ],
+                        &[],
+                        "Formatting to apply — at least one key required; an unknown key errors \
+                         naming it. Keys absent from the patch leave that aspect of each cell's \
+                         existing style untouched.",
+                    ),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["range", "patch"],
+        ),
+        tool(
+            "xlsxy_col_width",
+            "Set one column's display width, in Excel column-width units.",
+            vec![
+                (
+                    "col",
+                    prop(
+                        "string",
+                        "Column letter (e.g. \"C\") or 0-based index; the reply echoes the \
+                         numeric index.",
+                    ),
+                ),
+                (
+                    "width",
+                    prop("number", "New column width; must be positive."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["col", "width"],
+        ),
     ])
 }
 
@@ -576,12 +643,15 @@ mod tests {
             "xlsxy_stats",
             "xlsxy_charts",
             "xlsxy_pivots",
+            // Wave-2: appended last, same relative order everywhere.
+            "xlsxy_format",
+            "xlsxy_col_width",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -628,6 +698,8 @@ mod tests {
         assert_eq!(required_of("xlsxy_stats"), "[\"range\"]");
         assert_eq!(required_of("xlsxy_charts"), "[]");
         assert_eq!(required_of("xlsxy_pivots"), "[]");
+        assert_eq!(required_of("xlsxy_format"), "[\"range\",\"patch\"]");
+        assert_eq!(required_of("xlsxy_col_width"), "[\"col\",\"width\"]");
     }
 
     #[test]
@@ -677,6 +749,73 @@ mod tests {
         );
     }
 
+    /// Wave-2: `xlsxy_format.patch` is an object schema with the six
+    /// optional typed properties (all described), and no required keys of
+    /// its own (the tool-level `required` covers `range`/`patch`).
+    #[test]
+    fn xlsxy_format_patch_schema_has_the_six_optional_typed_properties() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let patch_schema = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("xlsxy_format"))
+            .unwrap()
+            .get("inputSchema")
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .get("patch")
+            .unwrap()
+            .clone();
+        assert_eq!(patch_schema.get_str("type"), Some("object"));
+        assert!(patch_schema.get_str("description").is_some());
+        assert_eq!(patch_schema.get("required").unwrap().to_string(), "[]");
+        let props = patch_schema.get("properties").unwrap();
+        let expected_types = [
+            ("numFmt", "string"),
+            ("bold", "boolean"),
+            ("italic", "boolean"),
+            ("fontColor", "string"),
+            ("fillColor", "string"),
+            ("align", "string"),
+        ];
+        for (key, ty) in expected_types {
+            let p = props
+                .get(key)
+                .unwrap_or_else(|| panic!("patch missing key {key}"));
+            assert_eq!(p.get_str("type"), Some(ty), "wrong type for patch.{key}");
+            assert!(
+                p.get_str("description").is_some(),
+                "patch.{key} missing description"
+            );
+        }
+    }
+
+    /// `xlsxy_col_width.col` documents that it accepts a letter or 0-based
+    /// index, and that the reply echoes the numeric index — matching
+    /// `col.width`'s actual reply shape (`{col: <number>, width}`).
+    #[test]
+    fn xlsxy_col_width_col_description_notes_numeric_echo() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let props = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("xlsxy_col_width"))
+            .unwrap()
+            .get("inputSchema")
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .clone();
+        let col_desc = props.get("col").unwrap().get_str("description").unwrap();
+        assert!(col_desc.contains("index"), "{col_desc}");
+        assert!(
+            col_desc.to_lowercase().contains("reply echoes"),
+            "{col_desc}"
+        );
+        assert_eq!(props.get("width").unwrap().get_str("type"), Some("number"));
+    }
+
     /// Every forwarding tool → its exact spec verb string, pre-existing tools
     /// included (cheap, and it pins the whole surface, not just wave-1).
     const VERB_TABLE: &[(&str, &str)] = &[
@@ -708,6 +847,8 @@ mod tests {
         ("xlsxy_stats", "sheet.stats"),
         ("xlsxy_charts", "chart.list"),
         ("xlsxy_pivots", "pivot.list"),
+        ("xlsxy_format", "cell.format"),
+        ("xlsxy_col_width", "col.width"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

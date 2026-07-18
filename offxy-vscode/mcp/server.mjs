@@ -325,8 +325,17 @@ function itemObj(properties, required) {
   return { type: 'object', properties, required };
 }
 
+/** A JSON-schema property for an object-typed arg — mirrors
+ *  `ctlcore::mcp::prop_obj`: `itemObj`'s bare object schema plus a
+ *  top-level `description`. */
+function propObj(properties, required, description) {
+  return { type: 'object', properties, required, description };
+}
+
 const DOCXY_TARGET_DESC =
   'Optional: which docxy to act on (a substring of its instance/pane id) when several are open.';
+const MARKDOWN_DESC =
+  'Parse text as Markdown (headings, bold, lists, tables, links) instead of plain text.';
 
 function docxyToolDefs() {
   const target = () => ['target', prop('string', DOCXY_TARGET_DESC)];
@@ -389,6 +398,7 @@ function docxyToolDefs() {
         ['start', prop('integer', 'First paragraph block index to replace.')],
         ['end', prop('integer', 'Last paragraph block index, inclusive (default: start).')],
         ['text', prop('string', 'Replacement text; \\n starts a new paragraph.')],
+        ['markdown', prop('boolean', MARKDOWN_DESC)],
         target(),
       ]),
       ['start', 'text'],
@@ -399,6 +409,7 @@ function docxyToolDefs() {
       Object.fromEntries([
         ['at', prop('integer', 'Block index to insert before (== block count to append).')],
         ['text', prop('string', 'Text to insert; \\n starts a new paragraph.')],
+        ['markdown', prop('boolean', MARKDOWN_DESC)],
         target(),
       ]),
       ['at', 'text'],
@@ -406,7 +417,11 @@ function docxyToolDefs() {
     tool(
       'docxy_append',
       'Append text as new paragraph(s) at the end of the document (\\n separates paragraphs). Undoable.',
-      Object.fromEntries([['text', prop('string', 'Text to append; \\n starts a new paragraph.')], target()]),
+      Object.fromEntries([
+        ['text', prop('string', 'Text to append; \\n starts a new paragraph.')],
+        ['markdown', prop('boolean', MARKDOWN_DESC)],
+        target(),
+      ]),
       ['text'],
     ),
     tool('docxy_save', 'Save the open document to its file.', Object.fromEntries([target()]), []),
@@ -783,6 +798,52 @@ function xlsxyToolDefs() {
       Object.fromEntries([target()]),
       [],
     ),
+    tool(
+      'xlsxy_format',
+      'Apply cell formatting (number format, bold/italic, font/fill color, alignment) to ' +
+        "every cell in a range. One undo group. `xlsxy_get`'s reply echoes a cell's current " +
+        'format the same way, for read-modify-write.',
+      Object.fromEntries([
+        ['range', prop('string', 'A1-style range, e.g. "A1:C10".')],
+        [
+          'patch',
+          propObj(
+            Object.fromEntries([
+              ['numFmt', prop('string', 'Number format code, e.g. "0.00%" or "m/d/yyyy".')],
+              ['bold', prop('boolean', 'Bold on/off.')],
+              ['italic', prop('boolean', 'Italic on/off.')],
+              ['fontColor', prop('string', 'Font color as "#RRGGBB".')],
+              ['fillColor', prop('string', 'Fill (background) color as "#RRGGBB".')],
+              ['align', prop('string', 'Horizontal alignment: "left", "center", or "right".')],
+            ]),
+            [],
+            'Formatting to apply — at least one key required; an unknown key errors ' +
+              "naming it. Keys absent from the patch leave that aspect of each cell's " +
+              'existing style untouched.',
+          ),
+        ],
+        sheet(),
+        target(),
+      ]),
+      ['range', 'patch'],
+    ),
+    tool(
+      'xlsxy_col_width',
+      "Set one column's display width, in Excel column-width units.",
+      Object.fromEntries([
+        [
+          'col',
+          prop(
+            'string',
+            'Column letter (e.g. "C") or 0-based index; the reply echoes the numeric index.',
+          ),
+        ],
+        ['width', prop('number', 'New column width; must be positive.')],
+        sheet(),
+        target(),
+      ]),
+      ['col', 'width'],
+    ),
   ];
 }
 
@@ -843,6 +904,8 @@ const XLSXY_VERBS = {
   xlsxy_stats: 'sheet.stats',
   xlsxy_charts: 'chart.list',
   xlsxy_pivots: 'pivot.list',
+  xlsxy_format: 'cell.format',
+  xlsxy_col_width: 'col.width',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result
