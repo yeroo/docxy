@@ -4,6 +4,7 @@
 //! (Microsoft Graph REST client), `store` (SQLite), `sync` (background engine).
 
 pub mod auth;
+pub mod compose_html;
 pub mod graph;
 pub mod htmlrender;
 pub mod json;

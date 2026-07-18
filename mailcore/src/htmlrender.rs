@@ -51,7 +51,7 @@ pub const INDENT_SPACES: usize = 2;
 /// changes bold/indent/link state. Covers the common case of a `<style>`
 /// block in the body (Outlook loves to inline one) and a stray `<head>`
 /// in a malformed/full-document body.
-const SKIP_CONTENT_TAGS: [&str; 4] = ["script", "style", "head", "title"];
+pub(crate) const SKIP_CONTENT_TAGS: [&str; 4] = ["script", "style", "head", "title"];
 
 /// A single word (a whitespace-delimited run of characters) plus the
 /// styling/link state active when it was collected. The unit `render_html`
@@ -356,8 +356,12 @@ fn trim_trailing_blank(lines: &mut Vec<StyledLine>) {
 /// A markup token: the same event shape as `opccore::xml::XmlParser`
 /// (start/end/text/eof) but produced by an HTML-lenient scanner rather
 /// than an XML one — see [`Tokenizer`].
+///
+/// `pub(crate)`: reused by `crate::compose_html::from_html`, which walks
+/// the same token stream to build a `RichText` instead of `StyledLine`s —
+/// see that module rather than duplicating this scanner.
 #[derive(Debug, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     TagOpen {
         name: String,
         attrs: Vec<(String, String)>,
@@ -396,7 +400,7 @@ enum Token {
 ///   (`malformed_html_does_not_panic`) exercising a handful of gnarly
 ///   cases (unclosed tags, unquoted values with special characters, bare
 ///   `<`/`>` runs) to guard it.
-struct Tokenizer<'a> {
+pub(crate) struct Tokenizer<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
@@ -406,7 +410,7 @@ fn is_ws(c: u8) -> bool {
 }
 
 impl<'a> Tokenizer<'a> {
-    fn new(src: &'a str) -> Self {
+    pub(crate) fn new(src: &'a str) -> Self {
         Tokenizer {
             bytes: src.as_bytes(),
             pos: 0,
@@ -434,7 +438,7 @@ impl<'a> Tokenizer<'a> {
             .map(|x| from + x)
     }
 
-    fn next(&mut self) -> Token {
+    pub(crate) fn next(&mut self) -> Token {
         let len = self.bytes.len();
         loop {
             if self.pos >= len {
