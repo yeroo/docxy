@@ -182,12 +182,22 @@ const TEMPLATES = {
  *  creates nothing; no live instance still creates, with `opened:false`). */
 async function doNew(app, args) {
   if (typeof args?.path !== 'string') throw new Error('missing path');
+  // path.resolve('') falls back to cwd; Rust's std::path::absolute("") errors
+  // instead, so match it explicitly before resolving.
+  if (args.path === '') throw new Error('bad path: cannot make an empty path absolute');
   const abs = path.resolve(args.path);
   const target = typeof args?.target === 'string' ? args.target : undefined;
   const inst = await resolveTargetForNew(app, target);
   if (fs.existsSync(abs)) throw new Error(`already exists: ${abs}`);
   try {
+    // mkdirSync throws EEXIST when a PARENT component is an existing file,
+    // not when `abs` itself exists (already ruled out above) — so any error
+    // here is a genuine creation failure, never "already exists".
     fs.mkdirSync(path.dirname(abs), { recursive: true });
+  } catch (e) {
+    throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
     // COPYFILE_EXCL: create-exclusive, so a file appearing between the exists
     // check and the copy errors instead of being truncated — mirrors the
     // create_new(true) open in ctlcore::client::new_file.

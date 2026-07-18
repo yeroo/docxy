@@ -168,7 +168,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   `xlsxy_recalc`, `xlsxy_save`. It's
   a thin bridge — it opens no document itself, only forwards to whichever
   `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
-  running; pass `target` (a substring of the instance/pane id) to disambiguate
+  running (the `_new` tools are the exception: they create the file on disk
+  themselves, then hand off to an instance via the same open forwarding);
+  pass `target` (a substring of the instance/pane id) to disambiguate
   when several are open, or call `docxy_list`/`xlsxy_list` to see what's
   running.
 

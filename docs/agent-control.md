@@ -88,7 +88,9 @@ Notes:
 `docxy --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
 stdio server that exposes the verbs as native tools — no shell glue, and Claude
 Code's own permission prompts apply. It is a thin client of a running docxy
-(discovered via the ctl directory above); it opens no document itself.
+(discovered via the ctl directory above); it opens no document itself, except
+via `docxy_new`, which creates the file on disk before handing off to an
+instance to open it.
 
 ```bash
 claude mcp add docxy -- docxy --mcp
@@ -97,7 +99,8 @@ claude mcp add docxy -- docxy --mcp
 Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_find`, `docxy_replace_range`, `docxy_insert`, `docxy_append`,
 `docxy_save`. Each edit
-tool maps to the matching verb; results come back as JSON text. When several
+tool maps to the matching verb — except `docxy_new`, which composes a file
+create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
 pick one — `docxy_list` shows what's running. So the whole flow is: split the
 pane, open a document in docxy, and ask Claude to "tighten the second paragraph
@@ -163,7 +166,11 @@ scripting against a tab:
 
 `docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
 **new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
-file is still created on disk but nothing opens (`"opened":false`).
+file is still created on disk but nothing opens (`"opened":false`). The
+reply's `instance` names the tab that *handled the open* and still serves its
+**old** document — not the fresh tab the new file landed in (found via
+`docxy_list`/`xlsxy_list`) — so don't reuse it as `target` for follow-up verbs
+on the new file.
 
 See the [extension's README](../offxy-vscode/README.md#ai-assistants) for how
 to point an AI assistant at these tabs (Copilot: automatic; Claude Code: a
