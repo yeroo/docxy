@@ -14,7 +14,7 @@
 //!
 //! | Verb | Args | Result |
 //! |---|---|---|
-//! | `doc.path` | — | `{path, format, modified, blocks}` |
+//! | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
 //! | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 //! | `doc.read` | `{start?, end?, range?}` | `{total, start, end, text, blocks:[…]}` |
 //! | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[…]}` |
@@ -24,6 +24,12 @@
 //! | `doc.save` | — | `{path, …}` |
 //! | `doc.reload` | — | `{path, …}` |
 //! | `doc.open` | `{path}` | `{path, …}` |
+//! | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the live buffer |
+//! | `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
+//! | `doc.notes` | — | `{notes:[{id,kind:"footnote"\|"endnote",text}]}` |
+//! | `doc.header` / `doc.footer` | — | `{blocks:[{index,kind,text}]}` (empty if none) |
+//! | `doc.metadata` | — | present-if-set keys: `{title?,author?,subject?,keywords?,comments?,last_saved_by?,revision?,created?,modified?}` |
+//! | `doc.stats` | — | `{words, chars, paragraphs, blocks}` |
 
 use crate::{App, DocFormat};
 use ctlcore::json::Json;
@@ -55,6 +61,13 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.replace-range" => replace_range(app, args),
         "doc.insert" => insert(app, args),
         "doc.append" => append(app, args),
+        "doc.export" => export(app, args),
+        "doc.comments" => Ok(comments(app)),
+        "doc.notes" => Ok(notes(app)),
+        "doc.header" => Ok(header_footer(&app.headers.default)),
+        "doc.footer" => Ok(header_footer(&app.footers.default)),
+        "doc.metadata" => Ok(metadata(app)),
+        "doc.stats" => Ok(stats(app)),
         "doc.save" => {
             app.save();
             Ok(path_info(app))
@@ -96,12 +109,21 @@ fn path_info(app: &App) -> Json {
         DocFormat::Docx => "docx",
         DocFormat::Markdown => "markdown",
     };
-    Json::obj(vec![
+    let mut fields = vec![
         ("path", Json::Str(app.path.clone())),
         ("format", Json::Str(fmt.to_string())),
         ("modified", Json::Bool(app.modified)),
         ("blocks", Json::Num(app.editor.doc.body.len() as f64)),
-    ])
+    ];
+    // Only present when the package actually carries the state — an
+    // unprotected, unwatermarked document must not gain these keys at all.
+    if let Some(p) = &app.doc_protection {
+        fields.push(("protection", Json::Str(p.clone())));
+    }
+    if let Some(w) = &app.doc_watermark {
+        fields.push(("watermark", Json::Str(w.clone())));
+    }
+    Json::obj(fields)
 }
 
 fn outline(app: &App) -> Json {
@@ -182,6 +204,129 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         ("count", Json::Num(matches.len() as f64)),
         ("matches", Json::Arr(matches)),
     ]))
+}
+
+/// `doc.export`: the live buffer as Markdown or plain text, on the same
+/// terms an agent would read the saved file — except this reflects unsaved
+/// edits.
+fn export(app: &App, args: &Json) -> Result<Json, String> {
+    let format = args
+        .get_str("format")
+        .ok_or("doc.export needs a 'format' (markdown|text)")?;
+    let text = match format {
+        "markdown" => docxcore::markdown::to_markdown(&app.editor.doc),
+        "text" => app.editor.doc.plain_text(),
+        other => return Err(format!("unknown format '{other}' (markdown|text)")),
+    };
+    Ok(Json::obj(vec![
+        ("format", Json::Str(format.to_string())),
+        ("text", Json::Str(text)),
+    ]))
+}
+
+/// `doc.comments`: the review comments parsed at load (or last reload), in
+/// anchor order.
+fn comments(app: &App) -> Json {
+    let items = app
+        .comments
+        .iter()
+        .map(|c| {
+            Json::obj(vec![
+                ("id", Json::Str(c.id.clone())),
+                ("author", Json::Str(c.author.clone())),
+                ("initials", Json::Str(c.initials.clone())),
+                ("date", Json::Str(c.date.clone())),
+                ("text", Json::Str(c.text.clone())),
+                ("anchor", Json::Str(c.quoted.clone())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("comments", Json::Arr(items))])
+}
+
+/// `doc.notes`: footnotes then endnotes, in file order.
+fn notes(app: &App) -> Json {
+    let items = app
+        .notes
+        .iter()
+        .map(|n| {
+            let kind = if n.endnote { "endnote" } else { "footnote" };
+            Json::obj(vec![
+                ("id", Json::Num(n.id as f64)),
+                ("kind", Json::Str(kind.to_string())),
+                ("text", Json::Str(n.text.clone())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("notes", Json::Arr(items))])
+}
+
+/// `doc.header` / `doc.footer`: the default section header/footer's block
+/// content, empty when the document has none.
+fn header_footer(blocks: &[Block]) -> Json {
+    let items = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            Json::obj(vec![
+                ("index", Json::Num(i as f64)),
+                ("kind", Json::Str(agent::block_kind(b).to_string())),
+                ("text", Json::Str(b.plain_text())),
+            ])
+        })
+        .collect();
+    Json::obj(vec![("blocks", Json::Arr(items))])
+}
+
+/// `doc.metadata`: `docProps/core.xml`, present-if-set (empty strings and
+/// unparsed dates are omitted rather than sent as empty/null).
+fn metadata(app: &App) -> Json {
+    let props = app
+        .pkg
+        .part("docProps/core.xml")
+        .map(|b| docxcore::field::parse_core_props(std::str::from_utf8(b).unwrap_or("")))
+        .unwrap_or_default();
+    let mut fields: Vec<(&str, Json)> = Vec::new();
+    for (key, val) in [
+        ("title", &props.title),
+        ("author", &props.author),
+        ("subject", &props.subject),
+        ("keywords", &props.keywords),
+        ("comments", &props.comments),
+        ("last_saved_by", &props.last_saved_by),
+        ("revision", &props.revision),
+    ] {
+        if !val.is_empty() {
+            fields.push((key, Json::Str(val.clone())));
+        }
+    }
+    if let Some(dt) = &props.created {
+        fields.push(("created", Json::Str(format_iso(dt))));
+    }
+    if let Some(dt) = &props.modified {
+        fields.push(("modified", Json::Str(format_iso(dt))));
+    }
+    Json::obj(fields)
+}
+
+/// Format a [`docxcore::field::DateTime`] (already the stored UTC components)
+/// as an ISO-8601 timestamp.
+fn format_iso(dt: &docxcore::field::DateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
+    )
+}
+
+/// `doc.stats`: word/char/paragraph/block counts over the live buffer.
+fn stats(app: &App) -> Json {
+    let (words, chars, paragraphs, blocks) = agent::stats(&app.editor.doc);
+    Json::obj(vec![
+        ("words", Json::Num(words as f64)),
+        ("chars", Json::Num(chars as f64)),
+        ("paragraphs", Json::Num(paragraphs as f64)),
+        ("blocks", Json::Num(blocks as f64)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +694,116 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn export_returns_live_markdown() {
+        let mut app = app_with(&["Title", "body text"]);
+        if let Block::Paragraph(p) = &mut app.editor.doc.body[0] {
+            p.props.heading_level = Some(1);
+        }
+        let r = export(&app, &args(vec![("format", Json::Str("markdown".into()))])).unwrap();
+        let text = r.get_str("text").unwrap();
+        assert!(text.contains("Title"), "{text}");
+        assert_eq!(r.get_str("format"), Some("markdown"));
+    }
+
+    #[test]
+    fn export_returns_live_plain_text() {
+        let app = app_with(&["Alpha", "Beta"]);
+        let r = export(&app, &args(vec![("format", Json::Str("text".into()))])).unwrap();
+        assert_eq!(r.get_str("format"), Some("text"));
+        assert_eq!(r.get_str("text"), Some("Alpha\nBeta\n"));
+    }
+
+    #[test]
+    fn export_rejects_unknown_format() {
+        let app = app_with(&["x"]);
+        let err = export(&app, &args(vec![("format", Json::Str("rtf".into()))])).unwrap_err();
+        assert!(err.contains("unknown format"), "{err}");
+    }
+
+    #[test]
+    fn export_requires_format() {
+        let app = app_with(&["x"]);
+        let err = export(&app, &Json::Null).unwrap_err();
+        assert!(err.contains("format"), "{err}");
+    }
+
+    #[test]
+    fn comments_empty_shape_on_plain_fixture() {
+        let app = app_with(&["x"]);
+        let r = comments(&app);
+        assert_eq!(r.get("comments").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn notes_empty_shape_on_plain_fixture() {
+        let app = app_with(&["x"]);
+        let r = notes(&app);
+        assert_eq!(r.get("notes").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn header_empty_when_no_header_part() {
+        let app = app_with(&["x"]);
+        let r = header_footer(&app.headers.default);
+        assert_eq!(r.get("blocks").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn footer_empty_when_no_footer_part() {
+        let app = app_with(&["x"]);
+        let r = header_footer(&app.footers.default);
+        assert_eq!(r.get("blocks").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn metadata_omits_unset_keys_on_plain_fixture() {
+        let app = app_with(&["x"]);
+        let r = metadata(&app);
+        // new_package() carries no docProps/core.xml part at all, so every
+        // present-if-set key is absent.
+        assert_eq!(r, Json::obj(vec![]));
+    }
+
+    #[test]
+    fn stats_counts_words_chars_paragraphs() {
+        let app = app_with(&["one two", "three"]);
+        let r = stats(&app);
+        assert_eq!(r.get("words").and_then(Json::as_i64), Some(3));
+        assert_eq!(r.get("paragraphs").and_then(Json::as_i64), Some(2));
+        assert_eq!(r.get("blocks").and_then(Json::as_i64), Some(2));
+        assert_eq!(r.get("chars").and_then(Json::as_i64), Some(12));
+    }
+
+    #[test]
+    fn path_has_no_protection_or_watermark_keys_when_unset() {
+        let app = app_with(&["x"]);
+        let r = path_info(&app);
+        assert!(r.get("protection").is_none());
+        assert!(r.get("watermark").is_none());
+    }
+
+    #[test]
+    fn dispatch_routes_new_read_verbs() {
+        let mut app = app_with(&["hello"]);
+        for verb in [
+            "doc.export",
+            "doc.comments",
+            "doc.notes",
+            "doc.header",
+            "doc.footer",
+            "doc.metadata",
+            "doc.stats",
+        ] {
+            let a = if verb == "doc.export" {
+                args(vec![("format", Json::Str("text".into()))])
+            } else {
+                Json::Null
+            };
+            assert!(dispatch(&mut app, verb, &a).is_ok(), "{verb}");
+        }
     }
 
     #[test]

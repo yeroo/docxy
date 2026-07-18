@@ -1400,6 +1400,33 @@ mod tests {
         parse_document_xml(xml, &Relationships::default())
     }
 
+    /// The populated-content case for [`parse_header_footer`], the shape
+    /// `docxy`'s `doc.header`/`doc.footer` control verbs marshal directly
+    /// into JSON (`{blocks:[{index,kind,text}]}`).
+    #[test]
+    fn parse_header_footer_returns_its_block_content() {
+        let xml = r#"<?xml version="1.0"?><w:hdr xmlns:w="x">
+            <w:p><w:r><w:t>Company Confidential</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Page footer line two</w:t></w:r></w:p>
+        </w:hdr>"#;
+        let blocks = parse_header_footer(xml, &Relationships::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].plain_text(), "Company Confidential");
+        assert_eq!(blocks[1].plain_text(), "Page footer line two");
+        assert!(matches!(&blocks[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn parse_header_footer_is_empty_without_the_wrapper_tag() {
+        assert!(
+            parse_header_footer(
+                "<w:p><w:r><w:t>x</w:t></w:r></w:p>",
+                &Relationships::default()
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn extracts_diagram_node_text() {
         // Node text from a diagram data part, with blank placeholder nodes dropped

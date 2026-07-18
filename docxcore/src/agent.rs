@@ -76,6 +76,26 @@ pub fn read(doc: &Document, start: usize, end: usize) -> Result<Vec<BlockInfo>, 
     Ok(out)
 }
 
+/// Word/character/paragraph/block counts over the document's plain text
+/// (`(words, chars, paragraphs, blocks)`). `words` splits on whitespace over
+/// [`Document::plain_text`]; `chars` counts everything in that same text
+/// except the block-separator newlines `plain_text` inserts, so it's a visible
+/// character count rather than a byte count. `paragraphs` counts only
+/// paragraph-kind top-level blocks; `blocks` is the raw body length (so it
+/// also includes tables/raw blocks that `paragraphs` excludes).
+pub fn stats(doc: &Document) -> (usize, usize, usize, usize) {
+    let text = doc.plain_text();
+    let words = text.split_whitespace().count();
+    let chars = text.chars().filter(|&c| c != '\n').count();
+    let paragraphs = doc
+        .body
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_)))
+        .count();
+    let blocks = doc.body.len();
+    (words, chars, paragraphs, blocks)
+}
+
 /// All matches of `query` across the whole document (paragraphs at any
 /// nesting depth, including inside table cells). This is the search core
 /// behind [`Editor::find_all`], exposed here as a pure `Document` function so
@@ -288,6 +308,17 @@ mod tests {
 
         assert_eq!(paras(&a.doc), vec!["A", "B", "C", "D"]);
         assert_eq!(paras(&a.doc), paras(&b.doc));
+    }
+
+    #[test]
+    fn stats_counts_words_chars_paragraphs_and_blocks() {
+        let doc = doc_with(&["one two", "three"]);
+        let (words, chars, paragraphs, blocks) = stats(&doc);
+        assert_eq!(words, 3);
+        // "one two" (7) + "three" (5) = 12 visible chars, newlines excluded.
+        assert_eq!(chars, 12);
+        assert_eq!(paragraphs, 2);
+        assert_eq!(blocks, 2);
     }
 
     #[test]

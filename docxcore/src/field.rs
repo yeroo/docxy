@@ -1052,6 +1052,43 @@ mod tests {
         assert_eq!(eval_field_ctx(" CREATEDATE \\@ \"M/d/yyyy\" ", &ctx), None);
     }
 
+    /// All [`DocProps`] fields `docxy`'s `doc.metadata` control verb
+    /// surfaces, from one `docProps/core.xml`.
+    #[test]
+    fn core_props_parses_every_field() {
+        let props = parse_core_props(
+            "<x xmlns:dc=\"a\" xmlns:cp=\"b\" xmlns:dcterms=\"c\">\
+             <dc:creator>Ann</dc:creator>\
+             <dc:title>Q3 Report</dc:title>\
+             <dc:subject>Finance</dc:subject>\
+             <cp:keywords>q3, budget</cp:keywords>\
+             <dc:description>internal review</dc:description>\
+             <cp:lastModifiedBy>Bob</cp:lastModifiedBy>\
+             <cp:revision>4</cp:revision>\
+             <dcterms:created>2020-01-02T03:04:05Z</dcterms:created>\
+             <dcterms:modified>2020-06-07T08:09:10Z</dcterms:modified>\
+             </x>",
+        );
+        assert_eq!(props.author, "Ann");
+        assert_eq!(props.title, "Q3 Report");
+        assert_eq!(props.subject, "Finance");
+        assert_eq!(props.keywords, "q3, budget");
+        assert_eq!(props.comments, "internal review");
+        assert_eq!(props.last_saved_by, "Bob");
+        assert_eq!(props.revision, "4");
+        assert_eq!(props.created, Some(at(2020, 1, 2, 3, 4, 5)));
+        assert_eq!(props.modified, Some(at(2020, 6, 7, 8, 9, 10)));
+    }
+
+    #[test]
+    fn core_props_missing_tags_default_to_empty_and_none() {
+        let props = parse_core_props("<x/>");
+        assert_eq!(props.author, "");
+        assert_eq!(props.title, "");
+        assert!(props.created.is_none());
+        assert!(props.modified.is_none());
+    }
+
     #[test]
     fn non_formula_and_unsupported_return_none() {
         assert_eq!(ev(" DATE \\@ \"M/d/yyyy\" "), None);
