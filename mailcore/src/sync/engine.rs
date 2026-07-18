@@ -366,10 +366,20 @@ impl Engine {
             !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
         self.sync_pass(needs_full);
         // Interleave a calendar refresh with the periodic mail sync (see
-        // `SyncCommand::RefreshCalendar` for the on-demand path). Best-effort:
-        // `refresh_calendar` surfaces its own failures via `react`/`Error` and
-        // never aborts the tick.
-        self.refresh_calendar();
+        // `SyncCommand::RefreshCalendar` for the on-demand path) — but ONLY
+        // when the mail pass just above didn't already drop the engine into
+        // sign-in (`token` cleared) or a back-off/throttle wait (`next_retry`
+        // set). Both `token.is_none()` and `next_retry.is_some()` are false
+        // at this point unless `sync_pass` itself just set one of them (see
+        // the guards at the top of this function), so this is exactly "did
+        // this tick's mail sync just fail the same way `refresh_calendar`
+        // would fail too". Skipping it there avoids a second, doomed Graph
+        // call in the same tick — which, on a transport error, would call
+        // `go_offline` a second time and double the exponential back-off in
+        // one offline tick instead of advancing it by one step.
+        if self.token.is_some() && self.next_retry.is_none() {
+            self.refresh_calendar();
+        }
     }
 
     /// Dispatches one UI command.
@@ -1499,6 +1509,8 @@ mod tests {
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -2062,6 +2074,96 @@ mod tests {
         }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_offline_tick_advances_backoff_by_one_step_not_two() {
+        // Final v2 review, Fix 2: `on_tick` used to call `refresh_calendar()`
+        // unconditionally after `sync_pass`. When `sync_pass` itself hit a
+        // transport error, it already called `go_offline` (doubling the
+        // back-off) and returned early — but the unconditional
+        // `refresh_calendar()` right after made its OWN doomed Graph call,
+        // hit the same transport error, and called `go_offline` a SECOND
+        // time in the same tick, advancing the back-off two steps instead of
+        // one and emitting a spurious extra `Offline` transition.
+        //
+        // `FakeServer` always answers with a valid canned HTTP response, so
+        // it can't produce a transport-level failure; this test instead uses
+        // a bare TCP listener that accepts each connection and drops it
+        // without writing anything, forcing `ureq` (and thus `GraphClient`)
+        // to see `GraphError::Transport` — exactly the class `go_offline`
+        // reacts to. Counting *accepted connections* is a reliable proxy for
+        // "how many Graph calls did this tick make" without reaching into
+        // the engine's private back-off state.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
+        let port = listener.local_addr().expect("local_addr").port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dead_shutdown = Arc::new(AtomicBool::new(false));
+        let thread_attempts = Arc::clone(&attempts);
+        let thread_shutdown = Arc::clone(&dead_shutdown);
+        let dead_server = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                thread_attempts.fetch_add(1, Ordering::SeqCst);
+                drop(stream); // close without responding: forces a transport error
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+
+        let dir = unique_dir("offline-single-backoff-step");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Short tick: the first attempt is `startup`'s own sync pass (which
+        // goes offline immediately, scheduling `next_retry` at BACKOFF_MIN),
+        // so the tick itself fires once that elapses; a short tick here just
+        // avoids adding extra wall-clock time on top of that.
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_millis(50),
+        );
+
+        // Wait for 2 accepted connections: startup's sync_pass, then the
+        // first tick's sync_pass (gated behind BACKOFF_MIN, ~5s).
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "did not observe 2 connection attempts in time (saw {})",
+                    attempts.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Give a (buggy) extra `refresh_calendar` attempt in that same tick a
+        // moment to land, then assert it never does: exactly 2 attempts
+        // total (1 from startup + 1 from the tick's mail sync), never 3.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "refresh_calendar must be skipped in the same tick sync_pass just went offline in \
+             (a 3rd attempt means it ran anyway and doubled the back-off twice)"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        dead_shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let _ = dead_server.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

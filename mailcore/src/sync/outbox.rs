@@ -113,42 +113,58 @@ fn ensure_draft_on_graph(
 /// `Store::upsert_message`, same as any synced message). A from-scratch
 /// local draft's columns, on the other hand, are whatever `update_draft_fields`
 /// was given directly (compose's flat `to`/`cc` input, e.g. `bob@x` or
-/// `bob@x; carol@x` — no `Name <addr>` structure, since compose never
-/// captured a display name there). Splits on both `;` and `,` since compose
-/// doesn't mandate one separator, trims whitespace, and drops empty tokens
-/// (a trailing separator, or an empty field) rather than sending a blank
-/// recipient to Graph. Each non-empty part is then parsed by
-/// `parse_one_recipient`, which handles both shapes.
+/// `bob@x, carol@x` — no `Name <addr>` structure, since compose never
+/// captured a display name there).
+///
+/// Splits on `;` FIRST — that's the only separator `encode_recipients` ever
+/// joins on, so it's always safe to split on. `,` is NOT safe to split on
+/// unconditionally: the default corporate directory display-name format is
+/// "Surname, Given" (e.g. `"Doe, John <john@x>"`), and splitting that on `,`
+/// would wrongly produce a bogus, address-less `"Doe"` recipient alongside
+/// `"John <john@x>"`. So each `;`-separated part is handled by
+/// `parse_recipient_part`, which only treats `,` as a separator for the
+/// bare-address (no `<...>`) shape, where it's the compose UI's own
+/// separator for `"a@x, b@y"`-style typed input.
 fn parse_recipients(raw: &str) -> Vec<Recipient> {
-    raw.split([';', ','])
+    raw.split(';')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(parse_one_recipient)
+        .flat_map(parse_recipient_part)
         .collect()
 }
 
-/// Parses one recipient part, in either of the two shapes `parse_recipients`
-/// can see: `Name <addr>` (a synced message's — or a reply/forward draft's —
-/// column, from `store::encode_recipients`) or a bare `addr` (a from-scratch
-/// local draft's flat compose input). Recognized as the former only when
-/// `<` is followed later by a `>` (`part.find('<')` before `part.rfind('>')`)
-/// — anything else (including a lone `<` or `>`, which a real address never
-/// contains) falls back to treating the whole trimmed part as a bare
-/// address with an empty name, same as before this parsed the wrapped form
-/// at all.
-fn parse_one_recipient(part: &str) -> Recipient {
+/// Parses one `;`-separated part into one or more `Recipient`s.
+///
+/// A part containing a `<...>`-wrapped address (`Name <addr>`, recognized
+/// only when `<` is followed later by `>` — `part.find('<')` before
+/// `part.rfind('>')`) is a synced message's or reply/forward draft's column
+/// from `store::encode_recipients`, and is ALWAYS exactly one recipient —
+/// the display name before `<` may itself contain a comma (`"Doe, John"`),
+/// which is part of the name, not a separator.
+///
+/// A part with no `<...>` (including one with a lone `<` or `>`, which a
+/// real address never contains) is the bare-address shape a from-scratch
+/// local draft's flat compose input uses. There, a user may type several
+/// addresses comma-separated into one field (`"a@x, b@y"`), so `,` IS a
+/// separator: the part is split on it into one address-only `Recipient`
+/// (empty name) per non-empty piece.
+fn parse_recipient_part(part: &str) -> Vec<Recipient> {
     if let (Some(open), Some(close)) = (part.find('<'), part.rfind('>')) {
         if open < close {
-            return Recipient {
+            return vec![Recipient {
                 name: part[..open].trim().to_string(),
                 address: part[open + 1..close].trim().to_string(),
-            };
+            }];
         }
     }
-    Recipient {
-        name: String::new(),
-        address: part.to_string(),
-    }
+    part.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|addr| Recipient {
+            name: String::new(),
+            address: addr.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -565,6 +581,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_recipients_keeps_a_comma_in_an_encoded_display_name_as_one_recipient() {
+        // Final v2 review, Fix 1: "Surname, Given" is the default corporate
+        // directory display-name format. A `<...>`-wrapped part is always one
+        // recipient, however many commas its name contains.
+        let recipients = parse_recipients("Doe, John <john@x>");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].name, "Doe, John");
+        assert_eq!(recipients[0].address, "john@x");
+    }
+
+    #[test]
+    fn parse_recipients_splits_bare_comma_separated_addresses() {
+        // The compose UI's To/Cc fields have no `<...>` structure at all, so a
+        // user typing "a@x, b@y" into one field must still split into two
+        // recipients.
+        let recipients = parse_recipients("a@x, b@y");
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0].name, "");
+        assert_eq!(recipients[0].address, "a@x");
+        assert_eq!(recipients[1].name, "");
+        assert_eq!(recipients[1].address, "b@y");
+    }
+
+    #[test]
+    fn parse_recipients_handles_a_mix_of_comma_in_name_and_semicolon_separated_parts() {
+        let recipients = parse_recipients("Doe, John <john@x>; Jane Roe <jane@y>");
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0].name, "Doe, John");
+        assert_eq!(recipients[0].address, "john@x");
+        assert_eq!(recipients[1].name, "Jane Roe");
+        assert_eq!(recipients[1].address, "jane@y");
+    }
+
+    #[test]
     fn apply_op_save_draft_strips_the_name_wrapper_for_a_reply_style_draft() {
         // Regression test for the bug the coordinator's review caught: a
         // reply/forward draft (`sync::engine::store_composed_draft`) files
@@ -653,5 +703,119 @@ mod tests {
             "expected the bare address, not the \"Name <addr>\" wrapper: {}",
             reqs[0].body
         );
+    }
+
+    #[test]
+    fn apply_op_send_draft_keeps_a_comma_in_name_as_one_recipient_through_reply_and_send() {
+        // Final v2 review, Fix 1: the exact bug — a reply/forward draft whose
+        // recipient's display name is "Surname, Given" (the default corporate
+        // directory format, e.g. "Doe, John") stores `to_recipients` as
+        // `"Doe, John <john@x>"` via `store::encode_recipients`. The old
+        // `parse_recipients`, which split on both `;` and `,`, cut that into
+        // a bogus address-less `"Doe"` recipient plus `"John <john@x>"`,
+        // which Graph would reject — so the reply looked sent locally (the
+        // optimistic `mark_sent`/move-to-Sent already ran) but was never
+        // actually delivered. This drives the full `SendDraft` path (update
+        // the already-Graph-addressed draft, then send it) and asserts the
+        // wire body carries exactly one recipient with the address from
+        // inside `<>` and the full comma-containing name intact.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/DRAFT1/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/DRAFT1".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+
+        store
+            .upsert_folder(&MailFolder {
+                id: "DRAFTS".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        let draft = Message {
+            id: "DRAFT1".into(),
+            conversation_id: "C1".into(),
+            subject: "Re: Hi".into(),
+            from: Recipient {
+                name: "Me".into(),
+                address: "me@x".into(),
+            },
+            to: vec![Recipient {
+                name: "Doe, John".into(),
+                address: "john@x".into(),
+            }],
+            cc: vec![],
+            received: "".into(),
+            sent: "".into(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "".into(),
+            is_draft: true,
+        };
+        store.upsert_message("DRAFTS", &draft).unwrap();
+        store
+            .put_body(
+                "DRAFT1",
+                &Body {
+                    content_type: "html".into(),
+                    content: "<p>quoted</p>".into(),
+                },
+            )
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: "DRAFT1".into(),
+            },
+        )
+        .unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH", "update_draft must run before send");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let to = sent.get("toRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            to.len(),
+            1,
+            "a comma in the display name must not split it into two recipients: {}",
+            reqs[0].body
+        );
+        assert_eq!(
+            to[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("john@x"),
+            "expected the address from inside <>, not \"Doe\": {}",
+            reqs[0].body
+        );
+        assert_eq!(
+            to[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("name"))
+                .and_then(Value::as_str),
+            Some("Doe, John")
+        );
+        assert!(reqs[1].path.starts_with("/me/messages/DRAFT1/send"));
     }
 }
