@@ -34,7 +34,29 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
         OutboxOp::SendDraft { id } => {
             let graph_id = ensure_draft_on_graph(client, store, id)?;
-            client.send_draft(&graph_id)
+            // Upload each pending attachment to the (now-on-Graph) draft before
+            // sending. A file-read or upload error returns here, so the drain's
+            // retry/quarantine policy applies and the attachments are NOT
+            // cleared — the send hasn't happened, so a retry is clean.
+            for att in store
+                .outbound_attachments(&graph_id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?
+            {
+                let bytes = std::fs::read(&att.path).map_err(|e| {
+                    GraphError::Parse(format!("cannot read attachment {}: {e}", att.path))
+                })?;
+                client.add_attachment(
+                    &graph_id,
+                    &att.name,
+                    &content_type_for(&att.name),
+                    &bytes,
+                )?;
+            }
+            client.send_draft(&graph_id)?;
+            store
+                .clear_outbound_attachments(&graph_id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            Ok(())
         }
         OutboxOp::RespondEvent { id, kind, comment } => {
             // An unrecognized `kind` must NOT silently fall back to
@@ -51,6 +73,31 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             client.respond_event(id, rsvp, comment.as_deref(), true)
         }
     }
+}
+
+/// A best-effort MIME type from a file name's extension, defaulting to
+/// `application/octet-stream`. Small built-in map — no new dependency.
+fn content_type_for(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Maps the `response_status` vocabulary `Store::set_event_response` writes
@@ -554,6 +601,110 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].method, "PATCH");
         assert!(reqs[1].path.starts_with("/me/messages/GRAPH-7/send"));
+    }
+
+    #[test]
+    fn send_draft_uploads_pending_attachments_then_clears_them() {
+        // temp file to attach
+        let dir = std::env::temp_dir().join(format!("lookxy-att-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-1/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-1/attachments".into(),
+                status: 201,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-1", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+            .unwrap();
+        store
+            .add_outbound_attachment(&local_id, file.to_str().unwrap(), "note.txt", 5)
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        // the attachment POST was made, and the pending rows are cleared after send:
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path.contains("/attachments"))
+        );
+        assert!(store.outbound_attachments("GRAPH-1").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_draft_errors_and_keeps_attachments_when_a_file_is_missing() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-2/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-2", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+            .unwrap();
+        store
+            .add_outbound_attachment(&local_id, "/does/not/exist/missing.pdf", "missing.pdf", 123)
+            .unwrap();
+
+        let r = apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        );
+        assert!(r.is_err());
+
+        // the pending attachment is NOT cleared (so a retry can re-upload
+        // once the file is back). The draft is reconciled to GRAPH-2 by
+        // `ensure_draft_on_graph` before the upload loop runs, so that's
+        // where the pending row now lives.
+        assert!(!store.outbound_attachments("GRAPH-2").unwrap().is_empty());
+        // And send was never reached.
+        assert!(!srv.requests().iter().any(|r| r.path.ends_with("/send")));
     }
 
     #[test]
