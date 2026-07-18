@@ -104,13 +104,12 @@ const EDITORS: EditorSpec[] = [
         'doc.insert',
         'doc.append',
         // 'doc.replace-all' fires an edit event only when it actually replaced
-        // something (undoSteps>0); a zero-match run reports undoSteps:0 and the
-        // wasm leaves no undo checkpoint, so the default `undoSteps ?? 1` replay
-        // path (see `onMutated`) correctly does one wasm undo for a real
-        // replace and — because `handleLine` still fires for it — we rely on
-        // the count being 0 to make the event's undo a no-op. 'doc.undo'/'redo'
-        // get the inverse-op adaptation (see `onMutated`); `handleLine` skips
-        // firing them entirely when `{done:false}`.
+        // something: `handleLine`'s no-op gate skips firing when undoSteps is 0
+        // (a zero-match run — the wasm leaves no undo checkpoint), so no dead
+        // undo entry lands and the doc isn't dirtied. A real replace (undoSteps
+        // >0) takes the bucket-A `undoSteps` replay path in `onMutated`.
+        // 'doc.undo'/'redo' take the inverse-wasm-op adaptation (onMutated
+        // Case 1); `handleLine` skips firing them entirely when `{done:false}`.
         'doc.replace-all',
         'doc.undo',
         'doc.redo',
@@ -834,12 +833,24 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
       const blocks = ctlOkResult(
         await document.requestCtl(JSON.stringify({ verb: 'doc.blocks', args: null }), false),
       );
-      return {
+      const info: Record<string, unknown> = {
         path: filePath,
         format: 'docx',
         modified: blocks?.modified ?? false,
         blocks: blocks?.total ?? 0,
       };
+      // `doc.path`'s present-if-set `protection`/`watermark` keys — carried by
+      // ALL of terminal docxy's path-shaped replies (`doc.save`/`reload`/`open`
+      // return the full `path_info`, control.rs), so a tab's must too. `doc.path`
+      // itself also gets them via `CtlServer.resolvePathInfo`'s allowlist, but
+      // save/reload/open return this object as-is with no such merge — so add
+      // them here (present-if-set, exactly as `doc.blocks` reports them).
+      for (const key of ['protection', 'watermark'] as const) {
+        if (blocks && key in blocks) {
+          info[key] = blocks[key];
+        }
+      }
+      return info;
     }
     // xlsxy: `wb.path`'s documented shape includes `active_name`, which
     // `wb.info` doesn't carry — pull it from `sheet.list` and merge in.

@@ -27,6 +27,7 @@
     "spreadsheet"
   ],
   "main": "./out/extension.js",
+  "activationEvents": [],
   "contributes": {
     "customEditors": [
       {

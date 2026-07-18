@@ -364,8 +364,14 @@ export class CtlServer {
     if (fs.existsSync(abs)) {
       throw new Error(`already exists: ${abs}`);
     }
-    // Render only after the path is known-writable (mirrors the terminal's
-    // precedence). The wasm reply is docxwasm's flat `{pdfBase64,ok:true}`.
+    // Create parent dirs before rendering, matching terminal `export_pdf`'s
+    // exact ordering (create_dir_all → render → create_new write).
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+    } catch (e) {
+      throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // The wasm reply is docxwasm's flat `{pdfBase64,ok:true}`.
     const raw = await this.host.callWasm(JSON.stringify({ verb: 'doc.export-pdf', args: {} }));
     const reply = JSON.parse(raw) as Record<string, unknown>;
     if (reply.ok !== true) {
@@ -375,11 +381,6 @@ export class CtlServer {
       throw new Error('create failed: the document engine returned no PDF data');
     }
     const pdf = Buffer.from(reply.pdfBase64, 'base64');
-    try {
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-    } catch (e) {
-      throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
     try {
       // 'wx' = exclusive create: a file appearing between the exists check
       // above and here errors instead of being truncated (create_new(true)).
