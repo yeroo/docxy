@@ -32,6 +32,11 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
     if name == "docxy_list" {
         return Ok(client::list_running(&dir, "docxy").to_string());
     }
+    if name == "docxy_new" {
+        return Ok(
+            client::new_file(&dir, "docxy", "doc.open", &blank_docx_bytes(), args)?.to_string(),
+        );
+    }
     let verb = match name {
         "docxy_status" => "doc.path",
         "docxy_outline" => "doc.outline",
@@ -53,6 +58,22 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
 const TARGET_DESC: &str =
     "Optional: which docxy to act on (a substring of its instance/pane id) when several are open.";
 
+/// A minimal valid .docx: one empty paragraph in a fresh OPC package. Also the
+/// source of the committed template the bundled VS Code MCP server ships.
+pub(crate) fn blank_docx_bytes() -> Vec<u8> {
+    use docxcore::model::{Block, Document, Inline, ParProps, Paragraph, Run, RunProps};
+    let doc = Document {
+        body: vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: String::new(),
+                props: RunProps::default(),
+            })],
+        })],
+    };
+    docxcore::package::save_package(&docxcore::package::new_package(doc))
+}
+
 fn tool_defs() -> Json {
     let target = || ("target", prop("string", TARGET_DESC));
     Json::Arr(vec![
@@ -61,6 +82,23 @@ fn tool_defs() -> Json {
             "List the docxy editors currently running on this machine (instance/pane id, port, pid).",
             vec![],
             &[],
+        ),
+        tool(
+            "docxy_new",
+            "Create a new blank .docx at a path and open it in the running docxy (in a VS Code \
+             window, a new tab). With no docxy running the file is still created. Refuses to \
+             overwrite an existing file.",
+            vec![
+                (
+                    "path",
+                    prop(
+                        "string",
+                        "File path for the new document (created; must not exist).",
+                    ),
+                ),
+                target(),
+            ],
+            &["path"],
         ),
         tool(
             "docxy_status",
@@ -168,6 +206,33 @@ fn tool_defs() -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_docx_bytes_load_back_as_one_empty_paragraph() {
+        let pkg = docxcore::package::load_package(&blank_docx_bytes()).expect("blank loads");
+        assert_eq!(pkg.document.body.len(), 1);
+        assert_eq!(pkg.document.plain_text(), "\n");
+    }
+
+    #[test]
+    fn tool_defs_include_docxy_new_with_required_path() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        // Ordered right after docxy_list (parity with the bundled server).
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get_str("name")).collect();
+        let list_pos = names.iter().position(|n| *n == "docxy_list").unwrap();
+        assert_eq!(names[list_pos + 1], "docxy_new");
+        let new_tool = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("docxy_new"))
+            .unwrap();
+        let req = new_tool
+            .get("inputSchema")
+            .unwrap()
+            .get("required")
+            .unwrap();
+        assert_eq!(req.to_string(), "[\"path\"]");
+    }
 
     #[test]
     fn tools_list_includes_the_edit_verbs() {
