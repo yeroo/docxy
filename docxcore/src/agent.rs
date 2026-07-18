@@ -214,6 +214,31 @@ fn overwrite_blocks(ed: &mut Editor, start: usize, blocks: Vec<Block>) {
     }
 }
 
+/// Validate that `at` is a splice position [`insert_blocks`] (or plain-text
+/// [`insert`]) can use: `0..=doc.body.len()`, and — unless `at` is the
+/// document-end/append case — that block `at` is itself a paragraph.
+///
+/// Pure (no mutation, doesn't even need a live `Editor`): a caller that must
+/// prepare package-level state before splicing — e.g. `docxy::control`'s
+/// ensure-numbering/ensure-styles step, which mutates the `Package` a splice
+/// verb never sees — should call this (or [`validate_replace_range`]) FIRST,
+/// and only do that package mutation once the splice itself is known not to
+/// fail on bounds/paragraph-kind. Otherwise a rejected out-of-bounds call
+/// still leaves behind a numbering/styles part nothing actually used. Every
+/// block-splice verb below validates in this same order — bounds/paragraph-
+/// kind before content (e.g. "empty markdown") — so a caller pre-validating
+/// this way never diverges from what the verb itself would reject.
+pub fn validate_insert_at(doc: &Document, at: usize) -> Result<(), String> {
+    let n = doc.body.len();
+    if at > n {
+        return Err(format!("'at' {at} out of bounds (0..={n})"));
+    }
+    if at < n {
+        require_para(&doc.body, at)?;
+    }
+    Ok(())
+}
+
 /// Insert `blocks` before block `at` (or at the document end if
 /// `at == doc.body.len()`, equivalent to [`append_blocks`]) — the block-splice
 /// counterpart to [`insert`]. Pastes a placeholder clip of `blocks.len() + 1`
@@ -222,19 +247,20 @@ fn overwrite_blocks(ed: &mut Editor, start: usize, blocks: Vec<Block>) {
 /// trick does for plain text), then [`overwrite_blocks`] turns the
 /// `blocks.len()` opened slots into the real content. One [`Editor::paste`]
 /// call is made, so this is **one** undo checkpoint, matching `insert`.
+///
+/// Validates bounds/paragraph-kind ([`validate_insert_at`]) before the
+/// "non-empty `blocks`" check — see that function's doc comment for why a
+/// caller doing pre-splice package prep must match this order.
 pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(), String> {
-    let n = ed.doc.body.len();
-    if at > n {
-        return Err(format!("'at' {at} out of bounds (0..={n})"));
-    }
+    validate_insert_at(&ed.doc, at)?;
     if blocks.is_empty() {
         return Err("empty markdown".to_string());
     }
+    let n = ed.doc.body.len();
     if at == n {
         append_blocks(ed, blocks);
         return Ok(());
     }
-    require_para(&ed.doc.body, at)?;
     let count = blocks.len();
     ed.anchor = None;
     ed.caret = Caret::top(at, 0);
@@ -267,6 +293,19 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     overwrite_blocks(ed, start, blocks);
 }
 
+/// Validate that `[start..=end]` is a range [`replace_range_blocks`] (or
+/// plain-text [`replace_range`]) can use: in bounds, and both ends
+/// paragraphs. Pure, for the same pre-mutation-validation reason as
+/// [`validate_insert_at`] (see its doc comment) — bounds/paragraph-kind
+/// first, matching `replace_range_blocks`'s own check order.
+pub fn validate_replace_range(doc: &Document, start: usize, end: usize) -> Result<(), String> {
+    let n = doc.body.len();
+    bounds(start, end, n)?;
+    require_para(&doc.body, start)?;
+    require_para(&doc.body, end)?;
+    Ok(())
+}
+
 /// Replace paragraphs `[start..=end]` (inclusive) with `blocks` — the
 /// block-splice counterpart to [`replace_range`]. Selects `[start..=end]`
 /// exactly as `replace_range` does (anchor at the head, caret at the true end
@@ -277,19 +316,20 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
 /// deleted range was non-empty, **one** when it collapsed to nothing (the sole
 /// case being a single empty paragraph). Returns `(replaced, undo_steps)`:
 /// the number of original paragraphs replaced, and the checkpoint count.
+///
+/// Validates bounds/paragraph-kind ([`validate_replace_range`]) before the
+/// "non-empty `blocks`" check — same order as [`insert_blocks`], see
+/// [`validate_insert_at`]'s doc comment for why.
 pub fn replace_range_blocks(
     ed: &mut Editor,
     start: usize,
     end: usize,
     blocks: Vec<Block>,
 ) -> Result<(usize, usize), String> {
+    validate_replace_range(&ed.doc, start, end)?;
     if blocks.is_empty() {
         return Err("empty markdown".to_string());
     }
-    let n = ed.doc.body.len();
-    bounds(start, end, n)?;
-    require_para(&ed.doc.body, start)?;
-    require_para(&ed.doc.body, end)?;
 
     ed.anchor = None;
     ed.caret = Caret::top(end, 0);
@@ -569,6 +609,34 @@ mod tests {
         // Nothing was ever spliced or checkpointed: an editor left untouched.
         let mut ed = Editor::new(doc_with(&["A"]));
         assert!(!ed.undo());
+    }
+
+    #[test]
+    fn validators_reject_exactly_what_the_splice_verbs_would() {
+        // Pure, `Editor`-free pre-checks a caller can run before doing any
+        // package-level prep (numbering/styles) — must agree with what
+        // `insert_blocks`/`replace_range_blocks` themselves would reject.
+        let doc = doc_with(&["A", "B"]);
+        assert!(validate_insert_at(&doc, 5).is_err());
+        assert!(validate_insert_at(&doc, 2).is_ok()); // == len: the append case
+        assert!(validate_insert_at(&doc, 0).is_ok());
+        assert!(validate_replace_range(&doc, 0, 5).is_err());
+        assert!(validate_replace_range(&doc, 2, 0).is_err()); // start > end
+        assert!(validate_replace_range(&doc, 0, 1).is_ok());
+    }
+
+    #[test]
+    fn insert_blocks_out_of_bounds_does_not_touch_the_document() {
+        // Regression guard: bounds validation must run — and fail — before
+        // any splicing happens, so a caller that pre-validates the same way
+        // (e.g. before mutating a Package for numbering/styles) never ends up
+        // with a mutated package backing a rejected, no-op edit.
+        let mut ed = Editor::new(doc_with(&["A"]));
+        let before = ed.doc.clone();
+        let blocks = parse_markdown_blocks("- item").unwrap();
+        assert!(insert_blocks(&mut ed, 99, blocks).is_err());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo(), "a rejected splice must push no checkpoint");
     }
 
     #[test]

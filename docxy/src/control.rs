@@ -356,6 +356,12 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
     // checkpoint count `agent::replace_range`/`replace_range_blocks` also
     // report; its wire reply stays exactly `{replaced, total}` either way.
     let replaced = if markdown_flag(args) {
+        // Validate the target range BEFORE `prepare_markdown_blocks` does any
+        // package mutation (ensure_list/ensure_styles): a rejected
+        // out-of-bounds/non-paragraph range must leave the package exactly as
+        // it was, not permanently gain a numbering/styles part nothing ends
+        // up using. See `agent::validate_replace_range`'s doc comment.
+        agent::validate_replace_range(&app.editor.doc, start, end)?;
         let blocks = prepare_markdown_blocks(app, text)?;
         agent::replace_range_blocks(&mut app.editor, start, end, blocks)?.0
     } else {
@@ -374,6 +380,8 @@ fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
         .ok_or("doc.insert needs an 'at' index")?;
     let text = args.get_str("text").ok_or("doc.insert needs 'text'")?;
     if markdown_flag(args) {
+        // Same validate-before-mutate ordering as `replace_range` above.
+        agent::validate_insert_at(&app.editor.doc, at)?;
         let blocks = prepare_markdown_blocks(app, text)?;
         agent::insert_blocks(&mut app.editor, at, blocks)?;
     } else {
@@ -410,21 +418,77 @@ fn markdown_flag(args: &Json) -> bool {
         .unwrap_or(false)
 }
 
+/// The paragraph style ids (`w:pStyle` references) [`docxcore::markdown::from_markdown`]
+/// emits: `Heading1`..`Heading6`, `Quote`, `SourceCode`. (Deliberately not
+/// `Code` — that's a run-level *character* style, `w:rStyle`, applied at save
+/// time from `RunProps.code`, not a `w:pStyle` any parsed `Block` carries; see
+/// `prepare_markdown_blocks`'s doc comment.)
+const MARKDOWN_PARAGRAPH_STYLE_IDS: &[&str] = &[
+    "Heading1",
+    "Heading2",
+    "Heading3",
+    "Heading4",
+    "Heading5",
+    "Heading6",
+    "Quote",
+    "SourceCode",
+];
+
+/// Which of [`MARKDOWN_PARAGRAPH_STYLE_IDS`] the top-level paragraphs in
+/// `blocks` actually reference (`w:pStyle`), in first-seen order. Markdown
+/// table cells never carry one of these ids (`markdown.rs::parse_table`
+/// builds cell paragraphs with `ParProps::default()`), so — like the
+/// numbering scan below — only top-level `Block::Paragraph`s need checking.
+fn referenced_style_ids(blocks: &[Block]) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = Vec::new();
+    for b in blocks {
+        let Block::Paragraph(p) = b else { continue };
+        let Some(style) = p.props.style_id.as_deref() else {
+            continue;
+        };
+        if let Some(&known) = MARKDOWN_PARAGRAPH_STYLE_IDS.iter().find(|&&k| k == style) {
+            if !ids.contains(&known) {
+                ids.push(known);
+            }
+        }
+    }
+    ids
+}
+
 /// Parse `text` as Markdown into blocks ready to splice, ensuring this
-/// package's `Package` carries numbering definitions for any list the parsed
-/// content references before the caller splices it in.
+/// package's `Package` carries numbering/style definitions for any list or
+/// style the parsed content references before the caller splices it in.
 ///
-/// [`docxcore::markdown::from_markdown`] always marks bullet items `numId` 1
-/// and ordered items `numId` 2 — ids fixed for a *fresh* markdown package (see
-/// `new_markdown_package`), which can collide with a numbering id an existing
-/// `.docx` already defines for something else. So this remaps: for each kind
-/// actually referenced, it calls [`docxcore::package::Package::ensure_list`]
-/// (the same call the Bullets/Numbering ribbon commands use), which returns a
-/// reserved high id unlikely to collide with the document's own lists, and
-/// rewrites the parsed blocks' `numId` to match — then reparses the package's
-/// numbering so the live view picks up any newly created part.
+/// **List numbering**: [`docxcore::markdown::from_markdown`] always marks
+/// bullet items `numId` 1 and ordered items `numId` 2 — ids fixed for a
+/// *fresh* markdown package (see `new_markdown_package`), which can collide
+/// with a numbering id an existing `.docx` already defines for something
+/// else. So this remaps: for each kind actually referenced, it calls
+/// [`docxcore::package::Package::ensure_list`] (the same call the
+/// Bullets/Numbering ribbon commands use), which returns a reserved high id
+/// unlikely to collide with the document's own lists, and rewrites the parsed
+/// blocks' `numId` to match — then reparses the package's numbering so the
+/// live view picks up any newly created part.
+///
+/// **Paragraph styles**: unlike numbering ids, `HeadingN`/`Quote`/`SourceCode`
+/// are fixed, well-known names — there's nothing to remap, only to ensure
+/// present. [`referenced_style_ids`] finds which of them the parsed blocks
+/// reference and [`docxcore::package::Package::ensure_styles`] defines
+/// exactly those that the target package doesn't already have, leaving any
+/// pre-existing same-named style (e.g. a third-party document's own
+/// `Heading1`) untouched. Without this, `<w:pStyle w:val="HeadingN"/>` (or
+/// `Quote`/`SourceCode`) referencing an undefined style renders as plain
+/// Normal text in Word.
+///
+/// **Ordering**: this only ever ADDS package parts/definitions, never
+/// removes or rewrites unrelated ones — but callers must still validate the
+/// splice position (`agent::validate_insert_at`/`validate_replace_range`)
+/// BEFORE calling this, so a call that's ultimately going to be rejected for
+/// bad bounds never leaves the mutation behind. See those functions' doc
+/// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
     let mut blocks = agent::parse_markdown_blocks(text)?;
+
     let is_list =
         |b: &Block, id: i32| matches!(b, Block::Paragraph(p) if p.props.num_id == Some(id));
     let needs_bullet = blocks.iter().any(|b| is_list(b, 1));
@@ -444,6 +508,12 @@ fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, Stri
         }
         app.reparse_numbering();
     }
+
+    let style_ids = referenced_style_ids(&blocks);
+    if !style_ids.is_empty() {
+        app.pkg.ensure_styles(&style_ids);
+    }
+
     Ok(blocks)
 }
 
@@ -601,7 +671,7 @@ fn parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String> {
 mod tests {
     use super::*;
     use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps};
-    use docxcore::package::new_package;
+    use docxcore::package::{load_package, new_package, save_package};
 
     /// A document of simple text paragraphs.
     fn doc_with(paras: &[&str]) -> Document {
@@ -969,6 +1039,131 @@ mod tests {
         assert!(
             num_ids.iter().all(|&id| id != 1 && id != 2),
             "list paragraphs must be remapped onto ensure_list's ids: {num_ids:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_markdown_list_insert_leaves_the_package_untouched() {
+        // Regression guard: `prepare_markdown_blocks`'s ensure_list/ensure_styles
+        // mutation must never run before the splice position itself is known
+        // to be valid — otherwise a rejected out-of-bounds call leaves behind
+        // a numbering part a later, unrelated `doc.save` would persist even
+        // though nothing was actually inserted.
+        let mut app = app_with(&["A"]);
+        let before: Vec<String> = app.pkg.part_names().into_iter().map(String::from).collect();
+        assert!(!before.iter().any(|n| n == "word/numbering.xml"));
+
+        let err = insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(99.0)),
+                ("text", Json::Str("- item".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "{err}");
+
+        let after: Vec<String> = app.pkg.part_names().into_iter().map(String::from).collect();
+        assert_eq!(
+            after, before,
+            "a rejected splice must not mutate the package"
+        );
+        assert!(!app.modified);
+        assert_eq!(paras(&app), vec!["A"]);
+    }
+
+    #[test]
+    fn markdown_heading_into_a_fresh_package_ensures_heading1_and_persists_it() {
+        let mut app = app_with(&["Existing"]);
+        let styles_before =
+            String::from_utf8_lossy(app.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(!styles_before.contains("Heading1"), "{styles_before}");
+
+        insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("# Title".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+
+        let styles = String::from_utf8_lossy(app.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(styles.contains("w:styleId=\"Heading1\""), "{styles}");
+
+        // Persists through save/reload, with the document still referencing
+        // it — i.e. it renders styled (bold/large) once Word resolves the
+        // style, not as plain Normal text. `App::save` syncs `pkg.document`
+        // from the live `editor.doc` before calling `save_package`; mirror
+        // that here rather than driving a real file write.
+        app.pkg.document = app.editor.doc.clone();
+        let bytes = save_package(&app.pkg);
+        let reloaded = load_package(&bytes).expect("reload");
+        let reloaded_styles =
+            String::from_utf8_lossy(reloaded.part("word/styles.xml").unwrap()).into_owned();
+        assert!(
+            reloaded_styles.contains("w:styleId=\"Heading1\""),
+            "{reloaded_styles}"
+        );
+        let doc_xml =
+            String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap()).into_owned();
+        assert!(doc_xml.contains("w:pStyle w:val=\"Heading1\""), "{doc_xml}");
+    }
+
+    #[test]
+    fn markdown_heading_write_leaves_a_pre_existing_heading1_byte_unchanged() {
+        let mut app = app_with(&["Existing"]);
+        // A third-party Heading1 already defined, visibly different from ours.
+        let custom = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/></w:style></w:styles>"#;
+        app.pkg
+            .set_part("word/styles.xml", custom.as_bytes().to_vec());
+
+        insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("# Title".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+
+        let styles = String::from_utf8_lossy(app.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(
+            styles.contains(
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/></w:style>"#
+            ),
+            "{styles}"
+        );
+        assert_eq!(
+            styles.matches("w:styleId=\"Heading1\"").count(),
+            1,
+            "must not append a second, competing Heading1: {styles}"
+        );
+    }
+
+    #[test]
+    fn non_style_referencing_markdown_leaves_styles_xml_untouched() {
+        let mut app = app_with(&["Existing"]);
+        let before = app.pkg.part("word/styles.xml").unwrap().to_vec();
+
+        insert(
+            &mut app,
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("plain paragraph, **bold** even".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.pkg.part("word/styles.xml").unwrap(),
+            before.as_slice(),
+            "markdown with no pStyle-referencing construct must not touch styles.xml"
         );
     }
 

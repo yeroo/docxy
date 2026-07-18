@@ -391,6 +391,108 @@ impl Package {
         }
         num_id
     }
+
+    /// Ensure `styles.xml` defines each style id in `ids` that Markdown-sourced
+    /// content might reference (`HeadingN` for `N` in `1..=6`, `Quote`,
+    /// `SourceCode`, `Code` — the exact set [`markdown_styles_xml`] defines for
+    /// a fresh markdown package; any other id is silently ignored). Strictly
+    /// additive, mirroring [`Package::ensure_list`]'s idiom: a style id already
+    /// defined in the package — e.g. a third-party document's own `Heading1` —
+    /// is left byte-untouched; only ids genuinely ABSENT from `styles.xml` get
+    /// a definition appended. Creates the part from scratch in the (practically
+    /// unreachable, since `new_package`/`load_package` always carry one)
+    /// case a package has no `styles.xml` at all.
+    ///
+    /// Without this, a `<w:pStyle w:val="HeadingN"/>` (or `Quote`/`SourceCode`)
+    /// referencing a style the target package never defined renders as plain
+    /// Normal text in Word — the same problem [`markdown_styles_xml`]'s doc
+    /// comment describes for a *fresh* markdown package, here fixed for
+    /// splicing into an *existing* one.
+    pub fn ensure_styles(&mut self, ids: &[&str]) {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let name = "word/styles.xml";
+        let existing = self
+            .part(name)
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let mut additions = String::new();
+        for &id in ids {
+            let marker = format!("w:styleId=\"{id}\"");
+            let already_present = existing.as_deref().is_some_and(|xml| xml.contains(&marker))
+                || additions.contains(&marker);
+            if already_present {
+                continue;
+            }
+            if let Some(def) = markdown_style_def(id) {
+                additions.push_str(&def);
+            }
+        }
+        if additions.is_empty() {
+            return; // every requested id was already defined (or unknown)
+        }
+        match existing {
+            Some(xml) => {
+                let xml = xml.replacen("</w:styles>", &format!("{additions}</w:styles>"), 1);
+                self.set_part(name, xml.into_bytes());
+            }
+            None => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                     <w:styles xmlns:w=\"{W_NS}\">{additions}</w:styles>"
+                );
+                self.parts.push((name.to_string(), body.into_bytes()));
+            }
+        }
+    }
+}
+
+/// The `<w:style>` XML definition for one of the styles Markdown maps onto
+/// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`), or `None`
+/// for any other id. Shared by [`markdown_styles_xml`] (which defines the full
+/// set for a fresh markdown package) and [`Package::ensure_styles`] (which
+/// defines only the ids actually referenced, for an existing package), so the
+/// two can never drift apart.
+fn markdown_style_def(id: &str) -> Option<String> {
+    if let Some(n) = id
+        .strip_prefix("Heading")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if !(1..=6).contains(&n) {
+            return None;
+        }
+        // Heading sizes in half-points (H1..H6), decreasing.
+        let sizes = [36u32, 32, 28, 26, 24, 22];
+        let sz = sizes[n - 1];
+        let idx = n - 1;
+        return Some(format!(
+            "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\">\
+             <w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:next w:val=\"Normal\"/>\
+             <w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"60\"/>\
+             <w:outlineLvl w:val=\"{idx}\"/></w:pPr>\
+             <w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>"
+        ));
+    }
+    match id {
+        "Quote" => Some(
+            "<w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/>\
+             <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
+             <w:pPr><w:ind w:left=\"720\"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        "SourceCode" => Some(
+            "<w:style w:type=\"paragraph\" w:styleId=\"SourceCode\">\
+             <w:name w:val=\"Source Code\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:next w:val=\"Normal\"/>\
+             <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        "Code" => Some(
+            "<w:style w:type=\"character\" w:styleId=\"Code\"><w:name w:val=\"Code\"/>\
+             <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
@@ -580,20 +682,17 @@ pub fn new_markdown_package(document: Document) -> Package {
 /// style. Word recognizes the headings by their `styleId`/`name`.
 fn markdown_styles_xml() -> String {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    // Heading sizes in half-points (H1..H6), decreasing.
-    let sizes = [36u32, 32, 28, 26, 24, 22];
+    // Heads/Quote/SourceCode/Code definitions come from `markdown_style_def`,
+    // the single source of truth also used by `Package::ensure_styles` — so a
+    // fresh markdown package and a splice into an existing one can never
+    // define these styles differently.
     let mut heads = String::new();
-    for (idx, sz) in sizes.iter().enumerate() {
-        let n = idx + 1;
-        heads.push_str(&format!(
-            "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\">\
-             <w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/>\
-             <w:next w:val=\"Normal\"/>\
-             <w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"60\"/>\
-             <w:outlineLvl w:val=\"{idx}\"/></w:pPr>\
-             <w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>"
-        ));
+    for n in 1..=6 {
+        heads.push_str(&markdown_style_def(&format!("Heading{n}")).unwrap());
     }
+    let quote = markdown_style_def("Quote").unwrap();
+    let source_code = markdown_style_def("SourceCode").unwrap();
+    let code = markdown_style_def("Code").unwrap();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:styles xmlns:w=\"{W}\">\
@@ -606,15 +705,9 @@ fn markdown_styles_xml() -> String {
          <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
          <w:rPr><w:b/><w:sz w:val=\"56\"/></w:rPr></w:style>\
          {heads}\
-         <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/>\
-         <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
-         <w:pPr><w:ind w:left=\"720\"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>\
-         <w:style w:type=\"paragraph\" w:styleId=\"SourceCode\">\
-         <w:name w:val=\"Source Code\"/><w:basedOn w:val=\"Normal\"/>\
-         <w:next w:val=\"Normal\"/>\
-         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
-         <w:style w:type=\"character\" w:styleId=\"Code\"><w:name w:val=\"Code\"/>\
-         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
+         {quote}\
+         {source_code}\
+         {code}\
          </w:styles>"
     )
 }
@@ -1005,6 +1098,52 @@ mod tests {
         let re = load_package(&doc_xml).expect("reload");
         let dx = String::from_utf8_lossy(re.part("word/document.xml").unwrap()).into_owned();
         assert!(dx.contains("w:pStyle w:val=\"Heading1\""), "{dx}");
+    }
+
+    #[test]
+    fn ensure_styles_adds_absent_ids_and_leaves_existing_ones_byte_untouched() {
+        let mut pkg = new_package(Document { body: vec![] });
+        // A third-party Heading1, visibly different from ours (custom name +
+        // color), already defined.
+        let custom_styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style></w:styles>"#;
+        pkg.set_part("word/styles.xml", custom_styles.as_bytes().to_vec());
+
+        pkg.ensure_styles(&["Heading1", "Quote"]);
+
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        // The third-party Heading1 definition is byte-for-byte untouched —
+        // not merged, not replaced, not duplicated.
+        assert!(
+            styles.contains(
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style>"#
+            ),
+            "{styles}"
+        );
+        assert_eq!(
+            styles.matches("w:styleId=\"Heading1\"").count(),
+            1,
+            "ensure_styles must not append a second, competing Heading1: {styles}"
+        );
+        // Quote, genuinely absent, was appended.
+        assert!(styles.contains("w:styleId=\"Quote\""), "{styles}");
+    }
+
+    #[test]
+    fn ensure_styles_is_idempotent_and_ignores_unknown_ids() {
+        let mut pkg = new_package(Document { body: vec![] });
+        pkg.ensure_styles(&["SourceCode", "NotARealStyle"]);
+        pkg.ensure_styles(&["SourceCode"]); // second call: already defined
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert_eq!(
+            styles.matches("w:styleId=\"SourceCode\"").count(),
+            1,
+            "a repeat call must not duplicate the definition: {styles}"
+        );
+        assert!(
+            !styles.contains("NotARealStyle"),
+            "an id outside the Markdown-mapped set must be silently ignored: {styles}"
+        );
     }
 
     #[test]
