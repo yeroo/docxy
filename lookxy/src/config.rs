@@ -177,29 +177,12 @@ pub fn config_file_path() -> Option<PathBuf> {
     }
 }
 
-/// Best-effort persistence of the `threaded` toggle to the real config file.
-/// Silently does nothing if the config path can't be determined or the write
-/// fails — a UI toggle must never crash or block on a settings-file problem.
-///
-/// Not called from production code — `App::toggle_threaded` (the `t`
-/// keybinding) calls `persist_threaded_to` directly instead, since it already
-/// has the resolved path cached in `config_path` and would otherwise pay to
-/// re-resolve it on every toggle. Kept for callers without a cached path
-/// (only this module's tests, currently); silences `dead_code`.
-#[allow(dead_code)]
-pub fn persist_threaded(value: bool) {
-    if let Some(path) = config_file_path() {
-        let _ = persist_threaded_to(&path, value);
-    }
-}
-
 /// Read-modify-write `path`, replacing only the `threaded` key and preserving
 /// every other key already in the file (client_id, backfill_days, unknown
 /// keys, …). Creates the file (and parent dir) if absent.
 ///
-/// Called directly by `App::toggle_threaded` (the `t` keybinding), bypassing
-/// `persist_threaded` above since `App` already has the resolved path in
-/// `config_path`.
+/// Called directly by `App::toggle_threaded` (the `t` keybinding), which
+/// already has the resolved path cached in `config_path`.
 pub fn persist_threaded_to(path: &Path, value: bool) -> std::io::Result<()> {
     use mailcore::json::Value;
 
