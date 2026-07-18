@@ -70,10 +70,11 @@ impl RichText {
             .join("\n")
     }
 
-    /// True when the document is a single empty paragraph, as produced by
-    /// [`RichText::new`].
+    /// True when the document has no text anywhere (e.g. as produced by
+    /// [`RichText::new`], or after edit operations leave behind empty runs
+    /// or empty paragraphs).
     pub fn is_empty(&self) -> bool {
-        matches!(self.blocks.as_slice(), [Block::Paragraph(runs)] if runs.is_empty())
+        self.plain().is_empty()
     }
 }
 
@@ -109,5 +110,16 @@ mod tests {
             ],
         };
         assert_eq!(rt.plain(), "Hello world\nNext");
+    }
+    #[test]
+    fn is_empty_ignores_empty_runs() {
+        let rt = RichText {
+            blocks: vec![Block::Paragraph(vec![Run::plain("")])],
+        };
+        assert!(rt.is_empty());
+        let rt2 = RichText {
+            blocks: vec![Block::Paragraph(vec![Run::plain("x")])],
+        };
+        assert!(!rt2.is_empty());
     }
 }
