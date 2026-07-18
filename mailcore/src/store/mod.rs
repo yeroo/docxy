@@ -1291,14 +1291,36 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Encodes a list of recipients into the flat text form stored in
 /// `to_recipients`/`cc_recipients` (`Name <addr>; Name <addr>; ...`).
-/// There's no structured decode yet — nothing reads these back as
-/// `Recipient`s in this task — but the format is delimiter-safe enough
-/// (`;`/`<`/`>`) for the message-list and search use the later tasks need.
+///
+/// The display `name` is attacker-controlled — it comes straight off a
+/// sender's `From`/`To` on a synced message or a reply draft — so it is
+/// sanitized before formatting. `;`, `<`, and `>` are the structural
+/// delimiters this flat form and `outbox::parse_recipients` rely on; a name
+/// that smuggled any of them (or a CR/LF) would inject an *extra* recipient
+/// when the column is parsed back at send time, silently exfiltrating a reply
+/// to an attacker-chosen address. Stripping them keeps every recipient exactly
+/// one `Name <addr>` unit.
 fn encode_recipients(list: &[Recipient]) -> String {
     list.iter()
-        .map(|r| format!("{} <{}>", r.name, r.address))
+        .map(|r| format!("{} <{}>", sanitize_recipient_name(&r.name), r.address))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Neutralizes the structural delimiters of the flat recipient encoding
+/// (`;`, `<`, `>`) and CR/LF in an attacker-controlled display name, so it can
+/// never be parsed back as more than the one recipient it belongs to. Each
+/// stripped delimiter becomes a space (rather than vanishing) so neighbouring
+/// name tokens don't fuse; the result is trimmed.
+fn sanitize_recipient_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            ';' | '<' | '>' | '\r' | '\n' => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Maps one row of a `SELECT id, folder_id, ..., preview, is_draft FROM
@@ -1368,6 +1390,25 @@ mod tests {
             preview: "p".into(),
             is_draft: false,
         }
+    }
+
+    #[test]
+    fn encode_recipients_neutralizes_display_name_injection() {
+        // A malicious sender sets their display name to smuggle the flat
+        // encoding's delimiters. When the victim replies, this name must not
+        // round-trip into a second recipient (silent reply exfiltration). H1.
+        let evil = Recipient {
+            name: "Ann <attacker@evil.com>; x".into(),
+            address: "mal@sender.com".into(),
+        };
+        let encoded = encode_recipients(&[evil]);
+        // Only the real address contributes an angle-bracket pair, and no `;`
+        // survives to act as a recipient separator — so a parse yields exactly
+        // one recipient, the legitimate one.
+        assert_eq!(encoded.matches('<').count(), 1);
+        assert_eq!(encoded.matches('>').count(), 1);
+        assert!(!encoded.contains(';'));
+        assert!(encoded.ends_with("<mal@sender.com>"));
     }
 
     #[test]

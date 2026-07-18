@@ -31,7 +31,7 @@
 //! | `mail.select` | `{folder?, id?}` | `{selected_folder?, selected_message?}` |
 //! | `mail.refresh` | — | `{refreshing:true}` |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::app::{App, downloads_dir, sanitize_filename};
 
@@ -415,7 +415,7 @@ fn save_attachment(app: &App, args: &Json) -> Result<Json, String> {
         .ok_or("mail.save-attachment needs an 'attachment'")?
         .to_string();
     let dest = match args.get_str("dest") {
-        Some(d) => PathBuf::from(d),
+        Some(d) => resolve_explicit_dest(d),
         None => {
             let items = app.store.attachments(&id).map_err(|e| e.to_string())?;
             let att = items
@@ -434,6 +434,21 @@ fn save_attachment(app: &App, args: &Json) -> Result<Json, String> {
         ("queued", Json::Bool(true)),
         ("dest", Json::Str(dest.display().to_string())),
     ]))
+}
+
+/// Resolves the `dest` argument of `mail.save-attachment` to a path that is
+/// always confined to the Downloads directory. A caller-supplied `dest` is
+/// interpreted as a *filename*: only its final path component is kept and run
+/// through `sanitize_filename`, so a malicious or prompt-injected control
+/// client can't turn "save an attachment" into an arbitrary-path write (e.g.
+/// dropping an attacker-chosen file into a Startup folder for code execution
+/// at next logon). M2.
+fn resolve_explicit_dest(dest: &str) -> PathBuf {
+    let final_component = Path::new(dest)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    downloads_dir().join(sanitize_filename(final_component))
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +494,30 @@ mod tests {
 
     fn args(pairs: Vec<(&str, Json)>) -> Json {
         Json::obj(pairs)
+    }
+
+    #[test]
+    fn explicit_save_dest_is_confined_to_downloads() {
+        let dl = downloads_dir();
+        // Absolute and traversal dests must all collapse to a single
+        // sanitized file name directly under Downloads — never an
+        // arbitrary-path write. M2. (Forward slashes only, so the parsing is
+        // identical on Windows and the Unix CI targets.)
+        for evil in [
+            "/etc/cron.d/evil",
+            "../../../../Startup/run.bat",
+            "sub/dir/note.txt",
+        ] {
+            let resolved = resolve_explicit_dest(evil);
+            assert_eq!(resolved.parent().unwrap(), dl.as_path());
+            assert!(!resolved.to_string_lossy().contains(".."));
+        }
+        assert_eq!(
+            resolve_explicit_dest("sub/dir/note.txt")
+                .file_name()
+                .unwrap(),
+            std::ffi::OsStr::new("note.txt")
+        );
     }
 
     fn seed_second_folder(app: &mut App) {
@@ -782,7 +821,10 @@ mod tests {
     }
 
     #[test]
-    fn save_attachment_respects_explicit_dest() {
+    fn save_attachment_confines_explicit_dest_to_downloads() {
+        // An explicit out-of-tree dest must be confined to Downloads (final
+        // component only), not honored verbatim — otherwise the control
+        // surface is an arbitrary-path write primitive. M2.
         let app = App::for_test_with_seeded_store();
         let r = save_attachment(
             &app,
@@ -793,7 +835,14 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(r.get_str("dest"), Some("C:/tmp/custom.txt"));
+        let dest = r.get_str("dest").unwrap();
+        assert_ne!(dest, "C:/tmp/custom.txt");
+        assert!(dest.contains("Downloads"));
+        assert!(dest.ends_with("custom.txt"));
+        assert!(matches!(
+            drain_last_command(&app),
+            Some(SyncCommand::SaveAttachment { dest, .. }) if dest.file_name().unwrap() == "custom.txt"
+        ));
     }
 
     #[test]
