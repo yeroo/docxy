@@ -79,6 +79,15 @@ pub struct MessageRow {
     pub bcc_recipients: String,
 }
 
+/// A file the user has attached to an outbound draft — a reference (path +
+/// name + size), not bytes; the bytes are read from disk at send time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboundAttachment {
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+}
+
 /// A `contacts` row — one per normalized (lowercased) email address, the
 /// autocomplete query surface. `source` is `local`/`graph`/`both`;
 /// `relevance` is the Graph `/me/people` rank (lower = more relevant),
@@ -782,6 +791,59 @@ impl Store {
         Ok(())
     }
 
+    /// Records a file attached to draft `draft_id`. Idempotent per (draft, path).
+    pub fn add_outbound_attachment(
+        &self,
+        draft_id: &str,
+        path: &str,
+        name: &str,
+        size: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO outbound_attachments (draft_id, path, name, size) VALUES (?1, ?2, ?3, ?4)",
+            params![draft_id, path, name, size],
+        )?;
+        Ok(())
+    }
+
+    /// The files attached to `draft_id`, ordered by name.
+    pub fn outbound_attachments(
+        &self,
+        draft_id: &str,
+    ) -> Result<Vec<OutboundAttachment>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map(params![draft_id], |r| {
+                Ok(OutboundAttachment {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    size: r.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes one attached file from `draft_id` (by path). No-op if absent.
+    pub fn remove_outbound_attachment(&self, draft_id: &str, path: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM outbound_attachments WHERE draft_id = ?1 AND path = ?2",
+            params![draft_id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Removes every attached file from `draft_id` (after a send, or on discard).
+    pub fn clear_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM outbound_attachments WHERE draft_id = ?1",
+            params![draft_id],
+        )?;
+        Ok(())
+    }
+
     /// Rewrites every row keyed by `local_id` (the message, its body, and —
     /// via the `messages`/`bodies` triggers described in `schema.rs` — the
     /// `messages_fts` index) to `graph_id`, once `create_draft` has pushed
@@ -803,6 +865,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE bodies SET message_id = ?2 WHERE message_id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.execute(
+            "UPDATE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
             params![local_id, graph_id],
         )?;
         tx.commit()?;
@@ -2559,6 +2625,37 @@ mod draft_tests {
 
         // search (via messages_fts) should follow the row to the new id too.
         assert_eq!(s.search("Subj", 50).unwrap()[0].id, "GRAPH-ID-1");
+    }
+
+    #[test]
+    fn outbound_attachment_crud_and_dedup() {
+        let s = Store::open_in_memory().unwrap();
+        s.add_outbound_attachment("local:d1", "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        s.add_outbound_attachment("local:d1", "/tmp/b.txt", "b.txt", 20)
+            .unwrap();
+        s.add_outbound_attachment("local:d1", "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap(); // dup path → no-op
+        let got = s.outbound_attachments("local:d1").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "a.pdf"); // ordered by name
+        s.remove_outbound_attachment("local:d1", "/tmp/a.pdf")
+            .unwrap();
+        assert_eq!(s.outbound_attachments("local:d1").unwrap().len(), 1);
+        s.clear_outbound_attachments("local:d1").unwrap();
+        assert!(s.outbound_attachments("local:d1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconcile_id_repoints_outbound_attachments() {
+        let s = Store::open_in_memory().unwrap();
+        // a local draft (message + body) plus a pending attachment on it
+        let id = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        s.reconcile_id(&id, "GRAPH-1").unwrap();
+        assert!(s.outbound_attachments(&id).unwrap().is_empty()); // old id emptied
+        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 1); // moved to graph id
     }
 
     #[test]
