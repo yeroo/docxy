@@ -91,6 +91,12 @@ enum Method {
     Delete,
 }
 
+/// Graph's inline-attachment ceiling: files this size or smaller go inline as a
+/// fileAttachment; larger ones use an upload session.
+const INLINE_MAX: usize = 3 * 1024 * 1024;
+/// Upload-session chunk size — a multiple of 320 KiB per Graph's requirement.
+const CHUNK_SIZE: usize = 12 * 320 * 1024; // 3,932,160 bytes
+
 impl GraphClient {
     /// `base` has no trailing slash requirement — one is stripped if
     /// present, since every path built below starts with `/`.
@@ -497,6 +503,86 @@ impl GraphClient {
         Ok(())
     }
 
+    /// Attaches `bytes` to the draft `message_id`, routing by size: inline
+    /// `fileAttachment` for ≤ `INLINE_MAX`, an upload session (chunked PUT) for
+    /// larger files.
+    pub fn add_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), GraphError> {
+        if bytes.len() <= INLINE_MAX {
+            self.add_file_attachment(message_id, name, content_type, bytes)
+        } else {
+            self.upload_large_attachment(message_id, name, content_type, bytes)
+        }
+    }
+
+    /// POST `.../attachments/createUploadSession`, then PUT the bytes to the
+    /// returned pre-authenticated `uploadUrl` in `CHUNK_SIZE` chunks, each with
+    /// a `Content-Range` header, until the last chunk completes.
+    fn upload_large_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(message_id);
+        let path = format!("/me/messages/{id}/attachments/createUploadSession");
+        let body = Value::Object(vec![(
+            "AttachmentItem".to_string(),
+            Value::Object(vec![
+                ("attachmentType".to_string(), Value::Str("file".to_string())),
+                ("name".to_string(), Value::Str(name.to_string())),
+                ("size".to_string(), Value::Num(bytes.len() as f64)),
+                (
+                    "contentType".to_string(),
+                    Value::Str(content_type.to_string()),
+                ),
+            ]),
+        )])
+        .to_string();
+        let resp = self.send(Method::Post, &path, Some(body), &[])?;
+        let v = parse_body(resp)?;
+        let upload_url = v
+            .get("uploadUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                GraphError::Parse("createUploadSession response has no uploadUrl".to_string())
+            })?
+            .to_string();
+
+        let total = bytes.len();
+        for (start, end) in chunk_ranges(total, CHUNK_SIZE) {
+            let range = format!("bytes {}-{}/{}", start, end - 1, total);
+            self.put_bytes(&upload_url, &range, &bytes[start..end])?;
+        }
+        Ok(())
+    }
+
+    /// Raw `PUT` of one `chunk` to a Graph upload-session `upload_url` with a
+    /// `Content-Range` header and NO bearer (the session URL is already
+    /// authorized). A 2xx (202 for an accepted intermediate chunk, 200/201 for
+    /// the final one) is Ok; anything else maps to a `GraphError`.
+    fn put_bytes(
+        &self,
+        upload_url: &str,
+        content_range: &str,
+        chunk: &[u8],
+    ) -> Result<(), GraphError> {
+        match ureq::put(upload_url)
+            .set("Content-Range", content_range)
+            .send_bytes(chunk)
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, resp)) => Err(classify_status(status, resp)),
+            Err(ureq::Error::Transport(t)) => Err(GraphError::Transport(t.to_string())),
+        }
+    }
+
     /// Builds and sends one request, applying the standard auth/accept
     /// headers plus any `extra_headers`, and maps a non-2xx result to a
     /// `GraphError`. `path` is either a path rooted at `base` (most calls)
@@ -626,6 +712,21 @@ fn recipients_json(recipients: &[Recipient]) -> Value {
             })
             .collect(),
     )
+}
+
+/// Splits `total` bytes into consecutive `(start, end)` half-open ranges of at
+/// most `chunk` bytes each — `end` exclusive, so `bytes[start..end]` is the
+/// slice to send and the last range's `end` always equals `total`. Empty
+/// (`total == 0`) yields no ranges.
+fn chunk_ranges(total: usize, chunk: usize) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + chunk).min(total);
+        v.push((start, end));
+        start = end;
+    }
+    v
 }
 
 /// Percent-encodes every byte except RFC 3986 unreserved characters
@@ -1617,5 +1718,124 @@ mod tests {
             sent.get("contentBytes").and_then(Value::as_str),
             Some("aGVsbG8=") // base64("hello")
         );
+    }
+
+    #[test]
+    fn chunk_ranges_covers_total_in_chunk_sized_pieces() {
+        assert_eq!(chunk_ranges(0, 100), Vec::<(usize, usize)>::new());
+        assert_eq!(chunk_ranges(100, 100), vec![(0, 100)]);
+        assert_eq!(
+            chunk_ranges(250, 100),
+            vec![(0, 100), (100, 200), (200, 250)]
+        );
+        // A payload just over INLINE_MAX still fits inside one CHUNK_SIZE chunk
+        // (CHUNK_SIZE is much bigger than INLINE_MAX), matching the "big"
+        // payload used in `add_attachment_routes_small_inline_and_large_to_upload_session`.
+        let total = INLINE_MAX + 100;
+        assert_eq!(chunk_ranges(total, CHUNK_SIZE), vec![(0, total)]);
+        // Multiple full CHUNK_SIZE-sized chunks plus a smaller remainder.
+        let total2 = CHUNK_SIZE * 2 + 500;
+        let ranges = chunk_ranges(total2, CHUNK_SIZE);
+        assert_eq!(
+            ranges,
+            vec![
+                (0, CHUNK_SIZE),
+                (CHUNK_SIZE, CHUNK_SIZE * 2),
+                (CHUNK_SIZE * 2, total2)
+            ]
+        );
+        let sum: usize = ranges.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(sum, total2);
+    }
+
+    #[test]
+    fn add_attachment_routes_small_inline_and_large_to_upload_session() {
+        // small: routes to inline POST /attachments
+        let small = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments".into(),
+            status: 201,
+            headers: vec![],
+            body: r#"{"id":"a"}"#.into(),
+        }]);
+        let c = GraphClient::new(&small.base_url, "T");
+        c.add_attachment("M1", "s.txt", "text/plain", b"tiny")
+            .unwrap();
+        assert!(
+            small
+                .requests()
+                .iter()
+                .any(|r| r.path.contains("/attachments")
+                    && !r.path.contains("createUploadSession"))
+        );
+
+        // large: createUploadSession -> chunked PUT(s) to the returned uploadUrl.
+        //
+        // Two separate FakeServers, not one: the createUploadSession response
+        // body must embed the uploadUrl's base, but a FakeServer's base_url
+        // (its ephemeral port) is only known once it's already started with
+        // its full route list — so the upload target is started first (its
+        // base_url is then a known value), and that value is baked into the
+        // *other* server's createUploadSession route.
+        let upload_srv = FakeServer::start(vec![Route {
+            method: "PUT".into(),
+            path_prefix: "/upload/xyz".into(),
+            status: 201,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let session_body = format!(r#"{{"uploadUrl":"{}/upload/xyz"}}"#, upload_srv.base_url);
+        let session_srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments/createUploadSession".into(),
+            status: 200,
+            headers: vec![],
+            body: session_body,
+        }]);
+        let c2 = GraphClient::new(&session_srv.base_url, "T");
+        let big = vec![7u8; 3 * 1024 * 1024 + 100]; // just over INLINE_MAX -> one upload session, >=1 chunk
+        c2.add_attachment("M1", "big.bin", "application/octet-stream", &big)
+            .unwrap();
+
+        let session_reqs = session_srv.requests();
+        assert_eq!(
+            session_reqs.len(),
+            1,
+            "exactly one createUploadSession POST"
+        );
+        assert!(session_reqs[0].path.contains("createUploadSession"));
+
+        let put_reqs = upload_srv.requests();
+        assert!(
+            !put_reqs.is_empty(),
+            "at least one PUT to the upload session"
+        );
+        let mut covered = 0usize;
+        for r in &put_reqs {
+            assert_eq!(r.method, "PUT");
+            let content_range = r
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                .map(|(_, v)| v.clone())
+                .expect("PUT carries a Content-Range header");
+            let rest = content_range
+                .strip_prefix("bytes ")
+                .expect("Content-Range starts with 'bytes '");
+            let (range, total_str) = rest.split_once('/').expect("Content-Range has a total");
+            let (start_str, end_str) = range.split_once('-').expect("Content-Range has a range");
+            let start: usize = start_str.parse().expect("range start is a number");
+            let end_incl: usize = end_str.parse().expect("range end is a number");
+            let total: usize = total_str.parse().expect("total is a number");
+            assert_eq!(total, big.len());
+            assert_eq!(start, covered, "chunks are contiguous, no gaps/overlaps");
+            assert_eq!(
+                r.body.len(),
+                end_incl - start + 1,
+                "body matches Content-Range span"
+            );
+            covered = end_incl + 1;
+        }
+        assert_eq!(covered, big.len(), "PUT(s) cover the whole payload");
     }
 }
