@@ -103,6 +103,16 @@ impl Json {
         }
     }
 
+    /// The elements of a JSON array; `None` for non-arrays. Needed by Task 6's
+    /// verbs that take structured array args (`range.set`'s `rows`,
+    /// `sheet.pivot`'s `rows`/`cols`/`values`).
+    pub fn as_array(&self) -> Option<&[Json]> {
+        match self {
+            Json::Arr(items) => Some(items),
+            _ => None,
+        }
+    }
+
     /// The number as an `i64`, but only when it is finite and integral.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
