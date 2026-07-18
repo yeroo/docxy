@@ -293,7 +293,14 @@ fn remove_run_range(
     let t = clamp_char_boundary(&runs[to_run].text, to_offset.min(to_len));
     runs[to_run].text.replace_range(0..t, "");
 
-    runs.drain(from_run + 1..to_run);
+    // Defensive: `from_run < to_run` holds whenever the caller passes a
+    // properly ordered range, but a stale/out-of-range `Selection` (set
+    // directly via the public `sel` field) can clamp down onto indices that
+    // end up reversed. Guard the drain so that degrades to a no-op instead
+    // of panicking with "slice index starts at N but ends at M".
+    if to_run > from_run + 1 {
+        runs.drain(from_run + 1..to_run);
+    }
 }
 
 /// Removes the text between `start` and `end` (already clamped, `start <=
@@ -379,7 +386,13 @@ impl Editor {
 
     fn ordered_clamped(&self) -> (Pos, Pos) {
         let (a, b) = self.sel.ordered();
-        (self.clamp(a), self.clamp(b))
+        let (a, b) = (self.clamp(a), self.clamp(b));
+        // Clamping each endpoint independently (e.g. because one endpoint's
+        // block/run index was stale or out of range) can reverse their
+        // relative order even though `sel.ordered()` sorted the originals.
+        // Every downstream consumer assumes `from <= to`, so restore that
+        // invariant here rather than at each call site.
+        if a <= b { (a, b) } else { (b, a) }
     }
 
     fn record(&mut self) {
@@ -1185,5 +1198,72 @@ mod tests {
         e.delete_backward(); // previous block has zero runs: must not panic
         assert_eq!(e.text.blocks.len(), 1);
         assert_eq!(e.text.plain(), "x");
+    }
+
+    // --- Regression: reversed clamped selection (reviewer-found panic) ----
+    //
+    // `sel` is a public field, so a caller can hand the editor an anchor/
+    // caret pair whose block/run indices are individually out of range.
+    // `ordered()` sorts by the *raw* Pos values, but clamping each endpoint
+    // independently can then reverse their effective order (e.g. one
+    // endpoint's out-of-range block collapses onto the same block as the
+    // other, and its clamped run index ends up larger). Every op that
+    // deletes/replaces a range must survive this without panicking.
+
+    #[test]
+    fn delete_selection_with_reversed_clamped_selection_does_not_panic() {
+        let mut e = Editor::from(RichText {
+            blocks: vec![Block::Paragraph(vec![Run::plain("xyz"), Run::plain("uvw")])],
+        });
+        e.sel = Selection {
+            anchor: row(0, 5, 0), // run out of range for a 2-run block
+            caret: row(3, 0, 0),  // block way past the end
+        };
+        e.delete_selection(); // must not panic
+        assert_eq!(e.text.blocks.len(), 1);
+        assert_eq!(e.text.plain(), "uvw");
+    }
+
+    #[test]
+    fn insert_text_with_reversed_clamped_selection_does_not_panic() {
+        let mut e = Editor::from(RichText {
+            blocks: vec![Block::Paragraph(vec![Run::plain("ab"), Run::plain("cd")])],
+        });
+        e.sel = Selection {
+            anchor: row(0, 5, 0),
+            caret: row(3, 0, 0),
+        };
+        e.insert_text("Z"); // must not panic
+        assert!(e.text.plain().contains('Z'));
+    }
+
+    #[test]
+    fn split_paragraph_with_reversed_clamped_selection_does_not_panic() {
+        let mut e = Editor::from(RichText {
+            blocks: vec![Block::Paragraph(vec![Run::plain("ab"), Run::plain("cd")])],
+        });
+        e.sel = Selection {
+            anchor: row(0, 5, 0),
+            caret: row(3, 0, 0),
+        };
+        e.split_paragraph(); // must not panic
+        assert_eq!(e.text.blocks.len(), 2);
+    }
+
+    #[test]
+    fn delete_selection_with_caret_block_far_past_end_does_not_panic() {
+        let mut e = Editor::from(RichText {
+            blocks: vec![
+                Block::Paragraph(vec![Run::plain("a")]),
+                Block::Paragraph(vec![Run::plain("b")]),
+            ],
+        });
+        e.sel = Selection {
+            anchor: row(0, 0, 0),
+            caret: row(999, 9, 9), // block/run/offset all far past the end
+        };
+        e.delete_selection(); // must not panic
+        assert_eq!(e.text.blocks.len(), 1);
+        assert!(e.text.is_empty());
     }
 }
