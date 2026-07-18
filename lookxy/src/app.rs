@@ -187,6 +187,10 @@ pub struct App {
     /// A pending destructive-action confirmation, if any (whole-thread delete
     /// or move). `Some` blocks other keys until answered — see `ui::handle_key`.
     pub confirm: Option<ConfirmModal>,
+    /// The open file-picker popup (opened to choose a file to attach to the
+    /// message being composed), if any — see `ui::filepicker`. `Some` takes
+    /// keys ahead of the compose view it's drawn over (see `ui::handle_key`).
+    pub file_picker: Option<crate::ui::filepicker::FilePicker>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -336,6 +340,7 @@ impl App {
             selected_event: None,
             rsvp_prompt: None,
             confirm: None,
+            file_picker: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -1573,6 +1578,15 @@ impl App {
         self.browser_open_invocations
             .set(self.browser_open_invocations.get() + 1);
     }
+
+    // --- File picker ----------------------------------------------------
+
+    /// Enter, while the file picker (`App::file_picker`) is open. A stub for
+    /// now — this task only wires up the picker's own navigation
+    /// (`ui::filepicker::FilePicker::move_selection`/`enter`, driven directly
+    /// by `ui::handle_key`); actually reacting to a chosen file (attaching it
+    /// to the message being composed) is Task 8's job.
+    pub fn file_picker_enter(&mut self) {}
 
     /// Test-only: whether `open_url_with_os_handler` has been reached at
     /// least once (see `browser_open_invocations`) — `SyncEvent::SignInStarted`

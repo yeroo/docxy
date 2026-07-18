@@ -7,6 +7,7 @@
 mod attachments;
 pub(crate) mod calendar;
 pub(crate) mod compose;
+pub mod filepicker;
 mod folders;
 mod message_list;
 mod reading;
@@ -72,6 +73,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     message_list::draw_move_picker(f, app);
     message_list::draw_confirm(f, app);
     attachments::draw(f, app);
+    filepicker::draw(f, app);
     signin::draw(f, app);
 }
 
@@ -90,6 +92,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // usefully do without a token.
     if app.signin_modal.is_some() {
         handle_signin_key(app, key);
+        return;
+    }
+    // The file picker (opened over the composer to choose an attachment) —
+    // checked ahead of the compose view itself, so the picker (drawn on top
+    // of it) gets keys first while both are notionally open.
+    if app.file_picker.is_some() {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(fp) = app.file_picker.as_mut() {
+                    fp.move_selection(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(fp) = app.file_picker.as_mut() {
+                    fp.move_selection(1);
+                }
+            }
+            KeyCode::Enter => app.file_picker_enter(),
+            KeyCode::Esc => app.file_picker = None,
+            _ => {}
+        }
         return;
     }
     // The compose view is a full-screen mode, not a popup over the normal
