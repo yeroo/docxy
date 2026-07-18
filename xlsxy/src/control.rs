@@ -44,7 +44,7 @@
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
 
-use crate::{App, comment_author, input_text_of, iso_now, parse_input};
+use crate::{App, comment_author, iso_now, parse_input};
 use ctlcore::json::Json;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::formula::Value;
@@ -706,31 +706,7 @@ fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
     let requested = args.get_str("name").unwrap_or("Sheet");
     let name = unique_sheet_name(&app.pkg.workbook, requested);
     let idx = app.pkg.add_sheet(&name);
-    {
-        let sh = &mut app.pkg.workbook.sheets[idx];
-        for (c, colname) in frame.names.iter().enumerate() {
-            sh.set_cell(0, c as u32, Cell::text(colname));
-        }
-        for (c, col) in frame.cols.iter().enumerate() {
-            for (r, v) in col.iter().enumerate() {
-                let value = match v {
-                    Value::Empty => continue,
-                    Value::Num(n) => CellValue::Number(*n),
-                    Value::Str(s) => CellValue::Text(s.clone()),
-                    Value::Bool(b) => CellValue::Bool(*b),
-                    Value::Err(e) => CellValue::Error(e.code().to_string()),
-                };
-                sh.set_cell(
-                    r as u32 + 1,
-                    c as u32,
-                    Cell {
-                        value,
-                        ..Cell::default()
-                    },
-                );
-            }
-        }
-    }
+    frame.write_to_sheet(&mut app.pkg.workbook.sheets[idx]);
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
     // New package parts (worksheet/relationship/workbook.xml wiring) don't
     // fit the cell-level undo model — same as the TUI's own AddSheet flow,
@@ -763,20 +739,7 @@ fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
     let mut replaced = 0usize;
     app.structural(|wb| {
         for sheet in &mut wb.sheets {
-            let changes: Vec<(u32, u32, Cell)> = sheet
-                .cells
-                .iter()
-                .filter_map(|(&(r, c), cell)| {
-                    let t = input_text_of(cell);
-                    if t.contains(query) {
-                        let mut nc = parse_input(&t.replace(query, text));
-                        nc.style = cell.style;
-                        Some((r, c, nc))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let changes = gridcore::edit::replace_all_in_sheet(sheet, query, text);
             replaced += changes.len();
             for (r, c, nc) in changes {
                 sheet.set_cell(r, c, nc);
@@ -808,19 +771,28 @@ fn sheet_add(app: &mut App, args: &Json) -> Result<Json, String> {
 /// destructive op shouldn't silently default to "whichever sheet is active".
 fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg_required(app, args)?;
+    let removed_active = app.sheet == si;
     if !app.pkg.remove_sheet(si) {
         return Err("cannot remove the last sheet".into());
     }
-    // Indices above the removed sheet shift down by one.
+    // Indices above the removed sheet shift down by one; an unaffected
+    // sheet below it keeps its index untouched. Only reset the viewport
+    // when the ACTIVE sheet itself is the one that just disappeared —
+    // mirrors the TUI's `delete_current_sheet`, which only ever removes
+    // the active sheet and so always resets. Removing some other sheet
+    // must leave a human's cursor/viewport on the sheet they're looking at
+    // exactly as they left it.
     if app.sheet > si {
         app.sheet -= 1;
-    } else {
+    } else if removed_active {
         app.sheet = app.sheet.min(app.pkg.workbook.sheets.len() - 1);
     }
-    app.cur = (0, 0);
-    app.top = 0;
-    app.left = 0;
-    app.anchor = None;
+    if removed_active {
+        app.cur = (0, 0);
+        app.top = 0;
+        app.left = 0;
+        app.anchor = None;
+    }
     // Same "can't be a cell-level undo" reasoning as sheet.import-csv.
     app.undo.clear();
     app.redo.clear();
@@ -847,11 +819,14 @@ fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
 /// Insert or delete `count` rows at 0-based row `at` — via [`App::structural`],
 /// mirroring the TUI's Ctrl-+/Ctrl-- row operations.
 fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
+    let verb = if insert { "row.insert" } else { "row.delete" };
     let si = sheet_arg(app, args)?;
-    let at = args.get_usize("at").ok_or("needs an 'at'")? as u32;
+    let at = args
+        .get_usize("at")
+        .ok_or_else(|| format!("{verb} needs an 'at'"))? as u32;
     let count = args.get_usize("count").unwrap_or(1) as u32;
     if count == 0 {
-        return Err("'count' must be at least 1".into());
+        return Err(format!("{verb}: 'count' must be at least 1"));
     }
     app.structural(|wb| {
         if insert {
@@ -867,11 +842,14 @@ fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
 /// Insert or delete `count` columns at 0-based column `at` — via
 /// [`App::structural`], mirroring the TUI's column operations.
 fn col_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
+    let verb = if insert { "col.insert" } else { "col.delete" };
     let si = sheet_arg(app, args)?;
-    let at = args.get_usize("at").ok_or("needs an 'at'")? as u32;
+    let at = args
+        .get_usize("at")
+        .ok_or_else(|| format!("{verb} needs an 'at'"))? as u32;
     let count = args.get_usize("count").unwrap_or(1) as u32;
     if count == 0 {
-        return Err("'count' must be at least 1".into());
+        return Err(format!("{verb}: 'count' must be at least 1"));
     }
     app.structural(|wb| {
         if insert {
@@ -1677,6 +1655,34 @@ mod tests {
     }
 
     #[test]
+    fn sheet_remove_resets_the_viewport_when_the_active_sheet_is_removed() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        a.cur = (5, 3);
+        a.top = 2;
+        a.left = 1;
+        a.anchor = Some((4, 4));
+        // Remove the ACTIVE sheet (index 0) — the sheet the human was
+        // looking at is gone, so the viewport must reset, same as the
+        // TUI's own delete_current_sheet.
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(0.0))]),
+        )
+        .unwrap();
+        assert_eq!(a.cur, (0, 0));
+        assert_eq!(a.top, 0);
+        assert_eq!(a.left, 0);
+        assert_eq!(a.anchor, None);
+    }
+
+    #[test]
     fn sheet_remove_requires_an_explicit_sheet_arg() {
         let mut a = app();
         dispatch(
@@ -1705,6 +1711,10 @@ mod tests {
         )
         .unwrap();
         a.sheet = 2; // "Third" is active
+        a.cur = (5, 3);
+        a.top = 2;
+        a.left = 1;
+        a.anchor = Some((4, 4));
         dispatch(
             &mut a,
             "sheet.remove",
@@ -1712,6 +1722,12 @@ mod tests {
         )
         .unwrap(); // remove Sheet1, before the active index
         assert_eq!(a.pkg.workbook.sheets[a.sheet].name, "Third");
+        // The active sheet itself wasn't touched — its viewport/cursor/
+        // selection must survive exactly as the human left them.
+        assert_eq!(a.cur, (5, 3));
+        assert_eq!(a.top, 2);
+        assert_eq!(a.left, 1);
+        assert_eq!(a.anchor, Some((4, 4)));
     }
 
     #[test]

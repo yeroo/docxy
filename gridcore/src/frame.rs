@@ -8,7 +8,7 @@
 
 use crate::engine::cell_to_value;
 use crate::formula::{ExcelError, Value, compare, to_text};
-use crate::sheet::Workbook;
+use crate::sheet::{Cell, CellValue, Sheet, Workbook};
 
 /// A columnar snapshot: equal-length value columns with header names.
 #[derive(Clone, Debug, Default)]
@@ -116,6 +116,36 @@ impl Frame {
             }
         }
         Frame { names, cols }
+    }
+
+    /// Write this frame into `sheet` starting at A1: row 0 = header names
+    /// (as text), rows 1.. = the data columns, one cell per value —
+    /// `Value::Empty` cells are left unset. Shared by CSV import (the
+    /// `sheet.import-csv` control verb and the TUI's own CSV-open path),
+    /// so both populate a freshly added sheet identically.
+    pub fn write_to_sheet(&self, sheet: &mut Sheet) {
+        for (c, name) in self.names.iter().enumerate() {
+            sheet.set_cell(0, c as u32, Cell::text(name));
+        }
+        for (c, col) in self.cols.iter().enumerate() {
+            for (r, v) in col.iter().enumerate() {
+                let value = match v {
+                    Value::Empty => continue,
+                    Value::Num(n) => CellValue::Number(*n),
+                    Value::Str(s) => CellValue::Text(s.clone()),
+                    Value::Bool(b) => CellValue::Bool(*b),
+                    Value::Err(e) => CellValue::Error(e.code().to_string()),
+                };
+                sheet.set_cell(
+                    r as u32 + 1,
+                    c as u32,
+                    Cell {
+                        value,
+                        ..Cell::default()
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -830,7 +860,7 @@ pub fn range_stats(vals: &[Value]) -> RangeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sheet::{Cell, Sheet};
+    use crate::sheet::{Cell, CellValue, Sheet};
 
     /// Region | Product | Qty | Sales
     fn sales_wb() -> Workbook {
@@ -1155,6 +1185,32 @@ mod tests {
         let f = Frame::from_csv("\"a,a\";B\nx;1\n");
         assert_eq!(f.names, vec!["a,a", "B"]);
         assert_eq!(sniff_delimiter("plain header\nrow\n"), ',');
+    }
+
+    #[test]
+    fn write_to_sheet_lays_out_headers_and_typed_data_leaving_blanks_unset() {
+        let frame = Frame::from_csv("name,amount,flag\nAlice,30,TRUE\nBob,,FALSE\n");
+        let mut sheet = Sheet::default();
+        frame.write_to_sheet(&mut sheet);
+        // Header row (row 0), as text.
+        assert_eq!(
+            sheet.cell(0, 0).unwrap().value,
+            CellValue::Text("name".into())
+        );
+        assert_eq!(
+            sheet.cell(0, 1).unwrap().value,
+            CellValue::Text("amount".into())
+        );
+        // Data rows (1..), typed per value.
+        assert_eq!(
+            sheet.cell(1, 0).unwrap().value,
+            CellValue::Text("Alice".into())
+        );
+        assert_eq!(sheet.cell(1, 1).unwrap().value, CellValue::Number(30.0));
+        assert_eq!(sheet.cell(1, 2).unwrap().value, CellValue::Bool(true));
+        // Bob's blank "amount" is left unset entirely, not a zero.
+        assert!(sheet.cell(2, 1).is_none());
+        assert_eq!(sheet.cell(2, 2).unwrap().value, CellValue::Bool(false));
     }
 
     #[test]

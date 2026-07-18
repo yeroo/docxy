@@ -61,6 +61,48 @@ pub fn parse_input(text: &str) -> Cell {
     Cell::text(text)
 }
 
+/// The text a cell would show in the formula bar (`=formula`, or the value
+/// as it would be re-entered) — [`parse_input`]'s inverse, and the surface
+/// Find/Replace operates on.
+pub fn input_text_of(cell: &Cell) -> String {
+    if let Some(f) = &cell.formula {
+        format!("={f}")
+    } else {
+        match &cell.value {
+            CellValue::Empty => String::new(),
+            CellValue::Number(n) => crate::sheet::fmt_general(*n),
+            CellValue::Text(s) => s.clone(),
+            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            CellValue::Error(e) => e.clone(),
+        }
+    }
+}
+
+/// The literal find/replace algorithm shared by the TUI's Find & Replace and
+/// the `wb.replace-all` control verb: every cell whose *input text* (its
+/// `=formula` source, or the value as it would be re-entered) contains
+/// `find` gets `find` replaced with `with`, then reparsed via
+/// [`parse_input`], preserving the cell's style. Returns the `(row, col,
+/// new_cell)` changes for one sheet — pure; callers decide how to apply
+/// them (one sheet under one undo group, or every sheet under one
+/// structural snapshot).
+pub fn replace_all_in_sheet(sheet: &Sheet, find: &str, with: &str) -> Vec<(u32, u32, Cell)> {
+    sheet
+        .cells
+        .iter()
+        .filter_map(|(&(r, c), cell)| {
+            let text = input_text_of(cell);
+            if text.contains(find) {
+                let mut newcell = parse_input(&text.replace(find, with));
+                newcell.style = cell.style;
+                Some((r, c, newcell))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Insert `count` blank rows before 0-based row `at` on sheet `idx`.
 pub fn insert_rows(wb: &mut Workbook, idx: usize, at: u32, count: u32) {
     structural_edit(
@@ -480,5 +522,53 @@ mod tests {
             w.sheets[1].cell(0, 0).unwrap().value,
             CellValue::Number(2.0)
         );
+    }
+
+    #[test]
+    fn input_text_of_is_parse_inputs_inverse() {
+        assert_eq!(input_text_of(&Cell::formula("A1+1")), "=A1+1");
+        assert_eq!(input_text_of(&Cell::number(30.0)), "30");
+        assert_eq!(input_text_of(&Cell::text("hi")), "hi");
+        assert_eq!(input_text_of(&Cell::default()), "");
+        // Round-trips through parse_input for every non-formula kind.
+        for text in ["42", "hello", "TRUE", "#DIV/0!"] {
+            assert_eq!(input_text_of(&parse_input(text)), text);
+        }
+    }
+
+    #[test]
+    fn replace_all_in_sheet_matches_in_values_and_formulas_preserving_style() {
+        let mut sheet = Sheet {
+            name: "Sheet1".to_string(),
+            ..Sheet::default()
+        };
+        sheet.set_cell(
+            0,
+            0,
+            Cell {
+                style: 7,
+                ..Cell::text("foo bar")
+            },
+        );
+        sheet.set_cell(1, 0, Cell::formula("foo+1")); // "foo" only inside the formula
+        sheet.set_cell(2, 0, Cell::text("no match here"));
+        let changes = replace_all_in_sheet(&sheet, "foo", "QUX");
+        assert_eq!(changes.len(), 2);
+        let at = |r: u32| changes.iter().find(|(cr, _, _)| *cr == r).unwrap();
+        let (_, _, c0) = at(0);
+        assert_eq!(c0.value, CellValue::Text("QUX bar".to_string()));
+        assert_eq!(c0.style, 7); // style survives the replace
+        let (_, _, c1) = at(1);
+        assert_eq!(c1.formula.as_deref(), Some("QUX+1"));
+    }
+
+    #[test]
+    fn replace_all_in_sheet_reports_no_changes_when_nothing_matches() {
+        let mut sheet = Sheet {
+            name: "Sheet1".to_string(),
+            ..Sheet::default()
+        };
+        sheet.set_cell(0, 0, Cell::text("nothing to see"));
+        assert!(replace_all_in_sheet(&sheet, "zzz", "y").is_empty());
     }
 }
