@@ -150,6 +150,61 @@ async function resolveTarget(app, target) {
   );
 }
 
+/** Like `resolveTarget`, but for tools that can proceed without any instance:
+ *  zero live instances with no `target` is `undefined` instead of an error. A
+ *  `target` that matches nothing, or an ambiguous candidate set, is still an
+ *  error — mirrors `ctlcore::client::resolve_target_for_new`. */
+async function resolveTargetForNew(app, target) {
+  const prefix = `${app}-`;
+  let live = (await discoverLive(ctlDir(app))).filter((i) => i.instance.startsWith(prefix));
+  if (typeof target === 'string') {
+    live = live.filter((i) => i.instance.includes(target));
+    if (live.length === 0) {
+      throw new Error(`no running ${app} matches target "${target}"`);
+    }
+  }
+  if (live.length === 0) return undefined;
+  if (live.length === 1) return live[0];
+  const names = live.map((i) => i.instance).join(', ');
+  throw new Error(
+    `several ${app} instances are running (${names}); pass "target" with a distinguishing substring (e.g. the pane id)`,
+  );
+}
+
+const TEMPLATES = {
+  docxy: path.join(__dirname, 'templates', 'blank.docx'),
+  xlsxy: path.join(__dirname, 'templates', 'blank.xlsx'),
+};
+
+/** `docxy_new`/`xlsxy_new`: copy the shipped blank template to an absolutized
+ *  path, then open it via the existing open verb — mirrors
+ *  `ctlcore::client::new_file` (resolution first: a bad or ambiguous target
+ *  creates nothing; no live instance still creates, with `opened:false`). */
+async function doNew(app, args) {
+  if (typeof args?.path !== 'string') throw new Error('missing path');
+  const abs = path.resolve(args.path);
+  const target = typeof args?.target === 'string' ? args.target : undefined;
+  const inst = await resolveTargetForNew(app, target);
+  if (fs.existsSync(abs)) throw new Error(`already exists: ${abs}`);
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    // COPYFILE_EXCL: create-exclusive, so a file appearing between the exists
+    // check and the copy errors instead of being truncated — mirrors the
+    // create_new(true) open in ctlcore::client::new_file.
+    fs.copyFileSync(TEMPLATES[app], abs, fs.constants.COPYFILE_EXCL);
+  } catch (e) {
+    if (e?.code === 'EEXIST') throw new Error(`already exists: ${abs}`);
+    throw new Error(`create failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (inst === undefined) return JSON.stringify({ path: abs, opened: false });
+  try {
+    await callInstance(inst, app === 'docxy' ? 'doc.open' : 'wb.open', { path: abs });
+  } catch (e) {
+    throw new Error(`created ${abs} but open failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return JSON.stringify({ path: abs, opened: true, instance: inst.instance });
+}
+
 /** Send `verb`/`args` to `inst` over a fresh short-lived TCP connection and
  *  return its `result` — or throw a transport failure or the server's own
  *  `{ok:false,error}` message. Mirrors `ctlcore::client::Client::call`
@@ -250,6 +305,17 @@ function docxyToolDefs() {
       [],
     ),
     tool(
+      'docxy_new',
+      'Create a new blank .docx at a path and open it in the running docxy (in a VS Code ' +
+        'window, a new tab). With no docxy running the file is still created. Refuses to ' +
+        'overwrite an existing file.',
+      Object.fromEntries([
+        ['path', prop('string', 'File path for the new document (created; must not exist).')],
+        target(),
+      ]),
+      ['path'],
+    ),
+    tool(
       'docxy_status',
       "Report the open document's path, format, modified flag, and block count.",
       Object.fromEntries([target()]),
@@ -327,6 +393,17 @@ function xlsxyToolDefs() {
       'List the xlsxy editors currently running on this machine (instance/pane id, port, pid).',
       {},
       [],
+    ),
+    tool(
+      'xlsxy_new',
+      'Create a new blank .xlsx at a path and open it in the running xlsxy (in a VS Code ' +
+        'window, a new tab). With no xlsxy running the file is still created. Refuses to ' +
+        'overwrite an existing file.',
+      Object.fromEntries([
+        ['path', prop('string', 'File path for the new workbook (created; must not exist).')],
+        target(),
+      ]),
+      ['path'],
     ),
     tool(
       'xlsxy_status',
@@ -427,6 +504,8 @@ async function doTool(name, args) {
   if (name === 'xlsxy_list') {
     return JSON.stringify(await listRunning('xlsxy'));
   }
+  if (name === 'docxy_new') return doNew('docxy', args);
+  if (name === 'xlsxy_new') return doNew('xlsxy', args);
   let app;
   let verb;
   if (Object.prototype.hasOwnProperty.call(DOCXY_VERBS, name)) {
