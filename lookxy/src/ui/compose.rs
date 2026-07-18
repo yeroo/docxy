@@ -989,6 +989,48 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_opens_accepts_and_esc_routes_through_handle_key() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_contact(&mailcore::store::Contact {
+                name: "Alice".into(),
+                address: "alice@x.com".into(),
+                source: "local".into(),
+                last_seen: "".into(),
+                frequency: 5,
+                relevance: None,
+            })
+            .unwrap();
+        app.compose = Some(Compose::new("d".into())); // focus starts on To
+
+        // Typing "al" (a token matching the seeded contact) opens the dropdown.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert!(app.compose.as_ref().unwrap().autocomplete.is_some());
+
+        // Down is a clamped no-op with a single match, but it must be
+        // consumed by the open dropdown rather than falling through to
+        // ordinary field editing.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.compose.as_ref().unwrap().autocomplete.is_none());
+        assert_eq!(app.compose.as_ref().unwrap().to, "Alice <alice@x.com>; ");
+
+        // The token after "; " is "a", which reopens the dropdown.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.compose.as_ref().unwrap().autocomplete.is_some());
+
+        // Esc with a dropdown open closes it and does NOT request save.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.compose.as_ref().unwrap().autocomplete.is_none());
+        assert!(app.compose_action.is_none());
+
+        // Esc again, with no dropdown open, falls through to save.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.compose_action, Some(ComposeAction::Save)));
+    }
+
+    #[test]
     fn handle_key_is_a_no_op_when_compose_is_closed() {
         let mut app = App::for_test_with_seeded_store();
         assert!(app.compose.is_none());
