@@ -122,7 +122,10 @@ plain-text form is preserved (`insert`/`append` = one undo step;
 `replace-range` = two steps when the replaced range is non-empty, one when
 it's empty — same as plain text on the same range). An empty/whitespace-only
 `text` that parses to zero blocks errors `"empty markdown"` and touches
-nothing (no splice, no undo entry, no dirty flag).
+nothing (no splice, no undo entry, no dirty flag). Undoing a markdown write
+reverts the spliced *content*, but any style/numbering definitions it ensured
+(`Heading1`, a list's numbering part, …) remain in the package — deliberate,
+since ensures aren't checkpointed onto the undo stack.
 
 Every construct below was verified spliced into an **existing** document
 (not just a freshly generated one), including its round-trip through
@@ -134,8 +137,8 @@ Every construct below was verified spliced into an **existing** document
 | Bold / italic / strike | Works. |
 | Inline code | Works structurally (round-trips); the `Code` character style is **not** auto-ensured (see below) — inline code never renders monospace in the TUI or PDF today regardless, a pre-existing, unrelated gap. |
 | Links | Works. |
-| Nested bullet lists | Works — numbering definitions ensured automatically. |
-| Nested ordered lists | Works — numbering definitions ensured automatically. |
+| Nested bullet lists | Works — all 9 indent levels are ensured (not just the top one), so a nested item gets a real marker, not a stray numeral. |
+| Nested ordered lists | Works — all 9 indent levels are ensured (not just the top one), so a nested item gets a real marker, not a stray numeral. |
 | Tables | Works. |
 | Blockquote | Works — styles auto-ensured. |
 | Horizontal rule | Works. |
@@ -145,7 +148,8 @@ Every construct below was verified spliced into an **existing** document
 | `$$display math$$` | Works. |
 | ` ```mermaid ` fences | Works. |
 
-All 15 constructs land correctly — nothing degrades silently. "Styles
+14 rows covering all 15 spec-listed constructs (`Bold / italic / strike`
+bundles three) land correctly — nothing degrades silently. "Styles
 auto-ensured" means: when a markdown write references a paragraph style the
 target `.docx` doesn't already define (`Heading1`–`Heading6`, `Quote`,
 `SourceCode`), the write injects that style's definition into `styles.xml`

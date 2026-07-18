@@ -1563,6 +1563,11 @@ impl Session {
         let si = self.ctl_sheet_arg(args)?;
         let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
         let (r1, c1, r2, c2) = ctl_parse_range(rg)?;
+        // Reject an oversized range BEFORE materializing a Cell per coordinate
+        // or touching the undo stack — see
+        // `gridcore::format::check_format_range_cap`; mirrors xlsxy's
+        // `cell_format` byte-for-byte, including the error string.
+        gridcore::format::check_format_range_cap(r1, c1, r2, c2)?;
         let patch_arg = args.get("patch").ok_or("cell.format needs a 'patch'")?;
         let pairs = ctl_patch_pairs(patch_arg)?;
         let patch = FormatPatch::parse(&pairs)?;
@@ -2091,21 +2096,42 @@ fn ctl_patch_pairs(patch: &json::Json) -> Result<Vec<(String, String)>, String> 
         .collect())
 }
 
-/// Resolve `col.width`'s `col` arg — a column letter (`"C"`) or a 0-based
-/// index — mirroring [`Session::ctl_sheet_arg`]'s index-or-name flexibility.
-/// Mirrors xlsxy control.rs's `col_arg` exactly, including its error strings.
+/// Resolve `col.width`'s `col` arg — a column letter (`"C"`), a 0-based
+/// numeric index, or a digit-string index (`"5"`, so the schema's "letter or
+/// 0-based index" description is truthful for schema-conforming string
+/// inputs too) — mirroring [`Session::ctl_sheet_arg`]'s index-or-name
+/// flexibility. Mirrors xlsxy control.rs's `col_arg` exactly, including its
+/// error strings. Every arm is bound to `gridcore::sheet::MAX_COLS`, the same
+/// bound [`parse_col`] already applies to the letter arm: an out-of-range
+/// numeric index used to sail straight through into a saved `.xlsx`'s
+/// `ColDef`, which Excel then refuses to open without a "needs repair"
+/// prompt.
 fn ctl_col_arg(args: &json::Json) -> Result<u32, String> {
     match args.get("col") {
-        Some(json::Json::Num(_)) => args
-            .get_usize("col")
-            .map(|c| c as u32)
-            .ok_or_else(|| "bad 'col' index".to_string()),
+        Some(json::Json::Num(_)) => {
+            let c = args
+                .get_usize("col")
+                .map(|c| c as u32)
+                .ok_or_else(|| "bad 'col' index".to_string())?;
+            if c >= gridcore::sheet::MAX_COLS {
+                return Err(format!("bad column '{c}'"));
+            }
+            Ok(c)
+        }
         Some(json::Json::Str(s)) => {
             let t = s.trim();
-            match parse_col(t) {
-                Some((col, used)) if used == t.len() => Ok(col),
-                _ => Err(format!("bad column '{s}'")),
+            if let Some((col, used)) = parse_col(t) {
+                if used == t.len() {
+                    return Ok(col);
+                }
+            } else if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(c) = t.parse::<u32>() {
+                    if c < gridcore::sheet::MAX_COLS {
+                        return Ok(c);
+                    }
+                }
             }
+            Err(format!("bad column '{s}'"))
         }
         _ => Err("col.width needs a 'col' (letter or 0-based index)".to_string()),
     }
@@ -3697,6 +3723,48 @@ mod tests {
     }
 
     #[test]
+    fn ctl_cell_format_rejects_a_range_over_the_cap_and_touches_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let undo_before = s.undo.len();
+        // A1:A1048576 — the whole column — vastly exceeds the cap; must be
+        // rejected BEFORE materializing a Cell per coordinate.
+        let out =
+            s.ctl(r#"{"verb":"cell.format","args":{"range":"A1:A1048576","patch":{"bold":true}}}"#);
+        assert!(
+            out.contains("\"ok\":false")
+                && out.contains(&format!(
+                    "cell.format: range too large (limit {} cells)",
+                    gridcore::format::CELL_FORMAT_CAP
+                )),
+            "{out}"
+        );
+        assert_eq!(s.undo.len(), undo_before, "a rejected range must not apply");
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(!cell.contains("\"format\""), "{cell}");
+    }
+
+    #[test]
+    fn ctl_cell_format_at_the_cap_still_works() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // A 50x100 rectangle lands exactly at the cap: allowed, and every
+        // cell in it gets formatted.
+        let cols: u32 = 50;
+        let rows: u64 = gridcore::format::CELL_FORMAT_CAP / u64::from(cols);
+        assert_eq!(rows * u64::from(cols), gridcore::format::CELL_FORMAT_CAP);
+        let range = format!("A1:{}{rows}", gridcore::sheet::col_name(cols - 1));
+        let out = s.ctl(&format!(
+            r#"{{"verb":"cell.format","args":{{"range":"{range}","patch":{{"bold":true}}}}}}"#
+        ));
+        assert!(
+            out.contains(&format!(
+                "\"formatted\":{}",
+                gridcore::format::CELL_FORMAT_CAP
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn ctl_cell_format_preserves_a_formula_and_its_recalculated_value() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"B4","patch":{"bold":true}}}"#);
@@ -3896,6 +3964,47 @@ mod tests {
             "{out}"
         );
         assert_eq!(s.pkg.workbook.sheets[0].col_width(4), 15.0);
+    }
+
+    #[test]
+    fn ctl_col_width_rejects_a_huge_numeric_col() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":99999999,"width":20}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("bad column '99999999'"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_col_width_accepts_a_digit_string_col_and_bounds_it() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // A schema-conforming string index ("5"), not just a JSON number.
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"5","width":12}}"#);
+        assert!(
+            out.contains("\"col\":5") && out.contains("\"width\":12"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(5), 12.0);
+
+        // But the same bound applies as the numeric arm.
+        let out2 = s.ctl(r#"{"verb":"col.width","args":{"col":"99999999","width":12}}"#);
+        assert!(
+            out2.contains("\"ok\":false") && out2.contains("bad column '99999999'"),
+            "{out2}"
+        );
+    }
+
+    #[test]
+    fn ctl_col_width_letter_arm_is_unchanged() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"Z","width":9}}"#);
+        assert!(out.contains("\"col\":25"), "{out}");
+        let out2 = s.ctl(r#"{"verb":"col.width","args":{"col":"ZZZZ","width":9}}"#);
+        assert!(
+            out2.contains("\"ok\":false") && out2.contains("bad column 'ZZZZ'"),
+            "{out2}"
+        );
     }
 
     #[test]

@@ -1004,6 +1004,42 @@ mod tests {
     }
 
     #[test]
+    fn markdown_nested_list_ensures_all_indent_levels_not_just_the_top_one() {
+        // Regression test for the bug `Package::ensure_list` used to define
+        // only `ilvl=0` — a nested item spliced into an EXISTING (non-
+        // markdown-created) package would reference an undefined level,
+        // rendering a stray decimal marker in the TUI / no marker in Word.
+        let mut app = app_with(&["Existing"]);
+        append(
+            &mut app,
+            &args(vec![
+                ("text", Json::Str("- a\n  - b".into())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        let numbering =
+            String::from_utf8_lossy(app.pkg.part("word/numbering.xml").unwrap()).into_owned();
+        assert!(
+            numbering.contains("w:ilvl=\"1\""),
+            "nested item's level must be defined: {numbering}"
+        );
+        // The nested paragraph's own ilvl survived the splice untouched
+        // (only numId gets remapped, never ilvl).
+        let nested_ilvl = app
+            .editor
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) if p.props.num_id.is_some() => Some(p.props.ilvl),
+                _ => None,
+            })
+            .max();
+        assert_eq!(nested_ilvl, Some(1), "{:?}", app.editor.doc.body);
+    }
+
+    #[test]
     fn out_of_bounds_markdown_list_insert_leaves_the_package_untouched() {
         // Regression guard: `prepare_markdown_blocks`'s ensure_list/ensure_styles
         // mutation must never run before the splice position itself is known

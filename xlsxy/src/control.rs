@@ -958,6 +958,9 @@ fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
     let (r1, c1, r2, c2) = parse_range(rg)?;
+    // Reject an oversized range BEFORE materializing a Cell per coordinate or
+    // touching the undo stack — see `gridcore::format::check_format_range_cap`.
+    gridcore::format::check_format_range_cap(r1, c1, r2, c2)?;
     let patch_arg = args.get("patch").ok_or("cell.format needs a 'patch'")?;
     let pairs = patch_pairs(patch_arg)?;
     let patch = FormatPatch::parse(&pairs)?;
@@ -987,20 +990,40 @@ fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![("formatted", Json::Num(formatted as f64))]))
 }
 
-/// Resolve the `col` arg — a column letter (`"C"`) or a 0-based index —
-/// mirroring [`sheet_arg`]'s index-or-name flexibility.
+/// Resolve the `col` arg — a column letter (`"C"`), a 0-based numeric index,
+/// or a digit-string index (`"5"`, so the schema's "letter or 0-based index"
+/// description is truthful for schema-conforming string inputs too) —
+/// mirroring [`sheet_arg`]'s index-or-name flexibility. Every arm is bound to
+/// `gridcore::sheet::MAX_COLS`, the same bound [`parse_col`] already applies
+/// to the letter arm: an out-of-range numeric index used to sail straight
+/// through into a saved `.xlsx`'s `ColDef`, which Excel then refuses to open
+/// without a "needs repair" prompt.
 fn col_arg(args: &Json) -> Result<u32, String> {
     match args.get("col") {
-        Some(Json::Num(_)) => args
-            .get_usize("col")
-            .map(|c| c as u32)
-            .ok_or_else(|| "bad 'col' index".to_string()),
+        Some(Json::Num(_)) => {
+            let c = args
+                .get_usize("col")
+                .map(|c| c as u32)
+                .ok_or_else(|| "bad 'col' index".to_string())?;
+            if c >= gridcore::sheet::MAX_COLS {
+                return Err(format!("bad column '{c}'"));
+            }
+            Ok(c)
+        }
         Some(Json::Str(s)) => {
             let t = s.trim();
-            match parse_col(t) {
-                Some((col, used)) if used == t.len() => Ok(col),
-                _ => Err(format!("bad column '{s}'")),
+            if let Some((col, used)) = parse_col(t) {
+                if used == t.len() {
+                    return Ok(col);
+                }
+            } else if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(c) = t.parse::<u32>() {
+                    if c < gridcore::sheet::MAX_COLS {
+                        return Ok(c);
+                    }
+                }
             }
+            Err(format!("bad column '{s}'"))
         }
         _ => Err("col.width needs a 'col' (letter or 0-based index)".to_string()),
     }
@@ -2103,6 +2126,61 @@ mod tests {
     }
 
     #[test]
+    fn cell_format_rejects_a_range_over_the_cap_and_touches_nothing() {
+        let mut a = app();
+        set(&mut a, "A1", "keep-me");
+        let undo_depth_before = a.undo.len();
+        // A1:A1048576 — the whole column — vastly exceeds the cap; must be
+        // rejected BEFORE materializing a Cell per coordinate.
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:A1048576".into())),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "cell.format: range too large (limit {} cells)",
+                gridcore::format::CELL_FORMAT_CAP
+            )
+        );
+        // Nothing applied: the pre-existing cell is untouched and no undo
+        // group landed on the stack.
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get_str("text"), Some("keep-me"));
+        assert!(g.get("format").is_none());
+        assert_eq!(a.undo.len(), undo_depth_before);
+    }
+
+    #[test]
+    fn cell_format_at_the_cap_still_works() {
+        let mut a = app();
+        // A 50x100 rectangle lands exactly at the cap: allowed, and every
+        // cell in it gets formatted.
+        let cols: u32 = 50;
+        let rows: u64 = gridcore::format::CELL_FORMAT_CAP / u64::from(cols);
+        assert_eq!(rows * u64::from(cols), gridcore::format::CELL_FORMAT_CAP);
+        let range = format!("A1:{}{rows}", gridcore::sheet::col_name(cols - 1));
+        let r = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str(range)),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            r.get_usize("formatted"),
+            Some(gridcore::format::CELL_FORMAT_CAP as usize)
+        );
+    }
+
+    #[test]
     fn cell_get_format_echoes_the_patch_on_every_formatted_cell() {
         let mut a = app();
         dispatch(
@@ -2433,6 +2511,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.pkg.workbook.sheets[0].col_width(4), 15.0);
+    }
+
+    #[test]
+    fn col_width_rejects_a_huge_numeric_col() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Num(99_999_999.0)),
+                ("width", Json::Num(20.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "bad column '99999999'");
+    }
+
+    #[test]
+    fn col_width_accepts_a_digit_string_col_and_bounds_it() {
+        let mut a = app();
+        // A schema-conforming string index ("5"), not just a JSON number.
+        dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("5".into())),
+                ("width", Json::Num(12.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(5), 12.0);
+
+        // But the same bound applies as the numeric arm.
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("99999999".into())),
+                ("width", Json::Num(12.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "bad column '99999999'");
+    }
+
+    #[test]
+    fn col_width_letter_arm_is_unchanged() {
+        let mut a = app();
+        // A valid letter still resolves exactly as before.
+        let r = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("Z".into())),
+                ("width", Json::Num(9.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("col"), Some(25));
+        // An out-of-range letter is still rejected the same way it always was.
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("ZZZZ".into())),
+                ("width", Json::Num(9.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "bad column 'ZZZZ'");
     }
 
     #[test]

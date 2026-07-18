@@ -319,20 +319,21 @@ impl Package {
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
     /// its `numId`, creating the part + relationship + content-type if absent. Used
     /// by the Bullets/Numbering ribbon commands so applied lists render and save.
+    ///
+    /// Defines all 9 indent levels (`ilvl` 0..9, [`markdown_list_levels`]) — the
+    /// same set [`new_markdown_package`] defines for a fresh markdown package —
+    /// not just `ilvl=0`. A nested Markdown list (`- a\n  - b`) spliced into an
+    /// *existing* package via this call references `ilvl=1`, `2`, etc.; with only
+    /// `ilvl=0` defined, [`crate::numbering::Numbering::marker`] falls back to a
+    /// stray decimal marker (or Word shows no marker at all) for any nested item.
     pub fn ensure_list(&mut self, bullet: bool) -> i32 {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         // Reserved high ids, unlikely to collide with a document's own lists.
-        let (num_id, abs_id, fmt, text) = if bullet {
-            (9990, 9990, "bullet", "•")
-        } else {
-            (9991, 9991, "decimal", "%1.")
-        };
-        let abstract_xml = format!(
-            "<w:abstractNum w:abstractNumId=\"{abs_id}\"><w:lvl w:ilvl=\"0\">\
-             <w:start w:val=\"1\"/><w:numFmt w:val=\"{fmt}\"/><w:lvlText w:val=\"{text}\"/>\
-             <w:lvlJc w:val=\"left\"/></w:lvl></w:abstractNum>"
-        );
+        let (num_id, abs_id) = if bullet { (9990, 9990) } else { (9991, 9991) };
+        let levels = markdown_list_levels(bullet);
+        let abstract_xml =
+            format!("<w:abstractNum w:abstractNumId=\"{abs_id}\">{levels}</w:abstractNum>");
         let num_xml =
             format!("<w:num w:numId=\"{num_id}\"><w:abstractNumId w:val=\"{abs_id}\"/></w:num>");
         let name = "word/numbering.xml";
@@ -495,6 +496,30 @@ fn markdown_style_def(id: &str) -> Option<String> {
     }
 }
 
+/// The concatenated `<w:lvl>` XML for all 9 indent levels (`ilvl` 0..9) of a
+/// bullet or decimal list — the depth Markdown lists can nest to. Shared by
+/// [`new_markdown_package`] (defines the full set for a fresh markdown
+/// package) and [`Package::ensure_list`] (defines the same set when splicing
+/// into an existing package), so the two list definitions can never drift
+/// apart — mirrors [`markdown_style_def`]'s role for styles.
+fn markdown_list_levels(bullet: bool) -> String {
+    let mut out = String::new();
+    for lvl in 0..9 {
+        if bullet {
+            out.push_str(&format!(
+                "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
+            ));
+        } else {
+            out.push_str(&format!(
+                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>\
+                 <w:lvlText w:val=\"%{}.\"/></w:lvl>",
+                lvl + 1
+            ));
+        }
+    }
+    out
+}
+
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
 fn next_rid(rels: &str) -> String {
     format!("rId{}", next_rid_num(rels))
@@ -621,17 +646,8 @@ pub fn new_markdown_package(document: Document) -> Package {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     let mut pkg = new_package(document);
 
-    let mut bullets = String::new();
-    let mut decimals = String::new();
-    for lvl in 0..9 {
-        bullets.push_str(&format!(
-            "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
-        ));
-        decimals.push_str(&format!(
-            "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%{}.\"/></w:lvl>",
-            lvl + 1
-        ));
-    }
+    let bullets = markdown_list_levels(true);
+    let decimals = markdown_list_levels(false);
     let numbering = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:numbering xmlns:w=\"{W}\">\
@@ -1143,6 +1159,77 @@ mod tests {
         assert!(
             !styles.contains("NotARealStyle"),
             "an id outside the Markdown-mapped set must be silently ignored: {styles}"
+        );
+    }
+
+    #[test]
+    fn ensure_list_defines_all_nine_levels_so_nested_items_get_real_markers() {
+        use crate::markdown::from_markdown;
+        use crate::model::Paragraph;
+        use crate::numbering::{compute_markers, parse_numbering_xml};
+
+        // Splice a nested bullet list into a plain, non-markdown-created package
+        // — exactly what `docxy::control::prepare_markdown_blocks` does.
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        let parsed = from_markdown("- a\n  - b");
+        let bullet_id = pkg.ensure_list(true);
+
+        // The numbering part must define ilvl=1 (and beyond), not just ilvl=0 —
+        // Word/`compute_markers` fall back to a plain decimal for an undefined
+        // level, which is the bug this fix closes.
+        let numbering =
+            String::from_utf8_lossy(pkg.part("word/numbering.xml").unwrap()).into_owned();
+        assert!(
+            numbering.contains("w:ilvl=\"1\""),
+            "ensure_list must define ilvl=1 for nested lists: {numbering}"
+        );
+        for lvl in 0..9 {
+            assert!(
+                numbering.contains(&format!("w:ilvl=\"{lvl}\"")),
+                "missing level {lvl}: {numbering}"
+            );
+        }
+
+        // Remap the parsed blocks' bare markdown numId (1) onto the reserved
+        // ensure_list id, same as `prepare_markdown_blocks` does, then verify
+        // the TUI marker path renders a real bullet — not a stray "1." — for
+        // the nested (ilvl=1) item.
+        let mut body = parsed.body;
+        for b in body.iter_mut() {
+            if let Block::Paragraph(p) = b {
+                if p.props.num_id == Some(1) {
+                    p.props.num_id = Some(bullet_id);
+                }
+            }
+        }
+        let nested_ilvl = body
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) if p.props.num_id == Some(bullet_id) && p.props.ilvl > 0 => {
+                    Some(p.props.ilvl)
+                }
+                _ => None,
+            })
+            .expect("markdown source has a nested (ilvl>0) item");
+        assert_eq!(nested_ilvl, 1);
+
+        let doc = Document { body };
+        let num = parse_numbering_xml(&numbering);
+        let markers = compute_markers(&doc, &num);
+        let nested_marker = doc
+            .body
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| match b {
+                Block::Paragraph(p) if p.props.ilvl == 1 => markers.get(&vec![i]).cloned(),
+                _ => None,
+            })
+            .expect("nested item must get a marker");
+        assert_eq!(
+            nested_marker, "◦",
+            "nested bullet must render its own marker char, not a decimal fallback"
         );
     }
 

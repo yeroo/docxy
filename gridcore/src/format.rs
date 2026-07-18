@@ -84,11 +84,58 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     if hex.len() != 6 || !hex.is_ascii() {
         return Err(bad());
     }
-    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    // Strict two-hex-digit parsing, byte by byte — NOT `u8::from_str_radix`,
+    // which accepts a leading '+' (`from_str_radix("+0", 16)` is `Ok(0)`),
+    // letting a code like "#+00000" sneak through as black instead of being
+    // rejected for the non-hex-digit byte it actually contains.
+    fn hex_digit(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = hex.as_bytes();
+    let byte =
+        |i: usize| -> Option<u8> { Some((hex_digit(bytes[i])? << 4) | hex_digit(bytes[i + 1])?) };
     match (byte(0), byte(2), byte(4)) {
         (Some(r), Some(g), Some(b)) => Ok((r, g, b)),
         _ => Err(bad()),
     }
+}
+
+/// The largest inclusive rectangle a single `cell.format` call may
+/// materialize. `cell.format` (unlike `sheet.read`, whose `READ_CAP`/
+/// `CTL_READ_CAP` only bounds how many already-populated cells get echoed
+/// back over the wire) writes a [`crate::sheet::Cell`] into EVERY coordinate
+/// of the range, including ones that were empty — an unbounded `A1:A1048576`
+/// would materialize ~1M cells (plus an undo snapshot of the same size).
+/// Sized to match `sheet.read`'s own `READ_CAP`/`CTL_READ_CAP` (5000): both
+/// bound the same class of "how much of a sheet does one control-verb call
+/// touch" cost, and 5000 real per-cell writes through `Engine::set_cell`
+/// (which — like the rest of a dense-range write — costs more than a plain
+/// insert per cell) stays comfortably fast, unlike, say, xlsxy's
+/// `MAX_PASTE_CELLS` (100,000, `xlsxy/src/main.rs`) which is sized only for
+/// an occasional big human paste, not a per-call agent verb. Kept here in
+/// gridcore so xlsxy's terminal `control.rs` and gridwasm's `grid_ctl`
+/// bridge share one bound and one error string.
+pub const CELL_FORMAT_CAP: u64 = 5_000;
+
+/// Reject a `cell.format` range whose cell count exceeds [`CELL_FORMAT_CAP`],
+/// BEFORE the caller materializes a `Cell` per coordinate or touches the undo
+/// stack. `r1<=r2`/`c1<=c2` is assumed (both hosts' `parse_range` already
+/// normalize min/max before calling this). Returns the exact wire error
+/// string both `cell.format` implementations return, byte-identical.
+pub fn check_format_range_cap(r1: u32, c1: u32, r2: u32, c2: u32) -> Result<(), String> {
+    let rows = u64::from(r2 - r1) + 1;
+    let cols = u64::from(c2 - c1) + 1;
+    if rows.saturating_mul(cols) > CELL_FORMAT_CAP {
+        return Err(format!(
+            "cell.format: range too large (limit {CELL_FORMAT_CAP} cells)"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_align(s: &str) -> Result<Align, String> {
@@ -257,6 +304,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_hex_color_rejects_a_leading_plus_sign() {
+        // `u8::from_str_radix("+0", 16)` is `Ok(0)` — a naive per-byte parse
+        // built on it would silently accept "#+00000" as black instead of
+        // rejecting the non-hex-digit '+' byte. Pin the strict behavior both
+        // directly and through the `FormatPatch::parse` entry point.
+        assert_eq!(
+            parse_hex_color("#+00000"),
+            Err("bad color '#+00000' (want \"#RRGGBB\")".to_string())
+        );
+        let err =
+            FormatPatch::parse(&[("fontColor".to_string(), "#+00000".to_string())]).unwrap_err();
+        assert!(err.contains("color"), "{err}");
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_every_valid_hex_digit() {
+        assert_eq!(parse_hex_color("#00FF7F"), Ok((0, 255, 127)));
+        assert_eq!(parse_hex_color("#abcdef"), Ok((171, 205, 239)));
+        assert_eq!(parse_hex_color("#ABCDEF"), Ok((171, 205, 239)));
+    }
+
+    #[test]
     fn bad_align_is_rejected() {
         let err = FormatPatch::parse(&[("align".to_string(), "middle".to_string())]).unwrap_err();
         assert!(err.contains("middle"), "{err}");
@@ -373,6 +442,22 @@ mod tests {
             xf_format_fields(&xf),
             vec![("numFmt", FormatValue::Str("m/d/yyyy".to_string()))]
         );
+    }
+
+    #[test]
+    fn check_format_range_cap_allows_at_cap_and_rejects_over_cap() {
+        // A single row spanning exactly CELL_FORMAT_CAP columns: allowed.
+        assert!(check_format_range_cap(0, 0, 0, CELL_FORMAT_CAP as u32 - 1).is_ok());
+        // One cell over: rejected, with the exact wire error string.
+        let err = check_format_range_cap(0, 0, 0, CELL_FORMAT_CAP as u32).unwrap_err();
+        assert_eq!(
+            err,
+            format!("cell.format: range too large (limit {CELL_FORMAT_CAP} cells)")
+        );
+        // A tiny range is always fine.
+        assert!(check_format_range_cap(3, 3, 5, 5).is_ok());
+        // A single cell is fine.
+        assert!(check_format_range_cap(9, 9, 9, 9).is_ok());
     }
 
     #[test]
