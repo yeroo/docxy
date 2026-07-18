@@ -10,7 +10,7 @@
 
 use ctlcore::client;
 use ctlcore::json::Json;
-use ctlcore::mcp::{McpServer, prop, tool};
+use ctlcore::mcp::{McpServer, item_array, item_obj, item_ty, prop, prop_array, tool};
 
 /// Serve MCP over stdio until stdin closes.
 pub fn run() -> std::io::Result<()> {
@@ -44,6 +44,25 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
         "xlsxy_find" => "find",
         "xlsxy_recalc" => "wb.recalc",
         "xlsxy_save" => "wb.save",
+        "xlsxy_comments" => "comment.list",
+        "xlsxy_comment_add" => "comment.add",
+        "xlsxy_comment_remove" => "comment.remove",
+        "xlsxy_range_set" => "range.set",
+        "xlsxy_export_csv" => "wb.export-csv",
+        "xlsxy_import_csv" => "sheet.import-csv",
+        "xlsxy_pivot" => "sheet.pivot",
+        "xlsxy_replace_all" => "wb.replace-all",
+        "xlsxy_sheet_add" => "sheet.add",
+        "xlsxy_sheet_remove" => "sheet.remove",
+        "xlsxy_sheet_rename" => "sheet.rename",
+        "xlsxy_row_insert" => "row.insert",
+        "xlsxy_row_delete" => "row.delete",
+        "xlsxy_col_insert" => "col.insert",
+        "xlsxy_col_delete" => "col.delete",
+        "xlsxy_eval" => "formula.eval",
+        "xlsxy_stats" => "sheet.stats",
+        "xlsxy_charts" => "chart.list",
+        "xlsxy_pivots" => "pivot.list",
         other => return Err(format!("unknown tool: {other}")),
     };
     let client = client::resolve_target(&dir, "xlsxy", args.get_str("target"))?;
@@ -169,6 +188,282 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "xlsxy_comments",
+            "List every cell comment (threads flattened in reply order): sheet, cell ref, author, text.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "xlsxy_comment_add",
+            "Add a threaded comment to a cell (or a reply, if the cell already has a thread).",
+            vec![
+                ("ref", prop("string", "Cell reference, e.g. \"B4\".")),
+                ("text", prop("string", "Comment text.")),
+                (
+                    "author",
+                    prop("string", "Comment author (default: a generic agent name)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["ref", "text"],
+        ),
+        tool(
+            "xlsxy_comment_remove",
+            "Remove the comment (threaded or legacy note) on a cell, if any.",
+            vec![
+                ("ref", prop("string", "Cell reference, e.g. \"B4\".")),
+                sheet(),
+                target(),
+            ],
+            &["ref"],
+        ),
+        tool(
+            "xlsxy_range_set",
+            "Write a rectangular block of cells starting at a top-left ref, atomically: every \
+             formula in the batch is validated before anything is applied. One undo group.",
+            vec![
+                (
+                    "start",
+                    prop("string", "Top-left cell reference, e.g. \"B4\"."),
+                ),
+                (
+                    "rows",
+                    prop_array(
+                        item_array(item_ty("string")),
+                        "Rows of cell text, each row an array of strings entered like xlsxy_set's \
+                         text (empty string clears the cell).",
+                    ),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["start", "rows"],
+        ),
+        tool(
+            "xlsxy_export_csv",
+            "Export a sheet's cells as display-formatted, RFC-4180 CSV.",
+            vec![sheet(), target()],
+            &[],
+        ),
+        tool(
+            "xlsxy_import_csv",
+            "Import CSV text as a brand-new sheet (never overwrites an existing one; name \
+             collisions are deduplicated).",
+            vec![
+                ("text", prop("string", "CSV text to import.")),
+                (
+                    "name",
+                    prop(
+                        "string",
+                        "Requested sheet name (default: \"Sheet\", deduplicated).",
+                    ),
+                ),
+                target(),
+            ],
+            &["text"],
+        ),
+        tool(
+            "xlsxy_pivot",
+            "Compute an ad-hoc pivot table over a range (first row = header names); read-only, no \
+             workbook mutation.",
+            vec![
+                (
+                    "range",
+                    prop(
+                        "string",
+                        "A1-style range, e.g. \"A1:D100\", first row = headers.",
+                    ),
+                ),
+                (
+                    "rows",
+                    prop_array(
+                        item_ty("string"),
+                        "Header names to group by, as pivot rows.",
+                    ),
+                ),
+                (
+                    "cols",
+                    prop_array(
+                        item_ty("string"),
+                        "Header names to group by, as pivot columns.",
+                    ),
+                ),
+                (
+                    "values",
+                    prop_array(
+                        item_obj(
+                            vec![
+                                (
+                                    "col",
+                                    prop("string", "Header name of the column to aggregate."),
+                                ),
+                                (
+                                    "agg",
+                                    prop(
+                                        "string",
+                                        "Aggregation: sum, count, countNums, average, max, min, \
+                                         product, stdDev, stdDevP, var, or varP.",
+                                    ),
+                                ),
+                            ],
+                            &["col", "agg"],
+                        ),
+                        "Measures to compute, each a {col, agg} pair.",
+                    ),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["range", "rows", "values"],
+        ),
+        tool(
+            "xlsxy_replace_all",
+            "Literal find/replace across every cell's input text, on every sheet. One undo group.",
+            vec![
+                ("query", prop("string", "Text to search for.")),
+                ("text", prop("string", "Replacement text.")),
+                target(),
+            ],
+            &["query", "text"],
+        ),
+        tool(
+            "xlsxy_sheet_add",
+            "Add a new sheet (deduplicated name on collision — never errors on a taken name).",
+            vec![
+                (
+                    "name",
+                    prop(
+                        "string",
+                        "Requested sheet name (default: \"Sheet\", deduplicated).",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
+        tool(
+            "xlsxy_sheet_remove",
+            "Remove a sheet (errors on the last one — a workbook must keep at least one).",
+            vec![
+                ("sheet", prop("string", "Sheet index or name to remove.")),
+                target(),
+            ],
+            &["sheet"],
+        ),
+        tool(
+            "xlsxy_sheet_rename",
+            "Rename a sheet and rewrite every formula/defined-name reference to it.",
+            vec![
+                ("sheet", prop("string", "Sheet index or name to rename.")),
+                ("name", prop("string", "New sheet name.")),
+                target(),
+            ],
+            &["sheet", "name"],
+        ),
+        tool(
+            "xlsxy_row_insert",
+            "Insert rows at a 0-based row index.",
+            vec![
+                ("at", prop("integer", "0-based row index to insert at.")),
+                (
+                    "count",
+                    prop("integer", "Number of rows to insert (default 1)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["at"],
+        ),
+        tool(
+            "xlsxy_row_delete",
+            "Delete rows at a 0-based row index.",
+            vec![
+                ("at", prop("integer", "0-based row index to delete from.")),
+                (
+                    "count",
+                    prop("integer", "Number of rows to delete (default 1)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["at"],
+        ),
+        tool(
+            "xlsxy_col_insert",
+            "Insert columns at a 0-based column index.",
+            vec![
+                ("at", prop("integer", "0-based column index to insert at.")),
+                (
+                    "count",
+                    prop("integer", "Number of columns to insert (default 1)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["at"],
+        ),
+        tool(
+            "xlsxy_col_delete",
+            "Delete columns at a 0-based column index.",
+            vec![
+                (
+                    "at",
+                    prop("integer", "0-based column index to delete from."),
+                ),
+                (
+                    "count",
+                    prop("integer", "Number of columns to delete (default 1)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["at"],
+        ),
+        tool(
+            "xlsxy_eval",
+            "Side-effect-free formula preview: evaluate a formula against the live workbook at a \
+             cell without writing anywhere.",
+            vec![
+                (
+                    "formula",
+                    prop(
+                        "string",
+                        "Formula to evaluate, e.g. \"SUM(B1:B3)\" (leading '=' optional).",
+                    ),
+                ),
+                (
+                    "ref",
+                    prop("string", "Cell to evaluate at, e.g. \"B4\" (default A1)."),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["formula"],
+        ),
+        tool(
+            "xlsxy_stats",
+            "Summary statistics (sum, count, countNums, average, min, max) over a range.",
+            vec![
+                ("range", prop("string", "A1-style range, e.g. \"A1:C10\".")),
+                sheet(),
+                target(),
+            ],
+            &["range"],
+        ),
+        tool(
+            "xlsxy_charts",
+            "List every chart in the workbook: kind, title, categories, and series.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "xlsxy_pivots",
+            "List every persistent pivot table: sheet, row/column fields, and value fields.",
+            vec![target()],
+            &[],
+        ),
     ])
 }
 
@@ -241,5 +536,162 @@ mod tests {
     fn unknown_tool_is_reported() {
         let err = do_tool("xlsxy_nonesuch", &Json::obj(vec![])).unwrap_err();
         assert!(err.contains("unknown tool"));
+    }
+
+    #[test]
+    fn wave1_tools_are_present_and_ordered_after_the_existing_ones() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get_str("name")).collect();
+        let expected_tail = [
+            "xlsxy_comments",
+            "xlsxy_comment_add",
+            "xlsxy_comment_remove",
+            "xlsxy_range_set",
+            "xlsxy_export_csv",
+            "xlsxy_import_csv",
+            "xlsxy_pivot",
+            "xlsxy_replace_all",
+            "xlsxy_sheet_add",
+            "xlsxy_sheet_remove",
+            "xlsxy_sheet_rename",
+            "xlsxy_row_insert",
+            "xlsxy_row_delete",
+            "xlsxy_col_insert",
+            "xlsxy_col_delete",
+            "xlsxy_eval",
+            "xlsxy_stats",
+            "xlsxy_charts",
+            "xlsxy_pivots",
+        ];
+        let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
+        assert_eq!(
+            &names[save_pos + 1..],
+            &expected_tail,
+            "wave-1 tools must be appended right after xlsxy_save, in this order"
+        );
+        for t in tools {
+            assert_eq!(
+                t.get("inputSchema").unwrap().get_str("type"),
+                Some("object")
+            );
+        }
+    }
+
+    #[test]
+    fn wave1_tool_required_arrays_match_the_spec() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let required_of = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .get("inputSchema")
+                .unwrap()
+                .get("required")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(required_of("xlsxy_comments"), "[]");
+        assert_eq!(required_of("xlsxy_comment_add"), "[\"ref\",\"text\"]");
+        assert_eq!(required_of("xlsxy_comment_remove"), "[\"ref\"]");
+        assert_eq!(required_of("xlsxy_range_set"), "[\"start\",\"rows\"]");
+        assert_eq!(required_of("xlsxy_export_csv"), "[]");
+        assert_eq!(required_of("xlsxy_import_csv"), "[\"text\"]");
+        assert_eq!(
+            required_of("xlsxy_pivot"),
+            "[\"range\",\"rows\",\"values\"]"
+        );
+        assert_eq!(required_of("xlsxy_replace_all"), "[\"query\",\"text\"]");
+        assert_eq!(required_of("xlsxy_sheet_add"), "[]");
+        assert_eq!(required_of("xlsxy_sheet_remove"), "[\"sheet\"]");
+        assert_eq!(required_of("xlsxy_sheet_rename"), "[\"sheet\",\"name\"]");
+        assert_eq!(required_of("xlsxy_row_insert"), "[\"at\"]");
+        assert_eq!(required_of("xlsxy_row_delete"), "[\"at\"]");
+        assert_eq!(required_of("xlsxy_col_insert"), "[\"at\"]");
+        assert_eq!(required_of("xlsxy_col_delete"), "[\"at\"]");
+        assert_eq!(required_of("xlsxy_eval"), "[\"formula\"]");
+        assert_eq!(required_of("xlsxy_stats"), "[\"range\"]");
+        assert_eq!(required_of("xlsxy_charts"), "[]");
+        assert_eq!(required_of("xlsxy_pivots"), "[]");
+    }
+
+    #[test]
+    fn wave1_array_arg_schemas_have_the_expected_nested_shape() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let props_of = |name: &str| -> Json {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .unwrap()
+                .get("inputSchema")
+                .unwrap()
+                .get("properties")
+                .unwrap()
+                .clone()
+        };
+
+        // xlsxy_range_set.rows: array of arrays of strings.
+        let rows_schema = props_of("xlsxy_range_set").get("rows").unwrap().clone();
+        assert_eq!(rows_schema.get_str("type"), Some("array"));
+        let rows_items = rows_schema.get("items").unwrap();
+        assert_eq!(rows_items.get_str("type"), Some("array"));
+        assert_eq!(
+            rows_items.get("items").unwrap().get_str("type"),
+            Some("string")
+        );
+
+        // xlsxy_pivot.rows / .cols: arrays of strings.
+        let pivot_props = props_of("xlsxy_pivot");
+        for key in ["rows", "cols"] {
+            let schema = pivot_props.get(key).unwrap();
+            assert_eq!(schema.get_str("type"), Some("array"));
+            assert_eq!(schema.get("items").unwrap().get_str("type"), Some("string"));
+        }
+
+        // xlsxy_pivot.values: array of {col, agg} objects, both required.
+        let values_schema = pivot_props.get("values").unwrap();
+        assert_eq!(values_schema.get_str("type"), Some("array"));
+        let item = values_schema.get("items").unwrap();
+        assert_eq!(item.get_str("type"), Some("object"));
+        assert!(item.get("properties").unwrap().get("col").is_some());
+        assert!(item.get("properties").unwrap().get("agg").is_some());
+        assert_eq!(
+            item.get("required").unwrap().to_string(),
+            "[\"col\",\"agg\"]"
+        );
+    }
+
+    #[test]
+    fn wave1_verb_map_forwards_to_the_expected_verbs() {
+        for name in [
+            "xlsxy_comments",
+            "xlsxy_comment_add",
+            "xlsxy_comment_remove",
+            "xlsxy_range_set",
+            "xlsxy_export_csv",
+            "xlsxy_import_csv",
+            "xlsxy_pivot",
+            "xlsxy_replace_all",
+            "xlsxy_sheet_add",
+            "xlsxy_sheet_remove",
+            "xlsxy_sheet_rename",
+            "xlsxy_row_insert",
+            "xlsxy_row_delete",
+            "xlsxy_col_insert",
+            "xlsxy_col_delete",
+            "xlsxy_eval",
+            "xlsxy_stats",
+            "xlsxy_charts",
+            "xlsxy_pivots",
+        ] {
+            let err = do_tool(name, &Json::obj(vec![])).unwrap_err();
+            assert!(
+                !err.contains("unknown tool"),
+                "{name} should route to a verb, got: {err}"
+            );
+        }
     }
 }

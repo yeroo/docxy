@@ -302,6 +302,29 @@ function tool(name, description, properties, required) {
   };
 }
 
+/** A JSON-schema property for an array-typed arg — mirrors
+ *  `ctlcore::mcp::prop_array`. Compose `items` from `itemTy`/`itemArray`/
+ *  `itemObj`. */
+function propArray(items, description) {
+  return { type: 'array', items, description };
+}
+
+/** A bare `{"type": ty}` items schema — mirrors `ctlcore::mcp::item_ty`. */
+function itemTy(ty) {
+  return { type: ty };
+}
+
+/** A bare array items schema wrapping a nested `items` schema — mirrors
+ *  `ctlcore::mcp::item_array`. */
+function itemArray(items) {
+  return { type: 'array', items };
+}
+
+/** A bare object items schema — mirrors `ctlcore::mcp::item_obj`. */
+function itemObj(properties, required) {
+  return { type: 'object', properties, required };
+}
+
 const DOCXY_TARGET_DESC =
   'Optional: which docxy to act on (a substring of its instance/pane id) when several are open.';
 
@@ -387,6 +410,85 @@ function docxyToolDefs() {
       ['text'],
     ),
     tool('docxy_save', 'Save the open document to its file.', Object.fromEntries([target()]), []),
+    tool(
+      'docxy_export',
+      'Export the live document (including unsaved edits) as Markdown or plain text.',
+      Object.fromEntries([
+        ['format', prop('string', 'Output format: "markdown" or "text".')],
+        target(),
+      ]),
+      ['format'],
+    ),
+    tool(
+      'docxy_export_pdf',
+      'Render the live document to a PDF at a path. Refuses to overwrite an existing file.',
+      Object.fromEntries([
+        ['path', prop('string', 'File path for the PDF (created; must not exist).')],
+        target(),
+      ]),
+      ['path'],
+    ),
+    tool(
+      'docxy_comments',
+      "List the document's review comments (author, initials, date, text, anchor), in anchor order.",
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_notes',
+      "List the document's footnotes and endnotes, in file order.",
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_header',
+      "Read the default section header's block content (empty if the document has none).",
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_footer',
+      "Read the default section footer's block content (empty if the document has none).",
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_metadata',
+      "Read the document's core properties (title, author, subject, keywords, comments, " +
+        'last saved by, revision, created, modified) — present-if-set.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_stats',
+      'Word/character/paragraph/block counts over the live document.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_replace_all',
+      'Replace every occurrence of a query with text across the whole document ' +
+        '(case-insensitive unless case_sensitive:true). Undoable.',
+      Object.fromEntries([
+        ['query', prop('string', 'Text to search for.')],
+        ['text', prop('string', 'Replacement text.')],
+        ['case_sensitive', prop('boolean', 'Match case (default false).')],
+        target(),
+      ]),
+      ['query', 'text'],
+    ),
+    tool(
+      'docxy_undo',
+      'Undo the last edit, if any. Returns {done:false} when there is nothing to undo.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_redo',
+      'Redo the last undone edit, if any. Returns {done:false} when there is nothing to redo.',
+      Object.fromEntries([target()]),
+      [],
+    ),
   ];
 }
 
@@ -472,6 +574,215 @@ function xlsxyToolDefs() {
       [],
     ),
     tool('xlsxy_save', 'Save the open workbook to its file.', Object.fromEntries([target()]), []),
+    tool(
+      'xlsxy_comments',
+      'List every cell comment (threads flattened in reply order): sheet, cell ref, author, text.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'xlsxy_comment_add',
+      'Add a threaded comment to a cell (or a reply, if the cell already has a thread).',
+      Object.fromEntries([
+        ['ref', prop('string', 'Cell reference, e.g. "B4".')],
+        ['text', prop('string', 'Comment text.')],
+        ['author', prop('string', 'Comment author (default: a generic agent name).')],
+        sheet(),
+        target(),
+      ]),
+      ['ref', 'text'],
+    ),
+    tool(
+      'xlsxy_comment_remove',
+      'Remove the comment (threaded or legacy note) on a cell, if any.',
+      Object.fromEntries([['ref', prop('string', 'Cell reference, e.g. "B4".')], sheet(), target()]),
+      ['ref'],
+    ),
+    tool(
+      'xlsxy_range_set',
+      'Write a rectangular block of cells starting at a top-left ref, atomically: every ' +
+        'formula in the batch is validated before anything is applied. One undo group.',
+      Object.fromEntries([
+        ['start', prop('string', 'Top-left cell reference, e.g. "B4".')],
+        [
+          'rows',
+          propArray(
+            itemArray(itemTy('string')),
+            "Rows of cell text, each row an array of strings entered like xlsxy_set's " +
+              'text (empty string clears the cell).',
+          ),
+        ],
+        sheet(),
+        target(),
+      ]),
+      ['start', 'rows'],
+    ),
+    tool(
+      'xlsxy_export_csv',
+      "Export a sheet's cells as display-formatted, RFC-4180 CSV.",
+      Object.fromEntries([sheet(), target()]),
+      [],
+    ),
+    tool(
+      'xlsxy_import_csv',
+      'Import CSV text as a brand-new sheet (never overwrites an existing one; name ' +
+        'collisions are deduplicated).',
+      Object.fromEntries([
+        ['text', prop('string', 'CSV text to import.')],
+        ['name', prop('string', 'Requested sheet name (default: "Sheet", deduplicated).')],
+        target(),
+      ]),
+      ['text'],
+    ),
+    tool(
+      'xlsxy_pivot',
+      'Compute an ad-hoc pivot table over a range (first row = header names); read-only, no ' +
+        'workbook mutation.',
+      Object.fromEntries([
+        ['range', prop('string', 'A1-style range, e.g. "A1:D100", first row = headers.')],
+        ['rows', propArray(itemTy('string'), 'Header names to group by, as pivot rows.')],
+        ['cols', propArray(itemTy('string'), 'Header names to group by, as pivot columns.')],
+        [
+          'values',
+          propArray(
+            itemObj(
+              Object.fromEntries([
+                ['col', prop('string', 'Header name of the column to aggregate.')],
+                [
+                  'agg',
+                  prop(
+                    'string',
+                    'Aggregation: sum, count, countNums, average, max, min, ' +
+                      'product, stdDev, stdDevP, var, or varP.',
+                  ),
+                ],
+              ]),
+              ['col', 'agg'],
+            ),
+            'Measures to compute, each a {col, agg} pair.',
+          ),
+        ],
+        sheet(),
+        target(),
+      ]),
+      ['range', 'rows', 'values'],
+    ),
+    tool(
+      'xlsxy_replace_all',
+      "Literal find/replace across every cell's input text, on every sheet. One undo group.",
+      Object.fromEntries([
+        ['query', prop('string', 'Text to search for.')],
+        ['text', prop('string', 'Replacement text.')],
+        target(),
+      ]),
+      ['query', 'text'],
+    ),
+    tool(
+      'xlsxy_sheet_add',
+      'Add a new sheet (deduplicated name on collision — never errors on a taken name).',
+      Object.fromEntries([
+        ['name', prop('string', 'Requested sheet name (default: "Sheet", deduplicated).')],
+        target(),
+      ]),
+      [],
+    ),
+    tool(
+      'xlsxy_sheet_remove',
+      'Remove a sheet (errors on the last one — a workbook must keep at least one).',
+      Object.fromEntries([
+        ['sheet', prop('string', 'Sheet index or name to remove.')],
+        target(),
+      ]),
+      ['sheet'],
+    ),
+    tool(
+      'xlsxy_sheet_rename',
+      'Rename a sheet and rewrite every formula/defined-name reference to it.',
+      Object.fromEntries([
+        ['sheet', prop('string', 'Sheet index or name to rename.')],
+        ['name', prop('string', 'New sheet name.')],
+        target(),
+      ]),
+      ['sheet', 'name'],
+    ),
+    tool(
+      'xlsxy_row_insert',
+      'Insert rows at a 0-based row index.',
+      Object.fromEntries([
+        ['at', prop('integer', '0-based row index to insert at.')],
+        ['count', prop('integer', 'Number of rows to insert (default 1).')],
+        sheet(),
+        target(),
+      ]),
+      ['at'],
+    ),
+    tool(
+      'xlsxy_row_delete',
+      'Delete rows at a 0-based row index.',
+      Object.fromEntries([
+        ['at', prop('integer', '0-based row index to delete from.')],
+        ['count', prop('integer', 'Number of rows to delete (default 1).')],
+        sheet(),
+        target(),
+      ]),
+      ['at'],
+    ),
+    tool(
+      'xlsxy_col_insert',
+      'Insert columns at a 0-based column index.',
+      Object.fromEntries([
+        ['at', prop('integer', '0-based column index to insert at.')],
+        ['count', prop('integer', 'Number of columns to insert (default 1).')],
+        sheet(),
+        target(),
+      ]),
+      ['at'],
+    ),
+    tool(
+      'xlsxy_col_delete',
+      'Delete columns at a 0-based column index.',
+      Object.fromEntries([
+        ['at', prop('integer', '0-based column index to delete from.')],
+        ['count', prop('integer', 'Number of columns to delete (default 1).')],
+        sheet(),
+        target(),
+      ]),
+      ['at'],
+    ),
+    tool(
+      'xlsxy_eval',
+      'Side-effect-free formula preview: evaluate a formula against the live workbook at a ' +
+        'cell without writing anywhere.',
+      Object.fromEntries([
+        ['formula', prop('string', 'Formula to evaluate, e.g. "SUM(B1:B3)" (leading \'=\' optional).')],
+        ['ref', prop('string', 'Cell to evaluate at, e.g. "B4" (default A1).')],
+        sheet(),
+        target(),
+      ]),
+      ['formula'],
+    ),
+    tool(
+      'xlsxy_stats',
+      'Summary statistics (sum, count, countNums, average, min, max) over a range.',
+      Object.fromEntries([
+        ['range', prop('string', 'A1-style range, e.g. "A1:C10".')],
+        sheet(),
+        target(),
+      ]),
+      ['range'],
+    ),
+    tool(
+      'xlsxy_charts',
+      'List every chart in the workbook: kind, title, categories, and series.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'xlsxy_pivots',
+      'List every persistent pivot table: sheet, row/column fields, and value fields.',
+      Object.fromEntries([target()]),
+      [],
+    ),
   ];
 }
 
@@ -490,6 +801,17 @@ const DOCXY_VERBS = {
   docxy_insert: 'doc.insert',
   docxy_append: 'doc.append',
   docxy_save: 'doc.save',
+  docxy_export: 'doc.export',
+  docxy_export_pdf: 'doc.export-pdf',
+  docxy_comments: 'doc.comments',
+  docxy_notes: 'doc.notes',
+  docxy_header: 'doc.header',
+  docxy_footer: 'doc.footer',
+  docxy_metadata: 'doc.metadata',
+  docxy_stats: 'doc.stats',
+  docxy_replace_all: 'doc.replace-all',
+  docxy_undo: 'doc.undo',
+  docxy_redo: 'doc.redo',
 };
 
 const XLSXY_VERBS = {
@@ -502,6 +824,25 @@ const XLSXY_VERBS = {
   xlsxy_find: 'find',
   xlsxy_recalc: 'wb.recalc',
   xlsxy_save: 'wb.save',
+  xlsxy_comments: 'comment.list',
+  xlsxy_comment_add: 'comment.add',
+  xlsxy_comment_remove: 'comment.remove',
+  xlsxy_range_set: 'range.set',
+  xlsxy_export_csv: 'wb.export-csv',
+  xlsxy_import_csv: 'sheet.import-csv',
+  xlsxy_pivot: 'sheet.pivot',
+  xlsxy_replace_all: 'wb.replace-all',
+  xlsxy_sheet_add: 'sheet.add',
+  xlsxy_sheet_remove: 'sheet.remove',
+  xlsxy_sheet_rename: 'sheet.rename',
+  xlsxy_row_insert: 'row.insert',
+  xlsxy_row_delete: 'row.delete',
+  xlsxy_col_insert: 'col.insert',
+  xlsxy_col_delete: 'col.delete',
+  xlsxy_eval: 'formula.eval',
+  xlsxy_stats: 'sheet.stats',
+  xlsxy_charts: 'chart.list',
+  xlsxy_pivots: 'pivot.list',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

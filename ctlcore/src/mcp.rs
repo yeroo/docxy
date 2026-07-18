@@ -143,21 +143,59 @@ pub fn prop(ty: &str, desc: &str) -> Json {
     ])
 }
 
-/// An MCP tool definition with an object input schema.
-pub fn tool(name: &str, description: &str, props: Vec<(&str, Json)>, required: &[&str]) -> Json {
-    let schema = Json::obj(vec![
+/// A bare (description-less) object schema fragment: `{"type":"object",
+/// "properties":…,"required":…}` — factored out of [`tool`] so a nested
+/// array-of-objects `items` shape (e.g. `sheet.pivot`'s `values:
+/// [{col,agg}]`) can reuse it without a name/description wrapper.
+fn object_schema(props: Vec<(&str, Json)>, required: &[&str]) -> Json {
+    Json::obj(vec![
         ("type", Json::Str("object".into())),
         ("properties", Json::obj(props)),
         (
             "required",
             Json::Arr(required.iter().map(|s| Json::Str((*s).into())).collect()),
         ),
-    ]);
+    ])
+}
+
+/// An MCP tool definition with an object input schema.
+pub fn tool(name: &str, description: &str, props: Vec<(&str, Json)>, required: &[&str]) -> Json {
     Json::obj(vec![
         ("name", Json::Str(name.into())),
         ("description", Json::Str(description.into())),
-        ("inputSchema", schema),
+        ("inputSchema", object_schema(props, required)),
     ])
+}
+
+/// A JSON-schema property for an array-typed arg: `{"type":"array",
+/// "items":items,"description":desc}` — [`prop`]'s scalar `{type,
+/// description}` shape can't express a nested `items` schema, which a few
+/// wave-1 args need (`range.set`'s `rows`, `sheet.pivot`'s `rows`/`cols`/
+/// `values`). Compose `items` from [`item_ty`]/[`item_array`]/[`item_obj`].
+pub fn prop_array(items: Json, desc: &str) -> Json {
+    Json::obj(vec![
+        ("type", Json::Str("array".into())),
+        ("items", items),
+        ("description", Json::Str(desc.into())),
+    ])
+}
+
+/// A bare `{"type": ty}` items schema — e.g. `item_ty("string")` for
+/// `sheet.pivot`'s `rows`/`cols` (arrays of header-name strings).
+pub fn item_ty(ty: &str) -> Json {
+    Json::obj(vec![("type", Json::Str(ty.into()))])
+}
+
+/// A bare array items schema wrapping a nested `items` schema — e.g.
+/// `range.set`'s `rows: [[string]]` (each row an array of cell-text
+/// strings): `item_array(item_ty("string"))`.
+pub fn item_array(items: Json) -> Json {
+    Json::obj(vec![("type", Json::Str("array".into())), ("items", items)])
+}
+
+/// A bare object items schema — e.g. `sheet.pivot`'s `values: [{col,agg}]`.
+pub fn item_obj(props: Vec<(&str, Json)>, required: &[&str]) -> Json {
+    object_schema(props, required)
 }
 
 #[cfg(test)]

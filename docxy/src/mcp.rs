@@ -46,6 +46,17 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
         "docxy_insert" => "doc.insert",
         "docxy_append" => "doc.append",
         "docxy_save" => "doc.save",
+        "docxy_export" => "doc.export",
+        "docxy_export_pdf" => "doc.export-pdf",
+        "docxy_comments" => "doc.comments",
+        "docxy_notes" => "doc.notes",
+        "docxy_header" => "doc.header",
+        "docxy_footer" => "doc.footer",
+        "docxy_metadata" => "doc.metadata",
+        "docxy_stats" => "doc.stats",
+        "docxy_replace_all" => "doc.replace-all",
+        "docxy_undo" => "doc.undo",
+        "docxy_redo" => "doc.redo",
         other => return Err(format!("unknown tool: {other}")),
     };
     let client = client::resolve_target(&dir, "docxy", args.get_str("target"))?;
@@ -200,6 +211,94 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "docxy_export",
+            "Export the live document (including unsaved edits) as Markdown or plain text.",
+            vec![
+                (
+                    "format",
+                    prop("string", "Output format: \"markdown\" or \"text\"."),
+                ),
+                target(),
+            ],
+            &["format"],
+        ),
+        tool(
+            "docxy_export_pdf",
+            "Render the live document to a PDF at a path. Refuses to overwrite an existing file.",
+            vec![
+                (
+                    "path",
+                    prop("string", "File path for the PDF (created; must not exist)."),
+                ),
+                target(),
+            ],
+            &["path"],
+        ),
+        tool(
+            "docxy_comments",
+            "List the document's review comments (author, initials, date, text, anchor), in anchor order.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_notes",
+            "List the document's footnotes and endnotes, in file order.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_header",
+            "Read the default section header's block content (empty if the document has none).",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_footer",
+            "Read the default section footer's block content (empty if the document has none).",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_metadata",
+            "Read the document's core properties (title, author, subject, keywords, comments, \
+             last saved by, revision, created, modified) — present-if-set.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_stats",
+            "Word/character/paragraph/block counts over the live document.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_replace_all",
+            "Replace every occurrence of a query with text across the whole document \
+             (case-insensitive unless case_sensitive:true). Undoable.",
+            vec![
+                ("query", prop("string", "Text to search for.")),
+                ("text", prop("string", "Replacement text.")),
+                (
+                    "case_sensitive",
+                    prop("boolean", "Match case (default false)."),
+                ),
+                target(),
+            ],
+            &["query", "text"],
+        ),
+        tool(
+            "docxy_undo",
+            "Undo the last edit, if any. Returns {done:false} when there is nothing to undo.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_redo",
+            "Redo the last undone edit, if any. Returns {done:false} when there is nothing to redo.",
+            vec![target()],
+            &[],
+        ),
     ])
 }
 
@@ -274,6 +373,92 @@ mod tests {
     fn unknown_tool_is_reported() {
         let err = do_tool("docxy_nonesuch", &Json::obj(vec![])).unwrap_err();
         assert!(err.contains("unknown tool"));
+    }
+
+    #[test]
+    fn wave1_tools_are_present_and_ordered_after_the_existing_ones() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get_str("name")).collect();
+        let expected_tail = [
+            "docxy_export",
+            "docxy_export_pdf",
+            "docxy_comments",
+            "docxy_notes",
+            "docxy_header",
+            "docxy_footer",
+            "docxy_metadata",
+            "docxy_stats",
+            "docxy_replace_all",
+            "docxy_undo",
+            "docxy_redo",
+        ];
+        let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
+        assert_eq!(
+            &names[save_pos + 1..],
+            &expected_tail,
+            "wave-1 tools must be appended right after docxy_save, in this order"
+        );
+        for t in tools {
+            assert_eq!(
+                t.get("inputSchema").unwrap().get_str("type"),
+                Some("object")
+            );
+        }
+    }
+
+    #[test]
+    fn wave1_tool_required_arrays_match_the_spec() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let required_of = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .get("inputSchema")
+                .unwrap()
+                .get("required")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(required_of("docxy_export"), "[\"format\"]");
+        assert_eq!(required_of("docxy_export_pdf"), "[\"path\"]");
+        assert_eq!(required_of("docxy_comments"), "[]");
+        assert_eq!(required_of("docxy_notes"), "[]");
+        assert_eq!(required_of("docxy_header"), "[]");
+        assert_eq!(required_of("docxy_footer"), "[]");
+        assert_eq!(required_of("docxy_metadata"), "[]");
+        assert_eq!(required_of("docxy_stats"), "[]");
+        assert_eq!(required_of("docxy_replace_all"), "[\"query\",\"text\"]");
+        assert_eq!(required_of("docxy_undo"), "[]");
+        assert_eq!(required_of("docxy_redo"), "[]");
+    }
+
+    #[test]
+    fn wave1_verb_map_forwards_to_the_expected_verbs() {
+        // Every new tool name must route to its verb, not fall through to
+        // "unknown tool" — exercised without a live docxy by checking the
+        // error is the resolve-target failure, not the unknown-tool one.
+        for name in [
+            "docxy_export",
+            "docxy_export_pdf",
+            "docxy_comments",
+            "docxy_notes",
+            "docxy_header",
+            "docxy_footer",
+            "docxy_metadata",
+            "docxy_stats",
+            "docxy_replace_all",
+            "docxy_undo",
+            "docxy_redo",
+        ] {
+            let err = do_tool(name, &Json::obj(vec![])).unwrap_err();
+            assert!(
+                !err.contains("unknown tool"),
+                "{name} should route to a verb, got: {err}"
+            );
+        }
     }
 
     #[test]
