@@ -231,11 +231,18 @@ pub struct AttendeeRow {
 /// task's brief calls for `upsert_event` to take that type directly, but it
 /// doesn't exist yet (Task 2 hasn't landed). `NewEvent` stands in for it now
 /// — same field set as `EventRow` plus the extra columns
-/// (`series_master_id`, `body_preview`, `web_link`, `last_modified`) that
-/// `EventRow` doesn't surface — so this task compiles and tests standalone.
-/// When Task 2's `Event` lands, either it should have this exact shape (in
-/// which case `upsert_event` can take `&Event` directly and this struct goes
-/// away) or a `From<&Event> for NewEvent` conversion bridges the two.
+/// (`series_master_id`, `body_preview`, `web_link`, `last_modified`,
+/// `body_html`) that `EventRow` doesn't surface — so this task compiles and
+/// tests standalone. When Task 2's `Event` lands, either it should have this
+/// exact shape (in which case `upsert_event` can take `&Event` directly and
+/// this struct goes away) or a `From<&Event> for NewEvent` conversion
+/// bridges the two.
+///
+/// `body_html` supersedes the original spec idea of reusing the `bodies`
+/// table (keyed `event:<id>`) for event bodies — `bodies.message_id` has an
+/// FK to `messages(id)`, which an `event:<id>` key can't satisfy. Since an
+/// event has exactly one body, a plain column on `events` avoids the FK
+/// fight entirely. See `event_body` for reading it back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub id: String,
@@ -251,6 +258,7 @@ pub struct NewEvent {
     pub body_preview: String,
     pub web_link: String,
     pub last_modified: String,
+    pub body_html: String,
 }
 
 /// The field set `put_event_attendees` writes for one `event_attendees` row.
@@ -299,6 +307,14 @@ impl Store {
         // and swallowed rather than propagated.
         let _ = conn.execute(
             "ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Same idempotent-migration pattern as `is_draft` above: `events`
+        // already includes `body_html` for freshly-created databases; this
+        // brings an existing database up to date, erroring (and being
+        // swallowed) on every database that already has the column.
+        let _ = conn.execute(
+            "ALTER TABLE events ADD COLUMN body_html TEXT NOT NULL DEFAULT ''",
             [],
         );
         Ok(Store { conn })
@@ -908,8 +924,9 @@ impl Store {
             "INSERT INTO events (
                  id, subject, start_utc, end_utc, is_all_day, location,
                  organizer_name, organizer_addr, response_status,
-                 series_master_id, body_preview, web_link, last_modified
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 series_master_id, body_preview, web_link, last_modified,
+                 body_html
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                  subject = excluded.subject,
                  start_utc = excluded.start_utc,
@@ -922,7 +939,8 @@ impl Store {
                  series_master_id = excluded.series_master_id,
                  body_preview = excluded.body_preview,
                  web_link = excluded.web_link,
-                 last_modified = excluded.last_modified",
+                 last_modified = excluded.last_modified,
+                 body_html = excluded.body_html",
             params![
                 e.id,
                 e.subject,
@@ -937,6 +955,7 @@ impl Store {
                 e.body_preview,
                 e.web_link,
                 e.last_modified,
+                e.body_html,
             ],
         )?;
         Ok(())
@@ -1014,6 +1033,31 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The stored `body_html` for an event: `None` if there's no `events`
+    /// row with that id at all, `Some("")` if the row exists but no body
+    /// was ever written for it (or it was written empty) — mirroring
+    /// `get_body`'s `None`-means-"nothing stored" convention, adapted to a
+    /// column that's always present (`NOT NULL DEFAULT ''`) rather than a
+    /// row that may or may not exist in a separate table.
+    pub fn event_body(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let body = self
+            .conn
+            .query_row(
+                "SELECT body_html FROM events WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(body)
     }
 
     /// Locally sets an event's RSVP response status (`"accepted"`,
@@ -1281,6 +1325,7 @@ mod calendar_tests {
             body_preview: "".into(),
             web_link: "".into(),
             last_modified: "".into(),
+            body_html: "".into(),
         }
     }
 
@@ -1399,6 +1444,29 @@ mod calendar_tests {
         .unwrap();
         s.put_event_attendees("1", &[]).unwrap();
         assert!(s.event_attendees("1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn event_body_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        let mut e = ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z");
+        e.body_html = "<p>agenda</p>".into();
+        s.upsert_event(&e).unwrap();
+        assert_eq!(s.event_body("1").unwrap().as_deref(), Some("<p>agenda</p>"));
+    }
+
+    #[test]
+    fn event_body_is_none_for_unknown_event() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.event_body("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn event_body_is_some_empty_when_event_has_no_body() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        assert_eq!(s.event_body("1").unwrap().as_deref(), Some(""));
     }
 
     #[test]

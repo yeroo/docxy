@@ -78,16 +78,15 @@ CREATE TABLE IF NOT EXISTS meta (
 INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
 
 -- v2 calendar: a read-only mirror of Graph calendar events, synced the same
--- way `messages` is (see `Store::upsert_event`). Per the Task-1 brief, event
--- bodies are meant to reuse the existing `bodies` table keyed by
--- `event:<id>` — not wired up in this task (no store method here calls
--- `put_body`/`get_body` for an event), and note for Task 2/3: `bodies.
--- message_id` has `REFERENCES messages(id) ON DELETE CASCADE`, so an
--- `event:<id>` key will need that FK relaxed (or a lookup table) before it
--- can actually be used that way. The calendar's delta link (and, later, its
--- sync window bounds) live in `meta` alongside `schema_version` rather than
--- getting dedicated columns, since (unlike folders) there's only ever one
--- calendar.
+-- way `messages` is (see `Store::upsert_event`). The spec's original idea —
+-- event bodies reusing the existing `bodies` table keyed by `event:<id>` —
+-- doesn't work: `bodies.message_id` has `REFERENCES messages(id) ON DELETE
+-- CASCADE`, so an `event:<id>` key would fail that FK (no such row in
+-- `messages`). Simplest correct fix, since an event has exactly one body:
+-- `events.body_html` below, a plain column, no separate table, no FK to
+-- fight. The calendar's delta link (and, later, its sync window bounds)
+-- live in `meta` alongside `schema_version` rather than getting dedicated
+-- columns, since (unlike folders) there's only ever one calendar.
 CREATE TABLE IF NOT EXISTS events (
     id               TEXT PRIMARY KEY,
     subject          TEXT NOT NULL DEFAULT '',
@@ -101,7 +100,8 @@ CREATE TABLE IF NOT EXISTS events (
     series_master_id TEXT,
     body_preview     TEXT NOT NULL DEFAULT '',
     web_link         TEXT NOT NULL DEFAULT '',
-    last_modified    TEXT NOT NULL DEFAULT ''
+    last_modified    TEXT NOT NULL DEFAULT '',
+    body_html        TEXT NOT NULL DEFAULT ''
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
