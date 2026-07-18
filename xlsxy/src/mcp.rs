@@ -29,6 +29,11 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
     if name == "xlsxy_list" {
         return Ok(client::list_running(&dir, "xlsxy").to_string());
     }
+    if name == "xlsxy_new" {
+        return Ok(
+            client::new_file(&dir, "xlsxy", "wb.open", &blank_xlsx_bytes(), args)?.to_string(),
+        );
+    }
     let verb = match name {
         "xlsxy_status" => "wb.path",
         "xlsxy_sheets" => "sheet.list",
@@ -50,6 +55,12 @@ const TARGET_DESC: &str =
     "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open.";
 const SHEET_DESC: &str = "Optional sheet index or name (default: the active sheet).";
 
+/// A minimal valid .xlsx: one empty sheet ("Sheet1") in a fresh OPC package.
+/// Also the source of the committed template the bundled VS Code MCP server ships.
+pub(crate) fn blank_xlsx_bytes() -> Vec<u8> {
+    gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx())
+}
+
 fn tool_defs() -> Json {
     let target = || ("target", prop("string", TARGET_DESC));
     let sheet = || ("sheet", prop("string", SHEET_DESC));
@@ -59,6 +70,23 @@ fn tool_defs() -> Json {
             "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
             vec![],
             &[],
+        ),
+        tool(
+            "xlsxy_new",
+            "Create a new blank .xlsx at a path and open it in the running xlsxy (in a VS Code \
+             window, a new tab). With no xlsxy running the file is still created. Refuses to \
+             overwrite an existing file.",
+            vec![
+                (
+                    "path",
+                    prop(
+                        "string",
+                        "File path for the new workbook (created; must not exist).",
+                    ),
+                ),
+                target(),
+            ],
+            &["path"],
         ),
         tool(
             "xlsxy_status",
@@ -147,6 +175,32 @@ fn tool_defs() -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_xlsx_bytes_load_back_with_one_sheet() {
+        let pkg = gridcore::xlsx::load_xlsx(&blank_xlsx_bytes()).expect("blank loads");
+        // new_xlsx() ships exactly one sheet named Sheet1; assert via the workbook accessor.
+        assert_eq!(pkg.workbook.sheets.len(), 1);
+    }
+
+    #[test]
+    fn tool_defs_include_xlsxy_new_with_required_path() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get_str("name")).collect();
+        let list_pos = names.iter().position(|n| *n == "xlsxy_list").unwrap();
+        assert_eq!(names[list_pos + 1], "xlsxy_new");
+        let new_tool = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("xlsxy_new"))
+            .unwrap();
+        let req = new_tool
+            .get("inputSchema")
+            .unwrap()
+            .get("required")
+            .unwrap();
+        assert_eq!(req.to_string(), "[\"path\"]");
+    }
 
     #[test]
     fn tools_list_includes_the_grid_verbs() {
