@@ -103,6 +103,17 @@ impl Json {
         }
     }
 
+    /// The raw `f64` of a JSON number (no integrality requirement, unlike
+    /// [`Json::as_i64`]) — needed by Task 4's `col.width`, whose `width` is a
+    /// fractional Excel column-width unit. Copied from `ctlcore::json::Json`
+    /// (see the module note above `Json`), which already has it.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     /// The elements of a JSON array; `None` for non-arrays. Needed by Task 6's
     /// verbs that take structured array args (`range.set`'s `rows`,
     /// `sheet.pivot`'s `rows`/`cols`/`values`).

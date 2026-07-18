@@ -4,11 +4,12 @@
 
 use gridcore::edit::parse_input;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
+use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
 use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
 use gridcore::sheet::{
-    Align, Cell, CellValue, DefinedName, DrawingKind, MAX_COLS, MAX_ROWS, Sheet, cell_name,
-    fmt_general, format_with, parse_cell_name, parse_range_name, sheet_to_csv,
+    Align, Cell, CellValue, DefinedName, DrawingKind, MAX_COLS, MAX_ROWS, Sheet, Styles, cell_name,
+    fmt_general, format_with, parse_cell_name, parse_col, parse_range_name, sheet_to_csv,
 };
 use gridcore::xlsx::{SheetPackage, load_xlsx, save_xlsx};
 
@@ -709,6 +710,8 @@ impl Session {
             "row.delete" => self.ctl_row_op(args, false),
             "col.insert" => self.ctl_col_op(args, true),
             "col.delete" => self.ctl_col_op(args, false),
+            "cell.format" => self.ctl_cell_format(args),
+            "col.width" => self.ctl_col_width(args),
             other => Err(format!("unknown verb '{other}'")),
         };
         match result {
@@ -784,13 +787,17 @@ impl Session {
         Ok(out)
     }
 
-    /// `{ref, sheet?}` -> `{ref, row, col, value, formula?, text}`
+    /// `{ref, sheet?}` -> `{ref, row, col, value, formula?, text, format?}`.
+    /// The only mirror verb whose cell JSON carries the additive `format`
+    /// object (see [`Session::ctl_cell_json_with_format`]) — matches xlsxy
+    /// control.rs's scoping decision exactly (`sheet.read`/`find`/`cell.set`
+    /// stay format-less; see Task 3's report, "Concerns" #3).
     fn ctl_cell_get(&self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg(args)?;
         let (r, c) = ctl_ref_arg(args)?;
         let s = &self.pkg.workbook.sheets[si];
         Ok(match s.cell(r, c) {
-            Some(cell) => self.ctl_cell_json(r, c, cell),
+            Some(cell) => self.ctl_cell_json_with_format(r, c, cell),
             None => {
                 let mut out = String::from("{\"ref\":");
                 json::push_str(&mut out, &cell_name(r, c));
@@ -955,6 +962,25 @@ impl Session {
         let wb = &self.pkg.workbook;
         let xf = wb.styles.xf(cell.style);
         format_with(&xf, &cell.value, wb.date1904)
+    }
+
+    /// [`Session::ctl_cell_json`] plus — additively, present only when set —
+    /// a `format` object (see [`ctl_format_json`]). Used by `cell.get` ONLY:
+    /// the read-back exists for read-modify-write, not for bulk reads
+    /// (`sheet.read`/`find`) or the busiest mutating verb (`cell.set`), which
+    /// all still go through the plain [`Session::ctl_cell_json`] above.
+    /// Mirrors xlsxy control.rs's `cell_json_with_format`.
+    fn ctl_cell_json_with_format(&self, row: u32, col: u32, cell: &Cell) -> String {
+        let mut out = self.ctl_cell_json(row, col, cell);
+        if let Some(fmt) = ctl_format_json(&self.pkg.workbook.styles, cell.style) {
+            // `out` always ends in the cell object's closing '}' — splice
+            // the format object in just before it.
+            out.pop();
+            out.push_str(",\"format\":");
+            out.push_str(&fmt);
+            out.push('}');
+        }
+        out
     }
 
     /// Resolve the `sheet` arg (index or name) to a sheet index; default =
@@ -1297,6 +1323,24 @@ impl Session {
     //     earlier version of this bucket used a lossy `sheet.add`-by-name
     //     inverse instead — replaced after review flagged that it would
     //     silently resurrect an EMPTY sheet as "undo".)
+    //   - `cell.format`: Task 3's empirical bucket A carries over unchanged —
+    //     it goes through the identical [`Session::apply`] path `range.set`
+    //     uses (only each cell's `style` index differs; value/formula/spill
+    //     untouched), so it lands in the SAME true wasm-undo-stack `Cells`
+    //     group -> `"undoSteps":1`, unconditionally (a range always covers
+    //     >=1 cell, unlike `range.set`'s possibly-empty `rows` batch).
+    //   - `col.width`: Task 3 found the TUI's own F7/F8 width-adjust keys
+    //     never push onto xlsxy's undo stack at all (no true inverse exists
+    //     to reuse) -> here too, NOT pushed onto gridwasm's `undo`/`redo`
+    //     stack. Unlike `comment.add`/`comment.remove` (whose inverse only
+    //     needs to restore an opaque snapshot), a column width has a
+    //     trivially cheap TRUE inverse — the prior width, captured here
+    //     before mutating — so this follows the Wave-1 three-bucket
+    //     playbook (bucket B): reply carries `"undoSteps":0` plus an
+    //     `"inverse"` that is itself another `col.width` call (carrying the
+    //     prior width), whose own reply chains a working redo. `col` echoes
+    //     NUMERICALLY (0-based) per Task 3's locked reply-shape decision —
+    //     there is no paired ref-style field here to carry a letter form.
     // -----------------------------------------------------------------
 
     /// `{ref,text,author?,sheet?}` -> `{sheet,ref,undoSteps:0}` — plus the
@@ -1502,6 +1546,89 @@ impl Session {
         out.push_str(",\"undoSteps\":");
         out.push_str(&undo_steps.to_string());
         out.push('}');
+        Ok(out)
+    }
+
+    /// `{range,patch,sheet?}` -> `{formatted,undoSteps:1}` — sets `patch`
+    /// over every cell in `range` via the shared `gridcore::format` helpers
+    /// (`apply_patch_to_xf`/`FormatPatch::parse`), landing as ONE
+    /// [`Session::apply`] call — the SAME true wasm-undo-stack `Cells` group
+    /// `range.set` uses (Task 3's empirical bucket A). Value/formula/spill
+    /// are preserved; only each cell's style index changes. `undoSteps` is
+    /// unconditionally `1`: unlike `range.set`'s possibly-empty `rows`
+    /// batch, a parsed range always covers >=1 cell. Mirrors xlsxy
+    /// control.rs's `cell_format` field-for-field (snapshot-then-mutate,
+    /// same `Styles::intern` reuse/dedup).
+    fn ctl_cell_format(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
+        let (r1, c1, r2, c2) = ctl_parse_range(rg)?;
+        let patch_arg = args.get("patch").ok_or("cell.format needs a 'patch'")?;
+        let pairs = ctl_patch_pairs(patch_arg)?;
+        let patch = FormatPatch::parse(&pairs)?;
+
+        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+            let sheet = &self.pkg.workbook.sheets[si];
+            let mut v = Vec::new();
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    v.push((r, c, sheet.cell(r, c).cloned()));
+                }
+            }
+            v
+        };
+        let mut changes = Vec::with_capacity(snapshot.len());
+        for (r, c, existing) in snapshot {
+            let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+            let base_xf = self.pkg.workbook.styles.xf(cur);
+            let new_xf = apply_patch_to_xf(&base_xf, &patch);
+            let idx = self.pkg.workbook.styles.intern(new_xf);
+            let mut cell = existing.unwrap_or_default();
+            cell.style = idx;
+            changes.push((r, c, cell));
+        }
+        let formatted = changes.len();
+        // `apply` targets `self.active` — temporarily swap it to the target
+        // sheet, same trick `ctl_range_set`/`ctl_cell_set` already use.
+        let prev_active = self.active;
+        self.active = si;
+        self.apply(changes);
+        self.active = prev_active;
+        Ok(format!("{{\"formatted\":{formatted},\"undoSteps\":1}}"))
+    }
+
+    /// `{col,width,sheet?}` -> `{col,width,undoSteps:0}` — plus the internal
+    /// `inverse`, a `col.width` call carrying the PRIOR width (captured
+    /// before mutating) — Wave-1's three-bucket playbook, bucket B: Task 3
+    /// found the TUI's own F7/F8 width-adjust keys never push onto xlsxy's
+    /// undo stack (no true inverse to reuse), and this mirrors that exactly
+    /// — NOT pushed onto gridwasm's `undo`/`redo` stack either. Unlike
+    /// `comment.add`/`comment.remove` (an opaque-snapshot inverse), a column
+    /// width has a trivially cheap TRUE inverse, so the inverse's own reply
+    /// chains a working redo (apply it again to get back to the new width).
+    /// `col` echoes NUMERICALLY (0-based), matching Task 3's locked
+    /// reply-shape decision — there is no paired ref-style field here to
+    /// carry a letter form. Mirrors xlsxy control.rs's `col_width`.
+    fn ctl_col_width(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let col = ctl_col_arg(args)?;
+        let width = args
+            .get("width")
+            .and_then(json::Json::as_f64)
+            .ok_or("col.width needs a 'width' number")?;
+        if !(width.is_finite() && width > 0.0) {
+            return Err("col.width: 'width' must be positive".to_string());
+        }
+        let prior = self.pkg.workbook.sheets[si].col_width(col);
+        self.pkg.workbook.sheets[si].set_col_width(col, width);
+        self.dirty = true;
+        let mut out = String::from("{\"col\":");
+        out.push_str(&col.to_string());
+        out.push_str(",\"width\":");
+        json::push_num(&mut out, width);
+        out.push_str(",\"inverse\":");
+        out.push_str(&ctl_col_width_inverse(si, col, prior));
+        out.push_str(",\"undoSteps\":0}");
         Ok(out)
     }
 
@@ -1935,6 +2062,97 @@ fn ctl_parse_range(s: &str) -> Result<(u32, u32, u32, u32), String> {
         return Ok((r, c, r, c));
     }
     Err(format!("bad range '{s}' (use A1 or A1:C10)"))
+}
+
+/// `cell.format`'s `patch` object as wire key/value STRINGS —
+/// `gridcore::format::FormatPatch::parse` does the actual key/value
+/// validation and stays JSON-free, so scalar-to-string stringification lives
+/// here (`true`/`false` for booleans, the raw text for strings/numbers; a
+/// non-scalar value stringifies to `""`, which then fails `FormatPatch`'s
+/// own per-key validation with a clear message rather than panicking or
+/// silently no-opping). Key order is preserved from the request. Mirrors
+/// xlsxy control.rs's `patch_pairs` exactly, including its error string for
+/// a non-object `patch`.
+fn ctl_patch_pairs(patch: &json::Json) -> Result<Vec<(String, String)>, String> {
+    let json::Json::Obj(pairs) = patch else {
+        return Err("cell.format needs a 'patch' object".to_string());
+    };
+    Ok(pairs
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                json::Json::Str(s) => s.clone(),
+                json::Json::Bool(b) => b.to_string(),
+                json::Json::Num(n) => n.to_string(),
+                json::Json::Null | json::Json::Arr(_) | json::Json::Obj(_) => String::new(),
+            };
+            (k.clone(), text)
+        })
+        .collect())
+}
+
+/// Resolve `col.width`'s `col` arg — a column letter (`"C"`) or a 0-based
+/// index — mirroring [`Session::ctl_sheet_arg`]'s index-or-name flexibility.
+/// Mirrors xlsxy control.rs's `col_arg` exactly, including its error strings.
+fn ctl_col_arg(args: &json::Json) -> Result<u32, String> {
+    match args.get("col") {
+        Some(json::Json::Num(_)) => args
+            .get_usize("col")
+            .map(|c| c as u32)
+            .ok_or_else(|| "bad 'col' index".to_string()),
+        Some(json::Json::Str(s)) => {
+            let t = s.trim();
+            match parse_col(t) {
+                Some((col, used)) if used == t.len() => Ok(col),
+                _ => Err(format!("bad column '{s}'")),
+            }
+        }
+        _ => Err("col.width needs a 'col' (letter or 0-based index)".to_string()),
+    }
+}
+
+/// Serialize `col.width`'s internal bucket-B `inverse`: another `col.width`
+/// call, over the same `(sheet, col)`, carrying the width to restore. Used
+/// both for the forward call's inverse (the PRIOR width) and, when the host
+/// applies that inverse, for ITS OWN reply's inverse (the width just
+/// replaced) — so the chain alternates prior/current indefinitely and redo
+/// keeps working.
+fn ctl_col_width_inverse(sheet: usize, col: u32, width: f64) -> String {
+    let mut out = String::from("{\"verb\":\"col.width\",\"args\":{\"col\":");
+    out.push_str(&col.to_string());
+    out.push_str(",\"width\":");
+    json::push_num(&mut out, width);
+    out.push_str(",\"sheet\":");
+    out.push_str(&sheet.to_string());
+    out.push_str("}}");
+    out
+}
+
+/// The `cell.get` read-back `format` object for style index `style`: only
+/// the `cell.format` patch keys whose value differs from the default style,
+/// via `gridcore::format::xf_format_fields`; `None` for an unstyled cell (no
+/// `format` key on the wire at all). Mirrors xlsxy control.rs's
+/// `format_json`.
+fn ctl_format_json(styles: &Styles, style: u32) -> Option<String> {
+    let xf = styles.xf(style);
+    let fields = xf_format_fields(&xf);
+    if fields.is_empty() {
+        return None;
+    }
+    let mut out = String::from("{");
+    for (i, (k, v)) in fields.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json::push_str(&mut out, k);
+        out.push(':');
+        match v {
+            FormatValue::Str(s) => json::push_str(&mut out, &s),
+            FormatValue::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        }
+    }
+    out.push('}');
+    Some(out)
 }
 
 /// A sheet name derived from `base`, deduplicated against existing sheet
@@ -3431,6 +3649,307 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"row.delete","args":{"at":0,"count":0}}"#);
         assert!(out.contains("'count' must be at least 1"), "{out}");
+    }
+
+    // -- cell.format: Task 3's bucket A carries over (true wasm-undo-stack) -
+    //
+    // PRE-EXISTING GRIDCORE GAP (see task-4-report.md, "Concerns"): every
+    // cell.get in THIS test module carries a `"numFmt":"General"` entry even
+    // for a genuinely unstyled cell. Root cause, empirically isolated: any
+    // real `.xlsx` byte stream that goes through `load_xlsx` (which every
+    // `Session::open` call does — there is no in-memory-only constructor)
+    // has style index 0's `Xf::code` populated as `Some("General")` by
+    // `xlsx.rs`'s cellXfs parser (`crate::numfmt::builtin_code(0)` ==
+    // `"General"`, used as the code fallback for `numFmtId="0"`). That
+    // differs from `Xf::default().code == None`, so
+    // `gridcore::format::xf_format_fields` — reused unmodified, per this
+    // task's contract — sees a spurious diff and echoes `numFmt:"General"`
+    // on every cell whose style traces back to index 0 (which is EVERY
+    // cell.format-authored style too, since `apply_patch_to_xf` clones that
+    // base xf and a patch that doesn't touch `numFmt` leaves `code`
+    // untouched). xlsxy's own Task 3 tests never caught this because their
+    // fixture (`App::new(new_xlsx(), …)`) is used directly, in-memory,
+    // WITHOUT a save/load round trip — `new_xlsx()`'s own in-memory
+    // `Xf::default()` has `code: None`. A real, disk-loaded `.xlsx` (which
+    // is 100% of xlsxy's real-world usage too, not just gridwasm's) would
+    // exhibit the identical leak; Task 3's suite just never exercised the
+    // load path. This can't be fixed HERE: filtering the spurious
+    // `numFmt:"General"` locally in gridwasm's `ctl_format_json` would
+    // restore THIS task's literal "no format key for an unstyled cell"
+    // clause but would then break the OTHER locked clause — byte-parity
+    // with xlsxy control.rs's `format_json`, which has the same bug on any
+    // real file and is out of this task's file scope (`gridwasm/src/
+    // bridge.rs` only) to fix. The tests below pin the ACTUAL wire behavior
+    // (including the artifact) rather than assert an unreachable ideal —
+    // flagged prominently in the report as a coordinator-level finding: the
+    // correct fix is a small, precisely-scoped change to
+    // `gridcore::format::xf_format_fields`'s default-baseline comparison
+    // (e.g. treat `code == Some("General")` as equivalent to `None`),
+    // applied once, benefiting BOTH xlsxy and gridwasm identically.
+
+    #[test]
+    fn ctl_cell_format_bold_and_fill_is_one_undo_group_and_undo_clears_the_agent_set_format() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(
+            r##"{"verb":"cell.format","args":{"range":"A1:B2","patch":{"bold":true,"fillColor":"#FFFF00"}}}"##,
+        );
+        assert!(
+            out.contains("\"formatted\":4") && out.contains("\"undoSteps\":1"),
+            "{out}"
+        );
+
+        // Value preserved, format visible per-cell via cell.get (the leading
+        // `numFmt:"General"` is the pre-existing gap documented above, not
+        // this patch's doing — the patch itself only set bold/fillColor).
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A2"}}"#);
+        assert!(cell.contains("\"text\":\"Apple\""), "{cell}");
+        assert!(
+            cell.contains(r##""format":{"numFmt":"General","bold":true,"fillColor":"#FFFF00"}"##),
+            "{cell}"
+        );
+
+        s.dispatch("undo"); // the declared mechanism: ONE dispatch("undo")
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A2"}}"#);
+        assert!(
+            !cell.contains("\"bold\"") && !cell.contains("\"fillColor\""),
+            "one undo must clear the AGENT-SET format fields on every cell in the range: {cell}"
+        );
+        assert!(
+            cell.contains("\"text\":\"Apple\""),
+            "value untouched: {cell}"
+        );
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B2"}}"#);
+        assert!(
+            !cell.contains("\"bold\"") && !cell.contains("\"fillColor\""),
+            "{cell}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_preserves_a_formula_and_its_recalculated_value() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"B4","patch":{"bold":true}}}"#);
+        assert!(out.contains("\"formatted\":1"), "{out}");
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4"}}"#);
+        assert!(cell.contains("\"formula\":\"=SUM(B1:B3)\""), "{cell}");
+        assert!(cell.contains("\"value\":3.75"), "{cell}");
+        assert!(cell.contains("\"bold\":true"), "{cell}");
+    }
+
+    #[test]
+    fn ctl_cell_format_align_and_numfmt_round_trip_through_cell_get() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(
+            r#"{"verb":"cell.format","args":{"range":"B2","patch":{"numFmt":"0.00","italic":true,"align":"right"}}}"#,
+        );
+        let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B2"}}"#);
+        // The patch itself sets numFmt, so this one is genuinely agent-set,
+        // not the pre-existing "General" artifact.
+        assert!(
+            out.contains(r#""format":{"numFmt":"0.00","italic":true,"align":"right"}"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_get_format_has_only_the_pre_existing_general_numfmt_for_an_unstyled_cell() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        // See the pre-existing-gap note above the section header: this
+        // SHOULD be `!out.contains("\"format\"")` per the spec's "unstyled
+        // cell has NO format key" clause, but the shared gridcore helper
+        // this task must reuse unmodified leaks a baseline artifact on any
+        // real loaded workbook. Pinned here as the actual wire behavior.
+        assert!(out.contains("\"format\":{\"numFmt\":\"General\"}"), "{out}");
+    }
+
+    #[test]
+    fn ctl_format_read_back_is_scoped_to_cell_get_only() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{"bold":true}}}"#);
+
+        let get = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(get.contains("\"bold\":true"), "{get}");
+
+        let read = s.ctl(r#"{"verb":"sheet.read","args":{"range":"A1"}}"#);
+        assert!(
+            !read.contains("\"format\""),
+            "sheet.read must stay format-less: {read}"
+        );
+
+        let find = s.ctl(r#"{"verb":"find","args":{"query":"Item"}}"#);
+        assert!(
+            !find.contains("\"format\""),
+            "find must stay format-less: {find}"
+        );
+
+        let set = s.ctl(r#"{"verb":"cell.set","args":{"ref":"A1","text":"Item"}}"#);
+        assert!(
+            !set.contains("\"format\""),
+            "cell.set's own reply must stay format-less: {set}"
+        );
+        // ...even though the style survived the rewrite (still bold via cell.get).
+        let get = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(get.contains("\"bold\":true"), "{get}");
+    }
+
+    #[test]
+    fn ctl_cell_format_reflects_in_the_view_and_marks_dirty() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"cell.format","args":{"range":"A2","patch":{"bold":true}}}"#);
+        let v = s.view_json(None);
+        assert!(v.contains("\"dirty\":true"), "{v}");
+        assert!(
+            v.contains("\"r\":1,\"c\":0") && v.contains("\"b\":1"),
+            "A2's bold must repaint in the viewport: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_empty_patch_errors_and_applies_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let undo_before = s.undo.len();
+        let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{}}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("patch needs at least one key"),
+            "{out}"
+        );
+        assert_eq!(s.undo.len(), undo_before, "a rejected patch must not apply");
+        // Only the pre-existing baseline artifact, nothing agent-set.
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(
+            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
+            "{cell}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_missing_patch_key_errors() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"A1"}}"#);
+        assert!(
+            out.contains("cell.format needs a 'patch'") && !out.contains("'patch' object"),
+            "a missing key and a non-object patch must produce distinct messages: {out}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_rejects_a_non_object_patch() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":"bold"}}"#);
+        assert!(out.contains("cell.format needs a 'patch' object"), "{out}");
+    }
+
+    #[test]
+    fn ctl_cell_format_unknown_key_names_it_and_applies_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{"wrap":true}}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("unknown patch key 'wrap'"),
+            "{out}"
+        );
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(
+            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
+            "{cell}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_bad_num_fmt_errors_and_applies_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(
+            r#"{"verb":"cell.format","args":{"range":"A1","patch":{"numFmt":"[[[not a format"}}}"#,
+        );
+        assert!(
+            out.contains("\"ok\":false") && out.contains("bad numFmt code"),
+            "{out}"
+        );
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(
+            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
+            "{cell}"
+        );
+    }
+
+    #[test]
+    fn ctl_cell_format_bad_color_errors_and_applies_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out =
+            s.ctl(r#"{"verb":"cell.format","args":{"range":"A1","patch":{"fontColor":"red"}}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("bad color"),
+            "{out}"
+        );
+        let cell = s.ctl(r#"{"verb":"cell.get","args":{"ref":"A1"}}"#);
+        assert!(
+            cell.contains("\"format\":{\"numFmt\":\"General\"}"),
+            "{cell}"
+        );
+    }
+
+    // -- col.width: NOT on the undo stack; inverse carries prior width -----
+
+    #[test]
+    fn ctl_col_width_sets_and_the_inverse_restores_and_chains_a_working_redo() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let undo_before = s.undo.len();
+        let prior = s.pkg.workbook.sheets[0].col_width(2);
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"C","width":20}}"#);
+        assert!(
+            out.contains("\"col\":2")
+                && out.contains("\"width\":20")
+                && out.contains("\"undoSteps\":0"),
+            "{out}"
+        );
+        assert_eq!(
+            s.undo.len(),
+            undo_before,
+            "col.width must NOT be on the undo stack"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(2), 20.0);
+        assert!(s.dirty, "col.width must still mark the session dirty");
+
+        // Applying the declared inverse restores the PRIOR width.
+        let inv_reply = s.ctl(&extract_inverse(&out));
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(2), prior);
+        assert_eq!(
+            s.undo.len(),
+            undo_before,
+            "the inverse call must not touch the undo stack either"
+        );
+
+        // The inverse's OWN reply chains a working redo (back to 20).
+        let redo_inv = extract_inverse(&inv_reply);
+        s.ctl(&redo_inv);
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(2), 20.0);
+    }
+
+    #[test]
+    fn ctl_col_width_accepts_a_0_based_index_too() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":4,"width":15}}"#);
+        assert!(
+            out.contains("\"col\":4") && out.contains("\"width\":15"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].col_width(4), 15.0);
+    }
+
+    #[test]
+    fn ctl_col_width_rejects_non_positive_width() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":0}}"#);
+        assert!(out.contains("'width' must be positive"), "{out}");
+        let out2 = s.ctl(r#"{"verb":"col.width","args":{"col":"A","width":-5}}"#);
+        assert!(out2.contains("'width' must be positive"), "{out2}");
+    }
+
+    #[test]
+    fn ctl_col_width_rejects_a_malformed_column_letter() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(r#"{"verb":"col.width","args":{"col":"C1","width":20}}"#);
+        assert!(out.contains("bad column 'C1'"), "{out}");
     }
 
     // -- wb.replace-all: one wasm-undo-stack group, every sheet ------------
