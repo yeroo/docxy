@@ -86,6 +86,7 @@ mod tests {
                     has_attachments: false,
                     importance: "normal".into(),
                     preview: "numbers for next quarter".into(),
+                    is_draft: false,
                 },
             )
             .expect("seed second message");

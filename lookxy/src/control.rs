@@ -736,6 +736,7 @@ mod tests {
                     has_attachments: true,
                     importance: "normal".into(),
                     preview: "hi there".into(),
+                    is_draft: false,
                 },
             )
             .unwrap();

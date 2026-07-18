@@ -918,6 +918,7 @@ impl App {
                     has_attachments: false,
                     importance: "normal".into(),
                     preview: "hi there".into(),
+                    is_draft: false,
                 },
             )
             .expect("seed message");
@@ -1380,6 +1381,7 @@ mod tests {
                     has_attachments: true,
                     importance: "normal".into(),
                     preview: "hi there".into(),
+                    is_draft: false,
                 },
             )
             .expect("update message to has_attachments=true");

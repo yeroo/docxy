@@ -327,6 +327,7 @@ mod tests {
                     has_attachments: false,
                     importance: "normal".into(),
                     preview: "second preview".into(),
+                    is_draft: false,
                 },
             )
             .expect("seed second message");
@@ -383,6 +384,7 @@ mod tests {
                     has_attachments: false,
                     importance: "normal".into(),
                     preview: "sent preview".into(),
+                    is_draft: false,
                 },
             )
             .expect("seed message in second folder");
@@ -615,6 +617,7 @@ mod tests {
                     has_attachments: true,
                     importance: "normal".into(),
                     preview: "hi there".into(),
+                    is_draft: false,
                 },
             )
             .expect("update message to has_attachments=true");
