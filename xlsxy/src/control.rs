@@ -29,12 +29,22 @@
 //! | `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
 //! | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
 //! | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` |
+//! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
+//! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
+//! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
+//! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet |
+//! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
+//! | `sheet.add` | `{name?}` | `{sheet,name}` |
+//! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
+//! | `sheet.rename` | `{sheet,name}` | `{name}` |
+//! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
+//! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.save` | — | `{path, …}` |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
 
-use crate::{App, parse_input};
+use crate::{App, comment_author, input_text_of, iso_now, parse_input};
 use ctlcore::json::Json;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::formula::Value;
@@ -68,6 +78,18 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.stats" => sheet_stats(app, args),
         "chart.list" => Ok(chart_list(app)),
         "pivot.list" => Ok(pivot_list(app)),
+        "comment.add" => comment_add(app, args),
+        "comment.remove" => comment_remove(app, args),
+        "range.set" => range_set(app, args),
+        "sheet.import-csv" => sheet_import_csv(app, args),
+        "wb.replace-all" => wb_replace_all(app, args),
+        "sheet.add" => sheet_add(app, args),
+        "sheet.remove" => sheet_remove(app, args),
+        "sheet.rename" => sheet_rename(app, args),
+        "row.insert" => row_op(app, args, true),
+        "row.delete" => row_op(app, args, false),
+        "col.insert" => col_op(app, args, true),
+        "col.delete" => col_op(app, args, false),
         "wb.recalc" => {
             app.recalc_and_refresh();
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
@@ -94,7 +116,23 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // workbook being worked on.
-        if matches!(verb, "cell.set" | "range.clear") {
+        if matches!(
+            verb,
+            "cell.set"
+                | "range.clear"
+                | "comment.add"
+                | "comment.remove"
+                | "range.set"
+                | "sheet.import-csv"
+                | "wb.replace-all"
+                | "sheet.add"
+                | "sheet.remove"
+                | "sheet.rename"
+                | "row.insert"
+                | "row.delete"
+                | "col.insert"
+                | "col.delete"
+        ) {
             ctlcore::signal_activity();
         }
     }
@@ -542,6 +580,310 @@ fn range_clear(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![("cleared", Json::Num(cleared as f64))]))
 }
 
+/// Add a threaded comment (or a reply, if the cell already has a thread) —
+/// mirrors the TUI's `commit_comment`. Comment data lives in package parts
+/// outside the cell grid, so this is deliberately **not** pushed onto the
+/// undo stack, exactly like the keyboard path.
+fn comment_add(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let (r, c) = ref_arg(args)?;
+    let text = args.get_str("text").ok_or("comment.add needs 'text'")?;
+    if text.is_empty() {
+        return Err("comment.add needs non-empty 'text'".into());
+    }
+    let author = args
+        .get_str("author")
+        .map(str::to_string)
+        .unwrap_or_else(comment_author);
+    app.pkg
+        .add_threaded_comment(si, r, c, &author, text, &iso_now());
+    app.modified = true;
+    app.refresh_comments();
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("ref", Json::Str(cell_name(r, c))),
+    ]))
+}
+
+/// Remove the comment (threaded or legacy note) on a cell, if any.
+fn comment_remove(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let (r, c) = ref_arg(args)?;
+    let existed = app
+        .pkg
+        .comments()
+        .iter()
+        .any(|cm| cm.sheet == si && cm.row == r && cm.col == c);
+    if existed {
+        app.pkg.remove_comment(si, r, c);
+        app.modified = true;
+        app.refresh_comments();
+    }
+    Ok(Json::obj(vec![("removed", Json::Bool(existed))]))
+}
+
+/// Write a rectangular block of cells starting at `start`, atomically: every
+/// formula in the batch is validated *before* anything is applied, so a bad
+/// formula anywhere in the block leaves the sheet (and the undo stack)
+/// completely untouched. The whole block lands as one [`App::apply_on`]
+/// call, i.e. one undo group.
+fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let start = args.get_str("start").ok_or("range.set needs a 'start'")?;
+    let (r0, c0) =
+        parse_cell_name(start.trim()).ok_or_else(|| format!("bad cell ref '{start}'"))?;
+    let rows_json = args
+        .get("rows")
+        .and_then(Json::as_array)
+        .ok_or("range.set needs a 'rows' array")?;
+
+    let mut entries = Vec::new();
+    for (i, row) in rows_json.iter().enumerate() {
+        let row_arr = row
+            .as_array()
+            .ok_or("range.set: each row must be an array of strings")?;
+        for (j, cellv) in row_arr.iter().enumerate() {
+            let text = cellv
+                .as_str()
+                .ok_or("range.set: each cell must be a string")?;
+            entries.push((r0 + i as u32, c0 + j as u32, text.to_string()));
+        }
+    }
+
+    // Pass 1: validate every formula before touching anything (atomicity).
+    for (r, c, text) in &entries {
+        if let Some(body) = text.strip_prefix('=') {
+            if !body.is_empty() {
+                Engine::validate(body).map_err(|e| {
+                    format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
+                })?;
+            }
+        }
+    }
+
+    // Pass 2: every entry validated — build the changes and apply as one group.
+    let sheet = &app.pkg.workbook.sheets[si];
+    let changes: Vec<(u32, u32, Cell)> = entries
+        .into_iter()
+        .map(|(r, c, text)| {
+            let style = sheet.cell(r, c).map(|x| x.style).unwrap_or(0);
+            let mut cell = parse_input(&text);
+            cell.style = style;
+            (r, c, cell)
+        })
+        .collect();
+    let n = changes.len();
+    app.apply_on(si, changes);
+    Ok(Json::obj(vec![("set", Json::Num(n as f64))]))
+}
+
+/// A sheet name derived from `base`, deduplicated against existing sheet
+/// names by appending " 2", " 3", … (the same scheme `create_pivot_from`/
+/// `build_model_report` use for their generated sheets).
+fn unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
+    if wb.sheet_index(base).is_none() {
+        return base.to_string();
+    }
+    let mut n = 1;
+    loop {
+        n += 1;
+        let candidate = format!("{base} {n}");
+        if wb.sheet_index(&candidate).is_none() {
+            return candidate;
+        }
+    }
+}
+
+/// Import CSV text as a brand-new sheet (never overwrites an existing one —
+/// name collisions are deduplicated). Mirrors the shape of the TUI's
+/// `csv_to_pkg`, but populates a sheet inside the *live* workbook instead of
+/// building a standalone package.
+fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
+    let text = args
+        .get_str("text")
+        .ok_or("sheet.import-csv needs 'text'")?;
+    let frame = Frame::from_csv(text);
+    let requested = args.get_str("name").unwrap_or("Sheet");
+    let name = unique_sheet_name(&app.pkg.workbook, requested);
+    let idx = app.pkg.add_sheet(&name);
+    {
+        let sh = &mut app.pkg.workbook.sheets[idx];
+        for (c, colname) in frame.names.iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(colname));
+        }
+        for (c, col) in frame.cols.iter().enumerate() {
+            for (r, v) in col.iter().enumerate() {
+                let value = match v {
+                    Value::Empty => continue,
+                    Value::Num(n) => CellValue::Number(*n),
+                    Value::Str(s) => CellValue::Text(s.clone()),
+                    Value::Bool(b) => CellValue::Bool(*b),
+                    Value::Err(e) => CellValue::Error(e.code().to_string()),
+                };
+                sh.set_cell(
+                    r as u32 + 1,
+                    c as u32,
+                    Cell {
+                        value,
+                        ..Cell::default()
+                    },
+                );
+            }
+        }
+    }
+    let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
+    // New package parts (worksheet/relationship/workbook.xml wiring) don't
+    // fit the cell-level undo model — same as the TUI's own AddSheet flow,
+    // which clears history rather than push an entry it couldn't invert.
+    app.undo.clear();
+    app.redo.clear();
+    app.rebuild_engine();
+    app.modified = true;
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(idx as f64)),
+        ("name", Json::Str(name)),
+        ("rows", Json::Num(rows as f64)),
+        ("cols", Json::Num(cols as f64)),
+    ]))
+}
+
+/// Literal find/replace across every cell's input text, on **every sheet** —
+/// the workbook-wide counterpart of the TUI's per-sheet `replace_all`. Runs
+/// through [`App::structural`] (not `apply_on`) so the whole multi-sheet
+/// edit lands as a single undo group; `structural` already rebuilds the
+/// engine and recalculates afterward.
+fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
+    let query = args
+        .get_str("query")
+        .ok_or("wb.replace-all needs a 'query'")?;
+    if query.is_empty() {
+        return Err("empty query".into());
+    }
+    let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
+    let mut replaced = 0usize;
+    app.structural(|wb| {
+        for sheet in &mut wb.sheets {
+            let changes: Vec<(u32, u32, Cell)> = sheet
+                .cells
+                .iter()
+                .filter_map(|(&(r, c), cell)| {
+                    let t = input_text_of(cell);
+                    if t.contains(query) {
+                        let mut nc = parse_input(&t.replace(query, text));
+                        nc.style = cell.style;
+                        Some((r, c, nc))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            replaced += changes.len();
+            for (r, c, nc) in changes {
+                sheet.set_cell(r, c, nc);
+            }
+        }
+    });
+    Ok(Json::obj(vec![("replaced", Json::Num(replaced as f64))]))
+}
+
+/// Add a new sheet (default base name "Sheet", deduplicated on collision —
+/// never errors on a taken name).
+fn sheet_add(app: &mut App, args: &Json) -> Result<Json, String> {
+    let requested = args.get_str("name").unwrap_or("Sheet");
+    let name = unique_sheet_name(&app.pkg.workbook, requested);
+    let idx = app.pkg.add_sheet(&name);
+    // Same "can't be a cell-level undo" reasoning as sheet.import-csv.
+    app.undo.clear();
+    app.redo.clear();
+    app.rebuild_engine();
+    app.modified = true;
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(idx as f64)),
+        ("name", Json::Str(name)),
+    ]))
+}
+
+/// Remove a sheet (errors on the last one — a workbook must keep at least
+/// one). `sheet` is required here, unlike the other verbs' `sheet?`: a
+/// destructive op shouldn't silently default to "whichever sheet is active".
+fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg_required(app, args)?;
+    if !app.pkg.remove_sheet(si) {
+        return Err("cannot remove the last sheet".into());
+    }
+    // Indices above the removed sheet shift down by one.
+    if app.sheet > si {
+        app.sheet -= 1;
+    } else {
+        app.sheet = app.sheet.min(app.pkg.workbook.sheets.len() - 1);
+    }
+    app.cur = (0, 0);
+    app.top = 0;
+    app.left = 0;
+    app.anchor = None;
+    // Same "can't be a cell-level undo" reasoning as sheet.import-csv.
+    app.undo.clear();
+    app.redo.clear();
+    app.rebuild_engine();
+    app.modified = true;
+    Ok(Json::obj(vec![("removed", Json::Bool(true))]))
+}
+
+/// Rename a sheet and rewrite every formula/defined-name reference to it —
+/// via [`App::structural`], so it's one undo group like the TUI's own
+/// RenameSheet prompt.
+fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg_required(app, args)?;
+    let name = args.get_str("name").ok_or("sheet.rename needs a 'name'")?;
+    if name.is_empty() || name.contains(['[', ']', '*', '?', ':', '/', '\\']) {
+        return Err("invalid sheet name".into());
+    }
+    let name = name.to_string();
+    let new_name = name.clone();
+    app.structural(move |wb| gridcore::edit::rename_sheet(wb, si, &new_name));
+    Ok(Json::obj(vec![("name", Json::Str(name))]))
+}
+
+/// Insert or delete `count` rows at 0-based row `at` — via [`App::structural`],
+/// mirroring the TUI's Ctrl-+/Ctrl-- row operations.
+fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let at = args.get_usize("at").ok_or("needs an 'at'")? as u32;
+    let count = args.get_usize("count").unwrap_or(1) as u32;
+    if count == 0 {
+        return Err("'count' must be at least 1".into());
+    }
+    app.structural(|wb| {
+        if insert {
+            gridcore::edit::insert_rows(wb, si, at, count);
+        } else {
+            gridcore::edit::delete_rows(wb, si, at, count);
+        }
+    });
+    let key = if insert { "inserted" } else { "deleted" };
+    Ok(Json::obj(vec![(key, Json::Num(count as f64))]))
+}
+
+/// Insert or delete `count` columns at 0-based column `at` — via
+/// [`App::structural`], mirroring the TUI's column operations.
+fn col_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let at = args.get_usize("at").ok_or("needs an 'at'")? as u32;
+    let count = args.get_usize("count").unwrap_or(1) as u32;
+    if count == 0 {
+        return Err("'count' must be at least 1".into());
+    }
+    app.structural(|wb| {
+        if insert {
+            gridcore::edit::insert_cols(wb, si, at, count);
+        } else {
+            gridcore::edit::delete_cols(wb, si, at, count);
+        }
+    });
+    let key = if insert { "inserted" } else { "deleted" };
+    Ok(Json::obj(vec![(key, Json::Num(count as f64))]))
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
@@ -569,6 +911,16 @@ fn sheet_arg(app: &App, args: &Json) -> Result<usize, String> {
             .ok_or_else(|| format!("no sheet named '{name}'")),
         Some(_) => Err("'sheet' must be an index or a name".into()),
     }
+}
+
+/// Like [`sheet_arg`], but the `sheet` key must be present — for ops
+/// (rename/remove) that would be dangerous applied to the wrong sheet by a
+/// silent default to "whichever one is active".
+fn sheet_arg_required(app: &App, args: &Json) -> Result<usize, String> {
+    if matches!(args.get("sheet"), None | Some(Json::Null)) {
+        return Err("needs a 'sheet' (index or name)".into());
+    }
+    sheet_arg(app, args)
 }
 
 /// Parse the `ref` arg (`"B4"`) into (row, col).
@@ -1004,5 +1356,525 @@ mod tests {
         assert_eq!(pivots[0].get("cols").unwrap().as_array().unwrap().len(), 0);
         let values = pivots[0].get("values").unwrap().as_array().unwrap();
         assert_eq!(values[0].as_str(), Some("Sum of Sales"));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-1 mutating verbs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn comment_add_returns_sheet_and_ref_and_is_visible_in_list() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("B2".into())),
+                ("text", Json::Str("Check this".into())),
+                ("author", Json::Str("Ana".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("sheet"), Some(0));
+        assert_eq!(r.get_str("ref"), Some("B2"));
+        let list = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        let comments = list.get("comments").unwrap().as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].get_str("author"), Some("Ana"));
+        assert_eq!(comments[0].get_str("text"), Some("Check this"));
+    }
+
+    #[test]
+    fn comment_add_defaults_author_when_omitted() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("Hi".into())),
+            ]),
+        )
+        .unwrap();
+        let list = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        let comments = list.get("comments").unwrap().as_array().unwrap();
+        assert!(!comments[0].get_str("author").unwrap().is_empty());
+    }
+
+    #[test]
+    fn comment_add_rejects_empty_text() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("text"));
+    }
+
+    #[test]
+    fn comment_remove_reports_removed_bool() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("Hi".into())),
+            ]),
+        )
+        .unwrap();
+        let r = dispatch(
+            &mut a,
+            "comment.remove",
+            &Json::obj(vec![("ref", Json::Str("A1".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("removed").unwrap().as_bool(), Some(true));
+        // Already gone: reports false, doesn't error.
+        let r = dispatch(
+            &mut a,
+            "comment.remove",
+            &Json::obj(vec![("ref", Json::Str("A1".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("removed").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn comments_are_not_on_the_undo_stack() {
+        let mut a = app();
+        set(&mut a, "A1", "1"); // one undoable edit on the stack
+        dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("Hi".into())),
+            ]),
+        )
+        .unwrap();
+        // A single undo() restores A1's value; the comment op never touched
+        // the stack at all, so the comment survives untouched.
+        a.undo();
+        let list = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        assert_eq!(list.get("comments").unwrap().as_array().unwrap().len(), 1);
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get("value"), Some(&Json::Null));
+    }
+
+    #[test]
+    fn range_set_writes_a_block_and_reports_count() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("A1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![
+                        Json::Arr(vec![Json::Str("1".into()), Json::Str("2".into())]),
+                        Json::Arr(vec![Json::Str("3".into()), Json::Str("=A1+B1".into())]),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("set"), Some(4));
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("B2".into()))])).unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(3.0)); // A1(1)+B1(2)
+    }
+
+    #[test]
+    fn range_set_empty_string_clears_a_cell() {
+        let mut a = app();
+        set(&mut a, "A1", "old");
+        dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("A1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(vec![Json::Str("".into())])]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get("value"), Some(&Json::Null));
+    }
+
+    #[test]
+    fn range_set_is_atomic_bad_formula_touches_nothing() {
+        let mut a = app();
+        set(&mut a, "A1", "keep-me");
+        let undo_depth_before = a.undo.len();
+        let err = dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("A1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(vec![
+                        Json::Str("10".into()),
+                        Json::Str("=SUM((".into()),
+                    ])]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("B1"),
+            "error should name the offending cell: {err}"
+        );
+        // A1 was earlier in the same batch, but nothing was applied at all —
+        // not even a no-op undo group landed on the stack.
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get_str("text"), Some("keep-me"));
+        assert_eq!(a.undo.len(), undo_depth_before);
+    }
+
+    #[test]
+    fn range_set_is_one_undo_group() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("A1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![
+                        Json::Arr(vec![Json::Str("1".into()), Json::Str("2".into())]),
+                        Json::Arr(vec![Json::Str("3".into()), Json::Str("4".into())]),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        a.undo(); // ONE undo call
+        for r in ["A1", "B1", "A2", "B2"] {
+            let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str(r.into()))])).unwrap();
+            assert_eq!(g.get("value"), Some(&Json::Null), "{r} should be reverted");
+        }
+    }
+
+    #[test]
+    fn sheet_import_csv_creates_a_new_sheet_with_shape() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![("text", Json::Str("name,amount\nAlice,30\n".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("rows"), Some(2)); // header + 1 data row
+        assert_eq!(r.get_usize("cols"), Some(2));
+        let idx = r.get_usize("sheet").unwrap();
+        assert!(idx > 0); // never overwrites sheet 0
+        let name = r.get_str("name").unwrap().to_string();
+        assert_eq!(a.pkg.workbook.sheets[idx].name, name);
+    }
+
+    #[test]
+    fn sheet_import_csv_twice_yields_two_distinct_sheets() {
+        let mut a = app();
+        let r1 = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![
+                ("text", Json::Str("a\n1\n".into())),
+                ("name", Json::Str("Data".into())),
+            ]),
+        )
+        .unwrap();
+        let r2 = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![
+                ("text", Json::Str("a\n2\n".into())),
+                ("name", Json::Str("Data".into())),
+            ]),
+        )
+        .unwrap();
+        assert_ne!(r1.get_usize("sheet"), r2.get_usize("sheet"));
+        assert_ne!(r1.get_str("name"), r2.get_str("name"));
+        assert_eq!(a.pkg.workbook.sheets.len(), 3);
+    }
+
+    #[test]
+    fn sheet_import_csv_clears_the_undo_stack() {
+        let mut a = app();
+        set(&mut a, "A1", "1"); // an undoable edit exists
+        dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![("text", Json::Str("a\n1\n".into()))]),
+        )
+        .unwrap();
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn sheet_add_defaults_name_and_dedupes() {
+        let mut a = app();
+        let r1 = dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        let r2 = dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        assert_ne!(r1.get_str("name"), r2.get_str("name"));
+        assert_eq!(a.pkg.workbook.sheets.len(), 3);
+    }
+
+    #[test]
+    fn sheet_add_clears_the_undo_stack() {
+        let mut a = app();
+        set(&mut a, "A1", "1");
+        dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn sheet_remove_errors_on_the_last_sheet() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(0.0))]),
+        )
+        .unwrap_err();
+        assert!(err.contains("last sheet"), "{err}");
+    }
+
+    #[test]
+    fn sheet_remove_removes_the_named_sheet_and_clears_undo() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        assert_eq!(a.pkg.workbook.sheets.len(), 2);
+        set(&mut a, "A1", "1"); // an undoable edit exists
+        let r = dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("removed").unwrap().as_bool(), Some(true));
+        assert_eq!(a.pkg.workbook.sheets.len(), 1);
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn sheet_remove_requires_an_explicit_sheet_arg() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        let err = dispatch(&mut a, "sheet.remove", &Json::Null).unwrap_err();
+        assert!(err.contains("sheet"));
+    }
+
+    #[test]
+    fn sheet_remove_keeps_active_sheet_pointed_at_the_same_sheet() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Third".into()))]),
+        )
+        .unwrap();
+        a.sheet = 2; // "Third" is active
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(0.0))]),
+        )
+        .unwrap(); // remove Sheet1, before the active index
+        assert_eq!(a.pkg.workbook.sheets[a.sheet].name, "Third");
+    }
+
+    #[test]
+    fn sheet_rename_updates_name_rewrites_refs_one_undo_group() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Data".into()))]),
+        )
+        .unwrap();
+        set(&mut a, "A1", "=Data!A1"); // Sheet1!A1 references the other sheet
+        let r = dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Data".into())),
+                ("name", Json::Str("Renamed".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_str("name"), Some("Renamed"));
+        assert_eq!(a.pkg.workbook.sheets[1].name, "Renamed");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get_str("formula"), Some("=Renamed!A1"));
+        // One TUI-level undo reverts the whole rename (name + every formula).
+        a.undo();
+        assert_eq!(a.pkg.workbook.sheets[1].name, "Data");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get_str("formula"), Some("=Data!A1"));
+    }
+
+    #[test]
+    fn row_insert_shifts_a_formula_reference() {
+        let mut a = app();
+        set(&mut a, "A2", "5");
+        set(&mut a, "B1", "=A2");
+        let r = dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("inserted"), Some(1));
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("B2".into()))])).unwrap();
+        assert_eq!(g.get_str("formula"), Some("=A3"));
+    }
+
+    #[test]
+    fn row_delete_removes_rows_with_structural_undo() {
+        let mut a = app();
+        set(&mut a, "A1", "1");
+        set(&mut a, "A2", "2");
+        let r = dispatch(
+            &mut a,
+            "row.delete",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("deleted"), Some(1));
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(2.0)); // A2 shifted up
+        a.undo();
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn col_insert_and_col_delete_report_counts() {
+        let mut a = app();
+        set(&mut a, "B1", "x");
+        let r = dispatch(
+            &mut a,
+            "col.insert",
+            &Json::obj(vec![("at", Json::Num(0.0)), ("count", Json::Num(2.0))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("inserted"), Some(2));
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("D1".into()))])).unwrap();
+        assert_eq!(g.get_str("text"), Some("x"));
+        let r = dispatch(
+            &mut a,
+            "col.delete",
+            &Json::obj(vec![("at", Json::Num(0.0)), ("count", Json::Num(2.0))]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("deleted"), Some(2));
+    }
+
+    #[test]
+    fn wb_replace_all_touches_every_sheet_in_one_undo_group() {
+        let mut a = app();
+        set(&mut a, "A1", "foo bar");
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        a.sheet = 1;
+        set(&mut a, "A1", "foo baz");
+        let r = dispatch(
+            &mut a,
+            "wb.replace-all",
+            &Json::obj(vec![
+                ("query", Json::Str("foo".into())),
+                ("text", Json::Str("QUX".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("replaced"), Some(2));
+        let g0 = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("sheet", Json::Num(0.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g0.get_str("text"), Some("QUX bar"));
+        let g1 = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("sheet", Json::Num(1.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g1.get_str("text"), Some("QUX baz"));
+        // One undo restores BOTH sheets — proof it's a single undo group.
+        a.undo();
+        let g0 = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("sheet", Json::Num(0.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g0.get_str("text"), Some("foo bar"));
+        let g1 = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("sheet", Json::Num(1.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g1.get_str("text"), Some("foo baz"));
+    }
+
+    #[test]
+    fn wb_replace_all_rejects_empty_query() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "wb.replace-all",
+            &Json::obj(vec![
+                ("query", Json::Str("".into())),
+                ("text", Json::Str("x".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("query"));
     }
 }
