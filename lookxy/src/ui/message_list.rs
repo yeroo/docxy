@@ -16,7 +16,98 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Pane::List;
-    draw_list(f, area, "Messages", focused, &app.messages, app.msg_index);
+    if app.threaded_active() {
+        draw_threaded(f, area, focused, app);
+    } else {
+        draw_list(f, area, "Messages", focused, &app.messages, app.msg_index);
+    }
+}
+
+/// Renders the threaded folder view: one row per `visible_rows` entry — a
+/// conversation header (`▾`/`▸`, count, participants, subject, latest time,
+/// aggregate unread-bold / `!` / `@`), or an indented child message row under
+/// an expanded header. The cursor (`row_index`) is highlighted.
+fn draw_threaded(f: &mut Frame, area: Rect, focused: bool, app: &App) {
+    use crate::app::Row;
+
+    let block = Block::default()
+        .title("Conversations")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    let items: Vec<ListItem> = app
+        .visible_rows
+        .iter()
+        .map(|row| match *row {
+            Row::Header(t) => {
+                header_line(&app.threads[t].thread, app.threads[t].expanded, inner_width)
+            }
+            Row::Message(t, m) => {
+                let tv = &app.threads[t];
+                // A singleton (no header) renders flush-left like the flat list;
+                // a child under an expanded header is indented.
+                let indent = tv.thread.messages.len() > 1;
+                child_line(&tv.thread.messages[m], indent, inner_width)
+            }
+        })
+        .map(ListItem::new)
+        .collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
+
+    let mut state = ListState::default();
+    if !app.visible_rows.is_empty() {
+        state.select(Some(app.row_index.min(app.visible_rows.len() - 1)));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// A conversation header row.
+fn header_line(t: &mailcore::thread::Thread, expanded: bool, width: usize) -> Line<'static> {
+    let chevron = if expanded { "▾" } else { "▸" };
+    let flagged = if t.any_flagged { "!" } else { " " };
+    let attached = if t.any_attachments { "@" } else { " " };
+    let time = short_time(&t.latest_received); // same-module private fn
+    let who = t.participants.join(", ");
+    let text = format!(
+        "{chevron}{flagged}{attached} {time}  ({}) {} — {}",
+        t.messages.len(),
+        who,
+        t.subject
+    );
+    let truncated = truncate_width(&text, width);
+    let mut style = Style::default();
+    if t.unread_count > 0 {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(truncated, style))
+}
+
+/// A single message row: indented when it's a child under an expanded header,
+/// flush-left when it's a singleton conversation.
+fn child_line(m: &MessageRow, indent: bool, width: usize) -> Line<'static> {
+    let flagged = if m.is_flagged { "!" } else { " " };
+    let attached = if m.has_attachments { "@" } else { " " };
+    let time = short_time(&m.received_at);
+    let pad = if indent { "    " } else { "" };
+    let subject_or_preview = if m.subject.is_empty() {
+        &m.preview
+    } else {
+        &m.subject
+    };
+    let text = format!(
+        "{pad}{flagged}{attached} {time}  {} — {}",
+        m.from_name, subject_or_preview
+    );
+    let truncated = truncate_width(&text, width);
+    let mut style = Style::default();
+    if !m.is_read {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(truncated, style))
 }
 
 /// Renders a titled, bordered list of `messages` with `selected` highlighted
@@ -132,8 +223,36 @@ fn short_time(received_at: &str) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::app::tests::seed_second_in_c1;
     use mailcore::graph::model::MailFolder;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn threaded_view_renders_headers_and_expanded_children() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = [Alice "Hello", Bob "Re: Hello"]
+        app.reload_messages();
+        // expand the first header
+        if let Some(Row::Header(t)) = app
+            .visible_rows
+            .iter()
+            .copied()
+            .find(|r| matches!(r, Row::Header(_)))
+        {
+            app.threads[t].expanded = true;
+            app.rebuild_visible_rows();
+        }
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("(2)")); // thread count
+        assert!(text.contains("Re: Hello")); // latest subject
+        assert!(text.contains("Alice")); // a participant
+    }
 
     #[test]
     fn move_picker_overlay_renders_folder_names_when_open() {

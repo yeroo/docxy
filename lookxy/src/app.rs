@@ -1562,12 +1562,14 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Adds a second message to conversation `c1` (m1's conversation) so `c1`
-    /// becomes a 2-message thread: from Bob, newer than m1, unread.
-    fn seed_second_in_c1(app: &App) {
+    /// becomes a 2-message thread: from Bob, newer than m1, unread. Shared
+    /// across UI render tests (e.g. `ui::message_list`) that need a
+    /// multi-message thread fixture, not just `app`'s own tests.
+    pub(crate) fn seed_second_in_c1(app: &App) {
         use mailcore::graph::model::{Message, Recipient};
         app.store
             .upsert_message(
