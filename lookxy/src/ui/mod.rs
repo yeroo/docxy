@@ -216,7 +216,9 @@ fn move_selection(app: &mut App, delta: isize) {
             }
         }
         Pane::List => {
-            if let Some(len) = nonzero(app.messages.len()) {
+            if app.threaded_active() {
+                app.move_thread_selection(delta);
+            } else if let Some(len) = nonzero(app.messages.len()) {
                 app.msg_index = wrapped(app.msg_index, delta, len);
             }
         }
@@ -237,7 +239,9 @@ fn activate(app: &mut App) {
     match app.focus {
         Pane::Folders => app.focus = Pane::List,
         Pane::List => {
-            if let Some(msg) = app.messages.get(app.msg_index) {
+            if app.threaded_active() {
+                app.activate_thread_row();
+            } else if let Some(msg) = app.messages.get(app.msg_index) {
                 let id = msg.id.clone();
                 if msg.is_draft {
                     app.open_draft(&id);

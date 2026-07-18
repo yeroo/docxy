@@ -451,9 +451,6 @@ impl App {
 
     /// True when the threaded folder view is what's on screen: threading is on,
     /// no search is active (search results stay flat), and we're in Mail mode.
-    /// Nothing calls this yet — the threaded rendering/key-handling wiring is
-    /// a later task. Silences `dead_code`, which can't see across tasks.
-    #[allow(dead_code)]
     pub fn threaded_active(&self) -> bool {
         self.threaded && self.search.is_none() && self.mode == Mode::Mail
     }
@@ -523,6 +520,61 @@ impl App {
             if self.msg_index >= self.messages.len() {
                 self.msg_index = self.messages.len().saturating_sub(1);
             }
+        }
+    }
+
+    /// The `visible_rows` entry the cursor is on, if any.
+    fn selected_row(&self) -> Option<Row> {
+        self.visible_rows.get(self.row_index).copied()
+    }
+
+    /// Moves the threaded-list cursor by `delta`, clamped to `[0, len)` (no
+    /// wrap — a header and its children read as one block, so wrapping the
+    /// cursor off either end would be disorienting).
+    pub fn move_thread_selection(&mut self, delta: isize) {
+        let len = self.visible_rows.len();
+        if len == 0 {
+            return;
+        }
+        let max = (len - 1) as isize;
+        let next = (self.row_index as isize + delta).clamp(0, max);
+        self.row_index = next as usize;
+    }
+
+    /// Enter on the highlighted threaded row. On a header: toggle expansion,
+    /// and when it becomes expanded, open the thread's latest message in the
+    /// reading pane. On a message row: open that message (a draft opens in the
+    /// composer, matching the flat list's activate behavior).
+    pub fn activate_thread_row(&mut self) {
+        match self.selected_row() {
+            Some(Row::Header(t)) => {
+                let expanding = !self.threads[t].expanded;
+                self.threads[t].expanded = expanding;
+                if expanding {
+                    if let Some(latest) = self.threads[t].thread.messages.last() {
+                        let (id, is_draft) = (latest.id.clone(), latest.is_draft);
+                        if is_draft {
+                            self.open_draft(&id);
+                        } else {
+                            self.open_message(&id);
+                            self.focus = Pane::Reading;
+                        }
+                    }
+                }
+                self.rebuild_visible_rows();
+            }
+            Some(Row::Message(t, m)) => {
+                if let Some(msg) = self.threads[t].thread.messages.get(m) {
+                    let (id, is_draft) = (msg.id.clone(), msg.is_draft);
+                    if is_draft {
+                        self.open_draft(&id);
+                    } else {
+                        self.open_message(&id);
+                        self.focus = Pane::Reading;
+                    }
+                }
+            }
+            None => {}
         }
     }
 
@@ -1596,6 +1648,42 @@ mod tests {
             app.rebuild_visible_rows();
         }
         assert!(app.visible_rows.len() > before); // child rows appeared
+    }
+
+    #[test]
+    fn thread_navigation_is_clamped_over_visible_rows() {
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 header
+        seed_singleton_c2(&app); // c2 message → visible_rows.len() >= 2
+        app.reload_messages();
+        app.row_index = 0;
+        app.move_thread_selection(-1);
+        assert_eq!(app.row_index, 0); // clamped at the top
+        let last = app.visible_rows.len().saturating_sub(1);
+        app.row_index = last;
+        app.move_thread_selection(1);
+        assert_eq!(app.row_index, last); // clamped at the bottom
+    }
+
+    #[test]
+    fn activating_a_collapsed_header_expands_and_opens_latest() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = [m1 10:00, m2 11:00]; latest = m2
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+        app.activate_thread_row();
+        if let Row::Header(t) = app.visible_rows[pos] {
+            assert!(app.threads[t].expanded);
+            assert_eq!(app.selected_msg.as_deref(), Some("m2")); // newest opened
+        }
     }
 
     #[test]
