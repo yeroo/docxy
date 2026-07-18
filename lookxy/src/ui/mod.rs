@@ -804,6 +804,7 @@ mod tests {
             editor: Editor::from(compose_html::from_html("<p>new body</p>")),
             focus: ComposeField::Body,
             draft_id: id.clone(),
+            autocomplete: None,
         });
         id
     }

@@ -1190,6 +1190,7 @@ impl App {
             editor,
             focus: ComposeField::To,
             draft_id: row.id,
+            autocomplete: None,
         });
     }
 
@@ -2578,6 +2579,7 @@ pub(crate) mod tests {
             editor: Editor::from(compose_html::from_html("<p>body</p>")),
             focus: ComposeField::Body,
             draft_id: id.clone(),
+            autocomplete: None,
         });
         app.compose_action = Some(ComposeAction::Save);
 

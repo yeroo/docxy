@@ -19,13 +19,14 @@ use editcore::model::{Block, RichText, Run};
 // `editcore`'s crate root has no re-export of `Editor` (same adaptation
 // `mailcore::compose_html`'s tests note) — it lives at `editcore::ops::Editor`.
 use editcore::ops::Editor;
+use mailcore::store::Contact;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as RBlock, Borders, Paragraph};
+use ratatui::widgets::{Block as RBlock, Borders, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 /// Which field currently has keyboard focus in the composer. Tab cycles
@@ -66,6 +67,9 @@ pub struct Compose {
     /// update/send). Silences `dead_code`, which can't see across tasks.
     #[allow(dead_code)]
     pub draft_id: String,
+    /// The open recipient-autocomplete dropdown, if the focused To/Cc/Bcc
+    /// field's current token has store matches — see `refresh_autocomplete`.
+    pub autocomplete: Option<Autocomplete>,
 }
 
 impl Compose {
@@ -87,8 +91,62 @@ impl Compose {
             editor: Editor::new(),
             focus: ComposeField::To,
             draft_id,
+            autocomplete: None,
         }
     }
+}
+
+/// The open autocomplete dropdown over a recipient field: which field it
+/// belongs to, the token it was searched for, the store's matches, and the
+/// highlighted index within them.
+pub struct Autocomplete {
+    pub field: ComposeField,
+    /// The token this dropdown's `matches` were searched for. Nothing reads
+    /// it back yet (kept for a future "no matches for X" / debug display);
+    /// silences `dead_code`, same pattern as `Compose::draft_id`.
+    #[allow(dead_code)]
+    pub query: String,
+    pub matches: Vec<Contact>,
+    pub index: usize,
+}
+
+impl Autocomplete {
+    /// Move the highlighted suggestion, clamped (no wrap).
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let max = (self.matches.len() - 1) as isize;
+        self.index = (self.index as isize + delta).clamp(0, max) as usize;
+    }
+}
+
+/// The recipient token currently being typed: the text after the last `;` or
+/// `,` in the field, trimmed. Empty when the field ends in a separator (or is
+/// empty) — meaning nothing to complete.
+pub(crate) fn current_token(field: &str) -> String {
+    field
+        .rsplit([';', ','])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Replace the current (last) token in `field` with the chosen contact as a
+/// structured `Name <addr>; ` (ready for the next recipient), leaving any
+/// earlier finished recipients intact.
+pub(crate) fn apply_completion(field: &str, c: &Contact) -> String {
+    let cut = field.rfind([';', ',']).map(|i| i + 1).unwrap_or(0);
+    let prefix = &field[..cut];
+    let sep = if prefix.is_empty() { "" } else { " " };
+    let name = c.name.trim();
+    let rendered = if name.is_empty() {
+        c.address.clone()
+    } else {
+        format!("{} <{}>", name, c.address)
+    };
+    format!("{prefix}{sep}{rendered}; ")
 }
 
 /// Renders the full-screen composer when `app.compose` is open; a no-op
@@ -101,6 +159,7 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
         return;
     };
 
+    let frame_area = f.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -111,7 +170,7 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
             Constraint::Min(3),
             Constraint::Length(1),
         ])
-        .split(f.area());
+        .split(frame_area);
 
     draw_field(
         f,
@@ -143,6 +202,62 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
     );
     draw_body(f, rows[4], compose);
     draw_action_bar(f, rows[5]);
+
+    if let Some(ac) = &compose.autocomplete {
+        if ac.field == compose.focus {
+            let row = match ac.field {
+                ComposeField::To => Some(rows[0]),
+                ComposeField::Cc => Some(rows[1]),
+                ComposeField::Bcc => Some(rows[2]),
+                _ => None,
+            };
+            if let Some(row) = row {
+                draw_autocomplete(f, row, frame_area, ac);
+            }
+        }
+    }
+}
+
+/// The recipient-autocomplete dropdown: a bordered overlay directly below
+/// `field_area` listing `ac.matches` as `Name <addr>`, highlighting
+/// `ac.index`. Its height is bound to the match count (capped at 8 rows
+/// including borders) and clipped to `frame_area` so it never renders
+/// outside the terminal.
+fn draw_autocomplete(f: &mut Frame, field_area: Rect, frame_area: Rect, ac: &Autocomplete) {
+    let wanted_height = (ac.matches.len() as u16 + 2).min(8);
+    let area = Rect {
+        x: field_area.x,
+        y: field_area.y + field_area.height,
+        width: field_area.width,
+        height: wanted_height,
+    }
+    .intersection(frame_area);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    f.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = ac
+        .matches
+        .iter()
+        .map(|c| {
+            let name = c.name.trim();
+            let label = if name.is_empty() {
+                c.address.clone()
+            } else {
+                format!("{} <{}>", name, c.address)
+            };
+            ListItem::new(label)
+        })
+        .collect();
+    let list = List::new(items)
+        .block(RBlock::default().borders(Borders::ALL))
+        .highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
+
+    let mut state = ListState::default();
+    state.select(Some(ac.index));
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 /// One single-line To/Cc/Subject field: a bordered box, bright when
@@ -426,16 +541,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.compose_action = Some(ComposeAction::Discard);
         return;
     }
+    // Esc closes an open autocomplete dropdown first; only once none is open
+    // does it fall through to the existing "save the draft" request.
     if key.code == KeyCode::Esc {
+        if let Some(compose) = app.compose.as_mut() {
+            if compose.autocomplete.is_some() {
+                compose.autocomplete = None;
+                return;
+            }
+        }
         app.compose_action = Some(ComposeAction::Save);
         return;
     }
 
-    let Some(compose) = app.compose.as_mut() else {
-        return;
-    };
-
     if ctrl {
+        let Some(compose) = app.compose.as_mut() else {
+            return;
+        };
         if compose.focus == ComposeField::Body {
             if let KeyCode::Char(c) = key.code {
                 match c.to_ascii_lowercase() {
@@ -450,39 +572,179 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The compose-only mutation happens against `app.compose`; if it changed
+    // a recipient field's text, that borrow is released before the
+    // store-backed suggestion refresh runs (`refresh_autocomplete` needs
+    // `app.store` and `app.compose` at once).
+    let refresh = {
+        let Some(compose) = app.compose.as_mut() else {
+            return;
+        };
+        handle_compose_key(compose, key)
+    };
+    if let Some(field) = refresh {
+        refresh_autocomplete(app, field);
+    }
+}
+
+/// All compose-only key handling that doesn't need the store: dropdown
+/// navigation/accept when `compose.autocomplete` is open (which takes
+/// precedence over everything else), otherwise the existing Tab-cycle/
+/// Char/Backspace/Body-editing behavior. Returns `Some(field)` when a
+/// recipient field's text just changed, so the caller (which holds
+/// `app.store`) can refresh that field's suggestions; `None` otherwise.
+/// (Esc is handled by `handle_key`'s top-level interceptor, not here — an
+/// `Esc` arm here would be unreachable.)
+fn handle_compose_key(compose: &mut Compose, key: KeyEvent) -> Option<ComposeField> {
+    if compose.autocomplete.is_some() {
+        match key.code {
+            KeyCode::Down => {
+                compose.autocomplete.as_mut().unwrap().move_selection(1);
+                return None;
+            }
+            KeyCode::Up => {
+                compose.autocomplete.as_mut().unwrap().move_selection(-1);
+                return None;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let ac = compose.autocomplete.take().unwrap();
+                if let Some(c) = ac.matches.get(ac.index).cloned() {
+                    let field = recipient_field_mut(compose, ac.field);
+                    *field = apply_completion(field, &c);
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+
     let extend = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Tab => cycle_focus(compose),
+        KeyCode::Tab => {
+            cycle_focus(compose);
+            None
+        }
         KeyCode::Char(c) => match compose.focus {
-            ComposeField::To => compose.to.push(c),
-            ComposeField::Cc => compose.cc.push(c),
-            ComposeField::Bcc => compose.bcc.push(c),
-            ComposeField::Subject => compose.subject.push(c),
-            ComposeField::Body => compose.editor.insert_text(&c.to_string()),
+            ComposeField::To => {
+                compose.to.push(c);
+                Some(ComposeField::To)
+            }
+            ComposeField::Cc => {
+                compose.cc.push(c);
+                Some(ComposeField::Cc)
+            }
+            ComposeField::Bcc => {
+                compose.bcc.push(c);
+                Some(ComposeField::Bcc)
+            }
+            ComposeField::Subject => {
+                compose.subject.push(c);
+                None
+            }
+            ComposeField::Body => {
+                compose.editor.insert_text(&c.to_string());
+                None
+            }
         },
         KeyCode::Backspace => match compose.focus {
             ComposeField::To => {
                 compose.to.pop();
+                Some(ComposeField::To)
             }
             ComposeField::Cc => {
                 compose.cc.pop();
+                Some(ComposeField::Cc)
             }
             ComposeField::Bcc => {
                 compose.bcc.pop();
+                Some(ComposeField::Bcc)
             }
             ComposeField::Subject => {
                 compose.subject.pop();
+                None
             }
-            ComposeField::Body => compose.editor.delete_backward(),
+            ComposeField::Body => {
+                compose.editor.delete_backward();
+                None
+            }
         },
-        KeyCode::Enter if compose.focus == ComposeField::Body => compose.editor.split_paragraph(),
-        KeyCode::Left if compose.focus == ComposeField::Body => compose.editor.move_left(extend),
-        KeyCode::Right if compose.focus == ComposeField::Body => compose.editor.move_right(extend),
-        KeyCode::Up if compose.focus == ComposeField::Body => compose.editor.move_up(extend),
-        KeyCode::Down if compose.focus == ComposeField::Body => compose.editor.move_down(extend),
-        KeyCode::Home if compose.focus == ComposeField::Body => compose.editor.move_home(extend),
-        KeyCode::End if compose.focus == ComposeField::Body => compose.editor.move_end(extend),
-        _ => {}
+        KeyCode::Enter if compose.focus == ComposeField::Body => {
+            compose.editor.split_paragraph();
+            None
+        }
+        KeyCode::Left if compose.focus == ComposeField::Body => {
+            compose.editor.move_left(extend);
+            None
+        }
+        KeyCode::Right if compose.focus == ComposeField::Body => {
+            compose.editor.move_right(extend);
+            None
+        }
+        KeyCode::Up if compose.focus == ComposeField::Body => {
+            compose.editor.move_up(extend);
+            None
+        }
+        KeyCode::Down if compose.focus == ComposeField::Body => {
+            compose.editor.move_down(extend);
+            None
+        }
+        KeyCode::Home if compose.focus == ComposeField::Body => {
+            compose.editor.move_home(extend);
+            None
+        }
+        KeyCode::End if compose.focus == ComposeField::Body => {
+            compose.editor.move_end(extend);
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The `String` field on `compose` that recipient field `field` addresses.
+/// Only ever called with `field` taken from an `Autocomplete` (always
+/// `To`/`Cc`/`Bcc` — see `refresh_autocomplete`), so the `To` fallback for
+/// `Subject`/`Body` is unreachable in practice.
+fn recipient_field_mut(compose: &mut Compose, field: ComposeField) -> &mut String {
+    match field {
+        ComposeField::To => &mut compose.to,
+        ComposeField::Cc => &mut compose.cc,
+        ComposeField::Bcc => &mut compose.bcc,
+        _ => &mut compose.to,
+    }
+}
+
+/// Re-runs the recipient-autocomplete search for `field` after its text
+/// changed: computes the current token, searches the store for it (a fresh
+/// borrow, taken after `handle_compose_key`'s `app.compose` borrow above has
+/// ended), and sets/clears `compose.autocomplete` accordingly.
+fn refresh_autocomplete(app: &mut App, field: ComposeField) {
+    let token = {
+        let Some(compose) = app.compose.as_ref() else {
+            return;
+        };
+        current_token(match field {
+            ComposeField::To => &compose.to,
+            ComposeField::Cc => &compose.cc,
+            ComposeField::Bcc => &compose.bcc,
+            _ => return,
+        })
+    };
+    let matches = if token.is_empty() {
+        Vec::new()
+    } else {
+        app.store.search_contacts(&token, 8).unwrap_or_default()
+    };
+    if let Some(compose) = app.compose.as_mut() {
+        compose.autocomplete = if matches.is_empty() {
+            None
+        } else {
+            Some(Autocomplete {
+                field,
+                query: token,
+                matches,
+                index: 0,
+            })
+        };
     }
 }
 
@@ -519,6 +781,20 @@ mod tests {
             editor,
             focus: ComposeField::Body,
             draft_id: "d1".into(),
+            autocomplete: None,
+        }
+    }
+
+    /// A minimal `Contact` for tests that only care about the address (name
+    /// left empty, everything else a plausible placeholder).
+    fn sample_contact(addr: &str) -> mailcore::store::Contact {
+        mailcore::store::Contact {
+            name: String::new(),
+            address: addr.into(),
+            source: "local".into(),
+            last_seen: String::new(),
+            frequency: 1,
+            relevance: None,
         }
     }
 
@@ -763,5 +1039,47 @@ mod tests {
 
         let text = render_text(&app);
         assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn current_token_is_text_after_the_last_separator() {
+        assert_eq!(current_token("a@x; bo"), "bo");
+        assert_eq!(current_token("a@x;"), "");
+        assert_eq!(current_token("  al"), "al");
+        assert_eq!(current_token("a@x, c"), "c"); // comma is also a separator
+        assert_eq!(current_token(""), "");
+    }
+
+    #[test]
+    fn accepting_a_match_replaces_the_current_token() {
+        // field holds one finished recipient plus a partial token being typed
+        let field = "bob@x; al".to_string();
+        let contact = mailcore::store::Contact {
+            name: "Alice".into(),
+            address: "alice@x.com".into(),
+            source: "local".into(),
+            last_seen: "".into(),
+            frequency: 1,
+            relevance: None,
+        };
+        let result = apply_completion(&field, &contact);
+        // the partial "al" is replaced with the structured recipient; earlier ones untouched
+        assert_eq!(result, "bob@x; Alice <alice@x.com>; ");
+    }
+
+    #[test]
+    fn dropdown_navigation_is_clamped() {
+        let mut ac = Autocomplete {
+            field: ComposeField::To,
+            query: "a".into(),
+            matches: vec![sample_contact("a@x"), sample_contact("b@x")],
+            index: 0,
+        };
+        ac.move_selection(-1);
+        assert_eq!(ac.index, 0); // clamped at top
+        ac.move_selection(1);
+        assert_eq!(ac.index, 1);
+        ac.move_selection(1);
+        assert_eq!(ac.index, 1); // clamped at bottom
     }
 }
