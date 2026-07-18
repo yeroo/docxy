@@ -110,6 +110,20 @@ pub struct App {
     /// dropping it.
     #[cfg(test)]
     pub test_cmd_rx: Option<std::sync::mpsc::Receiver<SyncCommand>>,
+    /// The open compose view (new message, reply, forward, or a resumed
+    /// draft), if any — see `ui::compose`. `Some` takes over the whole
+    /// screen (`ui::draw`) and all key handling (`ui::handle_key`) ahead of
+    /// every other pane/popup. Entry points that populate this (new/reply/
+    /// forward/resume-a-draft) are a later task's concern; this field and
+    /// `ui::compose`'s own key handling are what they'll set/drive.
+    pub compose: Option<crate::ui::compose::Compose>,
+    /// What the compose view's key handling last requested — Send
+    /// (Ctrl-Enter), Save (Esc), or Discard (Ctrl-D) — for a later task's
+    /// wiring to act on (send via Graph, `SyncCommand::SaveDraft`, discard +
+    /// close) and then clear. `ui::compose::handle_key` only ever *records*
+    /// the request here; it never performs the action or closes `compose`
+    /// itself. `None` in the steady state.
+    pub compose_action: Option<crate::ui::compose::ComposeAction>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -199,6 +213,8 @@ impl App {
             browser_open_invocations: std::cell::Cell::new(0),
             #[cfg(test)]
             test_cmd_rx: None,
+            compose: None,
+            compose_action: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -280,12 +296,14 @@ impl App {
         }
     }
 
-    /// Whether a text-input context is currently capturing keystrokes — today
-    /// only the search prompt (`/`). The event loop consults this so a global
-    /// hotkey like `q`-to-quit doesn't steal a character the user is typing
-    /// into the query (searching for "quarterly" must not quit the app).
+    /// Whether a text-input context is currently capturing keystrokes — the
+    /// search prompt (`/`), or the compose view's fields/body. The event
+    /// loop consults this so a global hotkey like `q`-to-quit doesn't steal
+    /// a character the user is typing into the query or a compose field
+    /// (searching for "quarterly", or composing a message that mentions
+    /// "quit", must not quit the app).
     pub fn is_capturing_text(&self) -> bool {
-        self.search.is_some()
+        self.search.is_some() || self.compose.is_some()
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt

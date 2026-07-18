@@ -5,6 +5,7 @@
 //! `folders`/`messages` (see `app.rs`) — never by querying the store mid-draw.
 
 mod attachments;
+pub(crate) mod compose;
 mod folders;
 mod message_list;
 mod reading;
@@ -24,7 +25,17 @@ use ratatui::style::{Color, Style};
 /// search prompt (`/`) is open, `search::draw` takes over the message-list
 /// column instead of `message_list::draw` — same column, a virtual list of
 /// results instead of the selected folder's messages.
+///
+/// While the compose view (`App::compose`) is open, it takes over the
+/// entire frame instead — a full-screen mode, not an overlay over the
+/// three panes (unlike the move-folder/attachments/sign-in popups, which
+/// are drawn on top of them).
 pub fn draw(f: &mut Frame, app: &App) {
+    if app.compose.is_some() {
+        compose::draw_compose(f, app);
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -73,6 +84,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // usefully do without a token.
     if app.signin_modal.is_some() {
         handle_signin_key(app, key);
+        return;
+    }
+    // The compose view is a full-screen mode, not a popup over the normal
+    // panes — checked next (still ahead of the popups below), since none
+    // of them can meaningfully be open at the same time as it in practice.
+    if app.compose.is_some() {
+        compose::handle_key(app, key);
         return;
     }
     if app.move_picker.is_some() {
