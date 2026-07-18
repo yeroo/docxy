@@ -1545,6 +1545,13 @@ mod tests {
 
         let rows = store.conversations_in_folder("inbox", 50, 0).unwrap();
         assert_eq!(rows.len(), 2); // two independent singletons, not one merged group
+
+        // limit=1 only returns a single row if the two blanks are genuinely
+        // separate singleton conversations; if they were wrongly merged into
+        // one group, both messages would still come back under this cap.
+        let top = store.conversations_in_folder("inbox", 1, 0).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].id, "21"); // most recent: received 2026-07-21 > 2026-07-20
     }
 
     #[test]
