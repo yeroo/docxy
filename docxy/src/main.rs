@@ -24,9 +24,9 @@ use std::process::ExitCode;
 
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
-use docxcore::load::{Relationships, parse_rels_xml};
 #[cfg(test)]
 use docxcore::load::parse_header_footer;
+use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::markdown::{from_markdown, to_markdown_with};
 use docxcore::model::{Align, Block, Document, Hyperlink, Inline, PageGeom, Run, RunProps};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
