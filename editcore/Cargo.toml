@@ -1,0 +1,18 @@
+[package]
+name = "editcore"
+description = "Headless, editable rich-text model shared by docxy and lookxy: RichText blocks/runs and cursor/selection types."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["editor", "rich-text", "cursor"]
+categories = ["text-editors"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only — keep this crate pure and auditable.
