@@ -19,7 +19,7 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError};
-use crate::graph::model::DeltaItem;
+use crate::graph::model::{DeltaItem, Message};
 use crate::store::{OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
@@ -65,6 +65,25 @@ pub enum SyncCommand {
         attachment_id: String,
         dest: PathBuf,
     },
+    /// Push a draft's currently-stored fields to Graph (optimistic write
+    /// already applied by the caller — compose autosaves via
+    /// `Store::update_draft_fields` directly): enqueue
+    /// [`crate::store::OutboxOp::SaveDraft`] and drain. A `local:` id is
+    /// created on Graph and reconciled (see `sync::outbox::apply_op`); an
+    /// already-synced id is patched in place.
+    SaveDraft { id: String },
+    /// Hand a draft to Graph for delivery: optimistically mark it sent and
+    /// (if the Sent folder has synced) move it there locally, then enqueue
+    /// [`crate::store::OutboxOp::SendDraft`] and drain. Emits
+    /// [`SyncEvent::Sent`] once the drain actually delivers it.
+    SendDraft { id: String },
+    /// Fetch a pre-quoted reply draft for `id` (`createReply`/
+    /// `createReplyAll` depending on `all`), store it, and emit
+    /// [`SyncEvent::DraftReady`] so the UI can open the compose editor on it.
+    ComposeReply { id: String, all: bool },
+    /// Fetch a pre-quoted forward draft for `id` (`createForward`), store
+    /// it, and emit [`SyncEvent::DraftReady`].
+    ComposeForward { id: String },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -94,6 +113,15 @@ pub enum SyncEvent {
     /// An attachment's bytes were fetched and written to `path` (the `dest`
     /// from the triggering [`SyncCommand::SaveAttachment`]).
     AttachmentSaved { path: PathBuf },
+    /// A reply/forward draft (from [`SyncCommand::ComposeReply`]/
+    /// [`SyncCommand::ComposeForward`]) was stored; the UI should load it
+    /// (`Store::draft`) and open the compose editor.
+    DraftReady { id: String },
+    /// The draft `id` (the same id the triggering [`SyncCommand::SendDraft`]
+    /// was addressed with — not necessarily its final Graph id, if it was
+    /// still a `local:` id when send started) was successfully handed to
+    /// Graph for delivery.
+    Sent { id: String },
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -358,6 +386,26 @@ impl Engine {
                 attachment_id,
                 dest,
             } => self.save_attachment(&message_id, &attachment_id, dest),
+            SyncCommand::SaveDraft { id } => {
+                self.enqueue_and_drain(OutboxOp::SaveDraft { id });
+            }
+            SyncCommand::SendDraft { id } => {
+                // Optimistic local write, same spirit as MarkRead/SetFlag/
+                // Move/Delete: mark the row no longer a draft, and — if the
+                // Sent folder has synced — re-file it there right away so
+                // the UI reflects "sent" before the outbox drain actually
+                // reaches Graph. `id` is whatever the caller currently
+                // addresses this draft by (a `local:` id if it was never
+                // pushed, else its Graph id); `apply_op` resolves/reconciles
+                // the Graph side, this only touches the local row.
+                self.store.mark_sent(&id);
+                if let Some(sent_id) = self.sent_items_folder_id() {
+                    let _ = self.store.move_message(&id, &sent_id);
+                }
+                self.enqueue_and_drain(OutboxOp::SendDraft { id });
+            }
+            SyncCommand::ComposeReply { id, all } => self.compose_reply(&id, all),
+            SyncCommand::ComposeForward { id } => self.compose_forward(&id),
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -404,11 +452,25 @@ impl Engine {
 
     /// GET the folder tree, upsert every folder, emit `FoldersUpdated`.
     /// Returns `false` if the pass should abort (auth/throttle/transport).
+    ///
+    /// If the real Drafts folder (`well_known_name = "drafts"`) is present in
+    /// this fetch, also re-files (`Store::adopt_sentinel_drafts`) any
+    /// messages still sitting under the local drafts sentinel folder — see
+    /// `Store::drafts_folder_id` for why that sentinel exists and the Task 6
+    /// report for the gap this closes. Harmless (a no-op `UPDATE` matching
+    /// zero rows) once already adopted, so this doesn't need a "did we
+    /// already do this" flag.
     fn sync_folders(&mut self) -> bool {
         match self.with_auth(|c| c.list_folders()) {
             Ok(folders) => {
                 for f in &folders {
                     let _ = self.store.upsert_folder(f);
+                }
+                if let Some(drafts) = folders
+                    .iter()
+                    .find(|f| f.well_known_name.as_deref() == Some("drafts"))
+                {
+                    let _ = self.store.adopt_sentinel_drafts(&drafts.id);
                 }
                 // The initial enumeration has now succeeded at least once, so
                 // ticks can safely drop to incremental deltas.
@@ -523,8 +585,13 @@ impl Engine {
         };
 
         for row in ops {
-            match self.with_auth(|c| apply_op(c, &row.op)) {
-                Ok(()) => self.store.drop_op(row.seq),
+            match self.apply_op_with_retry(&row.op) {
+                Ok(()) => {
+                    self.store.drop_op(row.seq);
+                    if let OutboxOp::SendDraft { id } = &row.op {
+                        self.emit(SyncEvent::Sent { id: id.clone() });
+                    }
+                }
                 Err(GraphError::Unauthorized) => {
                     self.enter_signin();
                     return;
@@ -581,6 +648,47 @@ impl Engine {
     /// Count of ops still queued (0 if the count can't be read).
     fn pending_count(&self) -> usize {
         self.store.pending_ops().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Applies one outbox op via `sync::outbox::apply_op`, refreshing the
+    /// token once and retrying on a 401 — the same policy as `with_auth`,
+    /// duplicated rather than reused because `apply_op` (unlike every other
+    /// Graph call in this engine) also needs `&self.store`. `with_auth`'s
+    /// closure parameter can't borrow `self.store` itself: it's an argument
+    /// evaluated at the call site of `self.with_auth(...)`, which needs
+    /// `&mut self` for the whole method call, so a closure over
+    /// `&self.store` captured there would alias that mutable borrow for as
+    /// long as `with_auth` runs. Building the client and calling `apply_op`
+    /// directly in this method's own body sidesteps that: each borrow of
+    /// `self.store` here ends at the end of its statement, well before the
+    /// next `&mut self` use (`self.try_refresh()`).
+    fn apply_op_with_retry(&mut self, op: &OutboxOp) -> Result<(), GraphError> {
+        let client = self.client();
+        match apply_op(&client, &self.store, op) {
+            Err(GraphError::Unauthorized) => {
+                if self.try_refresh() {
+                    let client = self.client();
+                    apply_op(&client, &self.store, op)
+                } else {
+                    Err(GraphError::Unauthorized)
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// The Sent Items folder's local id, once it has synced
+    /// (`well_known_name = "sentitems"`) — `None` before that first sync, so
+    /// `SendDraft`'s optimistic local re-file is skipped rather than moving a
+    /// message into a folder id that doesn't exist yet (which the
+    /// `messages.folder_id` foreign key would reject anyway).
+    fn sent_items_folder_id(&self) -> Option<String> {
+        self.store
+            .folders()
+            .ok()?
+            .into_iter()
+            .find(|f| f.well_known_name.as_deref() == Some("sentitems"))
+            .map(|f| f.id)
     }
 
     // --- Bodies ----------------------------------------------------------
@@ -665,6 +773,71 @@ impl Engine {
                 self.react(e);
             }
         }
+    }
+
+    // --- Compose (reply/forward) ------------------------------------------
+
+    /// Fetch a pre-quoted reply draft for `id` from Graph (`createReply`, or
+    /// `createReplyAll` when `all`) and store it — see `store_composed_draft`.
+    fn compose_reply(&mut self, id: &str, all: bool) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.create_reply(id, all)) {
+            Ok(draft) => self.store_composed_draft(draft),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch a pre-quoted forward draft for `id` from Graph (`createForward`)
+    /// and store it — see `store_composed_draft`.
+    fn compose_forward(&mut self, id: &str) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.create_forward(id)) {
+            Ok(draft) => self.store_composed_draft(draft),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Finishes storing a reply/forward draft `create_reply`/`create_forward`
+    /// just fetched: fetches its body (neither Graph call's response carries
+    /// one — `Message` has no body field, see `graph::model` — so this is a
+    /// second round-trip), files the message under the local Drafts folder
+    /// (`Store::drafts_folder_id`, the same resolution `create_local_draft`
+    /// uses — real folder if synced, sentinel otherwise), stores the body,
+    /// and emits `DraftReady` so the UI can open the compose editor on it.
+    fn store_composed_draft(&mut self, draft: Message) {
+        let body = match self.with_auth(|c| c.get_body(&draft.id, false)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.react(e);
+                return;
+            }
+        };
+        let folder_id = match self.store.drafts_folder_id() {
+            Ok(id) => id,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        if let Err(e) = self.store.upsert_message(&folder_id, &draft) {
+            self.emit(SyncEvent::Error(e.to_string()));
+            return;
+        }
+        if let Err(e) = self.store.put_body(&draft.id, &body) {
+            self.emit(SyncEvent::Error(e.to_string()));
+            return;
+        }
+        self.emit(SyncEvent::DraftReady { id: draft.id });
     }
 
     // --- Auth ------------------------------------------------------------
@@ -1895,6 +2068,345 @@ mod tests {
         let atts = store.attachments("M1").unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "f.txt");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_sync_adopts_sentinel_drafts_into_the_real_drafts_folder() {
+        // A draft created before the first folder sync lands under the local
+        // sentinel folder id (see `Store::drafts_folder_id`). Once the sync
+        // engine fetches a real Drafts folder, it must re-file that draft —
+        // otherwise it stays permanently invisible in the real Drafts folder
+        // view.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/REAL-DRAFTS/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/REAL-DRAFTS/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[],"@odata.deltaLink":"/me/mailFolders/REAL-DRAFTS/messages/delta?token=D1"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"REAL-DRAFTS","displayName":"Drafts","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"drafts"}]}"#.into(),
+            },
+        ]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("adopt-sentinel");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Seed the sentinel-filed draft BEFORE the engine (and its own
+        // `Store::open`) starts up.
+        let local_id = {
+            let store = Store::open(&store_path).unwrap();
+            store
+                .create_local_draft("Hi", "a@x", "", "<p>hi</p>")
+                .unwrap()
+        };
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "REAL-DRAFTS"),
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store.messages_in_folder("REAL-DRAFTS", 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, local_id);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_reply_stores_draft_and_emits_ready() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/M1/createReply".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"DRAFT1","conversationId":"C1","subject":"Re: Hi","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[{"emailAddress":{"name":"Bob","address":"bob@x"}}],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/DRAFT1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"body":{"contentType":"html","content":"<p>quoted</p>"}}"#.into(),
+            },
+        ]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("compose-reply");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: false,
+            })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::DraftReady { .. })
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT1"))
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, body) = store
+            .draft("DRAFT1")
+            .unwrap()
+            .expect("reply draft should be stored");
+        assert_eq!(row.subject, "Re: Hi");
+        assert!(row.is_draft);
+        assert_eq!(body.content, "<p>quoted</p>");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_forward_stores_draft_and_emits_ready() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/M1/createForward".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"DRAFT2","conversationId":"C1","subject":"Fwd: Hi","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/DRAFT2".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"body":{"contentType":"html","content":"<p>fwd body</p>"}}"#.into(),
+            },
+        ]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("compose-forward");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeForward { id: "M1".into() })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::DraftReady { .. })
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT2"))
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, body) = store
+            .draft("DRAFT2")
+            .unwrap()
+            .expect("forward draft should be stored");
+        assert_eq!(row.subject, "Fwd: Hi");
+        assert_eq!(body.content, "<p>fwd body</p>");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Routes for a mailbox with only a synced Sent Items folder — enough for
+    // `send_draft_of_a_local_draft_...` to exercise SendDraft's optimistic
+    // "move toward Sent" against a real (FK-satisfying) folder id.
+    fn sent_folder_routes() -> Vec<Route> {
+        vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/SENT1/childFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/SENT1/messages/delta".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[],"@odata.deltaLink":"/me/mailFolders/SENT1/messages/delta?token=D1"}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"SENT1","displayName":"Sent Items","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"sentitems"}]}"#.into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn send_draft_of_a_local_draft_creates_reconciles_sends_and_files_under_sent() {
+        let mut routes = sent_folder_routes();
+        // Specific routes precede the generic `/me/messages` POST route, same
+        // ordering rationale as `move_routes()` above: the fake server
+        // matches the FIRST route whose method+prefix matches.
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-42/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+        );
+        routes.insert(
+            1,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: r#"{"id":"GRAPH-42","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("send-draft");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Seed a local draft directly through the store BEFORE the engine
+        // opens it, so the row (and its sentinel Drafts folder) already
+        // exist when the sync thread starts up.
+        let local_id = {
+            let store = Store::open(&store_path).unwrap();
+            store
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap()
+        };
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Backfill first, so SENT1 exists locally and `sent_items_folder_id`
+        // can resolve it.
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "SENT1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft {
+                id: local_id.clone(),
+            })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Sent { .. }));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Sent { id } if id == &local_id))
+        );
+
+        let reqs = srv.requests();
+        assert!(
+            reqs.iter()
+                .any(|r| r.method == "POST" && r.path == "/me/messages")
+        );
+        assert!(
+            reqs.iter()
+                .any(|r| r.method == "POST" && r.path.starts_with("/me/messages/GRAPH-42/send"))
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.draft(&local_id).unwrap().is_none());
+        let sent_rows = store.messages_in_folder("SENT1", 50, 0).unwrap();
+        assert_eq!(sent_rows.len(), 1);
+        assert_eq!(sent_rows[0].id, "GRAPH-42");
+        assert!(!sent_rows[0].is_draft);
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

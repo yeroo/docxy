@@ -85,10 +85,34 @@ pub struct MessageRow {
 /// this variant's fields.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboxOp {
-    MarkRead { id: String, read: bool },
-    SetFlag { id: String, flagged: bool },
-    Move { id: String, dest: String },
-    Delete { id: String },
+    MarkRead {
+        id: String,
+        read: bool,
+    },
+    SetFlag {
+        id: String,
+        flagged: bool,
+    },
+    Move {
+        id: String,
+        dest: String,
+    },
+    Delete {
+        id: String,
+    },
+    /// Push a draft's current locally-stored fields (subject/to/cc/body) to
+    /// Graph: `sync::outbox::apply_op` creates it (and reconciles the local
+    /// `local:` id to the Graph-minted one) if `id` hasn't synced yet,
+    /// otherwise patches the existing Graph draft in place.
+    SaveDraft {
+        id: String,
+    },
+    /// Ensure the draft addressed by `id` exists on Graph (same as
+    /// `SaveDraft`, if it hasn't already), then hand it to Graph for
+    /// delivery via `.../send`.
+    SendDraft {
+        id: String,
+    },
 }
 
 impl OutboxOp {
@@ -101,6 +125,8 @@ impl OutboxOp {
             OutboxOp::SetFlag { .. } => "setFlag",
             OutboxOp::Move { .. } => "move",
             OutboxOp::Delete { .. } => "delete",
+            OutboxOp::SaveDraft { .. } => "saveDraft",
+            OutboxOp::SendDraft { .. } => "sendDraft",
         }
     }
 
@@ -127,6 +153,14 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
+            OutboxOp::SaveDraft { id } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+            ]),
+            OutboxOp::SendDraft { id } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+            ]),
         }
     }
 
@@ -150,6 +184,8 @@ impl OutboxOp {
                 dest: v.get("dest")?.as_str()?.to_string(),
             }),
             "delete" => Some(OutboxOp::Delete { id: id()? }),
+            "saveDraft" => Some(OutboxOp::SaveDraft { id: id()? }),
+            "sendDraft" => Some(OutboxOp::SendDraft { id: id()? }),
             _ => None,
         }
     }
@@ -356,6 +392,18 @@ impl Store {
         let _ = self.conn.execute(
             "UPDATE messages SET is_flagged = ?1 WHERE id = ?2",
             params![flagged, id],
+        );
+    }
+
+    /// Locally marks a draft as sent (`is_draft = 0`) — the optimistic half
+    /// of `SyncCommand::SendDraft` (the sync engine's outbox, via
+    /// `OutboxOp::SendDraft`, is what actually hands the draft to Graph for
+    /// delivery). See `set_read` for why this doesn't return a `Result`: a
+    /// mismatched/already-gone `id` just changes zero rows.
+    pub fn mark_sent(&self, id: &str) {
+        let _ = self.conn.execute(
+            "UPDATE messages SET is_draft = 0 WHERE id = ?1",
+            params![id],
         );
     }
 
@@ -575,7 +623,8 @@ impl Store {
         Ok(Some((row, body)))
     }
 
-    /// Resolves the Drafts folder's id, for filing a new local draft.
+    /// Resolves the Drafts folder's id, for filing a new local draft (or a
+    /// reply/forward draft the sync engine just fetched from Graph).
     ///
     /// The normal case: the Drafts folder has already synced down from
     /// Graph, so it's a row with `well_known_name = 'drafts'` — return its
@@ -588,10 +637,15 @@ impl Store {
     /// it if needed (a real row has to exist for the `messages.folder_id`
     /// foreign key to accept the insert). This sentinel is *not* marked
     /// `well_known_name = 'drafts'`, so once the real sync happens the two
-    /// don't collide — but nothing here re-files the sentinel's messages
-    /// into the real Drafts folder afterward; that reconciliation is left
-    /// to a later task (see the Task 6 report).
-    fn drafts_folder_id(&self) -> Result<String, StoreError> {
+    /// don't collide — see `adopt_sentinel_drafts`, which the sync engine
+    /// calls once the real Drafts folder appears, to re-file whatever ended
+    /// up under the sentinel.
+    ///
+    /// `pub(crate)` (not `pub`) rather than private: the sync engine
+    /// (`sync::engine`) needs the same resolution when it stores a
+    /// reply/forward draft fetched from Graph, so both call sites agree on
+    /// where "the Drafts folder" is instead of duplicating this logic.
+    pub(crate) fn drafts_folder_id(&self) -> Result<String, StoreError> {
         let existing = self.conn.query_row(
             "SELECT id FROM folders WHERE well_known_name = 'drafts' LIMIT 1",
             [],
@@ -610,6 +664,24 @@ impl Store {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Re-files every message still sitting under the local drafts sentinel
+    /// folder (`LOCAL_DRAFTS_SENTINEL_FOLDER_ID`) into `real_drafts_id`, the
+    /// id of the Drafts folder (`well_known_name = 'drafts'`) once it has
+    /// actually synced down from Graph. Called by the sync engine right
+    /// after upserting a fresh folder list that contains the real Drafts
+    /// folder, so drafts created (or reply/forward-fetched) before the
+    /// first folder sync don't stay stranded under the sentinel — see
+    /// `drafts_folder_id`'s doc comment and the Task 6 report for the gap
+    /// this closes. Affects zero rows (not an error) if nothing was ever
+    /// filed under the sentinel.
+    pub fn adopt_sentinel_drafts(&self, real_drafts_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET folder_id = ?1 WHERE folder_id = ?2",
+            params![real_drafts_id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+        )?;
+        Ok(())
     }
 
     /// Replaces the full set of attachment metadata stored for a message
@@ -1039,6 +1111,22 @@ mod outbox_tests {
             OutboxOp::Delete { id: "1".into() }.to_json().to_string(),
             r#"{"kind":"delete","id":"1"}"#
         );
+        assert_eq!(
+            OutboxOp::SaveDraft {
+                id: "local:1".into()
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"saveDraft","id":"local:1"}"#
+        );
+        assert_eq!(
+            OutboxOp::SendDraft {
+                id: "local:1".into()
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"sendDraft","id":"local:1"}"#
+        );
     }
 
     #[test]
@@ -1057,6 +1145,12 @@ mod outbox_tests {
                 dest: "Archive".into(),
             },
             OutboxOp::Delete { id: "M4".into() },
+            OutboxOp::SaveDraft {
+                id: "local:M5".into(),
+            },
+            OutboxOp::SendDraft {
+                id: "local:M6".into(),
+            },
         ];
         for op in ops {
             let encoded = op.to_json().to_string();
@@ -1207,5 +1301,70 @@ mod draft_tests {
     fn draft_returns_none_for_unknown_id() {
         let s = Store::open_in_memory().unwrap();
         assert!(s.draft("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_sent_clears_is_draft() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "a@x", "", "body").unwrap();
+        assert!(s.draft(&id).unwrap().unwrap().0.is_draft);
+        s.mark_sent(&id);
+        assert!(!s.draft(&id).unwrap().unwrap().0.is_draft);
+    }
+
+    #[test]
+    fn adopt_sentinel_drafts_refiles_into_the_newly_synced_drafts_folder() {
+        // A draft created before the first folder sync lands under the local
+        // sentinel folder (see `drafts_folder_id`). Once the real Drafts
+        // folder syncs down from Graph, `adopt_sentinel_drafts` must re-file
+        // it so it doesn't stay stranded under the sentinel forever.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "a@x", "", "<p>hi</p>").unwrap();
+        assert_eq!(
+            s.messages_in_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, 50, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        s.upsert_folder(&MailFolder {
+            id: "REAL-DRAFTS".into(),
+            display_name: "Drafts".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("drafts".into()),
+        })
+        .unwrap();
+        s.adopt_sentinel_drafts("REAL-DRAFTS").unwrap();
+
+        assert!(
+            s.messages_in_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, 50, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = s.messages_in_folder("REAL-DRAFTS", 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+    }
+
+    #[test]
+    fn adopt_sentinel_drafts_is_a_no_op_when_nothing_is_filed_under_the_sentinel() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "REAL-DRAFTS".into(),
+            display_name: "Drafts".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("drafts".into()),
+        })
+        .unwrap();
+        s.adopt_sentinel_drafts("REAL-DRAFTS").unwrap();
+        assert!(
+            s.messages_in_folder("REAL-DRAFTS", 50, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
