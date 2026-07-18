@@ -569,6 +569,18 @@ pub struct DateTime {
     pub weekday: u32,
 }
 
+/// Format a [`DateTime`] (already the stored UTC components) as an ISO-8601
+/// timestamp (`YYYY-MM-DDTHH:MM:SSZ`). Shared by every `doc.metadata`
+/// control-surface implementation (docxy's terminal `control.rs` and
+/// docxwasm's `docx_ctl`), so they report identical wire strings from the
+/// same field order.
+pub fn format_iso(dt: &DateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
+    )
+}
+
 /// Document properties from `docProps/core.xml`, the source for AUTHOR/TITLE/… and
 /// CREATEDATE/SAVEDATE fields.
 #[derive(Clone, Debug, Default)]
@@ -1095,5 +1107,23 @@ mod tests {
         assert_eq!(ev(" PAGE "), None);
         // a table/bookmark reference we can't resolve falls back to the cache
         assert_eq!(ev("= SUM(ABOVE)"), None);
+    }
+
+    #[test]
+    fn format_iso_pins_the_field_order() {
+        // Every component is a distinct digit, so a swapped field (e.g.
+        // month/day) would produce a different string, not a coincidentally
+        // matching one — the same guard docxy's and docxwasm's metadata
+        // tests rely on now that this lives here.
+        let dt = DateTime {
+            year: 2020,
+            month: 1,
+            day: 2,
+            hour: 3,
+            min: 4,
+            sec: 5,
+            weekday: 4,
+        };
+        assert_eq!(format_iso(&dt), "2020-01-02T03:04:05Z");
     }
 }

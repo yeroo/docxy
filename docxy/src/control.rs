@@ -321,21 +321,12 @@ fn metadata(app: &App) -> Json {
         }
     }
     if let Some(dt) = &props.created {
-        fields.push(("created", Json::Str(format_iso(dt))));
+        fields.push(("created", Json::Str(docxcore::field::format_iso(dt))));
     }
     if let Some(dt) = &props.modified {
-        fields.push(("modified", Json::Str(format_iso(dt))));
+        fields.push(("modified", Json::Str(docxcore::field::format_iso(dt))));
     }
     Json::obj(fields)
-}
-
-/// Format a [`docxcore::field::DateTime`] (already the stored UTC components)
-/// as an ISO-8601 timestamp.
-fn format_iso(dt: &docxcore::field::DateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
-    )
 }
 
 /// `doc.stats`: word/char/paragraph/block counts over the live buffer.

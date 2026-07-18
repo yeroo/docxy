@@ -24,7 +24,9 @@ use std::process::ExitCode;
 
 use docxcore::editor::{Caret, Clip, Editor, Match};
 use docxcore::export::{PdfOptions, to_pdf};
-use docxcore::load::{Relationships, parse_header_footer, parse_rels_xml};
+use docxcore::load::{Relationships, parse_rels_xml};
+#[cfg(test)]
+use docxcore::load::parse_header_footer;
 use docxcore::markdown::{from_markdown, to_markdown_with};
 use docxcore::model::{Align, Block, Document, Hyperlink, Inline, PageGeom, Run, RunProps};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
@@ -6210,42 +6212,11 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
 
 /// Load the default header/footer block content referenced by the section's
 /// `<w:{kind}>` (kind = "headerReference" or "footerReference"). Empty if none.
+/// Thin wrapper over `docxcore::load::resolve_header_footer` (shared with
+/// docxwasm's `docx_ctl`, which needs the identical sectPr -> rels -> part ->
+/// parse resolution for its `doc.header`/`doc.footer` verbs).
 fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str, wtype: &str) -> Vec<Block> {
-    let Some(rid) = ref_rid(pkg.sect_pr(), kind, wtype) else {
-        return Vec::new();
-    };
-    let Some(target) = rels.target(&rid) else {
-        return Vec::new();
-    };
-    let name = match target.strip_prefix('/') {
-        Some(r) => r.to_string(),
-        None => format!("word/{}", target.trim_start_matches("./")),
-    };
-    let Some(bytes) = pkg.part(&name) else {
-        return Vec::new();
-    };
-    parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), rels)
-}
-
-/// The relationship id of a section header/footer reference of the given type
-/// (`default` / `first` / `even`).
-fn ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<String> {
-    let needle = format!("<w:{kind}");
-    let want = format!("w:type=\"{wtype}\"");
-    let mut i = 0;
-    while let Some(p) = sect[i..].find(&needle) {
-        let start = i + p;
-        let end = sect[start..]
-            .find('>')
-            .map(|e| start + e)
-            .unwrap_or(sect.len());
-        let el = &sect[start..end];
-        if el.contains(&want) {
-            return attr_value(el, "r:id");
-        }
-        i = (end + 1).min(sect.len());
-    }
-    None
+    docxcore::load::resolve_header_footer(pkg, rels, kind, wtype)
 }
 
 /// Whether an on/off OOXML element (`<w:tag/>` / `<w:tag w:val="…"/>`) is present
@@ -6257,17 +6228,9 @@ fn flag_on(xml: &str, tag: &str) -> bool {
     };
     let end = xml[p..].find('>').map(|e| p + e).unwrap_or(xml.len());
     !matches!(
-        attr_value(&xml[p..end], "w:val").as_deref(),
+        docxcore::load::xml_attr_value(&xml[p..end], "w:val").as_deref(),
         Some("false" | "0" | "off")
     )
-}
-
-fn attr_value(el: &str, key: &str) -> Option<String> {
-    let k = format!("{key}=\"");
-    let s = el.find(&k)? + k.len();
-    let rest = &el[s..];
-    let e = rest.find('"')?;
-    Some(rest[..e].to_string())
 }
 
 /// Rewrite a `<w:sectPr>` so its page size is landscape (w>h) or portrait (h>w),
@@ -6295,7 +6258,7 @@ fn orient_sectpr(sect: &str, landscape: bool) -> String {
 
 /// The package part name of the default header/footer (for editing/saving).
 fn hf_part_name(pkg: &Package, rels: &Relationships, kind: &str) -> Option<String> {
-    let rid = ref_rid(pkg.sect_pr(), kind, "default")?;
+    let rid = docxcore::load::header_footer_ref_rid(pkg.sect_pr(), kind, "default")?;
     let target = rels.target(&rid)?;
     Some(match target.strip_prefix('/') {
         Some(r) => r.to_string(),

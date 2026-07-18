@@ -650,25 +650,11 @@ impl Session {
 
     /// Resolve the DEFAULT section header/footer's block content from `kind`
     /// (`"headerReference"`/`"footerReference"`), empty when the document has
-    /// none. A small, self-contained re-implementation of docxy main.rs's
-    /// `load_hdr_ftr`/`ref_rid`/`attr_value` (private to that binary crate,
-    /// so duplicated here rather than shared — `docxwasm` depends only on
-    /// `docxcore`, see this crate's single-dependency rule).
+    /// none. Thin wrapper over `docxcore::load::resolve_header_footer` —
+    /// shared with docxy main.rs's `load_hdr_ftr`, so the sectPr -> rels ->
+    /// part -> parse resolution lives in exactly one place.
     fn header_footer_blocks(&self, kind: &str) -> Vec<Block> {
-        let Some(rid) = hf_ref_rid(self.pkg.sect_pr(), kind, "default") else {
-            return Vec::new();
-        };
-        let Some(target) = self.rels.target(&rid) else {
-            return Vec::new();
-        };
-        let name = match target.strip_prefix('/') {
-            Some(r) => r.to_string(),
-            None => format!("word/{}", target.trim_start_matches("./")),
-        };
-        let Some(bytes) = self.pkg.part(&name) else {
-            return Vec::new();
-        };
-        docxcore::load::parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), &self.rels)
+        docxcore::load::resolve_header_footer(&self.pkg, &self.rels, kind, "default")
     }
 
     /// `{}` -> present-if-set: `{title?,author?,subject?,keywords?,comments?,
@@ -710,14 +696,14 @@ impl Session {
             }
             first = false;
             out.push_str("\"created\":");
-            json::push_str(&mut out, &hf_format_iso(dt));
+            json::push_str(&mut out, &docxcore::field::format_iso(dt));
         }
         if let Some(dt) = &props.modified {
             if !first {
                 out.push(',');
             }
             out.push_str("\"modified\":");
-            json::push_str(&mut out, &hf_format_iso(dt));
+            json::push_str(&mut out, &docxcore::field::format_iso(dt));
         }
         out.push('}');
         out
@@ -981,49 +967,6 @@ fn ctl_parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String
             Ok((v, v))
         }
     }
-}
-
-/// The relationship id of a section header/footer reference of the given
-/// type (`default`/`first`/`even`) inside a captured `w:sectPr` XML string.
-/// Duplicated from docxy main.rs's private `ref_rid` — see
-/// [`Session::header_footer_blocks`] for why.
-fn hf_ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<String> {
-    let needle = format!("<w:{kind}");
-    let want = format!("w:type=\"{wtype}\"");
-    let mut i = 0;
-    while let Some(p) = sect[i..].find(&needle) {
-        let start = i + p;
-        let end = sect[start..]
-            .find('>')
-            .map(|e| start + e)
-            .unwrap_or(sect.len());
-        let el = &sect[start..end];
-        if el.contains(&want) {
-            return hf_attr_value(el, "r:id");
-        }
-        i = (end + 1).min(sect.len());
-    }
-    None
-}
-
-/// Read the value of attribute `key="…"` from a raw XML element slice.
-/// Duplicated from docxy main.rs's private `attr_value`.
-fn hf_attr_value(el: &str, key: &str) -> Option<String> {
-    let k = format!("{key}=\"");
-    let s = el.find(&k)? + k.len();
-    let rest = &el[s..];
-    let e = rest.find('"')?;
-    Some(rest[..e].to_string())
-}
-
-/// Format a [`docxcore::field::DateTime`] (already the stored UTC components)
-/// as an ISO-8601 timestamp. Duplicated from docxy control.rs's `format_iso`
-/// — same field order, so a swapped month/day would fail the metadata tests.
-fn hf_format_iso(dt: &docxcore::field::DateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
-    )
 }
 
 /// Find the caret's screen `(line, col)` from a set of caret maps.
@@ -1481,9 +1424,10 @@ mod tests {
     #[test]
     fn ctl_header_resolves_the_default_section_header_content() {
         // A real header part wired through sectPr -> document.xml.rels ->
-        // word/header1.xml, proving the duplicated ref-rid resolution logic
-        // (mirrors docxy main.rs's `load_hdr_ftr`/`ref_rid`) actually works,
-        // not just that it degrades to the empty-shape default.
+        // word/header1.xml, proving `header_footer_blocks`'s call into the
+        // shared `docxcore::load::resolve_header_footer` (also used by docxy
+        // main.rs's `load_hdr_ftr`) actually resolves content, not just that
+        // it degrades to the empty-shape default.
         let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
             <w:p><w:r><w:t>body text</w:t></w:r></w:p>
             <w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>
@@ -1651,54 +1595,15 @@ mod tests {
         let end = out[start..].find('"').expect("closing quote") + start;
         let b64 = &out[start..end];
         assert!(!b64.is_empty());
-        let bytes = decode_base64_for_test(b64);
+        // Shared test-only decoder (json.rs::decode_base64_for_test) — the
+        // inverse of `json::to_base64`, kept as a single copy rather than
+        // duplicated per test module.
+        let bytes = json::decode_base64_for_test(b64);
         assert!(
             bytes.starts_with(b"%PDF"),
             "decoded bytes don't start with %PDF: {:?}",
             &bytes[..bytes.len().min(16)]
         );
-    }
-
-    /// Minimal decoder, test-only (mirrors `json.rs`'s own test-only decoder):
-    /// proves `ctl_export_pdf`'s base64 payload actually decodes to real PDF
-    /// bytes, without adding a dependency to the production encode-only path.
-    fn decode_base64_for_test(s: &str) -> Vec<u8> {
-        fn val(c: u8) -> u8 {
-            match c {
-                b'A'..=b'Z' => c - b'A',
-                b'a'..=b'z' => c - b'a' + 26,
-                b'0'..=b'9' => c - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                _ => 0,
-            }
-        }
-        let mut out = Vec::new();
-        for chunk in s.as_bytes().chunks(4) {
-            let mut vals = [0u8; 4];
-            let mut n = 0usize;
-            for (i, &c) in chunk.iter().enumerate() {
-                if c == b'=' {
-                    break;
-                }
-                vals[i] = val(c);
-                n += 1;
-            }
-            let x = ((vals[0] as u32) << 18)
-                | ((vals[1] as u32) << 12)
-                | ((vals[2] as u32) << 6)
-                | (vals[3] as u32);
-            if n >= 2 {
-                out.push((x >> 16) as u8);
-            }
-            if n >= 3 {
-                out.push((x >> 8) as u8);
-            }
-            if n >= 4 {
-                out.push(x as u8);
-            }
-        }
-        out
     }
 
     #[test]

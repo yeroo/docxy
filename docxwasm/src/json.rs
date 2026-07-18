@@ -61,6 +61,53 @@ pub fn to_base64(data: &[u8]) -> String {
     out
 }
 
+/// The inverse of [`to_base64`], test-only: proves the encoder against known
+/// vectors/round-trips in this module's own tests, and lets `bridge.rs`'s
+/// tests check that `doc.export-pdf`'s `pdfBase64` payload actually decodes
+/// to real PDF bytes. Production code only ever *emits* base64 (see
+/// `to_base64`'s doc comment), never parses it back, so this never ships
+/// outside `cfg(test)` — kept here as the single copy rather than duplicated
+/// per test module.
+#[cfg(test)]
+pub(crate) fn decode_base64_for_test(s: &str) -> Vec<u8> {
+    fn val(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    }
+    let mut out = Vec::new();
+    for chunk in s.as_bytes().chunks(4) {
+        let mut vals = [0u8; 4];
+        let mut n = 0usize;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                break;
+            }
+            vals[i] = val(c);
+            n += 1;
+        }
+        let x = ((vals[0] as u32) << 18)
+            | ((vals[1] as u32) << 12)
+            | ((vals[2] as u32) << 6)
+            | (vals[3] as u32);
+        if n >= 2 {
+            out.push((x >> 16) as u8);
+        }
+        if n >= 3 {
+            out.push((x >> 8) as u8);
+        }
+        if n >= 4 {
+            out.push(x as u8);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Parsing — `docx_ctl` requests
 // ---------------------------------------------------------------------------
@@ -380,48 +427,6 @@ mod tests {
         assert!(Json::parse("1 2").is_err());
     }
 
-    /// Minimal decoder, test-only: proves [`to_base64`] against known vectors
-    /// and a round-trip, without adding a dependency to the production side
-    /// (which only ever needs to *emit* base64, never parse it back).
-    fn decode_b64(s: &str) -> Vec<u8> {
-        fn val(c: u8) -> u8 {
-            match c {
-                b'A'..=b'Z' => c - b'A',
-                b'a'..=b'z' => c - b'a' + 26,
-                b'0'..=b'9' => c - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                _ => 0,
-            }
-        }
-        let mut out = Vec::new();
-        for chunk in s.as_bytes().chunks(4) {
-            let mut vals = [0u8; 4];
-            let mut n = 0usize;
-            for (i, &c) in chunk.iter().enumerate() {
-                if c == b'=' {
-                    break;
-                }
-                vals[i] = val(c);
-                n += 1;
-            }
-            let x = ((vals[0] as u32) << 18)
-                | ((vals[1] as u32) << 12)
-                | ((vals[2] as u32) << 6)
-                | (vals[3] as u32);
-            if n >= 2 {
-                out.push((x >> 16) as u8);
-            }
-            if n >= 3 {
-                out.push((x >> 8) as u8);
-            }
-            if n >= 4 {
-                out.push(x as u8);
-            }
-        }
-        out
-    }
-
     #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(to_base64(b""), "");
@@ -437,6 +442,6 @@ mod tests {
     fn base64_round_trips_arbitrary_bytes() {
         let data: Vec<u8> = (0..=255u8).collect();
         let encoded = to_base64(&data);
-        assert_eq!(decode_b64(&encoded), data);
+        assert_eq!(decode_base64_for_test(&encoded), data);
     }
 }
