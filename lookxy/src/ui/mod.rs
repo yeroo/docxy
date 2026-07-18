@@ -29,8 +29,8 @@ use ratatui::style::{Color, Style};
 ///
 /// While the compose view (`App::compose`) is open, it takes over the
 /// entire frame instead — a full-screen mode, not an overlay over the
-/// three panes (unlike the move-folder/attachments/sign-in popups, which
-/// are drawn on top of them).
+/// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
+/// which are drawn on top of them, in that order).
 pub fn draw(f: &mut Frame, app: &App) {
     if app.compose.is_some() {
         compose::draw_compose(f, app);

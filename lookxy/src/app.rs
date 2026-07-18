@@ -2664,4 +2664,62 @@ pub(crate) mod tests {
         assert!(app.confirm.is_none());
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
     }
+
+    #[test]
+    fn moving_a_thread_confirms_then_moves_every_message() {
+        use crate::app::Row;
+        use mailcore::graph::model::MailFolder;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "archive".into(),
+                display_name: "Archive".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("archive".into()),
+            })
+            .expect("seed archive folder");
+        seed_second_in_c1(&app); // c1 = m1 + m2
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        // `v` must open the picker on a thread — this is the regression the
+        // threaded-id capture in `open_move_picker` fixed.
+        app.open_move_picker();
+        assert!(app.move_picker.is_some());
+
+        let archive_pos = app
+            .move_picker
+            .as_ref()
+            .unwrap()
+            .folders
+            .iter()
+            .position(|f| f.id == "archive")
+            .unwrap();
+        app.move_picker.as_mut().unwrap().index = archive_pos;
+
+        // Enter on the picker only opens the confirm modal for a
+        // multi-message thread — nothing moved yet.
+        app.confirm_move();
+        assert!(app.confirm.is_some());
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+
+        // Confirming moves every message and enqueues one Move per message.
+        app.confirm_yes();
+        assert!(app.confirm.is_none());
+        let mut count = 0;
+        while let Ok(SyncCommand::Move { dest, .. }) = app.test_cmd_rx.as_ref().unwrap().try_recv()
+        {
+            assert_eq!(dest, "archive");
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
 }
