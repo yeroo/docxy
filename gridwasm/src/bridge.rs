@@ -70,6 +70,13 @@ struct RemovedSheetStash {
     /// data lives in package parts outside `Sheet`, so it isn't part of the
     /// `sheet` snapshot above and would otherwise be silently dropped.
     comments: Vec<gridcore::comments::Comment>,
+    /// Every defined name SCOPED to the removed sheet (`scope ==
+    /// Some(idx)`) — `SheetPackage::remove_sheet` drops these via a
+    /// `defined_names.retain(|d| d.scope != Some(idx))` (gridcore/src/
+    /// xlsx.rs), and they live on `Workbook::defined_names`, not `Sheet`,
+    /// so they too would otherwise be silently dropped. Replayed on
+    /// restore with `scope` re-pointed at the restored sheet's NEW index.
+    defined_names: Vec<DefinedName>,
     /// Whether the removed sheet was the ACTIVE one at the moment of
     /// removal — mirrors `sheet.remove`'s own viewport-reset rule, in
     /// reverse, on restore (see `ctl_sheet_restore_removed`).
@@ -1447,15 +1454,25 @@ impl Session {
     /// "args":{}}` (see the bucket-table doc comment above and
     /// [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed) for
     /// what that verb does). Before removing, snapshots the sheet's full
-    /// `Sheet` value and its comments into `Session::removed_sheet_stash`
-    /// ([`RemovedSheetStash`]), so the inverse is a genuine restore, not a
-    /// name-only placeholder. Errors on the last sheet. `sheet` is required
-    /// (no default to active) — a destructive op shouldn't silently default
-    /// to "whichever one is active". Only resets `cur`/`anchor`/the
-    /// viewport when the ACTIVE sheet itself is the one removed (Task 5's
-    /// xlsxy fix, mirrored here).
+    /// `Sheet` value, its comments, and its sheet-scoped defined names into
+    /// `Session::removed_sheet_stash` ([`RemovedSheetStash`]), so the
+    /// inverse is a genuine restore, not a name-only placeholder. Errors on
+    /// the last sheet — checked FIRST, before any cloning, so a doomed call
+    /// doesn't pay for a snapshot it's about to throw away. `sheet` is
+    /// required (no default to active) — a destructive op shouldn't
+    /// silently default to "whichever one is active". Only resets
+    /// `cur`/`anchor`/the viewport when the ACTIVE sheet itself is the one
+    /// removed (Task 5's xlsxy fix, mirrored here).
     fn ctl_sheet_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
+        // A workbook must keep at least one sheet — `SheetPackage::remove_sheet`
+        // enforces this too (and is still checked below as a safety net),
+        // but checking it here FIRST avoids cloning a whole `Sheet` (plus
+        // walking comments/defined names) on a call that's guaranteed to
+        // fail anyway.
+        if self.pkg.workbook.sheets.len() <= 1 {
+            return Err("cannot remove the last sheet".into());
+        }
         let name = self.pkg.workbook.sheets[si].name.clone();
         let sheet_snapshot = self.pkg.workbook.sheets[si].clone();
         // Comment data lives in package parts outside `Sheet` — must be
@@ -1466,6 +1483,17 @@ impl Session {
             .comments()
             .into_iter()
             .filter(|cm| cm.sheet == si)
+            .collect();
+        // Defined names scoped to this sheet live on `Workbook::defined_names`,
+        // not `Sheet` — `remove_sheet` drops them via a `retain(|d| d.scope
+        // != Some(idx))`, so they'd otherwise vanish silently too.
+        let defined_names: Vec<DefinedName> = self
+            .pkg
+            .workbook
+            .defined_names
+            .iter()
+            .filter(|d| d.scope == Some(si))
+            .cloned()
             .collect();
         let removed_active = self.active == si;
         if !self.pkg.remove_sheet(si) {
@@ -1498,6 +1526,7 @@ impl Session {
             name,
             sheet: sheet_snapshot,
             comments,
+            defined_names,
             removed_active,
         });
         Ok(
@@ -1516,12 +1545,20 @@ impl Session {
     ///
     /// Restores the single most-recently-removed sheet from
     /// `Session::removed_sheet_stash`: the full `Sheet` value (cells,
-    /// formulas, drawings — everything `Sheet` itself carries) plus every
-    /// comment (threaded and legacy) `ctl_sheet_remove` captured just before
-    /// deletion. The stash is single-slot — a second `sheet.remove`
-    /// overwrites it, and a successful restore takes (clears) it via
-    /// `Option::take` — so calling this with nothing stashed errors
-    /// (`"nothing to restore"`).
+    /// formulas, drawings — everything `Sheet` itself carries), every
+    /// comment (threaded and legacy), and every defined name that was
+    /// scoped to the removed sheet — all captured by `ctl_sheet_remove`
+    /// just before deletion. Defined names are re-inserted with `scope`
+    /// re-pointed at the restored sheet's NEW index (their old index may no
+    /// longer even exist). This restores the LIVE, in-memory session
+    /// correctly; whether a defined-name write survives a subsequent
+    /// `save`/reload round trip is a separate, pre-existing concern (the
+    /// xlsx byte-preservation gap list already flags named-range writes as
+    /// unverified repo-wide — this restore doesn't newly introduce that
+    /// gap, just inherits it). The stash is single-slot — a second
+    /// `sheet.remove` overwrites it, and a successful restore takes
+    /// (clears) it via `Option::take` — so calling this with nothing
+    /// stashed errors (`"nothing to restore"`).
     ///
     /// Active-sheet/viewport handling mirrors `sheet.remove`'s own rule in
     /// reverse: if the removed sheet WAS the active one, the restored sheet
@@ -1561,6 +1598,15 @@ impl Session {
                 self.pkg
                     .set_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text);
             }
+        }
+        // Re-point each name's scope at the NEW index — the old one may no
+        // longer even exist (sheets above it shifted down on removal).
+        for dn in stash.defined_names {
+            self.pkg.workbook.defined_names.push(DefinedName {
+                name: dn.name,
+                scope: Some(new_idx),
+                formula: dn.formula,
+            });
         }
         if stash.removed_active {
             self.active = new_idx;
@@ -2745,7 +2791,7 @@ mod tests {
     }
 
     #[test]
-    fn ctl_sheet_remove_restore_round_trips_cells_formulas_name_and_comments() {
+    fn ctl_sheet_remove_restore_round_trips_cells_formulas_name_comments_and_defined_names() {
         let mut s = two_sheet_session();
         s.active = 1; // Sheet2
         s.dispatch("set\t0\t0\t10");
@@ -2754,10 +2800,23 @@ mod tests {
         s.ctl(
             r#"{"verb":"comment.add","args":{"ref":"A1","text":"Check this","author":"Ana","sheet":1}}"#,
         );
+        // A sheet-scoped defined name — no ctl verb creates these (out of
+        // wave-1 scope), so push it directly, same as a load from a real
+        // .xlsx would populate `workbook.defined_names`.
+        s.pkg.workbook.defined_names.push(DefinedName {
+            name: "MyRange".to_string(),
+            scope: Some(1), // scoped to Sheet2
+            formula: "A1:B2".to_string(),
+        });
 
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
+        assert_eq!(
+            s.pkg.workbook.defined_name("MyRange", 0),
+            None,
+            "the scoped name must vanish along with its sheet"
+        );
 
         let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
         assert!(
@@ -2787,6 +2846,11 @@ mod tests {
                 && list.contains("\"author\":\"Ana\"")
                 && list.contains("\"text\":\"Check this\""),
             "the comment must be restored too, not silently dropped: {list}"
+        );
+        assert_eq!(
+            s.pkg.workbook.defined_name("MyRange", 1),
+            Some("A1:B2"),
+            "the defined name must resolve again, scoped to the restored sheet's NEW index"
         );
     }
 
