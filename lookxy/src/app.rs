@@ -492,6 +492,8 @@ impl App {
             self.messages.clear();
             self.threads.clear();
             self.visible_rows.clear();
+            self.msg_index = 0;
+            self.row_index = 0;
             return;
         };
         if self.threaded {
@@ -1594,6 +1596,20 @@ mod tests {
             app.rebuild_visible_rows();
         }
         assert!(app.visible_rows.len() > before); // child rows appeared
+    }
+
+    #[test]
+    fn reload_with_no_folder_resets_cursors() {
+        let mut app = App::for_test_with_seeded_store();
+        app.msg_index = 5;
+        app.row_index = 5;
+        app.selected_folder = None;
+        app.reload_messages();
+
+        assert_eq!(app.msg_index, 0);
+        assert_eq!(app.row_index, 0);
+        assert!(app.messages.is_empty());
+        assert!(app.visible_rows.is_empty());
     }
 
     #[test]
