@@ -58,6 +58,9 @@ pane** — plus a status bar. `Tab` cycles focus between them.
 | `v` | move the highlighted message — opens a folder picker (`↑`/`↓`/`j`/`k` to choose, `Enter` to confirm, `Esc` to cancel) |
 | `a` | open the attachments popup for the highlighted message (`↑`/`↓`/`j`/`k` to pick, `Enter` to save to Downloads, `o` to save-and-open, `Esc` to close) |
 | `/` | open the search prompt — type a query, `Enter` to run it against the local full-text index, `↑`/`↓` to move through results, `Esc` to return to the folder view |
+| `c` | compose a new message |
+| `r` / `R` | reply / reply-all to the highlighted message |
+| `F` | forward the highlighted message |
 | `q`, `Ctrl-C` | quit |
 
 Every triage action (`m`/`u`/`f`/`v`/`d`) writes to the local store
@@ -67,6 +70,47 @@ retried automatically and never silently drops your action. The background
 sync engine also re-syncs on its own on a timer (`refresh_secs`, see
 [Configuration](#configuration)), so folders and messages refresh even if
 you never touch anything.
+
+## Writing mail
+
+Press `c` to start a new message, `r`/`R` to reply/reply-all to the
+highlighted message, or `F` to forward it — each opens a full-screen
+composer over the three-pane layout. (Forward is `F`, not a bare `f`: that
+key was already "toggle flag" before compose existed, so forward takes the
+shift variant instead, the same way `r`/`R` already pair reply with
+reply-all.)
+
+`Tab` cycles focus between the composer's fields: **To** → **Cc** →
+**Subject** → **Body** → back to **To**. To/Cc/Subject are plain text; the
+Body is a rich-text editor with its own formatting keys, active only while
+Body has focus:
+
+| Keys | Action |
+|------|--------|
+| `Ctrl-B` / `Ctrl-I` / `Ctrl-U` | toggle bold / italic / underline on the current selection |
+| `Ctrl-L` | toggle the current paragraph into (or out of) a bulleted list item |
+| `↑`/`↓`/`←`/`→`, `Home`/`End` | move the caret (hold `Shift` to extend the selection) |
+| `Enter` | split the paragraph |
+
+Three keys work from any field, not just Body:
+
+| Keys | Action |
+|------|--------|
+| `Ctrl-Enter` | **Send** — delivers the message and closes the composer |
+| `Esc` | **Save draft** and close the composer |
+| `Ctrl-D` | **Discard** — closes the composer without saving your edits (the draft itself, if one already exists, is left alone) |
+
+**Resuming a draft.** Every message sitting in the **Drafts** folder is a
+draft, whether it's one you started with `c` and saved, or one Exchange
+itself created — selecting it (`Enter`, same as opening any other message)
+opens it straight into the composer, loaded with its saved To/Cc/Subject and
+body, instead of the read-only reading pane.
+
+**Sends ride the outbox.** Pressing `Ctrl-Enter` doesn't wait on the
+network: like every other triage action (`m`/`u`/`f`/`v`/`d`), it writes the
+message to the local store and queues it to Exchange in the background,
+retrying automatically on a transient failure. Once delivered, it appears in
+your **Sent Items** the same as if you'd sent it from Outlook.
 
 ## Agent control (MCP)
 

@@ -1,9 +1,14 @@
 //! `App` — the TUI's in-memory state: the local mail store, the background
 //! sync handle, where the three panes (folders/list/reading) currently
-//! point, and the triage actions (`m`/`u`/`f`/`d`/`v`) that mutate them.
+//! point, the triage actions (`m`/`u`/`f`/`d`/`v`) that mutate them, and
+//! compose's entry points (`c`/`r`/`R`/`F`, drafts resume, send/save/discard
+//! wiring — see the "Compose" section below).
 
 use std::path::{Path, PathBuf};
 
+use crate::ui::compose::{Compose, ComposeAction, ComposeField};
+use editcore::ops::Editor;
+use mailcore::compose_html;
 use mailcore::graph::model::{AttachmentMeta, Body};
 use mailcore::store::{FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
@@ -277,21 +282,26 @@ impl App {
             }
             SyncEvent::AttachmentsUpdated { message_id } => self.reload_attachments(&message_id),
             SyncEvent::AttachmentSaved { path } => self.finish_attachment_save(path),
+            // A reply/forward draft (`SyncCommand::ComposeReply`/
+            // `ComposeForward`) just landed in the store — open the composer
+            // on it (see `open_draft`).
+            SyncEvent::DraftReady { id } => self.open_draft(&id),
             SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
             SyncEvent::SignInStarted { authorize_url } => {
                 self.open_url_with_os_handler(&authorize_url);
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
             SyncEvent::Error(msg) => self.error_notice = Some(msg),
-            // `DraftReady`/`Sent` (mailcore Task 7) have no TUI consumer yet —
-            // compose's UI side (plan Task 8/9) is what will react to these
-            // (open the editor on `DraftReady`, close it / show a toast on
-            // `Sent`). Folded into the existing catch-all rather than given
-            // dedicated arms so this compiles now without guessing at that
-            // future behavior.
+            // `Sent` has no TUI consumer yet: the composer already closes
+            // optimistically the moment Send is pressed (`apply_compose_action`),
+            // before the engine's outbox drain even reaches Graph, so by the
+            // time this lands there's nothing left open for it to affect —
+            // it's purely a "yes, it actually got delivered" confirmation.
+            // Folded into the existing catch-all rather than given a
+            // dedicated arm so this compiles now without inventing a
+            // toast/notice mechanism the brief doesn't ask for.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
-            | SyncEvent::DraftReady { .. }
             | SyncEvent::Sent { .. } => {}
         }
     }
@@ -412,6 +422,16 @@ impl App {
             'v' => self.open_move_picker(),
             'a' => self.open_attachments_popup(),
             '/' => self.start_search(),
+            'c' => self.compose_new(),
+            'r' => self.compose_reply(false),
+            'R' => self.compose_reply(true),
+            // `F`, not the brief's bare `f` — lowercase `f` already means
+            // "toggle flag" (see the `'f'` arm above, shipped before this
+            // task existed), so forward is bound to its uppercase shift
+            // variant instead, the same lower/upper pairing the brief itself
+            // already uses for reply vs. reply-all (`r`/`R`). See
+            // `compose_forward`'s doc comment for the same note.
+            'F' => self.compose_forward(),
             _ => {}
         }
     }
@@ -523,6 +543,123 @@ impl App {
                 dest,
             });
         }
+    }
+
+    // --- Compose: entry points, drafts resume, send/save/discard ----------
+
+    /// `c`: starts a brand-new message — an empty local draft
+    /// (`Store::create_local_draft`, filed under Drafts even while offline)
+    /// opened straight into the composer via `open_draft`, so this and the
+    /// drafts-resume path (`ui::activate`) share the exact same load logic
+    /// rather than two slightly different ways of constructing a `Compose`.
+    /// A no-op if the store write itself fails (e.g. disk full) — nothing
+    /// downstream could open anyway.
+    pub fn compose_new(&mut self) {
+        if let Ok(id) = self.store.create_local_draft("", "", "", "") {
+            self.open_draft(&id);
+        }
+    }
+
+    /// `r`/`R`: fires `SyncCommand::ComposeReply` for the highlighted
+    /// message (`all` picks reply vs. reply-all). This does not open the
+    /// composer itself — the engine fetches a pre-quoted draft from Graph
+    /// and emits `SyncEvent::DraftReady`, which is what actually opens it
+    /// (see `on_sync_event`). A no-op if nothing is highlighted.
+    pub fn compose_reply(&mut self, all: bool) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        let _ = self.sync.cmd_tx.send(SyncCommand::ComposeReply { id, all });
+    }
+
+    /// Forward the highlighted message (`SyncCommand::ComposeForward`) —
+    /// same shape as `compose_reply`. Bound to uppercase `F` rather than the
+    /// brief's bare `f`: lowercase `f` was already the flag-toggle key (see
+    /// `on_key_char`) before this task existed, and reusing it here would
+    /// have silently broken that shipped, tested behavior. `F` pairs with
+    /// `f` the same way the brief's own `r`/`R` (reply/reply-all) already
+    /// pairs lower/upper case for a related pair of actions, so this follows
+    /// the same convention rather than inventing a new one.
+    pub fn compose_forward(&mut self) {
+        let Some(id) = self.highlighted_message_id() else {
+            return;
+        };
+        let _ = self.sync.cmd_tx.send(SyncCommand::ComposeForward { id });
+    }
+
+    /// Loads draft/reply/forward-draft `id` from the store and opens the
+    /// composer on it: `Store::draft` for the message row + body,
+    /// `compose_html::from_html` to parse the body back into an editable
+    /// `RichText`, `editcore::ops::Editor::from` to wrap it. Three callers
+    /// share this: `compose_new` (a just-created empty draft),
+    /// `on_sync_event`'s `DraftReady` handling (a reply/forward draft the
+    /// engine just fetched), and `ui::activate` (resuming a message already
+    /// sitting in Drafts, via `MessageRow::is_draft`). A no-op if the store
+    /// has nothing for `id` — a stale/foreign id, or (for `DraftReady`) a
+    /// race where the row was deleted before this ran.
+    pub fn open_draft(&mut self, id: &str) {
+        let Ok(Some((row, body))) = self.store.draft(id) else {
+            return;
+        };
+        let editor = Editor::from(compose_html::from_html(&body.content));
+        self.compose = Some(Compose {
+            to: row.to_recipients,
+            cc: row.cc_recipients,
+            subject: row.subject,
+            editor,
+            focus: ComposeField::To,
+            draft_id: row.id,
+        });
+    }
+
+    /// Acts on the last request the compose view's key handling recorded on
+    /// `App::compose_action` — Ctrl-Enter (`Send`), Esc (`Save`), or Ctrl-D
+    /// (`Discard`) — and closes the composer either way, clearing the
+    /// request so it can't be replayed on the next tick. Called from
+    /// `ui::handle_key` right after every keystroke while the composer is
+    /// open (`ui::compose::handle_key` only ever *records* the request,
+    /// never acts on it — see that module's doc comment). A no-op if
+    /// nothing was requested.
+    ///
+    /// Send/Save both serialize the editor's body to HTML
+    /// (`compose_html::to_html`) and write it back to the store
+    /// (`Store::update_draft_fields`) before firing the matching
+    /// `SyncCommand` (`SendDraft`/`SaveDraft`), so the engine's outbox drain
+    /// reads the fields the user actually typed rather than whatever the
+    /// draft row held before this edit; the composer then closes
+    /// optimistically, without waiting for the engine to confirm anything.
+    /// Discard drops the in-progress edit without writing or sending
+    /// anything at all — the local draft row (if any) is left exactly as it
+    /// was, the same way closing an Outlook compose window without sending
+    /// leaves the autosaved draft behind rather than deleting it.
+    pub fn apply_compose_action(&mut self) {
+        let Some(action) = self.compose_action.take() else {
+            return;
+        };
+        let Some(compose) = self.compose.take() else {
+            return;
+        };
+        if action == ComposeAction::Discard {
+            return;
+        }
+        let html = compose_html::to_html(&compose.editor.text);
+        let _ = self.store.update_draft_fields(
+            &compose.draft_id,
+            &compose.subject,
+            &compose.to,
+            &compose.cc,
+            &html,
+        );
+        let cmd = if action == ComposeAction::Send {
+            SyncCommand::SendDraft {
+                id: compose.draft_id,
+            }
+        } else {
+            SyncCommand::SaveDraft {
+                id: compose.draft_id,
+            }
+        };
+        let _ = self.sync.cmd_tx.send(cmd);
     }
 
     // --- Search -------------------------------------------------------
@@ -1609,5 +1746,99 @@ mod tests {
         assert!(app.is_capturing_text());
         app.cancel_search();
         assert!(!app.is_capturing_text());
+    }
+
+    // --- Compose entry points / drafts resume / send-save wiring ----------
+
+    #[test]
+    fn c_key_creates_a_fresh_local_draft_and_opens_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('c');
+
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.to, "");
+        assert_eq!(compose.cc, "");
+        assert_eq!(compose.subject, "");
+        // The composer is editing a real store row, not just UI state.
+        assert!(app.store.draft(&compose.draft_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn r_key_sends_compose_reply_for_the_highlighted_message() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('r');
+
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::ComposeReply { id, all }) if id == "m1" && !all
+        ));
+    }
+
+    #[test]
+    fn shift_r_key_sends_compose_reply_all_for_the_highlighted_message() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('R');
+
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::ComposeReply { id, all }) if id == "m1" && all
+        ));
+    }
+
+    #[test]
+    fn shift_f_key_sends_compose_forward_for_the_highlighted_message() {
+        // Lowercase 'f' is already the flag-toggle key (see `on_key_char`),
+        // so forward is bound to uppercase 'F' instead of the brief's bare
+        // `f` — see `App::compose_forward`'s doc comment for the full note.
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('F');
+
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::ComposeForward { id }) if id == "m1"
+        ));
+    }
+
+    #[test]
+    fn lowercase_f_still_toggles_the_flag_unaffected_by_the_forward_binding() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('f');
+        let rows = app.store.messages_in_folder("inbox", 50, 0).unwrap();
+        assert!(rows[0].is_flagged);
+    }
+
+    #[test]
+    fn draft_ready_event_opens_the_composer_loaded_from_the_store() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = app
+            .store
+            .create_local_draft(
+                "Re: Hi",
+                "alice@example.com",
+                "carol@example.com",
+                "<p>Hello</p>",
+            )
+            .unwrap();
+
+        app.on_sync_event(SyncEvent::DraftReady { id: id.clone() });
+
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.subject, "Re: Hi");
+        assert_eq!(compose.to, "alice@example.com");
+        assert_eq!(compose.cc, "carol@example.com");
+        assert_eq!(compose.editor.text.plain(), "Hello");
+        assert_eq!(compose.draft_id, id);
+    }
+
+    #[test]
+    fn draft_ready_for_an_unknown_id_does_not_open_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::DraftReady {
+            id: "no-such-draft".into(),
+        });
+        assert!(app.compose.is_none());
     }
 }

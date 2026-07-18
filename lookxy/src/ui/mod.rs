@@ -91,6 +91,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // of them can meaningfully be open at the same time as it in practice.
     if app.compose.is_some() {
         compose::handle_key(app, key);
+        // `compose::handle_key` only *records* a Send/Save/Discard request
+        // on `app.compose_action` (Ctrl-Enter/Esc/Ctrl-D) — this is what
+        // actually carries it out (serialize + store + `SyncCommand`) and
+        // closes the composer. Run every keystroke, not just those three:
+        // it's a no-op whenever nothing was requested.
+        app.apply_compose_action();
         return;
     }
     if app.move_picker.is_some() {
@@ -204,17 +210,27 @@ fn move_selection(app: &mut App, delta: isize) {
 }
 
 /// Enter: on `Folders`, move into the message list (matching how the
-/// selection already loaded that folder's messages); on `List`, open the
-/// highlighted message (sets `selected_msg`) and move focus to the reading
-/// pane; `Reading` has nothing further to activate.
+/// selection already loaded that folder's messages); on `List`, activate the
+/// highlighted message — a draft (`MessageRow::is_draft`, whether it's
+/// sitting in the real Drafts folder or a not-yet-synced sentinel one, see
+/// `Store::drafts_folder_id`) opens straight into the composer
+/// (`App::open_draft`) instead of the reading pane, since there's nothing
+/// useful to read-only-render for something still being written; anything
+/// else opens normally (sets `selected_msg`) and moves focus to the reading
+/// pane. `Reading` has nothing further to activate.
 fn activate(app: &mut App) {
     match app.focus {
         Pane::Folders => app.focus = Pane::List,
         Pane::List => {
-            if let Some(id) = app.messages.get(app.msg_index).map(|m| m.id.clone()) {
-                app.open_message(&id);
+            if let Some(msg) = app.messages.get(app.msg_index) {
+                let id = msg.id.clone();
+                if msg.is_draft {
+                    app.open_draft(&id);
+                } else {
+                    app.open_message(&id);
+                    app.focus = Pane::Reading;
+                }
             }
-            app.focus = Pane::Reading;
         }
         Pane::Reading => {}
     }
@@ -282,8 +298,12 @@ pub(crate) fn truncate_width(s: &str, w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::compose::{Compose, ComposeField};
+    use editcore::ops::Editor;
+    use mailcore::compose_html;
     use mailcore::graph::model::{MailFolder, Message, Recipient};
     use mailcore::sync::engine::SyncCommand;
+    use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -710,5 +730,101 @@ mod tests {
         assert!(app.search.is_none());
         assert_eq!(app.folder_index, 0);
         assert_eq!(app.msg_index, 0);
+    }
+
+    // --- Drafts resume + compose send/save/discard wiring ------------------
+
+    #[test]
+    fn enter_on_a_draft_message_opens_the_composer_loaded_from_the_store() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = app
+            .store
+            .create_local_draft("Draft Subj", "bob@x", "carol@x", "<p>Body text</p>")
+            .unwrap();
+        let (row, _) = app.store.draft(&id).unwrap().unwrap();
+        app.selected_folder = Some(row.folder_id.clone());
+        app.reload_messages();
+        app.focus = Pane::List;
+        app.msg_index = 0;
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].is_draft);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.subject, "Draft Subj");
+        assert_eq!(compose.to, "bob@x");
+        assert_eq!(compose.cc, "carol@x");
+        assert_eq!(compose.editor.text.plain(), "Body text");
+        assert_eq!(compose.draft_id, id);
+        // Must not also fall through to the normal reading-pane open path.
+        assert!(app.selected_msg.is_none());
+    }
+
+    /// A compose session over the seeded draft "d1", body "old" — the shared
+    /// setup `ctrl_enter_...`/`esc_...`/`ctrl_d_...` below each start from.
+    fn seeded_compose_session(app: &mut App) -> String {
+        let id = app
+            .store
+            .create_local_draft("Subj", "a@x", "", "<p>old</p>")
+            .unwrap();
+        app.compose = Some(Compose {
+            to: "a@x".into(),
+            cc: "".into(),
+            subject: "Subj".into(),
+            editor: Editor::from(compose_html::from_html("<p>new body</p>")),
+            focus: ComposeField::Body,
+            draft_id: id.clone(),
+        });
+        id
+    }
+
+    #[test]
+    fn ctrl_enter_in_compose_saves_the_body_sends_send_draft_and_closes_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = seeded_compose_session(&mut app);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+
+        assert!(app.compose.is_none());
+        let (_, body) = app.store.draft(&id).unwrap().unwrap();
+        assert!(body.content.contains("new body"));
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(last, Ok(SyncCommand::SendDraft { id: sent }) if sent == id));
+    }
+
+    #[test]
+    fn esc_in_compose_saves_the_body_sends_save_draft_and_closes_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = seeded_compose_session(&mut app);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.compose.is_none());
+        let (_, body) = app.store.draft(&id).unwrap().unwrap();
+        assert!(body.content.contains("new body"));
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(last, Ok(SyncCommand::SaveDraft { id: saved }) if saved == id));
+    }
+
+    #[test]
+    fn ctrl_d_in_compose_discards_and_sends_no_command() {
+        let mut app = App::for_test_with_seeded_store();
+        let id = seeded_compose_session(&mut app);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+
+        assert!(app.compose.is_none());
+        // The store's copy of the draft is untouched — discard never wrote
+        // the in-progress body back.
+        let (_, body) = app.store.draft(&id).unwrap().unwrap();
+        assert!(body.content.contains("old"));
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
     }
 }
