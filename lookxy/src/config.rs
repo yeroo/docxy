@@ -4,7 +4,7 @@
 //! and every field has a sane built-in default. Precedence, highest wins:
 //!
 //! 1. environment variables (`LOOKXY_CLIENT_ID`, `LOOKXY_BACKFILL_DAYS`,
-//!    `LOOKXY_REFRESH_SECS`)
+//!    `LOOKXY_REFRESH_SECS`, `LOOKXY_THREADED`)
 //! 2. `%APPDATA%\lookxy\config.json` (if present and parseable)
 //! 3. the built-in defaults below
 //!
@@ -22,6 +22,9 @@ pub struct Config {
     pub client_id: String,
     pub backfill_days: i64,
     pub refresh_secs: u64,
+    /// Whether the folder message-list is grouped into conversations. Toggled
+    /// at runtime with `t` (persisted via `persist_threaded`).
+    pub threaded: bool,
 }
 
 impl Default for Config {
@@ -34,6 +37,7 @@ impl Default for Config {
             client_id: "14d82eec-204b-4c2f-b7e8-296a70dab67e".to_string(),
             backfill_days: 180,
             refresh_secs: 60,
+            threaded: true,
         }
     }
 }
@@ -90,6 +94,9 @@ impl Config {
         {
             self.refresh_secs = n as u64;
         }
+        if let Some(b) = value.get("threaded").and_then(|v| v.as_bool()) {
+            self.threaded = b;
+        }
     }
 
     /// Overlays `LOOKXY_CLIENT_ID`/`LOOKXY_BACKFILL_DAYS`/`LOOKXY_REFRESH_SECS`
@@ -114,6 +121,14 @@ impl Config {
             && is_sane_refresh_secs(n)
         {
             self.refresh_secs = n;
+        }
+        if let Ok(v) = std::env::var("LOOKXY_THREADED") {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("true") || v == "1" {
+                self.threaded = true;
+            } else if v.eq_ignore_ascii_case("false") || v == "0" {
+                self.threaded = false;
+            }
         }
     }
 }
@@ -144,7 +159,7 @@ fn is_sane_refresh_secs_i64(n: i64) -> bool {
 /// `$HOME/.config/lookxy/config.json`) — `None` if the base directory
 /// variable isn't set, in which case `load_from` just skips the file
 /// overlay.
-fn config_file_path() -> Option<PathBuf> {
+pub fn config_file_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var("APPDATA")
@@ -160,6 +175,47 @@ fn config_file_path() -> Option<PathBuf> {
                 .join("config.json")
         })
     }
+}
+
+/// Best-effort persistence of the `threaded` toggle to the real config file.
+/// Silently does nothing if the config path can't be determined or the write
+/// fails — a UI toggle must never crash or block on a settings-file problem.
+///
+/// Not called from production code yet (only from this module's tests) — a
+/// later task wires it up to the `t` keybinding. Silences `dead_code`, which
+/// can't see across tasks.
+#[allow(dead_code)]
+pub fn persist_threaded(value: bool) {
+    if let Some(path) = config_file_path() {
+        let _ = persist_threaded_to(&path, value);
+    }
+}
+
+/// Read-modify-write `path`, replacing only the `threaded` key and preserving
+/// every other key already in the file (client_id, backfill_days, unknown
+/// keys, …). Creates the file (and parent dir) if absent.
+///
+/// Only `persist_threaded` (also `dead_code`-allowed above) and this module's
+/// tests call it yet — see that function's doc comment.
+#[allow(dead_code)]
+pub fn persist_threaded_to(path: &Path, value: bool) -> std::io::Result<()> {
+    use mailcore::json::Value;
+
+    // Start from the file's existing object (or an empty one).
+    let mut entries: Vec<(String, Value)> = match std::fs::read_to_string(path) {
+        Ok(text) => match mailcore::json::parse(&text) {
+            Ok(Value::Object(e)) => e,
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    entries.retain(|(k, _)| k != "threaded");
+    entries.push(("threaded".to_string(), Value::Bool(value)));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, Value::Object(entries).to_string())
 }
 
 #[cfg(test)]
@@ -193,6 +249,7 @@ mod tests {
             std::env::remove_var("LOOKXY_CLIENT_ID");
             std::env::remove_var("LOOKXY_BACKFILL_DAYS");
             std::env::remove_var("LOOKXY_REFRESH_SECS");
+            std::env::remove_var("LOOKXY_THREADED");
         }
     }
 
@@ -371,5 +428,47 @@ mod tests {
         }
 
         assert_eq!(c.backfill_days, 180);
+    }
+
+    #[test]
+    fn threaded_defaults_true_and_file_overlay_can_disable() {
+        assert!(Config::default().threaded);
+        let _guard = lock_env();
+        clear_env();
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-config-test-{}-threaded-overlay",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"threaded":false}"#).unwrap();
+        let c = Config::load_from(Some(&path));
+        assert!(!c.threaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_threaded_roundtrips_and_preserves_other_keys() {
+        let _guard = lock_env();
+        clear_env();
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-config-test-{}-persist-threaded",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"client_id":"keep-me","backfill_days":7}"#).unwrap();
+
+        persist_threaded_to(&path, false).unwrap();
+
+        let c = Config::load_from(Some(&path));
+        assert!(!c.threaded); // the toggle was written
+        assert_eq!(c.client_id, "keep-me"); // other keys preserved
+        assert_eq!(c.backfill_days, 7);
+
+        persist_threaded_to(&path, true).unwrap();
+        assert!(Config::load_from(Some(&path)).threaded);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
