@@ -227,7 +227,20 @@ pub fn new_file(
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
     }
-    std::fs::write(&abs, blank).map_err(|e| format!("create failed: {e}"))?;
+    // create_new: exclusive-create, so a file appearing between the exists
+    // check above and this open errors instead of being truncated.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&abs)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("already exists: {}", abs.display())
+            } else {
+                format!("create failed: {e}")
+            }
+        })?;
+    std::io::Write::write_all(&mut f, blank).map_err(|e| format!("create failed: {e}"))?;
     let abs_str = abs.display().to_string();
     match client {
         Some(client) => {
