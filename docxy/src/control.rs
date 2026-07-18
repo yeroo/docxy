@@ -64,6 +64,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.export" => export(app, args),
         "doc.comments" => Ok(comments(app)),
         "doc.notes" => Ok(notes(app)),
+        // Default section variant only — first-page/even-page headers and
+        // footers (`app.headers.first`/`.even`, `app.footers.first`/`.even`)
+        // are not surfaced by this verb. Tasks 3/8 (docxwasm, MCP tools) must
+        // mirror this default-only choice, not add `first`/`even` on their own.
         "doc.header" => Ok(header_footer(&app.headers.default)),
         "doc.footer" => Ok(header_footer(&app.footers.default)),
         "doc.metadata" => Ok(metadata(app)),
@@ -262,7 +266,10 @@ fn notes(app: &App) -> Json {
 }
 
 /// `doc.header` / `doc.footer`: the default section header/footer's block
-/// content, empty when the document has none.
+/// content, empty when the document has none. Callers pass
+/// `app.headers.default`/`app.footers.default` only — see the dispatch note
+/// at the `doc.header`/`doc.footer` match arms for why first/even variants
+/// are out of scope for this verb.
 fn header_footer(blocks: &[Block]) -> Json {
     let items = blocks
         .iter()
@@ -767,6 +774,49 @@ mod tests {
         assert_eq!(r, Json::obj(vec![]));
     }
 
+    /// Marshalling-level coverage for `metadata()`/`format_iso()`'s actual
+    /// transformation (empty-string filtering, date formatting) — the
+    /// empty-shape test above only proves the omission path, not that a set
+    /// property round-trips or that `format_iso`'s `y-m-d-h-m-s` field order
+    /// is correct. Pins the exact ISO string so a swapped month/day (or any
+    /// other field-order bug) would fail loudly.
+    #[test]
+    fn metadata_populated_pins_wire_shape_and_omits_empty_fields() {
+        use docxcore::package::load_package;
+        use docxcore::zipwrite::write_zip;
+
+        let core_xml = r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="b" xmlns:dc="a" xmlns:dcterms="c">
+            <dc:creator>Ann</dc:creator>
+            <dc:title>Q3 Report</dc:title>
+            <dc:subject></dc:subject>
+            <dcterms:created>2020-01-02T03:04:05Z</dcterms:created>
+        </cp:coreProperties>"#;
+        let document_xml =
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body><w:p/></w:body></w:document>";
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("docProps/core.xml".into(), core_xml.into()),
+        ]);
+        let mut app = app_with(&["x"]);
+        app.pkg = load_package(&bytes).expect("load");
+
+        let r = metadata(&app);
+        assert_eq!(r.get_str("title"), Some("Q3 Report"));
+        assert_eq!(r.get_str("author"), Some("Ann"));
+        // Pins format_iso's exact y-m-d-h-m-s field order: every component is
+        // a distinct digit, so a swapped field would produce a different
+        // string, not a coincidentally-matching one.
+        assert_eq!(r.get_str("created"), Some("2020-01-02T03:04:05Z"));
+        // dc:subject is present but empty in the source XML -> the
+        // present-if-set filter must omit it entirely, not emit `""`.
+        assert!(r.get("subject").is_none(), "{r}");
+    }
+
     #[test]
     fn stats_counts_words_chars_paragraphs() {
         let app = app_with(&["one two", "three"]);
@@ -783,6 +833,16 @@ mod tests {
         let r = path_info(&app);
         assert!(r.get("protection").is_none());
         assert!(r.get("watermark").is_none());
+    }
+
+    #[test]
+    fn path_reports_protection_and_watermark_when_set() {
+        let mut app = app_with(&["x"]);
+        app.doc_protection = Some("read-only".to_string());
+        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        let r = path_info(&app);
+        assert_eq!(r.get_str("protection"), Some("read-only"));
+        assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL"));
     }
 
     #[test]
