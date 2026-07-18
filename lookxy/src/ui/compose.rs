@@ -70,6 +70,12 @@ pub struct Compose {
     /// The open recipient-autocomplete dropdown, if the focused To/Cc/Bcc
     /// field's current token has store matches — see `refresh_autocomplete`.
     pub autocomplete: Option<Autocomplete>,
+    /// Files attached to this draft so far — mirrors the store's
+    /// `outbound_attachments` for this `draft_id` (loaded by `open_draft`,
+    /// kept in sync by `App::attach_file` and Ctrl+R's removal). Drawn as an
+    /// "Attachments:" row between the header fields and the body; see
+    /// `draw_compose`.
+    pub attachments: Vec<mailcore::store::OutboundAttachment>,
 }
 
 impl Compose {
@@ -92,6 +98,7 @@ impl Compose {
             focus: ComposeField::To,
             draft_id,
             autocomplete: None,
+            attachments: Vec::new(),
         }
     }
 }
@@ -152,8 +159,8 @@ pub(crate) fn apply_completion(field: &str, c: &Contact) -> String {
 /// Renders the full-screen composer when `app.compose` is open; a no-op
 /// otherwise (mirrors every other conditional-draw function in `ui`, e.g.
 /// `ui::signin::draw`). Layout, top to bottom: To / Cc / Bcc / Subject
-/// (3 rows each), the body editor (everything else), and a 1-row
-/// action-bar footer.
+/// (3 rows each), a 1-row Attachments summary, the body editor (everything
+/// else), and a 1-row action-bar footer.
 pub fn draw_compose(f: &mut Frame, app: &App) {
     let Some(compose) = &app.compose else {
         return;
@@ -167,6 +174,7 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -200,8 +208,9 @@ pub fn draw_compose(f: &mut Frame, app: &App) {
         &compose.subject,
         compose.focus == ComposeField::Subject,
     );
-    draw_body(f, rows[4], compose);
-    draw_action_bar(f, rows[5]);
+    draw_attachments(f, rows[4], compose);
+    draw_body(f, rows[5], compose);
+    draw_action_bar(f, rows[6]);
 
     if let Some(ac) = &compose.autocomplete {
         if ac.field == compose.focus {
@@ -279,10 +288,30 @@ fn draw_field(f: &mut Frame, area: Rect, title: &str, value: &str, focused: bool
     f.render_widget(Paragraph::new(text).block(block), area);
 }
 
+/// The Attachments summary row: `name (size)` for each attached file, joined
+/// by `", "`, truncated to the row's width — a no-op visual (an empty
+/// `Paragraph`) when `compose.attachments` is empty, so it never draws so
+/// much as a border over the body/existing layout when there's nothing to
+/// show.
+fn draw_attachments(f: &mut Frame, area: Rect, compose: &Compose) {
+    if compose.attachments.is_empty() {
+        return;
+    }
+    let joined = compose
+        .attachments
+        .iter()
+        .map(|a| format!("{} ({})", a.name, a.size))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!("Attachments: {joined}");
+    let truncated: String = text.chars().take(area.width as usize).collect();
+    f.render_widget(Paragraph::new(truncated), area);
+}
+
 /// The action-bar footer: a reminder of the keys that aren't otherwise
 /// visible on screen.
 fn draw_action_bar(f: &mut Frame, area: Rect) {
-    let text = "Send: Ctrl-Enter   Save: Esc   Discard: Ctrl-D   \
+    let text = "Send: Ctrl-Enter   Save: Esc   Discard: Ctrl-D   Attach: Ctrl-O  Remove: Ctrl-R   \
                 Bold: Ctrl-B  Italic: Ctrl-I  Underline: Ctrl-U  List: Ctrl-L";
     f.render_widget(
         Paragraph::new(text).style(Style::new().fg(Color::White).bg(Color::DarkGray)),
@@ -525,8 +554,11 @@ fn cursor_span_styled(style: Style) -> Span<'static> {
 /// have no meaning over a plain header field). Ctrl-Enter/Esc/Ctrl-D don't
 /// act directly — see the module doc comment — they just record
 /// `App::compose_action`, checked (and cleared) by the next task's wiring.
-/// Called from `ui::handle_key` whenever `app.compose` is open, ahead of
-/// every other popup.
+/// Ctrl-O opens the file picker (`App::file_picker`) to attach a file;
+/// Ctrl-R removes the most recently attached one — both touch `app.store`/
+/// `app.file_picker`, so they're handled here at the `app` level rather than
+/// in `handle_compose_key`. Called from `ui::handle_key` whenever
+/// `app.compose` is open, ahead of every other popup.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.compose.is_none() {
         return;
@@ -551,6 +583,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         app.compose_action = Some(ComposeAction::Save);
+        return;
+    }
+
+    if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+        app.file_picker = Some(crate::ui::filepicker::FilePicker::open(
+            crate::app::downloads_dir(),
+        ));
+        return;
+    }
+    if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+        if let Some(compose) = app.compose.as_mut() {
+            if let Some(att) = compose.attachments.pop() {
+                let _ = app
+                    .store
+                    .remove_outbound_attachment(&compose.draft_id, &att.path);
+            }
+        }
         return;
     }
 
@@ -782,6 +831,7 @@ mod tests {
             focus: ComposeField::Body,
             draft_id: "d1".into(),
             autocomplete: None,
+            attachments: Vec::new(),
         }
     }
 

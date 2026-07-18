@@ -14,11 +14,7 @@ use crate::ui::centered_rect;
 pub struct FileEntry {
     pub name: String,
     /// Read back by `FilePicker::enter` (to descend into a directory or
-    /// return the chosen file) — not yet reachable from production code
-    /// (nothing calls `FilePicker::open`/`enter` outside tests until Task 8
-    /// wires attaching to the picker). Silences `dead_code`, same pattern as
-    /// `Compose::draft_id`.
-    #[allow(dead_code)]
+    /// return the chosen file).
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
@@ -33,12 +29,6 @@ pub struct FilePicker {
 
 impl FilePicker {
     /// Opens the picker on `dir`, listing its entries.
-    ///
-    /// Not yet called from production code — Task 8's "attach a file" entry
-    /// point is what will call this to open the popup; `cfg_attr` silences
-    /// `dead_code` only outside tests, same pattern already used for
-    /// `Compose::new`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(dir: PathBuf) -> FilePicker {
         let entries = read_entries(&dir);
         FilePicker {
@@ -59,11 +49,6 @@ impl FilePicker {
 
     /// Enter on the selected entry: descends into a directory (re-lists, returns
     /// `None`) or selects a file (returns its path). `None` on an empty list.
-    ///
-    /// Not yet called from production code — `App::file_picker_enter` is a
-    /// stub until Task 8 fills it in to actually call this and act on the
-    /// chosen file; same `cfg_attr` pattern as `FilePicker::open`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn enter(&mut self) -> Option<PathBuf> {
         let entry = self.entries.get(self.index)?;
         if entry.is_dir {

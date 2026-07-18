@@ -828,6 +828,7 @@ mod tests {
             focus: ComposeField::Body,
             draft_id: id.clone(),
             autocomplete: None,
+            attachments: Vec::new(),
         });
         id
     }

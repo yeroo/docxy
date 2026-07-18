@@ -1193,6 +1193,7 @@ impl App {
             return;
         };
         let editor = Editor::from(compose_html::from_html(&body.content));
+        let attachments = self.store.outbound_attachments(&row.id).unwrap_or_default();
         self.compose = Some(Compose {
             to: row.to_recipients,
             cc: row.cc_recipients,
@@ -1202,6 +1203,7 @@ impl App {
             focus: ComposeField::To,
             draft_id: row.id,
             autocomplete: None,
+            attachments,
         });
     }
 
@@ -1233,6 +1235,7 @@ impl App {
             return;
         };
         if action == ComposeAction::Discard {
+            let _ = self.store.clear_outbound_attachments(&compose.draft_id);
             return;
         }
         let html = compose_html::to_html(&compose.editor.text);
@@ -1581,12 +1584,43 @@ impl App {
 
     // --- File picker ----------------------------------------------------
 
-    /// Enter, while the file picker (`App::file_picker`) is open. A stub for
-    /// now — this task only wires up the picker's own navigation
-    /// (`ui::filepicker::FilePicker::move_selection`/`enter`, driven directly
-    /// by `ui::handle_key`); actually reacting to a chosen file (attaching it
-    /// to the message being composed) is Task 8's job.
-    pub fn file_picker_enter(&mut self) {}
+    /// Enter in the file picker: on a file, attach it and close the picker;
+    /// on a directory, the picker navigated (stays open) — see
+    /// `ui::filepicker::FilePicker::enter`.
+    pub fn file_picker_enter(&mut self) {
+        let Some(picker) = self.file_picker.as_mut() else {
+            return;
+        };
+        if let Some(path) = picker.enter() {
+            self.file_picker = None;
+            self.attach_file(&path);
+        }
+    }
+
+    /// Records `path` as an attachment on the open draft (store + the
+    /// composer's in-memory list). A no-op if no composer is open.
+    pub fn attach_file(&mut self, path: &Path) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+        let path_str = path.to_string_lossy().to_string();
+        let draft_id = compose.draft_id.clone();
+        let _ = self
+            .store
+            .add_outbound_attachment(&draft_id, &path_str, &name, size);
+        if let Some(compose) = self.compose.as_mut() {
+            compose.attachments = self
+                .store
+                .outbound_attachments(&draft_id)
+                .unwrap_or_default();
+        }
+    }
 
     /// Test-only: whether `open_url_with_os_handler` has been reached at
     /// least once (see `browser_open_invocations`) — `SyncEvent::SignInStarted`
@@ -2618,6 +2652,7 @@ pub(crate) mod tests {
             focus: ComposeField::Body,
             draft_id: id.clone(),
             autocomplete: None,
+            attachments: Vec::new(),
         });
         app.compose_action = Some(ComposeAction::Save);
 
@@ -2921,6 +2956,38 @@ pub(crate) mod tests {
         app.compose_new();
         let editor_text = app.compose.as_ref().unwrap().editor.text.plain();
         assert!(editor_text.contains("Boris")); // signature landed in the composer body
+    }
+
+    #[test]
+    fn attaching_a_file_records_it_on_the_draft_and_in_compose() {
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new(); // opens a fresh local draft
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+        // a real temp file to attach
+        let dir = std::env::temp_dir().join(format!("lookxy-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("r.pdf");
+        std::fs::write(&file, b"pdfbytes").unwrap();
+
+        app.attach_file(&file);
+
+        // stored on the draft AND reflected in the composer's list
+        assert_eq!(app.store.outbound_attachments(&draft_id).unwrap().len(), 1);
+        assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
+        assert_eq!(app.compose.as_ref().unwrap().attachments[0].name, "r.pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_draft_loads_existing_attachments() {
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new();
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/x.txt", "x.txt", 3)
+            .unwrap();
+        app.open_draft(&draft_id); // reopen
+        assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
     }
 
     #[test]
