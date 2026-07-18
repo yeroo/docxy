@@ -237,11 +237,19 @@ impl Event {
         Some(Event {
             id: str_field(v, "id"),
             subject: str_field(v, "subject"),
-            start_utc: v
-                .get("start")
-                .map(datetime_field_to_utc)
-                .unwrap_or_default(),
-            end_utc: v.get("end").map(datetime_field_to_utc).unwrap_or_default(),
+            // `unwrap_or(&Value::Null)` rather than `.map(...).unwrap_or_default()`:
+            // a fully-absent `start`/`end` key must still go through
+            // `datetime_field_to_utc` → `to_utc` → `normalize_datetime`, so it
+            // gets the same fixed-width canonical fallback
+            // (`0000-00-00T00:00:00Z`) as a present-but-empty `dateTime` does.
+            // `.unwrap_or_default()` on the `Option<String>` would instead
+            // short-circuit straight to `""`, which is shorter than every
+            // real canonical timestamp and would sort first in
+            // `Store::events_in_window`'s `ORDER BY start_utc ASC` — ahead of
+            // every real event, not last, breaking the whole
+            // lexical-sortability invariant `to_utc`'s fixed width exists for.
+            start_utc: datetime_field_to_utc(v.get("start").unwrap_or(&Value::Null)),
+            end_utc: datetime_field_to_utc(v.get("end").unwrap_or(&Value::Null)),
             is_all_day: v.get("isAllDay").and_then(Value::as_bool).unwrap_or(false),
             location: v
                 .get("location")
@@ -521,6 +529,22 @@ mod tests {
         .unwrap();
         let e = Event::from_json(&v).unwrap();
         assert_eq!(e.series_master_id.as_deref(), Some("SERIES1"));
+    }
+
+    #[test]
+    fn event_with_fully_absent_start_and_end_gets_canonical_fixed_width_fallback() {
+        // A missing `start`/`end` key entirely (not merely an empty
+        // `dateTime`) must still normalize to the same fixed-width
+        // canonical fallback as an empty one, not `""` — `""` is shorter
+        // than every real canonical timestamp and would sort first under
+        // `Store::events_in_window`'s `ORDER BY start_utc ASC`, ahead of
+        // every real event, which breaks the lexical-sortability invariant
+        // `to_utc`'s fixed width exists for.
+        let v = parse(r#"{"id":"E3","subject":"No times"}"#).unwrap();
+        let e = Event::from_json(&v).unwrap();
+        assert_eq!(e.start_utc, "0000-00-00T00:00:00Z");
+        assert_eq!(e.end_utc, "0000-00-00T00:00:00Z");
+        assert_ne!(e.start_utc, "");
     }
 
     #[test]
