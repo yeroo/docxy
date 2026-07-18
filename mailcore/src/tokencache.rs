@@ -288,8 +288,14 @@ mod tests {
         };
         save(&p, &t).unwrap();
         let raw = std::fs::read(&p).unwrap();
+        // On Windows DPAPI must hide the token from the on-disk bytes. Off
+        // Windows the cache is plaintext-at-rest by design (`protect` is the
+        // identity transform — see I2), so the token appears verbatim; assert
+        // that so `raw` is exercised on every platform.
         #[cfg(windows)]
         assert!(!raw.windows(18).any(|w| w == b"SECRET_TOKEN_VALUE"));
+        #[cfg(not(windows))]
+        assert!(raw.windows(18).any(|w| w == b"SECRET_TOKEN_VALUE"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
