@@ -432,6 +432,12 @@ export class CtlServer {
         ? (inv as { verb: string; args: unknown })
         : undefined;
     delete rest.inverse;
+    // `pdfBase64` is docxwasm's internal `doc.export-pdf` payload; the
+    // host-assisted `exportPdf` path consumes it via `host.callWasm` directly
+    // (never through here) and replies `{path}`, so it should never reach this
+    // strip. Delete it anyway as defense-in-depth — a wasm verb must never leak
+    // raw PDF bytes onto the TCP wire.
+    delete rest.pdfBase64;
     return rest;
   }
 

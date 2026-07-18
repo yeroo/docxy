@@ -679,6 +679,13 @@ impl Session {
             "comment.list" => Ok(self.ctl_comment_list()),
             "comment.add" => self.ctl_comment_add(args),
             "comment.remove" => self.ctl_comment_remove(args),
+            // INTERNAL-ONLY: the host invokes this in response to
+            // comment.add/comment.remove's declared `inverse`, through the same
+            // ctl channel — but it must NOT appear in `wasmVerbs`, so an
+            // external agent calling it through `CtlServer` still gets
+            // "unknown verb 'comment.replace-thread'". See
+            // `ctl_comment_replace_thread`'s doc comment.
+            "comment.replace-thread" => self.ctl_comment_replace_thread(args),
             "wb.export-csv" => self.ctl_wb_export_csv(args),
             "sheet.pivot" => self.ctl_sheet_pivot(args),
             "formula.eval" => self.ctl_formula_eval(args),
@@ -1056,6 +1063,9 @@ impl Session {
         let (r1, c1, r2, c2) = ctl_parse_range(rg)?;
         let frame = Frame::from_range(&self.pkg.workbook, si, (r1, c1, r2, c2));
 
+        // The MCP schema marks `rows` required; the code tolerates its absence
+        // (defaults to empty). The schema is the contract — this leniency is
+        // deliberate slack, not a documented behavior to rely on.
         let rows = ctl_names_arg(args, "rows");
         let cols = ctl_names_arg(args, "cols");
         let values_json = args
@@ -1251,9 +1261,15 @@ impl Session {
     //   - `comment.add`/`comment.remove`: NEVER on the undo stack (comment
     //     data lives in package parts outside `Cell`/`Sheet`/`WbSnapshot`) ->
     //     reply carries an internal `"inverse":{"verb":…,"args":{…}}`
-    //     describing the host-orchestrated inverse (add <-> remove), which
-    //     IS a byte-exact reversal since both directions carry the full
-    //     ref/text/author.
+    //     describing the host-orchestrated inverse. Both directions invert to
+    //     the SAME internal `comment.replace-thread` verb carrying the cell's
+    //     captured PRE-op thread (every message, in order): `comment.add`
+    //     appends a reply, so its inverse must restore the exact prior thread
+    //     (not wipe the whole ref); `comment.remove` drops the whole ref, so
+    //     its inverse must re-add every message (not just the first). This is
+    //     faithful in both directions — an earlier version re-added only the
+    //     first message on remove and wiped the pre-existing thread on add,
+    //     silently losing user data on undo.
     //   - `sheet.add`: reuses the SAME true wasm-undo-stack machinery the
     //     interactive `"sheet\tadd"` dispatch command already has
     //     (`UndoAction::SheetAdd`, whose inverse is the real
@@ -1284,8 +1300,12 @@ impl Session {
     // -----------------------------------------------------------------
 
     /// `{ref,text,author?,sheet?}` -> `{sheet,ref,undoSteps:0}` — plus the
-    /// internal `inverse` (`comment.remove` on the same ref/sheet). Not
-    /// pushed onto the undo stack: comment data lives in package parts
+    /// internal `inverse`, a `comment.replace-thread` that restores the cell's
+    /// PRE-ADD thread (captured here before the append). `comment.add` appends
+    /// a reply when a thread already exists, so a blind `comment.remove`
+    /// inverse would wipe the user's pre-existing thread on undo; replaying the
+    /// captured thread (empty when the cell was blank) reverses ONLY this add.
+    /// Not pushed onto the undo stack: comment data lives in package parts
     /// (`xl/threadedComments/…`, `xl/persons/…`) outside `Cell`/`Sheet`.
     /// `undoSteps` is unconditionally present (see `ctl_comment_remove`'s
     /// doc comment for why).
@@ -1297,6 +1317,9 @@ impl Session {
             return Err("comment.add needs non-empty 'text'".into());
         }
         let author = args.get_str("author").unwrap_or(CTL_DEFAULT_COMMENT_AUTHOR);
+        // Snapshot the cell's PRE-ADD thread so the inverse restores exactly
+        // it (empty = pure removal), rather than dropping the whole ref.
+        let pre = self.ctl_comment_messages_at(si, r, c);
         let when = self.ctl_iso_now();
         self.pkg.add_threaded_comment(si, r, c, author, text, &when);
         self.dirty = true;
@@ -1305,18 +1328,19 @@ impl Session {
         out.push_str(&si.to_string());
         out.push_str(",\"ref\":");
         json::push_str(&mut out, &cref);
-        out.push_str(",\"inverse\":{\"verb\":\"comment.remove\",\"args\":{\"ref\":");
-        json::push_str(&mut out, &cref);
-        out.push_str(",\"sheet\":");
-        out.push_str(&si.to_string());
-        out.push_str("}},\"undoSteps\":0}");
+        out.push_str(",\"inverse\":");
+        out.push_str(&ctl_replace_thread_inverse(si, &cref, &pre));
+        out.push_str(",\"undoSteps\":0}");
         Ok(out)
     }
 
     /// `{ref,sheet?}` -> `{removed:bool,undoSteps:0}` — plus, only when
-    /// something was actually removed, the internal `inverse` (`comment.add`
-    /// with the same ref/text/author/sheet the removed comment carried — a
-    /// byte-exact reversal). Not on the undo stack, same reasoning as
+    /// something was actually removed, the internal `inverse`, a
+    /// `comment.replace-thread` carrying the WHOLE pre-remove thread (every
+    /// message, in order) so undo restores the entire conversation, not just
+    /// its first message. `comment.remove` drops the whole ref, so a
+    /// single-message `comment.add` inverse would silently lose the rest of a
+    /// multi-message thread. Not on the undo stack, same reasoning as
     /// `comment.add`. `undoSteps` is unconditionally present (always `0`
     /// here) so every mutating verb's reply carries it uniformly — Task 7
     /// can check it first regardless of bucket, falling back to `inverse`
@@ -1324,29 +1348,90 @@ impl Session {
     fn ctl_comment_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg(args)?;
         let (r, c) = ctl_ref_arg(args)?;
-        let existing = self
-            .pkg
-            .comments()
-            .into_iter()
-            .find(|cm| cm.sheet == si && cm.row == r && cm.col == c);
-        let existed = existing.is_some();
+        // Snapshot the WHOLE pre-remove thread so the inverse restores every
+        // message; empty = nothing here, so no change and no inverse.
+        let pre = self.ctl_comment_messages_at(si, r, c);
+        let existed = !pre.is_empty();
         if existed {
             self.pkg.remove_comment(si, r, c);
             self.dirty = true;
         }
         let mut out = String::from("{\"removed\":");
         out.push_str(if existed { "true" } else { "false" });
-        if let Some(cm) = existing {
-            out.push_str(",\"inverse\":{\"verb\":\"comment.add\",\"args\":{\"ref\":");
-            json::push_str(&mut out, &cell_name(r, c));
-            out.push_str(",\"text\":");
-            json::push_str(&mut out, &cm.text);
-            out.push_str(",\"author\":");
-            json::push_str(&mut out, &cm.author);
-            out.push_str(",\"sheet\":");
-            out.push_str(&si.to_string());
-            out.push_str("}}");
+        if existed {
+            let cref = cell_name(r, c);
+            out.push_str(",\"inverse\":");
+            out.push_str(&ctl_replace_thread_inverse(si, &cref, &pre));
         }
+        out.push_str(",\"undoSteps\":0}");
+        Ok(out)
+    }
+
+    /// Every `(author, text)` at `(si, r, c)`, in `comments()` order (threaded
+    /// replies keep their insertion order). The whole-thread snapshot behind a
+    /// faithful `comment.replace-thread` inverse for comment.add/remove.
+    fn ctl_comment_messages_at(&self, si: usize, r: u32, c: u32) -> Vec<(String, String)> {
+        self.pkg
+            .comments()
+            .into_iter()
+            .filter(|cm| cm.sheet == si && cm.row == r && cm.col == c)
+            .map(|cm| (cm.author, cm.text))
+            .collect()
+    }
+
+    /// `{sheet?,ref,messages:[{author,text},...]}` -> `{sheet,ref,undoSteps:0}`
+    /// — plus the internal `inverse`, another `comment.replace-thread`
+    /// carrying this call's PRE-REPLACE thread (so undo/redo chains work).
+    /// **INTERNAL-ONLY**, like [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed):
+    /// it is deliberately absent from `wasmVerbs`, the MCP tool maps, and the
+    /// docs, so an external agent calling it through `CtlServer` still gets
+    /// "unknown verb 'comment.replace-thread'"; it is reached only as the
+    /// host-orchestrated `inverse` of comment.add/remove (and of itself).
+    ///
+    /// Removes the whole ref, then re-adds `messages` in order (empty list =
+    /// pure removal). STATELESS — the args carry the thread, no session stash,
+    /// so redo chains never desync. Re-adds through `add_threaded_comment`
+    /// (comment.add's own primitive): a restored thread is threaded regardless
+    /// of the removed thread's original storage form. Message author/text are
+    /// preserved exactly (what `comment.list` reports and the tests compare);
+    /// the threaded-vs-legacy distinction is intentionally outside this
+    /// inverse's fidelity contract, matching the `{author,text}` message shape.
+    fn ctl_comment_replace_thread(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let (r, c) = ctl_ref_arg(args)?;
+        let messages_json = args
+            .get("messages")
+            .and_then(json::Json::as_array)
+            .ok_or("comment.replace-thread needs a 'messages' array")?;
+        // Parse every message BEFORE mutating, so a malformed entry leaves the
+        // existing thread untouched.
+        let mut messages: Vec<(String, String)> = Vec::new();
+        for m in messages_json {
+            let author = m
+                .get_str("author")
+                .unwrap_or(CTL_DEFAULT_COMMENT_AUTHOR)
+                .to_string();
+            let text = m
+                .get_str("text")
+                .ok_or("comment.replace-thread: each message needs a 'text'")?
+                .to_string();
+            messages.push((author, text));
+        }
+        // Snapshot the PRE-REPLACE thread for this call's own inverse (redo).
+        let pre = self.ctl_comment_messages_at(si, r, c);
+        self.pkg.remove_comment(si, r, c);
+        for (author, text) in &messages {
+            let when = self.ctl_iso_now();
+            self.pkg.add_threaded_comment(si, r, c, author, text, &when);
+        }
+        self.dirty = true;
+        let cref = cell_name(r, c);
+        let mut out = String::from("{\"sheet\":");
+        out.push_str(&si.to_string());
+        out.push_str(",\"ref\":");
+        json::push_str(&mut out, &cref);
+        out.push_str(",\"inverse\":");
+        out.push_str(&ctl_replace_thread_inverse(si, &cref, &pre));
         out.push_str(",\"undoSteps\":0}");
         Ok(out)
     }
@@ -1450,10 +1535,14 @@ impl Session {
     }
 
     /// `{sheet}` -> `{removed:true,undoSteps:0}` — plus the internal
-    /// `inverse`, always the fixed, ARGLESS `{"verb":"sheet.restore-removed",
-    /// "args":{}}` (see the bucket-table doc comment above and
+    /// `inverse`, `{"verb":"sheet.restore-removed","args":{"name":"<removed
+    /// sheet name>"}}` (see the bucket-table doc comment above and
     /// [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed) for
-    /// what that verb does). Before removing, snapshots the sheet's full
+    /// what that verb does). The `name` gives the inverse an IDENTITY: the
+    /// stash is single-slot, so an intervening `sheet.remove` (e.g. a user
+    /// undo of an agent import) overwrites it; a named restore can then detect
+    /// the mismatch and refuse rather than silently resurrecting the wrong
+    /// sheet. Before removing, snapshots the sheet's full
     /// `Sheet` value, its comments, and its sheet-scoped defined names into
     /// `Session::removed_sheet_stash` ([`RemovedSheetStash`]), so the
     /// inverse is a genuine restore, not a name-only placeholder. Errors on
@@ -1523,21 +1612,32 @@ impl Session {
         // stashed from an earlier one — only the most recent removal is
         // restorable, by design (see `RemovedSheetStash`'s doc comment).
         self.removed_sheet_stash = Some(RemovedSheetStash {
-            name,
+            name: name.clone(),
             sheet: sheet_snapshot,
             comments,
             defined_names,
             removed_active,
         });
-        Ok(
-            "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{}},\"undoSteps\":0}"
-                .to_string(),
-        )
+        let mut out = String::from(
+            "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":",
+        );
+        json::push_str(&mut out, &name);
+        out.push_str("}},\"undoSteps\":0}");
+        Ok(out)
     }
 
-    /// `{}` -> `{sheet,name,undoSteps:0}` — plus the internal `inverse`
+    /// `{name?}` -> `{sheet,name,undoSteps:0}` — plus the internal `inverse`
     /// (`sheet.remove` on the just-restored sheet's NEW index, so a
-    /// follow-up `sheet.remove` redoes the removal). **INTERNAL-ONLY**: this
+    /// follow-up `sheet.remove` redoes the removal). The optional `name` is
+    /// the IDENTITY guard: `sheet.remove`'s inverse always supplies the name
+    /// of the sheet it removed, and this errors (`restore mismatch: …`) when
+    /// that name doesn't match the single-slot stash — the failure mode where
+    /// an intervening `sheet.remove` overwrote the stash, so a blind restore
+    /// would resurrect the wrong sheet. It also errors (`cannot restore …`)
+    /// when a sheet with the stashed name already exists (an intervening
+    /// same-name `sheet.add`), rather than minting a duplicate name. Both
+    /// checks run BEFORE the stash is consumed, so a rejected restore leaves
+    /// it intact for a correct later attempt. **INTERNAL-ONLY**: this
     /// verb exists solely so the host can invoke `sheet.remove`'s declared
     /// `inverse` through the normal ctl channel — Task 7 must NOT list it in
     /// `wasmVerbs`, so an external agent calling it through `CtlServer`
@@ -1582,11 +1682,39 @@ impl Session {
     /// part). True positional restore needs a small new gridcore primitive
     /// (e.g. an `insert_sheet_at`); genuinely out of reach from
     /// `gridwasm/src/bridge.rs` alone, which is this task's explicit scope.
-    fn ctl_sheet_restore_removed(&mut self, _args: &json::Json) -> Result<String, String> {
+    fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
+        // Peek at the stash name WITHOUT consuming it, so a mismatch (or a
+        // name collision) leaves the stash intact for a correct later restore.
+        let stashed_name = self
+            .removed_sheet_stash
+            .as_ref()
+            .map(|s| s.name.clone())
+            .ok_or("nothing to restore")?;
+        // Identity guard: the inverse of `sheet.remove` names the sheet it
+        // removed. If an intervening `sheet.remove` (e.g. a user undo of an
+        // agent import) has overwritten the single-slot stash, the requested
+        // name won't match — error rather than silently restoring the wrong
+        // (most-recently-removed) sheet. `name` is optional for legacy/direct
+        // callers, but `sheet.remove`'s inverse always carries it.
+        if let Some(req) = args.get_str("name") {
+            if req != stashed_name {
+                return Err(format!(
+                    "restore mismatch: stashed sheet is \"{stashed_name}\", not \"{req}\""
+                ));
+            }
+        }
+        // A sheet with the stashed name may have been re-created after removal
+        // (an intervening same-name `sheet.add`). `add_sheet` doesn't dedupe,
+        // so restoring would mint a duplicate sheet name — refuse instead.
+        if self.pkg.workbook.sheet_index(&stashed_name).is_some() {
+            return Err(format!(
+                "cannot restore \"{stashed_name}\": a sheet with that name already exists"
+            ));
+        }
         let stash = self
             .removed_sheet_stash
             .take()
-            .ok_or("nothing to restore")?;
+            .expect("stash presence verified above");
         let new_idx = self.pkg.add_sheet(&stash.name);
         self.pkg.workbook.sheets[new_idx] = stash.sheet;
         for cm in &stash.comments {
@@ -1763,6 +1891,30 @@ fn ctl_push_value(out: &mut String, v: &CellValue) {
         CellValue::Bool(false) => out.push_str("false"),
         CellValue::Error(e) => json::push_str(out, e),
     }
+}
+
+/// Serialize a `comment.replace-thread` inverse request for `(sheet, cref)`
+/// carrying `messages` (author/text pairs, in order). The internal `inverse`
+/// of comment.add/remove/replace-thread — never emitted on the wire (Task 7's
+/// `CtlServer` strips `inverse`), so its INTERNAL-ONLY verb never leaks.
+fn ctl_replace_thread_inverse(sheet: usize, cref: &str, messages: &[(String, String)]) -> String {
+    let mut out = String::from("{\"verb\":\"comment.replace-thread\",\"args\":{\"sheet\":");
+    out.push_str(&sheet.to_string());
+    out.push_str(",\"ref\":");
+    json::push_str(&mut out, cref);
+    out.push_str(",\"messages\":[");
+    for (i, (author, text)) in messages.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"author\":");
+        json::push_str(&mut out, author);
+        out.push_str(",\"text\":");
+        json::push_str(&mut out, text);
+        out.push('}');
+    }
+    out.push_str("]}}");
+    out
 }
 
 /// Parse the `ref` arg (`"B4"`) into (row, col).
@@ -2589,8 +2741,11 @@ mod tests {
             out.contains("\"sheet\":0") && out.contains("\"ref\":\"B2\""),
             "{out}"
         );
+        // B2 had no prior thread, so the inverse restores an EMPTY thread
+        // (a `comment.replace-thread` with no messages = pure removal).
         assert!(
-            out.contains("\"inverse\":{\"verb\":\"comment.remove\""),
+            out.contains("\"inverse\":{\"verb\":\"comment.replace-thread\"")
+                && out.contains("\"messages\":[]"),
             "{out}"
         );
         assert!(
@@ -2603,9 +2758,11 @@ mod tests {
             "{list}"
         );
 
-        // Revert via the declared inverse.
-        let inv = s.ctl(r#"{"verb":"comment.remove","args":{"ref":"B2","sheet":0}}"#);
-        assert!(inv.contains("\"removed\":true"), "{inv}");
+        // Revert via the declared inverse (the internal replace-thread verb).
+        let inv = s.ctl(
+            r#"{"verb":"comment.replace-thread","args":{"sheet":0,"ref":"B2","messages":[]}}"#,
+        );
+        assert!(inv.contains("\"ok\":true"), "{inv}");
         let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
         assert!(list.contains("\"comments\":[]"), "{list}");
     }
@@ -2624,7 +2781,7 @@ mod tests {
         let out = s.ctl(r#"{"verb":"comment.remove","args":{"ref":"A1"}}"#);
         assert!(out.contains("\"removed\":true"), "{out}");
         assert!(
-            out.contains("\"inverse\":{\"verb\":\"comment.add\"")
+            out.contains("\"inverse\":{\"verb\":\"comment.replace-thread\"")
                 && out.contains("\"text\":\"Hi\"")
                 && out.contains("\"author\":\"Bo\""),
             "{out}"
@@ -2633,9 +2790,9 @@ mod tests {
         let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
         assert!(list.contains("\"comments\":[]"), "{list}");
 
-        // Apply the declared inverse.
+        // Apply the declared inverse (the internal replace-thread verb).
         let inv = s.ctl(
-            r#"{"verb":"comment.add","args":{"ref":"A1","text":"Hi","author":"Bo","sheet":0}}"#,
+            r#"{"verb":"comment.replace-thread","args":{"sheet":0,"ref":"A1","messages":[{"author":"Bo","text":"Hi"}]}}"#,
         );
         assert!(inv.contains("\"ok\":true"), "{inv}");
         let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
@@ -2773,7 +2930,9 @@ mod tests {
         let out = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
         assert!(out.contains("\"removed\":true"), "{out}");
         assert!(
-            out.contains("\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{}}"),
+            out.contains(
+                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\"}}"
+            ),
             "{out}"
         );
         assert!(out.contains("\"undoSteps\":0"), "{out}");
@@ -2945,6 +3104,200 @@ mod tests {
         assert!(redo.contains("\"removed\":true"), "{redo}");
         let v = s.view_json(None);
         assert!(v.contains("\"sheets\":[\"Sheet1\"]"), "{v}");
+    }
+
+    /// Extract the `inverse` object (a valid `{"verb":…,"args":…}` request)
+    /// out of a ctl reply envelope, by balanced-brace scanning — so tests
+    /// replay exactly the inverse the code produced, not a hand-written copy.
+    fn extract_inverse(reply: &str) -> String {
+        let key = "\"inverse\":";
+        let start = reply.find(key).expect("reply carries an inverse") + key.len();
+        let bytes = reply.as_bytes();
+        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            let ch = b as char;
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+            } else {
+                match ch {
+                    '"' => in_str = true,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return reply[start..start + i + 1].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        panic!("unbalanced inverse object in reply: {reply}");
+    }
+
+    // -- Fix 1: identity-guarded sheet restore ---------------------------
+
+    #[test]
+    fn ctl_sheet_restore_identity_guard_rejects_a_stash_clobber_interleave() {
+        // The exact CRITICAL interleave. Agent removes A (stash=A); agent
+        // imports a CSV (a new sheet); then the import's OWN inverse
+        // (sheet.remove of that imported sheet) OVERWRITES the single-slot
+        // stash. Applying A's restore inverse must now ERROR on the name
+        // mismatch, never silently resurrect the imported sheet in A's place.
+        let mut s = two_sheet_session(); // [Sheet1, Sheet2] — Sheet2 is our "A"
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
+        assert!(
+            removed.contains(
+                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\"}}"
+            ),
+            "sheet.remove's inverse must name the removed sheet: {removed}"
+        );
+        // Agent import-csv -> a new sheet "Imp"; the stash is still Sheet2.
+        let imported =
+            s.ctl(r#"{"verb":"sheet.import-csv","args":{"name":"Imp","text":"x,y\n1,2"}}"#);
+        assert!(imported.contains("\"name\":\"Imp\""), "{imported}");
+        // Apply the IMPORT's inverse (sheet.remove of the imported sheet) —
+        // this clobbers the stash, replacing Sheet2 with Imp.
+        let clobber = s.ctl(&extract_inverse(&imported));
+        assert!(clobber.contains("\"removed\":true"), "{clobber}");
+        // Now apply A's (Sheet2's) restore inverse: the names no longer match.
+        let restore = s.ctl(&extract_inverse(&removed));
+        assert!(
+            restore.contains("\"ok\":false") && restore.contains("restore mismatch"),
+            "the clobbered stash must be detected, not mis-restored: {restore}"
+        );
+        // And nothing was restored — only Sheet1 remains.
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"sheets\":[\"Sheet1\"]"),
+            "a rejected restore must not resurrect the wrong sheet: {v}"
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_errors_on_a_name_collision() {
+        // A same-name `sheet.add` between removal and restore would make the
+        // restore mint a DUPLICATE name (add_sheet doesn't dedupe) — refuse.
+        let mut s = two_sheet_session(); // [Sheet1, Sheet2]
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#); // stash = Sheet2
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"Sheet2"}}"#); // a new, live Sheet2
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{"name":"Sheet2"}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("already exists"),
+            "restoring onto an existing same-name sheet must error, not duplicate: {out}"
+        );
+        // Still exactly one Sheet2 — the rejected restore added nothing.
+        let v = s.view_json(None);
+        assert!(v.contains("\"sheets\":[\"Sheet1\",\"Sheet2\"]"), "{v}");
+    }
+
+    // -- Fix 2: faithful comment inverses (both directions) --------------
+
+    #[test]
+    fn ctl_comment_add_inverse_preserves_a_pre_existing_thread() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // A pre-existing two-message thread on A1.
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"first","author":"Ana"}}"#);
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"second","author":"Bob"}}"#);
+        // The add whose inverse we test: a reply appended to that thread.
+        let out =
+            s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"third","author":"Cid"}}"#);
+        // Its inverse restores the PRE-ADD thread (first, second) — NOT a wipe.
+        assert!(
+            out.contains("\"inverse\":{\"verb\":\"comment.replace-thread\"")
+                && out.contains("\"text\":\"first\"")
+                && out.contains("\"text\":\"second\"")
+                && !out.contains("\"messages\":[]"),
+            "the add-reply inverse must carry the prior thread, not wipe the ref: {out}"
+        );
+        // Apply the exact inverse the code produced.
+        let inv = s.ctl(&extract_inverse(&out));
+        assert!(inv.contains("\"ok\":true"), "{inv}");
+        // The original two messages survive, in order; the appended reply is gone.
+        let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
+        let (p1, p2) = (list.find("first"), list.find("second"));
+        assert!(
+            p1.is_some() && p2.is_some() && p1 < p2 && !list.contains("third"),
+            "undoing the reply must leave the original thread intact and ordered: {list}"
+        );
+    }
+
+    #[test]
+    fn ctl_comment_remove_inverse_restores_every_message_in_order() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // A three-message thread on A1.
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"m1","author":"Ana"}}"#);
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"m2","author":"Bob"}}"#);
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"m3","author":"Cid"}}"#);
+        // Remove the whole ref; the inverse must carry ALL three messages.
+        let out = s.ctl(r#"{"verb":"comment.remove","args":{"ref":"A1"}}"#);
+        assert!(out.contains("\"removed\":true"), "{out}");
+        assert!(
+            out.contains("\"text\":\"m1\"")
+                && out.contains("\"text\":\"m2\"")
+                && out.contains("\"text\":\"m3\""),
+            "the remove inverse must carry the whole thread, not just its first message: {out}"
+        );
+        assert!(
+            s.ctl(r#"{"verb":"comment.list","args":{}}"#)
+                .contains("\"comments\":[]")
+        );
+        // Apply the inverse: all three come back, in order.
+        let inv = s.ctl(&extract_inverse(&out));
+        assert!(inv.contains("\"ok\":true"), "{inv}");
+        let list = s.ctl(r#"{"verb":"comment.list","args":{}}"#);
+        let (a, b, c) = (list.find("m1"), list.find("m2"), list.find("m3"));
+        assert!(
+            a.is_some() && a < b && b < c,
+            "every message must be restored, in original order: {list}"
+        );
+    }
+
+    #[test]
+    fn ctl_comment_replace_thread_inverse_chains_into_a_working_redo() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"comment.add","args":{"ref":"A1","text":"keep","author":"Ana"}}"#);
+        // Undo the removal → restores the thread; its reply carries the redo.
+        let removed = s.ctl(r#"{"verb":"comment.remove","args":{"ref":"A1"}}"#);
+        let restore = s.ctl(&extract_inverse(&removed));
+        assert!(restore.contains("\"ok\":true"), "{restore}");
+        assert!(
+            s.ctl(r#"{"verb":"comment.list","args":{}}"#)
+                .contains("\"text\":\"keep\""),
+            "the thread must be back after undo"
+        );
+        // Redo = apply the restore's OWN inverse → the thread is removed again.
+        let redo = s.ctl(&extract_inverse(&restore));
+        assert!(redo.contains("\"ok\":true"), "{redo}");
+        assert!(
+            s.ctl(r#"{"verb":"comment.list","args":{}}"#)
+                .contains("\"comments\":[]"),
+            "redoing the removal must clear the thread again"
+        );
+    }
+
+    #[test]
+    fn ctl_comment_replace_thread_is_not_a_public_verb() {
+        // Internal-only: reached solely via the host-orchestrated inverse. It
+        // IS routed in `ctl`, but must never appear on `wasmVerbs`/MCP/docs —
+        // that omission is what keeps external agents out (asserted in Task 7).
+        // Here we only pin that its own reply shape is inverse-bearing.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let out = s.ctl(
+            r#"{"verb":"comment.replace-thread","args":{"sheet":0,"ref":"A1","messages":[{"author":"Ana","text":"x"}]}}"#,
+        );
+        assert!(
+            out.contains("\"ok\":true")
+                && out.contains("\"inverse\":{\"verb\":\"comment.replace-thread\"")
+                && out.contains("\"undoSteps\":0"),
+            "{out}"
+        );
     }
 
     #[test]

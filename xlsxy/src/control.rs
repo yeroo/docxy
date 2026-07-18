@@ -121,7 +121,6 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             "cell.set"
                 | "range.clear"
                 | "comment.add"
-                | "comment.remove"
                 | "range.set"
                 | "sheet.import-csv"
                 | "wb.replace-all"
@@ -135,6 +134,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         ) {
             ctlcore::signal_activity();
         }
+        // `comment.remove` can legitimately no-op (nothing on the cell), so it
+        // signals itself inside `comment_remove`, gated on `removed:true` — a
+        // no-op must not flash the activity dot (docxy's no-op principle).
     }
     out
 }
@@ -367,6 +369,9 @@ fn sheet_pivot(app: &App, args: &Json) -> Result<Json, String> {
     let (r1, c1, r2, c2) = parse_range(rg)?;
     let frame = Frame::from_range(&app.pkg.workbook, si, (r1, c1, r2, c2));
 
+    // The MCP schema marks `rows` required; the code tolerates its absence
+    // (defaults to empty). The schema is the contract — this leniency is
+    // deliberate slack, not a documented behavior to rely on.
     let rows = names_arg(args, "rows");
     let cols = names_arg(args, "cols");
     let values_json = args
@@ -618,6 +623,9 @@ fn comment_remove(app: &mut App, args: &Json) -> Result<Json, String> {
         app.pkg.remove_comment(si, r, c);
         app.modified = true;
         app.refresh_comments();
+        // Gated no-op signal: only a real removal flashes the activity dot
+        // (see the dispatch note above; matches docxy's no-op principle).
+        ctlcore::signal_activity();
     }
     Ok(Json::obj(vec![("removed", Json::Bool(existed))]))
 }
@@ -1421,6 +1429,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.get("removed").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn comment_remove_noop_does_not_mark_modified() {
+        // A no-op comment.remove (nothing on the cell) must not look like an
+        // edit: it neither marks the workbook modified nor flashes the activity
+        // dot — both ride the same `existed` guard (docxy's no-op principle).
+        let mut a = app();
+        assert!(!a.modified, "a fresh app starts unmodified");
+        let r = dispatch(
+            &mut a,
+            "comment.remove",
+            &Json::obj(vec![("ref", Json::Str("A1".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("removed").unwrap().as_bool(), Some(false));
+        assert!(!a.modified, "a no-op comment.remove must not mark modified");
     }
 
     #[test]

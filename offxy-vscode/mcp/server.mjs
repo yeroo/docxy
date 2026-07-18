@@ -586,7 +586,7 @@ function xlsxyToolDefs() {
       Object.fromEntries([
         ['ref', prop('string', 'Cell reference, e.g. "B4".')],
         ['text', prop('string', 'Comment text.')],
-        ['author', prop('string', 'Comment author (default: a generic agent name).')],
+        ['author', prop('string', 'Comment author (defaults to the editing identity).')],
         sheet(),
         target(),
       ]),

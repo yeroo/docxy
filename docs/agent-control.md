@@ -216,6 +216,14 @@ worth knowing:
   first (restoring the second removal) but the second undo shows a warning
   (`"Offxy: couldn't undo … — nothing left to reverse"` or "… nothing to
   restore") instead of silently failing or reviving the first removed sheet.
+- **An agent `sheet.remove`/`sheet.import-csv` invalidates earlier grid
+  edits' undo entries.** These verbs clear the workbook's own undo history
+  (mirroring the terminal apps, whose package-parts churn can't be represented
+  as a stack entry), so any grid edits made *before* one of them can no longer
+  be reversed on the wasm stack. VS Code still holds their edit-event entries,
+  so pressing Ctrl+Z past that point reports success but changes nothing.
+  (Per-edit epoch tracking that would surface this as a real warning is a
+  disclosed fast-follow.)
 - **Comment author defaults to `"agent"` on tabs**, not the OS username — the
   terminal apps stamp new threaded comments with the OS user
   (`$USER`/`%USERNAME%`, falling back to `"xlsxy"`); a tab's `comment.add`
@@ -226,7 +234,9 @@ worth knowing:
   sandbox, so the webview renders the PDF bytes and hands them to the
   extension host, which does the exclusive-create write to disk (same
   refuses-to-overwrite / `already exists:` semantics as the terminal, which
-  writes directly). The reply shape is identical either way: `{path}`.
+  writes directly). The reply shape is identical either way: `{path}`. Pass an
+  **absolute** `path`: a relative one absolutizes against the serving process's
+  cwd, which differs between a terminal instance and the extension host.
 
 `docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
 **new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
