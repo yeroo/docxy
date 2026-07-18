@@ -11,7 +11,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, Row, params};
 
-use crate::graph::model::{AttachmentMeta, Body, MailFolder, Message, Recipient};
+use crate::graph::model::{AttachmentMeta, Attendee, Body, Event, MailFolder, Message, Recipient};
 use crate::json::{self, Value};
 
 mod schema;
@@ -113,6 +113,18 @@ pub enum OutboxOp {
     SendDraft {
         id: String,
     },
+    /// Push an RSVP for a calendar event to Graph
+    /// (`.../accept`|`.../decline`|`.../tentativelyAccept`, always with
+    /// `sendResponse: true` — see `sync::outbox::apply_op`). `kind` is the
+    /// same response_status vocabulary `Store::set_event_response` writes
+    /// locally (`"accepted"`, `"declined"`, `"tentativelyAccepted"`);
+    /// `apply_op` converts it to a `graph::client::RsvpKind`. `comment` is
+    /// the optional note attendees see alongside the response.
+    RespondEvent {
+        id: String,
+        kind: String,
+        comment: Option<String>,
+    },
 }
 
 impl OutboxOp {
@@ -127,6 +139,7 @@ impl OutboxOp {
             OutboxOp::Delete { .. } => "delete",
             OutboxOp::SaveDraft { .. } => "saveDraft",
             OutboxOp::SendDraft { .. } => "sendDraft",
+            OutboxOp::RespondEvent { .. } => "respondEvent",
         }
     }
 
@@ -161,6 +174,18 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
+            OutboxOp::RespondEvent { id, kind, comment } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("rsvp".to_string(), Value::Str(kind.clone())),
+                (
+                    "comment".to_string(),
+                    match comment {
+                        Some(c) => Value::Str(c.clone()),
+                        None => Value::Null,
+                    },
+                ),
+            ]),
         }
     }
 
@@ -186,6 +211,11 @@ impl OutboxOp {
             "delete" => Some(OutboxOp::Delete { id: id()? }),
             "saveDraft" => Some(OutboxOp::SaveDraft { id: id()? }),
             "sendDraft" => Some(OutboxOp::SendDraft { id: id()? }),
+            "respondEvent" => Some(OutboxOp::RespondEvent {
+                id: id()?,
+                kind: v.get("rsvp")?.as_str()?.to_string(),
+                comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+            }),
             _ => None,
         }
     }
@@ -226,17 +256,13 @@ pub struct AttendeeRow {
 
 /// The field set `upsert_event` writes to an `events` row.
 ///
-/// The Task-2 sync engine will introduce a Graph-facing `Event` model
-/// (mirroring `graph::model::Message`) with a `from_json` constructor; this
-/// task's brief calls for `upsert_event` to take that type directly, but it
-/// doesn't exist yet (Task 2 hasn't landed). `NewEvent` stands in for it now
-/// — same field set as `EventRow` plus the extra columns
-/// (`series_master_id`, `body_preview`, `web_link`, `last_modified`,
-/// `body_html`) that `EventRow` doesn't surface — so this task compiles and
-/// tests standalone. When Task 2's `Event` lands, either it should have this
-/// exact shape (in which case `upsert_event` can take `&Event` directly and
-/// this struct goes away) or a `From<&Event> for NewEvent` conversion
-/// bridges the two.
+/// Same field set as `EventRow` plus the extra columns (`series_master_id`,
+/// `body_preview`, `web_link`, `last_modified`, `body_html`) that `EventRow`
+/// doesn't surface. `graph::model::Event` (Task 2) turned out to be a
+/// field-for-field superset of this (it additionally carries `attendees`),
+/// so rather than folding `NewEvent` away, the sync engine bridges the two
+/// via the `From<&Event> for NewEvent` conversion below — a straight
+/// per-field copy the engine runs for every event `calendar_view` returns.
 ///
 /// `body_html` supersedes the original spec idea of reusing the `bodies`
 /// table (keyed `event:<id>`) for event bodies — `bodies.message_id` has an
@@ -261,15 +287,51 @@ pub struct NewEvent {
     pub body_html: String,
 }
 
-/// The field set `put_event_attendees` writes for one `event_attendees` row.
-/// Stands in for the Task-2 `Attendee` model the same way `NewEvent` stands
-/// in for `Event` — see `NewEvent`'s doc comment.
+/// The field set `put_event_attendees` writes for one `event_attendees` row —
+/// the same field set as `graph::model::Attendee`; see `From<&Attendee> for
+/// NewAttendee` below.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewAttendee {
     pub name: String,
     pub addr: String,
     pub r#type: String,
     pub response: String,
+}
+
+/// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
+/// every event `GraphClient::calendar_view` returns, before `upsert_event`.
+impl From<&Event> for NewEvent {
+    fn from(e: &Event) -> Self {
+        NewEvent {
+            id: e.id.clone(),
+            subject: e.subject.clone(),
+            start_utc: e.start_utc.clone(),
+            end_utc: e.end_utc.clone(),
+            is_all_day: e.is_all_day,
+            location: e.location.clone(),
+            organizer_name: e.organizer_name.clone(),
+            organizer_addr: e.organizer_addr.clone(),
+            response_status: e.response_status.clone(),
+            series_master_id: e.series_master_id.clone(),
+            body_preview: e.body_preview.clone(),
+            web_link: e.web_link.clone(),
+            last_modified: e.last_modified.clone(),
+            body_html: e.body_html.clone(),
+        }
+    }
+}
+
+/// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
+/// every attendee of every event, before `put_event_attendees`.
+impl From<&Attendee> for NewAttendee {
+    fn from(a: &Attendee) -> Self {
+        NewAttendee {
+            name: a.name.clone(),
+            addr: a.addr.clone(),
+            r#type: a.r#type.clone(),
+            response: a.response.clone(),
+        }
+    }
 }
 
 /// The local mail database. Single-threaded access is assumed (the sync
@@ -1567,6 +1629,26 @@ mod outbox_tests {
             .to_string(),
             r#"{"kind":"sendDraft","id":"local:1"}"#
         );
+        assert_eq!(
+            OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: Some("looking forward to it".into()),
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it"}"#
+        );
+        assert_eq!(
+            OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "declined".into(),
+                comment: None,
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null}"#
+        );
     }
 
     #[test]
@@ -1590,6 +1672,16 @@ mod outbox_tests {
             },
             OutboxOp::SendDraft {
                 id: "local:M6".into(),
+            },
+            OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: Some("ok".into()),
+            },
+            OutboxOp::RespondEvent {
+                id: "E2".into(),
+                kind: "tentativelyAccepted".into(),
+                comment: None,
             },
         ];
         for op in ops {

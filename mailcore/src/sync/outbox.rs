@@ -16,7 +16,7 @@
 //! would happen for free). So `apply_op` takes a `&Store` too, used only by
 //! those two ops.
 
-use crate::graph::client::{GraphClient, GraphError};
+use crate::graph::client::{GraphClient, GraphError, RsvpKind};
 use crate::graph::model::Recipient;
 use crate::store::{OutboxOp, Store};
 
@@ -36,6 +36,24 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             let graph_id = ensure_draft_on_graph(client, store, id)?;
             client.send_draft(&graph_id)
         }
+        OutboxOp::RespondEvent { id, kind, comment } => {
+            client.respond_event(id, rsvp_kind(kind), comment.as_deref(), true)
+        }
+    }
+}
+
+/// Maps the `response_status` vocabulary `Store::set_event_response` writes
+/// locally — and `OutboxOp::RespondEvent`'s `kind` field carries — to the
+/// RSVP action `GraphClient::respond_event` sends: `"declined"` → `Decline`,
+/// `"tentativelyAccepted"` → `Tentative`. Anything else (including the
+/// common case, `"accepted"`) maps to `Accept` — a safe default for an
+/// unrecognized value rather than silently dropping the RSVP (this crate's
+/// usual "default rather than fail" convention; see e.g. `Event::from_json`).
+fn rsvp_kind(kind: &str) -> RsvpKind {
+    match kind {
+        "declined" => RsvpKind::Decline,
+        "tentativelyAccepted" => RsvpKind::Tentative,
+        _ => RsvpKind::Accept,
     }
 }
 
@@ -215,6 +233,68 @@ mod tests {
         apply_op(&c, &store, &OutboxOp::Delete { id: "M1".into() }).unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "DELETE");
+    }
+
+    #[test]
+    fn apply_op_dispatches_respond_event_accept_with_comment() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/accept".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: Some("looking forward to it".into()),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert!(reqs[0].path.ends_with("/accept"));
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent.get("comment").and_then(Value::as_str),
+            Some("looking forward to it")
+        );
+        assert_eq!(
+            sent.get("sendResponse").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_op_dispatches_respond_event_decline_maps_to_the_right_action() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/decline".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "declined".into(),
+                comment: None,
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert!(reqs[0].path.ends_with("/decline"));
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some(""));
     }
 
     #[test]

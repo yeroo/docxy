@@ -20,7 +20,7 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError};
 use crate::graph::model::{DeltaItem, Message};
-use crate::store::{OutboxOp, Store, StoreError};
+use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
 use std::io::{Read, Write};
@@ -84,6 +84,24 @@ pub enum SyncCommand {
     /// Fetch a pre-quoted forward draft for `id` (`createForward`), store
     /// it, and emit [`SyncEvent::DraftReady`].
     ComposeForward { id: String },
+    /// Fetch the calendar window (`calendar_window`, anchored at
+    /// `SystemTime::now()`) via `calendar_view`, upsert every event and its
+    /// attendees into the store, and emit [`SyncEvent::CalendarUpdated`].
+    /// Also run automatically on the periodic tick (see `Engine::on_tick`),
+    /// interleaved with the mail sync pass.
+    RefreshCalendar,
+    /// Respond to a calendar event's invite: optimistic local
+    /// `Store::set_event_response` (immediately reflected, before Graph is
+    /// even reached) plus [`SyncEvent::CalendarUpdated`], then enqueue
+    /// [`crate::store::OutboxOp::RespondEvent`] and drain. `kind` is the
+    /// response_status vocabulary `Store::set_event_response` accepts
+    /// (`"accepted"`/`"declined"`/`"tentativelyAccepted"`); `comment` is an
+    /// optional note sent alongside the RSVP.
+    RespondEvent {
+        id: String,
+        kind: String,
+        comment: Option<String>,
+    },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -122,6 +140,9 @@ pub enum SyncEvent {
     /// still a `local:` id when send started) was successfully handed to
     /// Graph for delivery.
     Sent { id: String },
+    /// The events store changed (a `RefreshCalendar`/`RespondEvent` just
+    /// landed); re-read `Store::events_in_window`/`Store::event_attendees`.
+    CalendarUpdated,
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -344,6 +365,11 @@ impl Engine {
         let needs_full =
             !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
         self.sync_pass(needs_full);
+        // Interleave a calendar refresh with the periodic mail sync (see
+        // `SyncCommand::RefreshCalendar` for the on-demand path). Best-effort:
+        // `refresh_calendar` surfaces its own failures via `react`/`Error` and
+        // never aborts the tick.
+        self.refresh_calendar();
     }
 
     /// Dispatches one UI command.
@@ -406,6 +432,15 @@ impl Engine {
             }
             SyncCommand::ComposeReply { id, all } => self.compose_reply(&id, all),
             SyncCommand::ComposeForward { id } => self.compose_forward(&id),
+            SyncCommand::RefreshCalendar => self.refresh_calendar(),
+            SyncCommand::RespondEvent { id, kind, comment } => {
+                // Optimistic local write, same pattern as MarkRead/SetFlag/
+                // Move/Delete: reflect the RSVP immediately, before the
+                // outbox drain even reaches Graph.
+                self.store.set_event_response(&id, &kind);
+                self.emit(SyncEvent::CalendarUpdated);
+                self.enqueue_and_drain(OutboxOp::RespondEvent { id, kind, comment });
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -838,6 +873,44 @@ impl Engine {
             return;
         }
         self.emit(SyncEvent::DraftReady { id: draft.id });
+    }
+
+    // --- Calendar ----------------------------------------------------------
+
+    /// Fetches `calendar_window(SystemTime::now())` via `calendar_view`,
+    /// upserts every returned event (`NewEvent::from`) and its attendees
+    /// (`NewAttendee::from`) into the store, and emits
+    /// `SyncEvent::CalendarUpdated`. Unlike mail's delta sync, Graph's
+    /// `/me/calendarView` isn't a delta endpoint — there's no link to resume
+    /// from, so every call re-fetches and re-upserts the whole window;
+    /// `upsert_event`/`put_event_attendees` are idempotent, so repeating this
+    /// is harmless, just not incremental. (`Store::calendar_delta_link`/
+    /// `set_calendar_delta_link` are there for a future delta-capable
+    /// endpoint; nothing here has a link to write into them.)
+    ///
+    /// Same signed-in guard as `fetch_body` et al.; a Graph failure goes
+    /// through `react` for the standard auth/throttle/transport handling (a
+    /// 4xx/parse is surfaced via `SyncEvent::Error`, not fatal to the caller).
+    fn refresh_calendar(&mut self) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        let (from, to) = calendar_window(SystemTime::now());
+        match self.with_auth(|c| c.calendar_view(&from, &to)) {
+            Ok(events) => {
+                for e in &events {
+                    let _ = self.store.upsert_event(&NewEvent::from(e));
+                    let attendees: Vec<NewAttendee> =
+                        e.attendees.iter().map(NewAttendee::from).collect();
+                    let _ = self.store.put_event_attendees(&e.id, &attendees);
+                }
+                self.emit(SyncEvent::CalendarUpdated);
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
     }
 
     // --- Auth ------------------------------------------------------------
@@ -1354,6 +1427,26 @@ fn unix_to_iso8601(secs: u64) -> String {
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// `RefreshCalendar`'s window: this many days into the past...
+const CALENDAR_WINDOW_PAST_DAYS: u64 = 7;
+/// ...and this many days into the future, both anchored at the base time
+/// `calendar_window` is called with.
+const CALENDAR_WINDOW_FUTURE_DAYS: u64 = 30;
+
+/// Computes the `[from, to]` ISO-8601 UTC bounds `RefreshCalendar` fetches:
+/// `base - 7d` .. `base + 30d`. `base` is an injectable anchor so tests can
+/// pin it to a fixed instant; production (`Engine::refresh_calendar`) always
+/// passes `SystemTime::now()`.
+fn calendar_window(base: SystemTime) -> (String, String) {
+    let base_secs = base
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let from = base_secs.saturating_sub(CALENDAR_WINDOW_PAST_DAYS * 86400);
+    let to = base_secs + CALENDAR_WINDOW_FUTURE_DAYS * 86400;
+    (unix_to_iso8601(from), unix_to_iso8601(to))
 }
 
 /// Converts a count of days since the Unix epoch into a `(year, month, day)`
@@ -2648,6 +2741,285 @@ mod tests {
         // sign-in-required rather than getting stuck.
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
         assert!(tokencache::load(&token_path).unwrap().is_none());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_window_defaults_to_7_days_back_and_30_days_forward() {
+        // 2026-07-18T00:00:00Z, a fixed base so this doesn't depend on wall
+        // clock — the whole point of `calendar_window` taking `base` as a
+        // parameter rather than reading `SystemTime::now()` itself.
+        let base = UNIX_EPOCH + Duration::from_secs(1_784_332_800);
+        let (from, to) = calendar_window(base);
+        assert_eq!(from, "2026-07-11T00:00:00Z");
+        assert_eq!(to, "2026-08-17T00:00:00Z");
+    }
+
+    /// A Graph calendar-event JSON body shaped like `Event::from_json`
+    /// expects — same shape `graph::client`'s own `sample_event_json` test
+    /// fixture uses, duplicated here since that one is private to that module.
+    fn calendar_event_json(id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","subject":"Standup",
+            "start":{{"dateTime":"{start}.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"{end}.0000000","timeZone":"UTC"}},
+            "isAllDay":false,
+            "location":{{"displayName":"Room"}},
+            "organizer":{{"emailAddress":{{"name":"Org","address":"org@x"}}}},
+            "responseStatus":{{"response":"none"}},
+            "seriesMasterId":null,
+            "bodyPreview":"p","webLink":"https://x/{id}",
+            "lastModifiedDateTime":"2026-07-17T00:00:00Z",
+            "body":{{"contentType":"html","content":"agenda"}},
+            "attendees":[{{"type":"required","status":{{"response":"none"}},"emailAddress":{{"name":"Bob","address":"bob@x"}}}}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn refresh_calendar_populates_store_and_emits_event() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                ),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("refresh-calendar");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Let the mail backfill land first (not strictly required — this
+        // engine only fetches the calendar on an explicit `RefreshCalendar`
+        // or a periodic tick, never as part of a mail `Refresh` — but it
+        // keeps the fixture realistic and gives us a well-defined signal to
+        // wait on first).
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "E1");
+        assert_eq!(rows[0].subject, "Standup");
+        assert_eq!(rows[0].start_utc, "2026-07-18T09:00:00Z");
+
+        let attendees = store.event_attendees("E1").unwrap();
+        assert_eq!(attendees.len(), 1);
+        assert_eq!(attendees[0].name, "Bob");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_event_optimistically_flips_status_and_drains_to_accept() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/accept".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("respond-event");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        // Seed the event locally BEFORE the engine (and its own `Store::open`)
+        // starts up — same pattern `folder_sync_adopts_sentinel_drafts_...`
+        // uses for a local draft — so `RespondEvent`'s optimistic write has a
+        // row to flip.
+        {
+            let store = Store::open(&store_path).unwrap();
+            store
+                .upsert_event(&NewEvent {
+                    id: "E1".into(),
+                    subject: "Standup".into(),
+                    start_utc: "2026-07-18T09:00:00Z".into(),
+                    end_utc: "2026-07-18T09:30:00Z".into(),
+                    is_all_day: false,
+                    location: "".into(),
+                    organizer_name: "Org".into(),
+                    organizer_addr: "org@x".into(),
+                    response_status: "none".into(),
+                    series_master_id: None,
+                    body_preview: "".into(),
+                    web_link: "".into(),
+                    last_modified: "".into(),
+                    body_html: "".into(),
+                })
+                .unwrap();
+        }
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: Some("see you there".into()),
+            })
+            .unwrap();
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+
+        // The optimistic local write lands before the drain even starts.
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows[0].response_status, "accepted");
+
+        // The drain reaches Graph too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if srv
+                .requests()
+                .iter()
+                .any(|r| r.method == "POST" && r.path.starts_with("/me/events/E1/accept"))
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("no accept POST observed; requests: {:?}", srv.requests());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let accept = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.path.starts_with("/me/events/E1/accept"))
+            .unwrap();
+        assert_eq!(
+            accept.body,
+            r#"{"comment":"see you there","sendResponse":true}"#
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_event_quarantines_after_repeated_4xx() {
+        // Same drain policy as mail ops — `drain_outbox` doesn't distinguish
+        // op kind — so this mirrors `quarantine_drops_op_and_clears_delta_
+        // links_for_reconverge` above, just against a `RespondEvent` op whose
+        // Graph call always 404s.
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/accept".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("respond-event-quarantine");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        // The RespondEvent command drains once (attempt 1); each Refresh
+        // drains again (attempts 2..5). The 4th Refresh is the 5th failed
+        // drain and quarantines.
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: None,
+            })
+            .unwrap();
+        for _ in 0..4 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+
+        let events = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))),
+            "expected a quarantine Error event, saw: {events:?}"
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

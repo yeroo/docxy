@@ -300,9 +300,15 @@ impl App {
             // Folded into the existing catch-all rather than given a
             // dedicated arm so this compiles now without inventing a
             // toast/notice mechanism the brief doesn't ask for.
+            // `CalendarUpdated` (from `SyncCommand::RefreshCalendar`/
+            // `RespondEvent`) has no TUI consumer yet — the calendar view
+            // lands in a later task. Folded into this catch-all for the same
+            // reason `Sent` is: compiles now without inventing a view this
+            // brief doesn't ask for.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
-            | SyncEvent::Sent { .. } => {}
+            | SyncEvent::Sent { .. }
+            | SyncEvent::CalendarUpdated => {}
         }
     }
 
