@@ -1377,6 +1377,80 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Rebuilds the local contact signal from the `messages` table: every
+    /// distinct address seen as a sender or a to/cc recipient becomes a
+    /// contact, with `frequency` = how many messages it appeared in and
+    /// `last_seen` = the most recent of those messages' dates. Idempotent —
+    /// safe to run every sync pass (the miner computes exact counts and
+    /// `upsert_contact` takes the MAX, so re-runs don't inflate anything).
+    pub fn refresh_local_contacts(&self) -> Result<(), StoreError> {
+        use std::collections::HashMap;
+        // (name, last_seen, count) aggregated by lowercased address.
+        let mut agg: HashMap<String, (String, String, i64)> = HashMap::new();
+        let consider = |name: &str,
+                        addr: &str,
+                        date: &str,
+                        agg: &mut HashMap<String, (String, String, i64)>| {
+            let addr = addr.trim().to_lowercase();
+            if addr.is_empty() || !addr.contains('@') {
+                return;
+            }
+            let e = agg
+                .entry(addr)
+                .or_insert_with(|| (String::new(), String::new(), 0));
+            if e.0.is_empty() && !name.trim().is_empty() {
+                e.0 = name.trim().to_string();
+            }
+            if date > e.1.as_str() {
+                e.1 = date.to_string();
+            }
+            e.2 += 1;
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT from_name, from_addr, to_recipients, cc_recipients, received_at, sent_at FROM messages",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (from_name, from_addr, to, cc, received, sent) in rows {
+            let date = if !received.is_empty() {
+                received.as_str()
+            } else {
+                sent.as_str()
+            };
+            consider(&from_name, &from_addr, date, &mut agg);
+            for r in crate::sync::outbox::parse_recipients(&to) {
+                consider(&r.name, &r.address, date, &mut agg);
+            }
+            for r in crate::sync::outbox::parse_recipients(&cc) {
+                consider(&r.name, &r.address, date, &mut agg);
+            }
+        }
+
+        for (address, (name, last_seen, frequency)) in agg {
+            self.upsert_contact(&Contact {
+                name,
+                address,
+                source: "local".to_string(),
+                last_seen,
+                frequency,
+                relevance: None,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// The local `folders.id` a new draft is filed under when the real Drafts
@@ -1766,6 +1840,56 @@ mod tests {
             s.search_contacts("ANN", 10).unwrap()[0].address,
             "ann@x.com"
         );
+    }
+
+    #[test]
+    fn refresh_local_contacts_mines_from_and_to_and_cc() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "inbox".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        // A message FROM Alice, TO Bob + Carol.
+        let mut m = msg("1", false); // helper sets received "2026-07-1T00:00:00Z"
+        m.from = Recipient {
+            name: "Alice".into(),
+            address: "alice@x.com".into(),
+        };
+        m.to = vec![Recipient {
+            name: "Bob".into(),
+            address: "bob@x.com".into(),
+        }];
+        m.cc = vec![Recipient {
+            name: "Carol".into(),
+            address: "carol@x.com".into(),
+        }];
+        s.upsert_message("inbox", &m).unwrap();
+
+        s.refresh_local_contacts().unwrap();
+        // All three parties are mined as contacts.
+        let names: Vec<String> = ["alice", "bob", "carol"]
+            .iter()
+            .map(|q| {
+                s.search_contacts(q, 1)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .map(|c| c.address)
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(names, ["alice@x.com", "bob@x.com", "carol@x.com"]);
+        // Idempotent: a second pass does not double-count frequency.
+        let f1 = s.search_contacts("alice", 1).unwrap()[0].frequency;
+        s.refresh_local_contacts().unwrap();
+        let f2 = s.search_contacts("alice", 1).unwrap()[0].frequency;
+        assert_eq!(f1, f2);
+        assert_eq!(f1, 1); // appeared in exactly one message
     }
 }
 

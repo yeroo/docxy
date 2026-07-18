@@ -125,7 +125,7 @@ fn ensure_draft_on_graph(
 /// `parse_recipient_part`, which only treats `,` as a separator for the
 /// bare-address (no `<...>`) shape, where it's the compose UI's own
 /// separator for `"a@x, b@y"`-style typed input.
-fn parse_recipients(raw: &str) -> Vec<Recipient> {
+pub(crate) fn parse_recipients(raw: &str) -> Vec<Recipient> {
     raw.split(';')
         .map(str::trim)
         .filter(|s| !s.is_empty())
