@@ -208,6 +208,15 @@ pub struct MovePicker {
     pub folders: Vec<FolderRow>,
     pub index: usize,
     pub message_id: String,
+    /// The full set of a thread's message ids, captured at open time, when
+    /// the picker was opened on a threaded multi-message conversation
+    /// (`None` for a flat/single-message target). `confirm_move` uses this
+    /// captured set rather than re-deriving `threaded_target_ids()` at Enter
+    /// time, so a background sync reload between open and confirm (which
+    /// rebuilds `threads`/`visible_rows` under an unchanged `row_index`)
+    /// can't retarget the move to a different thread than the one the user
+    /// opened the picker on.
+    pub thread_ids: Option<Vec<String>>,
 }
 
 /// State for the search prompt opened by `/`: the in-progress query text,
@@ -811,11 +820,39 @@ impl App {
         }
     }
 
+    /// The (id, has_attachments) of the message the list cursor currently
+    /// points at — thread-aware. In threaded mode a Header targets the
+    /// conversation's latest message (matching Enter/activate), a Message row
+    /// targets that message; in flat mode it's messages[msg_index]. `None` when
+    /// nothing is selected.
+    fn highlighted_message_fields(&self) -> Option<(String, bool)> {
+        if self.threaded_active() {
+            return match self.selected_row()? {
+                Row::Message(t, m) => self.threads[t]
+                    .thread
+                    .messages
+                    .get(m)
+                    .map(|x| (x.id.clone(), x.has_attachments)),
+                Row::Header(t) => self.threads[t]
+                    .thread
+                    .messages
+                    .last()
+                    .map(|x| (x.id.clone(), x.has_attachments)),
+            };
+        }
+        self.messages
+            .get(self.msg_index)
+            .map(|m| (m.id.clone(), m.has_attachments))
+    }
+
     /// The id of the message currently highlighted in the list pane, if any
     /// (empty list, or nothing loaded yet, yield `None` — every triage
-    /// action is then a no-op rather than a panic).
+    /// action is then a no-op rather than a panic). Thread-aware — see
+    /// `highlighted_message_fields`, which this reuses so `compose_reply`/
+    /// `compose_forward` (the only callers) target the row under the cursor
+    /// rather than the stale flat `messages` list while threaded.
     fn highlighted_message_id(&self) -> Option<String> {
-        self.messages.get(self.msg_index).map(|m| m.id.clone())
+        self.highlighted_message_fields().map(|(id, _)| id)
     }
 
     /// The message ids a triage key targets in threaded mode: every message
@@ -1004,12 +1041,15 @@ impl App {
     /// land) — so this can never open a popup `confirm_move` can't act on.
     /// In threaded mode, captures the threaded target id (`threaded_target_ids`)
     /// rather than the flat `highlighted_message_id`, since the flat
-    /// `messages` list is empty while threaded — see `confirm_move`, which
-    /// re-derives the full thread-id list for a multi-message conversation
-    /// and ignores `message_id` in that case.
+    /// `messages` list is empty while threaded. Also captures the full
+    /// thread id set up front, in `MovePicker::thread_ids`, when the target is
+    /// a multi-message conversation — `confirm_move` uses that captured set
+    /// rather than re-deriving it at Enter time, so a background sync reload
+    /// in between can't retarget the move to a different thread.
     pub fn open_move_picker(&mut self) {
-        let Some(id) = self
-            .threaded_target_ids()
+        let target = self.threaded_target_ids();
+        let Some(id) = target
+            .clone()
             .and_then(|v| v.into_iter().next())
             .or_else(|| self.highlighted_message_id())
         else {
@@ -1023,6 +1063,7 @@ impl App {
             folders,
             index: 0,
             message_id: id,
+            thread_ids: target.filter(|v| v.len() > 1),
         });
     }
 
@@ -1062,15 +1103,18 @@ impl App {
         };
         // In threaded mode with a multi-message conversation selected, confirm
         // the whole-thread move; otherwise move the single captured message.
-        if let Some(ids) = self.threaded_target_ids() {
-            if ids.len() > 1 {
-                let scope = self.describe_thread_scope(&ids);
-                self.confirm = Some(ConfirmModal {
-                    prompt: format!("Move {scope} to this folder?"),
-                    action: ConfirmAction::MoveThread(ids, dest),
-                });
-                return;
-            }
+        // Uses the id set CAPTURED at `open_move_picker` time (`picker.thread_ids`)
+        // rather than re-deriving `threaded_target_ids()` here, so a background
+        // sync reload between open and confirm (which rebuilds `threads`/
+        // `visible_rows` under an unchanged `row_index`) can't move a different
+        // thread than the one the user opened the picker on.
+        if let Some(ids) = picker.thread_ids {
+            let scope = self.describe_thread_scope(&ids);
+            self.confirm = Some(ConfirmModal {
+                prompt: format!("Move {scope} to this folder?"),
+                action: ConfirmAction::MoveThread(ids, dest),
+            });
+            return;
         }
         if self.store.move_message(&picker.message_id, &dest).is_ok() {
             self.reload_messages();
@@ -1304,11 +1348,7 @@ impl App {
     /// is a no-op — same "don't open a popup that can't work" pattern as
     /// `open_move_picker`.
     pub fn open_attachments_popup(&mut self) {
-        let Some((id, has_attachments)) = self
-            .messages
-            .get(self.msg_index)
-            .map(|m| (m.id.clone(), m.has_attachments))
-        else {
+        let Some((id, has_attachments)) = self.highlighted_message_fields() else {
             return;
         };
         let items = self.store.attachments(&id).unwrap_or_default();
@@ -2558,6 +2598,204 @@ pub(crate) mod tests {
             last,
             Ok(SyncCommand::ComposeForward { id }) if id == "m1"
         ));
+    }
+
+    /// Regression test for the final-review Critical bug: reply/forward used
+    /// to read the stale flat `messages`/`msg_index` even in threaded mode
+    /// (only the triage verbs were made thread-aware via
+    /// `threaded_target_ids`), so `r`/`R`/`F` could target the wrong message.
+    /// `compose_reply`/`compose_forward` both go through
+    /// `highlighted_message_id`, so exercising `compose_reply` here covers
+    /// both.
+    #[test]
+    fn reply_in_threaded_mode_targets_message_under_cursor() {
+        use crate::app::Row;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = m1@10:00, m2@11:00; latest = m2
+        app.reload_messages();
+
+        // Cursor on the (collapsed) header: targets the thread's latest
+        // message (m2), matching Enter/activate's behavior — NOT the stale
+        // flat `messages[0]`, which is "m1".
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        app.compose_reply(false);
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::ComposeReply { id, all }) if id == "m2" && !all
+        ));
+
+        // Expand the header and move the cursor onto m1's own child row —
+        // now it must target "m1" specifically, proving this follows the
+        // cursor rather than always landing on the flat list's message.
+        if let Row::Header(t) = app.visible_rows[pos] {
+            app.threads[t].expanded = true;
+            app.rebuild_visible_rows();
+        }
+        let child_pos = app
+            .visible_rows
+            .iter()
+            .position(|r| {
+                if let Row::Message(t, m) = r {
+                    app.threads[*t].thread.messages[*m].id == "m1"
+                } else {
+                    false
+                }
+            })
+            .unwrap();
+        app.row_index = child_pos;
+
+        app.compose_reply(false);
+        let last = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(
+            last,
+            Ok(SyncCommand::ComposeReply { id, all }) if id == "m1" && !all
+        ));
+    }
+
+    /// Regression test for the same Critical bug, for the attachments popup
+    /// (`a`): it used to index the stale flat `messages[msg_index]` even in
+    /// threaded mode. Seeds distinct attachments on m1 and m2 so the test can
+    /// tell which message's popup actually opened, not just that some popup did.
+    #[test]
+    fn attachments_in_threaded_mode_uses_cursor_message() {
+        use crate::app::Row;
+        use mailcore::graph::model::{AttachmentMeta, Message, Recipient};
+
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        seed_second_in_c1(&app); // c1 = m1@10:00, m2@11:00; latest = m2
+
+        // Mark both messages as having attachments (re-upsert; the seeded
+        // fixture and `seed_second_in_c1` both start with `has_attachments:
+        // false`), and give each a distinct local attachment row.
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m1".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Hello".into(),
+                    from: Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: "2026-07-16T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: true,
+                    importance: "normal".into(),
+                    preview: "hi there".into(),
+                    is_draft: false,
+                },
+            )
+            .expect("mark m1 has_attachments");
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "m2".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Re: Hello".into(),
+                    from: Recipient {
+                        name: "Bob".into(),
+                        address: "bob@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T11:00:00Z".into(),
+                    sent: "".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: true,
+                    importance: "normal".into(),
+                    preview: "re hi".into(),
+                    is_draft: false,
+                },
+            )
+            .expect("mark m2 has_attachments");
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "one.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 1,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed m1 attachment");
+        app.store
+            .put_attachments(
+                "m2",
+                &[AttachmentMeta {
+                    id: "a2".into(),
+                    name: "two.txt".into(),
+                    content_type: "text/plain".into(),
+                    size: 1,
+                    is_inline: false,
+                }],
+            )
+            .expect("seed m2 attachment");
+        app.reload_messages();
+
+        // Cursor on the (collapsed) header: targets the thread's latest
+        // message (m2)'s attachments.
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        app.row_index = pos;
+
+        app.open_attachments_popup();
+        {
+            let popup = app
+                .attachments
+                .as_ref()
+                .expect("popup should open for the header's latest message");
+            assert_eq!(popup.message_id, "m2");
+            assert_eq!(popup.items[0].name, "two.txt");
+        }
+        app.attachments = None;
+
+        // Expand and move onto m1's own child row: now it must target m1's
+        // attachments specifically.
+        if let Row::Header(t) = app.visible_rows[pos] {
+            app.threads[t].expanded = true;
+            app.rebuild_visible_rows();
+        }
+        let child_pos = app
+            .visible_rows
+            .iter()
+            .position(|r| {
+                if let Row::Message(t, m) = r {
+                    app.threads[*t].thread.messages[*m].id == "m1"
+                } else {
+                    false
+                }
+            })
+            .unwrap();
+        app.row_index = child_pos;
+
+        app.open_attachments_popup();
+        let popup = app
+            .attachments
+            .as_ref()
+            .expect("popup should open for m1's row");
+        assert_eq!(popup.message_id, "m1");
+        assert_eq!(popup.items[0].name, "one.txt");
     }
 
     #[test]
