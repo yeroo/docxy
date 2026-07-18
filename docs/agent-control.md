@@ -116,6 +116,47 @@ send doc.replace-range '{"start":1,"text":"A tighter second paragraph."}'
 send doc.save '{}'
 ```
 
+## VS Code tabs
+
+The [`offxy` VS Code extension](../offxy-vscode) gives every open `.docx`/
+`.xlsx` tab its own ctlcore-compatible control server
+(`offxy-vscode/src/ctlserver.ts`) — discoverable and drivable exactly like a
+terminal docxy/xlsxy pane: same discovery directory, same wire protocol, same
+verb tables above (`doc.*` for Word tabs, the xlsxy verbs below for Excel
+tabs). A tab's instance id is `<app>-vscode-<basename>-<n>` (e.g.
+`docxy-vscode-report_docx-1`), so it lists alongside terminal instances
+(`docxy-<pid>` / `docxy-<AGWINTERM_SESSION_ID>`) in the same discovery dir and
+in `docxy_list`/`xlsxy_list`. A tab exposes **exactly** the terminal verb
+surface, nothing more: a couple of internal-only verbs the extension host
+uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
+are deliberately not in the tab's exposed verb set, and are rejected as
+`"unknown verb"` — same as a terminal instance, which has no arm for them at
+all.
+
+Two behaviors differ from a terminal instance — worth knowing before
+scripting against a tab:
+
+- **`doc.open`/`wb.open` opens a new tab, not an in-place swap.** VS Code's
+  per-tab document model has no equivalent of the terminal apps' single
+  mutable "current document"; calling `doc.open`/`wb.open` on a tab's ctl
+  instance opens the target file in its *own new tab* — a wholly separate ctl
+  instance — instead of swapping the current instance's content the way the
+  terminal apps do. An agent that opens a file via one instance and keeps
+  issuing verbs to that *same* instance is still operating on the **old**
+  file; it needs to re-resolve `target` (e.g. via `docxy_list`/`xlsxy_list`)
+  to reach the instance for the file it just opened.
+- **`doc.reload` doesn't clear VS Code's dirty flag.** It re-reads the file
+  from disk and repaints the tab with the fresh content (dropping unsaved
+  edits, per its documented behavior) — but unlike VS Code's own "Revert
+  File" command, there's no public API for a custom editor to clear the dirty
+  indicator outside the edit-event path, which would wrongly put "reload" on
+  the undo stack. So immediately after a `doc.reload`, the tab's title may
+  still show the dirty dot even though its content now matches disk.
+
+See the [extension's README](../offxy-vscode/README.md#ai-assistants) for how
+to point an AI assistant at these tabs (Copilot: automatic; Claude Code: a
+one-liner).
+
 ## The other editors
 
 **xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` by index or name):

@@ -189,6 +189,17 @@ function register(context: vscode.ExtensionContext): vscode.Disposable {
     }),
   );
 
+  // Publish the bundled `mcp/server.mjs` bridge to VS Code's MCP API, so
+  // GitHub Copilot's agent mode (and anything else that consumes
+  // `vscode.lm`-registered MCP servers) discovers the docxy_*/xlsxy_* tools
+  // with no user configuration. This is purely a *pointer* to the script —
+  // the server itself is the same dependency-free Node process a `claude mcp
+  // add offxy -- node <extension>/mcp/server.mjs` registration would spawn
+  // (see the README's "AI assistants" section); it opens no document itself,
+  // only bridges to whichever docxy/xlsxy instance (terminal pane or VS Code
+  // tab) is already running.
+  disposables.push(registerMcpProvider(context));
+
   if (docxProvider) {
     // Register the command-palette actions once; each posts a bridge command
     // string (tab-delimited) to the active panel's webview.
@@ -233,6 +244,32 @@ function register(context: vscode.ExtensionContext): vscode.Disposable {
   }
 
   return vscode.Disposable.from(...disposables);
+}
+
+/** Register `mcp/server.mjs` as an MCP server definition provider (VS Code
+ *  ≥ 1.101's `vscode.lm.registerMcpServerDefinitionProvider`, paired with
+ *  this extension's `contributes.mcpServerDefinitionProviders` entry, id
+ *  `"offxy"`). `command`/`args` are built positionally per
+ *  `vscode.McpStdioServerDefinition`'s constructor
+ *  (`label, command, args?, env?, version?`) — `command: 'node'` rather than
+ *  `process.execPath` (the Electron host binary), since running the Electron
+ *  binary as plain Node requires `ELECTRON_RUN_AS_NODE` to be set on the
+ *  child's environment and VS Code's own samples/docs use `'node'` for
+ *  Node-based bundled servers, not `process.execPath`. */
+function registerMcpProvider(context: vscode.ExtensionContext): vscode.Disposable {
+  const serverPath = vscode.Uri.joinPath(context.extensionUri, 'mcp', 'server.mjs').fsPath;
+  const version = String(context.extension.packageJSON?.version ?? '0.0.0');
+  return vscode.lm.registerMcpServerDefinitionProvider('offxy', {
+    provideMcpServerDefinitions: () => [
+      new vscode.McpStdioServerDefinition(
+        'Offxy (docxy/xlsxy control bridge)',
+        'node',
+        [serverPath],
+        undefined,
+        version,
+      ),
+    ],
+  });
 }
 
 /** A live binary document (`.docx`, and eventually other formats). The

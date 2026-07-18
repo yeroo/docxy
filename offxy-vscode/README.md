@@ -130,6 +130,47 @@ light the dirty dot and route undo/redo back into the wasm editor.
 
 See [../VSCODE.md](../VSCODE.md) for the full design.
 
+## AI assistants
+
+Every open `.docx`/`.xlsx` tab exposes the same agent [control surface](../docs/agent-control.md)
+as the `docxy`/`xlsxy` terminal apps — an AI assistant can read and edit the
+**live, in-memory** document (including unsaved changes), with the edit
+landing on VS Code's own undo stack and repainting the tab instantly, exactly
+like driving a terminal pane. See ["VS Code tabs"](../docs/agent-control.md#vs-code-tabs)
+for the two ways a tab's semantics differ from a terminal instance.
+
+- **GitHub Copilot (agent mode)** — automatic. This extension registers
+  `mcp/server.mjs`, its bundled dependency-free MCP bridge, as an MCP server
+  provider on activation (`contributes.mcpServerDefinitionProviders` +
+  `vscode.lm.registerMcpServerDefinitionProvider`, VS Code ≥ 1.101).
+  Copilot's agent mode discovers the tools with no configuration.
+- **Claude Code** — one-liner:
+
+  ```sh
+  claude mcp add offxy -- node <extension-path>/mcp/server.mjs
+  ```
+
+  `<extension-path>` is wherever VS Code installed this extension — typically
+  `~/.vscode/extensions/yeroo.offxy-0.3.0` (Windows:
+  `%USERPROFILE%\.vscode\extensions\yeroo.offxy-0.3.0`). **Caveat:** that path
+  is *versioned* — it changes on every extension update, so the registration
+  silently goes stale after an upgrade until you re-run `claude mcp add` with
+  the new path. If you already have the `docxy`/`xlsxy` terminal binaries on
+  `PATH`, `claude mcp add docxy -- docxy --mcp` (and the `xlsxy` equivalent)
+  sidesteps the versioned-path problem entirely — see
+  [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
+- **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do:
+  `docxy_list`, `docxy_status`, `docxy_outline`, `docxy_read`, `docxy_find`,
+  `docxy_replace_range`, `docxy_insert`, `docxy_append`, `docxy_save`, and
+  `xlsxy_list`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`,
+  `xlsxy_set`, `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. It's
+  a thin bridge — it opens no document itself, only forwards to whichever
+  `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
+  running; pass `target` (a substring of the instance/pane id) to disambiguate
+  when several are open, or call `docxy_list`/`xlsxy_list` to see what's
+  running.
+
 ## Install
 
 Grab the `offxy-*.vsix` from the [latest release](https://github.com/yeroo/docxy/releases/latest)
