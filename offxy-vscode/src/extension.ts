@@ -168,6 +168,9 @@ const EDITORS: EditorSpec[] = [
         'row.delete',
         'col.insert',
         'col.delete',
+        // Wave-2 mutating verbs (cell formatting + column width).
+        'cell.format',
+        'col.width',
       ]),
       mutatingVerbs: new Set([
         'cell.set',
@@ -181,9 +184,19 @@ const EDITORS: EditorSpec[] = [
         'col.delete',
         'wb.replace-all',
         'sheet.add',
+        // Wave-2: cell.format lands on the SAME true wasm-undo-stack group
+        // range.set uses (Session::apply captures the style-only before/after
+        // Cell diff) — bucket A, undoSteps:1 (see gridwasm's ctl_cell_format).
+        'cell.format',
         // Bucket B — host-orchestrated inverse (comment add ⇄ remove):
         'comment.add',
         'comment.remove',
+        // Wave-2: col.width is NOT on xlsxy's own undo stack (mirrors the
+        // TUI's F7/F8 width-adjust path); the wasm reply carries an internal
+        // `inverse` (a col.width call restoring the prior width) that this
+        // same bucket-B flip-flop mechanism drives as the edit event's
+        // undo()/redo() — undoSteps:0.
+        'col.width',
         // Bucket C — history-cleared + inverse (import-csv ⇄ remove;
         // remove ⇄ restore-removed):
         'sheet.import-csv',
