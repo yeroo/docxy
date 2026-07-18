@@ -23,18 +23,14 @@ pub fn run() -> std::io::Result<()> {
     .run()
 }
 
-/// Execute a tool by forwarding to the control surface.
-fn do_tool(name: &str, args: &Json) -> Result<String, String> {
-    let dir = ctlcore::config_ctl_dir("xlsxy").ok_or("no control directory on this system")?;
-    if name == "xlsxy_list" {
-        return Ok(client::list_running(&dir, "xlsxy").to_string());
-    }
-    if name == "xlsxy_new" {
-        return Ok(
-            client::new_file(&dir, "xlsxy", "wb.open", &blank_xlsx_bytes(), args)?.to_string(),
-        );
-    }
-    let verb = match name {
+/// Map a forwarding tool name to its exact ctl verb string — the single
+/// source of truth `do_tool` dispatches through, so a test can pin every
+/// tool's verb precisely (not just "resolves to *something*", which a
+/// swapped-but-valid mapping would still pass). Returns `None` for
+/// `xlsxy_list`/`xlsxy_new` (handled specially in `do_tool`, not simple
+/// forwards) and for any unrecognized name.
+pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
+    Some(match name {
         "xlsxy_status" => "wb.path",
         "xlsxy_sheets" => "sheet.list",
         "xlsxy_read" => "sheet.read",
@@ -63,8 +59,22 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
         "xlsxy_stats" => "sheet.stats",
         "xlsxy_charts" => "chart.list",
         "xlsxy_pivots" => "pivot.list",
-        other => return Err(format!("unknown tool: {other}")),
-    };
+        _ => return None,
+    })
+}
+
+/// Execute a tool by forwarding to the control surface.
+fn do_tool(name: &str, args: &Json) -> Result<String, String> {
+    let dir = ctlcore::config_ctl_dir("xlsxy").ok_or("no control directory on this system")?;
+    if name == "xlsxy_list" {
+        return Ok(client::list_running(&dir, "xlsxy").to_string());
+    }
+    if name == "xlsxy_new" {
+        return Ok(
+            client::new_file(&dir, "xlsxy", "wb.open", &blank_xlsx_bytes(), args)?.to_string(),
+        );
+    }
+    let verb = verb_for(name).ok_or_else(|| format!("unknown tool: {name}"))?;
     let client = client::resolve_target(&dir, "xlsxy", args.get_str("target"))?;
     let result = client.call(verb, args.clone())?;
     Ok(result.to_string())
@@ -664,33 +674,78 @@ mod tests {
         );
     }
 
+    /// Every forwarding tool → its exact spec verb string, pre-existing tools
+    /// included (cheap, and it pins the whole surface, not just wave-1).
+    const VERB_TABLE: &[(&str, &str)] = &[
+        ("xlsxy_status", "wb.path"),
+        ("xlsxy_sheets", "sheet.list"),
+        ("xlsxy_read", "sheet.read"),
+        ("xlsxy_get", "cell.get"),
+        ("xlsxy_set", "cell.set"),
+        ("xlsxy_clear", "range.clear"),
+        ("xlsxy_find", "find"),
+        ("xlsxy_recalc", "wb.recalc"),
+        ("xlsxy_save", "wb.save"),
+        ("xlsxy_comments", "comment.list"),
+        ("xlsxy_comment_add", "comment.add"),
+        ("xlsxy_comment_remove", "comment.remove"),
+        ("xlsxy_range_set", "range.set"),
+        ("xlsxy_export_csv", "wb.export-csv"),
+        ("xlsxy_import_csv", "sheet.import-csv"),
+        ("xlsxy_pivot", "sheet.pivot"),
+        ("xlsxy_replace_all", "wb.replace-all"),
+        ("xlsxy_sheet_add", "sheet.add"),
+        ("xlsxy_sheet_remove", "sheet.remove"),
+        ("xlsxy_sheet_rename", "sheet.rename"),
+        ("xlsxy_row_insert", "row.insert"),
+        ("xlsxy_row_delete", "row.delete"),
+        ("xlsxy_col_insert", "col.insert"),
+        ("xlsxy_col_delete", "col.delete"),
+        ("xlsxy_eval", "formula.eval"),
+        ("xlsxy_stats", "sheet.stats"),
+        ("xlsxy_charts", "chart.list"),
+        ("xlsxy_pivots", "pivot.list"),
+    ];
+    /// Tools handled specially in `do_tool` (not simple verb forwards), so
+    /// `verb_for` deliberately returns `None` for them.
+    const SPECIALLY_HANDLED: &[&str] = &["xlsxy_list", "xlsxy_new"];
+
     #[test]
-    fn wave1_verb_map_forwards_to_the_expected_verbs() {
-        for name in [
-            "xlsxy_comments",
-            "xlsxy_comment_add",
-            "xlsxy_comment_remove",
-            "xlsxy_range_set",
-            "xlsxy_export_csv",
-            "xlsxy_import_csv",
-            "xlsxy_pivot",
-            "xlsxy_replace_all",
-            "xlsxy_sheet_add",
-            "xlsxy_sheet_remove",
-            "xlsxy_sheet_rename",
-            "xlsxy_row_insert",
-            "xlsxy_row_delete",
-            "xlsxy_col_insert",
-            "xlsxy_col_delete",
-            "xlsxy_eval",
-            "xlsxy_stats",
-            "xlsxy_charts",
-            "xlsxy_pivots",
-        ] {
-            let err = do_tool(name, &Json::obj(vec![])).unwrap_err();
+    fn verb_for_maps_every_tool_to_its_exact_spec_verb() {
+        // A swapped-but-valid mapping (e.g. xlsxy_row_insert -> row.delete)
+        // must fail this test, not just "resolves to something" — that's the
+        // whole point of pinning the exact string per tool.
+        for (name, verb) in VERB_TABLE {
+            assert_eq!(verb_for(name), Some(*verb), "wrong verb for {name}");
+        }
+        for name in SPECIALLY_HANDLED {
+            assert_eq!(
+                verb_for(name),
+                None,
+                "{name} is handled specially in do_tool, verb_for must return None"
+            );
+        }
+        // Every tool_defs() name must appear in exactly one of the two lists
+        // above — catches a newly added tool whose verb_for entry (or
+        // special-case) was forgotten.
+        let defs = tool_defs();
+        let all_names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get_str("name"))
+            .collect();
+        assert_eq!(
+            all_names.len(),
+            VERB_TABLE.len() + SPECIALLY_HANDLED.len(),
+            "VERB_TABLE + SPECIALLY_HANDLED must cover every tool exactly once"
+        );
+        for name in &all_names {
+            let in_table = VERB_TABLE.iter().any(|(n, _)| n == name);
+            let in_special = SPECIALLY_HANDLED.contains(name);
             assert!(
-                !err.contains("unknown tool"),
-                "{name} should route to a verb, got: {err}"
+                in_table ^ in_special,
+                "{name} must be in exactly one of VERB_TABLE/SPECIALLY_HANDLED"
             );
         }
     }

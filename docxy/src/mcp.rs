@@ -25,19 +25,14 @@ pub fn run() -> std::io::Result<()> {
     .run()
 }
 
-/// Execute a tool by forwarding to the control surface. Returns the result text
-/// (JSON) or an error message.
-fn do_tool(name: &str, args: &Json) -> Result<String, String> {
-    let dir = control::control_dir().ok_or("no control directory on this system")?;
-    if name == "docxy_list" {
-        return Ok(client::list_running(&dir, "docxy").to_string());
-    }
-    if name == "docxy_new" {
-        return Ok(
-            client::new_file(&dir, "docxy", "doc.open", &blank_docx_bytes(), args)?.to_string(),
-        );
-    }
-    let verb = match name {
+/// Map a forwarding tool name to its exact ctl verb string — the single
+/// source of truth `do_tool` dispatches through, so a test can pin every
+/// tool's verb precisely (not just "resolves to *something*", which a
+/// swapped-but-valid mapping would still pass). Returns `None` for
+/// `docxy_list`/`docxy_new` (handled specially in `do_tool`, not simple
+/// forwards) and for any unrecognized name.
+pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
+    Some(match name {
         "docxy_status" => "doc.path",
         "docxy_outline" => "doc.outline",
         "docxy_read" => "doc.read",
@@ -57,8 +52,23 @@ fn do_tool(name: &str, args: &Json) -> Result<String, String> {
         "docxy_replace_all" => "doc.replace-all",
         "docxy_undo" => "doc.undo",
         "docxy_redo" => "doc.redo",
-        other => return Err(format!("unknown tool: {other}")),
-    };
+        _ => return None,
+    })
+}
+
+/// Execute a tool by forwarding to the control surface. Returns the result text
+/// (JSON) or an error message.
+fn do_tool(name: &str, args: &Json) -> Result<String, String> {
+    let dir = control::control_dir().ok_or("no control directory on this system")?;
+    if name == "docxy_list" {
+        return Ok(client::list_running(&dir, "docxy").to_string());
+    }
+    if name == "docxy_new" {
+        return Ok(
+            client::new_file(&dir, "docxy", "doc.open", &blank_docx_bytes(), args)?.to_string(),
+        );
+    }
+    let verb = verb_for(name).ok_or_else(|| format!("unknown tool: {name}"))?;
     let client = client::resolve_target(&dir, "docxy", args.get_str("target"))?;
     // Control verbs ignore unknown keys, so forwarding `arguments` verbatim
     // (including any `target`) is harmless.
@@ -435,28 +445,69 @@ mod tests {
         assert_eq!(required_of("docxy_redo"), "[]");
     }
 
+    /// Every forwarding tool → its exact spec verb string, pre-existing tools
+    /// included (cheap, and it pins the whole surface, not just wave-1).
+    const VERB_TABLE: &[(&str, &str)] = &[
+        ("docxy_status", "doc.path"),
+        ("docxy_outline", "doc.outline"),
+        ("docxy_read", "doc.read"),
+        ("docxy_find", "doc.find"),
+        ("docxy_replace_range", "doc.replace-range"),
+        ("docxy_insert", "doc.insert"),
+        ("docxy_append", "doc.append"),
+        ("docxy_save", "doc.save"),
+        ("docxy_export", "doc.export"),
+        ("docxy_export_pdf", "doc.export-pdf"),
+        ("docxy_comments", "doc.comments"),
+        ("docxy_notes", "doc.notes"),
+        ("docxy_header", "doc.header"),
+        ("docxy_footer", "doc.footer"),
+        ("docxy_metadata", "doc.metadata"),
+        ("docxy_stats", "doc.stats"),
+        ("docxy_replace_all", "doc.replace-all"),
+        ("docxy_undo", "doc.undo"),
+        ("docxy_redo", "doc.redo"),
+    ];
+    /// Tools handled specially in `do_tool` (not simple verb forwards), so
+    /// `verb_for` deliberately returns `None` for them.
+    const SPECIALLY_HANDLED: &[&str] = &["docxy_list", "docxy_new"];
+
     #[test]
-    fn wave1_verb_map_forwards_to_the_expected_verbs() {
-        // Every new tool name must route to its verb, not fall through to
-        // "unknown tool" — exercised without a live docxy by checking the
-        // error is the resolve-target failure, not the unknown-tool one.
-        for name in [
-            "docxy_export",
-            "docxy_export_pdf",
-            "docxy_comments",
-            "docxy_notes",
-            "docxy_header",
-            "docxy_footer",
-            "docxy_metadata",
-            "docxy_stats",
-            "docxy_replace_all",
-            "docxy_undo",
-            "docxy_redo",
-        ] {
-            let err = do_tool(name, &Json::obj(vec![])).unwrap_err();
+    fn verb_for_maps_every_tool_to_its_exact_spec_verb() {
+        // A swapped-but-valid mapping (e.g. docxy_undo -> doc.redo) must fail
+        // this test, not just "resolves to something" — that's the whole
+        // point of pinning the exact string per tool.
+        for (name, verb) in VERB_TABLE {
+            assert_eq!(verb_for(name), Some(*verb), "wrong verb for {name}");
+        }
+        for name in SPECIALLY_HANDLED {
+            assert_eq!(
+                verb_for(name),
+                None,
+                "{name} is handled specially in do_tool, verb_for must return None"
+            );
+        }
+        // Every tool_defs() name must appear in exactly one of the two lists
+        // above — catches a newly added tool whose verb_for entry (or
+        // special-case) was forgotten.
+        let defs = tool_defs();
+        let all_names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get_str("name"))
+            .collect();
+        assert_eq!(
+            all_names.len(),
+            VERB_TABLE.len() + SPECIALLY_HANDLED.len(),
+            "VERB_TABLE + SPECIALLY_HANDLED must cover every tool exactly once"
+        );
+        for name in &all_names {
+            let in_table = VERB_TABLE.iter().any(|(n, _)| n == name);
+            let in_special = SPECIALLY_HANDLED.contains(name);
             assert!(
-                !err.contains("unknown tool"),
-                "{name} should route to a verb, got: {err}"
+                in_table ^ in_special,
+                "{name} must be in exactly one of VERB_TABLE/SPECIALLY_HANDLED"
             );
         }
     }

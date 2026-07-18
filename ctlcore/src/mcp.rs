@@ -323,4 +323,43 @@ mod tests {
             Some(-32601)
         );
     }
+
+    #[test]
+    fn prop_array_wraps_items_with_type_and_description() {
+        let p = prop_array(item_ty("string"), "Some strings.");
+        assert_eq!(p.get_str("type"), Some("array"));
+        assert_eq!(p.get_str("description"), Some("Some strings."));
+        assert_eq!(p.get("items").unwrap().get_str("type"), Some("string"));
+    }
+
+    #[test]
+    fn item_ty_is_a_bare_type_only_fragment() {
+        let it = item_ty("integer");
+        assert_eq!(it.get_str("type"), Some("integer"));
+        assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn item_array_wraps_a_nested_items_schema() {
+        let it = item_array(item_ty("string"));
+        assert_eq!(it.get_str("type"), Some("array"));
+        assert_eq!(it.get("items").unwrap().get_str("type"), Some("string"));
+        assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn item_obj_builds_a_bare_object_schema_with_required() {
+        let it = item_obj(
+            vec![
+                ("col", prop("string", "col desc")),
+                ("agg", prop("string", "agg desc")),
+            ],
+            &["col", "agg"],
+        );
+        assert_eq!(it.get_str("type"), Some("object"));
+        assert!(it.get("properties").unwrap().get("col").is_some());
+        assert!(it.get("properties").unwrap().get("agg").is_some());
+        assert_eq!(it.get("required").unwrap().to_string(), "[\"col\",\"agg\"]");
+        assert!(it.get("description").is_none());
+    }
 }

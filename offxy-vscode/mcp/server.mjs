@@ -20,7 +20,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const PROTOCOL_VERSION = '2024-11-05';
 
@@ -977,4 +977,14 @@ function main() {
   });
 }
 
-main();
+// Only start the stdio server loop when this file is run directly (`node
+// mcp/server.mjs`), not when a test/parity harness `import`s it to reach
+// TOOLS/DOCXY_VERBS/XLSXY_VERBS — an imported module has no business reading
+// stdin. `process.argv[1]` is the entry script Node was invoked with; compare
+// as a file URL (not a raw path string) so drive-letter casing/slash-style
+// differences on Windows can't make this false-negative.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}
+
+export { TOOLS, DOCXY_VERBS, XLSXY_VERBS };
