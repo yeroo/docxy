@@ -105,15 +105,14 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         app.dirty = true;
         // A content edit flashes this pane's agent-status dot, so a watcher sees
         // the document being worked on.
-        if matches!(
-            verb,
-            "doc.replace-range" | "doc.insert" | "doc.append" | "doc.replace-all"
-        ) {
+        if matches!(verb, "doc.replace-range" | "doc.insert" | "doc.append") {
             ctlcore::signal_activity();
         }
-        // doc.undo/doc.redo only flash activity when something actually
-        // happened; they signal it themselves (see undo()/redo() below) since
-        // a no-op (`{done:false}`) must not look like an edit occurred.
+        // doc.replace-all/doc.undo/doc.redo can each legitimately no-op (no
+        // match found; empty undo/redo stack), so they signal activity
+        // themselves (see replace_all()/undo()/redo() below), gated on
+        // whether anything actually changed — a no-op must not look like an
+        // edit occurred.
     }
     out
 }
@@ -401,8 +400,12 @@ fn append(app: &mut App, args: &Json) -> Result<Json, String> {
 /// terminal app ignores the checkpoint count `agent::replace_all` also
 /// reports (see its doc comment: always 1 when something was replaced, 0
 /// otherwise) — it doesn't drive a host undo stack, so its wire reply stays
-/// exactly `{replaced}`, matching `doc.replace-range`'s convention of always
-/// finishing the edit after a successful call.
+/// exactly `{replaced}`. Unlike `doc.replace-range` (which is bounds-checked
+/// and so never has a genuine no-op case), `replace-all` can legitimately
+/// match nothing — a `query` that isn't found leaves the document byte-for-
+/// byte unchanged and pushes zero undo checkpoints, so it must not be
+/// reported as an edit: `finish_edit`/`signal_activity` only fire when
+/// `replaced > 0`, same no-op guard as `doc.undo`/`doc.redo` below.
 fn replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
     let query = args
         .get_str("query")
@@ -413,7 +416,10 @@ fn replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
         .and_then(Json::as_bool)
         .unwrap_or(false);
     let (replaced, _undo_steps) = agent::replace_all(&mut app.editor, query, text, case_sensitive);
-    finish_edit(app);
+    if replaced > 0 {
+        finish_edit(app);
+        ctlcore::signal_activity();
+    }
     Ok(Json::obj(vec![("replaced", Json::Num(replaced as f64))]))
 }
 
@@ -443,10 +449,10 @@ fn redo(app: &mut App) -> Json {
 /// `doc.export-pdf`: render the live buffer to a PDF at `path` (absolutized
 /// against this process's cwd) and write it — refusing to overwrite an
 /// existing file. Copies the exclusive-create pattern and error-string family
-/// (`already exists:`/`bad path:`/`create failed:`) from
-/// `ctlcore::client::new_file` verbatim, since docxy doesn't depend on
-/// `ctlcore`'s fs helpers. Doesn't touch `app.editor`, so it neither marks the
-/// document modified nor is part of the undo stack.
+/// (`already exists:`/`bad path:`/`create failed:`), including the parent-
+/// directory creation step, from `ctlcore::client::new_file` verbatim, since
+/// docxy doesn't depend on `ctlcore`'s fs helpers. Doesn't touch `app.editor`,
+/// so it neither marks the document modified nor is part of the undo stack.
 fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
     let path = args
         .get_str("path")
@@ -454,6 +460,9 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
     let abs = std::path::absolute(Path::new(path)).map_err(|e| format!("bad path: {e}"))?;
     if abs.exists() {
         return Err(format!("already exists: {}", abs.display()));
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
     }
     let pdf = to_pdf(
         &app.editor.doc,
@@ -978,6 +987,34 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_with_no_matches_leaves_no_tracks() {
+        // Unlike doc.replace-range (bounds-checked, never a genuine no-op),
+        // doc.replace-all can legitimately match nothing. A no-match call
+        // must not look like an edit: no modified flag, no content change,
+        // and (per agent::replace_all's doc comment) no undo checkpoint was
+        // even pushed, so there is nothing to undo.
+        let mut app = app_with(&["hello world"]);
+        let r = replace_all(
+            &mut app,
+            &args(vec![
+                ("query", Json::Str("xyz".into())),
+                ("text", Json::Str("BAR".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("replaced"), Some(0));
+        assert!(
+            !app.modified,
+            "a no-match replace-all must not mark modified"
+        );
+        assert_eq!(paras(&app), vec!["hello world"]);
+        assert!(
+            !app.editor.undo(),
+            "no checkpoint was pushed, so there is nothing to undo"
+        );
+    }
+
+    #[test]
     fn replace_all_is_undoable_in_exactly_the_reported_undo_steps() {
         // agent::replace_all always reports 1 undo step when it replaces
         // anything (see its doc comment) — pin that a single Editor::undo
@@ -1022,6 +1059,7 @@ mod tests {
         let mut app = app_with(&["A"]);
         let r = redo(&mut app);
         assert_eq!(r.get("done").unwrap().as_bool(), Some(false));
+        assert!(!app.modified, "a no-op redo must not mark modified");
 
         replace_all(
             &mut app,
@@ -1039,6 +1077,10 @@ mod tests {
         // The redo stack is empty again.
         let r = redo(&mut app);
         assert_eq!(r.get("done").unwrap().as_bool(), Some(false));
+        assert!(
+            app.modified,
+            "modified stays true from the earlier real edit; a later no-op redo doesn't clear it"
+        );
     }
 
     #[test]
@@ -1061,6 +1103,28 @@ mod tests {
         );
         let bytes = std::fs::read(&out).expect("pdf written");
         assert!(!bytes.is_empty(), "exported PDF must be nonempty");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn export_pdf_creates_missing_parent_directories() {
+        // Matches ctlcore::client::new_file's create_dir_all step: a target
+        // path whose parent doesn't exist yet must still succeed, not error.
+        let tmp = std::env::temp_dir().join(format!("docxy_ctl_pdf_mkdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = tmp.join("newdir").join("nested").join("x.pdf");
+        assert!(!tmp.exists(), "precondition: nothing exists yet");
+
+        let app = app_with(&["hello"]);
+        let r = export_pdf(
+            &app,
+            &args(vec![("path", Json::Str(out.display().to_string()))]),
+        )
+        .unwrap();
+        let expected = out.display().to_string();
+        assert_eq!(r.get_str("path"), Some(expected.as_str()));
+        assert!(out.exists(), "parent dirs must be created on demand");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
