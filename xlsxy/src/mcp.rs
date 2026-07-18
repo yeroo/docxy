@@ -184,6 +184,18 @@ mod tests {
     }
 
     #[test]
+    fn committed_blank_template_matches_blank_xlsx_bytes() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../offxy-vscode/mcp/templates/blank.xlsx");
+        let bytes = std::fs::read(&p).expect("template committed");
+        assert_eq!(
+            bytes,
+            blank_xlsx_bytes(),
+            "regenerate the template (see plan Task 4)"
+        );
+    }
+
+    #[test]
     fn tool_defs_include_xlsxy_new_with_required_path() {
         let defs = tool_defs();
         let tools = defs.as_array().unwrap();
