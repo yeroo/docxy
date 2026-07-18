@@ -267,7 +267,16 @@ impl App {
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
             SyncEvent::Error(msg) => self.error_notice = Some(msg),
-            SyncEvent::MessagesUpdated { .. } | SyncEvent::BodyReady { .. } => {}
+            // `DraftReady`/`Sent` (mailcore Task 7) have no TUI consumer yet —
+            // compose's UI side (plan Task 8/9) is what will react to these
+            // (open the editor on `DraftReady`, close it / show a toast on
+            // `Sent`). Folded into the existing catch-all rather than given
+            // dedicated arms so this compiles now without guessing at that
+            // future behavior.
+            SyncEvent::MessagesUpdated { .. }
+            | SyncEvent::BodyReady { .. }
+            | SyncEvent::DraftReady { .. }
+            | SyncEvent::Sent { .. } => {}
         }
     }
 
