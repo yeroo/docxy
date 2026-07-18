@@ -290,13 +290,28 @@ export class CtlServer {
     return rest;
   }
 
-  /** `doc.path`/`wb.path`: the host's URI-derived info merged with the live
-   *  session's block-count/modified fields (`doc.blocks` / `wb.info` — wasm
-   *  verbs used internally here, not otherwise exposed to clients). */
+  /** `doc.path`/`wb.path`: the host's URI-derived info refreshed with the
+   *  live session's block-count/modified fields (`doc.blocks` / `wb.info` —
+   *  wasm verbs used internally here, not otherwise exposed to clients).
+   *
+   *  `host.pathInfo()` owns the *complete* documented reply shape
+   *  (`docs/agent-control.md`'s `doc.path`/`wb.path` tables) — `extra` may
+   *  only overwrite a key `base` already declares with a fresher value, never
+   *  introduce a new one. `doc.blocks`'s own field is named `"total"` (it
+   *  doubles as `doc.insert`/`doc.append`'s documented result), not
+   *  `"blocks"`, so spreading it in unconditionally would leak an
+   *  undocumented `total` key into the wire reply — a VS Code tab's `doc.path`
+   *  must be byte-for-byte what a terminal docxy/xlsxy instance sends. */
   private async resolvePathInfo(): Promise<object> {
-    const base = await this.host.pathInfo();
+    const base = (await this.host.pathInfo()) as Record<string, unknown>;
     const infoVerb = this.app === 'docxy' ? 'doc.blocks' : 'wb.info';
-    const extra = await this.callWasm(infoVerb, null);
-    return { ...base, ...(extra as object) };
+    const extra = (await this.callWasm(infoVerb, null)) as Record<string, unknown>;
+    const merged: Record<string, unknown> = { ...base };
+    for (const key of Object.keys(merged)) {
+      if (key in extra) {
+        merged[key] = extra[key];
+      }
+    }
+    return merged;
   }
 }

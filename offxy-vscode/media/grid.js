@@ -553,11 +553,22 @@
       case 'ctl': {
         // One agent control verb (docs/agent-control.md), routed through the
         // same grid_ctl marshalling cmd() already uses for grid_cmd.
-        const u8 = enc.encode(msg.payload);
-        const p = writeBytes(u8);
-        const r = ex.grid_ctl(handle, p, u8.length);
-        ex.grid_free(p, u8.length);
-        const raw = dec.decode(readResult(r));
+        // Always post a ctlResult, even on an unexpected throw (a wasm trap,
+        // say) — the host's pending promise for this requestId has no other
+        // way to settle, and silence here would hang the agent's TCP request.
+        let raw;
+        try {
+          const u8 = enc.encode(msg.payload);
+          const p = writeBytes(u8);
+          const r = ex.grid_ctl(handle, p, u8.length);
+          ex.grid_free(p, u8.length);
+          raw = dec.decode(readResult(r));
+        } catch (err) {
+          raw = JSON.stringify({
+            ok: false,
+            error: 'grid_ctl threw: ' + (err && err.message ? err.message : String(err)),
+          });
+        }
         vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
         // The host already knows (from its mutating-verb set) whether this
         // call *could* have changed the workbook; only repaint if it also

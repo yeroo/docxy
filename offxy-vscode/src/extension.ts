@@ -67,6 +67,12 @@ const EDITORS: EditorSpec[] = [
     mintEmpty: (ctx) => markdownToDocx(ctx, ''),
     ctl: {
       app: 'docxy',
+      // 'doc.blocks' is deliberately NOT in this set: it's an internal-only
+      // verb `fullPathInfo()` calls directly (bypassing this gate), used to
+      // compose `doc.path`'s reply. Terminal docxy's control.rs has no
+      // `doc.blocks` arm, so exposing it here to external agents would let a
+      // VS Code tab answer a verb a terminal instance rejects as "unknown
+      // verb" — breaking "indistinguishable from a terminal instance".
       wasmVerbs: new Set([
         'doc.outline',
         'doc.read',
@@ -74,7 +80,6 @@ const EDITORS: EditorSpec[] = [
         'doc.replace-range',
         'doc.insert',
         'doc.append',
-        'doc.blocks',
       ]),
       mutatingVerbs: new Set(['doc.replace-range', 'doc.insert', 'doc.append']),
     },
@@ -90,6 +95,10 @@ const EDITORS: EditorSpec[] = [
     mintEmpty: (ctx) => newWorkbook(ctx),
     ctl: {
       app: 'xlsxy',
+      // 'wb.info' is deliberately NOT in this set: same reasoning as
+      // 'doc.blocks' above — it's an internal-only verb `fullPathInfo()`
+      // calls directly to compose `wb.path`'s reply, and terminal xlsxy's
+      // control.rs has no `wb.info` arm.
       wasmVerbs: new Set([
         'sheet.list',
         'sheet.read',
@@ -98,7 +107,6 @@ const EDITORS: EditorSpec[] = [
         'range.clear',
         'find',
         'wb.recalc',
-        'wb.info',
       ]),
       mutatingVerbs: new Set(['cell.set', 'range.clear']),
     },
@@ -244,7 +252,10 @@ class BinaryDocument implements vscode.CustomDocument {
   /** Guards `start()` against firing twice if `ready` somehow arrives more
    *  than once for the same document. */
   ctlServerStarted = false;
-  private readonly ctlPending = new Map<number, (value: string) => void>();
+  private readonly ctlPending = new Map<
+    number,
+    { resolve: (value: string) => void; reject: (reason: Error) => void }
+  >();
   private ctlReqSeq = 0;
 
   constructor(
@@ -256,7 +267,7 @@ class BinaryDocument implements vscode.CustomDocument {
 
   dispose(): void {
     this.pending.clear();
-    this.ctlPending.clear();
+    this.rejectPendingCtl('document closed');
   }
 
   /** Ask the webview to serialize the current document and resolve with the
@@ -294,8 +305,8 @@ class BinaryDocument implements vscode.CustomDocument {
       return Promise.resolve('{"ok":false,"error":"no active webview"}');
     }
     const requestId = ++this.ctlReqSeq;
-    return new Promise<string>((resolve) => {
-      this.ctlPending.set(requestId, resolve);
+    return new Promise<string>((resolve, reject) => {
+      this.ctlPending.set(requestId, { resolve, reject });
       panel.webview.postMessage({ type: 'ctl', requestId, payload, repaint });
     });
   }
@@ -303,16 +314,31 @@ class BinaryDocument implements vscode.CustomDocument {
   /** Resolve a pending `requestCtl` call with the reply the webview posted
    *  back as `ctlResult`. */
   fulfillCtl(requestId: number, payload: string): void {
-    const resolve = this.ctlPending.get(requestId);
-    if (resolve) {
+    const pending = this.ctlPending.get(requestId);
+    if (pending) {
       this.ctlPending.delete(requestId);
-      resolve(payload);
+      pending.resolve(payload);
     }
   }
 
-  /** Stop the ctl server (closes its listener, deletes its discovery file)
-   *  and clear the reference so a stray late message can't restart it. */
+  /** Reject every in-flight `requestCtl` call — called when the tab/document
+   *  is going away so a ctl request that was mid-flight (sent to the webview
+   *  but never answered) doesn't leave an agent's TCP connection waiting
+   *  forever for a reply line that will never arrive. `CtlServer`'s own
+   *  `handleLine` try/catch turns a rejection here into a normal
+   *  `{"ok":false,"error":…}` reply — this doesn't need to shape one itself. */
+  private rejectPendingCtl(reason: string): void {
+    for (const pending of this.ctlPending.values()) {
+      pending.reject(new Error(reason));
+    }
+    this.ctlPending.clear();
+  }
+
+  /** Stop the ctl server (closes its listener, deletes its discovery file),
+   *  settle any request still waiting on this tab's webview, and clear the
+   *  reference so a stray late message can't restart it. */
   disposeCtlServer(): void {
+    this.rejectPendingCtl('ctl server stopped');
     this.ctlServer?.dispose();
     this.ctlServer = undefined;
     this.ctlServerStarted = false;

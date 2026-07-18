@@ -374,7 +374,18 @@
       case 'ctl': {
         // One agent control verb (docs/agent-control.md), routed through the
         // same docx_ctl marshalling callBytes() already uses for docx_cmd.
-        const raw = dec.decode(callBytes(ex.docx_ctl, enc.encode(msg.payload)));
+        // Always post a ctlResult, even on an unexpected throw (a wasm trap,
+        // say) — the host's pending promise for this requestId has no other
+        // way to settle, and silence here would hang the agent's TCP request.
+        let raw;
+        try {
+          raw = dec.decode(callBytes(ex.docx_ctl, enc.encode(msg.payload)));
+        } catch (err) {
+          raw = JSON.stringify({
+            ok: false,
+            error: 'docx_ctl threw: ' + (err && err.message ? err.message : String(err)),
+          });
+        }
         vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
         // The host already knows (from its mutating-verb set) whether this
         // call *could* have changed the document; only repaint if it also
