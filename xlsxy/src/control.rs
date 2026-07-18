@@ -46,10 +46,15 @@
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
 //!
-//! `cell.get`'s reply (and every other reply built through the shared
-//! `cell_json`: `sheet.read`, `find`) additively gains a `format` object —
-//! present only when the cell's style differs from the default in at least
-//! one of the six `cell.format` keys; see [`gridcore::format::xf_format_fields`].
+//! `cell.get`'s reply additively gains a `format` object — present only when
+//! the cell's style differs from the default in at least one of the six
+//! `cell.format` keys; see [`gridcore::format::xf_format_fields`]. This is
+//! deliberately scoped to `cell.get` alone (read-modify-write is the only
+//! use case): `sheet.read`, `find`, and `cell.set`'s reply share the same
+//! underlying `cell_json` builder but do NOT carry `format` — a fully-styled
+//! `sheet.read` window can return thousands of cells, and paying six extra
+//! keys per cell there (or on the busiest mutating verb, `cell.set`) isn't
+//! worth it when nothing consumes it.
 
 use crate::{App, comment_author, iso_now, parse_input};
 use ctlcore::json::Json;
@@ -191,10 +196,10 @@ fn sheet_list(app: &App) -> Json {
     ])
 }
 
-/// One cell as JSON: `ref`, coordinates, the typed `value`, the formula source
-/// (with `=`), `text` (the general-format display string), and — additively,
-/// present only when set — a `format` object (see [`format_json`]).
-fn cell_json(row: u32, col: u32, cell: &Cell, styles: &Styles) -> Json {
+/// One cell as JSON: `ref`, coordinates, the typed `value`, the formula
+/// source (with `=`), and `text` (the general-format display string). No
+/// `format` key — see [`cell_json_with_format`], used by `cell.get` alone.
+fn cell_json(row: u32, col: u32, cell: &Cell) -> Json {
     let mut fields = vec![
         ("ref", Json::Str(cell_name(row, col))),
         ("row", Json::Num(row as f64)),
@@ -205,16 +210,28 @@ fn cell_json(row: u32, col: u32, cell: &Cell, styles: &Styles) -> Json {
     if let Some(f) = &cell.formula {
         fields.push(("formula", Json::Str(format!("={f}"))));
     }
-    if let Some(fmt) = format_json(styles, cell.style) {
-        fields.push(("format", fmt));
-    }
     Json::obj(fields)
 }
 
-/// The `cell.get`/`cell.format` read-back `format` object for style index
-/// `style`: only the `cell.format` patch keys whose value differs from the
-/// default style, via [`xf_format_fields`]; `None` for an unstyled cell (no
-/// `format` key on the wire at all).
+/// [`cell_json`] plus — additively, present only when set — a `format`
+/// object (see [`format_json`]). Deliberately used by `cell.get` ONLY: the
+/// read-back exists for read-modify-write, not for bulk reads
+/// (`sheet.read`/`find`) or the busiest mutating verb (`cell.set`), which
+/// all still go through the plain [`cell_json`] above.
+fn cell_json_with_format(row: u32, col: u32, cell: &Cell, styles: &Styles) -> Json {
+    let mut j = cell_json(row, col, cell);
+    if let Some(fmt) = format_json(styles, cell.style) {
+        if let Json::Obj(pairs) = &mut j {
+            pairs.push(("format".to_string(), fmt));
+        }
+    }
+    j
+}
+
+/// The `cell.get` read-back `format` object for style index `style`: only
+/// the `cell.format` patch keys whose value differs from the default style,
+/// via [`xf_format_fields`]; `None` for an unstyled cell (no `format` key on
+/// the wire at all).
 fn format_json(styles: &Styles, style: u32) -> Option<Json> {
     let xf = styles.xf(style);
     let fields = xf_format_fields(&xf);
@@ -274,7 +291,7 @@ fn sheet_read(app: &App, args: &Json) -> Result<Json, String> {
             truncated = true;
             break;
         }
-        cells.push(cell_json(r, c, cell, &app.pkg.workbook.styles));
+        cells.push(cell_json(r, c, cell));
     }
     Ok(Json::obj(vec![
         ("sheet", Json::Num(si as f64)),
@@ -291,7 +308,7 @@ fn cell_get(app: &App, args: &Json) -> Result<Json, String> {
     let (r, c) = ref_arg(args)?;
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
-        Some(cell) => Ok(cell_json(r, c, cell, &app.pkg.workbook.styles)),
+        Some(cell) => Ok(cell_json_with_format(r, c, cell, &app.pkg.workbook.styles)),
         None => Ok(Json::obj(vec![
             ("ref", Json::Str(cell_name(r, c))),
             ("row", Json::Num(r as f64)),
@@ -328,7 +345,7 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
                 if matches.len() >= FIND_CAP {
                     break 'outer;
                 }
-                let mut m = cell_json(r, c, cell, &app.pkg.workbook.styles);
+                let mut m = cell_json(r, c, cell);
                 if let Json::Obj(pairs) = &mut m {
                     pairs.insert(0, ("sheet".to_string(), Json::Num(si as f64)));
                     pairs.insert(1, ("sheet_name".to_string(), Json::Str(s.name.clone())));
@@ -592,7 +609,7 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     app.apply_on(si, vec![(r, c, cell)]);
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
-        Some(cell) => Ok(cell_json(r, c, cell, &app.pkg.workbook.styles)),
+        Some(cell) => Ok(cell_json(r, c, cell)),
         None => Ok(Json::obj(vec![("ref", Json::Str(cell_name(r, c)))])),
     }
 }
@@ -2264,6 +2281,72 @@ mod tests {
         assert_eq!(fmt.get_str("align"), Some("center"));
         assert_eq!(fmt.get_str("numFmt"), Some("0.00%"));
         assert_eq!(fmt.get("italic").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn cell_format_rejects_a_non_object_patch() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::Str("bold".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("patch"), "{err}");
+    }
+
+    /// The format read-back is deliberately scoped to `cell.get` alone (per
+    /// spec: read-modify-write is the only use case). A styled cell's
+    /// `format` object must NOT leak into `sheet.read`, `find`, or
+    /// `cell.set`'s reply — even though all three share the underlying
+    /// `cell_json` builder with `cell.get`. This pins the scope so Task 4's
+    /// gridwasm mirror matches exactly.
+    #[test]
+    fn format_read_back_is_scoped_to_cell_get_only() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap();
+
+        // cell.set's own reply, on the now-styled cell: no format key.
+        let set_reply = dispatch(
+            &mut a,
+            "cell.set",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("hello".into())),
+            ]),
+        )
+        .unwrap();
+        assert!(set_reply.get("format").is_none(), "{set_reply:?}");
+
+        // cell.get: format IS present (the one carrier of this key).
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert!(g.get("format").is_some());
+
+        // sheet.read: no format key on the same styled cell's entry.
+        let sr = sheet_read(&a, &Json::Null).unwrap();
+        let cells = sr.get("cells").unwrap().as_array().unwrap();
+        let a1 = cells
+            .iter()
+            .find(|c| c.get_str("ref") == Some("A1"))
+            .expect("A1 present in sheet.read");
+        assert!(a1.get("format").is_none(), "{a1:?}");
+
+        // find: no format key on the matched cell either.
+        let found = find(&a, &Json::obj(vec![("query", Json::Str("hello".into()))])).unwrap();
+        let matches = found.get("matches").unwrap().as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].get("format").is_none(), "{:?}", matches[0]);
     }
 
     #[test]
