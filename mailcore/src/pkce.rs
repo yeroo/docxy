@@ -25,8 +25,12 @@ impl Pkce {
 }
 
 /// Reads `n` bytes of OS-provided randomness.
+///
+/// `pub(crate)` (rather than private) so `store` can reuse this same
+/// OS-entropy source for the `local:<hex>` draft id, instead of pulling in
+/// a `uuid` crate for something this small.
 #[cfg(windows)]
-fn random_bytes(n: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     use windows_sys::Win32::Security::Cryptography::{
         BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
@@ -47,9 +51,10 @@ fn random_bytes(n: usize) -> Vec<u8> {
     buf
 }
 
-/// Reads `n` bytes of OS-provided randomness.
+/// Reads `n` bytes of OS-provided randomness. See the `windows` cfg of this
+/// same function for why this is `pub(crate)`.
 #[cfg(not(windows))]
-fn random_bytes(n: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
     let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");

@@ -66,6 +66,10 @@ pub struct Message {
     pub has_attachments: bool,
     pub importance: String,
     pub preview: String,
+    /// Graph's `isDraft`: true for messages still sitting in Drafts that
+    /// haven't been sent. Mirrored locally as `messages.is_draft` so a
+    /// draft displays like any other message in its folder.
+    pub is_draft: bool,
 }
 
 impl Message {
@@ -90,6 +94,7 @@ impl Message {
                 .unwrap_or(false),
             importance: str_field(v, "importance"),
             preview: str_field(v, "bodyPreview"),
+            is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -217,7 +222,8 @@ mod tests {
           "receivedDateTime":"2026-07-17T10:00:00Z","sentDateTime":"2026-07-17T09:59:00Z",
           "isRead":false,"hasAttachments":true,"importance":"normal",
           "bodyPreview":"hello",
-          "flag":{"flagStatus":"flagged"}
+          "flag":{"flagStatus":"flagged"},
+          "isDraft":true
         }"#,
         )
         .unwrap();
@@ -228,6 +234,7 @@ mod tests {
         assert!(!m.is_read);
         assert!(m.is_flagged);
         assert!(m.has_attachments);
+        assert!(m.is_draft);
     }
 
     #[test]

@@ -75,6 +75,7 @@ pub struct MessageRow {
     pub has_attachments: bool,
     pub importance: String,
     pub preview: String,
+    pub is_draft: bool,
 }
 
 /// A queued local mutation, awaiting a push to Microsoft Graph by
@@ -190,6 +191,17 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(schema::SCHEMA_SQL)?;
+        // `SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS messages` already
+        // includes `is_draft` for freshly-created databases; this
+        // `ALTER TABLE` brings an *existing* database (created before this
+        // column existed) up to date. It errors ("duplicate column name")
+        // on every database that already has the column — i.e. every fresh
+        // one, and every one already migrated — so the failure is expected
+        // and swallowed rather than propagated.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -255,8 +267,8 @@ impl Store {
             "INSERT INTO messages (
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
-                 is_read, is_flagged, has_attachments, importance, preview
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = excluded.conversation_id,
@@ -271,7 +283,8 @@ impl Store {
                  is_flagged = excluded.is_flagged,
                  has_attachments = excluded.has_attachments,
                  importance = excluded.importance,
-                 preview = excluded.preview",
+                 preview = excluded.preview,
+                 is_draft = excluded.is_draft",
             params![
                 m.id,
                 folder_id,
@@ -288,6 +301,7 @@ impl Store {
                 m.has_attachments,
                 m.importance,
                 m.preview,
+                m.is_draft,
             ],
         )?;
         Ok(())
@@ -312,7 +326,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
@@ -441,6 +455,163 @@ impl Store {
         Ok(body)
     }
 
+    /// Creates a new draft entirely locally — no Graph round-trip — so
+    /// compose can start editing immediately, even offline. Mints a
+    /// `local:<hex>` id (see `local_draft_id`), files the message under the
+    /// Drafts folder (resolved by `well_known_name = 'drafts'`; see
+    /// `drafts_folder_id` for what happens if that folder hasn't synced
+    /// yet), marks it `is_draft = 1`, and stores `body_html` as its body.
+    /// Returns the minted id so the caller (compose) can address this draft
+    /// with `update_draft_fields`/`draft` until `reconcile_id` swaps it for
+    /// the real Graph id.
+    pub fn create_local_draft(
+        &self,
+        subject: &str,
+        to: &str,
+        cc: &str,
+        body_html: &str,
+    ) -> Result<String, StoreError> {
+        let id = local_draft_id();
+        let folder_id = self.drafts_folder_id()?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO messages (
+                 id, folder_id, conversation_id, subject, from_name, from_addr,
+                 to_recipients, cc_recipients, received_at, sent_at,
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft
+             ) VALUES (?1, ?2, '', ?3, '', '', ?4, ?5, '', '', 1, 0, 0, 'normal', '', 1)",
+            params![id, folder_id, subject, to, cc],
+        )?;
+        tx.execute(
+            "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, 'html', ?2)",
+            params![id, body_html],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Updates a draft's editable fields in place (subject, recipients, and
+    /// body) — the store side of "compose autosaves as you type". `id` is
+    /// whatever `create_local_draft` returned (a `local:` id before the
+    /// draft has synced, or the reconciled Graph id after). A mismatched/
+    /// already-gone `id` changes zero rows rather than erroring, matching
+    /// `set_read`/`set_flag`'s convention for local mutations of a row that
+    /// might have raced with something else — except here the body write
+    /// is real work worth reporting failure on, so this does return a
+    /// `Result`.
+    pub fn update_draft_fields(
+        &self,
+        id: &str,
+        subject: &str,
+        to: &str,
+        cc: &str,
+        body_html: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4
+             WHERE id = ?1",
+            params![id, subject, to, cc],
+        )?;
+        tx.execute(
+            "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, 'html', ?2)
+             ON CONFLICT(message_id) DO UPDATE SET content = excluded.content",
+            params![id, body_html],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rewrites every row keyed by `local_id` (the message, its body, and —
+    /// via the `messages`/`bodies` triggers described in `schema.rs` — the
+    /// `messages_fts` index) to `graph_id`, once `create_draft` has pushed
+    /// the local draft to Graph and gotten back its real id. Runs as one
+    /// transaction with `defer_foreign_keys` turned on for its duration: the
+    /// `messages` row's id (the parent key `bodies.message_id` and
+    /// `attachments.message_id` reference) changes first, which would
+    /// otherwise trip the `FOREIGN KEY` check immediately (there's no
+    /// `ON UPDATE CASCADE` — only `ON DELETE CASCADE` — on those columns),
+    /// since the child rows still point at the old id until the very next
+    /// statement fixes them up. Deferring means the check runs once, at
+    /// `commit()`, by which point every row agrees.
+    pub fn reconcile_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        tx.execute(
+            "UPDATE messages SET id = ?2 WHERE id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.execute(
+            "UPDATE bodies SET message_id = ?2 WHERE message_id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads a draft (its message row and body) for editing, by whatever id
+    /// currently addresses it (`local:` before sync, the Graph id after
+    /// `reconcile_id`). `None` if there's no message with that id, or no
+    /// body stored for it — either of which means there's nothing for
+    /// compose to load.
+    pub fn draft(&self, id: &str) -> Result<Option<(MessageRow, Body)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
+                    to_recipients, cc_recipients, received_at, sent_at,
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft
+             FROM messages
+             WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_map(params![id], map_message_row)?
+            .next()
+            .transpose()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Some(body) = self.get_body(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((row, body)))
+    }
+
+    /// Resolves the Drafts folder's id, for filing a new local draft.
+    ///
+    /// The normal case: the Drafts folder has already synced down from
+    /// Graph, so it's a row with `well_known_name = 'drafts'` — return its
+    /// real id.
+    ///
+    /// The cold-start case: compose runs before the first folder sync has
+    /// happened, so no such row exists yet. Rather than fail (or block
+    /// drafting on a network round-trip), file the draft under a stable
+    /// local sentinel folder id, creating a placeholder `folders` row for
+    /// it if needed (a real row has to exist for the `messages.folder_id`
+    /// foreign key to accept the insert). This sentinel is *not* marked
+    /// `well_known_name = 'drafts'`, so once the real sync happens the two
+    /// don't collide — but nothing here re-files the sentinel's messages
+    /// into the real Drafts folder afterward; that reconciliation is left
+    /// to a later task (see the Task 6 report).
+    fn drafts_folder_id(&self) -> Result<String, StoreError> {
+        let existing = self.conn.query_row(
+            "SELECT id FROM folders WHERE well_known_name = 'drafts' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match existing {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO folders
+                         (id, parent_id, display_name, total_count, unread_count, well_known_name)
+                     VALUES (?1, NULL, 'Drafts', 0, 0, NULL)",
+                    params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+                )?;
+                Ok(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Replaces the full set of attachment metadata stored for a message
     /// (no bytes — those are fetched separately, later, on demand).
     ///
@@ -526,7 +697,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview
+                    is_read, is_flagged, has_attachments, importance, preview, is_draft
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
@@ -595,6 +766,30 @@ impl Store {
     }
 }
 
+/// The local `folders.id` a new draft is filed under when the real Drafts
+/// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
+/// See `Store::drafts_folder_id`.
+const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
+
+/// Mints a fresh local draft id: `local:` followed by 16 bytes of
+/// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
+/// OS-entropy source the PKCE verifier uses, rather than pulling in a
+/// `uuid` crate for this one call site). The `local:` prefix is what marks
+/// an id as not-yet-synced-to-Graph throughout the store and sync engine.
+fn local_draft_id() -> String {
+    format!("local:{}", to_hex(&crate::pkce::random_bytes(16)))
+}
+
+/// Lowercase-hex-encodes a byte slice (`format!("{b:02x}")` per byte,
+/// concatenated) — used only for `local_draft_id`'s random suffix.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// Encodes a list of recipients into the flat text form stored in
 /// `to_recipients`/`cc_recipients` (`Name <addr>; Name <addr>; ...`).
 /// There's no structured decode yet — nothing reads these back as
@@ -607,11 +802,11 @@ fn encode_recipients(list: &[Recipient]) -> String {
         .join("; ")
 }
 
-/// Maps one row of a `SELECT id, folder_id, ..., preview FROM messages ...`
-/// query (that exact column order) to a `MessageRow`. Shared by
-/// `messages_in_folder` and `search`, which both select those columns in
-/// that order from `messages`, so there's only one place mapping can drift
-/// out of sync with the column list.
+/// Maps one row of a `SELECT id, folder_id, ..., preview, is_draft FROM
+/// messages ...` query (that exact column order) to a `MessageRow`. Shared
+/// by `messages_in_folder`, `search`, and `draft`, which all select those
+/// columns in that order from `messages`, so there's only one place mapping
+/// can drift out of sync with the column list.
 fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
@@ -629,6 +824,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         has_attachments: row.get(12)?,
         importance: row.get(13)?,
         preview: row.get(14)?,
+        is_draft: row.get(15)?,
     })
 }
 
@@ -671,6 +867,7 @@ mod tests {
             has_attachments: false,
             importance: "normal".into(),
             preview: "p".into(),
+            is_draft: false,
         }
     }
 
@@ -904,6 +1101,7 @@ mod search_tests {
             has_attachments: false,
             importance: "normal".into(),
             preview: "".into(),
+            is_draft: false,
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(
@@ -919,5 +1117,95 @@ mod search_tests {
         s.upsert_message("F", &m).unwrap();
         assert_eq!(s.search("budget", 50).unwrap().len(), 1);
         assert_eq!(s.search("pizza", 50).unwrap()[0].id, "1");
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    #[test]
+    fn create_local_draft_appears_in_drafts_folder_with_local_id() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_draft("Hi", "bob@x", "carol@x", "<p>hello</p>")
+            .unwrap();
+        assert!(id.starts_with("local:"));
+
+        let folders = s.folders().unwrap();
+        let drafts_folder = folders
+            .iter()
+            .find(|f| f.display_name == "Drafts")
+            .expect("a Drafts folder should exist");
+
+        let rows = s.messages_in_folder(&drafts_folder.id, 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert!(rows[0].is_draft);
+        assert_eq!(rows[0].subject, "Hi");
+        assert_eq!(rows[0].to_recipients, "bob@x");
+        assert_eq!(rows[0].cc_recipients, "carol@x");
+
+        let body = s.get_body(&id).unwrap().unwrap();
+        assert_eq!(body.content, "<p>hello</p>");
+    }
+
+    #[test]
+    fn create_local_draft_reuses_the_synced_drafts_folder() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "REAL-DRAFTS".into(),
+            display_name: "Drafts".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("drafts".into()),
+        })
+        .unwrap();
+        let id = s.create_local_draft("Hi", "", "", "").unwrap();
+        let rows = s.messages_in_folder("REAL-DRAFTS", 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+    }
+
+    #[test]
+    fn update_draft_fields_changes_subject_and_body() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Old", "a@x", "", "old body").unwrap();
+        s.update_draft_fields(&id, "New", "b@x", "c@x", "new body")
+            .unwrap();
+
+        let (row, body) = s.draft(&id).unwrap().expect("draft should still exist");
+        assert_eq!(row.subject, "New");
+        assert_eq!(row.to_recipients, "b@x");
+        assert_eq!(row.cc_recipients, "c@x");
+        assert_eq!(body.content, "new body");
+    }
+
+    #[test]
+    fn reconcile_id_moves_message_and_body_to_the_graph_id() {
+        let s = Store::open_in_memory().unwrap();
+        let local_id = s
+            .create_local_draft("Subj", "a@x", "", "body text")
+            .unwrap();
+        s.reconcile_id(&local_id, "GRAPH-ID-1").unwrap();
+
+        assert!(s.draft(&local_id).unwrap().is_none());
+        let (row, body) = s
+            .draft("GRAPH-ID-1")
+            .unwrap()
+            .expect("reconciled draft should be found under the graph id");
+        assert_eq!(row.id, "GRAPH-ID-1");
+        assert_eq!(row.subject, "Subj");
+        assert_eq!(body.content, "body text");
+
+        // search (via messages_fts) should follow the row to the new id too.
+        assert_eq!(s.search("Subj", 50).unwrap()[0].id, "GRAPH-ID-1");
+    }
+
+    #[test]
+    fn draft_returns_none_for_unknown_id() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.draft("nope").unwrap().is_none());
     }
 }
