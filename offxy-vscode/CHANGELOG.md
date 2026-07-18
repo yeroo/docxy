@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **New: the wave-1 agent verb surface** — every tab (Word and Excel) and both
+  terminal apps (`docxy`, `xlsxy`) gain ~30 new control-surface verbs exposed
+  as MCP tools, growing the bundled server (and both terminal `--mcp`
+  binaries) from 21 to **51 tools**: docxy adds `doc.export`,
+  `doc.export-pdf`, `doc.comments`, `doc.notes`, `doc.header`/`doc.footer`,
+  `doc.metadata`, `doc.stats`, `doc.replace-all`, `doc.undo`/`doc.redo`;
+  xlsxy adds comment read/write, `range.set` (atomic block writes),
+  `wb.export-csv`, `sheet.import-csv`, an ad-hoc read-only `sheet.pivot`,
+  `wb.replace-all` (spans every sheet), `sheet.add`/`remove`/`rename`,
+  `row.*`/`col.*` insert/delete, `formula.eval`, `sheet.stats`, and
+  `chart.list`/`pivot.list`. See [docs/agent-control.md](../docs/agent-control.md)
+  for the full verb tables and tool lists.
+  - Every mutating verb lands on VS Code's own undo/redo stack as a labeled
+    "Agent: `<verb>`" entry, in lockstep with the wasm engine's own undo
+    stack — `doc.undo`/`doc.redo` fire a new inverse-wasm-op edit event
+    rather than replaying the existing stack; comment add/remove and
+    sheet-structural ops (`sheet.import-csv`, `sheet.remove`) drive a
+    host-orchestrated inverse request instead of a wasm undo replay, since
+    those changes live outside the cell-level undo model.
+  - Agent `sheet.remove` is undoable — content, comments, and sheet-scoped
+    defined names are restored — but the restored sheet re-appends at the
+    **end** of the tab's sheet order, and the restore is backed by a
+    **single-slot stash**: a second consecutive `sheet.remove` before
+    undoing the first only leaves the second one recoverable, and undoing
+    past it surfaces a warning instead of silently failing.
+  - A tab's `comment.add` with no `author` defaults to `"agent"` (the
+    terminal apps default to the OS username instead).
+  - `doc.export-pdf` on a tab is rendered by the wasm engine but **written
+    to disk by the extension host** (`docxcore`'s PDF exporter is std-only
+    and can't run inside the wasm sandbox); the terminal apps write directly.
+  - Added `"activationEvents": []` to `package.json` for `@vscode/vsce` 3.x
+    packaging compatibility (3.x otherwise refuses to package a manifest
+    with no explicit activation events; VS Code still derives the implicit
+    `onCustomEditor:` activations from the `customEditors` contribution
+    points, so this is a packaging-only change with no runtime effect).
 - **New: the bundled MCP server (`mcp/server.mjs`) is now registered with VS
   Code's MCP API** (`contributes.mcpServerDefinitionProviders` +
   `vscode.lm.registerMcpServerDefinitionProvider`), so GitHub Copilot's agent

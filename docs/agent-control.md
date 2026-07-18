@@ -63,7 +63,7 @@ One JSON object per line; one reply line per request:
 
 | Verb | Args | Result |
 |---|---|---|
-| `doc.path` | — | `{path, format, modified, blocks}` |
+| `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
 | `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` |
@@ -73,6 +73,15 @@ One JSON object per line; one reply line per request:
 | `doc.save` | — | `{path, …}` |
 | `doc.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `doc.open` | `{path}` | `{path, …}` |
+| `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the **live buffer** |
+| `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite — same `already exists:`/`bad path:`/`create failed:` error family as creating a new file) |
+| `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
+| `doc.notes` | — | `{notes:[{id,kind:"footnote"\|"endnote",text}]}` |
+| `doc.header` / `doc.footer` | — | `{blocks:[{index,kind,text}]}` (empty list if the document has none) |
+| `doc.metadata` | — | present-if-set keys: `{title?,author?,subject?,keywords?,comments?,last_saved_by?,revision?,created?,modified?}` |
+| `doc.stats` | — | `{words, chars, paragraphs, blocks}` |
+| `doc.replace-all` | `{query, text, case_sensitive?}` | `{replaced}` |
+| `doc.undo` / `doc.redo` | — | `{done}` (`false` = nothing to undo/redo) |
 
 Notes:
 
@@ -82,6 +91,22 @@ Notes:
   of any kind are replaced.
 - A `doc.replace-range` is a delete-then-insert — the same two undo steps as a
   paste over a selection in the UI.
+- **`doc.export` reads the live buffer.** Unlike opening the saved `.docx` in
+  another tool, `doc.export`'s Markdown/text reflects **unsaved** edits —
+  it serializes `editor.doc`, never the file on disk. This is the same
+  live-buffer guarantee every read verb already has (`doc.read`, `doc.outline`,
+  …); it's called out here because "export" more easily reads as "export the
+  saved file" than "read" does. `xlsxy`'s `wb.export-csv` (below) is the same
+  differentiator: both let an agent capture the document/workbook exactly as
+  it currently stands, mid-edit, without a `doc.save`/`wb.save` first.
+- **`doc.header`/`doc.footer` read the *default* section variant only.**
+  A document can have distinct first-page and even-page headers/footers;
+  those aren't surfaced by these verbs — only `app.headers.default`/
+  `app.footers.default`.
+- `doc.replace-all` and `doc.undo`/`doc.redo` no-op cleanly: a `query` that
+  matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
+  `done:false` and does **not** mark the document modified or flash the
+  agent-status dot — nothing actually changed.
 
 ## MCP (native tools in Claude Code)
 
@@ -98,7 +123,9 @@ claude mcp add docxy -- docxy --mcp
 
 Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_find`, `docxy_replace_range`, `docxy_insert`, `docxy_append`,
-`docxy_save`. Each edit
+`docxy_save`, `docxy_export`, `docxy_export_pdf`, `docxy_comments`,
+`docxy_notes`, `docxy_header`, `docxy_footer`, `docxy_metadata`, `docxy_stats`,
+`docxy_replace_all`, `docxy_undo`, `docxy_redo` (21 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -164,6 +191,43 @@ scripting against a tab:
   the undo stack. So immediately after a `doc.reload`, the tab's title may
   still show the dirty dot even though its content now matches disk.
 
+**Wave-1 additions on tabs** — every new verb above (docxy and xlsxy) is
+reachable on a tab exactly like the original surface, with these mechanics
+worth knowing:
+
+- **`doc.undo`/`doc.redo` land as their own labeled entries on VS Code's undo
+  stack**, not as a replay of whatever was already there. The wasm undo/redo
+  runs immediately, and the tab fires a *new* edit event — labeled "Agent:
+  undo"/"Agent: redo" — whose own undo/redo drives the **inverse** wasm op
+  (agent `doc.undo` → the event's `undo()` sends a wasm redo, `redo()` sends a
+  wasm undo), keeping VS Code's stack and the wasm stack in lockstep with no
+  private API. A `{done:false}` no-op (nothing to undo/redo) fires no event.
+  Every other mutating verb's edit event is labeled "Agent: `<verb>`" (e.g.
+  "Agent: range.set", "Agent: comment.add").
+- **Agent `sheet.remove` undo restores the sheet's content, comments, and
+  sheet-scoped defined names — but re-appends it at the END of the tab's
+  sheet order**, not back at its original index. Sheets below the removed one
+  don't shift back, so a workbook with sheets `[A, B, C]` where an agent
+  removes `B` and the user then presses Ctrl+Z ends up `[A, C, B]`, not the
+  original `[A, B, C]`.
+- **Agent sheet-removals are single-level-undoable.** The restore is backed by
+  a single-slot stash (only the most recently removed sheet is recoverable);
+  a *second* consecutive `sheet.remove` followed by two undos succeeds on the
+  first (restoring the second removal) but the second undo shows a warning
+  (`"Offxy: couldn't undo … — nothing left to reverse"` or "… nothing to
+  restore") instead of silently failing or reviving the first removed sheet.
+- **Comment author defaults to `"agent"` on tabs**, not the OS username — the
+  terminal apps stamp new threaded comments with the OS user
+  (`$USER`/`%USERNAME%`, falling back to `"xlsxy"`); a tab's `comment.add`
+  with no `author` arg stamps `"agent"` instead, since there's no terminal
+  session to read a username from.
+- **`doc.export-pdf` on a tab is written by the extension host, not the
+  wasm.** `docxcore`'s PDF exporter is std-only and can't run inside the wasm
+  sandbox, so the webview renders the PDF bytes and hands them to the
+  extension host, which does the exclusive-create write to disk (same
+  refuses-to-overwrite / `already exists:` semantics as the terminal, which
+  writes directly). The reply shape is identical either way: `{path}`.
+
 `docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
 **new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
 file is still created on disk but nothing opens (`"opened":false`). The
@@ -178,14 +242,64 @@ one-liner).
 
 ## The other editors
 
-**xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` by index or name):
-`wb.path`, `sheet.list`, `sheet.read {sheet?, range?}`, `cell.get {ref}`,
-`cell.set {ref, text}` (leading `=` = formula, validated + recalculated),
-`range.clear {range}`, `find {query}`, `wb.recalc`, `wb.save`, `wb.reload`,
-`wb.open {path}`. MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`,
-`xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`,
-`xlsxy_set`, `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`. Skill:
-`xlsxy install skill`.
+**xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` selects by index or
+name and defaults to the active sheet):
+
+| Verb | Args | Result |
+|---|---|---|
+| `wb.path` | — | `{path, modified, sheets, active, active_name}` |
+| `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
+| `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
+| `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |
+| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — leading `=` is a formula, validated + recalculated |
+| `range.clear` | `{range, sheet?}` | `{cleared}` |
+| `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
+| `wb.recalc` | — | `{recalculated:true}` |
+| `wb.save` | — | `{path, …}` |
+| `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
+| `wb.open` | `{path}` | `{path, …}` |
+| `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` (threads flattened in reply order) |
+| `wb.export-csv` | `{sheet?}` | `{sheet, csv}` — display-formatted RFC-4180, the **live buffer** |
+| `sheet.pivot` | `{range,rows:[col],cols?:[col],values:[{col,agg}],sheet?}` | `{table:[[string]]}` — **ad-hoc and read-only**, no workbook mutation |
+| `formula.eval` | `{formula,ref?,sheet?}` | `{value,text}` — side-effect-free preview, writes nowhere |
+| `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
+| `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
+| `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` (persistent pivots, summarized) |
+| `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
+| `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
+| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — **atomic**: every formula validated first, any invalid → error and nothing applied; one undo group |
+| `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites |
+| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group |
+| `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
+| `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default) |
+| `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |
+| `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted:N}` |
+| `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted:N}` |
+
+Notes:
+
+- **`wb.export-csv` reads the live buffer** — same live-buffer guarantee as
+  `doc.export` above: it reflects unsaved edits, not the saved file.
+- **`sheet.pivot` is read-only and ad-hoc.** It computes a grid straight from
+  a snapshot of `range` and never writes a persistent pivot table into the
+  workbook — `pivot.list` (also read-only) lists *existing* persistent
+  pivots, a separate thing.
+- **`wb.replace-all` spans every sheet** in the workbook, unlike a find/replace
+  scoped to one sheet — the whole multi-sheet edit lands as a single undo
+  group.
+- `sheet.remove`/`sheet.rename` require `sheet` explicitly (not defaulted to
+  the active sheet) — a destructive or renaming op shouldn't silently land on
+  "whichever sheet happens to be showing".
+
+MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
+`xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`,
+`xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
+`xlsxy_comment_add`, `xlsxy_comment_remove`, `xlsxy_range_set`,
+`xlsxy_export_csv`, `xlsxy_import_csv`, `xlsxy_pivot`, `xlsxy_replace_all`,
+`xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
+`xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
+`xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
+`xlsxy_pivots` (30 total). Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
 `proj.path`, `task.list` (scheduled dates, critical path, slack, links),
