@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use docxcore::agent;
 use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::model::{Align, Block};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
@@ -350,6 +351,20 @@ impl Session {
             "doc.insert" => self.ctl_insert(args),
             "doc.append" => self.ctl_append(args),
             "doc.blocks" => Ok(self.ctl_blocks()),
+            "doc.export" => self.ctl_export(args),
+            "doc.comments" => Ok(self.ctl_comments()),
+            "doc.notes" => Ok(self.ctl_notes()),
+            // Default section variant only — mirrors docxy control.rs's
+            // doc.header/doc.footer exactly (see the dispatch note there for
+            // why first/even-page variants are out of scope for this verb).
+            "doc.header" => Ok(self.ctl_header_footer("headerReference")),
+            "doc.footer" => Ok(self.ctl_header_footer("footerReference")),
+            "doc.metadata" => Ok(self.ctl_metadata()),
+            "doc.stats" => Ok(self.ctl_stats()),
+            "doc.replace-all" => self.ctl_replace_all(args),
+            "doc.undo" => Ok(self.ctl_undo()),
+            "doc.redo" => Ok(self.ctl_redo()),
+            "doc.export-pdf" => Ok(self.ctl_export_pdf()),
             other => Err(format!("unknown verb '{other}'")),
         };
         match result {
@@ -516,13 +531,281 @@ impl Session {
         Ok(out)
     }
 
-    /// `{}` -> `{total, modified}` (the host composes this with URI info for
-    /// its own `doc.path`-equivalent reply).
+    /// `{}` -> `{total, modified, protection?, watermark?}` (the host composes
+    /// this with URI info for its own `doc.path`-equivalent reply). The last
+    /// two are present-if-set, straight off `Package::protection`/
+    /// `Package::watermark` — the additive keys `doc.path` gains on every
+    /// surface in this wave (mirrors docxy control.rs's `path_info`).
     fn ctl_blocks(&self) -> String {
         let mut out = String::from("{\"total\":");
         out.push_str(&self.editor.doc.body.len().to_string());
         out.push_str(",\"modified\":");
         out.push_str(if self.dirty { "true" } else { "false" });
+        if let Some(p) = self.pkg.protection() {
+            out.push_str(",\"protection\":");
+            json::push_str(&mut out, &p);
+        }
+        if let Some(w) = self.pkg.watermark() {
+            out.push_str(",\"watermark\":");
+            json::push_str(&mut out, &w);
+        }
+        out.push('}');
+        out
+    }
+
+    /// `{format:"markdown"|"text"}` -> `{format, text}` — the live buffer, on
+    /// the same terms as docxy control.rs's `export` (mirrors it exactly,
+    /// including the error wording).
+    fn ctl_export(&self, args: &json::Json) -> Result<String, String> {
+        let format = args
+            .get_str("format")
+            .ok_or("doc.export needs a 'format' (markdown|text)")?;
+        let text = match format {
+            "markdown" => docxcore::markdown::to_markdown(&self.editor.doc),
+            "text" => self.editor.doc.plain_text(),
+            other => return Err(format!("unknown format '{other}' (markdown|text)")),
+        };
+        let mut out = String::from("{\"format\":");
+        json::push_str(&mut out, format);
+        out.push_str(",\"text\":");
+        json::push_str(&mut out, &text);
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{}` -> `{comments:[{id,author,initials,date,text,anchor}]}`. Read
+    /// straight off the package's `word/comments.xml` (not the live editor
+    /// document — edits to body text don't touch comment anchors), same
+    /// source docxy control.rs's `comments()` uses.
+    fn ctl_comments(&self) -> String {
+        let items = docxcore::comments::parse_comments(&self.pkg);
+        let mut out = String::from("{\"comments\":[");
+        for (i, c) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"id\":");
+            json::push_str(&mut out, &c.id);
+            out.push_str(",\"author\":");
+            json::push_str(&mut out, &c.author);
+            out.push_str(",\"initials\":");
+            json::push_str(&mut out, &c.initials);
+            out.push_str(",\"date\":");
+            json::push_str(&mut out, &c.date);
+            out.push_str(",\"text\":");
+            json::push_str(&mut out, &c.text);
+            out.push_str(",\"anchor\":");
+            json::push_str(&mut out, &c.quoted);
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// `{}` -> `{notes:[{id,kind:"footnote"|"endnote",text}]}`. Footnotes then
+    /// endnotes, in file order — mirrors docxy control.rs's `notes()`.
+    fn ctl_notes(&self) -> String {
+        let items = docxcore::notes::parse_notes(&self.pkg);
+        let mut out = String::from("{\"notes\":[");
+        for (i, n) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let kind = if n.endnote { "endnote" } else { "footnote" };
+            out.push_str("{\"id\":");
+            out.push_str(&n.id.to_string());
+            out.push_str(",\"kind\":");
+            json::push_str(&mut out, kind);
+            out.push_str(",\"text\":");
+            json::push_str(&mut out, &n.text);
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// `{}` -> `{blocks:[{index,kind,text}]}` (empty when the document has
+    /// none) — the DEFAULT section header/footer only, resolved via
+    /// [`header_footer_blocks`](Self::header_footer_blocks). `kind` is
+    /// `"headerReference"`/`"footerReference"`, matching docxy main.rs's
+    /// `load_hdr_ftr`/`parts` convention.
+    fn ctl_header_footer(&self, kind: &str) -> String {
+        let blocks = self.header_footer_blocks(kind);
+        let mut out = String::from("{\"blocks\":[");
+        for (i, b) in blocks.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"index\":");
+            out.push_str(&i.to_string());
+            out.push_str(",\"kind\":");
+            json::push_str(&mut out, agent::block_kind(b));
+            out.push_str(",\"text\":");
+            json::push_str(&mut out, &b.plain_text());
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// Resolve the DEFAULT section header/footer's block content from `kind`
+    /// (`"headerReference"`/`"footerReference"`), empty when the document has
+    /// none. A small, self-contained re-implementation of docxy main.rs's
+    /// `load_hdr_ftr`/`ref_rid`/`attr_value` (private to that binary crate,
+    /// so duplicated here rather than shared — `docxwasm` depends only on
+    /// `docxcore`, see this crate's single-dependency rule).
+    fn header_footer_blocks(&self, kind: &str) -> Vec<Block> {
+        let Some(rid) = hf_ref_rid(self.pkg.sect_pr(), kind, "default") else {
+            return Vec::new();
+        };
+        let Some(target) = self.rels.target(&rid) else {
+            return Vec::new();
+        };
+        let name = match target.strip_prefix('/') {
+            Some(r) => r.to_string(),
+            None => format!("word/{}", target.trim_start_matches("./")),
+        };
+        let Some(bytes) = self.pkg.part(&name) else {
+            return Vec::new();
+        };
+        docxcore::load::parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), &self.rels)
+    }
+
+    /// `{}` -> present-if-set: `{title?,author?,subject?,keywords?,comments?,
+    /// last_saved_by?,revision?,created?,modified?}` — `docProps/core.xml`,
+    /// empty strings and unparsed dates omitted rather than sent empty/null.
+    /// Mirrors docxy control.rs's `metadata()`/`format_iso()` field order
+    /// exactly.
+    fn ctl_metadata(&self) -> String {
+        let props = self
+            .pkg
+            .part("docProps/core.xml")
+            .map(|b| docxcore::field::parse_core_props(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let mut out = String::from("{");
+        let mut first = true;
+        for (key, val) in [
+            ("title", props.title.as_str()),
+            ("author", props.author.as_str()),
+            ("subject", props.subject.as_str()),
+            ("keywords", props.keywords.as_str()),
+            ("comments", props.comments.as_str()),
+            ("last_saved_by", props.last_saved_by.as_str()),
+            ("revision", props.revision.as_str()),
+        ] {
+            if val.is_empty() {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            json::push_str(&mut out, key);
+            out.push(':');
+            json::push_str(&mut out, val);
+        }
+        if let Some(dt) = &props.created {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str("\"created\":");
+            json::push_str(&mut out, &hf_format_iso(dt));
+        }
+        if let Some(dt) = &props.modified {
+            if !first {
+                out.push(',');
+            }
+            out.push_str("\"modified\":");
+            json::push_str(&mut out, &hf_format_iso(dt));
+        }
+        out.push('}');
+        out
+    }
+
+    /// `{}` -> `{words, chars, paragraphs, blocks}` — word/character/
+    /// paragraph/block counts over the live buffer (mirrors docxy
+    /// control.rs's `stats()`; `chars` excludes block-separator newlines).
+    fn ctl_stats(&self) -> String {
+        let (words, chars, paragraphs, blocks) = agent::stats(&self.editor.doc);
+        format!(
+            "{{\"words\":{words},\"chars\":{chars},\"paragraphs\":{paragraphs},\"blocks\":{blocks}}}"
+        )
+    }
+
+    /// `{query, text, case_sensitive?}` -> `{replaced, undoSteps}`.
+    ///
+    /// `undoSteps` is the internal field (see `ctl_replace_range`'s doc
+    /// comment for the pattern): `1` when anything was replaced, `0` on a
+    /// genuine no-match no-op — exactly `agent::replace_all`'s own reported
+    /// count. Unlike `doc.replace-range` (bounds-checked, never a genuine
+    /// no-op), `replace-all` can legitimately match nothing, and a no-match
+    /// call must leave no tracks: no undo checkpoint, no dirty flag — mirrors
+    /// docxy control.rs's `replace_all`'s no-op guard exactly.
+    fn ctl_replace_all(&mut self, args: &json::Json) -> Result<String, String> {
+        let query = args
+            .get_str("query")
+            .ok_or("doc.replace-all needs a 'query'")?;
+        let text = args.get_str("text").ok_or("doc.replace-all needs 'text'")?;
+        let case_sensitive = args
+            .get("case_sensitive")
+            .and_then(json::Json::as_bool)
+            .unwrap_or(false);
+        let (replaced, undo_steps) =
+            agent::replace_all(&mut self.editor, query, text, case_sensitive);
+        if replaced > 0 {
+            self.finish_ctl_edit();
+        }
+        let mut out = String::from("{\"replaced\":");
+        out.push_str(&replaced.to_string());
+        out.push_str(",\"undoSteps\":");
+        out.push_str(&undo_steps.to_string());
+        out.push('}');
+        Ok(out)
+    }
+
+    /// `{}` -> `{done, undoSteps:0}`. Undo/redo are not themselves undoable
+    /// edits, so `undoSteps` is always `0` regardless of `done` — Task 7's
+    /// tab adaptation fires its own host-orchestrated inverse edit event
+    /// (a NEW edit whose undo/redo replays this same wasm op) rather than
+    /// replaying a wasm-undo-stack count. A no-op (`done:false`, empty undo
+    /// stack) must not dirty the session — mirrors docxy control.rs's `undo`.
+    fn ctl_undo(&mut self) -> String {
+        let done = agent::undo(&mut self.editor);
+        if done {
+            self.finish_ctl_edit();
+        }
+        format!("{{\"done\":{done},\"undoSteps\":0}}")
+    }
+
+    /// `{}` -> `{done, undoSteps:0}`. Same contract and no-op guard as
+    /// [`ctl_undo`](Self::ctl_undo), mirroring docxy control.rs's `redo`.
+    fn ctl_redo(&mut self) -> String {
+        let done = agent::redo(&mut self.editor);
+        if done {
+            self.finish_ctl_edit();
+        }
+        format!("{{\"done\":{done},\"undoSteps\":0}}")
+    }
+
+    /// `{}` -> internal shape `{"pdfBase64":"<base64>"}` (the `"ok":true` is
+    /// added by `ctl_ok`). No `path` arg — unlike the terminal's
+    /// `doc.export-pdf`, which writes the file itself, this hands raw PDF
+    /// bytes to the host; the extension (Task 7) decodes `pdfBase64`, writes
+    /// it, and produces the terminal-shaped `{path}` reply on the wire.
+    /// Doesn't touch `self.editor`, so it neither dirties the session nor is
+    /// part of the undo stack — mirrors docxy control.rs's `export_pdf`
+    /// (`PdfOptions`/`styles` construction is identical).
+    fn ctl_export_pdf(&self) -> String {
+        let pdf = to_pdf(
+            &self.editor.doc,
+            &PdfOptions {
+                styles: self.styles.clone(),
+                ..PdfOptions::default()
+            },
+        );
+        let mut out = String::from("{\"pdfBase64\":");
+        json::push_str(&mut out, &json::to_base64(&pdf));
         out.push('}');
         out
     }
@@ -637,11 +920,17 @@ impl Session {
 }
 
 /// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
-/// completing the success envelope.
+/// completing the success envelope. Handles the genuinely-empty-object case
+/// (`doc.metadata` on a package with no set properties returns `"{}"`) so the
+/// splice doesn't leave a leading comma (`{,"ok":true}`, invalid JSON).
 fn ctl_ok(body: String) -> String {
     let mut s = body;
     s.pop(); // trailing '}'
-    s.push_str(",\"ok\":true}");
+    s.push_str(if s.ends_with('{') {
+        "\"ok\":true}"
+    } else {
+        ",\"ok\":true}"
+    });
     s
 }
 
@@ -692,6 +981,49 @@ fn ctl_parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String
             Ok((v, v))
         }
     }
+}
+
+/// The relationship id of a section header/footer reference of the given
+/// type (`default`/`first`/`even`) inside a captured `w:sectPr` XML string.
+/// Duplicated from docxy main.rs's private `ref_rid` — see
+/// [`Session::header_footer_blocks`] for why.
+fn hf_ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<String> {
+    let needle = format!("<w:{kind}");
+    let want = format!("w:type=\"{wtype}\"");
+    let mut i = 0;
+    while let Some(p) = sect[i..].find(&needle) {
+        let start = i + p;
+        let end = sect[start..]
+            .find('>')
+            .map(|e| start + e)
+            .unwrap_or(sect.len());
+        let el = &sect[start..end];
+        if el.contains(&want) {
+            return hf_attr_value(el, "r:id");
+        }
+        i = (end + 1).min(sect.len());
+    }
+    None
+}
+
+/// Read the value of attribute `key="…"` from a raw XML element slice.
+/// Duplicated from docxy main.rs's private `attr_value`.
+fn hf_attr_value(el: &str, key: &str) -> Option<String> {
+    let k = format!("{key}=\"");
+    let s = el.find(&k)? + k.len();
+    let rest = &el[s..];
+    let e = rest.find('"')?;
+    Some(rest[..e].to_string())
+}
+
+/// Format a [`docxcore::field::DateTime`] (already the stored UTC components)
+/// as an ISO-8601 timestamp. Duplicated from docxy control.rs's `format_iso`
+/// — same field order, so a swapped month/day would fail the metadata tests.
+fn hf_format_iso(dt: &docxcore::field::DateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
+    )
 }
 
 /// Find the caret's screen `(line, col)` from a set of caret maps.
@@ -1052,5 +1384,354 @@ mod tests {
                 && out.contains("\"ok\":true"),
             "{out}"
         );
+    }
+
+    // ---- Wave-1 ctl verb mirrors (mirrors docxy control.rs byte-for-byte) --
+
+    /// A `.docx` with several plain-text paragraphs (real bytes, so `Session::open`
+    /// exercises the full load path). Mirrors `sample_docx` but multi-paragraph.
+    fn sample_docx_multi(paras: &[&str]) -> Vec<u8> {
+        let ps: String = paras
+            .iter()
+            .map(|t| format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>"))
+            .collect();
+        let xml = format!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <w:body>{ps}</w:body></w:document>"
+        );
+        let doc = docxcore::load::parse_document_xml(&xml, &Default::default());
+        save_package(&new_package(doc))
+    }
+
+    fn view_text(s: &mut Session) -> String {
+        s.view_json(None)
+    }
+
+    /// The live document's plain text, via `doc.export` — unlike
+    /// `view_json`, this carries no transient view state (`dirty`, caret,
+    /// selection), so it's the right comparison for "content restored"
+    /// assertions where `dispatch("undo")`'s own dirty-flag side effect (it
+    /// always marks the session dirty, whether or not the undo stack was
+    /// actually non-empty — a pre-existing `dispatch` property, not part of
+    /// this task's contract) would otherwise make an exact `view_json`
+    /// equality check spuriously fail.
+    fn doc_text(s: &mut Session) -> String {
+        let out = s.ctl(r#"{"verb":"doc.export","args":{"format":"text"}}"#);
+        let marker = "\"text\":\"";
+        let start = out.find(marker).expect("text field") + marker.len();
+        let end = out[start..].find('"').expect("closing quote") + start;
+        out[start..end].to_string()
+    }
+
+    #[test]
+    fn ctl_export_returns_live_markdown_and_text() {
+        let bytes = sample_docx("Hello world");
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.export","args":{"format":"text"}}"#);
+        assert!(
+            out.contains("\"format\":\"text\"")
+                && out.contains("Hello world")
+                && out.contains("\"ok\":true"),
+            "{out}"
+        );
+        let out_md = s.ctl(r#"{"verb":"doc.export","args":{"format":"markdown"}}"#);
+        assert!(
+            out_md.contains("\"format\":\"markdown\"") && out_md.contains("\"ok\":true"),
+            "{out_md}"
+        );
+    }
+
+    #[test]
+    fn ctl_export_requires_format_and_rejects_unknown() {
+        let mut s = Session::open(&sample_docx("x")).expect("open");
+        let err = s.ctl(r#"{"verb":"doc.export","args":{}}"#);
+        assert!(
+            err.contains("\"ok\":false") && err.contains("format"),
+            "{err}"
+        );
+        let err2 = s.ctl(r#"{"verb":"doc.export","args":{"format":"rtf"}}"#);
+        assert!(err2.contains("unknown format 'rtf'"), "{err2}");
+    }
+
+    #[test]
+    fn ctl_comments_notes_header_footer_empty_shape_on_plain_fixture() {
+        let mut s = Session::open(&sample_docx("x")).expect("open");
+        let c = s.ctl(r#"{"verb":"doc.comments","args":{}}"#);
+        assert!(
+            c.contains("\"comments\":[]") && c.contains("\"ok\":true"),
+            "{c}"
+        );
+        let n = s.ctl(r#"{"verb":"doc.notes","args":{}}"#);
+        assert!(
+            n.contains("\"notes\":[]") && n.contains("\"ok\":true"),
+            "{n}"
+        );
+        let h = s.ctl(r#"{"verb":"doc.header","args":{}}"#);
+        assert!(
+            h.contains("\"blocks\":[]") && h.contains("\"ok\":true"),
+            "{h}"
+        );
+        let f = s.ctl(r#"{"verb":"doc.footer","args":{}}"#);
+        assert!(
+            f.contains("\"blocks\":[]") && f.contains("\"ok\":true"),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn ctl_header_resolves_the_default_section_header_content() {
+        // A real header part wired through sectPr -> document.xml.rels ->
+        // word/header1.xml, proving the duplicated ref-rid resolution logic
+        // (mirrors docxy main.rs's `load_hdr_ftr`/`ref_rid`) actually works,
+        // not just that it degrades to the empty-shape default.
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>body text</w:t></w:r></w:p>
+            <w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>
+        </w:body></w:document>"#;
+        let doc_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>"#;
+        let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:w="x"><w:p><w:r><w:t>Confidential</w:t></w:r></w:p></w:hdr>"#;
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let root_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = docxcore::zipwrite::write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/_rels/document.xml.rels".into(), doc_rels.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/header1.xml".into(), header_xml.into()),
+        ]);
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.header","args":{}}"#);
+        assert!(out.contains("Confidential"), "{out}");
+        assert!(out.contains("\"kind\":\"paragraph\""), "{out}");
+        assert!(out.contains("\"index\":0"), "{out}");
+        // The footer verb must not pick up the header content.
+        let f = s.ctl(r#"{"verb":"doc.footer","args":{}}"#);
+        assert!(f.contains("\"blocks\":[]"), "{f}");
+    }
+
+    #[test]
+    fn ctl_metadata_empty_on_plain_fixture() {
+        let mut s = Session::open(&sample_docx("x")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.metadata","args":{}}"#);
+        assert_eq!(out, "{\"ok\":true}", "{out}");
+    }
+
+    #[test]
+    fn ctl_metadata_populated_pins_wire_shape_and_key_set() {
+        let core_xml = r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="b" xmlns:dc="a" xmlns:dcterms="c">
+            <dc:creator>Ann</dc:creator>
+            <dc:title>Q3 Report</dc:title>
+            <dc:subject></dc:subject>
+            <dcterms:created>2020-01-02T03:04:05Z</dcterms:created>
+        </cp:coreProperties>"#;
+        let document_xml =
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body><w:p/></w:body></w:document>";
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = docxcore::zipwrite::write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("docProps/core.xml".into(), core_xml.into()),
+        ]);
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.metadata","args":{}}"#);
+        assert!(out.contains("\"title\":\"Q3 Report\""), "{out}");
+        assert!(out.contains("\"author\":\"Ann\""), "{out}");
+        // Pins format_iso's y-m-d-h-m-s field order, matching control.rs exactly.
+        assert!(
+            out.contains("\"created\":\"2020-01-02T03:04:05Z\""),
+            "{out}"
+        );
+        assert!(
+            !out.contains("\"subject\""),
+            "empty dc:subject must be omitted: {out}"
+        );
+        assert!(
+            !out.contains("\"modified\""),
+            "unset field must be omitted: {out}"
+        );
+        assert!(out.contains("\"ok\":true"), "{out}");
+    }
+
+    #[test]
+    fn ctl_stats_counts_words_chars_paragraphs_blocks_exact_key_set() {
+        let bytes = sample_docx_multi(&["one two", "three"]);
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.stats","args":{}}"#);
+        assert!(out.contains("\"words\":3"), "{out}");
+        assert!(out.contains("\"chars\":12"), "{out}");
+        assert!(out.contains("\"paragraphs\":2"), "{out}");
+        assert!(out.contains("\"blocks\":2"), "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        let obj = out.trim_start_matches('{').trim_end_matches('}');
+        let keys: Vec<&str> = obj
+            .split(',')
+            .map(|kv| kv.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            5,
+            "exact key set (words,chars,paragraphs,blocks,ok): {out}"
+        );
+    }
+
+    #[test]
+    fn ctl_replace_all_undo_integrity_one_undo_restores_prestate() {
+        let bytes = sample_docx_multi(&["a foo b foo c", "foo"]);
+        let mut s = Session::open(&bytes).expect("open");
+        let before = doc_text(&mut s);
+        let out = s.ctl(r#"{"verb":"doc.replace-all","args":{"query":"foo","text":"BAR"}}"#);
+        assert!(out.contains("\"replaced\":3"), "{out}");
+        assert!(out.contains("\"undoSteps\":1"), "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        // internal field must never carry over into a byte-identical reply
+        // shape check against control.rs's `{replaced}` — proven separately
+        // by ctlserver.ts stripping it; here we only assert it's present.
+        let after = doc_text(&mut s);
+        assert!(after.contains("BAR"), "{after}");
+        // One dispatch("undo") (== reported undoSteps) restores pre-state.
+        s.dispatch("undo");
+        assert_eq!(doc_text(&mut s), before);
+    }
+
+    #[test]
+    fn ctl_replace_all_zero_match_is_side_effect_free() {
+        let bytes = sample_docx("hello world");
+        let mut s = Session::open(&bytes).expect("open");
+        let before = doc_text(&mut s);
+        let was_dirty = s.is_dirty();
+        let out = s.ctl(r#"{"verb":"doc.replace-all","args":{"query":"xyz","text":"BAR"}}"#);
+        assert!(out.contains("\"replaced\":0"), "{out}");
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
+        assert_eq!(
+            s.is_dirty(),
+            was_dirty,
+            "a no-match replace-all must not dirty the session"
+        );
+        assert_eq!(doc_text(&mut s), before);
+        // No checkpoint was pushed, so there is nothing to undo.
+        assert_eq!(s.dispatch("undo"), None);
+        assert_eq!(doc_text(&mut s), before);
+    }
+
+    #[test]
+    fn ctl_undo_redo_report_done_and_revert_content() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let r = s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        assert!(
+            r.contains("\"done\":false") && r.contains("\"undoSteps\":0"),
+            "{r}"
+        );
+
+        s.ctl(r#"{"verb":"doc.replace-all","args":{"query":"A","text":"B"}}"#);
+        assert!(view_text(&mut s).contains('B'));
+        let r = s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        assert!(
+            r.contains("\"done\":true") && r.contains("\"undoSteps\":0"),
+            "{r}"
+        );
+        let v = view_text(&mut s);
+        assert!(v.contains('A') && !v.contains('B'), "{v}");
+
+        let r = s.ctl(r#"{"verb":"doc.redo","args":{}}"#);
+        assert!(r.contains("\"done\":true") && r.contains("\"undoSteps\":0"));
+        assert!(view_text(&mut s).contains('B'));
+    }
+
+    #[test]
+    fn ctl_export_pdf_takes_no_path_and_returns_pdf_bytes_as_base64() {
+        let mut s = Session::open(&sample_docx("hello world")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.export-pdf","args":{}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        let marker = "\"pdfBase64\":\"";
+        let start = out.find(marker).expect("pdfBase64 field") + marker.len();
+        let end = out[start..].find('"').expect("closing quote") + start;
+        let b64 = &out[start..end];
+        assert!(!b64.is_empty());
+        let bytes = decode_base64_for_test(b64);
+        assert!(
+            bytes.starts_with(b"%PDF"),
+            "decoded bytes don't start with %PDF: {:?}",
+            &bytes[..bytes.len().min(16)]
+        );
+    }
+
+    /// Minimal decoder, test-only (mirrors `json.rs`'s own test-only decoder):
+    /// proves `ctl_export_pdf`'s base64 payload actually decodes to real PDF
+    /// bytes, without adding a dependency to the production encode-only path.
+    fn decode_base64_for_test(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            }
+        }
+        let mut out = Vec::new();
+        for chunk in s.as_bytes().chunks(4) {
+            let mut vals = [0u8; 4];
+            let mut n = 0usize;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c == b'=' {
+                    break;
+                }
+                vals[i] = val(c);
+                n += 1;
+            }
+            let x = ((vals[0] as u32) << 18)
+                | ((vals[1] as u32) << 12)
+                | ((vals[2] as u32) << 6)
+                | (vals[3] as u32);
+            if n >= 2 {
+                out.push((x >> 16) as u8);
+            }
+            if n >= 3 {
+                out.push((x >> 8) as u8);
+            }
+            if n >= 4 {
+                out.push(x as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ctl_blocks_has_no_protection_or_watermark_keys_when_unset() {
+        let mut s = Session::open(&sample_docx("x")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.blocks","args":{}}"#);
+        assert!(!out.contains("\"protection\""), "{out}");
+        assert!(!out.contains("\"watermark\""), "{out}");
+    }
+
+    #[test]
+    fn ctl_blocks_reports_protection_and_watermark_when_set() {
+        // documentProtection (read-only enforcement) + a VML textpath watermark,
+        // both read straight off `Package::protection`/`Package::watermark` —
+        // the same core.rs surface docxy's `doc.path` uses, so `doc.blocks`
+        // (which feeds the tab's `doc.path` composition) must mirror it.
+        let document_xml =
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body><w:p/></w:body></w:document>";
+        let settings_xml = r#"<?xml version="1.0"?><w:settings xmlns:w="x"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
+        let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:v="y"><w:p><v:textpath string="CONFIDENTIAL"/></w:p></w:hdr>"#;
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = docxcore::zipwrite::write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/settings.xml".into(), settings_xml.into()),
+            ("word/header1.xml".into(), header_xml.into()),
+        ]);
+        let mut s = Session::open(&bytes).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.blocks","args":{}}"#);
+        assert!(out.contains("\"protection\":\"read-only\""), "{out}");
+        assert!(out.contains("\"watermark\":\"CONFIDENTIAL\""), "{out}");
     }
 }

@@ -33,6 +33,34 @@ pub fn quote(s: &str) -> String {
     out
 }
 
+/// Standard base64 (RFC 4648, `=`-padded) — hand-rolled since `docxwasm` has a
+/// single-dependency rule (`docxcore` only, no `base64` crate). Used to carry
+/// binary payloads (PDF bytes) over `docx_ctl`'s JSON wire, e.g.
+/// `doc.export-pdf`'s internal `pdfBase64` field.
+pub fn to_base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Parsing — `docx_ctl` requests
 // ---------------------------------------------------------------------------
@@ -350,5 +378,65 @@ mod tests {
     fn rejects_malformed_json() {
         assert!(Json::parse("{").is_err());
         assert!(Json::parse("1 2").is_err());
+    }
+
+    /// Minimal decoder, test-only: proves [`to_base64`] against known vectors
+    /// and a round-trip, without adding a dependency to the production side
+    /// (which only ever needs to *emit* base64, never parse it back).
+    fn decode_b64(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            }
+        }
+        let mut out = Vec::new();
+        for chunk in s.as_bytes().chunks(4) {
+            let mut vals = [0u8; 4];
+            let mut n = 0usize;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c == b'=' {
+                    break;
+                }
+                vals[i] = val(c);
+                n += 1;
+            }
+            let x = ((vals[0] as u32) << 18)
+                | ((vals[1] as u32) << 12)
+                | ((vals[2] as u32) << 6)
+                | (vals[3] as u32);
+            if n >= 2 {
+                out.push((x >> 16) as u8);
+            }
+            if n >= 3 {
+                out.push((x >> 8) as u8);
+            }
+            if n >= 4 {
+                out.push(x as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(to_base64(b""), "");
+        assert_eq!(to_base64(b"f"), "Zg==");
+        assert_eq!(to_base64(b"fo"), "Zm8=");
+        assert_eq!(to_base64(b"foo"), "Zm9v");
+        assert_eq!(to_base64(b"foob"), "Zm9vYg==");
+        assert_eq!(to_base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(to_base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_round_trips_arbitrary_bytes() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        let encoded = to_base64(&data);
+        assert_eq!(decode_b64(&encoded), data);
     }
 }
