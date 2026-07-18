@@ -1430,12 +1430,31 @@ impl Store {
             } else {
                 sent.as_str()
             };
-            consider(&from_name, &from_addr, date, &mut agg);
+            // Dedup this message's parties by lowercased address first, so an
+            // address that appears in more than one role of the SAME message
+            // (e.g. a reply-all sender also CC'd, or a to+cc duplicate)
+            // contributes at most one increment to `frequency` for this
+            // message rather than one per role.
+            let mut seen: HashMap<String, String> = HashMap::new();
+            let mut note = |name: &str, addr: &str| {
+                let a = addr.trim().to_lowercase();
+                if a.is_empty() || !a.contains('@') {
+                    return;
+                }
+                let e = seen.entry(a).or_default();
+                if e.is_empty() && !name.trim().is_empty() {
+                    *e = name.trim().to_string();
+                }
+            };
+            note(&from_name, &from_addr);
             for r in crate::sync::outbox::parse_recipients(&to) {
-                consider(&r.name, &r.address, date, &mut agg);
+                note(&r.name, &r.address);
             }
             for r in crate::sync::outbox::parse_recipients(&cc) {
-                consider(&r.name, &r.address, date, &mut agg);
+                note(&r.name, &r.address);
+            }
+            for (addr, name) in seen {
+                consider(&name, &addr, date, &mut agg);
             }
         }
 
@@ -1890,6 +1909,47 @@ mod tests {
         let f2 = s.search_contacts("alice", 1).unwrap()[0].frequency;
         assert_eq!(f1, f2);
         assert_eq!(f1, 1); // appeared in exactly one message
+    }
+
+    #[test]
+    fn refresh_local_contacts_counts_a_multi_role_address_once() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "inbox".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        // A single message FROM Alice, TO Bob, and ALSO CC Bob (reply-all /
+        // self-CC style duplication of the same address across roles).
+        let mut m = msg("1", false);
+        m.from = Recipient {
+            name: "Alice".into(),
+            address: "alice@x.com".into(),
+        };
+        m.to = vec![Recipient {
+            name: "Bob".into(),
+            address: "bob@x.com".into(),
+        }];
+        m.cc = vec![Recipient {
+            name: "Bob".into(),
+            address: "Bob@X.com".into(), // same address, different case
+        }];
+        s.upsert_message("inbox", &m).unwrap();
+
+        s.refresh_local_contacts().unwrap();
+        let bob = s
+            .search_contacts("bob", 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        // Bob appeared in ONE message, even though he's listed in both `to`
+        // and `cc` of it — frequency counts messages, not role-appearances.
+        assert_eq!(bob.frequency, 1);
     }
 }
 
