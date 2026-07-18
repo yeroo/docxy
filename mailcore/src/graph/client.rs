@@ -467,6 +467,36 @@ impl GraphClient {
         Ok(people)
     }
 
+    /// POST `/me/messages/{id}/attachments` with an inline
+    /// `#microsoft.graph.fileAttachment` (base64 `contentBytes`). For files
+    /// ≤ 3MB; larger files go through `upload_large_attachment` (see
+    /// `add_attachment`).
+    pub fn add_file_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(message_id);
+        let path = format!("/me/messages/{id}/attachments");
+        let body = Value::Object(vec![
+            (
+                "@odata.type".to_string(),
+                Value::Str("#microsoft.graph.fileAttachment".to_string()),
+            ),
+            ("name".to_string(), Value::Str(name.to_string())),
+            (
+                "contentType".to_string(),
+                Value::Str(content_type.to_string()),
+            ),
+            ("contentBytes".to_string(), Value::Str(base64_encode(bytes))),
+        ])
+        .to_string();
+        self.send(Method::Post, &path, Some(body), &[])?;
+        Ok(())
+    }
+
     /// Builds and sends one request, applying the standard auth/accept
     /// headers plus any `extra_headers`, and maps a non-2xx result to a
     /// `GraphError`. `path` is either a path rooted at `base` (most calls)
@@ -665,11 +695,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// Standard base64 (RFC 4648 §4: `+`/`/` alphabet, `=` padding) — the encoding
 /// Graph expects for `fileAttachment.contentBytes`. The `pkce` module's
 /// base64*url* encoder can't be reused (different alphabet, no padding).
-///
-/// Not yet called from production code: the outbound-attachments task that
-/// wires this into a `fileAttachment` request body lands separately. Until
-/// then it's only exercised by `base64_encode_matches_known_vectors` below.
-#[allow(dead_code)]
+/// Used by `add_file_attachment` to encode inline attachment bytes.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1561,5 +1587,35 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(c.people().is_err());
+    }
+
+    #[test]
+    fn add_file_attachment_posts_a_file_attachment_with_base64_bytes() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments".into(),
+            status: 201,
+            headers: vec![],
+            body: r#"{"id":"att1"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.add_file_attachment("M1", "hello.txt", "text/plain", b"hello")
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent.get("@odata.type").and_then(Value::as_str),
+            Some("#microsoft.graph.fileAttachment")
+        );
+        assert_eq!(sent.get("name").and_then(Value::as_str), Some("hello.txt"));
+        assert_eq!(
+            sent.get("contentType").and_then(Value::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            sent.get("contentBytes").and_then(Value::as_str),
+            Some("aGVsbG8=") // base64("hello")
+        );
     }
 }
