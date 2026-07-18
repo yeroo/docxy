@@ -39,19 +39,27 @@
 //! | `sheet.rename` | `{sheet,name}` | `{name}` |
 //! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
+//! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
+//! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.save` | — | `{path, …}` |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
+//!
+//! `cell.get`'s reply (and every other reply built through the shared
+//! `cell_json`: `sheet.read`, `find`) additively gains a `format` object —
+//! present only when the cell's style differs from the default in at least
+//! one of the six `cell.format` keys; see [`gridcore::format::xf_format_fields`].
 
 use crate::{App, comment_author, iso_now, parse_input};
 use ctlcore::json::Json;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
+use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
 use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
 use gridcore::sheet::{
-    Cell, CellValue, DrawingKind, cell_name, fmt_general, parse_cell_name, parse_range_name,
-    sheet_to_csv,
+    Cell, CellValue, DrawingKind, Styles, cell_name, fmt_general, parse_cell_name, parse_col,
+    parse_range_name, sheet_to_csv,
 };
 
 /// The most cells one `sheet.read` returns (non-empty cells in the window);
@@ -90,6 +98,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "row.delete" => row_op(app, args, false),
         "col.insert" => col_op(app, args, true),
         "col.delete" => col_op(app, args, false),
+        "cell.format" => cell_format(app, args),
+        "col.width" => col_width(app, args),
         "wb.recalc" => {
             app.recalc_and_refresh();
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
@@ -131,6 +141,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "row.delete"
                 | "col.insert"
                 | "col.delete"
+                | "cell.format"
+                | "col.width"
         ) {
             ctlcore::signal_activity();
         }
@@ -180,8 +192,9 @@ fn sheet_list(app: &App) -> Json {
 }
 
 /// One cell as JSON: `ref`, coordinates, the typed `value`, the formula source
-/// (with `=`), and `text` (the general-format display string).
-fn cell_json(row: u32, col: u32, cell: &Cell) -> Json {
+/// (with `=`), `text` (the general-format display string), and — additively,
+/// present only when set — a `format` object (see [`format_json`]).
+fn cell_json(row: u32, col: u32, cell: &Cell, styles: &Styles) -> Json {
     let mut fields = vec![
         ("ref", Json::Str(cell_name(row, col))),
         ("row", Json::Num(row as f64)),
@@ -192,7 +205,33 @@ fn cell_json(row: u32, col: u32, cell: &Cell) -> Json {
     if let Some(f) = &cell.formula {
         fields.push(("formula", Json::Str(format!("={f}"))));
     }
+    if let Some(fmt) = format_json(styles, cell.style) {
+        fields.push(("format", fmt));
+    }
     Json::obj(fields)
+}
+
+/// The `cell.get`/`cell.format` read-back `format` object for style index
+/// `style`: only the `cell.format` patch keys whose value differs from the
+/// default style, via [`xf_format_fields`]; `None` for an unstyled cell (no
+/// `format` key on the wire at all).
+fn format_json(styles: &Styles, style: u32) -> Option<Json> {
+    let xf = styles.xf(style);
+    let fields = xf_format_fields(&xf);
+    if fields.is_empty() {
+        return None;
+    }
+    let pairs = fields
+        .into_iter()
+        .map(|(k, v)| {
+            let v = match v {
+                FormatValue::Str(s) => Json::Str(s),
+                FormatValue::Bool(b) => Json::Bool(b),
+            };
+            (k.to_string(), v)
+        })
+        .collect();
+    Some(Json::Obj(pairs))
 }
 
 fn value_json(v: &CellValue) -> Json {
@@ -235,7 +274,7 @@ fn sheet_read(app: &App, args: &Json) -> Result<Json, String> {
             truncated = true;
             break;
         }
-        cells.push(cell_json(r, c, cell));
+        cells.push(cell_json(r, c, cell, &app.pkg.workbook.styles));
     }
     Ok(Json::obj(vec![
         ("sheet", Json::Num(si as f64)),
@@ -252,7 +291,7 @@ fn cell_get(app: &App, args: &Json) -> Result<Json, String> {
     let (r, c) = ref_arg(args)?;
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
-        Some(cell) => Ok(cell_json(r, c, cell)),
+        Some(cell) => Ok(cell_json(r, c, cell, &app.pkg.workbook.styles)),
         None => Ok(Json::obj(vec![
             ("ref", Json::Str(cell_name(r, c))),
             ("row", Json::Num(r as f64)),
@@ -289,7 +328,7 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
                 if matches.len() >= FIND_CAP {
                     break 'outer;
                 }
-                let mut m = cell_json(r, c, cell);
+                let mut m = cell_json(r, c, cell, &app.pkg.workbook.styles);
                 if let Json::Obj(pairs) = &mut m {
                     pairs.insert(0, ("sheet".to_string(), Json::Num(si as f64)));
                     pairs.insert(1, ("sheet_name".to_string(), Json::Str(s.name.clone())));
@@ -553,7 +592,7 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     app.apply_on(si, vec![(r, c, cell)]);
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
-        Some(cell) => Ok(cell_json(r, c, cell)),
+        Some(cell) => Ok(cell_json(r, c, cell, &app.pkg.workbook.styles)),
         None => Ok(Json::obj(vec![("ref", Json::Str(cell_name(r, c)))])),
     }
 }
@@ -868,6 +907,108 @@ fn col_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
     });
     let key = if insert { "inserted" } else { "deleted" };
     Ok(Json::obj(vec![(key, Json::Num(count as f64))]))
+}
+
+/// Build `gridcore::format::FormatPatch`'s wire pairs from the `patch`
+/// object's own JSON values — gridcore stays JSON-free, so scalars are
+/// stringified here (`true`/`false` for booleans, the raw text for
+/// strings) and [`FormatPatch::parse`] does the actual key/value
+/// validation. Key order is preserved from the request.
+fn patch_pairs(patch: &Json) -> Result<Vec<(String, String)>, String> {
+    let Json::Obj(pairs) = patch else {
+        return Err("cell.format needs a 'patch' object".to_string());
+    };
+    Ok(pairs
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                Json::Str(s) => s.clone(),
+                Json::Bool(b) => b.to_string(),
+                Json::Num(n) => n.to_string(),
+                Json::Null | Json::Arr(_) | Json::Obj(_) => String::new(),
+            };
+            (k.clone(), text)
+        })
+        .collect())
+}
+
+/// Set `patch` over every cell in `range`, on the existing
+/// `Styles::intern`/`apply_format` path — one [`App::apply_on`] call, so the
+/// whole range lands as ONE undo group exactly like the TUI's own
+/// `apply_format`. Value/formula/spill are preserved; only each cell's style
+/// index changes.
+fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
+    let (r1, c1, r2, c2) = parse_range(rg)?;
+    let patch_arg = args.get("patch").ok_or("cell.format needs a 'patch'")?;
+    let pairs = patch_pairs(patch_arg)?;
+    let patch = FormatPatch::parse(&pairs)?;
+
+    let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let sheet = &app.pkg.workbook.sheets[si];
+        let mut v = Vec::new();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                v.push((r, c, sheet.cell(r, c).cloned()));
+            }
+        }
+        v
+    };
+    let mut changes = Vec::with_capacity(snapshot.len());
+    for (r, c, existing) in snapshot {
+        let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let base_xf = app.pkg.workbook.styles.xf(cur);
+        let new_xf = apply_patch_to_xf(&base_xf, &patch);
+        let idx = app.pkg.workbook.styles.intern(new_xf);
+        let mut cell = existing.unwrap_or_default();
+        cell.style = idx;
+        changes.push((r, c, cell));
+    }
+    let formatted = changes.len();
+    app.apply_on(si, changes);
+    Ok(Json::obj(vec![("formatted", Json::Num(formatted as f64))]))
+}
+
+/// Resolve the `col` arg — a column letter (`"C"`) or a 0-based index —
+/// mirroring [`sheet_arg`]'s index-or-name flexibility.
+fn col_arg(args: &Json) -> Result<u32, String> {
+    match args.get("col") {
+        Some(Json::Num(_)) => args
+            .get_usize("col")
+            .map(|c| c as u32)
+            .ok_or_else(|| "bad 'col' index".to_string()),
+        Some(Json::Str(s)) => {
+            let t = s.trim();
+            match parse_col(t) {
+                Some((col, used)) if used == t.len() => Ok(col),
+                _ => Err(format!("bad column '{s}'")),
+            }
+        }
+        _ => Err("col.width needs a 'col' (letter or 0-based index)".to_string()),
+    }
+}
+
+/// Set one column's display width — directly, like the TUI's own F7/F8
+/// width-adjust keys, which mutate `Sheet::set_col_width` without pushing
+/// onto the undo stack (empirically: no `self.undo.push` on that path in
+/// `main.rs`). This verb mirrors that: NOT on the undo/redo stack.
+fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let col = col_arg(args)?;
+    let width = args
+        .get("width")
+        .and_then(Json::as_f64)
+        .ok_or("col.width needs a 'width' number")?;
+    if !(width.is_finite() && width > 0.0) {
+        return Err("col.width: 'width' must be positive".to_string());
+    }
+    app.pkg.workbook.sheets[si].set_col_width(col, width);
+    app.modified = true;
+    Ok(Json::obj(vec![
+        ("col", Json::Num(col as f64)),
+        ("width", Json::Num(width)),
+    ]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,5 +2058,286 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("query"));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-2 cell.format / col.width
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cell_format_bold_and_fill_over_a_2x2_range_reports_formatted_count() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B2".into())),
+                (
+                    "patch",
+                    Json::obj(vec![
+                        ("bold", Json::Bool(true)),
+                        ("fillColor", Json::Str("#FFFF00".into())),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("formatted"), Some(4));
+    }
+
+    #[test]
+    fn cell_get_format_echoes_the_patch_on_every_formatted_cell() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B2".into())),
+                (
+                    "patch",
+                    Json::obj(vec![
+                        ("bold", Json::Bool(true)),
+                        ("fillColor", Json::Str("#FFFF00".into())),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        for r in ["A1", "A2", "B1", "B2"] {
+            let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str(r.into()))])).unwrap();
+            let fmt = g
+                .get("format")
+                .unwrap_or_else(|| panic!("{r} should carry a format"));
+            assert_eq!(fmt.get("bold").unwrap().as_bool(), Some(true));
+            assert_eq!(fmt.get_str("fillColor"), Some("#FFFF00"));
+        }
+    }
+
+    #[test]
+    fn cell_format_preserves_existing_cell_value() {
+        let mut a = app();
+        set(&mut a, "A1", "42");
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap();
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(42.0));
+        assert_eq!(
+            g.get("format").unwrap().get("bold").unwrap().as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cell_format_is_one_undo_group_and_undo_clears_the_format_key() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B2".into())),
+                (
+                    "patch",
+                    Json::obj(vec![
+                        ("bold", Json::Bool(true)),
+                        ("fillColor", Json::Str("#FFFF00".into())),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        a.undo(); // ONE undo call
+        for r in ["A1", "A2", "B1", "B2"] {
+            let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str(r.into()))])).unwrap();
+            assert!(
+                g.get("format").is_none(),
+                "{r} should have no format key after undo, got {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_get_reports_no_format_key_for_an_unstyled_cell() {
+        let mut a = app();
+        set(&mut a, "A1", "plain");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert!(g.get("format").is_none());
+    }
+
+    #[test]
+    fn cell_format_unknown_key_names_it_and_applies_nothing() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::obj(vec![("wrap", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("wrap"), "{err}");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert!(g.get("format").is_none());
+    }
+
+    #[test]
+    fn cell_format_empty_patch_errors() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("patch", Json::obj(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "patch needs at least one key");
+    }
+
+    #[test]
+    fn cell_format_bad_num_fmt_errors_and_applies_nothing() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                (
+                    "patch",
+                    Json::obj(vec![("numFmt", Json::Str("[[[not a format".into()))]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("numFmt"), "{err}");
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        assert!(g.get("format").is_none());
+    }
+
+    #[test]
+    fn cell_format_bad_color_errors() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                (
+                    "patch",
+                    Json::obj(vec![("fontColor", Json::Str("red".into()))]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("color"), "{err}");
+    }
+
+    #[test]
+    fn cell_format_align_and_numfmt_round_trip_through_cell_get() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                (
+                    "patch",
+                    Json::obj(vec![
+                        ("align", Json::Str("center".into())),
+                        ("numFmt", Json::Str("0.00%".into())),
+                        ("italic", Json::Bool(true)),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let g = cell_get(&a, &Json::obj(vec![("ref", Json::Str("A1".into()))])).unwrap();
+        let fmt = g.get("format").unwrap();
+        assert_eq!(fmt.get_str("align"), Some("center"));
+        assert_eq!(fmt.get_str("numFmt"), Some("0.00%"));
+        assert_eq!(fmt.get("italic").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn col_width_sets_and_is_readable_from_the_sheet() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("C".into())),
+                ("width", Json::Num(20.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("col"), Some(2));
+        assert_eq!(r.get("width").unwrap().as_f64(), Some(20.0));
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(2), 20.0);
+    }
+
+    #[test]
+    fn col_width_accepts_a_0_based_index_too() {
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![("col", Json::Num(4.0)), ("width", Json::Num(15.0))]),
+        )
+        .unwrap();
+        assert_eq!(a.pkg.workbook.sheets[0].col_width(4), 15.0);
+    }
+
+    #[test]
+    fn col_width_rejects_non_positive_width() {
+        let mut a = app();
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(0.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("positive"), "{err}");
+        let err = dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(-5.0)),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn col_width_is_not_on_the_undo_stack() {
+        // Empirical fact this verb mirrors: the TUI's own F7/F8 width-adjust
+        // keys mutate `Sheet::set_col_width` directly, with no `self.undo`
+        // entry. `col.width` matches that — a human's Ctrl+Z in the TUI must
+        // not touch a column width an agent (or the keyboard) just set.
+        let mut a = app();
+        let undo_depth_before = a.undo.len();
+        dispatch(
+            &mut a,
+            "col.width",
+            &Json::obj(vec![
+                ("col", Json::Str("A".into())),
+                ("width", Json::Num(20.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.undo.len(), undo_depth_before);
+        assert!(a.modified);
     }
 }

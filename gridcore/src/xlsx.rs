@@ -2718,6 +2718,47 @@ mod tests {
         assert!(!d.bold && !d.italic && d.fill.is_none() && d.align == Align::General);
     }
 
+    /// The Task-3 contract: a `cell.format`-style patch (built via
+    /// [`crate::format::FormatPatch`]/[`crate::format::apply_patch_to_xf`],
+    /// exactly as xlsxy's `control.rs` uses them) survives `save_xlsx` →
+    /// `load_xlsx` intact — not just an `Xf` authored directly.
+    #[test]
+    fn format_patch_style_round_trips_through_save_and_load() {
+        use crate::format::{FormatPatch, apply_patch_to_xf};
+        use crate::sheet::Align;
+
+        let pairs = vec![
+            ("bold".to_string(), "true".to_string()),
+            ("fillColor".to_string(), "#ABCDEF".to_string()),
+            ("align".to_string(), "center".to_string()),
+            ("numFmt".to_string(), "0.00".to_string()),
+        ];
+        let patch = FormatPatch::parse(&pairs).unwrap();
+
+        let mut pkg = new_xlsx();
+        let base = pkg.workbook.styles.xf(0);
+        let xf = apply_patch_to_xf(&base, &patch);
+        let idx = pkg.workbook.styles.intern(xf);
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                value: CellValue::Number(1.5),
+                style: idx,
+                ..Cell::default()
+            },
+        );
+
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).expect("reload format-patch styles");
+        let cell = pkg2.workbook.sheets[0].cell(0, 0).unwrap();
+        let xf2 = pkg2.workbook.styles.xf(cell.style);
+        assert!(xf2.bold);
+        assert_eq!(xf2.fill, Some((0xAB, 0xCD, 0xEF)));
+        assert_eq!(xf2.align, Align::Center);
+        assert_eq!(xf2.code.as_deref(), Some("0.00"));
+    }
+
     #[test]
     fn text_with_special_chars_round_trips() {
         let mut pkg = new_xlsx();
