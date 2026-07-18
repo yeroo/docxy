@@ -18,7 +18,10 @@ use std::io;
 use std::process::ExitCode;
 
 mod backstage;
+mod control;
+mod mcp;
 mod ribbon;
+mod skill;
 
 use backstage::{Backstage, Item, Pane};
 use ribbon::{Act, Ribbon};
@@ -55,6 +58,32 @@ const WEEKEND: Color = Color::Rgb(90, 100, 110);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running yppxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `yppxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(m) => {
@@ -389,12 +418,15 @@ struct App {
     leveled: bool,
     level: Option<Leveled>,
     // geometry recorded during draw for mouse hit-testing
-    list_y0: u16,     // absolute y of the first task row
-    list_left_w: u16, // width of the task pane (left of the gantt)
-    gantt_x0: u16,    // absolute x where the gantt inner area begins
+    list_y0: u16,       // absolute y of the first task row
+    list_left_w: u16,   // width of the task pane (left of the gantt)
+    gantt_x0: u16,      // absolute x where the gantt inner area begins
+    bs_menu: Rect,      // backstage menu items (one per row)
+    bs_list: Rect,      // backstage browser file list (row 0 = header)
+    bs_list_top: usize, // first entry index visible in bs_list
 }
 
-const RIBBON_H: u16 = 6; // tab strip (1) + body (5: border, 2 rows, separator, titles)
+const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, titles, border)
 
 impl App {
     fn new(proj: Project, path: Option<String>, vim: bool) -> App {
@@ -419,6 +451,9 @@ impl App {
             list_y0: 0,
             list_left_w: 0,
             gantt_x0: 0,
+            bs_menu: Rect::default(),
+            bs_list: Rect::default(),
+            bs_list_top: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             find_query: String::new(),
@@ -1146,6 +1181,53 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
     let mut app = App::new(proj, path, vim);
     let mut title = String::new();
 
+    // Bring up the agent control surface. Best-effort: if the config directory or
+    // the loopback bind fails, the editor runs exactly as before, just without a
+    // control channel. `ctl_server` is held for the whole session — its Drop
+    // removes the discovery file.
+    let ctl_instance = ctlcore::instance_name("yppxy");
+    let (ctl_server, ctl_rx) = match ctlcore::config_ctl_dir("yppxy") {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // One message stream drives the loop: terminal input (read on its own thread
+    // so the loop can block cheaply) and control requests. The main thread stays
+    // the sole owner of the project, so applying a request needs no locking.
+    enum Msg {
+        Term(Event),
+        Ctl(ctlcore::Request),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("yppxy-input".into())
+            .spawn(move || {
+                while let Ok(ev) = event::read() {
+                    if tx.send(Msg::Term(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    if let Some(ctl_rx) = ctl_rx {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("yppxy-ctl".into())
+            .spawn(move || {
+                for req in ctl_rx {
+                    if tx.send(Msg::Ctl(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(tx); // only the reader/forwarder threads keep the channel open now
+
     let res = loop {
         // Keep the terminal window title in sync: [* ]yppxy - filename.
         let want = window_title(&app.path, app.dirty);
@@ -1156,16 +1238,32 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
         if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
             break Err(e);
         }
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
-            Ok(Event::Mouse(m)) => on_mouse(&mut app, m),
-            Ok(_) => {}
-            Err(e) => break Err(e),
+        // Block until something arrives, then drain the queue so a burst of
+        // agent edits collapses into a single repaint.
+        let mut next = match rx.recv() {
+            Ok(m) => Some(m),
+            Err(_) => break Ok(()), // every input source is gone
+        };
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => on_key(&mut app, k),
+                Msg::Term(Event::Mouse(m)) => on_mouse(&mut app, m),
+                Msg::Term(_) => {}
+                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
+                },
+            }
+            if app.quit {
+                break;
+            }
+            next = rx.try_recv().ok();
         }
         if app.quit {
             break Ok(());
         }
     };
+    drop(ctl_server); // remove the discovery file
 
     disable_raw_mode()?;
     execute!(
@@ -1178,6 +1276,13 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
+    if app.start {
+        return; // the start screen is keyboard-driven
+    }
+    if app.backstage.is_some() {
+        bs_mouse(app, m); // don't let clicks/scroll leak to the editor behind
+        return;
+    }
     let (x, y) = (m.column, m.row);
     match m.kind {
         MouseEventKind::ScrollDown => {
@@ -1195,9 +1300,6 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.start || app.backstage.is_some() {
-                return; // modal surfaces are keyboard-driven for now
-            }
             // Ribbon area (top RIBBON_H rows).
             if y < RIBBON_H {
                 match app.ribbon.hit(x, y, true) {
@@ -1224,6 +1326,69 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                     app.sel = idx;
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+/// Mouse inside the File backstage: click a menu item to run it, click a
+/// browser row to highlight it (click it again to open), wheel to move the
+/// browser selection.
+fn bs_mouse(app: &mut App, m: MouseEvent) {
+    let (x, y) = (m.column, m.row);
+    let inside = |r: Rect| -> bool {
+        r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    };
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if inside(app.bs_menu) {
+                let idx = (y - app.bs_menu.y) as usize;
+                if let Some(&it) = backstage::ITEMS.get(idx) {
+                    if let Some(b) = app.backstage.as_mut() {
+                        b.item = it;
+                        b.pane = Pane::Menu;
+                    }
+                    app.bs_activate_item(); // same as highlighting it and pressing Enter
+                }
+                return;
+            }
+            if inside(app.bs_list) && y > app.bs_list.y {
+                // Row 0 is the "Open — <dir>" header; entries start below it.
+                let idx = app.bs_list_top + (y - app.bs_list.y - 1) as usize;
+                let Some((valid, same)) = app.backstage.as_ref().map(|b| {
+                    (
+                        idx < b.entries.len(),
+                        idx == b.sel && b.pane == Pane::Browser,
+                    )
+                }) else {
+                    return;
+                };
+                if !valid {
+                    return;
+                }
+                if let Some(b) = app.backstage.as_mut() {
+                    b.pane = Pane::Browser;
+                    b.sel = idx;
+                }
+                if same {
+                    // Second click on the highlighted row activates it.
+                    let opened = app.backstage.as_mut().and_then(|b| b.enter());
+                    match opened {
+                        Some(path) => app.open_file(&path.to_string_lossy()),
+                        None => app.bs_update_preview(),
+                    }
+                } else {
+                    app.bs_update_preview();
+                }
+            }
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(app.bs_list) => {
+            let down = matches!(m.kind, MouseEventKind::ScrollDown);
+            if let Some(b) = app.backstage.as_mut() {
+                b.pane = Pane::Browser;
+                b.move_sel(down);
+            }
+            app.bs_update_preview();
         }
         _ => {}
     }
@@ -1581,7 +1746,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // ribbon tab strip
-            Constraint::Length(5), // ribbon body (border, 2 rows, separator, titles)
+            Constraint::Length(6), // ribbon body (border, 2 rows, separator, titles, border)
             Constraint::Length(1), // project header
             Constraint::Min(3),    // tasks | gantt
             Constraint::Length(1), // status / hint
@@ -1631,7 +1796,11 @@ fn draw_start(f: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
+fn draw_backstage(f: &mut Frame, area: Rect, app: &mut App) {
+    // Geometry for mouse hit-testing: reset each frame, filled in below.
+    app.bs_menu = Rect::default();
+    app.bs_list = Rect::default();
+    app.bs_list_top = 0;
     let Some(bs) = app.backstage.as_ref() else {
         return;
     };
@@ -1657,11 +1826,16 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
         menu.push(Line::from(Span::styled(format!(" {} ", it.label()), style)));
     }
     f.render_widget(Paragraph::new(menu), cols[0]);
+    let menu_rect = Rect {
+        height: cols[0].height.min(backstage::ITEMS.len() as u16),
+        ..cols[0]
+    };
 
     // Right: content depends on the pane / item.
     let body = cols[1];
+    let mut browser_geom: Option<(Rect, usize)> = None;
     match bs.pane {
-        Pane::Browser => draw_bs_browser(f, body, bs),
+        Pane::Browser => browser_geom = Some(draw_bs_browser(f, body, bs)),
         Pane::SaveAs => {
             let dir = bs.dir.to_string_lossy();
             let lines = vec![
@@ -1686,7 +1860,7 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
         }
         Pane::Menu | Pane::Preview => {
             if bs.item == Item::Open {
-                draw_bs_browser(f, body, bs);
+                browser_geom = Some(draw_bs_browser(f, body, bs));
             } else if bs.item == Item::Info || bs.pane == Pane::Preview {
                 let lines: Vec<Line> = bs.preview.iter().map(|s| Line::from(s.clone())).collect();
                 f.render_widget(Paragraph::new(lines), body);
@@ -1718,9 +1892,16 @@ fn draw_backstage(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+    app.bs_menu = menu_rect;
+    if let Some((list, top)) = browser_geom {
+        app.bs_list = list;
+        app.bs_list_top = top;
+    }
 }
 
-fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) {
+/// Returns the file-list rect and the index of its first visible entry, for
+/// mouse hit-testing.
+fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) -> (Rect, usize) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1769,6 +1950,7 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) {
         Paragraph::new(prev).block(Block::default().borders(Borders::LEFT)),
         cols[1],
     );
+    (cols[0], start)
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {

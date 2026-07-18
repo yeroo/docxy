@@ -26,7 +26,7 @@ mailcore = { version = "0.1.0", path = "../mailcore" }
 editcore = { version = "0.1.0", path = "../editcore" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
 # live mailbox from a sibling agwinterm pane.
-ctlcore = { version = "0.3.0", path = "../ctlcore" }
+ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
 ratatui = "0.29"
 # Display-column widths for correct alignment + truncation with wide glyphs.

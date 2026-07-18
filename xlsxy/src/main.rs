@@ -16,9 +16,13 @@ use std::process::ExitCode;
 use std::time::SystemTime;
 
 mod backstage;
+mod control;
+mod mcp;
 mod ribbon;
+mod skill;
 
 use gridcore::comments::Comment;
+use gridcore::edit::parse_input;
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
@@ -51,6 +55,32 @@ use ratatui_image::{Image, Resize};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running xlsxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `xlsxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -353,7 +383,9 @@ fn print_usage() {
            xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
-           xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n\n\
+           xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
+           xlsxy --mcp                      run the MCP bridge to drive a live xlsxy\n  \
+           xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \
            type to replace · F2 edit in place · = starts a formula\n  \
            Enter/Tab commit (move down/right) · Esc cancel · Del clear\n  \
@@ -869,6 +901,15 @@ struct App {
     vis_rows: Vec<u32>,             // sheet row per screen line (freeze-aware)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
+    // Backstage (File) geometry + click tracking, captured during draw for mouse
+    // hit-testing.
+    bs_menu_rect: Rect,
+    bs_list_rect: Rect,
+    bs_list_top: usize,
+    bs_preview_rect: Rect,
+    bs_name_rect: Rect,
+    /// Last file-list click (entry index + time) for double-click-to-open.
+    bs_click: Option<(usize, std::time::Instant)>,
 }
 
 impl App {
@@ -933,6 +974,12 @@ impl App {
             vis_rows: Vec::new(),
             tab_spans: Vec::new(),
             ribbon_rows: 1,
+            bs_menu_rect: Rect::default(),
+            bs_list_rect: Rect::default(),
+            bs_list_top: 0,
+            bs_preview_rect: Rect::default(),
+            bs_name_rect: Rect::default(),
+            bs_click: None,
         }
     }
 
@@ -1021,19 +1068,25 @@ impl App {
         self.edit = None;
     }
 
-    /// Apply cell changes as one undo group, through the engine.
+    /// Apply cell changes to the current sheet as one undo group.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
+        self.apply_on(self.sheet, changes);
+    }
+
+    /// Apply cell changes to sheet `sheet_idx` as one undo group, through the
+    /// engine. This is the shared edit path for keyboard edits (via [`Self::apply`])
+    /// and agent control edits (which may target a non-active sheet).
+    fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) {
         if changes.is_empty() {
             return;
         }
         self.engine.clock = now_serial();
-        let sheet_idx = self.sheet;
         let mut group = UndoGroup {
             sheet: sheet_idx,
             changes: Vec::with_capacity(changes.len()),
         };
         for (r, c, cell) in changes {
-            let before = self.sheet().cell(r, c).cloned();
+            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
             let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
@@ -2721,6 +2774,96 @@ impl App {
         false
     }
 
+    /// Route a mouse event to the File backstage. Returns true to exit (e.g. a
+    /// click on the Exit menu item). Menu items activate on a single click; file
+    /// rows select on a single click and open on a double click.
+    fn backstage_mouse(&mut self, m: MouseEvent) -> bool {
+        use backstage::{Item, Pane};
+        let hit = |r: Rect, col: u16, row: u16| {
+            r.height > 0 && row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width
+        };
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = matches!(m.kind, MouseEventKind::ScrollDown);
+                let in_prev = hit(self.bs_preview_rect, m.column, m.row);
+                if let Some(bs) = &mut self.backstage {
+                    if in_prev && !bs.preview.is_empty() {
+                        bs.preview_scroll = if down {
+                            (bs.preview_scroll + 3).min(bs.preview.len().saturating_sub(1))
+                        } else {
+                            bs.preview_scroll.saturating_sub(3)
+                        };
+                    } else if !bs.entries.is_empty() {
+                        // The list view follows the selection, so scrolling moves it.
+                        for _ in 0..3 {
+                            bs.move_sel(down);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (col, row) = (m.column, m.row);
+                // 1) Left menu — single click selects and activates the item.
+                if hit(self.bs_menu_rect, col, row) {
+                    let idx = (row - self.bs_menu_rect.y) as usize;
+                    if idx < backstage::ITEMS.len() {
+                        if let Some(bs) = &mut self.backstage {
+                            bs.item = backstage::ITEMS[idx];
+                            bs.pane = Pane::Menu;
+                            bs.preview_path = None;
+                        }
+                        return self.bs_activate_item();
+                    }
+                    return false;
+                }
+                // 2) Save As name field — clicking focuses it for typing.
+                if hit(self.bs_name_rect, col, row) {
+                    if let Some(bs) = &mut self.backstage {
+                        bs.name_focus = true;
+                    }
+                    return false;
+                }
+                // 3) File list — single click selects, double click opens/enters.
+                if hit(self.bs_list_rect, col, row) {
+                    let idx = self.bs_list_top + (row - self.bs_list_rect.y) as usize;
+                    let now = std::time::Instant::now();
+                    let dbl = matches!(self.bs_click, Some((i, t))
+                        if i == idx && now.duration_since(t) < std::time::Duration::from_millis(500));
+                    self.bs_click = Some((idx, now));
+                    let mut open_path = None;
+                    if let Some(bs) = &mut self.backstage {
+                        if idx < bs.entries.len() {
+                            if bs.pane == Pane::SaveAs {
+                                bs.name_focus = false;
+                            } else {
+                                bs.pane = Pane::Browser;
+                            }
+                            bs.sel = idx;
+                            if dbl {
+                                open_path = bs.enter();
+                            }
+                        }
+                    }
+                    if let Some(p) = open_path {
+                        let p = p.to_string_lossy().into_owned();
+                        self.open_workbook(&p);
+                    }
+                    return false;
+                }
+                // 4) Preview pane — clicking focuses it so the wheel/keys scroll it.
+                if hit(self.bs_preview_rect, col, row) {
+                    if let Some(bs) = &mut self.backstage {
+                        if bs.item != Item::Info && bs.pane == Pane::Browser {
+                            bs.pane = Pane::Preview;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     /// Save As pane: type a name (or browse to a folder) then commit.
     fn bs_saveas_key(&mut self, code: KeyCode) -> bool {
         use backstage::Pane;
@@ -3547,52 +3690,6 @@ impl App {
     }
 }
 
-/// Interpret typed input as Excel would: formulas, numbers (incl. percent),
-/// booleans, error constants, text.
-fn parse_input(text: &str) -> Cell {
-    if let Some(body) = text.strip_prefix('=') {
-        if !body.is_empty() {
-            return Cell::formula(body);
-        }
-    }
-    if text.is_empty() {
-        return Cell::default();
-    }
-    let t = text.trim();
-    if let Ok(n) = t.parse::<f64>() {
-        if n.is_finite() {
-            return Cell::number(n);
-        }
-    }
-    if let Some(pct) = t.strip_suffix('%') {
-        if let Ok(n) = pct.trim().parse::<f64>() {
-            let v = n / 100.0;
-            if v.is_finite() {
-                return Cell::number(v);
-            }
-        }
-    }
-    if t.eq_ignore_ascii_case("TRUE") {
-        return Cell {
-            value: CellValue::Bool(true),
-            ..Cell::default()
-        };
-    }
-    if t.eq_ignore_ascii_case("FALSE") {
-        return Cell {
-            value: CellValue::Bool(false),
-            ..Cell::default()
-        };
-    }
-    if gridcore::formula::ExcelError::from_code(t).is_some() {
-        return Cell {
-            value: CellValue::Error(t.to_ascii_uppercase()),
-            ..Cell::default()
-        };
-    }
-    Cell::text(text)
-}
-
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
@@ -3624,7 +3721,7 @@ fn draw(app: &mut App, f: &mut Frame) {
     app.ribbon.set_toggles(toggles);
     let engaged = app.ribbon_focus != ribbon::Focus::None;
     let ribbon_h: u16 = if engaged {
-        7
+        8 // tab strip + closed body box (6) + hint bar
     } else if app.auto_hide_ribbon {
         0 // auto-hide reclaims the tab strip line for the grid
     } else {
@@ -3641,8 +3738,8 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     if engaged {
         let body = app.ribbon.render_body(app.ribbon_focus);
-        f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 5));
-        y += 5;
+        f.render_widget(Paragraph::new(body), Rect::new(area.x, y, area.width, 6));
+        y += 6;
         f.render_widget(
             Paragraph::new(app.ribbon.render_hint(app.ribbon_focus, area.width)),
             Rect::new(area.x, y, area.width, 1),
@@ -4175,7 +4272,7 @@ fn draw_start_screen(app: &App, f: &mut Frame, area: Rect) {
 
 /// The File backstage: a left menu, plus a folder browser + workbook preview
 /// (or the Info screen).
-fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
+fn draw_backstage(app: &mut App, f: &mut Frame, area: Rect) {
     use backstage::{Item, Pane};
     let Some(bs) = &app.backstage else { return };
     f.render_widget(Clear, area);
@@ -4211,16 +4308,17 @@ fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
     );
 
     let right = Rect::new(area.x + menu_w + 1, body_y, area.width - menu_w - 1, body_h);
-    if bs.item == Item::Info {
+    let (list_rect, list_top, preview_rect, name_rect) = if bs.item == Item::Info {
         draw_bs_info(app, f, right);
+        (Rect::default(), 0usize, Rect::default(), Rect::default())
     } else {
-        draw_bs_browser(f, right, bs);
-    }
+        draw_bs_browser(f, right, bs)
+    };
 
     let hint = match bs.pane {
-        Pane::Menu => "↑↓ menu · Enter choose · Esc close",
-        Pane::Browser => "↑↓ files · Enter open · ← up · Tab menu · Esc back",
-        Pane::Preview => "↑↓ scroll · Esc back",
+        Pane::Menu => "↑↓/click menu · Enter choose · Esc close",
+        Pane::Browser => "↑↓/click files · Enter/2×click open · ← up · Tab menu · Esc back",
+        Pane::Preview => "↑↓/wheel scroll · Esc back",
         Pane::SaveAs => "type name · Tab switch field · Enter save · Esc back",
     };
     f.render_widget(
@@ -4230,6 +4328,19 @@ fn draw_backstage(app: &App, f: &mut Frame, area: Rect) {
         )),
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
     );
+
+    // Record on-screen geometry so mouse clicks can be hit-tested. The `bs`
+    // borrow ends at the hint match above, freeing `app` for these writes.
+    app.bs_menu_rect = Rect::new(
+        area.x,
+        body_y,
+        menu_w,
+        (backstage::ITEMS.len() as u16).min(body_h),
+    );
+    app.bs_list_rect = list_rect;
+    app.bs_list_top = list_top;
+    app.bs_preview_rect = preview_rect;
+    app.bs_name_rect = name_rect;
 }
 
 fn draw_bs_info(app: &App, f: &mut Frame, area: Rect) {
@@ -4264,7 +4375,15 @@ fn draw_bs_info(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
+/// Renders the Open/Save-As browser and returns the geometry needed for mouse
+/// hit-testing: `(file_list, first_visible_entry, preview, saveas_name_field)`.
+/// Rects are `Rect::default()` (zero height) when the corresponding element is
+/// not shown.
+fn draw_bs_browser(
+    f: &mut Frame,
+    area: Rect,
+    bs: &backstage::Backstage,
+) -> (Rect, usize, Rect, Rect) {
     use backstage::Pane;
     let list_w = (area.width * 4 / 10).clamp(18, area.width.saturating_sub(10));
     let mut y = area.y;
@@ -4278,18 +4397,20 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
     );
     y += 1;
     // Save As name field.
+    let mut name_rect = Rect::default();
     if bs.pane == Pane::SaveAs {
         let field_style = if bs.name_focus {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
             Style::new()
         };
+        name_rect = Rect::new(area.x, y, list_w, 1);
         f.render_widget(
             Paragraph::new(RLine::from(vec![
                 RSpan::styled("name: ", Style::new().add_modifier(Modifier::DIM)),
                 RSpan::styled(bs.name_input.clone(), field_style),
             ])),
-            Rect::new(area.x, y, list_w, 1),
+            name_rect,
         );
         y += 1;
     }
@@ -4346,6 +4467,8 @@ fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &backstage::Backstage) {
         plines.push(RLine::from(RSpan::raw(fit(l, prev.width as usize, false))));
     }
     f.render_widget(Paragraph::new(plines), prev);
+
+    (list, top, prev, name_rect)
 }
 
 /// The sheet-picker popup: every sheet, the highlighted one selected.
@@ -4849,10 +4972,7 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
         Event::Key(key) => handle_key(app, key),
-        Event::Mouse(m) => {
-            handle_mouse(app, m);
-            false
-        }
+        Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => false,
         _ => false,
     }
@@ -5251,7 +5371,12 @@ fn char_index(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn handle_mouse(app: &mut App, m: MouseEvent) {
+fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // The File backstage is a full-screen surface: it owns the mouse while open,
+    // so clicks never leak through to the grid underneath.
+    if app.backstage.is_some() {
+        return app.backstage_mouse(m);
+    }
     match m.kind {
         MouseEventKind::ScrollUp => {
             app.top = app.top.saturating_sub(3);
@@ -5278,7 +5403,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     }
                     ribbon::Hit::Outside => {}
                 }
-                return;
+                return false;
             }
             // Sheet tabs live on the line right below the grid.
             let tabs_y = app.grid_area.y + app.grid_area.height;
@@ -5290,15 +5415,15 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                         } else if i != app.sheet {
                             app.goto_sheet(i);
                         }
-                        return;
+                        return false;
                     }
                 }
-                return;
+                return false;
             }
             // Grid?
             let g = app.grid_area;
             if m.row < g.y || m.row >= g.y + g.height || m.column < g.x + app.gutter_w {
-                return;
+                return false;
             }
             // Map the screen line to a sheet row via the freeze-aware table.
             let vy = (m.row - g.y) as usize;
@@ -5315,11 +5440,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     break;
                 }
             }
-            let Some(col) = col else { return };
+            let Some(col) = col else { return false };
             if app.edit.is_some() {
                 // Clicking outside while editing commits first.
                 if !app.commit_edit() {
-                    return;
+                    return false;
                 }
             }
             if drag {
@@ -5336,6 +5461,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         _ => {}
     }
+    false
 }
 
 /// Only http/https links may be opened, and only via a direct process exec (no
@@ -5396,8 +5522,56 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
     let mut last_title = String::new();
+
+    // Bring up the agent control surface. Best-effort: if the config directory or
+    // the loopback bind fails, the editor runs exactly as before, just without a
+    // control channel. `ctl_server` is held for the whole session — its Drop
+    // removes the discovery file.
+    let ctl_instance = ctlcore::instance_name("xlsxy");
+    let (ctl_server, ctl_rx) = match ctlcore::config_ctl_dir("xlsxy") {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // One message stream drives the loop: terminal input (read on its own thread
+    // so the loop can block cheaply) and control requests. The main thread stays
+    // the sole owner of the workbook, so applying a request needs no locking.
+    enum Msg {
+        Term(Event),
+        Ctl(ctlcore::Request),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("xlsxy-input".into())
+            .spawn(move || {
+                while let Ok(ev) = event::read() {
+                    if tx.send(Msg::Term(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    if let Some(ctl_rx) = ctl_rx {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("xlsxy-ctl".into())
+            .spawn(move || {
+                for req in ctl_rx {
+                    if tx.send(Msg::Ctl(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(tx); // only the reader/forwarder threads keep the channel open now
+
     let result = loop {
-        // Reflect the file + dirty state in the terminal window title.
+        // Reflect the file + unsaved state in the terminal window title.
         let title = window_title("xlsxy", &app.path, app.modified);
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
@@ -5406,50 +5580,37 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
         if let Err(e) = terminal.draw(|f| draw(&mut app, f)) {
             break Err(e);
         }
-        // Same frame pacing as docxy: batch fast input into ~30fps redraws,
-        // block when idle.
-        let drawn = std::time::Instant::now();
-        let frame = std::time::Duration::from_millis(33);
+
+        // Block until something arrives (no busy polling), then drain anything
+        // already queued so a burst — fast scrolling, or a run of agent edits —
+        // collapses into a single repaint.
+        let mut next = match rx.recv() {
+            Ok(m) => Some(m),
+            Err(_) => break Ok(()), // every input source is gone
+        };
         let mut quit = false;
-        let mut got_event = false;
-        let mut err = None;
-        loop {
-            let timeout = if got_event {
-                match frame.checked_sub(drawn.elapsed()) {
-                    Some(rem) if !rem.is_zero() => rem,
-                    _ => break,
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Term(ev) => {
+                    if handle_event(&mut app, ev) {
+                        quit = true;
+                    }
                 }
-            } else {
-                std::time::Duration::from_secs(3600)
-            };
-            match event::poll(timeout) {
-                Ok(false) => break,
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        got_event = true;
-                        if handle_event(&mut app, ev) {
-                            quit = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
-                    }
+                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
                 },
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
             }
-        }
-        if let Some(e) = err {
-            break Err(e);
+            if quit {
+                break;
+            }
+            next = rx.try_recv().ok();
         }
         if quit {
             break Ok(());
         }
     };
+    drop(ctl_server); // remove the discovery file
 
     app.save_view_prefs();
     disable_raw_mode()?;
@@ -5652,6 +5813,87 @@ mod tests {
         assert_eq!(app.path, "untitled.xlsx");
         assert!(app.sheet().cell(0, 0).is_none());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn backstage_mouse_selects_and_opens() {
+        // A temp folder holding one saved workbook.
+        let dir = std::env::temp_dir().join("xlsxy_bs_mouse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.xlsx");
+        {
+            let mut src = App::new(new_xlsx(), file.to_str().unwrap());
+            src.os_clip = None;
+            src.start_edit(Some('9'));
+            assert!(src.commit_edit());
+            src.save();
+        }
+
+        let mut app = App::new(new_xlsx(), "other.xlsx");
+        app.os_clip = None;
+        app.backstage = Some(backstage::Backstage::open(dir.clone()));
+
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // The left menu is rendered at x=0, first item at y=2. "Open" is item 1.
+        app.bs_menu_rect = Rect::new(0, 2, 16, backstage::ITEMS.len() as u16);
+        assert!(!app.backstage_mouse(click(3, 3))); // click "Open"
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Browser
+        );
+
+        // Entries: ".." (parent) then "a.xlsx". The list lives in the right pane
+        // (x past the 16-wide menu), starting at y=4.
+        app.bs_list_rect = Rect::new(18, 4, 18, 10);
+        app.bs_list_top = 0;
+        let a_idx = app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.name == "a.xlsx")
+            .unwrap();
+        let a_row = 4 + a_idx as u16;
+
+        // Single click selects but does not open.
+        assert!(!app.backstage_mouse(click(20, a_row)));
+        assert_eq!(app.backstage.as_ref().unwrap().sel, a_idx);
+        assert_eq!(app.path, "other.xlsx");
+
+        // A second click on the same row (double click) opens it.
+        assert!(!app.backstage_mouse(click(20, a_row)));
+        assert!(app.backstage.is_none());
+        assert_eq!(app.path, file.to_str().unwrap());
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(9.0))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backstage_mouse_exit_item_quits() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.backstage = Some(backstage::Backstage::open(std::env::temp_dir()));
+        app.bs_menu_rect = Rect::new(0, 2, 16, backstage::ITEMS.len() as u16);
+        // "Exit" is the last item; on an unmodified workbook it exits the app.
+        let exit_row = 2 + (backstage::ITEMS.len() as u16 - 1);
+        assert!(app.backstage_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: exit_row,
+            modifiers: KeyModifiers::empty(),
+        }));
     }
 
     #[test]

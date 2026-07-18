@@ -1,4 +1,5 @@
-// Docxy VS Code extension — a binary custom editor for Word `.docx` files.
+// Offxy VS Code extension — binary custom editors for Office files (currently
+// Word `.docx`; more formats register via the `EDITORS` table below).
 //
 // Architecture: the whole DOCX engine (parse → render → edit → lossless save) is
 // a WebAssembly build of the dependency-free `docxcore` Rust crate, and it runs
@@ -11,19 +12,131 @@
 
 import * as vscode from 'vscode';
 import { docxToMarkdown, markdownToDocx } from './engine';
+import { newWorkbook } from './gridengine';
 
 export function activate(context: vscode.ExtensionContext): void {
-  context.subscriptions.push(DocxyEditorProvider.register(context));
+  context.subscriptions.push(register(context));
 }
 
 export function deactivate(): void {
   /* nothing to clean up */
 }
 
-/** A live `.docx` document. The authoritative content lives in the webview's
- *  wasm session; this object just holds identity plus the on-disk bytes needed
- *  to (re)open, and coordinates request/response with its webview. */
-class DocxDocument implements vscode.CustomDocument {
+/** Describes one binary custom-editor registration. Each entry in `EDITORS`
+ *  spins up its own `OffxyEditorProvider` instance bound to these assets. */
+interface EditorSpec {
+  /** Custom-editor view type, e.g. `'offxy.docxEditor'`. */
+  viewType: string;
+  /** Human-readable name used in messages (e.g. "Word document"). */
+  label: string;
+  /** `media/` script file name. */
+  script: string;
+  /** `media/` stylesheet file name. */
+  style: string;
+  /** `media/` wasm file name. */
+  wasm: string;
+  /** Modal body text offered when a 0-byte file of this type is opened. May
+   *  contain the literal substring `{name}`, which is replaced with the
+   *  file's basename before display. */
+  emptyPrompt?: string;
+  /** Mint a fresh empty document's bytes for the empty-file create flow (both
+   *  the open-time modal and the webview's in-tab `createNew` message). */
+  mintEmpty?: (context: vscode.ExtensionContext) => Promise<Uint8Array>;
+}
+
+const EDITORS: EditorSpec[] = [
+  {
+    viewType: 'offxy.docxEditor',
+    label: 'Word document',
+    script: 'webview.js',
+    style: 'webview.css',
+    wasm: 'docxwasm.wasm',
+    emptyPrompt:
+      '“{name}” is empty — it isn\'t a Word document yet. Create a new Word document in its place?',
+    mintEmpty: (ctx) => markdownToDocx(ctx, ''),
+  },
+  {
+    viewType: 'offxy.gridEditor',
+    label: 'Excel workbook',
+    script: 'grid.js',
+    style: 'grid.css',
+    wasm: 'gridwasm.wasm',
+    emptyPrompt:
+      '“{name}” is empty — it isn\'t an Excel workbook yet. Create a new workbook in its place?',
+    mintEmpty: (ctx) => newWorkbook(ctx),
+  },
+];
+
+function register(context: vscode.ExtensionContext): vscode.Disposable {
+  const disposables: vscode.Disposable[] = [];
+  let docxProvider: OffxyEditorProvider | undefined;
+
+  for (const spec of EDITORS) {
+    const provider = new OffxyEditorProvider(context, spec);
+    disposables.push(
+      vscode.window.registerCustomEditorProvider(spec.viewType, provider, {
+        // enableFindWidget lets Ctrl+F search the rendered document text (it's
+        // real DOM text in the webview) with no extra code.
+        webviewOptions: { retainContextWhenHidden: true, enableFindWidget: true },
+        supportsMultipleEditorsPerDocument: false,
+      }),
+    );
+    if (spec.viewType === 'offxy.docxEditor') {
+      docxProvider = provider;
+    }
+  }
+
+  if (docxProvider) {
+    // Register the command-palette actions once; each posts a bridge command
+    // string (tab-delimited) to the active panel's webview.
+    const COMMANDS: Array<[string, string]> = [
+      ['offxy.toggleBold', 'bold'],
+      ['offxy.toggleItalic', 'italic'],
+      ['offxy.toggleUnderline', 'underline'],
+      ['offxy.toggleStrike', 'strike'],
+      ['offxy.heading1', 'heading\t1'],
+      ['offxy.heading2', 'heading\t2'],
+      ['offxy.heading3', 'heading\t3'],
+      ['offxy.normalStyle', 'heading\t0'],
+      ['offxy.bulletList', 'list\tbullet'],
+      ['offxy.numberedList', 'list\tnumber'],
+      ['offxy.alignLeft', 'align\tleft'],
+      ['offxy.alignCenter', 'align\tcenter'],
+      ['offxy.alignRight', 'align\tright'],
+      ['offxy.alignJustify', 'align\tjustify'],
+      ['offxy.fontBigger', 'fontsize\t2'],
+      ['offxy.fontSmaller', 'fontsize\t-2'],
+    ];
+    for (const [cmd, op] of COMMANDS) {
+      disposables.push(
+        vscode.commands.registerCommand(cmd, () => {
+          docxProvider!.activePanel?.webview.postMessage({ type: 'command', op });
+        }),
+      );
+    }
+    // Replace… prompts for the terms, then drives the engine's replace-all.
+    disposables.push(
+      vscode.commands.registerCommand('offxy.replace', () => docxProvider!.runReplace()),
+    );
+    // Markdown ⇄ docx conversion (runs the wasm in the extension host).
+    disposables.push(
+      vscode.commands.registerCommand('offxy.convertMarkdown', (uri?: vscode.Uri) =>
+        convertMarkdownToDocx(context, uri),
+      ),
+      vscode.commands.registerCommand('offxy.exportMarkdown', () =>
+        docxProvider!.runExportMarkdown(context),
+      ),
+    );
+  }
+
+  return vscode.Disposable.from(...disposables);
+}
+
+/** A live binary document (`.docx`, and eventually other formats). The
+ *  authoritative content lives in the webview's wasm session; this object
+ *  just holds identity plus the on-disk bytes needed to (re)open, and
+ *  coordinates request/response with its webview. */
+class BinaryDocument implements vscode.CustomDocument {
   private readonly pending = new Map<number, (value: Uint8Array) => void>();
   private reqSeq = 0;
   /** Set once the editor panel is resolved; used to message the webview. */
@@ -41,7 +154,7 @@ class DocxDocument implements vscode.CustomDocument {
   }
 
   /** Ask the webview to serialize the current document and resolve with the
-   *  resulting `.docx` bytes. */
+   *  resulting bytes. */
   requestBytes(): Promise<Uint8Array> {
     const panel = this.panel;
     if (!panel) {
@@ -66,77 +179,21 @@ class DocxDocument implements vscode.CustomDocument {
   }
 }
 
-class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
-  private static readonly viewType = 'docxy.docxEditor';
-
-  /** The most recently focused Docxy panel, so command-palette actions target
-   *  the editor the user is looking at. */
-  private activePanel?: vscode.WebviewPanel;
+class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument> {
+  /** The most recently focused panel for this editor, so command-palette
+   *  actions target the editor the user is looking at. */
+  activePanel?: vscode.WebviewPanel;
   /** Panel → its document, so commands can reach the active document's bytes. */
-  private readonly panelDocs = new Map<vscode.WebviewPanel, DocxDocument>();
+  private readonly panelDocs = new Map<vscode.WebviewPanel, BinaryDocument>();
 
-  private get activeDocument(): DocxDocument | undefined {
+  private get activeDocument(): BinaryDocument | undefined {
     return this.activePanel ? this.panelDocs.get(this.activePanel) : undefined;
   }
 
-  static register(context: vscode.ExtensionContext): vscode.Disposable {
-    const provider = new DocxyEditorProvider(context);
-    const disposables: vscode.Disposable[] = [
-      vscode.window.registerCustomEditorProvider(
-        DocxyEditorProvider.viewType,
-        provider,
-        {
-          // enableFindWidget lets Ctrl+F search the rendered document text (it's
-          // real DOM text in the webview) with no extra code.
-          webviewOptions: { retainContextWhenHidden: true, enableFindWidget: true },
-          supportsMultipleEditorsPerDocument: false,
-        },
-      ),
-    ];
-    // Register the command-palette actions once; each posts a bridge command
-    // string (tab-delimited) to the active panel's webview.
-    const COMMANDS: Array<[string, string]> = [
-      ['docxy.toggleBold', 'bold'],
-      ['docxy.toggleItalic', 'italic'],
-      ['docxy.toggleUnderline', 'underline'],
-      ['docxy.toggleStrike', 'strike'],
-      ['docxy.heading1', 'heading\t1'],
-      ['docxy.heading2', 'heading\t2'],
-      ['docxy.heading3', 'heading\t3'],
-      ['docxy.normalStyle', 'heading\t0'],
-      ['docxy.bulletList', 'list\tbullet'],
-      ['docxy.numberedList', 'list\tnumber'],
-      ['docxy.alignLeft', 'align\tleft'],
-      ['docxy.alignCenter', 'align\tcenter'],
-      ['docxy.alignRight', 'align\tright'],
-      ['docxy.alignJustify', 'align\tjustify'],
-      ['docxy.fontBigger', 'fontsize\t2'],
-      ['docxy.fontSmaller', 'fontsize\t-2'],
-    ];
-    for (const [cmd, op] of COMMANDS) {
-      disposables.push(
-        vscode.commands.registerCommand(cmd, () => {
-          provider.activePanel?.webview.postMessage({ type: 'command', op });
-        }),
-      );
-    }
-    // Replace… prompts for the terms, then drives the engine's replace-all.
-    disposables.push(
-      vscode.commands.registerCommand('docxy.replace', () => provider.runReplace()),
-    );
-    // Markdown ⇄ docx conversion (runs the wasm in the extension host).
-    disposables.push(
-      vscode.commands.registerCommand('docxy.convertMarkdown', (uri?: vscode.Uri) =>
-        convertMarkdownToDocx(context, uri),
-      ),
-      vscode.commands.registerCommand('docxy.exportMarkdown', () =>
-        provider.runExportMarkdown(context),
-      ),
-    );
-    return vscode.Disposable.from(...disposables);
-  }
-
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly spec: EditorSpec,
+  ) {}
 
   /** Prompt for find/replace terms and apply replace-all in the active editor. */
   async runReplace(): Promise<void> {
@@ -166,21 +223,21 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   // --- edit / dirty / undo-redo plumbing ------------------------------------
 
   private readonly _onDidChange =
-    new vscode.EventEmitter<vscode.CustomDocumentEditEvent<DocxDocument>>();
+    new vscode.EventEmitter<vscode.CustomDocumentEditEvent<BinaryDocument>>();
   readonly onDidChangeCustomDocument = this._onDidChange.event;
 
   // --- document lifecycle ---------------------------------------------------
 
-  async openCustomDocument(uri: vscode.Uri): Promise<DocxDocument> {
+  async openCustomDocument(uri: vscode.Uri): Promise<BinaryDocument> {
     const content =
       uri.scheme === 'untitled'
         ? new Uint8Array()
         : await vscode.workspace.fs.readFile(uri);
-    return new DocxDocument(uri, content);
+    return new BinaryDocument(uri, content);
   }
 
   async resolveCustomEditor(
-    document: DocxDocument,
+    document: BinaryDocument,
     panel: vscode.WebviewPanel,
   ): Promise<void> {
     document.panel = panel;
@@ -233,17 +290,17 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
 
   /** Send the document bytes to the webview. A 0-byte file (e.g. created via
    *  the explorer's "New File…") can't be parsed as OOXML, so offer to seed it
-   *  with a fresh empty Word document instead. */
+   *  with a fresh empty document instead. */
   private async openInWebview(
-    document: DocxDocument,
+    document: BinaryDocument,
     panel: vscode.WebviewPanel,
   ): Promise<void> {
-    if (document.initialContent.length === 0) {
-      const pick = await vscode.window.showInformationMessage(
-        `“${basename(document.uri)}” is empty — it isn't a Word document yet. Create a new Word document in its place?`,
-        { modal: true },
-        'Create',
+    if (document.initialContent.length === 0 && this.spec.mintEmpty) {
+      const prompt = (this.spec.emptyPrompt ?? '“{name}” is empty. Create a new document in its place?').replace(
+        '{name}',
+        basename(document.uri),
       );
+      const pick = await vscode.window.showInformationMessage(prompt, { modal: true }, 'Create');
       if (pick === 'Create') {
         await this.seedNewDocument(document);
       }
@@ -254,9 +311,12 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
     });
   }
 
-  /** Mint a fresh empty Word document and write it over the (empty) file. */
-  private async seedNewDocument(document: DocxDocument): Promise<void> {
-    const bytes = await markdownToDocx(this.context, '');
+  /** Mint a fresh empty document and write it over the (empty) file. */
+  private async seedNewDocument(document: BinaryDocument): Promise<void> {
+    if (!this.spec.mintEmpty) {
+      return;
+    }
+    const bytes = await this.spec.mintEmpty(this.context);
     if (document.uri.scheme !== 'untitled') {
       await vscode.workspace.fs.writeFile(document.uri, bytes);
     }
@@ -264,7 +324,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   }
 
   private onMessage(
-    document: DocxDocument,
+    document: BinaryDocument,
     panel: vscode.WebviewPanel,
     msg: any,
   ): void {
@@ -325,26 +385,26 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   // --- save / backup --------------------------------------------------------
 
   async saveCustomDocument(
-    document: DocxDocument,
+    document: BinaryDocument,
     _cancellation: vscode.CancellationToken,
   ): Promise<void> {
     await this.saveAs(document, document.uri);
   }
 
   async saveCustomDocumentAs(
-    document: DocxDocument,
+    document: BinaryDocument,
     destination: vscode.Uri,
     _cancellation: vscode.CancellationToken,
   ): Promise<void> {
     await this.saveAs(document, destination);
   }
 
-  private async saveAs(document: DocxDocument, target: vscode.Uri): Promise<void> {
+  private async saveAs(document: BinaryDocument, target: vscode.Uri): Promise<void> {
     const bytes = await document.requestBytes();
     await vscode.workspace.fs.writeFile(target, bytes);
   }
 
-  async revertCustomDocument(document: DocxDocument): Promise<void> {
+  async revertCustomDocument(document: BinaryDocument): Promise<void> {
     const bytes = await vscode.workspace.fs.readFile(document.uri);
     document.panel?.webview.postMessage({
       type: 'open',
@@ -353,7 +413,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   }
 
   async backupCustomDocument(
-    document: DocxDocument,
+    document: BinaryDocument,
     ctx: vscode.CustomDocumentBackupContext,
     _cancellation: vscode.CancellationToken,
   ): Promise<vscode.CustomDocumentBackup> {
@@ -376,9 +436,9 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
   private html(webview: vscode.Webview): string {
     const media = (name: string) =>
       webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
-    const scriptUri = media('webview.js');
-    const styleUri = media('webview.css');
-    const wasmUri = media('docxwasm.wasm');
+    const scriptUri = media(this.spec.script);
+    const styleUri = media(this.spec.style);
+    const wasmUri = media(this.spec.wasm);
     const nonce = makeNonce();
     const csp = [
       `default-src 'none'`,
@@ -403,7 +463,7 @@ class DocxyEditorProvider implements vscode.CustomEditorProvider<DocxDocument> {
 <body>
   <div id="doc" tabindex="0" aria-label="Document" spellcheck="false"></div>
   <div id="status" role="status"></div>
-  <script nonce="${nonce}">window.__DOCXY__ = { wasmUri: "${wasmUri}" };</script>
+  <script nonce="${nonce}">window.__OFFXY__ = { wasmUri: "${wasmUri}" };</script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -426,7 +486,7 @@ async function convertMarkdownToDocx(
   const docx = await markdownToDocx(context, md);
   const target = withExtension(source, '.docx');
   await vscode.workspace.fs.writeFile(target, docx);
-  await vscode.commands.executeCommand('vscode.openWith', target, 'docxy.docxEditor');
+  await vscode.commands.executeCommand('vscode.openWith', target, 'offxy.docxEditor');
   void vscode.window.showInformationMessage(`Docxy: created ${basename(target)}`);
 }
 

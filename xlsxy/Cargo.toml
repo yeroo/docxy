@@ -20,6 +20,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# The agent control surface (loopback-TCP + newline-JSON), used to drive the
+# live workbook from a sibling agwinterm pane.
+ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # Path + version so `xlsxy` can be published once `gridcore` is on crates.io.
 gridcore = { version = "0.1.0", path = "../gridcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.

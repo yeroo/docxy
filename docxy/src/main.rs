@@ -12,8 +12,11 @@
 //! line-map, and routes keys into a `docxcore::editor::Editor`.
 
 mod backstage;
+mod control;
+mod mcp;
 mod metafile;
 mod ribbon;
+mod skill;
 
 use std::collections::HashMap;
 use std::io;
@@ -147,6 +150,32 @@ fn source_lines_to_doc(md: &str) -> Document {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--mcp` runs the headless MCP stdio bridge (a client of a running docxy),
+    // not the editor, so handle it before the file-oriented argument parsing.
+    if args.iter().any(|a| a == "--mcp") {
+        return match mcp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mcp: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `docxy install skill` writes the agent SKILL.md and exits.
+    if args.first().map(String::as_str) == Some("install")
+        && args.get(1).map(String::as_str) == Some("skill")
+    {
+        return match skill::install() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install skill: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -251,6 +280,8 @@ fn print_usage() {
            docxy <file> --pdf <out>        export to PDF and exit\n  \
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
+           docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
+           docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx name converts between the two formats;\n   \
             View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \
@@ -6347,9 +6378,57 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
     let mut last_title = String::new();
+
+    // Bring up the agent control surface. Best-effort: if the config directory or
+    // the loopback bind fails, the editor runs exactly as before, just without a
+    // control channel. `ctl_server` is held for the whole session — its Drop
+    // removes the discovery file.
+    let ctl_instance = control::instance_name();
+    let (ctl_server, ctl_rx) = match control::control_dir() {
+        Some(dir) => match ctlcore::serve(&dir, &ctl_instance) {
+            Ok((srv, rx)) => (Some(srv), Some(rx)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // One message stream drives the loop: terminal input (read on its own thread
+    // so the loop can block cheaply) and control requests. The main thread stays
+    // the sole owner of the document, so applying a request needs no locking.
+    enum Msg {
+        Term(Event),
+        Ctl(ctlcore::Request),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("docxy-input".into())
+            .spawn(move || {
+                while let Ok(ev) = event::read() {
+                    if tx.send(Msg::Term(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    if let Some(ctl_rx) = ctl_rx {
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("docxy-ctl".into())
+            .spawn(move || {
+                for req in ctl_rx {
+                    if tx.send(Msg::Ctl(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(tx); // only the reader/forwarder threads keep the channel open now
+
     let result = loop {
-        // Reflect the file + dirty state in the terminal window title.
-        let title = window_title("docxy", &app.path, app.dirty);
+        // Reflect the file + unsaved state in the terminal window title.
+        let title = window_title("docxy", &app.path, app.modified);
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
             last_title = title;
@@ -6357,52 +6436,37 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(e);
         }
-        // Gather input before the next draw, capping the redraw rate to ~30 fps so
-        // a fast scroll wheel (events arriving quicker than the terminal can paint)
-        // batches into one redraw per frame instead of one slow repaint per tick.
-        // When idle we block for input, so there's no redraw when nothing changes.
-        let drawn = std::time::Instant::now();
-        let frame = std::time::Duration::from_millis(33);
+
+        // Block until something arrives (no busy polling), then drain anything
+        // already queued so a burst — fast scrolling, or a run of agent edits —
+        // collapses into a single repaint.
+        let mut next = match rx.recv() {
+            Ok(m) => Some(m),
+            Err(_) => break Ok(()), // every input source is gone
+        };
         let mut quit = false;
-        let mut got_event = false;
-        let mut err = None;
-        loop {
-            let timeout = if got_event {
-                match frame.checked_sub(drawn.elapsed()) {
-                    Some(rem) if !rem.is_zero() => rem, // still gathering this frame
-                    _ => break,                         // frame budget spent → redraw
+        while let Some(msg) = next.take() {
+            match msg {
+                Msg::Term(ev) => {
+                    if handle_event(&mut app, ev) {
+                        quit = true;
+                    }
                 }
-            } else {
-                std::time::Duration::from_secs(3600) // idle: block for input
-            };
-            match event::poll(timeout) {
-                Ok(false) => break, // frame budget spent or idle tick → redraw
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        got_event = true;
-                        if handle_event(&mut app, ev) {
-                            quit = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        err = Some(e);
-                        break;
-                    }
+                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
                 },
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
             }
-        }
-        if let Some(e) = err {
-            break Err(e);
+            if quit {
+                break;
+            }
+            next = rx.try_recv().ok();
         }
         if quit {
             break Ok(());
         }
     };
+    drop(ctl_server); // remove the discovery file
 
     disable_raw_mode()?;
     execute!(

@@ -1,0 +1,112 @@
+{
+  "name": "offxy",
+  "displayName": "Offxy — Word & Excel .docx/.xlsx editor",
+  "description": "Open, read, and edit Microsoft Word .docx and Excel .xlsx files right in an editor tab — powered by WebAssembly builds of the dependency-free docxcore and gridcore engines.",
+  "version": "0.3.0",
+  "license": "MIT",
+  "publisher": "yeroo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yeroo/docxy"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "docx",
+    "word",
+    "ooxml",
+    "editor",
+    "wasm",
+    "xlsx",
+    "excel",
+    "spreadsheet"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "offxy.docxEditor",
+        "displayName": "Docxy",
+        "selector": [
+          {
+            "filenamePattern": "*.docx"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "offxy.gridEditor",
+        "displayName": "Offxy Spreadsheet",
+        "selector": [
+          {
+            "filenamePattern": "*.xlsx"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      { "command": "offxy.toggleBold", "title": "Bold", "category": "Docxy" },
+      { "command": "offxy.toggleItalic", "title": "Italic", "category": "Docxy" },
+      { "command": "offxy.toggleUnderline", "title": "Underline", "category": "Docxy" },
+      { "command": "offxy.toggleStrike", "title": "Strikethrough", "category": "Docxy" },
+      { "command": "offxy.heading1", "title": "Heading 1", "category": "Docxy" },
+      { "command": "offxy.heading2", "title": "Heading 2", "category": "Docxy" },
+      { "command": "offxy.heading3", "title": "Heading 3", "category": "Docxy" },
+      { "command": "offxy.normalStyle", "title": "Normal (clear heading)", "category": "Docxy" },
+      { "command": "offxy.bulletList", "title": "Bulleted List", "category": "Docxy" },
+      { "command": "offxy.numberedList", "title": "Numbered List", "category": "Docxy" },
+      { "command": "offxy.alignLeft", "title": "Align Left", "category": "Docxy" },
+      { "command": "offxy.alignCenter", "title": "Align Center", "category": "Docxy" },
+      { "command": "offxy.alignRight", "title": "Align Right", "category": "Docxy" },
+      { "command": "offxy.alignJustify", "title": "Justify", "category": "Docxy" },
+      { "command": "offxy.fontBigger", "title": "Increase Font Size", "category": "Docxy" },
+      { "command": "offxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" },
+      { "command": "offxy.replace", "title": "Replace…", "category": "Docxy" },
+      { "command": "offxy.convertMarkdown", "title": "Convert Markdown to Word (.docx)", "category": "Docxy" },
+      { "command": "offxy.exportMarkdown", "title": "Export to Markdown (.md)", "category": "Docxy" }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "offxy.convertMarkdown",
+          "when": "resourceExtname == .md",
+          "group": "offxy@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "offxy.convertMarkdown",
+          "when": "resourceExtname == .md",
+          "group": "offxy@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "offxy.exportMarkdown",
+          "when": "activeCustomEditorId == offxy.docxEditor"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build:wasm": "cargo build -p docxwasm -p gridwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
+    "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
+    "build": "npm run build:wasm && npm run build:ext",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.84.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0"
+  }
+}
