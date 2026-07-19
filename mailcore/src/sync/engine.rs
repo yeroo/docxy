@@ -102,6 +102,24 @@ pub enum SyncCommand {
         kind: String,
         comment: Option<String>,
     },
+    /// Push a locally-created event (`Store::create_local_event`, already
+    /// applied by the caller) to Graph: enqueue
+    /// [`crate::store::OutboxOp::CreateEvent`] and drain, then emit
+    /// [`SyncEvent::CalendarUpdated`]. A `local:` id is reconciled to the
+    /// Graph-minted id by `sync::outbox::apply_op`, same pattern as
+    /// `SaveDraft`.
+    CreateEvent { id: String },
+    /// Push an edited event's currently-stored fields
+    /// (`Store::update_event_fields`, already applied by the caller) to
+    /// Graph: enqueue [`crate::store::OutboxOp::UpdateEvent`] and drain,
+    /// then emit [`SyncEvent::CalendarUpdated`].
+    UpdateEvent { id: String },
+    /// Delete an event (optimistic local delete already applied by the
+    /// caller via `Store::delete_event`): enqueue
+    /// [`crate::store::OutboxOp::DeleteEvent`] and drain, then emit
+    /// [`SyncEvent::CalendarUpdated`]. A `local:` id that never reached
+    /// Graph is a no-op on the Graph side (see `sync::outbox::apply_op`).
+    DeleteEvent { id: String },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -450,6 +468,18 @@ impl Engine {
                 self.store.set_event_response(&id, &kind);
                 self.emit(SyncEvent::CalendarUpdated);
                 self.enqueue_and_drain(OutboxOp::RespondEvent { id, kind, comment });
+            }
+            SyncCommand::CreateEvent { id } => {
+                self.enqueue_and_drain(OutboxOp::CreateEvent { id });
+                self.emit(SyncEvent::CalendarUpdated);
+            }
+            SyncCommand::UpdateEvent { id } => {
+                self.enqueue_and_drain(OutboxOp::UpdateEvent { id });
+                self.emit(SyncEvent::CalendarUpdated);
+            }
+            SyncCommand::DeleteEvent { id } => {
+                self.enqueue_and_drain(OutboxOp::DeleteEvent { id });
+                self.emit(SyncEvent::CalendarUpdated);
             }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}

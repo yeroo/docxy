@@ -14,7 +14,11 @@
 //! would ever do it (unlike `Move`, Graph never reports a `local:` id back
 //! through delta sync, so there's no later point where this reconciliation
 //! would happen for free). So `apply_op` takes a `&Store` too, used only by
-//! those two ops.
+//! those two ops — plus `CreateEvent`/`UpdateEvent`, which need the same
+//! store access for the same reason: `event_input_for` reads the event's
+//! currently-stored fields to build the `EventInput` Graph is sent, and
+//! `CreateEvent` reconciles a `local:` id to its Graph id afterward exactly
+//! like `SaveDraft`/`SendDraft` do for drafts.
 
 use crate::graph::client::{GraphClient, GraphError, RsvpKind};
 use crate::graph::model::Recipient;
@@ -72,13 +76,48 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
             client.respond_event(id, rsvp, comment.as_deref(), true)
         }
-        // implemented in Task 5
-        OutboxOp::CreateEvent { id: _ } => Ok(()),
-        // implemented in Task 5
-        OutboxOp::UpdateEvent { id: _ } => Ok(()),
-        // implemented in Task 5
-        OutboxOp::DeleteEvent { id: _ } => Ok(()),
+        OutboxOp::CreateEvent { id } => {
+            let input = event_input_for(store, id)?;
+            let created = client.create_event(&input)?;
+            store
+                .reconcile_event_id(id, &created.id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            Ok(())
+        }
+        OutboxOp::UpdateEvent { id } => {
+            let input = event_input_for(store, id)?;
+            client.update_event(id, &input)
+        }
+        OutboxOp::DeleteEvent { id } => {
+            // A local:-only event never reached Graph; nothing to delete there.
+            if id.starts_with("local:") {
+                Ok(())
+            } else {
+                client.delete_event(id)
+            }
+        }
     }
+}
+
+/// Reads the stored event `id` and builds the `EventInput` the create/update
+/// calls take. Errors if the event isn't in the store (a corrupt/raced op).
+fn event_input_for(
+    store: &Store,
+    id: &str,
+) -> Result<crate::graph::client::EventInput, GraphError> {
+    let d = store
+        .event_for_send(id)
+        .map_err(|e| GraphError::Parse(e.to_string()))?
+        .ok_or_else(|| GraphError::Parse(format!("no local event stored for {id}")))?;
+    Ok(crate::graph::client::EventInput {
+        subject: d.subject,
+        start_utc: d.start_utc,
+        end_utc: d.end_utc,
+        is_all_day: d.is_all_day,
+        location: d.location,
+        attendees: d.attendees,
+        body_html: d.body_html,
+    })
 }
 
 /// A best-effort MIME type from a file name's extension, defaulting to
@@ -711,6 +750,87 @@ mod tests {
         assert!(!store.outbound_attachments("GRAPH-2").unwrap().is_empty());
         // And send was never reached.
         assert!(!srv.requests().iter().any(|r| r.path.ends_with("/send")));
+    }
+
+    /// A Graph event JSON body shaped like `create_event`'s response —
+    /// mirrors the fixture `graph::client`'s own tests use.
+    fn event_json(id: &str, subject: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","subject":"{subject}",
+            "start":{{"dateTime":"2026-07-20T11:00:00.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"2026-07-20T12:00:00.0000000","timeZone":"UTC"}},
+            "isAllDay":false,"location":{{"displayName":"Room 1"}},
+            "organizer":{{"emailAddress":{{"name":"Me","address":"me@x"}}}},
+            "responseStatus":{{"response":"organizer"}},
+            "attendees":[{{"emailAddress":{{"name":"Bob","address":"bob@x.com"}},"type":"required","status":{{"response":"none"}}}}],
+            "bodyPreview":"agenda","webLink":"","lastModifiedDateTime":""}}"#
+        )
+    }
+
+    fn sample_event_fields() -> crate::store::LocalEventFields {
+        crate::store::LocalEventFields {
+            subject: "Sync".into(),
+            start_utc: "2026-07-20T11:00:00Z".into(),
+            end_utc: "2026-07-20T12:00:00Z".into(),
+            is_all_day: false,
+            location: "Room 1".into(),
+            body_html: "<p>agenda</p>".into(),
+            attendees: vec![("Bob".into(), "bob@x.com".into())],
+        }
+    }
+
+    #[test]
+    fn apply_op_create_event_posts_and_reconciles() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events".into(),
+            status: 201,
+            headers: vec![],
+            body: event_json("EV1", "Sync"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_event(&sample_event_fields(), "Me", "me@x")
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::CreateEvent {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Sync"));
+
+        // reconciled: the event now lives under "EV1"
+        assert!(store.event_for_send("EV1").unwrap().is_some());
+        assert!(store.event_for_send(&local_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_op_delete_event_of_a_local_id_makes_no_graph_call() {
+        // A local:-only event id that never synced: DeleteEvent must NOT
+        // hit Graph. No route is stubbed at all — any request would panic
+        // in the fake server's route matching.
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::DeleteEvent {
+                id: "local:never".into(),
+            },
+        )
+        .unwrap();
+        assert!(srv.requests().is_empty());
     }
 
     #[test]
