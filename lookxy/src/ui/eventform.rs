@@ -9,10 +9,11 @@
 //! field-row layout and focus highlighting), and key handling (`handle_key`):
 //! Tab cycles focus, Char/Backspace edit the focused text field (Space
 //! toggles All-day), Ctrl-Enter saves (`App::save_event_form`), Esc closes
-//! without saving. The attendee-autocomplete dropdown's actual content
-//! (search-as-you-type over the store) is a later task's concern; the
-//! dropdown overlay is wired here in an overlay-safe way (a no-op while
-//! `autocomplete` is `None`, which it always is until that task sets it).
+//! without saving. The Attendees field additionally gets contacts
+//! autocomplete (search-as-you-type over `Store::search_contacts`), reusing
+//! `ui::compose`'s `current_token`/`apply_completion`/`Autocomplete` rather
+//! than duplicating that logic — see `handle_key`'s doc comment and
+//! `refresh_attendee_autocomplete`.
 
 use crate::app::App;
 use crate::ui::border_style;
@@ -25,7 +26,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 /// Which field the event form's keyboard focus is on. Tab cycles
 /// Title → Start → End → AllDay → Location → Attendees → Body → Title.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventField {
     Title,
     Start,
@@ -131,10 +132,11 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if let Some(ac) = &form.autocomplete {
         if ac.field == crate::ui::compose::ComposeField::To {
-            // Placeholder wiring only — Task 8 gives the Attendees field its
-            // own dropdown field-matching (compose's `ComposeField` isn't
-            // what `EventField` autocomplete keys off of); nothing sets
-            // `autocomplete` to `Some` yet, so this never actually runs.
+            // `Autocomplete` is compose's type, reused as-is; its `field`
+            // only ever gets set to `ComposeField::To` here (see
+            // `refresh_attendee_autocomplete`) as a stand-in "this dropdown
+            // belongs to the Attendees field" marker — `EventField` isn't
+            // what the shared `Autocomplete` keys off of.
             draw_autocomplete(f, rows[5], frame_area, ac);
         }
     }
@@ -193,8 +195,8 @@ fn draw_footer(f: &mut Frame, area: Rect, error: Option<&str>) {
 /// The attendee-autocomplete dropdown: a bordered overlay directly below
 /// `field_area`, listing `ac.matches` as `Name <addr>`, highlighting
 /// `ac.index`. Mirrors `ui::compose::draw_autocomplete` (private to that
-/// module, so kept as its own copy here); unreachable in practice until a
-/// later task ever sets `EventForm::autocomplete` to `Some`.
+/// module, so kept as its own copy here); rendered whenever
+/// `refresh_attendee_autocomplete` has populated `EventForm::autocomplete`.
 fn draw_autocomplete(
     f: &mut Frame,
     field_area: Rect,
@@ -246,8 +248,16 @@ fn draw_autocomplete(
 /// of "typing" (there's no text there to edit); any other character while on
 /// All-day is ignored, same as compose's non-text fields ignore keys that
 /// don't apply to them. A no-op if the form isn't open (defensive; the only
-/// caller already checks `app.event_form.is_some()` first). Attendee
-/// autocomplete keys are Task 8's concern — none are handled here yet.
+/// caller already checks `app.event_form.is_some()` first).
+///
+/// The Attendees field additionally gets contacts autocomplete, mirroring
+/// `ui::compose`'s recipient dropdown: while it's open, Down/Up move the
+/// selection and Enter/Tab accept the highlighted contact (rewriting the
+/// current token via `compose::apply_completion`) instead of their ordinary
+/// meaning (cycling focus / editing text) — handled inline below, ahead of
+/// the ordinary field-editing match. Esc closes an open dropdown first
+/// (checked here, ahead of the "cancel the form" Esc below), same
+/// precedence as compose's Esc handling.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.event_form.is_none() {
         return;
@@ -258,48 +268,150 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     if key.code == KeyCode::Esc {
+        if let Some(form) = app.event_form.as_mut() {
+            if form.autocomplete.is_some() {
+                form.autocomplete = None;
+                return;
+            }
+        }
         app.event_form = None;
         return;
     }
-    let Some(form) = app.event_form.as_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Tab => cycle_focus(form),
-        KeyCode::Char(' ') if form.focus == EventField::AllDay => {
-            form.all_day = !form.all_day;
+
+    if let Some(form) = app.event_form.as_mut() {
+        if form.focus == EventField::Attendees && form.autocomplete.is_some() {
+            match key.code {
+                KeyCode::Down => {
+                    form.autocomplete.as_mut().unwrap().move_selection(1);
+                    return;
+                }
+                KeyCode::Up => {
+                    form.autocomplete.as_mut().unwrap().move_selection(-1);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    let ac = form.autocomplete.take().unwrap();
+                    if let Some(c) = ac.matches.get(ac.index).cloned() {
+                        form.attendees = crate::ui::compose::apply_completion(&form.attendees, &c);
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
-        KeyCode::Char(c) => match form.focus {
-            EventField::Title => form.title.push(c),
-            EventField::Start => form.start.push(c),
-            EventField::End => form.end.push(c),
-            EventField::AllDay => {}
-            EventField::Location => form.location.push(c),
-            EventField::Attendees => form.attendees.push(c),
-            EventField::Body => form.body.push(c),
-        },
-        KeyCode::Backspace => match form.focus {
-            EventField::Title => {
-                form.title.pop();
+    }
+
+    // The form-only mutation happens against `app.event_form`; if it changed
+    // the Attendees field's text, that borrow is released before the
+    // store-backed suggestion refresh runs (`refresh_attendee_autocomplete`
+    // needs `app.store` and `app.event_form` at once) — same borrow-split as
+    // `ui::compose::handle_key`.
+    let attendees_changed = {
+        let Some(form) = app.event_form.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab => {
+                cycle_focus(form);
+                false
             }
-            EventField::Start => {
-                form.start.pop();
+            KeyCode::Char(' ') if form.focus == EventField::AllDay => {
+                form.all_day = !form.all_day;
+                false
             }
-            EventField::End => {
-                form.end.pop();
-            }
-            EventField::AllDay => {}
-            EventField::Location => {
-                form.location.pop();
-            }
-            EventField::Attendees => {
-                form.attendees.pop();
-            }
-            EventField::Body => {
-                form.body.pop();
-            }
-        },
-        _ => {}
+            KeyCode::Char(c) => match form.focus {
+                EventField::Title => {
+                    form.title.push(c);
+                    false
+                }
+                EventField::Start => {
+                    form.start.push(c);
+                    false
+                }
+                EventField::End => {
+                    form.end.push(c);
+                    false
+                }
+                EventField::AllDay => false,
+                EventField::Location => {
+                    form.location.push(c);
+                    false
+                }
+                EventField::Attendees => {
+                    form.attendees.push(c);
+                    true
+                }
+                EventField::Body => {
+                    form.body.push(c);
+                    false
+                }
+            },
+            KeyCode::Backspace => match form.focus {
+                EventField::Title => {
+                    form.title.pop();
+                    false
+                }
+                EventField::Start => {
+                    form.start.pop();
+                    false
+                }
+                EventField::End => {
+                    form.end.pop();
+                    false
+                }
+                EventField::AllDay => false,
+                EventField::Location => {
+                    form.location.pop();
+                    false
+                }
+                EventField::Attendees => {
+                    form.attendees.pop();
+                    true
+                }
+                EventField::Body => {
+                    form.body.pop();
+                    false
+                }
+            },
+            _ => false,
+        }
+    };
+    if attendees_changed {
+        refresh_attendee_autocomplete(app);
+    }
+}
+
+/// Re-runs the attendee-autocomplete search after the Attendees field's text
+/// changed: computes the current token (`compose::current_token`), searches
+/// the store for it into an owned `Vec` (a fresh borrow, taken after the
+/// `app.event_form` borrow above has ended), then sets/clears
+/// `form.autocomplete` — same shape as `ui::compose::refresh_autocomplete`.
+/// The dropdown's `field` is always recorded as `ComposeField::To`: it's a
+/// stand-in "this belongs to the Attendees field" marker for `draw`'s
+/// reused `compose::Autocomplete`, which doesn't know about `EventField`.
+fn refresh_attendee_autocomplete(app: &mut App) {
+    let token = {
+        let Some(form) = app.event_form.as_ref() else {
+            return;
+        };
+        crate::ui::compose::current_token(&form.attendees)
+    };
+    let matches = if token.is_empty() {
+        Vec::new()
+    } else {
+        app.store.search_contacts(&token, 8).unwrap_or_default()
+    };
+    if let Some(form) = app.event_form.as_mut() {
+        form.autocomplete = if matches.is_empty() {
+            None
+        } else {
+            Some(crate::ui::compose::Autocomplete {
+                field: crate::ui::compose::ComposeField::To,
+                query: token,
+                matches,
+                index: 0,
+            })
+        };
     }
 }
 
@@ -457,6 +569,61 @@ mod tests {
         let mut app = App::for_test_with_seeded_store();
         assert!(app.event_form.is_none());
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('x'))); // must not panic
+        assert!(app.event_form.is_none());
+    }
+
+    #[test]
+    fn attendee_field_autocompletes_from_contacts() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_contact(&mailcore::store::Contact {
+                name: "Alice".into(),
+                address: "alice@x.com".into(),
+                source: "local".into(),
+                last_seen: "".into(),
+                frequency: 3,
+                relevance: None,
+            })
+            .unwrap();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+
+        // Focus Attendees (Title -> Start -> End -> AllDay -> Location -> Attendees).
+        for _ in 0..5 {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        }
+        assert_eq!(
+            app.event_form.as_ref().unwrap().focus,
+            EventField::Attendees
+        );
+
+        // Typing "al" (a token matching the seeded contact) opens the dropdown.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert!(app.event_form.as_ref().unwrap().autocomplete.is_some());
+
+        // Down is a clamped no-op with a single match, but it must be
+        // consumed by the open dropdown rather than falling through to
+        // ordinary field editing.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.event_form.as_ref().unwrap().autocomplete.is_none());
+        assert_eq!(
+            app.event_form.as_ref().unwrap().attendees,
+            "Alice <alice@x.com>; "
+        );
+
+        // The token after "; " is "a", which reopens the dropdown.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.event_form.as_ref().unwrap().autocomplete.is_some());
+
+        // Esc with a dropdown open closes it and does NOT close the form.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.event_form.as_ref().unwrap().autocomplete.is_none());
+        assert!(app.event_form.is_some());
+
+        // Esc again, with no dropdown open, falls through to closing the form.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
         assert!(app.event_form.is_none());
     }
 }
