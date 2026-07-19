@@ -61,12 +61,34 @@ fn utc_iso_to_local(utc: &str, offset_min: i64) -> Option<LocalDateTime> {
     Some(from_epoch_min(to_epoch_min(base) + offset_min))
 }
 
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let mut it = s.split('-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
     let d: u32 = it.next()?.parse().ok()?;
-    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if it.next().is_some() || !(1..=12).contains(&m) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, m) {
         return None;
     }
     Some((y, m, d))
@@ -288,5 +310,21 @@ mod tests {
         assert_eq!(parse_start("not a time", now(), OFF), None);
         assert_eq!(parse_start("25:99", now(), OFF), None);
         assert_eq!(parse_start("2026-13-40", now(), OFF), None);
+    }
+    #[test]
+    fn rejects_invalid_day_of_month() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 10,
+            min: 0,
+        };
+        assert_eq!(parse_start("2026-02-30", now, 180), None); // Feb never has 30
+        assert_eq!(parse_start("2026-04-31", now, 180), None); // Apr has 30
+        assert_eq!(parse_start("2026-02-29", now, 180), None); // 2026 not a leap year
+        // valid boundaries still parse:
+        assert!(parse_start("2024-02-29", now, 180).is_some()); // 2024 IS a leap year
+        assert!(parse_start("2026-01-31", now, 180).is_some());
     }
 }
