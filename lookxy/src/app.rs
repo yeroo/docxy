@@ -1954,10 +1954,13 @@ impl App {
                 });
             }
             AttachmentKind::Reference => match att.source_url.clone() {
-                Some(url) => {
+                Some(url) if is_web_url(&url) => {
                     self.open_with_os_handler(std::path::Path::new(&url));
                     self.attachment_notice = Some(format!("Opened link: {}", att.name));
                     self.attachments = None;
+                }
+                Some(_) => {
+                    self.attachment_notice = Some("Refusing to open non-web link".to_string());
                 }
                 None => {
                     self.attachment_notice = Some("No link for this attachment".to_string());
@@ -2354,11 +2357,25 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 /// Other names (incl. ones with internal dots) are returned unchanged.
 fn strip_item_ext(name: &str) -> &str {
     for ext in [".eml", ".ics"] {
-        if name.len() > ext.len() && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext) {
-            return &name[..name.len() - ext.len()];
+        if name.len() > ext.len() {
+            let (_, tail) = name.as_bytes().split_at(name.len() - ext.len());
+            if tail.eq_ignore_ascii_case(ext.as_bytes()) {
+                return &name[..name.len() - ext.len()]; // matched an ASCII ".eml"/".ics": boundary is '.', safe
+            }
         }
     }
     name
+}
+
+/// Whether `url` is an `http`/`https` link (case-insensitive scheme) — the
+/// only schemes a reference attachment is opened with. A sender-supplied
+/// `sourceUrl` with any other scheme (`file:`, a `\\host\share` UNC path, etc.)
+/// is refused, since handing it to the OS opener could leak credentials or
+/// open a local resource.
+fn is_web_url(url: &str) -> bool {
+    let u = url.trim_start();
+    let lower = u.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// The current wall-clock instant as local time — `ui::calendar::local_offset_minutes`
@@ -3066,6 +3083,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn strip_item_ext_handles_non_ascii_names_without_panicking() {
+        assert_eq!(strip_item_ext("Hi 😀!"), "Hi 😀!"); // no .eml/.ics suffix → unchanged, must not panic
+        assert_eq!(strip_item_ext("Résumé.eml"), "Résumé"); // non-ASCII before an ASCII .eml suffix → stripped
+        assert_eq!(strip_item_ext("Invite.ics"), "Invite"); // ASCII case still works
+        assert_eq!(strip_item_ext("report"), "report");
+        assert_eq!(strip_item_ext("invoice.2024"), "invoice.2024"); // non-.eml/.ics ext untouched
+    }
+
+    #[test]
     fn opening_a_reference_attachment_opens_the_link_and_sends_no_command() {
         let mut app = App::for_test_with_seeded_store();
         seed_one_attachment(
@@ -3112,6 +3138,33 @@ pub(crate) mod tests {
         assert_eq!(
             app.attachment_notice.as_deref(),
             Some("No link for this attachment")
+        );
+    }
+
+    #[test]
+    fn opening_a_reference_attachment_with_a_non_web_url_refuses_to_open() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_one_attachment(
+            &mut app,
+            AttachmentMeta {
+                id: "a4".into(),
+                name: "Doc".into(),
+                content_type: "".into(),
+                size: 0,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::Reference,
+                source_url: Some(r"\\attacker\share".into()),
+            },
+        );
+        let before = app.open_invocations.get();
+        app.save_attachment();
+        assert_eq!(app.open_invocations.get(), before); // no OS handler invoked
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err()); // no command
+        assert!(app.attachments.is_some()); // popup stays open
+        assert_eq!(
+            app.attachment_notice.as_deref(),
+            Some("Refusing to open non-web link")
         );
     }
 
