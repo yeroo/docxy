@@ -470,6 +470,26 @@ impl GraphClient {
         Ok(())
     }
 
+    /// GET `/me/messages/{id}?$expand=microsoft.graph.eventMessageRequest/event($select=id)`
+    /// — an `eventMessageRequest` message exposes the calendar event it invites
+    /// to via its `event` navigation property; expanding it (selecting only
+    /// `id`) is enough to then `respond_event` on that event. Returns the
+    /// expanded `event.id`, or `None` when the message carries no `event`
+    /// (not an invite, or an odd server state) so the caller can surface a
+    /// "not a meeting invite" notice rather than a hard error.
+    pub fn meeting_event_id(&self, message_id: &str) -> Result<Option<String>, GraphError> {
+        let id = encode_path_segment(message_id);
+        let path = format!(
+            "/me/messages/{id}?$expand=microsoft.graph.eventMessageRequest/event($select=id)"
+        );
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Ok(v.get("event")
+            .and_then(|e| e.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
     /// POST `/me/events` with the event body; returns the created `Event`
     /// (with its Graph-minted id). Graph sends invites to any attendees.
     pub fn create_event(&self, input: &EventInput) -> Result<Event, GraphError> {
@@ -1680,6 +1700,35 @@ mod tests {
             c.calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z"),
             Err(GraphError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn meeting_event_id_reads_expanded_event() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"M1","event":{"id":"E1"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_event_id("M1").unwrap().as_deref(), Some("E1"));
+        // The request carries the $expand for the invite's event id.
+        let reqs = srv.requests();
+        assert!(reqs[0].path.contains("expand"));
+    }
+
+    #[test]
+    fn meeting_event_id_is_none_without_event() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M2".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"M2"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_event_id("M2").unwrap(), None);
     }
 
     #[test]
