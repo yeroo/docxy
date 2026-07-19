@@ -12,7 +12,7 @@
 use crate::app::App;
 use crate::ui::centered_rect;
 
-use mailcore::graph::model::AttachmentMeta;
+use mailcore::graph::model::{AttachmentKind, AttachmentMeta};
 
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
@@ -59,10 +59,19 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// One row: `name  (content-type, N.N KB)`.
+/// One row, labeled per attachment kind: a `File` shows
+/// `name  (content-type, N.N KB)`; an `Item` (a forwarded message/event,
+/// saved as `.eml`/`.ics`) shows `✉ name  (item)`; a `Reference` (a cloud
+/// link, opened rather than downloaded) shows `🔗 name  (link)`.
 fn line(a: &AttachmentMeta) -> String {
-    let kb = a.size as f64 / 1024.0;
-    format!("{}  ({}, {kb:.1} KB)", a.name, a.content_type)
+    match a.kind {
+        AttachmentKind::Reference => format!("🔗 {}  (link)", a.name),
+        AttachmentKind::Item => format!("✉ {}  (item)", a.name),
+        AttachmentKind::File => {
+            let kb = a.size as f64 / 1024.0;
+            format!("{}  ({}, {kb:.1} KB)", a.name, a.content_type)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +111,34 @@ mod tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("budget.xlsx"));
         assert!(text.contains("2.0 KB"));
+    }
+
+    #[test]
+    fn popup_overlay_labels_a_reference_attachment_as_a_link() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_attachments(
+                "m1",
+                &[AttachmentMeta {
+                    id: "a1".into(),
+                    name: "Shared Doc".into(),
+                    content_type: "".into(),
+                    size: 0,
+                    is_inline: false,
+                    content_id: None,
+                    kind: AttachmentKind::Reference,
+                    source_url: Some("https://x/y".into()),
+                }],
+            )
+            .expect("seed attachment");
+        app.open_attachments_popup();
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("🔗"));
+        assert!(text.contains("(link)"));
     }
 
     #[test]

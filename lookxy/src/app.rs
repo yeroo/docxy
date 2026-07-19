@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
-use mailcore::graph::model::{AttachmentMeta, Body};
+use mailcore::graph::model::{AttachmentKind, AttachmentMeta, Body};
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 
@@ -1930,13 +1930,40 @@ impl App {
         };
         let message_id = popup.message_id.clone();
         let attachment_id = att.id.clone();
-        let dest = downloads_dir().join(sanitize_filename(&att.name));
-        self.pending_saves.insert(dest.clone(), open_after);
-        let _ = self.sync.cmd_tx.send(SyncCommand::SaveAttachment {
-            message_id,
-            attachment_id,
-            dest,
-        });
+        match att.kind {
+            AttachmentKind::File => {
+                let dest = downloads_dir().join(sanitize_filename(&att.name));
+                self.pending_saves.insert(dest.clone(), open_after);
+                let _ = self.sync.cmd_tx.send(SyncCommand::SaveAttachment {
+                    message_id,
+                    attachment_id,
+                    dest,
+                });
+            }
+            AttachmentKind::Item => {
+                // Extension is chosen by the engine (content sniff); register
+                // the open-intent by the extension-less base, matched by
+                // stem in `finish_attachment_save`.
+                let base_name = strip_item_ext(&sanitize_filename(&att.name)).to_string();
+                let dest_base = downloads_dir().join(base_name);
+                self.pending_saves.insert(dest_base.clone(), open_after);
+                let _ = self.sync.cmd_tx.send(SyncCommand::SaveItemAttachment {
+                    message_id,
+                    attachment_id,
+                    dest_base,
+                });
+            }
+            AttachmentKind::Reference => match att.source_url.clone() {
+                Some(url) => {
+                    self.open_with_os_handler(std::path::Path::new(&url));
+                    self.attachment_notice = Some(format!("Opened link: {}", att.name));
+                    self.attachments = None;
+                }
+                None => {
+                    self.attachment_notice = Some("No link for this attachment".to_string());
+                }
+            },
+        }
     }
 
     /// Called from `main::drain_events` when `SyncEvent::AttachmentSaved`
@@ -1948,7 +1975,14 @@ impl App {
     /// has resolved, so one save finishing can't yank the popup out from
     /// under another that's still pending.
     pub fn finish_attachment_save(&mut self, path: PathBuf) {
-        let open_after = self.pending_saves.remove(&path).unwrap_or(false);
+        // File saves registered the exact path; item saves registered the
+        // extension-less base (the engine appended .ics/.eml), so fall back
+        // to the stem. Remove whichever matched.
+        let open_after = self
+            .pending_saves
+            .remove(&path)
+            .or_else(|| self.pending_saves.remove(&path.with_extension("")))
+            .unwrap_or(false);
         if open_after {
             self.open_with_os_handler(&path);
         }
@@ -2312,6 +2346,19 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Strips a trailing `.eml`/`.ics` (case-insensitive) from an item
+/// attachment's sanitized name, so appending the sniffed extension can't
+/// double it (`Invite.ics` → base `Invite` → `Invite.ics`, not `Invite.ics.ics`).
+/// Other names (incl. ones with internal dots) are returned unchanged.
+fn strip_item_ext(name: &str) -> &str {
+    for ext in [".eml", ".ics"] {
+        if name.len() > ext.len() && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext) {
+            return &name[..name.len() - ext.len()];
+        }
+    }
+    name
 }
 
 /// The current wall-clock instant as local time — `ui::calendar::local_offset_minutes`
@@ -2972,6 +3019,110 @@ pub(crate) mod tests {
         app.finish_attachment_save(dest1);
         assert_eq!(app.open_invocations.get(), 1);
         assert!(app.attachments.is_none());
+    }
+
+    /// Seeds a single attachment for "m1" (the fixture's highlighted
+    /// message) and opens the attachments popup on it — the one-attachment
+    /// shorthand for the repeated `put_attachments` + `open_attachments_popup`
+    /// pattern above, for tests that only care about a single `kind`.
+    fn seed_one_attachment(app: &mut App, meta: AttachmentMeta) {
+        app.store
+            .put_attachments("m1", &[meta])
+            .expect("seed attachment");
+        app.open_attachments_popup();
+    }
+
+    #[test]
+    fn saving_an_item_attachment_sends_save_item_command_with_extensionless_base() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_one_attachment(
+            &mut app,
+            AttachmentMeta {
+                id: "a1".into(),
+                name: "Invite.ics".into(),
+                content_type: "".into(),
+                size: 0,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::Item,
+                source_url: None,
+            },
+        );
+        app.save_attachment(); // Enter
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::SaveItemAttachment { dest_base, .. }) => {
+                // extension stripped so the engine can choose .ics/.eml
+                assert_eq!(dest_base.extension(), None);
+                assert!(
+                    dest_base
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("Invite")
+                );
+            }
+            other => panic!("expected SaveItemAttachment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_a_reference_attachment_opens_the_link_and_sends_no_command() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_one_attachment(
+            &mut app,
+            AttachmentMeta {
+                id: "a2".into(),
+                name: "Doc".into(),
+                content_type: "".into(),
+                size: 0,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::Reference,
+                source_url: Some("https://x/y".into()),
+            },
+        );
+        let before = app.open_invocations.get();
+        app.save_attachment(); // Enter -> opens the link
+        assert_eq!(app.open_invocations.get(), before + 1); // OS handler invoked
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err()); // no command
+        assert!(app.attachments.is_none()); // popup closed
+    }
+
+    #[test]
+    fn opening_a_reference_attachment_with_no_link_leaves_the_popup_open() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_one_attachment(
+            &mut app,
+            AttachmentMeta {
+                id: "a3".into(),
+                name: "Doc".into(),
+                content_type: "".into(),
+                size: 0,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::Reference,
+                source_url: None,
+            },
+        );
+        let before = app.open_invocations.get();
+        app.save_attachment();
+        assert_eq!(app.open_invocations.get(), before); // no OS handler invoked
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err()); // no command
+        assert!(app.attachments.is_some()); // popup stays open
+        assert_eq!(
+            app.attachment_notice.as_deref(),
+            Some("No link for this attachment")
+        );
+    }
+
+    #[test]
+    fn finish_attachment_save_opens_item_file_by_stem() {
+        let mut app = App::for_test_with_seeded_store();
+        let base = downloads_dir().join("Invite");
+        app.pending_saves.insert(base.clone(), true); // open_after = true
+        let before = app.open_invocations.get();
+        app.finish_attachment_save(base.with_extension("ics")); // engine chose .ics
+        assert_eq!(app.open_invocations.get(), before + 1); // opened via stem match
     }
 
     /// Builds a seeded-store `App` whose message "m1" has `has_attachments`
