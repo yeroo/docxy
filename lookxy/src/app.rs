@@ -210,6 +210,17 @@ pub struct App {
     /// image's reserved `IMAGE_BOX_ROWS` band), as last recorded by
     /// `ui::reading::draw`. Used only to clamp `reading_scroll`.
     pub reading_content_rows: usize,
+    /// Inline-image bytes fetched for the currently opened HTML body, keyed
+    /// by `content_id` (the part after `cid:` in an `<img>` `src`) — see
+    /// `request_inline_images`. Cleared whenever a different message is
+    /// opened (`open_message`); painting the boxes onto pixels is a later
+    /// task's concern, this is just the in-memory cache it'll read.
+    pub inline_images: std::collections::HashMap<String, Vec<u8>>,
+    /// `content_id`s for which `SyncCommand::FetchInlineImage` has already
+    /// been sent for the currently opened message, so `request_inline_images`
+    /// doesn't re-fire on every call (e.g. once per `AttachmentsUpdated`).
+    /// Cleared alongside `inline_images` in `open_message`.
+    requested_inline: std::collections::HashSet<String>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -365,6 +376,8 @@ impl App {
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
+            inline_images: std::collections::HashMap::new(),
+            requested_inline: std::collections::HashSet::new(),
         };
         app.reload_folders();
         app.reload_account();
@@ -425,7 +438,17 @@ impl App {
             SyncEvent::BodyReady { id } if self.selected_msg.as_deref() == Some(id.as_str()) => {
                 self.reload_body();
             }
-            SyncEvent::AttachmentsUpdated { message_id } => self.reload_attachments(&message_id),
+            SyncEvent::AttachmentsUpdated { message_id } => {
+                self.reload_attachments(&message_id);
+                // Metadata just landed — cids can resolve now, but only if
+                // this is the message currently open in the reading pane
+                // (`request_inline_images` acts on `selected_msg`, not on
+                // `message_id`, so guard here rather than let it silently
+                // re-resolve for whatever else happens to be open).
+                if self.selected_msg.as_deref() == Some(message_id.as_str()) {
+                    self.request_inline_images();
+                }
+            }
             SyncEvent::AttachmentSaved { path } => self.finish_attachment_save(path),
             // A reply/forward draft (`SyncCommand::ComposeReply`/
             // `ComposeForward`) just landed in the store — open the composer
@@ -452,10 +475,18 @@ impl App {
             // Folded into the existing catch-all rather than given a
             // dedicated arm so this compiles now without inventing a
             // toast/notice mechanism the brief doesn't ask for.
-            // TODO(mailcore task 5): render these bytes in the reading pane,
-            // keyed by `content_id`. Temporary no-op so the workspace builds
-            // now that mailcore emits this event; replaced in task 5.
-            SyncEvent::InlineImageReady { .. } => {}
+            // Cache the bytes by `content_id` — but only if they're still
+            // for the message currently open; a slow fetch for a message
+            // the user has since navigated away from is simply dropped
+            // (matches `BodyReady`'s guard above).
+            SyncEvent::InlineImageReady {
+                message_id,
+                content_id,
+                bytes,
+            } if self.selected_msg.as_deref() == Some(message_id.as_str()) => {
+                self.inline_images.insert(content_id, bytes);
+            }
+            SyncEvent::InlineImageReady { .. } => {} // for a message no longer open — drop
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. } => {}
@@ -644,6 +675,11 @@ impl App {
         self.selected_msg = Some(id.to_string());
         self.reading_scroll = 0;
         self.reload_body();
+        // A new message is open — any previously cached/requested inline
+        // images belonged to whatever was open before.
+        self.inline_images.clear();
+        self.requested_inline.clear();
+        self.request_inline_images();
     }
 
     // --- Reading pane scroll -------------------------------------------
@@ -694,8 +730,15 @@ impl App {
         };
         match self.store.get_body(&id) {
             Ok(Some(body)) => {
+                let is_html = body.content_type.eq_ignore_ascii_case("html");
                 self.body = Some(body);
                 self.body_loading = false;
+                if is_html {
+                    // A late `BodyReady` (the body wasn't cached when this
+                    // message was opened) means `open_message`'s own call
+                    // never saw a body to scan for `cid:`s — do it now.
+                    self.request_inline_images();
+                }
             }
             Ok(None) => {
                 self.body = None;
@@ -706,6 +749,60 @@ impl App {
                 // The store itself is broken; nothing a re-fetch can fix.
                 self.body = None;
                 self.body_loading = false;
+            }
+        }
+    }
+
+    /// For the opened HTML message, resolve each `cid:` image to its
+    /// attachment and fetch its bytes into `inline_images` (once). Needs the
+    /// message's attachment metadata; if that isn't loaded yet, kicks off
+    /// `FetchAttachments` and returns — `on_sync_event`'s `AttachmentsUpdated`
+    /// arm calls this again once it lands. `data:` images carry their own
+    /// bytes and need no fetch; remote/unsupported are skipped.
+    pub fn request_inline_images(&mut self) {
+        let Some(id) = self.selected_msg.clone() else {
+            return;
+        };
+        let Some(body) = &self.body else {
+            return;
+        };
+        if !body.content_type.eq_ignore_ascii_case("html") {
+            return;
+        }
+        let refs = mailcore::htmlrender::image_refs(&body.content);
+        let cids: Vec<String> = refs
+            .iter()
+            .filter_map(|r| match &r.src {
+                mailcore::htmlrender::ImageSource::Cid(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        if cids.is_empty() {
+            return;
+        }
+        let metas = self.store.attachments(&id).unwrap_or_default();
+        if metas.is_empty() {
+            // No metadata yet — fetch it; AttachmentsUpdated re-enters here.
+            let _ = self
+                .sync
+                .cmd_tx
+                .send(SyncCommand::FetchAttachments { message_id: id });
+            return;
+        }
+        for cid in cids {
+            if self.requested_inline.contains(&cid) {
+                continue;
+            }
+            if let Some(att) = metas
+                .iter()
+                .find(|a| a.content_id.as_deref() == Some(cid.as_str()))
+            {
+                self.requested_inline.insert(cid.clone());
+                let _ = self.sync.cmd_tx.send(SyncCommand::FetchInlineImage {
+                    message_id: id.clone(),
+                    attachment_id: att.id.clone(),
+                    content_id: cid,
+                });
             }
         }
     }
@@ -2839,6 +2936,103 @@ pub(crate) mod tests {
             )
             .expect("update message to has_attachments=true");
         app.reload_messages();
+    }
+
+    /// Seeds a message `id` (into the "inbox" folder `for_test_with_seeded_store`
+    /// already creates) with an HTML `Body` whose content is `html_content` —
+    /// mirroring `seed_message_with_has_attachments_but_no_local_rows`'s
+    /// message-row shape plus `opening_a_message_with_a_cached_body_renders_it_
+    /// without_fetching`'s `put_body` — for cid-image-resolution tests.
+    fn seed_html_message(app: &mut App, id: &str, html_content: &str) {
+        use mailcore::graph::model::{Message, Recipient};
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: id.into(),
+                    conversation_id: "c1".into(),
+                    subject: "Hello".into(),
+                    from: Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: "2026-07-16T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: true,
+                    importance: "normal".into(),
+                    preview: "hi there".into(),
+                    is_draft: false,
+                },
+            )
+            .expect("seed message");
+        app.store
+            .put_body(
+                id,
+                &Body {
+                    content_type: "html".into(),
+                    content: html_content.into(),
+                },
+            )
+            .expect("seed body");
+    }
+
+    #[test]
+    fn opening_a_message_with_cid_images_requests_their_bytes() {
+        let mut app = App::for_test_with_seeded_store();
+        // Seed a message with an HTML body referencing cid:logo, and its
+        // attachment metadata.
+        seed_html_message(
+            &mut app,
+            "mimg",
+            r#"<p>hi</p><img src="cid:logo"><p>bye</p>"#,
+        );
+        app.store
+            .put_attachments(
+                "mimg",
+                &[AttachmentMeta {
+                    id: "att1".into(),
+                    name: "logo.png".into(),
+                    content_type: "image/png".into(),
+                    size: 3,
+                    is_inline: true,
+                    content_id: Some("logo".into()),
+                }],
+            )
+            .unwrap();
+
+        app.open_message("mimg"); // loads body + should request inline images
+
+        // A FetchInlineImage for att1/logo was enqueued (a FetchBody may also
+        // be queued ahead of it if the body wasn't already cached — it is
+        // here, but drain past anything else just in case).
+        let cmd_rx = app.test_cmd_rx.as_ref().unwrap();
+        let mut found = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::FetchInlineImage { .. }) {
+                found = Some(cmd);
+                break;
+            }
+        }
+        assert!(
+            matches!(found, Some(SyncCommand::FetchInlineImage { ref attachment_id, ref content_id, .. })
+                if attachment_id == "att1" && content_id == "logo"),
+            "expected a FetchInlineImage for att1/logo, got {found:?}"
+        );
+
+        // Delivering the bytes caches them by content_id:
+        app.on_sync_event(SyncEvent::InlineImageReady {
+            message_id: "mimg".into(),
+            content_id: "logo".into(),
+            bytes: vec![1, 2, 3],
+        });
+        assert_eq!(
+            app.inline_images.get("logo").map(|b| b.as_slice()),
+            Some(&[1, 2, 3][..])
+        );
     }
 
     #[test]
