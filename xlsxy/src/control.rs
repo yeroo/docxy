@@ -29,6 +29,7 @@
 //! | `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
 //! | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
 //! | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` |
+//! | `pivot.create` | `{range,rows,cols?,values,name?,sheet?}` | `{sheet,name}` — REAL persistent pivot on a NEW sheet; clears undo history like `sheet.add` |
 //! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 //! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
@@ -91,6 +92,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.stats" => sheet_stats(app, args),
         "chart.list" => Ok(chart_list(app)),
         "pivot.list" => Ok(pivot_list(app)),
+        "pivot.create" => pivot_create(app, args),
         "comment.add" => comment_add(app, args),
         "comment.remove" => comment_remove(app, args),
         "range.set" => range_set(app, args),
@@ -142,6 +144,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "sheet.add"
                 | "sheet.remove"
                 | "sheet.rename"
+                | "pivot.create"
                 | "row.insert"
                 | "row.delete"
                 | "col.insert"
@@ -390,17 +393,18 @@ fn wb_export_csv(app: &App, args: &Json) -> Result<Json, String> {
     ]))
 }
 
-/// One `{col, agg}` pair from `sheet.pivot`'s `values` array.
-fn parse_measure_arg(v: &Json) -> Result<(String, Agg), String> {
+/// One `{col, agg}` pair from a pivot verb's `values` array — shared by
+/// `sheet.pivot` and `pivot.create`, `verb` names the caller in errors so
+/// parity between the two stays honest about which verb actually failed.
+fn parse_measure_arg(verb: &str, v: &Json) -> Result<(String, Agg), String> {
     let col = v
         .get_str("col")
-        .ok_or("sheet.pivot: each value needs a 'col'")?
+        .ok_or_else(|| format!("{verb}: each value needs a 'col'"))?
         .to_string();
     let agg_s = v
         .get_str("agg")
-        .ok_or("sheet.pivot: each value needs an 'agg'")?;
-    let agg =
-        Agg::from_verb_name(agg_s).ok_or_else(|| format!("sheet.pivot: unknown agg '{agg_s}'"))?;
+        .ok_or_else(|| format!("{verb}: each value needs an 'agg'"))?;
+    let agg = Agg::from_verb_name(agg_s).ok_or_else(|| format!("{verb}: unknown agg '{agg_s}'"))?;
     Ok((col, agg))
 }
 
@@ -415,6 +419,97 @@ fn names_arg(args: &Json, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Create a REAL, persistent workbook pivot — arg shape identical to the
+/// ad-hoc `sheet.pivot` (same header-name resolution, same 11 agg strings,
+/// same unknown-column error family), plus an optional `name`. Builds it via
+/// [`gridcore::xlsx::SheetPackage::create_pivot`] (the TUI's own
+/// `add_pivot` + field-layout machinery, given the full layout up front
+/// instead of the interactive editor's one-field-at-a-time session) and
+/// lands the output on a NEW sheet, mirroring the TUI's Ctrl-P placement.
+///
+/// Undo: clears history like `sheet.add`/`sheet.import-csv` — a new sheet +
+/// pivot-part registration isn't a cell-level edit the undo stack can
+/// invert. An agent-level inverse (MCP/wasm) must remove BOTH the created
+/// sheet and the pivot registration; `SheetPackage::remove_sheet` already
+/// cascades pivot removal for exactly this reason.
+fn pivot_create(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let rg = args
+        .get_str("range")
+        .ok_or("pivot.create needs a 'range'")?;
+    let (r1, c1, r2, c2) = parse_range(rg)?;
+    let frame = Frame::from_range(&app.pkg.workbook, si, (r1, c1, r2, c2));
+    if frame.names.is_empty() || frame.rows() == 0 {
+        return Err("pivot.create: the range needs a header row and data rows".into());
+    }
+
+    // Same leniency note as sheet.pivot: the MCP schema marks `rows`
+    // required; the code tolerates its absence (defaults to empty).
+    let rows = names_arg(args, "rows");
+    let cols = names_arg(args, "cols");
+    let values_json = args
+        .get("values")
+        .and_then(Json::as_array)
+        .ok_or("pivot.create needs a 'values' array")?;
+    let values = values_json
+        .iter()
+        .map(|v| parse_measure_arg("pivot.create", v))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err("pivot.create needs at least one value field".into());
+    }
+    let spec = pivot_spec_from_names(&frame, &rows, &cols, &values)
+        .map_err(|col| format!("pivot.create: unknown column '{col}'"))?;
+
+    let sheet_name = match args.get_str("name") {
+        Some(n) => {
+            if n.is_empty() || n.contains(['[', ']', '*', '?', ':', '/', '\\']) {
+                return Err("invalid sheet name".into());
+            }
+            if app.pkg.workbook.sheet_index(n).is_some() {
+                return Err(format!("pivot.create: sheet name '{n}' is already taken"));
+            }
+            n.to_string()
+        }
+        None => unique_pivot_name(&app.pkg.workbook),
+    };
+
+    let source = gridcore::pivot::PivotSource::Range {
+        sheet: app.pkg.workbook.sheets[si].name.clone(),
+        rect: (r1, c1, r2, c2),
+    };
+    let idx = app
+        .pkg
+        .create_pivot(source, &frame, &spec, &sheet_name)
+        .ok_or("pivot.create: could not create the pivot")?;
+    let dest = app.pkg.workbook.pivots[idx].sheet;
+
+    // Same "can't be a cell-level undo" reasoning as sheet.add.
+    app.undo.clear();
+    app.redo.clear();
+    app.rebuild_engine();
+    app.modified = true;
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(dest as f64)),
+        ("name", Json::Str(sheet_name)),
+    ]))
+}
+
+/// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among existing
+/// sheet names. Distinct pattern from `unique_sheet_name`'s "Sheet"/"Sheet 2"
+/// (no space before the number) — Wave-3's convention for agent-created
+/// pivot sheets, chosen for the verb's spec.
+fn unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("Pivot{n}");
+        if wb.sheet_index(&candidate).is_none() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Ad-hoc, read-only pivot over `range`: no workbook mutation, computed
@@ -436,7 +531,7 @@ fn sheet_pivot(app: &App, args: &Json) -> Result<Json, String> {
         .ok_or("sheet.pivot needs a 'values' array")?;
     let values = values_json
         .iter()
-        .map(parse_measure_arg)
+        .map(|v| parse_measure_arg("sheet.pivot", v))
         .collect::<Result<Vec<_>, _>>()?;
 
     let spec = pivot_spec_from_names(&frame, &rows, &cols, &values)
@@ -2627,5 +2722,218 @@ mod tests {
         .unwrap();
         assert_eq!(a.undo.len(), undo_depth_before);
         assert!(a.modified);
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-3 pivot.create
+    // -----------------------------------------------------------------
+
+    fn pivot_create_args(name: Option<&str>) -> Json {
+        let mut fields = vec![
+            ("range", Json::Str("A1:B4".into())),
+            ("rows", Json::Arr(vec![Json::Str("name".into())])),
+            (
+                "values",
+                Json::Arr(vec![Json::obj(vec![
+                    ("col", Json::Str("amount".into())),
+                    ("agg", Json::Str("sum".into())),
+                ])]),
+            ),
+        ];
+        if let Some(n) = name {
+            fields.push(("name", Json::Str(n.into())));
+        }
+        Json::obj(fields)
+    }
+
+    #[test]
+    fn pivot_create_returns_sheet_and_name_lists_and_computes() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        assert_eq!(r.get_str("name"), Some("Pivot1"));
+        let dest = r.get_usize("sheet").unwrap();
+        assert_ne!(dest, 0, "the pivot must land on a NEW sheet");
+        assert_eq!(a.pkg.workbook.sheets[dest].name, "Pivot1");
+
+        // pivot.list includes it.
+        let lst = dispatch(&mut a, "pivot.list", &Json::Null).unwrap();
+        let pivots = lst.get("pivots").unwrap().as_array().unwrap();
+        assert_eq!(pivots.len(), 1);
+        assert_eq!(pivots[0].get_usize("sheet"), Some(dest));
+        let rows = pivots[0].get("rows").unwrap().as_array().unwrap();
+        assert_eq!(rows[0].as_str(), Some("name"));
+        let values = pivots[0].get("values").unwrap().as_array().unwrap();
+        assert_eq!(values[0].as_str(), Some("Sum of amount"));
+
+        // The output sheet already holds computed values (row 2 = header,
+        // row 3 = first row group — "Alice" sorts first, total 10+20=30).
+        let g = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("B4".into())),
+                ("sheet", Json::Num(dest as f64)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(30.0)); // Alice: 10+20
+    }
+
+    #[test]
+    fn pivot_create_default_names_are_unique_pivotn() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r1 = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        assert_eq!(r1.get_str("name"), Some("Pivot1"));
+        let r2 = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        assert_eq!(r2.get_str("name"), Some("Pivot2"));
+    }
+
+    #[test]
+    fn pivot_create_explicit_name_is_used_and_duplicate_errors() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r = dispatch(&mut a, "pivot.create", &pivot_create_args(Some("ByName"))).unwrap();
+        assert_eq!(r.get_str("name"), Some("ByName"));
+        let err = dispatch(&mut a, "pivot.create", &pivot_create_args(Some("ByName"))).unwrap_err();
+        assert!(err.contains("ByName"), "{err}");
+        // Colliding with a plain (non-pivot) sheet name errors the same way.
+        let err = dispatch(&mut a, "pivot.create", &pivot_create_args(Some("Sheet1"))).unwrap_err();
+        assert!(err.contains("Sheet1"), "{err}");
+    }
+
+    #[test]
+    fn pivot_create_unknown_header_names_the_column_like_sheet_pivot() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let err = dispatch(
+            &mut a,
+            "pivot.create",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B4".into())),
+                ("rows", Json::Arr(vec![Json::Str("nope".into())])),
+                (
+                    "values",
+                    Json::Arr(vec![Json::obj(vec![
+                        ("col", Json::Str("amount".into())),
+                        ("agg", Json::Str("sum".into())),
+                    ])]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("nope"), "error should name the column: {err}");
+        assert!(err.starts_with("pivot.create:"), "{err}");
+    }
+
+    #[test]
+    fn pivot_create_needs_at_least_one_value_field() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let err = dispatch(
+            &mut a,
+            "pivot.create",
+            &Json::obj(vec![
+                ("range", Json::Str("A1:B4".into())),
+                ("rows", Json::Arr(vec![Json::Str("name".into())])),
+                ("values", Json::Arr(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("value field"), "{err}");
+    }
+
+    #[test]
+    fn pivot_create_clears_the_undo_stack() {
+        // Empirical fact (Wave-3 Task 3): mirrors sheet.add/sheet.import-csv
+        // — the new sheet + pivot-part registration isn't a cell-level edit
+        // the undo stack can invert, so like those verbs it clears history
+        // rather than push an entry.
+        let mut a = app();
+        pivot_fixture(&mut a);
+        set(&mut a, "D1", "1"); // an undoable edit exists beforehand
+        dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        a.undo();
+        assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn pivot_create_source_edit_and_recalc_refreshes_the_output() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        let dest = r.get_usize("sheet").unwrap();
+        // Bob's amount 20 -> 200 (Bob is the second row group, at B5 — see
+        // the previous test's layout note: row2=header, row3=Alice, row4=Bob).
+        set(&mut a, "B3", "200");
+        dispatch(&mut a, "wb.recalc", &Json::Null).unwrap();
+        let g = cell_get(
+            &a,
+            &Json::obj(vec![
+                ("ref", Json::Str("B5".into())),
+                ("sheet", Json::Num(dest as f64)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(200.0));
+    }
+
+    #[test]
+    fn pivot_create_survives_save_load_and_is_still_refreshable() {
+        let tmp = std::env::temp_dir().join("xlsxy_pivot_create_round_trip.xlsx");
+        let _ = std::fs::remove_file(&tmp);
+        let mut a = App::new(new_xlsx(), tmp.to_str().unwrap());
+        a.os_clip = None;
+        pivot_fixture(&mut a);
+        let r = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        let dest = r.get_usize("sheet").unwrap();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+
+        // A different session opens the saved file.
+        let mut b = App::new(new_xlsx(), "other.xlsx");
+        b.os_clip = None;
+        dispatch(
+            &mut b,
+            "wb.open",
+            &Json::obj(vec![("path", Json::Str(tmp.to_str().unwrap().into()))]),
+        )
+        .unwrap();
+        assert_eq!(b.pkg.workbook.pivots.len(), 1, "pivot lost on reload");
+        assert_eq!(b.pkg.workbook.sheets[dest].name, "Pivot1");
+        let lst = dispatch(&mut b, "pivot.list", &Json::Null).unwrap();
+        assert_eq!(lst.get("pivots").unwrap().as_array().unwrap().len(), 1);
+        // Still refreshable: editing the source and recalculating updates
+        // the reloaded output sheet (Bob's row is B5 — see the layout note
+        // in pivot_create_returns_sheet_and_name_lists_and_computes).
+        set(&mut b, "B3", "200");
+        dispatch(&mut b, "wb.recalc", &Json::Null).unwrap();
+        let g = cell_get(
+            &b,
+            &Json::obj(vec![
+                ("ref", Json::Str("B5".into())),
+                ("sheet", Json::Num(dest as f64)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(g.get("value").unwrap().as_f64(), Some(200.0));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pivot_create_removing_its_sheet_also_drops_the_pivot_registration() {
+        // The "both or neither" inverse contract: sheet.remove on the
+        // pivot's own sheet must not leave a dangling pivot.list entry.
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let r = dispatch(&mut a, "pivot.create", &pivot_create_args(None)).unwrap();
+        let dest = r.get_usize("sheet").unwrap();
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(dest as f64))]),
+        )
+        .unwrap();
+        let lst = dispatch(&mut a, "pivot.list", &Json::Null).unwrap();
+        assert_eq!(lst.get("pivots").unwrap().as_array().unwrap().len(), 0);
     }
 }
