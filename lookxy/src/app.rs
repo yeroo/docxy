@@ -2658,6 +2658,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn o_opens_the_oof_form_in_calendar_mode_too() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut app = App::for_test_with_seeded_store();
+        // Calendar mode routes keys to `calendar::handle_key`, which does NOT
+        // fall through to `on_key_char` — so `O` must be bound there too.
+        app.mode = crate::app::Mode::Calendar;
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('O')));
+        assert!(app.oof_form.is_some());
+    }
+
+    #[test]
     fn automatic_replies_fetched_prefills_the_form() {
         use mailcore::graph::model::ExternalAudience;
         let mut app = App::for_test_with_seeded_store();

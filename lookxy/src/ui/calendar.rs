@@ -84,6 +84,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => app.open_new_event(),
         KeyCode::Char('e') => app.open_edit_event(),
         KeyCode::Char('x') => app.delete_selected_event(),
+        // `O` opens the automatic-replies editor here too — it's an
+        // account-level setting, so it's reachable from Calendar mode as well
+        // as Mail mode (Calendar's key handling doesn't fall through to
+        // `on_key_char`, so it must be bound explicitly).
+        KeyCode::Char('O') => app.open_oof_form(),
         _ => {}
     }
 }
