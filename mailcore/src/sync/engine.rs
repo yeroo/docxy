@@ -3078,29 +3078,30 @@ mod tests {
                 categories: vec!["Work".into()],
             })
             .unwrap();
-        // No completion event and no re-sync (tick is 3600s), so the optimistic
-        // local write persists — poll the store (paced by the event channel)
-        // until it appears.
-        let store = Store::open(&store_path).unwrap();
-        let mut found = false;
-        for _ in 0..60 {
-            let rows = store.messages_in_folder("F1", 50, 0).unwrap();
-            if rows
+        // No completion event and no re-sync (tick is 3600s). Poll (paced by the
+        // event channel) for the drain's PATCH — the definitive "command fully
+        // processed" signal, since the optimistic local write happens earlier in
+        // the same `handle_command` call. Asserting the PATCH immediately would
+        // race the drain on a slow CI machine.
+        let mut patched = false;
+        for _ in 0..100 {
+            if srv
+                .requests()
                 .iter()
-                .find(|m| m.id == "M1")
-                .map(|m| m.categories == vec!["Work".to_string()])
-                .unwrap_or(false)
+                .any(|r| r.method == "PATCH" && r.path.contains("/me/messages/M1"))
             {
-                found = true;
+                patched = true;
                 break;
             }
             let _ = handle.evt_rx.recv_timeout(Duration::from_millis(50));
         }
-        assert!(found, "optimistic category write did not land");
-        assert!(
-            srv.requests()
-                .iter()
-                .any(|r| r.method == "PATCH" && r.path.contains("/me/messages/M1"))
+        assert!(patched, "SetCategories did not PATCH");
+        // The PATCH ran, so the earlier optimistic local write is committed.
+        let store = Store::open(&store_path).unwrap();
+        let rows = store.messages_in_folder("F1", 50, 0).unwrap();
+        assert_eq!(
+            rows.iter().find(|m| m.id == "M1").unwrap().categories,
+            vec!["Work".to_string()]
         );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
