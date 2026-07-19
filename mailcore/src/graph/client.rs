@@ -853,7 +853,7 @@ fn encode_path_segment(s: &str) -> String {
 /// (`-`/`_`, no padding), a different alphabet, so it can't be reused
 /// as-is here. Structured the same way (chunks of 4 input chars -> up to 3
 /// output bytes) so the two are easy to compare.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn digit(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => u32::from(c - b'A'),

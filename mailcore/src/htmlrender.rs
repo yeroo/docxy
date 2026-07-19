@@ -33,10 +33,63 @@ pub struct StyledSpan {
 /// One rendered row: its spans, plus a blockquote/list nesting depth. The
 /// UI turns `indent` into leading spaces (`indent as usize * N`); this
 /// module doesn't hardcode a column count since that's a display concern.
+/// `image` is `Some` only for the special marker line an `<img>` produces
+/// (see `render_html`'s `"img"` handling) — such a line always has empty
+/// `spans`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StyledLine {
     pub spans: Vec<StyledSpan>,
     pub indent: u8,
+    pub image: Option<ImageRef>,
+}
+
+/// The source of an `<img>` in a rendered body.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageSource {
+    /// `src="cid:X"` — an inline attachment, resolved by `Content-ID`.
+    Cid(String),
+    /// `src="data:<mime>;base64,<b64>"` — bytes already decoded here.
+    Data { mime: String, bytes: Vec<u8> },
+    /// `src="http(s)://…"` — a remote image, deliberately NOT fetched
+    /// (tracking-pixel protection); the consumer shows a box.
+    Remote(String),
+    /// Any other/malformed `src` — the consumer shows a box.
+    Unsupported,
+}
+
+/// One `<img>` from a body: its source plus the `alt` text (for the fallback
+/// box caption).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRef {
+    pub src: ImageSource,
+    pub alt: String,
+}
+
+/// Classifies an `<img src>` value into an [`ImageSource`]. `data:` URIs are
+/// base64-decoded here (bounded work); `cid:` keeps the bare id; `http(s)`
+/// is marked remote and never fetched.
+fn classify_img_src(src: &str) -> ImageSource {
+    let s = src.trim();
+    if let Some(cid) = s.strip_prefix("cid:").or_else(|| s.strip_prefix("CID:")) {
+        return ImageSource::Cid(cid.to_string());
+    }
+    if let Some(rest) = s.strip_prefix("data:") {
+        // rest = "<mime>;base64,<b64>"
+        if let Some((meta, b64)) = rest.split_once(',') {
+            let is_b64 = meta.rsplit(';').any(|p| p.eq_ignore_ascii_case("base64"));
+            let mime = meta.split(';').next().unwrap_or("").to_string();
+            if is_b64 && !mime.is_empty() {
+                if let Some(bytes) = crate::graph::client::base64_decode(b64.trim()) {
+                    return ImageSource::Data { mime, bytes };
+                }
+            }
+        }
+        return ImageSource::Unsupported;
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return ImageSource::Remote(s.to_string());
+    }
+    ImageSource::Unsupported
 }
 
 /// Spaces per indent level. This module subtracts `indent * INDENT_SPACES`
@@ -175,6 +228,27 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                             link_stack.push((href, n));
                         }
                     }
+                    "img" => {
+                        flush(&mut lines, &mut words, indent, width);
+                        let src = attrs
+                            .iter()
+                            .find(|(k, _)| k == "src")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("");
+                        let alt = attrs
+                            .iter()
+                            .find(|(k, _)| k == "alt")
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
+                        lines.push(StyledLine {
+                            spans: Vec::new(),
+                            indent,
+                            image: Some(ImageRef {
+                                src: classify_img_src(src),
+                                alt,
+                            }),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -236,12 +310,43 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                     link: Some(url.clone()),
                     ..Default::default()
                 }],
+                ..Default::default()
             });
         }
     }
 
     trim_trailing_blank(&mut lines);
     lines
+}
+
+/// Every `<img>` in `html` as an [`ImageRef`], in document order — used by the
+/// reader to trigger inline-image fetches without caring about wrap width.
+pub fn image_refs(html: &str) -> Vec<ImageRef> {
+    let mut tok = Tokenizer::new(html);
+    let mut out = Vec::new();
+    loop {
+        match tok.next() {
+            Token::Eof => break,
+            Token::TagOpen { name, attrs, .. } if name == "img" => {
+                let src = attrs
+                    .iter()
+                    .find(|(k, _)| k == "src")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                let alt = attrs
+                    .iter()
+                    .find(|(k, _)| k == "alt")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                out.push(ImageRef {
+                    src: classify_img_src(src),
+                    alt,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Word-wraps a `text/plain` body to `width` columns. Lines whose original
@@ -272,6 +377,7 @@ pub fn render_text(plain: &str, width: usize) -> Vec<StyledLine> {
             lines.push(StyledLine {
                 spans: vec![],
                 indent: depth,
+                ..Default::default()
             });
             continue;
         }
@@ -279,6 +385,7 @@ pub fn render_text(plain: &str, width: usize) -> Vec<StyledLine> {
             lines.push(StyledLine {
                 spans,
                 indent: depth,
+                ..Default::default()
             });
         }
     }
@@ -296,7 +403,11 @@ fn flush(lines: &mut Vec<StyledLine>, words: &mut Vec<Word>, indent: u8, width: 
     let taken = std::mem::take(words);
     let effective = width.saturating_sub(indent as usize * INDENT_SPACES).max(1);
     for spans in wrap_words(&taken, effective) {
-        lines.push(StyledLine { spans, indent });
+        lines.push(StyledLine {
+            spans,
+            indent,
+            ..Default::default()
+        });
     }
 }
 
@@ -348,7 +459,11 @@ fn push_blank_separator(lines: &mut Vec<StyledLine>) {
 /// Drops trailing blank lines (paragraph/list/table spacing that ended up
 /// with nothing after it — normal at the end of a document).
 fn trim_trailing_blank(lines: &mut Vec<StyledLine>) {
-    while lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
+    while lines
+        .last()
+        .map(|l| l.spans.is_empty() && l.image.is_none())
+        .unwrap_or(false)
+    {
         lines.pop();
     }
 }
@@ -884,5 +999,61 @@ mod tests {
         let lines = render_text("first\n\nsecond", 80);
         assert_eq!(lines.len(), 3);
         assert!(lines[1].spans.is_empty());
+    }
+
+    #[test]
+    fn img_cid_becomes_an_image_marker_line() {
+        let lines = render_html(
+            r#"<p>before</p><img src="cid:logo123" alt="Logo"><p>after</p>"#,
+            80,
+        );
+        let marker = lines
+            .iter()
+            .find(|l| l.image.is_some())
+            .expect("an image marker line");
+        match &marker.image.as_ref().unwrap().src {
+            ImageSource::Cid(c) => assert_eq!(c, "logo123"),
+            other => panic!("expected Cid, got {other:?}"),
+        }
+        assert_eq!(marker.image.as_ref().unwrap().alt, "Logo");
+        // surrounding text still renders
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.clone())
+            .collect();
+        assert!(joined.contains("before") && joined.contains("after"));
+    }
+    #[test]
+    fn img_data_uri_decodes_bytes() {
+        // "R0lGOD" ... use a tiny valid base64: "aGk=" decodes to "hi"
+        let lines = render_html(r#"<img src="data:image/png;base64,aGk=">"#, 80);
+        let m = lines.iter().find_map(|l| l.image.as_ref()).unwrap();
+        match &m.src {
+            ImageSource::Data { mime, bytes } => {
+                assert_eq!(mime, "image/png");
+                assert_eq!(bytes, b"hi");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+    #[test]
+    fn img_remote_is_marked_remote_and_not_fetched() {
+        let lines = render_html(r#"<img src="https://tracker.example/x.png">"#, 80);
+        let m = lines.iter().find_map(|l| l.image.as_ref()).unwrap();
+        assert!(matches!(m.src, ImageSource::Remote(_)));
+    }
+    #[test]
+    fn img_malformed_data_is_unsupported() {
+        let lines = render_html(r#"<img src="data:whoops">"#, 80);
+        let m = lines.iter().find_map(|l| l.image.as_ref()).unwrap();
+        assert!(matches!(m.src, ImageSource::Unsupported));
+    }
+    #[test]
+    fn image_refs_extracts_all_in_order() {
+        let refs = image_refs(r#"<img src="cid:a"><p>x</p><img src="https://y">"#);
+        assert_eq!(refs.len(), 2);
+        assert!(matches!(refs[0].src, ImageSource::Cid(ref c) if c == "a"));
+        assert!(matches!(refs[1].src, ImageSource::Remote(_)));
     }
 }
