@@ -13,7 +13,11 @@
   const $ = (id) => document.getElementById(id);
 
   const ROW_H = 22;     // must match grid.css .cell height
-  const HDR_W = 44;     // row-number gutter width
+  const HDR_W = 44;     // row-number gutter width; must match grid.css #cells left
+  const COLHDR_H = 22;  // column-header band height; must match grid.css #colhdr
+                        // height AND #cells top. Numerically equal to ROW_H today,
+                        // but it is a different CSS fact — keep them separate so a
+                        // taller header band can't silently misalign hit-testing.
   const COL_PX = 7.5;   // Excel column-width unit -> px (approximate MDW)
   const OVERSCAN = 5;   // extra rows/cols fetched around the visible window
 
@@ -109,7 +113,7 @@
     const cols = Math.max(view.dims.cols + 10, left + ncols);
     // Scroll extent includes the #cells gutter offset so the last row/column
     // can scroll fully clear of the sticky headers.
-    $('spacer').style.height = rows * ROW_H + ROW_H + 'px';
+    $('spacer').style.height = rows * ROW_H + COLHDR_H + 'px';
     $('spacer').style.width = cols * defW + HDR_W + 'px';
 
     // cells
@@ -291,11 +295,11 @@
     const wrap = $('gridwrap');
     const rect = wrap.getBoundingClientRect();
     // The cell layer sits one header gutter inside #gridwrap (see grid.css
-    // #cells: top 22px = the column-header band, left 44px = HDR_W), so
-    // sheet coordinates start that far into the wrap's content box.
+    // #cells: top = COLHDR_H, left = HDR_W), so sheet coordinates start that
+    // far into the wrap's content box.
     const x = e.clientX - rect.left - HDR_W + wrap.scrollLeft;
-    const y = e.clientY - rect.top - ROW_H + wrap.scrollTop;
-    return { r: Math.max(0, Math.floor(y / ROW_H)), c: colAtX(Math.max(0, x)) };
+    const y = e.clientY - rect.top - COLHDR_H + wrap.scrollTop;
+    return { r: Math.max(0, Math.floor(y / ROW_H)), c: colAtX(x) };
   }
   let dragging = false;
   function onMousedown(e) {
@@ -349,15 +353,15 @@
     const wrap = $('gridwrap');
     const r = rowOfRef(), c = refCol();
     const y = r * ROW_H, x = c * defW;
-    // Near edges: a cell at sheet-y `y` sits at content-y `y + ROW_H` (the
+    // Near edges: a cell at sheet-y `y` sits at content-y `y + COLHDR_H` (the
     // #cells gutter offset), and the sticky headers cover the first
-    // ROW_H/HDR_W of the viewport — the two cancel, so the classic
+    // COLHDR_H/HDR_W of the viewport — the two cancel, so the classic
     // `y < scrollTop` check still means "hidden under the header band".
     // Far edges: the gutter does NOT cancel, so the visible span for cells
-    // is clientHeight - ROW_H tall (and clientWidth - HDR_W wide).
+    // is clientHeight - COLHDR_H tall (and clientWidth - HDR_W wide).
     if (y < wrap.scrollTop) wrap.scrollTop = y;
-    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight - ROW_H) {
-      wrap.scrollTop = y + 2 * ROW_H - wrap.clientHeight;
+    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight - COLHDR_H) {
+      wrap.scrollTop = y + ROW_H + COLHDR_H - wrap.clientHeight;
     }
     if (x < wrap.scrollLeft) wrap.scrollLeft = x;
     if (x + defW > wrap.scrollLeft + wrap.clientWidth - HDR_W) {

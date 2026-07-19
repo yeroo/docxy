@@ -181,11 +181,12 @@ for (let i = 0; i < 9; i++) {
     preventDefault() {},
   });
 }
+const CELL_H = cssNum('.cell', 'height'); // 22: one grid row
 assert.equal(byId.get('cellref').textContent, 'B11', 'arrowed down to B11');
-const curTop = WRAP_TOP + CELLS_TOP + 10 * 22 - wrap.scrollTop; // row 11 => r=10
+const curTop = WRAP_TOP + CELLS_TOP + 10 * CELL_H - wrap.scrollTop; // row 11 => r=10
 assert.ok(curTop >= WRAP_TOP + COLHDR_H,
   `active cell (top ${curTop}) must not be under the column-header band`);
-assert.ok(curTop + 22 <= WRAP_TOP + wrap.clientHeight,
-  `active cell (bottom ${curTop + 22}) must be inside the viewport`);
+assert.ok(curTop + CELL_H <= WRAP_TOP + wrap.clientHeight,
+  `active cell (bottom ${curTop + CELL_H}) must be inside the viewport`);
 
 console.log('grid layout OK: headers/cells aligned; click round-trip exact; scroll clears the header band');
