@@ -110,9 +110,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 .inline_images
                 .get(c)
                 .map(|b| (format!("cid:{c}"), b.as_slice())),
-            ImageSource::Data { bytes, .. } => {
-                Some((format!("data:{}", bytes.len()), bytes.as_slice()))
-            }
+            ImageSource::Data { bytes, .. } => Some((data_image_key(bytes), bytes.as_slice())),
             _ => None, // Remote / Unsupported → box
         };
         let painted = match (&app.picker, resolved) {
@@ -125,6 +123,19 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             draw_image_fallback_rect(f, rect, &ib.img);
         }
     }
+}
+
+/// A stable cache key for a `data:` URI image, derived from the bytes'
+/// *content* rather than their length — two different images that happen to
+/// encode to the same byte count (common for e.g. same-size PNGs) must not
+/// collide on the same key, or the second one paints with the first's
+/// cached protocol. Not cryptographic; `DefaultHasher` is only asked to tell
+/// distinct byte strings apart within one reading-pane session.
+fn data_image_key(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("data:{:016x}", h.finish())
 }
 
 /// Tries to paint `bytes` (the image source resolved from `key`'s
@@ -148,7 +159,23 @@ fn paint_inline_image(
 ) -> bool {
     let cache_key = format!("{key}#{}x{}", rect.width, rect.height);
     if !cache.contains_key(&cache_key) {
-        let Ok(img) = image::load_from_memory(bytes) else {
+        // Inline image bytes are attacker-controlled (a `data:` URI in the
+        // HTML, or a sender's cid attachment): decode under bounded limits
+        // so a small "decompression bomb" declaring huge pixel dimensions
+        // can't make the decoder allocate an unbounded buffer and OOM/hang
+        // the TUI. Any limit violation (or any other decode error) just
+        // falls back to the bordered box like every other unsupported case.
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+        reader = match reader.with_guessed_format() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(10_000);
+        limits.max_image_height = Some(10_000);
+        limits.max_alloc = Some(256 * 1024 * 1024); // 256 MiB decoded ceiling
+        reader.limits(limits);
+        let Ok(img) = reader.decode() else {
             return false;
         };
         let Ok(proto) = picker.new_protocol(img, rect, Resize::Fit(None)) else {
@@ -351,5 +378,22 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("[image: Logo]"));
+    }
+
+    /// Two `data:` images of equal *byte length* but different content must
+    /// not collide on the cache key — the old `format!("data:{}", bytes.len())`
+    /// key would let a second same-length image paint over the first's
+    /// cached protocol. Keying on content (a hash of the bytes) instead
+    /// keeps them distinct, while identical bytes still share one key.
+    #[test]
+    fn data_image_key_distinguishes_same_length_different_content() {
+        let a = data_image_key(b"AAAA");
+        let b = data_image_key(b"BBBB");
+        assert_ne!(a, b, "same-length different-content bytes must not collide");
+        assert_eq!(
+            data_image_key(b"AAAA"),
+            a,
+            "identical bytes must produce the same key"
+        );
     }
 }

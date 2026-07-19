@@ -221,6 +221,14 @@ pub struct App {
     /// doesn't re-fire on every call (e.g. once per `AttachmentsUpdated`).
     /// Cleared alongside `inline_images` in `open_message`.
     requested_inline: std::collections::HashSet<String>,
+    /// Whether `SyncCommand::FetchAttachments` has already been sent for the
+    /// currently opened message's inline-image resolution. `open_message`
+    /// calls `request_inline_images` once itself and once more indirectly
+    /// through `reload_body`'s cache-hit branch; both calls see empty
+    /// attachment metadata on a message whose metadata hasn't landed yet, so
+    /// without this guard each would fire its own `FetchAttachments`. Reset
+    /// to `false` in `open_message` alongside `inline_images`/`requested_inline`.
+    inline_attachments_requested: bool,
     /// The terminal graphics capability, detected once at startup
     /// (`main::main`) via `Picker::from_query_stdio` (falling back to a fixed
     /// font-cell size). `None` in every test `App` (`for_test_with_seeded_store`/
@@ -330,6 +338,20 @@ pub enum Row {
     Message(usize, usize), // (thread index, message index within the thread)
 }
 
+/// Normalizes a Content-ID for `cid:`-to-attachment comparison: trims
+/// surrounding whitespace, then strips one leading `<` and one trailing `>`
+/// if present. Graph's `contentId` may come back either bare (`logo@x`) or
+/// angle-bracketed (`<logo@x>`); an HTML body's `cid:` token is usually bare
+/// but can also be bracketed. Comparing the two forms directly with `==`
+/// fails whenever they disagree, silently falling back every cid image on
+/// the message to the bordered box. Comparison stays case-sensitive —
+/// Content-IDs are case-sensitive per RFC 2045.
+fn normalize_cid(s: &str) -> &str {
+    let trimmed = s.trim();
+    let no_prefix = trimmed.strip_prefix('<').unwrap_or(trimmed);
+    no_prefix.strip_suffix('>').unwrap_or(no_prefix)
+}
+
 /// How many messages `reload_messages` pulls per folder. Paging further back
 /// is a later task's concern; this is enough to fill a screen many times over.
 const MESSAGE_PAGE_SIZE: i64 = 200;
@@ -392,6 +414,7 @@ impl App {
             reading_content_rows: 0,
             inline_images: std::collections::HashMap::new(),
             requested_inline: std::collections::HashSet::new(),
+            inline_attachments_requested: false,
             picker: None,
             image_protocols: std::collections::HashMap::new(),
         };
@@ -699,6 +722,7 @@ impl App {
         // an empty set in turn and each cid gets fetched twice.
         self.inline_images.clear();
         self.requested_inline.clear();
+        self.inline_attachments_requested = false;
         self.image_protocols.clear();
         self.reload_body();
         self.request_inline_images();
@@ -805,20 +829,29 @@ impl App {
         let metas = self.store.attachments(&id).unwrap_or_default();
         if metas.is_empty() {
             // No metadata yet — fetch it; AttachmentsUpdated re-enters here.
-            let _ = self
-                .sync
-                .cmd_tx
-                .send(SyncCommand::FetchAttachments { message_id: id });
+            // `open_message` calls this function twice in a row (see its
+            // comment), and both calls can land here before either sees
+            // metadata, so guard on `inline_attachments_requested` rather
+            // than sending unconditionally — otherwise the message gets two
+            // identical `FetchAttachments` in flight.
+            if !self.inline_attachments_requested {
+                self.inline_attachments_requested = true;
+                let _ = self
+                    .sync
+                    .cmd_tx
+                    .send(SyncCommand::FetchAttachments { message_id: id });
+            }
             return;
         }
         for cid in cids {
             if self.requested_inline.contains(&cid) {
                 continue;
             }
-            if let Some(att) = metas
-                .iter()
-                .find(|a| a.content_id.as_deref() == Some(cid.as_str()))
-            {
+            if let Some(att) = metas.iter().find(|a| {
+                a.content_id
+                    .as_deref()
+                    .is_some_and(|stored| normalize_cid(stored) == normalize_cid(&cid))
+            }) {
                 self.requested_inline.insert(cid.clone());
                 let _ = self.sync.cmd_tx.send(SyncCommand::FetchInlineImage {
                     message_id: id.clone(),
@@ -3063,6 +3096,91 @@ pub(crate) mod tests {
         assert_eq!(
             app.inline_images.get("logo").map(|b| b.as_slice()),
             Some(&[1, 2, 3][..])
+        );
+    }
+
+    /// Graph's `contentId` may come back angle-bracketed (`<logo@x>`) even
+    /// when the body's `cid:` token is bare — `request_inline_images` must
+    /// normalize both sides before comparing, or every cid image on a
+    /// message whose attachment metadata is bracketed silently falls back to
+    /// the box (see `normalize_cid`).
+    #[test]
+    fn cid_matching_tolerates_angle_bracketed_content_ids() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_html_message(
+            &mut app,
+            "mimg2",
+            r#"<p>hi</p><img src="cid:logo@x"><p>bye</p>"#,
+        );
+        app.store
+            .put_attachments(
+                "mimg2",
+                &[AttachmentMeta {
+                    id: "att1".into(),
+                    name: "logo.png".into(),
+                    content_type: "image/png".into(),
+                    size: 3,
+                    is_inline: true,
+                    content_id: Some("<logo@x>".into()),
+                }],
+            )
+            .unwrap();
+
+        app.open_message("mimg2");
+
+        let cmd_rx = app.test_cmd_rx.as_ref().unwrap();
+        let mut logo_fetches = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let SyncCommand::FetchInlineImage {
+                ref attachment_id,
+                ref content_id,
+                ..
+            } = cmd
+            {
+                if content_id == "logo@x" {
+                    assert_eq!(attachment_id, "att1");
+                    logo_fetches.push(cmd);
+                }
+            }
+        }
+        assert_eq!(
+            logo_fetches.len(),
+            1,
+            "expected exactly one FetchInlineImage for att1/logo@x, got {logo_fetches:?}"
+        );
+    }
+
+    /// A cached HTML body (cid image, no attachment metadata seeded yet)
+    /// makes `request_inline_images` run twice during `open_message`
+    /// (once from the trailing call, once again from `reload_body`'s
+    /// cache-hit branch) — both see empty `metas` and must not each send
+    /// their own `FetchAttachments`; only one should ever go out per
+    /// message.
+    #[test]
+    fn opening_a_cached_html_message_sends_only_one_fetch_attachments() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_html_message(
+            &mut app,
+            "mimg3",
+            r#"<p>hi</p><img src="cid:logo"><p>bye</p>"#,
+        );
+        // Deliberately no `put_attachments` call — metadata is unknown.
+
+        app.open_message("mimg3");
+
+        let cmd_rx = app.test_cmd_rx.as_ref().unwrap();
+        let mut fetch_attachments = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let SyncCommand::FetchAttachments { ref message_id } = cmd {
+                if message_id == "mimg3" {
+                    fetch_attachments.push(cmd);
+                }
+            }
+        }
+        assert_eq!(
+            fetch_attachments.len(),
+            1,
+            "expected exactly one FetchAttachments for mimg3, got {fetch_attachments:?}"
         );
     }
 
