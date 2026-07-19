@@ -554,7 +554,7 @@ fn local_offset_minutes() -> i64 {
 /// civil date — Howard Hinnant's `civil_from_days` algorithm, the same one
 /// `mailcore::sync::engine` already uses (private to that module, so kept as
 /// its own copy here — same duplication reasoning as `to_ratatui_line`).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64; // [0, 146096]
@@ -570,7 +570,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// The inverse of `civil_from_days` — Howard Hinnant's `days_from_civil`
 /// algorithm: a `(year, month, day)` civil date to a day count since the
 /// Unix epoch.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64; // [0, 399]

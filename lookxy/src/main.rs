@@ -12,6 +12,7 @@
 
 mod app;
 mod config;
+mod datetime;
 // The control-surface verb dispatcher (mail read + triage against the live
 // App), wired into the run loop below via `ctlcore::serve` and its request
 // channel.
