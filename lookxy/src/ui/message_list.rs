@@ -6,6 +6,7 @@
 use crate::app::{App, Pane};
 use crate::ui::{border_style, centered_rect, truncate_width};
 
+use mailcore::graph::model::MasterCategory;
 use mailcore::store::MessageRow;
 
 use ratatui::Frame;
@@ -19,7 +20,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.threaded_active() {
         draw_threaded(f, area, focused, app);
     } else {
-        draw_list(f, area, "Messages", focused, &app.messages, app.msg_index);
+        draw_list(
+            f,
+            area,
+            "Messages",
+            focused,
+            &app.messages,
+            app.msg_index,
+            &app.master_categories,
+        );
     }
 }
 
@@ -48,7 +57,12 @@ fn draw_threaded(f: &mut Frame, area: Rect, focused: bool, app: &App) {
                 // A singleton (no header) renders flush-left like the flat list;
                 // a child under an expanded header is indented.
                 let indent = tv.thread.messages.len() > 1;
-                child_line(&tv.thread.messages[m], indent, inner_width)
+                child_line(
+                    &tv.thread.messages[m],
+                    indent,
+                    inner_width,
+                    &app.master_categories,
+                )
             }
         })
         .map(ListItem::new)
@@ -88,7 +102,12 @@ fn header_line(t: &mailcore::thread::Thread, expanded: bool, width: usize) -> Li
 
 /// A single message row: indented when it's a child under an expanded header,
 /// flush-left when it's a singleton conversation.
-fn child_line(m: &MessageRow, indent: bool, width: usize) -> Line<'static> {
+fn child_line(
+    m: &MessageRow,
+    indent: bool,
+    width: usize,
+    master: &[MasterCategory],
+) -> Line<'static> {
     let flagged = if m.is_flagged { "!" } else { " " };
     let attached = if m.has_attachments { "@" } else { " " };
     let time = short_time(&m.received_at);
@@ -102,12 +121,34 @@ fn child_line(m: &MessageRow, indent: bool, width: usize) -> Line<'static> {
         "{pad}{flagged}{attached} {time}  {} — {}",
         m.from_name, subject_or_preview
     );
-    let truncated = truncate_width(&text, width);
+    let (dots, dot_cols) = category_dots(m, master);
+    let truncated = truncate_width(&text, width.saturating_sub(dot_cols));
     let mut style = Style::default();
     if !m.is_read {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Line::from(Span::styled(truncated, style))
+    let mut spans = dots;
+    spans.push(Span::styled(truncated, style));
+    Line::from(spans)
+}
+
+/// The category-dot spans for a message (one colored `●` per assigned category,
+/// followed by a single trailing space when there's at least one), plus the
+/// number of display columns they occupy so the caller can shrink the text's
+/// truncation budget. Empty categories → no spans, 0 columns.
+fn category_dots(m: &MessageRow, master: &[MasterCategory]) -> (Vec<Span<'static>>, usize) {
+    if m.categories.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(m.categories.len() + 1);
+    for name in &m.categories {
+        spans.push(Span::styled(
+            "●",
+            Style::default().fg(crate::ui::categories::color_for(master, name)),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    (spans, m.categories.len() + 1) // one column per dot + the trailing space
 }
 
 /// Renders a titled, bordered list of `messages` with `selected` highlighted
@@ -123,6 +164,7 @@ pub(crate) fn draw_list(
     focused: bool,
     messages: &[MessageRow],
     selected: usize,
+    master: &[MasterCategory],
 ) {
     let block = Block::default()
         .title(title.to_string())
@@ -135,7 +177,7 @@ pub(crate) fn draw_list(
 
     let items: Vec<ListItem> = messages
         .iter()
-        .map(|m| ListItem::new(line(m, inner_width)))
+        .map(|m| ListItem::new(line(m, inner_width, master)))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -151,7 +193,7 @@ pub(crate) fn draw_list(
 /// One row: flag/attachment markers, a shortened received time, then
 /// "sender — subject", truncated to `width` display columns. Unread messages
 /// render bold.
-fn line(m: &MessageRow, width: usize) -> Line<'static> {
+fn line(m: &MessageRow, width: usize, master: &[MasterCategory]) -> Line<'static> {
     let flagged = if m.is_flagged { "!" } else { " " };
     let attached = if m.has_attachments { "@" } else { " " };
     let time = short_time(&m.received_at);
@@ -159,13 +201,16 @@ fn line(m: &MessageRow, width: usize) -> Line<'static> {
         "{flagged}{attached} {time}  {} — {}",
         m.from_name, m.subject
     );
-    let truncated = truncate_width(&text, width);
+    let (dots, dot_cols) = category_dots(m, master);
+    let truncated = truncate_width(&text, width.saturating_sub(dot_cols));
 
     let mut style = Style::default();
     if !m.is_read {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Line::from(Span::styled(truncated, style))
+    let mut spans = dots;
+    spans.push(Span::styled(truncated, style));
+    Line::from(spans)
 }
 
 /// Renders the move-folder popup (`v`) as a centered overlay, when
@@ -247,6 +292,53 @@ mod tests {
     use crate::app::tests::seed_second_in_c1;
     use mailcore::graph::model::MailFolder;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn message_row_shows_a_category_dot() {
+        use mailcore::graph::model::{MasterCategory, Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        app.master_categories = vec![MasterCategory {
+            display_name: "Work".into(),
+            color: "preset0".into(),
+        }];
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "mc".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Budget".into(),
+                    from: Recipient {
+                        name: "Al".into(),
+                        address: "a@x".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-19T10:00:00Z".into(),
+                    sent: "".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "p".into(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec!["Work".into()],
+                },
+            )
+            .unwrap();
+        app.reload_messages();
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, &app, f.area())).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains('●'));
+    }
 
     #[test]
     fn threaded_view_renders_headers_and_expanded_children() {

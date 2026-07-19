@@ -51,6 +51,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         true,
         app.visible_messages(),
         app.msg_index,
+        &app.master_categories,
     );
 }
 

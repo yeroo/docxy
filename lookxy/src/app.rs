@@ -10,7 +10,9 @@ use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::client::RsvpKind;
-use mailcore::graph::model::{AttachmentKind, AttachmentMeta, AutomaticReplies, Body, OofStatus};
+use mailcore::graph::model::{
+    AttachmentKind, AttachmentMeta, AutomaticReplies, Body, MasterCategory, OofStatus,
+};
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 
@@ -201,6 +203,10 @@ pub struct App {
     /// The automatic-replies (out-of-office) editor overlay, when open
     /// (opened by `O`; see `App::open_oof_form`).
     pub oof_form: Option<crate::ui::oofform::OofForm>,
+    /// The mailbox's master category list (name→color), for rendering category
+    /// dots/chips and the picker's choices. Loaded from the store on
+    /// `CategoriesUpdated` and at startup.
+    pub master_categories: Vec<MasterCategory>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -414,6 +420,7 @@ impl App {
             file_picker: None,
             event_form: None,
             oof_form: None,
+            master_categories: Vec::new(),
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -425,7 +432,13 @@ impl App {
         };
         app.reload_folders();
         app.reload_account();
+        app.reload_master_categories();
         app
+    }
+
+    /// Re-reads the master category list from the store (`Store::master_categories`).
+    pub fn reload_master_categories(&mut self) {
+        self.master_categories = self.store.master_categories().unwrap_or_default();
     }
 
     /// Re-reads the account name from the token cache (`None` if it can't be
@@ -534,6 +547,7 @@ impl App {
                 self.oof_form = None;
                 self.attachment_notice = Some("Automatic replies updated".to_string());
             }
+            SyncEvent::CategoriesUpdated => self.reload_master_categories(),
             SyncEvent::Error(msg) => {
                 // A fetch failure while the OOF form is open must clear its
                 // loading state so the user can still edit + save (a later PATCH

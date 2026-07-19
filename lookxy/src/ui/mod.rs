@@ -6,6 +6,7 @@
 
 mod attachments;
 pub(crate) mod calendar;
+pub mod categories;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;

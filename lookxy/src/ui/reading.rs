@@ -15,6 +15,7 @@
 use crate::app::{App, Pane};
 use crate::ui::border_style;
 
+use mailcore::graph::model::MasterCategory;
 use mailcore::htmlrender::{self, ImageRef, ImageSource, StyledLine, StyledSpan};
 use mailcore::store::MessageRow;
 
@@ -59,7 +60,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Fixed header (From/Subject/Received, an optional meeting-invite banner,
     // + blank), then the scrolling body.
-    let mut header = header_lines(m);
+    let mut header = header_lines(m, &app.master_categories);
     if m.is_meeting_request {
         header.push(Line::from(
             "📅 Meeting invite — [A]ccept  [D]ecline  [T]entative",
@@ -199,12 +200,23 @@ fn selected_message(app: &App) -> Option<&MessageRow> {
     app.selected_message_row()
 }
 
-fn header_lines(m: &MessageRow) -> Vec<Line<'static>> {
-    vec![
+fn header_lines(m: &MessageRow, master: &[MasterCategory]) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(format!("From: {} <{}>", m.from_name, m.from_addr)),
         Line::from(format!("Subject: {}", m.subject)),
         Line::from(format!("Received: {}", m.received_at)),
-    ]
+    ];
+    if !m.categories.is_empty() {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw("Categories: ")];
+        for name in &m.categories {
+            spans.push(Span::styled(
+                format!("[{name}] "),
+                Style::default().fg(crate::ui::categories::color_for(master, name)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The opened message's body as `StyledLine`s (HTML or plain), mirroring the
@@ -390,6 +402,55 @@ mod tests {
     /// key would let a second same-length image paint over the first's
     /// cached protocol. Keying on content (a hash of the bytes) instead
     /// keeps them distinct, while identical bytes still share one key.
+    #[test]
+    fn reader_shows_category_chips() {
+        use mailcore::graph::model::{MasterCategory, Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        app.master_categories = vec![MasterCategory {
+            display_name: "Work".into(),
+            color: "preset0".into(),
+        }];
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "mc".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Budget".into(),
+                    from: Recipient {
+                        name: "Al".into(),
+                        address: "a@x".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-19T10:00:00Z".into(),
+                    sent: "".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "p".into(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec!["Work".into()],
+                },
+            )
+            .unwrap();
+        app.reload_messages();
+        app.open_message("mc");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Categories:"));
+        assert!(text.contains("Work"));
+    }
+
     #[test]
     fn renders_the_meeting_banner_for_an_invite_only() {
         use mailcore::graph::model::{Message, Recipient};
