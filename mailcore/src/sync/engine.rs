@@ -19,7 +19,7 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
-use crate::graph::model::{DeltaItem, Message};
+use crate::graph::model::{AutomaticReplies, DeltaItem, Message};
 use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
@@ -84,6 +84,14 @@ pub enum SyncCommand {
     /// [`SyncEvent::MeetingResponded`] on success, or [`SyncEvent::Error`] when
     /// the message resolves to no event.
     RespondMeeting { message_id: String, kind: RsvpKind },
+    /// Fetch the mailbox's automatic-replies config
+    /// (`GraphClient::get_automatic_replies`) and emit
+    /// [`SyncEvent::AutomaticRepliesFetched`]. Direct call, no outbox.
+    FetchAutomaticReplies,
+    /// Write the mailbox's automatic-replies config
+    /// (`GraphClient::set_automatic_replies`) and emit
+    /// [`SyncEvent::AutomaticRepliesUpdated`]. Direct call, no outbox.
+    SetAutomaticReplies { replies: AutomaticReplies },
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
     /// `SaveAttachment`, which writes to disk. `content_id` is echoed back on
@@ -181,6 +189,12 @@ pub enum SyncEvent {
     /// A meeting invite was RSVP'd (from [`SyncCommand::RespondMeeting`]); the
     /// UI shows a confirmation and marks the message read.
     MeetingResponded { message_id: String, kind: RsvpKind },
+    /// The mailbox's automatic-replies config was fetched (from
+    /// [`SyncCommand::FetchAutomaticReplies`]); the UI prefills its OOF form.
+    AutomaticRepliesFetched { replies: AutomaticReplies },
+    /// The automatic-replies config was written (from
+    /// [`SyncCommand::SetAutomaticReplies`]); the UI closes its OOF form.
+    AutomaticRepliesUpdated,
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -487,6 +501,8 @@ impl Engine {
             SyncCommand::RespondMeeting { message_id, kind } => {
                 self.respond_meeting(&message_id, kind)
             }
+            SyncCommand::FetchAutomaticReplies => self.fetch_automatic_replies(),
+            SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
             SyncCommand::FetchInlineImage {
                 message_id,
                 attachment_id,
@@ -1025,6 +1041,38 @@ impl Engine {
                 message_id: message_id.to_string(),
                 kind,
             }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch the mailbox's automatic-replies config and emit
+    /// `AutomaticRepliesFetched`; a Graph failure goes through `react`. Same
+    /// signed-in guard as `fetch_body`.
+    fn fetch_automatic_replies(&mut self) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_automatic_replies()) {
+            Ok(replies) => self.emit(SyncEvent::AutomaticRepliesFetched { replies }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Write the mailbox's automatic-replies config and emit
+    /// `AutomaticRepliesUpdated`; a Graph failure goes through `react`. Same
+    /// signed-in guard as `fetch_body`.
+    fn set_automatic_replies(&mut self, replies: AutomaticReplies) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.set_automatic_replies(&replies)) {
+            Ok(()) => self.emit(SyncEvent::AutomaticRepliesUpdated),
             Err(e) => {
                 self.react(e);
             }
@@ -2818,6 +2866,102 @@ mod tests {
             .unwrap();
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
 
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_automatic_replies_emits_fetched() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailboxSettings".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"automaticRepliesSetting":{"status":"alwaysEnabled","externalAudience":"all","internalReplyMessage":"hi","externalReplyMessage":"bye"}}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("fetch-oof");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        handle.cmd_tx.send(SyncCommand::FetchAutomaticReplies).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::AutomaticRepliesFetched { replies }
+                if replies.status == crate::graph::model::OofStatus::AlwaysEnabled
+                    && replies.internal_message == "hi")
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_automatic_replies_patches_and_emits_updated() {
+        use crate::graph::model::{AutomaticReplies, ExternalAudience, OofStatus};
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/mailboxSettings".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("set-oof");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetAutomaticReplies {
+                replies: AutomaticReplies {
+                    status: OofStatus::Disabled,
+                    external_audience: ExternalAudience::All,
+                    internal_message: "x".into(),
+                    external_message: "y".into(),
+                    scheduled_start_utc: "".into(),
+                    scheduled_end_utc: "".into(),
+                },
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::AutomaticRepliesUpdated)
+        });
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.method == "PATCH" && r.path.contains("/me/mailboxSettings"))
+        );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
