@@ -1,0 +1,1329 @@
+[
+  {
+    "name": "docxy_list",
+    "description": "List the docxy editors currently running on this machine (instance/pane id, port, pid).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_new",
+    "description": "Create a new blank .docx at a path and open it in the running docxy (in a VS Code window, a new tab). With no docxy running the file is still created. Refuses to overwrite an existing file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path for the new document (created; must not exist)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "docxy_status",
+    "description": "Report the open document's path, format, modified flag, and block count.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_outline",
+    "description": "Return the document's heading outline: each heading's block index, level, and text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_read",
+    "description": "Read the live document (including unsaved edits). Returns per-block text + kind; defaults to the whole document, or pass a block range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "description": "First block index (default 0)."
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last block index, inclusive (default: last)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_find",
+    "description": "Find all occurrences of a query in the live document; returns match positions and the containing paragraph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Text to search for."
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "description": "Match case (default false)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "docxy_replace_range",
+    "description": "Replace paragraphs [start..=end] with new text (\\n separates paragraphs). Undoable; endpoints must be paragraphs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "description": "First paragraph block index to replace."
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last paragraph block index, inclusive (default: start)."
+        },
+        "text": {
+          "type": "string",
+          "description": "Replacement text; \\n starts a new paragraph."
+        },
+        "markdown": {
+          "type": "boolean",
+          "description": "Parse text as Markdown (headings, bold, lists, tables, links) instead of plain text."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "start",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "docxy_insert",
+    "description": "Insert text as new paragraph(s) before the block at `at` (\\n separates paragraphs). Undoable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "Block index to insert before (== block count to append)."
+        },
+        "text": {
+          "type": "string",
+          "description": "Text to insert; \\n starts a new paragraph."
+        },
+        "markdown": {
+          "type": "boolean",
+          "description": "Parse text as Markdown (headings, bold, lists, tables, links) instead of plain text."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "at",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "docxy_append",
+    "description": "Append text as new paragraph(s) at the end of the document (\\n separates paragraphs). Undoable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Text to append; \\n starts a new paragraph."
+        },
+        "markdown": {
+          "type": "boolean",
+          "description": "Parse text as Markdown (headings, bold, lists, tables, links) instead of plain text."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "docxy_save",
+    "description": "Save the open document to its file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_export",
+    "description": "Export the live document (including unsaved edits) as Markdown or plain text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "description": "Output format: \"markdown\" or \"text\"."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "format"
+      ]
+    }
+  },
+  {
+    "name": "docxy_export_pdf",
+    "description": "Render the live document to a PDF at a path. Refuses to overwrite an existing file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path for the PDF (created; must not exist)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "docxy_comments",
+    "description": "List the document's review comments (author, initials, date, text, anchor), in anchor order.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_notes",
+    "description": "List the document's footnotes and endnotes, in file order.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_header",
+    "description": "Read the default section header's block content (empty if the document has none).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_footer",
+    "description": "Read the default section footer's block content (empty if the document has none).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_metadata",
+    "description": "Read the document's core properties (title, author, subject, keywords, comments, last saved by, revision, created, modified) — present-if-set.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_stats",
+    "description": "Word/character/paragraph/block counts over the live document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_replace_all",
+    "description": "Replace every occurrence of a query with text across the whole document (case-insensitive unless case_sensitive:true). Undoable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Text to search for."
+        },
+        "text": {
+          "type": "string",
+          "description": "Replacement text."
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "description": "Match case (default false)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "query",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "docxy_undo",
+    "description": "Undo the last edit, if any. Returns {done:false} when there is nothing to undo.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_redo",
+    "description": "Redo the last undone edit, if any. Returns {done:false} when there is nothing to redo.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_format",
+    "description": "Apply character formatting to every run in a block range — bold/italic/underline/strike are set directly (not toggled), plus color/highlight/font/size. One undo checkpoint.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "description": "First block index to format."
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last block index, inclusive (default: start)."
+        },
+        "patch": {
+          "type": "object",
+          "properties": {
+            "bold": {
+              "type": "boolean",
+              "description": "Bold on/off (set directly, not toggled)."
+            },
+            "italic": {
+              "type": "boolean",
+              "description": "Italic on/off (set directly, not toggled)."
+            },
+            "underline": {
+              "type": "boolean",
+              "description": "Underline on/off (set directly, not toggled)."
+            },
+            "strike": {
+              "type": "boolean",
+              "description": "Strikethrough on/off (set directly, not toggled)."
+            },
+            "color": {
+              "type": "string",
+              "description": "Font color as \"#RRGGBB\"."
+            },
+            "highlight": {
+              "type": "string",
+              "description": "Highlight color: one of yellow, green, cyan, magenta, red, blue, lightGray, darkYellow, or \"none\" to clear."
+            },
+            "font": {
+              "type": "string",
+              "description": "Font name."
+            },
+            "size": {
+              "type": "number",
+              "description": "Font size in points (fractional allowed)."
+            }
+          },
+          "required": [],
+          "description": "Formatting to apply — at least one key required; an unknown key errors naming it. Keys absent from the patch leave that aspect of each run's existing formatting untouched."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "start",
+        "patch"
+      ]
+    }
+  },
+  {
+    "name": "docxy_set_style",
+    "description": "Set a paragraph style and/or alignment over a block range. At least one of `style`/`align` is required. One undo checkpoint.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "description": "First block index to style."
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last block index, inclusive (default: start)."
+        },
+        "style": {
+          "type": "string",
+          "description": "Paragraph style id: Heading1, Heading2, Heading3, Heading4, Heading5, Heading6, Quote, SourceCode, or \"Normal\" to clear to the default style."
+        },
+        "align": {
+          "type": "string",
+          "description": "Horizontal alignment: \"left\", \"center\", \"right\", or \"justify\"."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "start"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_list",
+    "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_new",
+    "description": "Create a new blank .xlsx at a path and open it in the running xlsxy (in a VS Code window, a new tab). With no xlsxy running the file is still created. Refuses to overwrite an existing file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path for the new workbook (created; must not exist)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_status",
+    "description": "Report the open workbook's path, modified flag, sheet count, and active sheet.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_sheets",
+    "description": "List every sheet: index, name, and used size (rows/cols).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_read",
+    "description": "Read non-empty cells of the live workbook (including unsaved edits): value, formula, and display text per cell. Defaults to the active sheet's whole used range, or pass an A1-style range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:C10\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_get",
+    "description": "Read one cell: value, formula, and display text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "Cell reference, e.g. \"B4\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_set",
+    "description": "Set a cell. A leading '=' makes a formula (validated + recalculated); otherwise number/bool/text is inferred like typing into the grid. Undoable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "Cell reference, e.g. \"B4\"."
+        },
+        "text": {
+          "type": "string",
+          "description": "What to enter, e.g. \"42\" or \"=SUM(B1:B3)\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_clear",
+    "description": "Clear a range's values/formulas (styles kept). One undo group.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:C10\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_find",
+    "description": "Search cell values and formula text (case-insensitive) across all sheets, or one sheet.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Text to search for."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_recalc",
+    "description": "Recalculate the whole workbook (and refresh pivots).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_save",
+    "description": "Save the open workbook to its file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_comments",
+    "description": "List every cell comment (threads flattened in reply order): sheet, cell ref, author, text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_comment_add",
+    "description": "Add a threaded comment to a cell (or a reply, if the cell already has a thread).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "Cell reference, e.g. \"B4\"."
+        },
+        "text": {
+          "type": "string",
+          "description": "Comment text."
+        },
+        "author": {
+          "type": "string",
+          "description": "Comment author (defaults to the editing identity)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_comment_remove",
+    "description": "Remove the comment (threaded or legacy note) on a cell, if any.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "Cell reference, e.g. \"B4\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_range_set",
+    "description": "Write a rectangular block of cells starting at a top-left ref, atomically: every formula in the batch is validated before anything is applied. One undo group.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "Top-left cell reference, e.g. \"B4\"."
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": "Rows of cell text, each row an array of strings entered like xlsxy_set's text (empty string clears the cell)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "start",
+        "rows"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_export_csv",
+    "description": "Export a sheet's cells as display-formatted, RFC-4180 CSV.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_import_csv",
+    "description": "Import CSV text as a brand-new sheet (never overwrites an existing one; name collisions are deduplicated).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "CSV text to import."
+        },
+        "name": {
+          "type": "string",
+          "description": "Requested sheet name (default: \"Sheet\", deduplicated)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_pivot",
+    "description": "Compute an ad-hoc pivot table over a range (first row = header names); read-only, no workbook mutation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:D100\", first row = headers."
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Header names to group by, as pivot rows."
+        },
+        "cols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Header names to group by, as pivot columns."
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "col": {
+                "type": "string",
+                "description": "Header name of the column to aggregate."
+              },
+              "agg": {
+                "type": "string",
+                "description": "Aggregation: sum, count, countNums, average, max, min, product, stdDev, stdDevP, var, or varP."
+              }
+            },
+            "required": [
+              "col",
+              "agg"
+            ]
+          },
+          "description": "Measures to compute, each a {col, agg} pair."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range",
+        "rows",
+        "values"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_replace_all",
+    "description": "Literal find/replace across every cell's input text, on every sheet. One undo group.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Text to search for."
+        },
+        "text": {
+          "type": "string",
+          "description": "Replacement text."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "query",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_sheet_add",
+    "description": "Add a new sheet (deduplicated name on collision — never errors on a taken name).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Requested sheet name (default: \"Sheet\", deduplicated)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_sheet_remove",
+    "description": "Remove a sheet (errors on the last one — a workbook must keep at least one).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Sheet index or name to remove."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "sheet"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_sheet_rename",
+    "description": "Rename a sheet and rewrite every formula/defined-name reference to it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Sheet index or name to rename."
+        },
+        "name": {
+          "type": "string",
+          "description": "New sheet name."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "sheet",
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_row_insert",
+    "description": "Insert rows at a 0-based row index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "0-based row index to insert at."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Number of rows to insert (default 1)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "at"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_row_delete",
+    "description": "Delete rows at a 0-based row index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "0-based row index to delete from."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Number of rows to delete (default 1)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "at"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_col_insert",
+    "description": "Insert columns at a 0-based column index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "0-based column index to insert at."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Number of columns to insert (default 1)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "at"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_col_delete",
+    "description": "Delete columns at a 0-based column index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "0-based column index to delete from."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Number of columns to delete (default 1)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "at"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_eval",
+    "description": "Side-effect-free formula preview: evaluate a formula against the live workbook at a cell without writing anywhere.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "formula": {
+          "type": "string",
+          "description": "Formula to evaluate, e.g. \"SUM(B1:B3)\" (leading '=' optional)."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Cell to evaluate at, e.g. \"B4\" (default A1)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "formula"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_stats",
+    "description": "Summary statistics (sum, count, countNums, average, min, max) over a range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:C10\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_charts",
+    "description": "List every chart in the workbook: kind, title, categories, and series.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_pivots",
+    "description": "List every persistent pivot table: sheet, row/column fields, and value fields.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_format",
+    "description": "Apply cell formatting (number format, bold/italic, font/fill color, alignment) to every cell in a range. One undo group. `xlsxy_get`'s reply echoes a cell's current format the same way, for read-modify-write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:C10\"."
+        },
+        "patch": {
+          "type": "object",
+          "properties": {
+            "numFmt": {
+              "type": "string",
+              "description": "Number format code, e.g. \"0.00%\" or \"m/d/yyyy\"."
+            },
+            "bold": {
+              "type": "boolean",
+              "description": "Bold on/off."
+            },
+            "italic": {
+              "type": "boolean",
+              "description": "Italic on/off."
+            },
+            "fontColor": {
+              "type": "string",
+              "description": "Font color as \"#RRGGBB\"."
+            },
+            "fillColor": {
+              "type": "string",
+              "description": "Fill (background) color as \"#RRGGBB\"."
+            },
+            "align": {
+              "type": "string",
+              "description": "Horizontal alignment: \"left\", \"center\", or \"right\"."
+            }
+          },
+          "required": [],
+          "description": "Formatting to apply — at least one key required; an unknown key errors naming it. Keys absent from the patch leave that aspect of each cell's existing style untouched."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range",
+        "patch"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_col_width",
+    "description": "Set one column's display width, in Excel column-width units.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "col": {
+          "type": "string",
+          "description": "Column letter (e.g. \"C\") or 0-based index; the reply echoes the numeric index."
+        },
+        "width": {
+          "type": "number",
+          "description": "New column width; must be positive."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "col",
+        "width"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_pivot_create",
+    "description": "Create a REAL, persistent pivot table on a new sheet (first row of `range` = header names) — unlike `xlsxy_pivot`, this mutates the workbook: the pivot participates in `xlsxy_pivots` and its output is refreshed by `xlsxy_recalc`. Clears undo history like adding a sheet (an agent-level undo must remove both the created sheet and the pivot registration).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "A1-style range, e.g. \"A1:D100\", first row = headers."
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Header names to group by, as pivot rows."
+        },
+        "cols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Header names to group by, as pivot columns."
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "col": {
+                "type": "string",
+                "description": "Header name of the column to aggregate."
+              },
+              "agg": {
+                "type": "string",
+                "description": "Aggregation: sum, count, countNums, average, max, min, product, stdDev, stdDevP, var, or varP."
+              }
+            },
+            "required": [
+              "col",
+              "agg"
+            ]
+          },
+          "description": "Measures to compute, each a {col, agg} pair."
+        },
+        "name": {
+          "type": "string",
+          "description": "Destination sheet name for the pivot output (default: PivotN)."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range",
+        "rows",
+        "values"
+      ]
+    }
+  }
+]

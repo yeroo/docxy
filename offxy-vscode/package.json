@@ -108,6 +108,7 @@
     "build": "npm run build:wasm && npm run build:ext",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
     "typecheck": "tsc --noEmit",
+    "test:mcp-parity": "node mcp/parity.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

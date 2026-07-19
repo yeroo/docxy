@@ -188,7 +188,8 @@ Errors mirror `cell.format`'s family: an empty patch → `"patch needs at
 least one key"`; an unknown key → `"unknown patch key '<key>'"`; a malformed
 value → a key-specific message (`"bad color '<v>' (want \"#RRGGBB\")"`,
 `"bad highlight '<v>' (want one of yellow, green, cyan, magenta, red, blue,
-lightGray, darkYellow, or none)"`, `"bad size '<v>'"`). `{formatted:N}` is
+lightGray, darkYellow, or none)"`, `"bad size '<v>' (want a positive number
+of points)"`). `{formatted:N}` is
 the number of blocks in `[start, end]` (tables included in the count even
 though they're skipped structurally); a patch that changes nothing (e.g.
 reapplying an already-set value) still checkpoints, matching `cell.format`'s

@@ -595,9 +595,10 @@ fn parse_highlight(value: &str) -> Result<Option<String>, String> {
 /// Parse a whole/fractional POINTS value (`doc.format`'s wire `size` key)
 /// into the half-points [`Editor::set_font_size`] takes.
 fn parse_size(value: &str) -> Result<u32, String> {
-    let pts: f32 = value.parse().map_err(|_| format!("bad size '{value}'"))?;
+    let bad = || format!("bad size '{value}' (want a positive number of points)");
+    let pts: f32 = value.parse().map_err(|_| bad())?;
     if !pts.is_finite() || pts <= 0.0 {
-        return Err(format!("bad size '{value}'"));
+        return Err(bad());
     }
     Ok((pts * 2.0).round() as u32)
 }

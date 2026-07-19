@@ -182,6 +182,18 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             dn.formula = updated;
         }
     }
+    // Pivot sources name their sheet directly (not as a formula reference) —
+    // `PivotSource::Range { sheet, .. }` must follow the rename too, or the
+    // pivot silently orphans: `refresh_pivots` looks the name up via
+    // `wb.sheet_index` and just skips when it no longer resolves, so nothing
+    // ever surfaces the break.
+    for piv in &mut wb.pivots {
+        if let crate::pivot::PivotSource::Range { sheet, .. } = &mut piv.source {
+            if sheet.eq_ignore_ascii_case(&old) {
+                *sheet = new_name.to_string();
+            }
+        }
+    }
     wb.sheets[idx].name = new_name.to_string();
 }
 

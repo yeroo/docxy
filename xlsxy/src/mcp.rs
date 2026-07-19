@@ -1003,4 +1003,55 @@ mod tests {
             );
         }
     }
+
+    /// Internal dev tool, NOT part of the MCP surface: when `XLSXY_MCP_TOOLS_DUMP`
+    /// names a file path, write `tool_defs()` as JSON to it — the xlsxy half
+    /// of the generator behind the committed JS<->Rust MCP parity snapshot at
+    /// `offxy-vscode/mcp/tools-expected.json` (see docxy's mirror-image
+    /// `dump_tool_defs_json_for_mcp_parity_snapshot` in `docxy/src/mcp.rs`
+    /// for the full regeneration recipe). A no-op — and always green — when
+    /// the env var is unset, which is every normal `cargo test` run; not a
+    /// CLI flag on the shipped binary.
+    #[test]
+    fn dump_tool_defs_json_for_mcp_parity_snapshot() {
+        if let Ok(path) = std::env::var("XLSXY_MCP_TOOLS_DUMP") {
+            std::fs::write(&path, tool_defs().to_string()).expect("write MCP tools dump");
+        }
+    }
+
+    /// Pins `tool_defs()` against the committed JS<->Rust MCP parity snapshot
+    /// (`offxy-vscode/mcp/tools-expected.json`, which also covers docxy's
+    /// tools — this test checks only xlsxy's own slice, filtered by name
+    /// prefix). `offxy-vscode/mcp/parity.test.mjs` checks the bundled JS
+    /// server's `TOOLS` against the same file, so drift on EITHER side of the
+    /// JS/Rust MCP tool surface fails somewhere committed, not just at
+    /// runtime in the field.
+    #[test]
+    fn tool_defs_matches_committed_mcp_parity_snapshot() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../offxy-vscode/mcp/tools-expected.json");
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("committed MCP parity snapshot at {}: {e}", p.display()));
+        let all = Json::parse(&text).expect("tools-expected.json must be valid JSON");
+        let all = all
+            .as_array()
+            .expect("tools-expected.json must be a JSON array");
+        let mine: Vec<Json> = all
+            .iter()
+            .filter(|t| {
+                t.get_str("name")
+                    .map(|n| n.starts_with("xlsxy_"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            Json::Arr(mine),
+            tool_defs(),
+            "xlsxy's tool_defs() drifted from the committed JS<->Rust MCP parity snapshot \
+             (offxy-vscode/mcp/tools-expected.json). Regenerate it (see \
+             dump_tool_defs_json_for_mcp_parity_snapshot's doc comment) and keep \
+             server.mjs's xlsxyToolDefs() in sync by hand."
+        );
+    }
 }
