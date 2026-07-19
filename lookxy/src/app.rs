@@ -927,15 +927,26 @@ impl App {
         let editing = form.editing_id.clone();
         match editing {
             Some(id) => {
-                let _ = self.store.update_event_fields(&id, &fields);
+                if self.store.update_event_fields(&id, &fields).is_err() {
+                    self.set_form_error("Couldn't save the event");
+                    return; // keep the form open; no sync command
+                }
+                // A local:-only event's pending CreateEvent carries the
+                // update; don't enqueue UpdateEvent for it.
                 if !id.starts_with("local:") {
                     let _ = self.sync.cmd_tx.send(SyncCommand::UpdateEvent { id });
                 }
             }
             None => {
                 let account = self.account.clone().unwrap_or_default();
-                if let Ok(id) = self.store.create_local_event(&fields, &account, &account) {
-                    let _ = self.sync.cmd_tx.send(SyncCommand::CreateEvent { id });
+                match self.store.create_local_event(&fields, &account, &account) {
+                    Ok(id) => {
+                        let _ = self.sync.cmd_tx.send(SyncCommand::CreateEvent { id });
+                    }
+                    Err(_) => {
+                        self.set_form_error("Couldn't create the event");
+                        return;
+                    }
                 }
             }
         }
