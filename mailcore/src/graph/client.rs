@@ -265,6 +265,27 @@ impl GraphClient {
             .ok_or_else(|| GraphError::Parse("contentBytes is not valid base64".to_string()))
     }
 
+    /// GET `/me/messages/{id}/attachments/{aid}/$value` — the attachment's
+    /// raw body bytes (an `itemAttachment`'s MIME), NOT JSON. Used to download
+    /// a nested item as `.eml`/`.ics`; `get_attachment_bytes` handles a
+    /// `fileAttachment`'s base64 `contentBytes` instead.
+    pub fn get_attachment_raw_value(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>, GraphError> {
+        use std::io::Read;
+        let message_id = encode_path_segment(message_id);
+        let attachment_id = encode_path_segment(attachment_id);
+        let path = format!("/me/messages/{message_id}/attachments/{attachment_id}/$value");
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let mut buf = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut buf)
+            .map_err(|e| GraphError::Transport(e.to_string()))?;
+        Ok(buf)
+    }
+
     /// PATCH `/me/messages/{id}` with `{"isRead":true|false}`.
     pub fn mark_read(&self, id: &str, read: bool) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
@@ -1062,6 +1083,20 @@ mod tests {
         let c = GraphClient::new(&srv.base_url, "AT");
         let bytes = c.get_attachment_bytes("M1", "A1").unwrap();
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn get_attachment_raw_value_returns_body_bytes() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1/attachments/A1/$value".into(),
+            status: 200,
+            headers: vec![],
+            body: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let bytes = c.get_attachment_raw_value("M1", "A1").unwrap();
+        assert_eq!(bytes, b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n");
     }
 
     #[test]
