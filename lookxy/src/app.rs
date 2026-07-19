@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
+use mailcore::graph::client::RsvpKind;
 use mailcore::graph::model::{AttachmentKind, AttachmentMeta, Body};
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
@@ -489,6 +490,26 @@ impl App {
                 }
             }
             SyncEvent::AttachmentSaved { path } => self.finish_attachment_save(path),
+            SyncEvent::MeetingResponded { message_id, kind } => {
+                if self.selected_msg.as_deref() == Some(message_id.as_str()) {
+                    self.attachment_notice = Some(
+                        match kind {
+                            RsvpKind::Accept => "Accepted the invite",
+                            RsvpKind::Decline => "Declined the invite",
+                            RsvpKind::Tentative => "Tentatively accepted the invite",
+                        }
+                        .to_string(),
+                    );
+                }
+                // Mark the invite read locally (a small courtesy) and push the
+                // change to Graph via the existing read path.
+                self.store.set_read(&message_id, true);
+                self.reload_messages();
+                let _ = self
+                    .sync
+                    .cmd_tx
+                    .send(SyncCommand::MarkRead { id: message_id, read: true });
+            }
             // A reply/forward draft (`SyncCommand::ComposeReply`/
             // `ComposeForward`) just landed in the store — open the composer
             // on it (see `open_draft`).
@@ -706,6 +727,40 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// The currently-open (`selected_msg`) message's row, resolved from the
+    /// loaded flat list or, in threaded mode, the built threads. `None` when
+    /// nothing is open or that row isn't loaded. Shared by the reader's
+    /// meeting banner and the RSVP-key guard so both agree on what's open.
+    pub(crate) fn selected_message_row(&self) -> Option<&MessageRow> {
+        let id = self.selected_msg.as_deref()?;
+        if let Some(m) = self.messages.iter().find(|m| m.id == id) {
+            return Some(m);
+        }
+        self.threads
+            .iter()
+            .flat_map(|tv| tv.thread.messages.iter())
+            .find(|m| m.id == id)
+    }
+
+    /// RSVP to the opened meeting-invite email: no-op unless the opened
+    /// message is a meeting request (so `A`/`D`/`T` never act on ordinary
+    /// mail). Sends `SyncCommand::RespondMeeting`; the confirmation + mark-read
+    /// happen when `SyncEvent::MeetingResponded` lands (see `on_sync_event`).
+    pub fn respond_meeting(&mut self, kind: RsvpKind) {
+        let Some(message_id) = self
+            .selected_message_row()
+            .filter(|m| m.is_meeting_request)
+            .map(|m| m.id.clone())
+        else {
+            return;
+        };
+        self.attachment_notice = Some("Responding…".to_string());
+        let _ = self
+            .sync
+            .cmd_tx
+            .send(SyncCommand::RespondMeeting { message_id, kind });
     }
 
     /// Opens message `id` in the reading pane: records it as `selected_msg`
@@ -1267,6 +1322,9 @@ impl App {
             // `compose_forward`'s doc comment for the same note.
             'F' => self.compose_forward(),
             't' => self.toggle_threaded(),
+            'A' => self.respond_meeting(RsvpKind::Accept),
+            'D' => self.respond_meeting(RsvpKind::Decline),
+            'T' => self.respond_meeting(RsvpKind::Tentative),
             _ => {}
         }
     }
@@ -2466,6 +2524,103 @@ fn signature_body_html(sig: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use mailcore::graph::model::AttachmentKind;
+
+    /// Seeds a meeting-invite message into the seeded fixture's inbox, pulls it
+    /// into `app.messages` (`reload_messages`), and opens it.
+    fn open_meeting_invite(app: &mut App) {
+        use mailcore::graph::model::{Message, Recipient};
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "invite1".into(),
+                    conversation_id: "c9".into(),
+                    subject: "Sprint review".into(),
+                    from: Recipient {
+                        name: "Boss".into(),
+                        address: "boss@x".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-18T10:00:00Z".into(),
+                    sent: "2026-07-18T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "invite".into(),
+                    is_draft: false,
+                    is_meeting_request: true,
+                },
+            )
+            .expect("seed invite");
+        app.reload_messages();
+        app.open_message("invite1");
+        // `open_message` queues a `FetchBody` (the body isn't cached) — drain it
+        // so a following RSVP assertion sees only the command it triggered.
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn respond_meeting_on_an_invite_sends_command() {
+        let mut app = App::for_test_with_seeded_store();
+        open_meeting_invite(&mut app);
+        app.respond_meeting(RsvpKind::Accept);
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::RespondMeeting { message_id, kind }) => {
+                assert_eq!(message_id, "invite1");
+                assert_eq!(kind, RsvpKind::Accept);
+            }
+            other => panic!("expected RespondMeeting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_meeting_on_ordinary_mail_is_a_noop() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_message("m1"); // m1 is an ordinary message
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain open's FetchBody
+        app.respond_meeting(RsvpKind::Accept);
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err()); // nothing sent
+    }
+
+    #[test]
+    fn uppercase_a_d_t_route_to_respond_meeting_only_for_invites() {
+        // Ordinary mail: A/D/T send nothing.
+        let mut app = App::for_test_with_seeded_store();
+        app.open_message("m1");
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain open's FetchBody
+        app.on_key_char('A');
+        app.on_key_char('D');
+        app.on_key_char('T');
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+
+        // Invite: each maps to the matching RsvpKind.
+        let mut app = App::for_test_with_seeded_store();
+        open_meeting_invite(&mut app);
+        app.on_key_char('D');
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::RespondMeeting { kind, .. }) => assert_eq!(kind, RsvpKind::Decline),
+            other => panic!("expected RespondMeeting Decline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn meeting_responded_notice_and_marks_read() {
+        let mut app = App::for_test_with_seeded_store();
+        open_meeting_invite(&mut app);
+        app.on_sync_event(SyncEvent::MeetingResponded {
+            message_id: "invite1".into(),
+            kind: RsvpKind::Tentative,
+        });
+        assert_eq!(
+            app.attachment_notice.as_deref(),
+            Some("Tentatively accepted the invite")
+        );
+        // Marked read locally.
+        let rows = app.store.messages_in_folder("inbox", 50, 0).unwrap();
+        assert!(rows.iter().find(|m| m.id == "invite1").unwrap().is_read);
+    }
 
     /// Adds a second message to conversation `c1` (m1's conversation) so `c1`
     /// becomes a 2-message thread: from Bob, newer than m1, unread. Shared
