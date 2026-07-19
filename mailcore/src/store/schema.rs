@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS messages (
     importance      TEXT NOT NULL DEFAULT '',
     preview         TEXT NOT NULL DEFAULT '',
     is_draft        INTEGER NOT NULL DEFAULT 0,
-    is_meeting_request INTEGER NOT NULL DEFAULT 0
+    is_meeting_request INTEGER NOT NULL DEFAULT 0,
+    categories      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

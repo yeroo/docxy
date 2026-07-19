@@ -88,6 +88,7 @@ mod tests {
                     preview: "numbers for next quarter".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed second message");

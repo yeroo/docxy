@@ -2377,6 +2377,7 @@ impl App {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed message");
@@ -2636,6 +2637,7 @@ pub(crate) mod tests {
                     preview: "invite".into(),
                     is_draft: false,
                     is_meeting_request: true,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed invite");
@@ -2855,6 +2857,7 @@ pub(crate) mod tests {
                     preview: "re hi".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed m2");
@@ -2885,6 +2888,7 @@ pub(crate) mod tests {
                     preview: "alone".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed m3");
@@ -3570,6 +3574,7 @@ pub(crate) mod tests {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("update message to has_attachments=true");
@@ -3605,6 +3610,7 @@ pub(crate) mod tests {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed message");
@@ -4152,6 +4158,7 @@ pub(crate) mod tests {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("mark m1 has_attachments");
@@ -4177,6 +4184,7 @@ pub(crate) mod tests {
                     preview: "re hi".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("mark m2 has_attachments");

@@ -82,6 +82,8 @@ pub struct MessageRow {
     /// Mirror of `Message::is_meeting_request` — true for a meeting-invite
     /// (`eventMessageRequest`) message. Drives the reader's RSVP banner.
     pub is_meeting_request: bool,
+    /// Assigned category names (color labels). Empty when none.
+    pub categories: Vec<String>,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -494,6 +496,12 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN is_meeting_request INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Same idempotent-migration pattern, for `messages.categories` (color
+        // labels): an empty list is stored as `""`.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN categories TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -560,8 +568,8 @@ impl Store {
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
                  is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                 is_meeting_request
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 is_meeting_request, categories
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = excluded.conversation_id,
@@ -578,7 +586,8 @@ impl Store {
                  importance = excluded.importance,
                  preview = excluded.preview,
                  is_draft = excluded.is_draft,
-                 is_meeting_request = excluded.is_meeting_request",
+                 is_meeting_request = excluded.is_meeting_request,
+                 categories = excluded.categories",
             params![
                 m.id,
                 folder_id,
@@ -597,6 +606,7 @@ impl Store {
                 m.preview,
                 m.is_draft,
                 m.is_meeting_request,
+                encode_categories(&m.categories),
             ],
         )?;
         Ok(())
@@ -622,7 +632,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request
+                    bcc_recipients, is_meeting_request, categories
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
@@ -652,7 +662,7 @@ impl Store {
                  SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                         to_recipients, cc_recipients, received_at, sent_at,
                         is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                        bcc_recipients, is_meeting_request,
+                        bcc_recipients, is_meeting_request, categories,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -668,7 +678,7 @@ impl Store {
              SELECT k.id, k.folder_id, k.conversation_id, k.subject, k.from_name, k.from_addr,
                     k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
                     k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft,
-                    k.bcc_recipients, k.is_meeting_request
+                    k.bcc_recipients, k.is_meeting_request, k.categories
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -697,6 +707,16 @@ impl Store {
         let _ = self.conn.execute(
             "UPDATE messages SET is_flagged = ?1 WHERE id = ?2",
             params![flagged, id],
+        );
+    }
+
+    /// Locally sets a message's category names (the optimistic half of
+    /// `SyncCommand::SetCategories`). See `set_read` for why this doesn't
+    /// return a `Result`.
+    pub fn set_categories(&self, id: &str, categories: &[String]) {
+        let _ = self.conn.execute(
+            "UPDATE messages SET categories = ?1 WHERE id = ?2",
+            params![encode_categories(categories), id],
         );
     }
 
@@ -973,7 +993,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request
+                    bcc_recipients, is_meeting_request, categories
              FROM messages
              WHERE id = ?1",
         )?;
@@ -1143,7 +1163,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request
+                    bcc_recipients, is_meeting_request, categories
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
@@ -1836,6 +1856,27 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Encodes a message's category names into the flat `messages.categories`
+/// column: names joined by the ASCII Unit Separator (`\u{1f}`), which is
+/// stripped from any name first (a real Outlook category name never contains a
+/// control char, so this is lossless in practice). An empty list encodes to
+/// `""`.
+fn encode_categories(cats: &[String]) -> String {
+    cats.iter()
+        .map(|c| c.replace('\u{1f}', " "))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+/// Inverse of `encode_categories`: splits on `\u{1f}`. An empty string decodes
+/// to an empty list (not `[""]`).
+fn decode_categories(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split('\u{1f}').map(str::to_string).collect()
+}
+
 /// Encodes a list of recipients into the flat text form stored in
 /// `to_recipients`/`cc_recipients` (`Name <addr>; Name <addr>; ...`).
 ///
@@ -1895,6 +1936,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         is_draft: row.get(15)?,
         bcc_recipients: row.get(16)?,
         is_meeting_request: row.get(17)?,
+        categories: decode_categories(&row.get::<_, String>(18)?),
     })
 }
 
@@ -1939,7 +1981,51 @@ mod tests {
             preview: "p".into(),
             is_draft: false,
             is_meeting_request: false,
+            categories: Vec::new(),
         }
+    }
+
+    #[test]
+    fn message_round_trips_categories_including_delimiter_names() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let mut m = msg("01", true);
+        m.categories = vec!["Work".into(), "A\u{1f}B".into()]; // embedded separator
+        s.upsert_message("F", &m).unwrap();
+        let rows = s.messages_in_folder("F", 10, 0).unwrap();
+        // The embedded separator was neutralized to a space, so the list stays 2.
+        assert_eq!(
+            rows[0].categories,
+            vec!["Work".to_string(), "A B".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_categories_updates_only_that_column() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let m = msg("01", true);
+        s.upsert_message("F", &m).unwrap();
+        s.set_categories("01", &["Urgent".to_string()]);
+        let rows = s.messages_in_folder("F", 10, 0).unwrap();
+        assert_eq!(rows[0].categories, vec!["Urgent".to_string()]);
+        assert!(rows[0].is_read); // untouched
     }
 
     #[test]
@@ -3014,6 +3100,7 @@ mod search_tests {
             preview: "".into(),
             is_draft: false,
             is_meeting_request: false,
+            categories: Vec::new(),
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(

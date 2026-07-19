@@ -416,6 +416,7 @@ mod tests {
                     preview: "invite".into(),
                     is_draft: false,
                     is_meeting_request: true,
+                    categories: Vec::new(),
                 },
             )
             .expect("seed invite");

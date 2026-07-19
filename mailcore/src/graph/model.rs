@@ -86,6 +86,9 @@ pub struct Message {
     /// OData control annotation auto-emitted for derived resource types, so it
     /// arrives with the normal delta response — no `$select` change needed.
     pub is_meeting_request: bool,
+    /// Graph `categories`: the message's assigned category names (color labels).
+    /// Colors live separately in the master category list (`MasterCategory`).
+    pub categories: Vec<String>,
 }
 
 impl Message {
@@ -113,6 +116,16 @@ impl Message {
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
                 == Some("#microsoft.graph.eventMessageRequest"),
+            categories: v
+                .get("categories")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -665,6 +678,23 @@ mod tests {
         assert!(m.is_flagged);
         assert!(m.has_attachments);
         assert!(m.is_draft);
+    }
+
+    #[test]
+    fn message_parses_categories() {
+        let with = parse(
+            r#"{"id":"M1","conversationId":"C","subject":"s","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"importance":"normal","bodyPreview":"","categories":["Work","Urgent"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Message::from_json(&with).unwrap().categories,
+            vec!["Work".to_string(), "Urgent".to_string()]
+        );
+        let without = parse(
+            r#"{"id":"M2","conversationId":"C","subject":"s","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"importance":"normal","bodyPreview":""}"#,
+        )
+        .unwrap();
+        assert!(Message::from_json(&without).unwrap().categories.is_empty());
     }
 
     #[test]

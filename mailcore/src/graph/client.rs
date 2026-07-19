@@ -95,7 +95,7 @@ pub struct EventInput {
 /// reads, so delta pages carry everything the local store needs without
 /// an extra per-message fetch.
 const MESSAGE_SELECT: &str = "id,conversationId,subject,from,toRecipients,ccRecipients,\
-receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview";
+receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories";
 
 enum Method {
     Get,

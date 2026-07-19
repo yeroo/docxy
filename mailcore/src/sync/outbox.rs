@@ -948,6 +948,7 @@ mod tests {
             preview: "".into(),
             is_draft: true,
             is_meeting_request: false,
+            categories: Vec::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -1049,6 +1050,7 @@ mod tests {
             preview: "".into(),
             is_draft: true,
             is_meeting_request: false,
+            categories: Vec::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store

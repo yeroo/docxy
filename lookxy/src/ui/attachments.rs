@@ -190,6 +190,7 @@ mod tests {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    categories: Vec::new(),
                 },
             )
             .expect("update message to has_attachments=true");
