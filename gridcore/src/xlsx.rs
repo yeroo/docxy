@@ -2884,6 +2884,88 @@ mod tests {
         assert!(!pkg5.remove_sheet(0));
     }
 
+    /// PERSISTENCE PROBE (Wave-3 Task 3, Part B): build a pivot the way the
+    /// TUI's `create_pivot_from` does — source rows on Sheet1, `add_pivot`
+    /// onto a fresh sheet, a row/col/value layout via `refresh_pivots` — then
+    /// `save_xlsx` → `load_xlsx` and assert the definition survives in
+    /// `workbook.pivots` AND `refresh_pivots` recomputes on the reload.
+    #[test]
+    fn pivot_survives_save_load_round_trip() {
+        let mut pkg = new_xlsx();
+        // Source data: Region/Product/Sales, header + 4 rows (Sheet1).
+        let rows: [[&str; 3]; 5] = [
+            ["Region", "Product", "Sales"],
+            ["East", "Widget", "10"],
+            ["East", "Gadget", "20"],
+            ["West", "Widget", "30"],
+            ["West", "Gadget", "40"],
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let cell = if r == 0 {
+                    Cell::text(*v)
+                } else if c == 2 {
+                    Cell::number(v.parse().unwrap())
+                } else {
+                    Cell::text(*v)
+                };
+                pkg.workbook.sheets[0].set_cell(r as u32, c as u32, cell);
+            }
+        }
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        assert_eq!(frame.names, vec!["Region", "Product", "Sales"]);
+        let measure = crate::pivot::DataField {
+            name: "Sum of Sales".into(),
+            field: 2,
+            agg: crate::frame::Agg::Sum,
+        };
+        let dest = pkg.add_sheet("Pivot");
+        let idx = pkg
+            .add_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                frame.names.clone(),
+                measure,
+                dest,
+                (2, 0),
+            )
+            .expect("add_pivot");
+        // Mirror the field editor: Region on rows (like Ctrl-P, 'r').
+        pkg.workbook.pivots[idx].row_fields = vec![0];
+        pkg.workbook.pivots[idx].edited = true;
+        let outcome = crate::pivot::refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 1, "refresh before save should succeed");
+        // Sanity: the output sheet actually holds computed values pre-save.
+        let sum_before = pkg.workbook.sheets[dest].cell(3, 1).map(|c| c.value.clone());
+        assert!(
+            matches!(sum_before, Some(CellValue::Number(_))),
+            "expected a computed value on the pivot output sheet, got {sum_before:?}"
+        );
+
+        let bytes = save_xlsx(&pkg);
+        let mut pkg2 = load_xlsx(&bytes).expect("reload with pivot");
+
+        assert_eq!(pkg2.workbook.pivots.len(), 1, "pivot definition lost on reload");
+        let p2 = &pkg2.workbook.pivots[0];
+        assert_eq!(p2.row_fields, vec![0], "row layout lost on reload");
+        assert_eq!(p2.data_fields.len(), 1);
+        assert_eq!(p2.data_fields[0].agg, crate::frame::Agg::Sum);
+        assert!(!p2.unsupported, "pivot round-tripped as unsupported");
+
+        let outcome2 = crate::pivot::refresh_pivots(&mut pkg2.workbook);
+        assert_eq!(
+            outcome2.refreshed, 1,
+            "refresh_pivots must recompute after reload"
+        );
+        let sum_after = pkg2.workbook.sheets[dest].cell(3, 1).map(|c| c.value.clone());
+        assert_eq!(
+            sum_before, sum_after,
+            "recomputed pivot values differ after round-trip"
+        );
+    }
+
     #[test]
     fn dimension_is_updated() {
         let mut pkg = load_xlsx(&fixture()).expect("load");
