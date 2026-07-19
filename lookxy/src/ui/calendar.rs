@@ -181,8 +181,12 @@ fn agenda_lines(events: &[EventRow]) -> Vec<AgendaLine> {
     let mut lines = Vec::with_capacity(events.len());
     let mut last_ymd: Option<(i64, u32, u32)> = None;
     for (i, e) in events.iter().enumerate() {
-        let start = to_local(&e.start_utc);
-        let ymd = (start.year, start.month, start.day);
+        let ymd = if e.is_all_day {
+            date_of_utc(&e.start_utc)
+        } else {
+            let start = to_local(&e.start_utc);
+            (start.year, start.month, start.day)
+        };
         if last_ymd != Some(ymd) {
             lines.push(AgendaLine::Header(day_header(ymd, today_ymd)));
             last_ymd = Some(ymd);
@@ -237,8 +241,22 @@ fn event_row(e: &EventRow) -> Line<'static> {
     Line::from(text)
 }
 
-/// Whether `e`'s local start and end fall on different calendar days.
+/// Whether `e` spans more than one calendar day. All-day events use their
+/// stored dates with the End treated as the exclusive next-day midnight (so a
+/// one-day all-day event, `end = start + 1 day`, is NOT multi-day); timed
+/// events compare local start/end days as before.
 fn is_multi_day(e: &EventRow) -> bool {
+    if e.is_all_day {
+        let start_days = {
+            let (y, m, d) = date_of_utc(&e.start_utc);
+            days_from_civil(y, m, d)
+        };
+        let last_inclusive_day = {
+            let (y, m, d) = date_of_utc(&e.end_utc);
+            days_from_civil(y, m, d) - 1
+        };
+        return start_days != last_inclusive_day;
+    }
     let start = to_local(&e.start_utc);
     let end = to_local(&e.end_utc);
     (start.year, start.month, start.day) != (end.year, end.month, end.day)
@@ -492,6 +510,17 @@ fn to_local(iso_utc: &str) -> LocalDateTime {
         hour: (rem / 3600) as u32,
         minute: ((rem % 3600) / 60) as u32,
     }
+}
+
+/// The `(year, month, day)` in the leading `YYYY-MM-DD` of a stored UTC
+/// timestamp — used for all-day events, whose date is absolute (floating) and
+/// must NOT be shifted by `to_local`'s offset conversion.
+fn date_of_utc(iso: &str) -> (i64, u32, u32) {
+    // `iso` is an ASCII ISO-8601 `YYYY-MM-DDT…`; `get(..)` is bounds/UTF-8 safe.
+    let year: i64 = iso.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let month: u32 = iso.get(5..7).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let day: u32 = iso.get(8..10).and_then(|s| s.parse().ok()).unwrap_or(1);
+    (year, month, day)
 }
 
 /// The system's local UTC offset, in minutes (local = UTC + this many
@@ -755,6 +784,35 @@ mod tests {
         let end = to_local(&e.end_utc);
         let expected = (start.year, start.month, start.day) != (end.year, end.month, end.day);
         assert_eq!(is_multi_day(&e), expected);
+    }
+
+    #[test]
+    fn date_of_utc_extracts_the_calendar_date() {
+        assert_eq!(date_of_utc("2026-07-20T00:00:00Z"), (2026, 7, 20));
+        assert_eq!(date_of_utc("2027-01-01T00:00:00Z"), (2027, 1, 1));
+    }
+
+    #[test]
+    fn single_day_all_day_event_is_not_multi_day() {
+        // end is the exclusive next-day midnight (Graph's convention)
+        let e = row("e1", "2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z", true);
+        assert!(!is_multi_day(&e));
+    }
+
+    #[test]
+    fn three_day_all_day_event_is_multi_day() {
+        let e = row("e2", "2026-07-20T00:00:00Z", "2026-07-23T00:00:00Z", true);
+        assert!(is_multi_day(&e));
+    }
+
+    #[test]
+    fn all_day_event_buckets_under_its_stored_start_date_regardless_of_offset() {
+        // The all-day day comes from the DATE PART of start_utc, not to_local,
+        // so it never shifts with the local offset. Assert via date_of_utc,
+        // which agenda_lines uses for all-day events.
+        assert_eq!(date_of_utc("2026-07-20T00:00:00Z"), (2026, 7, 20));
+        // (a timed event still buckets by to_local — unchanged, covered by the
+        // existing agenda_lines tests)
     }
 
     // --- App wiring / rendering ---------------------------------------------
