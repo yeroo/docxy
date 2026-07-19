@@ -98,6 +98,9 @@ const EDITORS: EditorSpec[] = [
         'doc.replace-all',
         'doc.undo',
         'doc.redo',
+        // Wave-3 mutating verbs (block-range formatting).
+        'doc.format',
+        'doc.set-style',
       ]),
       mutatingVerbs: new Set([
         'doc.replace-range',
@@ -113,6 +116,13 @@ const EDITORS: EditorSpec[] = [
         'doc.replace-all',
         'doc.undo',
         'doc.redo',
+        // Wave-3: doc.format/doc.set-style land ONE true wasm-undo-stack
+        // checkpoint each (agent::format_range/set_style_range push exactly
+        // one, same mechanism doc.insert/append/replace-all use) — bucket A,
+        // default steps=1 (neither carries an undoSteps field on the wire;
+        // see docxwasm's ctl_format/ctl_set_style doc comments).
+        'doc.format',
+        'doc.set-style',
       ]),
     },
   },
@@ -171,6 +181,8 @@ const EDITORS: EditorSpec[] = [
         // Wave-2 mutating verbs (cell formatting + column width).
         'cell.format',
         'col.width',
+        // Wave-3 mutating verb (persistent pivot tables).
+        'pivot.create',
       ]),
       mutatingVerbs: new Set([
         'cell.set',
@@ -201,6 +213,16 @@ const EDITORS: EditorSpec[] = [
         // remove ⇄ restore-removed):
         'sheet.import-csv',
         'sheet.remove',
+        // Wave-3: pivot.create lands a new sheet + pivot-part registration —
+        // not a cell-level change the wasm undo stack can invert, so it
+        // clears history like sheet.import-csv (same bucket-C mechanism,
+        // undoSteps:0). Its declared inverse is sheet.remove on the newly
+        // created sheet (already in this same bucket above); remove_sheet's
+        // pivot cascade drops the pivot registration WITH the sheet, so the
+        // existing inverse flip-flop (sheet.remove ⇄ sheet.restore-removed)
+        // round-trips the pivot for free — no pivot-specific host code
+        // needed (see gridwasm's ctl_pivot_create doc comment).
+        'pivot.create',
       ]),
     },
   },
