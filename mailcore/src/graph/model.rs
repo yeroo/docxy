@@ -206,6 +206,180 @@ impl AttachmentMeta {
     }
 }
 
+/// Graph `automaticRepliesSetting.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OofStatus {
+    Disabled,
+    AlwaysEnabled,
+    Scheduled,
+}
+
+impl OofStatus {
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            OofStatus::Disabled => "disabled",
+            OofStatus::AlwaysEnabled => "alwaysEnabled",
+            OofStatus::Scheduled => "scheduled",
+        }
+    }
+    /// Inverse of `as_wire`; an unrecognized value reads back as `Disabled`
+    /// (the safe "auto-replies are off" default).
+    pub fn from_wire(s: &str) -> OofStatus {
+        match s {
+            "alwaysEnabled" => OofStatus::AlwaysEnabled,
+            "scheduled" => OofStatus::Scheduled,
+            _ => OofStatus::Disabled,
+        }
+    }
+}
+
+/// Graph `automaticRepliesSetting.externalAudience`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAudience {
+    None,
+    ContactsOnly,
+    All,
+}
+
+impl ExternalAudience {
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            ExternalAudience::None => "none",
+            ExternalAudience::ContactsOnly => "contactsOnly",
+            ExternalAudience::All => "all",
+        }
+    }
+    /// Inverse of `as_wire`; unrecognized reads back as `All` (Graph's own
+    /// default external audience).
+    pub fn from_wire(s: &str) -> ExternalAudience {
+        match s {
+            "none" => ExternalAudience::None,
+            "contactsOnly" => ExternalAudience::ContactsOnly,
+            _ => ExternalAudience::All,
+        }
+    }
+}
+
+/// The mailbox's automatic-replies (out-of-office) configuration, parsed from
+/// Graph's `mailboxSettings.automaticRepliesSetting`. Reply messages are held
+/// as plain text (`html_to_plain` on read; `plain_to_html` on write — see
+/// `graph::client::set_automatic_replies`). `scheduled_*_utc` are canonical
+/// UTC only when `status == Scheduled`, else `""`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutomaticReplies {
+    pub status: OofStatus,
+    pub external_audience: ExternalAudience,
+    pub internal_message: String,
+    pub external_message: String,
+    pub scheduled_start_utc: String,
+    pub scheduled_end_utc: String,
+}
+
+impl AutomaticReplies {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let s = v.get("automaticRepliesSetting")?;
+        let status = OofStatus::from_wire(&str_field(s, "status"));
+        // Graph always echoes the scheduled datetimes (with `0001-01-01`
+        // defaults when off); only keep them when actually Scheduled so the
+        // form doesn't prefill a garbage window for a disabled mailbox.
+        let (start, end) = if status == OofStatus::Scheduled {
+            (
+                s.get("scheduledStartDateTime")
+                    .map(datetime_field_to_utc)
+                    .unwrap_or_default(),
+                s.get("scheduledEndDateTime")
+                    .map(datetime_field_to_utc)
+                    .unwrap_or_default(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        Some(AutomaticReplies {
+            status,
+            external_audience: ExternalAudience::from_wire(&str_field(s, "externalAudience")),
+            internal_message: html_to_plain(&str_field(s, "internalReplyMessage")),
+            external_message: html_to_plain(&str_field(s, "externalReplyMessage")),
+            scheduled_start_utc: start,
+            scheduled_end_utc: end,
+        })
+    }
+}
+
+/// Best-effort conversion of an OOF HTML reply message to plain text: `<br>`,
+/// `<p>`/`</p>`, and `<div>`/`</div>` become newlines; every other tag is
+/// dropped; the common entities are decoded; runs of 3+ newlines collapse to
+/// 2; both ends are trimmed. Rich formatting (tables, styling) is flattened to
+/// its text content — see the design's fidelity note.
+pub fn html_to_plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            // Unclosed '<': keep the rest verbatim and stop tag-scanning.
+            out.push_str(&rest[lt..]);
+            rest = "";
+            break;
+        };
+        let name = after[..gt]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(name.as_str(), "br" | "p" | "div") {
+            out.push('\n');
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
+
+    // Decode entities — `&amp;` LAST so `&amp;lt;` doesn't double-decode to `<`.
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+
+    // Collapse 3+ consecutive newlines to 2.
+    let mut collapsed = String::with_capacity(decoded.len());
+    let mut nl = 0;
+    for ch in decoded.chars() {
+        if ch == '\n' {
+            nl += 1;
+            if nl <= 2 {
+                collapsed.push('\n');
+            }
+        } else {
+            nl = 0;
+            collapsed.push(ch);
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+/// Inverse of `html_to_plain` for writing an OOF message: HTML-escape
+/// `& < > "` and turn `\n` into `<br>` (dropping any `\r`). A message authored
+/// in lookxy round-trips faithfully through this pair.
+pub fn plain_to_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\n' => out.push_str("<br>"),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// One entry of a delta sync page: either an upserted message or the id of
 /// a message that was removed since the last sync.
 #[derive(Debug, Clone, PartialEq)]
@@ -694,6 +868,87 @@ mod tests {
         assert_eq!(
             AttachmentMeta::from_json(&v2).unwrap().kind,
             AttachmentKind::File
+        );
+    }
+
+    #[test]
+    fn oof_status_and_audience_wire_round_trip() {
+        for s in [
+            OofStatus::Disabled,
+            OofStatus::AlwaysEnabled,
+            OofStatus::Scheduled,
+        ] {
+            assert_eq!(OofStatus::from_wire(s.as_wire()), s);
+        }
+        assert_eq!(OofStatus::from_wire("bogus"), OofStatus::Disabled);
+        for a in [
+            ExternalAudience::None,
+            ExternalAudience::ContactsOnly,
+            ExternalAudience::All,
+        ] {
+            assert_eq!(ExternalAudience::from_wire(a.as_wire()), a);
+        }
+        assert_eq!(ExternalAudience::from_wire("bogus"), ExternalAudience::All);
+    }
+
+    #[test]
+    fn automatic_replies_parses_scheduled_setting() {
+        let v = parse(
+            r#"{"automaticRepliesSetting":{
+                "status":"scheduled","externalAudience":"contactsOnly",
+                "internalReplyMessage":"<p>Away &amp; back <b>Monday</b></p>",
+                "externalReplyMessage":"Out<br>of office",
+                "scheduledStartDateTime":{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"},
+                "scheduledEndDateTime":{"dateTime":"2026-07-27T17:00:00.0000000","timeZone":"UTC"}
+            }}"#,
+        )
+        .unwrap();
+        let r = AutomaticReplies::from_json(&v).unwrap();
+        assert_eq!(r.status, OofStatus::Scheduled);
+        assert_eq!(r.external_audience, ExternalAudience::ContactsOnly);
+        assert_eq!(r.internal_message, "Away & back Monday");
+        assert_eq!(r.external_message, "Out\nof office");
+        assert_eq!(r.scheduled_start_utc, "2026-07-20T09:00:00Z");
+        assert_eq!(r.scheduled_end_utc, "2026-07-27T17:00:00Z");
+    }
+
+    #[test]
+    fn automatic_replies_disabled_drops_schedule_even_when_wire_has_defaults() {
+        let v = parse(
+            r#"{"automaticRepliesSetting":{
+                "status":"disabled","externalAudience":"all",
+                "internalReplyMessage":"","externalReplyMessage":"",
+                "scheduledStartDateTime":{"dateTime":"0001-01-01T00:00:00.0000000","timeZone":"UTC"},
+                "scheduledEndDateTime":{"dateTime":"0001-01-01T00:00:00.0000000","timeZone":"UTC"}
+            }}"#,
+        )
+        .unwrap();
+        let r = AutomaticReplies::from_json(&v).unwrap();
+        assert_eq!(r.status, OofStatus::Disabled);
+        assert_eq!(r.scheduled_start_utc, ""); // dropped: only kept when Scheduled
+        assert_eq!(r.scheduled_end_utc, "");
+    }
+
+    #[test]
+    fn html_to_plain_strips_tags_decodes_entities_and_breaks() {
+        // Adjacent block boundaries (`</div>` then `<p>`) each emit a newline,
+        // so the two blocks are separated by a blank line — best-effort spacing.
+        assert_eq!(
+            html_to_plain("<div>Hi &amp; bye</div><p>line1</p>line2<br>line3"),
+            "Hi & bye\n\nline1\nline2\nline3"
+        );
+        assert_eq!(html_to_plain("a<br/><br/><br/><br/>b"), "a\n\nb"); // 3+ newlines collapse to 2
+        assert_eq!(
+            html_to_plain("&lt;tag&gt; &quot;q&quot; &#39;s&#39;"),
+            "<tag> \"q\" 's'"
+        );
+    }
+
+    #[test]
+    fn plain_to_html_escapes_and_encodes_newlines() {
+        assert_eq!(
+            plain_to_html("a & b < c > d \"e\"\nf"),
+            "a &amp; b &lt; c &gt; d &quot;e&quot;<br>f"
         );
     }
 
