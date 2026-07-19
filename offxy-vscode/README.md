@@ -160,15 +160,19 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (53
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (56
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
   `docxy_comments`, `docxy_notes`, `docxy_header`, `docxy_footer`,
   `docxy_metadata`, `docxy_stats`, `docxy_replace_all`, `docxy_undo`,
-  `docxy_redo` (21) — `docxy_replace_range`/`docxy_insert`/`docxy_append` each
-  take an optional `markdown` flag to splice formatted Markdown (headings,
-  bold, lists, tables, links) into the document instead of plain text — and
+  `docxy_redo`, `docxy_format`, `docxy_set_style` (23) —
+  `docxy_replace_range`/`docxy_insert`/`docxy_append` each take an optional
+  `markdown` flag to splice formatted Markdown (headings, bold, lists,
+  tables, links) into the document instead of plain text, and
+  `docxy_format`/`docxy_set_style` apply direct run-level formatting (bold,
+  color, highlight, font, size) and paragraph styles/alignment to a block
+  range — and
   `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`,
   `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,
   `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
@@ -177,7 +181,9 @@ for the two ways a tab's semantics differ from a terminal instance.
   `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
   `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
   `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width` (32). It's
+  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`
+  (33) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
+  on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`). It's
   a thin bridge — it opens no document itself, only forwards to whichever
   `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
   running (the `_new` tools are the exception: they create the file on disk

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- **New: the wave-3 agent styling + persistent-pivots surface** — the agent
+  control surface (terminal apps, tabs, and both MCP servers) grows from 53
+  to **56 tools**:
+  - Two new docxy verbs apply direct formatting to existing content:
+    `doc.format` (`docxy_format`) sets a patch — `bold`, `italic`,
+    `underline`, `strike` (set-to-value, not toggle), `color`, `highlight`
+    (`yellow`/`green`/`cyan`/`magenta`/`red`/`blue`/`lightGray`/`darkYellow`,
+    or `"none"` to clear), `font`, `size` — onto every run in a block range,
+    as one undo checkpoint; `doc.set-style` (`docxy_set_style`) applies a
+    paragraph style (`Heading1`–`Heading6`, `Quote`, `SourceCode`, or
+    `Normal` to clear) and/or an alignment (`left`/`center`/`right`/
+    `justify`) to a block range, auto-ensuring the style definition so it
+    actually renders in Word, also as one undo checkpoint. Both land as a
+    single true wasm-undo-stack entry on tabs (<kbd>Ctrl+Z</kbd> undoes the
+    whole call).
+  - One new xlsxy verb, `pivot.create` (`xlsxy_pivot_create`), builds a REAL,
+    persistent workbook pivot table — not the existing read-only, ad-hoc
+    `sheet.pivot` — landing its computed output on a new sheet (reply:
+    `{sheet, name}`). It's refreshed by `wb.recalc` like any other pivot
+    (which now refreshes pivots as well as formulas) and survives
+    `wb.save`/reload. Undo is a history-clear + host-orchestrated inverse
+    (`sheet.remove` on the new sheet), matching `sheet.import-csv`; on tabs,
+    one <kbd>Ctrl+Z</kbd> removes the sheet AND the pivot registration
+    together (both-or-neither — `sheet.remove`'s cascade and its own
+    restore path now carry pivot registrations along with the sheet either
+    way), and redoing brings both back.
+  - See [docs/agent-control.md](../docs/agent-control.md) for the full
+    patch-key table, accepted style/align/highlight sets, and pivot
+    placement/refresh/persistence details.
 - **New: the wave-2 agent formatting surface** — the agent control surface
   (terminal apps, tabs, and both MCP servers) grows from 51 to **53 tools**:
   - `doc.insert`, `doc.replace-range`, and `doc.append` (docxy) gain an

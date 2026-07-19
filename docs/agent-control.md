@@ -82,6 +82,8 @@ One JSON object per line; one reply line per request:
 | `doc.stats` | — | `{words, chars, paragraphs, blocks}` |
 | `doc.replace-all` | `{query, text, case_sensitive?}` | `{replaced}` |
 | `doc.undo` / `doc.redo` | — | `{done}` (`false` = nothing to undo/redo) |
+| `doc.format` | `{start, end?, patch}` | `{formatted}` — block count; ONE undo checkpoint over the whole range |
+| `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — block count; ONE undo checkpoint |
 
 Notes:
 
@@ -162,6 +164,51 @@ falls outside this auto-ensure mechanism — inline code's `<w:rStyle
 w:val="Code"/>` reference is written on save regardless, but the style
 definition itself is only ensured for the six paragraph styles above.
 
+### Formatting and styles
+
+`doc.format {start, end?, patch}` applies direct run-level formatting to
+every run in the block range `[start, end]` (`end` default `start`). Both
+endpoints must be **paragraphs** (the same `require_para` rule other range
+verbs use); a table block mid-range is skipped (untouched) but still counted
+toward `formatted`. `patch` is an object with at least one of these eight
+keys:
+
+| Key | Type | Notes |
+|---|---|---|
+| `bold` | boolean | **set-to-value**, not toggle — `bold:true` on an already-bold run is a no-op on that run |
+| `italic` | boolean | set-to-value |
+| `underline` | boolean | set-to-value |
+| `strike` | boolean | set-to-value |
+| `color` | string | `"#RRGGBB"` |
+| `highlight` | string | one of `yellow`, `green`, `cyan`, `magenta`, `red`, `blue`, `lightGray`, `darkYellow`, or `"none"` (clears the highlight) |
+| `font` | string | any font-name string, unvalidated |
+| `size` | number | points, fractional allowed (e.g. `10.5`) |
+
+Errors mirror `cell.format`'s family: an empty patch → `"patch needs at
+least one key"`; an unknown key → `"unknown patch key '<key>'"`; a malformed
+value → a key-specific message (`"bad color '<v>' (want \"#RRGGBB\")"`,
+`"bad highlight '<v>' (want one of yellow, green, cyan, magenta, red, blue,
+lightGray, darkYellow, or none)"`, `"bad size '<v>'"`). `{formatted:N}` is
+the number of blocks in `[start, end]` (tables included in the count even
+though they're skipped structurally); a patch that changes nothing (e.g.
+reapplying an already-set value) still checkpoints, matching `cell.format`'s
+own always-snapshot behavior. **ONE undo checkpoint per call**, regardless
+of how many keys the patch carries or how many blocks the range spans.
+
+`doc.set-style {start, end?, style?, align?}` requires at least one of
+`style`/`align` (`"set-style needs 'style' or 'align'"` otherwise, both
+omitted). `style` accepts the Wave-2 markdown paragraph-style set —
+`Heading1`–`Heading6`, `Quote`, `SourceCode` — plus `Normal`, which clears
+the paragraph back to the default style. An unknown id errors naming it and
+listing the full accepted set. Applying any of the seven non-`Normal` styles
+runs the same `ensure_styles` mechanism Wave-2's markdown writes use
+(strictly additive), so the paragraph actually renders styled in Word even
+in a package that never defined that style before — `Normal` skips this,
+since it only clears a reference rather than requiring one. `align` accepts
+`left`, `center`, `right`, `justify` (`"bad align '<v>' (want
+left/center/right/justify)"` otherwise). **ONE undo checkpoint per call**,
+whether `style`, `align`, or both are given together.
+
 ## MCP (native tools in Claude Code)
 
 `docxy --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
@@ -179,7 +226,8 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_find`, `docxy_replace_range`, `docxy_insert`, `docxy_append`,
 `docxy_save`, `docxy_export`, `docxy_export_pdf`, `docxy_comments`,
 `docxy_notes`, `docxy_header`, `docxy_footer`, `docxy_metadata`, `docxy_stats`,
-`docxy_replace_all`, `docxy_undo`, `docxy_redo` (21 total). Each edit
+`docxy_replace_all`, `docxy_undo`, `docxy_redo`, `docxy_format`,
+`docxy_set_style` (23 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -258,12 +306,12 @@ worth knowing:
   private API. A `{done:false}` no-op (nothing to undo/redo) fires no event.
   Every other mutating verb's edit event is labeled "Agent: `<verb>`" (e.g.
   "Agent: range.set", "Agent: comment.add").
-- **Agent `sheet.remove` undo restores the sheet's content, comments, and
-  sheet-scoped defined names — but re-appends it at the END of the tab's
-  sheet order**, not back at its original index. Sheets below the removed one
-  don't shift back, so a workbook with sheets `[A, B, C]` where an agent
-  removes `B` and the user then presses Ctrl+Z ends up `[A, C, B]`, not the
-  original `[A, B, C]`.
+- **Agent `sheet.remove` undo restores the sheet's content, comments,
+  sheet-scoped defined names, and any pivot table registrations that lived
+  on it — but re-appends it at the END of the tab's sheet order**, not back
+  at its original index. Sheets below the removed one don't shift back, so a
+  workbook with sheets `[A, B, C]` where an agent removes `B` and the user
+  then presses Ctrl+Z ends up `[A, C, B]`, not the original `[A, B, C]`.
 - **Agent sheet-removals are single-level-undoable.** The restore is backed by
   a single-slot stash (only the most recently removed sheet is recoverable);
   a *second* consecutive `sheet.remove` followed by two undos succeeds on the
@@ -312,6 +360,25 @@ one undo-mechanics distinction worth knowing:
   reply carries a fresh inverse back to the width just replaced, so redo
   keeps working indefinitely) — rather than an on-stack undo replay.
 
+**Wave-3 additions on tabs** — both new docxy verbs and `pivot.create`
+behave exactly like their terminal counterparts, with the same undo-bucket
+split as the rest of the surface:
+
+- **`doc.format` and `doc.set-style` are each a true wasm undo-stack
+  entry**, like `cell.format` before them — a single <kbd>Ctrl+Z</kbd> undoes
+  the whole call (every block in the range, every patch key, together),
+  regardless of how many blocks or keys it touched.
+- **`pivot.create` undoes via the same inverse mechanism as
+  `sheet.import-csv`/`sheet.remove`, not the wasm undo stack.** Its declared
+  inverse is `sheet.remove` on the sheet it just created, so a single
+  <kbd>Ctrl+Z</kbd> removes the new sheet AND the pivot registration
+  together — both-or-neither, never a dangling pivot entry or an orphaned
+  empty sheet. Redoing that removal (<kbd>Ctrl+Shift+Z</kbd>/<kbd>Ctrl+Y</kbd>)
+  restores BOTH the sheet and the pivot, via the same restore path
+  `sheet.remove`/`sheet.restore-removed` already use — the restored pivot's
+  output is immediately correct and keeps refreshing on subsequent
+  `wb.recalc` calls, same as any other pivot.
+
 `docxy_new`/`xlsxy_new` on a tab instance opens the created document as a
 **new** tab (same as `doc.open`/`wb.open`, above); with no tab alive, the
 file is still created on disk but nothing opens (`"opened":false`). The
@@ -347,6 +414,7 @@ name and defaults to the active sheet):
 | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` (threads flattened in reply order) |
 | `wb.export-csv` | `{sheet?}` | `{sheet, csv}` — display-formatted RFC-4180, the **live buffer** |
 | `sheet.pivot` | `{range,rows:[col],cols?:[col],values:[{col,agg}],sheet?}` | `{table:[[string]]}` — **ad-hoc and read-only**, no workbook mutation |
+| `pivot.create` | `{range,rows:[col],cols?:[col],values:[{col,agg}],name?,sheet?}` | `{sheet,name}` — builds a REAL, persistent workbook pivot on a NEW sheet |
 | `formula.eval` | `{formula,ref?,sheet?}` | `{value,text}` — side-effect-free preview, writes nowhere |
 | `sheet.stats` | `{range,sheet?}` | `{sum,count,countNums,average,min,max}` |
 | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
@@ -369,7 +437,12 @@ Notes:
 - **`sheet.pivot` is read-only and ad-hoc.** It computes a grid straight from
   a snapshot of `range` and never writes a persistent pivot table into the
   workbook — `pivot.list` (also read-only) lists *existing* persistent
-  pivots, a separate thing.
+  pivots, a separate thing. `pivot.create` (below) is the mutating
+  counterpart that actually creates one.
+- **`wb.recalc` also refreshes every persistent pivot table**, not just
+  formulas — a source-cell edit followed by `wb.recalc` recomputes any
+  pivot's output sheet along with the rest of the recalc. Cost scales with
+  the number of pivots in the workbook, not just the number of dirty cells.
 - **`wb.replace-all` spans every sheet** in the workbook, unlike a find/replace
   scoped to one sheet — the whole multi-sheet edit lands as a single undo
   group.
@@ -429,6 +502,40 @@ default style. One consequence: explicitly patching `numFmt:"General"` as a
 deliberate reset also echoes nothing afterward, matching how the other five
 fields already behave when reset to their default.
 
+### Persistent pivots
+
+`pivot.create` takes the same arg shape as `sheet.pivot` above (first row of
+`range` is the header, `rows`/`cols` name grouping columns, `values` is
+`[{col,agg}]` using the same 11 aggregation strings and the same
+unknown-header error family — `"pivot.create: unknown column '<col>'"`),
+plus an optional `name`: the **destination sheet's** name (default: a
+generated `PivotN`, unique among existing sheet names; an explicit name that
+collides with any existing sheet errors `"pivot.create: sheet name '<name>'
+is already taken"`). No value fields at all errors `"pivot.create needs at
+least one value field"`.
+
+Unlike `sheet.pivot`, this builds a REAL, persistent workbook pivot table
+via the TUI's own pivot-creation machinery — not an ad-hoc computed grid —
+and lands its output on a **new** sheet, exactly mirroring where the TUI
+would place it. Reply: `{sheet, name}` — `sheet` is the new destination
+sheet's index, `name` is its name. The created pivot immediately shows up in
+`pivot.list`, its output is refreshed by `wb.recalc` like any other pivot,
+and — the one engine question this feature was probed against before
+shipping — **it survives `wb.save` → reload**: a saved and reopened
+workbook's pivot definition and refresh both keep working (proven by a
+create → save → reload → refresh round-trip test before the verb shipped;
+had the write path proved incomplete, `pivot.create` would have shipped as
+an honest error instead of a silently session-only pivot).
+
+Undo is a **history-clear + host-orchestrated inverse** — the same bucket
+`sheet.import-csv`/`sheet.remove` use — not a true undo-stack entry. The
+inverse is `sheet.remove` on the newly created destination sheet, which
+removes the pivot registration along with the sheet: `sheet.remove`'s own
+cascade drops a pivot's parts/registration whenever its destination sheet is
+removed, so no separate `pivot.remove` verb exists or is needed — removing
+the pivot's sheet is both-or-neither by construction. See "VS Code tabs"
+below for how this plays out through the tab's inverse-based undo.
+
 MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`, `xlsxy_get`, `xlsxy_set`,
 `xlsxy_clear`, `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
@@ -437,9 +544,9 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-`xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width` (32 total; docxy's 21 +
-xlsxy's 32 = **53 tools** total across both apps). Skill:
-`xlsxy install skill`.
+`xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create` (33
+total; docxy's 23 + xlsxy's 33 = **56 tools** total across both apps).
+Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
 `proj.path`, `task.list` (scheduled dates, critical path, slack, links),
