@@ -81,6 +81,7 @@ mod tests {
                     content_type: "application/vnd.ms-excel".into(),
                     size: 2048,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");

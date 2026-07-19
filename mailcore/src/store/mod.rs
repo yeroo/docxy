@@ -468,6 +468,11 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN bcc_recipients TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Additive migration for DBs created before `attachments.content_id`
+        // existed. SQLite has no `ADD COLUMN IF NOT EXISTS`, so attempt the
+        // ALTER and swallow the "duplicate column name" error it raises when
+        // the column is already present (fresh DBs get it from schema.rs).
+        let _ = conn.execute("ALTER TABLE attachments ADD COLUMN content_id TEXT", []);
         Ok(Store { conn })
     }
 
@@ -1047,15 +1052,16 @@ impl Store {
         )?;
         for a in atts {
             tx.execute(
-                "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline, content_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     a.id,
                     message_id,
                     a.name,
                     a.content_type,
                     a.size,
-                    a.is_inline
+                    a.is_inline,
+                    a.content_id,
                 ],
             )?;
         }
@@ -1067,7 +1073,7 @@ impl Store {
     /// id (not insertion order).
     pub fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, content_type, size, is_inline
+            "SELECT id, name, content_type, size, is_inline, content_id
              FROM attachments
              WHERE message_id = ?1
              ORDER BY id",
@@ -1080,6 +1086,7 @@ impl Store {
                     content_type: row.get(2)?,
                     size: row.get(3)?,
                     is_inline: row.get(4)?,
+                    content_id: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2040,6 +2047,71 @@ mod tests {
         s.set_read("10", true);
         let rows = s.messages_in_folder("F", 50, 0).unwrap();
         assert!(rows[0].is_read);
+    }
+
+    #[test]
+    fn attachments_round_trip_content_id() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.upsert_message("F", &msg("10", false)).unwrap();
+        s.put_attachments(
+            "10",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "logo.png".into(),
+                content_type: "image/png".into(),
+                size: 10,
+                is_inline: true,
+                content_id: Some("logo123".into()),
+            }],
+        )
+        .unwrap();
+        let got = s.attachments("10").unwrap();
+        assert_eq!(got[0].content_id.as_deref(), Some("logo123"));
+    }
+
+    #[test]
+    fn content_id_migration_is_idempotent() {
+        // `Store::init` always runs `ALTER TABLE attachments ADD COLUMN
+        // content_id` right after `SCHEMA_SQL`, even on a fresh in-memory DB
+        // where `SCHEMA_SQL` already created that column (see `schema.rs`) —
+        // so every `Store::open_in_memory()` call already exercises the
+        // "duplicate column name" error being swallowed by `let _ =` in
+        // `init`. There's no test accessor for the raw connection (and one
+        // isn't worth adding just for this), so this test instead confirms
+        // the store is still fully usable for attachments afterward.
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.upsert_message("F", &msg("11", false)).unwrap();
+        s.put_attachments(
+            "11",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "x.txt".into(),
+                content_type: "text/plain".into(),
+                size: 1,
+                is_inline: false,
+                content_id: None,
+            }],
+        )
+        .unwrap();
+        assert!(s.attachments("11").is_ok());
     }
 
     #[test]

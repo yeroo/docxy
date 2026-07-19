@@ -2535,6 +2535,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2566,6 +2567,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2591,6 +2593,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2632,6 +2635,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2667,6 +2671,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2696,6 +2701,7 @@ pub(crate) mod tests {
                         content_type: "text/plain".into(),
                         size: 1,
                         is_inline: false,
+                        content_id: None,
                     },
                     AttachmentMeta {
                         id: "a2".into(),
@@ -2703,6 +2709,7 @@ pub(crate) mod tests {
                         content_type: "text/plain".into(),
                         size: 1,
                         is_inline: false,
+                        content_id: None,
                     },
                 ],
             )
@@ -2802,6 +2809,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 3,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -2826,6 +2834,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 3,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");
@@ -3171,6 +3180,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 1,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed m1 attachment");
@@ -3183,6 +3193,7 @@ pub(crate) mod tests {
                     content_type: "text/plain".into(),
                     size: 1,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed m2 attachment");

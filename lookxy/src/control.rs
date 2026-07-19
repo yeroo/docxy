@@ -743,6 +743,7 @@ mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .unwrap();
@@ -799,6 +800,7 @@ mod tests {
                     content_type: "text/plain".into(),
                     size: 12,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .unwrap();

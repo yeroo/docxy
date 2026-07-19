@@ -686,6 +686,7 @@ mod tests {
                     content_type: "text/plain".into(),
                     size: 5,
                     is_inline: false,
+                    content_id: None,
                 }],
             )
             .expect("seed attachment");

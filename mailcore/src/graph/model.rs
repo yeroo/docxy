@@ -134,6 +134,10 @@ pub struct AttachmentMeta {
     pub content_type: String,
     pub size: i64,
     pub is_inline: bool,
+    /// The `Content-ID` of an inline attachment (Graph `contentId`), used to
+    /// resolve `<img src="cid:…">` in the body to this attachment. `None` for
+    /// ordinary (non-inline) attachments.
+    pub content_id: Option<String>,
 }
 
 impl AttachmentMeta {
@@ -144,6 +148,10 @@ impl AttachmentMeta {
             content_type: str_field(v, "contentType"),
             size: v.get("size").and_then(Value::as_i64).unwrap_or(0),
             is_inline: v.get("isInline").and_then(Value::as_bool).unwrap_or(false),
+            content_id: {
+                let cid = str_field(v, "contentId");
+                if cid.is_empty() { None } else { Some(cid) }
+            },
         })
     }
 }
@@ -555,6 +563,26 @@ mod tests {
         assert_eq!(e.start_utc, "0000-00-00T00:00:00Z");
         assert_eq!(e.end_utc, "0000-00-00T00:00:00Z");
         assert_ne!(e.start_utc, "");
+    }
+
+    #[test]
+    fn attachment_meta_parses_content_id() {
+        let v = crate::json::parse(
+            r#"{"id":"a1","name":"logo.png","contentType":"image/png","size":10,"isInline":true,"contentId":"logo123"}"#
+        ).unwrap();
+        let a = AttachmentMeta::from_json(&v).unwrap();
+        assert_eq!(a.content_id.as_deref(), Some("logo123"));
+        assert!(a.is_inline);
+    }
+
+    #[test]
+    fn attachment_meta_content_id_absent_is_none() {
+        let v = crate::json::parse(
+            r#"{"id":"a1","name":"x.txt","contentType":"text/plain","size":1,"isInline":false}"#,
+        )
+        .unwrap();
+        let a = AttachmentMeta::from_json(&v).unwrap();
+        assert_eq!(a.content_id, None);
     }
 
     #[test]
