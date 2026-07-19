@@ -107,8 +107,10 @@
     const originX = left * defW; // sheet-x of the fetched window's left edge
     const rows = Math.max(view.dims.rows + 50, top + nrows);
     const cols = Math.max(view.dims.cols + 10, left + ncols);
-    $('spacer').style.height = rows * ROW_H + 'px';
-    $('spacer').style.width = cols * defW + 'px';
+    // Scroll extent includes the #cells gutter offset so the last row/column
+    // can scroll fully clear of the sticky headers.
+    $('spacer').style.height = rows * ROW_H + ROW_H + 'px';
+    $('spacer').style.width = cols * defW + HDR_W + 'px';
 
     // cells
     const frag = document.createDocumentFragment();
@@ -288,9 +290,12 @@
   function cellFromEvent(e) {
     const wrap = $('gridwrap');
     const rect = wrap.getBoundingClientRect();
-    const x = e.clientX - rect.left + wrap.scrollLeft;
-    const y = e.clientY - rect.top + wrap.scrollTop;
-    return { r: Math.max(0, Math.floor(y / ROW_H)), c: colAtX(x) };
+    // The cell layer sits one header gutter inside #gridwrap (see grid.css
+    // #cells: top 22px = the column-header band, left 44px = HDR_W), so
+    // sheet coordinates start that far into the wrap's content box.
+    const x = e.clientX - rect.left - HDR_W + wrap.scrollLeft;
+    const y = e.clientY - rect.top - ROW_H + wrap.scrollTop;
+    return { r: Math.max(0, Math.floor(y / ROW_H)), c: colAtX(Math.max(0, x)) };
   }
   let dragging = false;
   function onMousedown(e) {
@@ -344,10 +349,20 @@
     const wrap = $('gridwrap');
     const r = rowOfRef(), c = refCol();
     const y = r * ROW_H, x = c * defW;
+    // Near edges: a cell at sheet-y `y` sits at content-y `y + ROW_H` (the
+    // #cells gutter offset), and the sticky headers cover the first
+    // ROW_H/HDR_W of the viewport — the two cancel, so the classic
+    // `y < scrollTop` check still means "hidden under the header band".
+    // Far edges: the gutter does NOT cancel, so the visible span for cells
+    // is clientHeight - ROW_H tall (and clientWidth - HDR_W wide).
     if (y < wrap.scrollTop) wrap.scrollTop = y;
-    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = y + ROW_H - wrap.clientHeight;
+    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight - ROW_H) {
+      wrap.scrollTop = y + 2 * ROW_H - wrap.clientHeight;
+    }
     if (x < wrap.scrollLeft) wrap.scrollLeft = x;
-    if (x + defW > wrap.scrollLeft + wrap.clientWidth) wrap.scrollLeft = x + defW - wrap.clientWidth;
+    if (x + defW > wrap.scrollLeft + wrap.clientWidth - HDR_W) {
+      wrap.scrollLeft = x + defW + HDR_W - wrap.clientWidth;
+    }
   }
 
   function onKeydown(e) {

@@ -17,7 +17,11 @@ html, body { height: 100%; overflow: hidden;
 
 #gridwrap { position: absolute; top: 28px; bottom: 24px; left: 0; right: 0; overflow: auto; }
 #spacer { position: absolute; top: 0; left: 0; width: 1px; height: 1px; }
-#cells { position: absolute; top: 0; left: 0; }
+/* The cell layer is offset by the sticky header gutters (44px row-number
+   column, 22px column-header band) so that cell (0,0) paints below/right of
+   the headers instead of underneath them. grid.js's cellFromEvent/
+   ensureVisible/spacer math compensates by the same constants (HDR_W/ROW_H). */
+#cells { position: absolute; top: 22px; left: 44px; }
 .cell { position: absolute; overflow: hidden; white-space: pre;
   padding: 0 4px; line-height: 22px; height: 22px;
   border-right: 1px solid var(--vscode-editorWidget-border, #0002);

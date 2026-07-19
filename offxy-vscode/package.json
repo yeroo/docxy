@@ -109,6 +109,7 @@
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
     "typecheck": "tsc --noEmit",
     "test:mcp-parity": "node mcp/parity.test.mjs",
+    "test:grid-layout": "node media/grid.layout.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
