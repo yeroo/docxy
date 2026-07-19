@@ -41,6 +41,11 @@ pub enum SyncCommand {
     MarkRead { id: String, read: bool },
     /// Flag/unflag a message (optimistic local write + queued Graph op).
     SetFlag { id: String, flagged: bool },
+    /// Set a message's category names (optimistic local write + queued Graph op).
+    SetCategories { id: String, categories: Vec<String> },
+    /// Fetch the master category list (`GraphClient::get_master_categories`),
+    /// store it, and emit [`SyncEvent::CategoriesUpdated`]. Direct call.
+    RefreshCategories,
     /// Move a message to another folder: optimistic local re-file plus a queued
     /// Graph op. Graph mints a new id on move, which the next delta reconciles
     /// (old id `@removed`, new id added).
@@ -195,6 +200,8 @@ pub enum SyncEvent {
     /// The automatic-replies config was written (from
     /// [`SyncCommand::SetAutomaticReplies`]); the UI closes its OOF form.
     AutomaticRepliesUpdated,
+    /// The master category list changed; the UI re-reads `Store::master_categories`.
+    CategoriesUpdated,
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -466,6 +473,11 @@ impl Engine {
                 self.store.set_flag(&id, flagged);
                 self.enqueue_and_drain(OutboxOp::SetFlag { id, flagged });
             }
+            SyncCommand::SetCategories { id, categories } => {
+                self.store.set_categories(&id, &categories);
+                self.enqueue_and_drain(OutboxOp::SetCategories { id, categories });
+            }
+            SyncCommand::RefreshCategories => self.refresh_master_categories(),
             SyncCommand::Move { id, dest } => {
                 // Optimistic local re-file, same pattern as MarkRead/SetFlag/
                 // Delete. Graph mints a new id on move; the next delta
@@ -602,9 +614,26 @@ impl Engine {
         // and the locally-mined contacts still power autocomplete.
         if include_folders {
             self.sync_people();
+            self.refresh_master_categories();
         }
 
         self.settle_state();
+    }
+
+    /// Best-effort master-category fetch → store + `CategoriesUpdated`. Any
+    /// failure (scope/offline/parse) is swallowed like `sync_people`: category
+    /// colors are a display bonus, never a hard dependency, so this never fails
+    /// a sync pass. Also called on demand via `SyncCommand::RefreshCategories`.
+    fn refresh_master_categories(&mut self) {
+        if self.token.is_none() {
+            return;
+        }
+        let cats = match self.with_auth(|c| c.get_master_categories()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _ = self.store.replace_master_categories(&cats);
+        self.emit(SyncEvent::CategoriesUpdated);
     }
 
     /// Best-effort `/me/people` fetch → contact upserts. Any error (insufficient
@@ -2964,6 +2993,114 @@ mod tests {
             srv.requests()
                 .iter()
                 .any(|r| r.method == "PATCH" && r.path.contains("/me/mailboxSettings"))
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_categories_stores_and_emits() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/outlook/masterCategories".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"c1","displayName":"Work","color":"preset0"}]}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("refresh-cats");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        handle.cmd_tx.send(SyncCommand::RefreshCategories).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::CategoriesUpdated)
+        });
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.master_categories().unwrap()[0].display_name, "Work");
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_categories_optimistically_writes_and_drains() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("set-cats");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCategories {
+                id: "M1".into(),
+                categories: vec!["Work".into()],
+            })
+            .unwrap();
+        // No completion event and no re-sync (tick is 3600s), so the optimistic
+        // local write persists — poll the store (paced by the event channel)
+        // until it appears.
+        let store = Store::open(&store_path).unwrap();
+        let mut found = false;
+        for _ in 0..60 {
+            let rows = store.messages_in_folder("F1", 50, 0).unwrap();
+            if rows
+                .iter()
+                .find(|m| m.id == "M1")
+                .map(|m| m.categories == vec!["Work".to_string()])
+                .unwrap_or(false)
+            {
+                found = true;
+                break;
+            }
+            let _ = handle.evt_rx.recv_timeout(Duration::from_millis(50));
+        }
+        assert!(found, "optimistic category write did not land");
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.method == "PATCH" && r.path.contains("/me/messages/M1"))
         );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

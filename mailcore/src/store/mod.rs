@@ -125,6 +125,12 @@ pub enum OutboxOp {
         id: String,
         flagged: bool,
     },
+    /// Push a message's assigned category names to Graph
+    /// (`client.set_message_categories`).
+    SetCategories {
+        id: String,
+        categories: Vec<String>,
+    },
     Move {
         id: String,
         dest: String,
@@ -179,6 +185,7 @@ impl OutboxOp {
         match self {
             OutboxOp::MarkRead { .. } => "markRead",
             OutboxOp::SetFlag { .. } => "setFlag",
+            OutboxOp::SetCategories { .. } => "setCategories",
             OutboxOp::Move { .. } => "move",
             OutboxOp::Delete { .. } => "delete",
             OutboxOp::SaveDraft { .. } => "saveDraft",
@@ -203,6 +210,14 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
                 ("flagged".to_string(), Value::Bool(*flagged)),
+            ]),
+            OutboxOp::SetCategories { id, categories } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "categories".to_string(),
+                    Value::Array(categories.iter().map(|c| Value::Str(c.clone())).collect()),
+                ),
             ]),
             OutboxOp::Move { id, dest } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -256,6 +271,19 @@ impl OutboxOp {
             "setFlag" => Some(OutboxOp::SetFlag {
                 id: id()?,
                 flagged: v.get("flagged")?.as_bool()?,
+            }),
+            "setCategories" => Some(OutboxOp::SetCategories {
+                id: id()?,
+                categories: v
+                    .get("categories")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             "move" => Some(OutboxOp::Move {
                 id: id()?,

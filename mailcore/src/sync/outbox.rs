@@ -33,6 +33,9 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
     match op {
         OutboxOp::MarkRead { id, read } => client.mark_read(id, *read),
         OutboxOp::SetFlag { id, flagged } => client.set_flag(id, *flagged),
+        OutboxOp::SetCategories { id, categories } => {
+            client.set_message_categories(id, categories)
+        }
         OutboxOp::Move { id, dest } => client.move_message(id, dest).map(|_new_id| ()),
         OutboxOp::Delete { id } => client.delete_message(id),
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
@@ -313,6 +316,31 @@ mod tests {
         .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].body, r#"{"flag":{"flagStatus":"flagged"}}"#);
+    }
+
+    #[test]
+    fn apply_op_dispatches_set_categories() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SetCategories {
+                id: "M1".into(),
+                categories: vec!["Work".into()],
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert!(reqs[0].path.contains("/me/messages/M1"));
     }
 
     #[test]
