@@ -1255,6 +1255,22 @@ impl Store {
     /// event with no entry there gets none, the same "replace with empty"
     /// semantics `put_event_attendees(id, &[])` has).
     ///
+    /// The window delete excludes `id LIKE 'local:%'` — a not-yet-synced
+    /// optimistic create (see `Store::create_local_event`/`CreateEvent`) has
+    /// no Graph id yet, so it can never appear in `events` (server truth for
+    /// this window) no matter how current the refetch is. Pruning it
+    /// anyway would silently delete the user's just-created event out from
+    /// under a pending `CreateEvent` op, which then finds no such row at
+    /// `event_for_send` time and quarantines instead of sending — the same
+    /// "server truth never clobbers an unsynced local row" rule
+    /// `drafts_folder_id`/local drafts already follow. A `local:` id is
+    /// always `local:<hex>` (see `create_local_event`), which contains no
+    /// `LIKE` metacharacters (`%`/`_`), so no `ESCAPE` clause is needed. Once
+    /// an event reconciles to its real Graph id (or a genuinely
+    /// server-cancelled event just keeps its Graph id), it's a normal row
+    /// again and this exclusion no longer applies — it prunes on the next
+    /// refresh like any other event no longer present server-side.
+    ///
     /// Runs as ONE transaction (the window delete, then every event upsert
     /// and attendee replace) so a crash mid-refresh can't leave the window
     /// emptied without ever refilling it: either the whole replacement
@@ -1279,7 +1295,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1",
+            "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1 AND id NOT LIKE 'local:%'",
             params![from_utc, to_utc],
         )?;
         for e in events {
@@ -2434,6 +2450,50 @@ mod calendar_tests {
         let attendees = s.event_attendees("1").unwrap();
         assert_eq!(attendees.len(), 1);
         assert_eq!(attendees[0].name, "Bob");
+    }
+
+    /// Final-review C2 fix: `replace_events_in_window`'s prune must not
+    /// sweep up a not-yet-synced `local:` event. Before the `id NOT LIKE
+    /// 'local:%'` exclusion, a calendar refresh racing a just-created event
+    /// (which can never appear in the server-truth `events` list — it has no
+    /// Graph id yet) would silently delete it out from under its pending
+    /// `CreateEvent` op. A genuinely stale event with a real Graph id must
+    /// still be pruned exactly as before.
+    #[test]
+    fn replace_events_in_window_preserves_unsynced_local_events_but_still_prunes_stale_ones() {
+        let s = Store::open_in_memory().unwrap();
+        let local_id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        s.upsert_event(&ev("STALE", "2026-07-20T09:00:00Z", "2026-07-20T09:30:00Z"))
+            .unwrap();
+
+        // Server truth for the window doesn't mention either id — the local
+        // event because it was never sent, "STALE" because it was cancelled.
+        s.replace_events_in_window(
+            "2026-07-20T00:00:00Z",
+            "2026-07-21T00:00:00Z",
+            &[ev("SERVER", "2026-07-20T14:00:00Z", "2026-07-20T15:00:00Z")],
+            &[],
+        )
+        .unwrap();
+
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&local_id.as_str()),
+            "unsynced local: event was wiped by the refresh prune: {ids:?}"
+        );
+        assert!(ids.contains(&"SERVER"));
+        assert!(
+            !ids.contains(&"STALE"),
+            "a real Graph-id event no longer present server-side must still be pruned: {ids:?}"
+        );
+        // The local event is still fully readable for its pending
+        // `CreateEvent` op to send.
+        assert!(s.event_for_send(&local_id).unwrap().is_some());
     }
 
     #[test]

@@ -45,6 +45,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         // compose — same "no-op unless open" shape as `eventform::draw`'s
         // own doc comment describes.
         eventform::draw(f, app);
+        // The delete-confirm modal (`x`) is also an overlay on top of the
+        // calendar — without this, `app.confirm` could be set (by
+        // `App::delete_selected_event`) with nothing on screen to show it,
+        // even though `handle_key` now routes Enter/Esc to it correctly.
+        message_list::draw_confirm(f, app);
         return;
     }
 
@@ -144,6 +149,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         eventform::handle_key(app, key);
         return;
     }
+    // Checked ahead of the Calendar-mode short-circuit below: the confirm
+    // modal (opened by `x` in Calendar mode, or a whole-thread delete/move in
+    // Mail mode) must win over both modes' own key handling, or its Enter/Esc
+    // leak through to whatever's underneath instead of confirming/cancelling
+    // — see `draw`'s matching `draw_confirm` call in the Calendar branch.
+    if app.confirm.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_yes(),
+            KeyCode::Esc => app.cancel_confirm(),
+            _ => {}
+        }
+        return;
+    }
     if app.mode == Mode::Calendar {
         calendar::handle_key(app, key);
         return;
@@ -158,14 +176,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.search.is_some() {
         handle_search_key(app, key);
-        return;
-    }
-    if app.confirm.is_some() {
-        match key.code {
-            KeyCode::Enter => app.confirm_yes(),
-            KeyCode::Esc => app.cancel_confirm(),
-            _ => {}
-        }
         return;
     }
     match key.code {
@@ -975,5 +985,82 @@ mod tests {
         let f = app.event_form.as_ref().expect("form opens");
         assert_eq!(f.editing_id.as_deref(), Some("e1"));
         assert_eq!(f.title, "Standup");
+    }
+
+    // --- Confirm modal routing in Calendar mode (final-review C1 fix) ------
+
+    /// Regression test for the merge-blocker where `handle_key` returned from
+    /// the `Mode::Calendar` branch before ever reaching the `app.confirm`
+    /// check: `x` set `app.confirm`, but the following Enter was routed to
+    /// `calendar::handle_key` instead, which treats Enter as
+    /// `open_selected_event` — so the delete could never actually be
+    /// confirmed. This drives the exact same two keystrokes a user would
+    /// press and must FAIL before the routing fix (the event would still
+    /// exist and no `DeleteEvent` would have been enqueued).
+    #[test]
+    fn deleting_an_event_through_handle_key_in_calendar_mode() {
+        use mailcore::store::NewEvent;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = Mode::Calendar;
+        app.store
+            .upsert_event(&NewEvent {
+                id: "e1".into(),
+                subject: "Standup".into(),
+                start_utc: iso_from_now(86_400),
+                end_utc: iso_from_now(86_400 + 1_800),
+                is_all_day: false,
+                location: "".into(),
+                organizer_name: "Boss".into(),
+                organizer_addr: "boss@example.com".into(),
+                response_status: "accepted".into(),
+                series_master_id: None,
+                body_preview: "".into(),
+                web_link: "".into(),
+                last_modified: "2020-01-01T00:00:00Z".into(),
+                body_html: "".into(),
+            })
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e1".into());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        assert!(
+            app.confirm.is_some(),
+            "'x' should open the delete-confirm modal"
+        );
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert!(
+            app.confirm.is_none(),
+            "Enter should have confirmed and closed the modal, not opened the event"
+        );
+        assert!(
+            app.store.event_for_send("e1").unwrap().is_none(),
+            "the event should have been deleted from the store"
+        );
+        let cmd = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(cmd, Ok(SyncCommand::DeleteEvent { .. })));
+    }
+
+    /// Regression test for the other half of the same merge-blocker: `draw`
+    /// took the Calendar-mode branch and returned before it would call
+    /// `message_list::draw_confirm`, so the modal — even once `handle_key`
+    /// routed to it correctly — never actually rendered over the calendar.
+    #[test]
+    fn confirm_modal_renders_over_the_calendar() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = Mode::Calendar;
+        app.confirm = Some(crate::app::ConfirmModal {
+            prompt: "Delete event 'Standup'?".into(),
+            action: crate::app::ConfirmAction::DeleteEvent("e1".into()),
+        });
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Delete event"));
     }
 }
