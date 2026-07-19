@@ -9,6 +9,7 @@ pub(crate) mod calendar;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
+pub mod oofform;
 mod folders;
 mod message_list;
 mod reading;

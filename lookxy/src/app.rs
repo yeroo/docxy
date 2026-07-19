@@ -198,6 +198,9 @@ pub struct App {
     /// (`ui::draw`'s Calendar branch); populated by `open_new_event`/
     /// `open_edit_event`, cleared by `save_event_form`/Esc (later tasks).
     pub event_form: Option<crate::ui::eventform::EventForm>,
+    /// The automatic-replies (out-of-office) editor overlay, when open
+    /// (opened by `O`; see `App::open_oof_form`).
+    pub oof_form: Option<crate::ui::oofform::OofForm>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -410,6 +413,7 @@ impl App {
             confirm: None,
             file_picker: None,
             event_form: None,
+            oof_form: None,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -519,7 +523,26 @@ impl App {
                 self.open_url_with_os_handler(&authorize_url);
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
             }
-            SyncEvent::Error(msg) => self.error_notice = Some(msg),
+            SyncEvent::AutomaticRepliesFetched { replies } => {
+                if let Some(form) = self.oof_form.as_mut() {
+                    let off = crate::ui::calendar::local_offset_minutes();
+                    form.prefill(&replies, off);
+                    form.loading = false;
+                }
+            }
+            SyncEvent::AutomaticRepliesUpdated => {
+                self.oof_form = None;
+                self.attachment_notice = Some("Automatic replies updated".to_string());
+            }
+            SyncEvent::Error(msg) => {
+                // A fetch failure while the OOF form is open must clear its
+                // loading state so the user can still edit + save (a later PATCH
+                // sets from scratch), rather than leaving a stuck "loading…".
+                if let Some(form) = self.oof_form.as_mut() {
+                    form.loading = false;
+                }
+                self.error_notice = Some(msg);
+            }
             // The events store changed (a `RefreshCalendar`/`RespondEvent`
             // just landed) — re-read the agenda window so the calendar view
             // reflects it. Unlike `MessagesUpdated`'s folder check, this
