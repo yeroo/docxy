@@ -65,6 +65,17 @@ pub enum SyncCommand {
         attachment_id: String,
         dest: PathBuf,
     },
+    /// Download a nested `itemAttachment` (`GraphClient::get_attachment_raw_value`)
+    /// and write it to `{dest_base}.ics` or `{dest_base}.eml` — the extension
+    /// is chosen by sniffing the bytes (`BEGIN:VCALENDAR` → calendar item).
+    /// `dest_base` is the Downloads path WITHOUT an extension (the UI can't
+    /// know it until the bytes are sniffed). Emits [`SyncEvent::AttachmentSaved`]
+    /// with the extended path, the same event `SaveAttachment` uses.
+    SaveItemAttachment {
+        message_id: String,
+        attachment_id: String,
+        dest_base: PathBuf,
+    },
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
     /// `SaveAttachment`, which writes to disk. `content_id` is echoed back on
@@ -457,6 +468,11 @@ impl Engine {
                 attachment_id,
                 dest,
             } => self.save_attachment(&message_id, &attachment_id, dest),
+            SyncCommand::SaveItemAttachment {
+                message_id,
+                attachment_id,
+                dest_base,
+            } => self.save_item_attachment(&message_id, &attachment_id, dest_base),
             SyncCommand::FetchInlineImage {
                 message_id,
                 attachment_id,
@@ -897,6 +913,52 @@ impl Engine {
         }
         match self.with_auth(|c| c.get_attachment_bytes(message_id, attachment_id)) {
             Ok(bytes) => {
+                if let Some(parent) = dest.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        self.emit(SyncEvent::Error(format!(
+                            "failed to create {}: {e}",
+                            parent.display()
+                        )));
+                        return;
+                    }
+                }
+                match std::fs::write(&dest, &bytes) {
+                    Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
+                    Err(e) => self.emit(SyncEvent::Error(format!(
+                        "failed to save attachment to {}: {e}",
+                        dest.display()
+                    ))),
+                }
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch one nested-item attachment's raw bytes
+    /// (`GraphClient::get_attachment_raw_value`) and write them to
+    /// `{dest_base}.ics`/`{dest_base}.eml` (sniffed via `looks_like_icalendar`),
+    /// then emit `SyncEvent::AttachmentSaved` — same error handling and
+    /// signed-in guard as `save_attachment`.
+    fn save_item_attachment(&mut self, message_id: &str, attachment_id: &str, dest_base: PathBuf) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_attachment_raw_value(message_id, attachment_id)) {
+            Ok(bytes) => {
+                let ext = if looks_like_icalendar(&bytes) {
+                    "ics"
+                } else {
+                    "eml"
+                };
+                // Append the extension (do NOT use with_extension — dest_base
+                // may legitimately contain dots we must keep).
+                let mut os = dest_base.into_os_string();
+                os.push(".");
+                os.push(ext);
+                let dest = std::path::PathBuf::from(os);
                 if let Some(parent) = dest.parent() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         self.emit(SyncEvent::Error(format!(
@@ -1609,6 +1671,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Whether `bytes` begin (after optional BOM/leading whitespace) with an
+/// iCalendar header, so a nested item should be saved as `.ics` rather than
+/// `.eml`.
+fn looks_like_icalendar(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(64)];
+    let s = String::from_utf8_lossy(head);
+    let s = s.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    s.to_ascii_uppercase().starts_with("BEGIN:VCALENDAR")
 }
 
 #[cfg(test)]
@@ -2473,6 +2545,116 @@ mod tests {
                 .any(|e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest))
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_item_attachment_picks_ics_or_eml_by_content() {
+        // Two nested-item attachments on the same message: A1's raw `/$value`
+        // body is an iCalendar invite, A2's is an RFC822-ish message — the
+        // engine must sniff the bytes and pick `.ics`/`.eml` accordingly.
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1/attachments/A1/$value".into(),
+                status: 200,
+                headers: vec![],
+                body: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+            },
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1/attachments/A2/$value".into(),
+                status: 200,
+                headers: vec![],
+                body: "Received: x\r\n\r\nbody".into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("save-item-attachment");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        // Let the backfill land first so M1 exists locally (same rationale as
+        // `save_attachment_writes_bytes_and_emits_saved_path`).
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        // ICS case.
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveItemAttachment {
+                message_id: "M1".into(),
+                attachment_id: "A1".into(),
+                dest_base: dir.join("downloads").join("invite"),
+            })
+            .unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::AttachmentSaved { .. })
+        });
+        let ics_path = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::AttachmentSaved { path } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("AttachmentSaved");
+        assert_eq!(ics_path.extension().unwrap(), "ics");
+        assert!(ics_path.exists());
+        assert_eq!(
+            std::fs::read(&ics_path).unwrap(),
+            b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+        );
+
+        // EML case.
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveItemAttachment {
+                message_id: "M1".into(),
+                attachment_id: "A2".into(),
+                dest_base: dir.join("downloads").join("message"),
+            })
+            .unwrap();
+        let events = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::AttachmentSaved { path } if path.extension().unwrap() == "eml"),
+        );
+        let eml_path = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::AttachmentSaved { path } if path.extension().unwrap() == "eml" => {
+                    Some(path.clone())
+                }
+                _ => None,
+            })
+            .expect("AttachmentSaved");
+        assert_eq!(eml_path.extension().unwrap(), "eml");
+        assert!(eml_path.exists());
+        assert_eq!(
+            std::fs::read(&eml_path).unwrap(),
+            b"Received: x\r\n\r\nbody"
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
