@@ -149,6 +149,18 @@ pub enum OutboxOp {
         kind: String,
         comment: Option<String>,
     },
+    /// Push a locally-created/edited/deleted calendar event to Graph. `id` is
+    /// the store's event id — a `local:` id (before its first `create_event`
+    /// reconciles it) or the Graph id. See `sync::outbox::apply_op`.
+    CreateEvent {
+        id: String,
+    },
+    UpdateEvent {
+        id: String,
+    },
+    DeleteEvent {
+        id: String,
+    },
 }
 
 impl OutboxOp {
@@ -164,6 +176,9 @@ impl OutboxOp {
             OutboxOp::SaveDraft { .. } => "saveDraft",
             OutboxOp::SendDraft { .. } => "sendDraft",
             OutboxOp::RespondEvent { .. } => "respondEvent",
+            OutboxOp::CreateEvent { .. } => "createEvent",
+            OutboxOp::UpdateEvent { .. } => "updateEvent",
+            OutboxOp::DeleteEvent { .. } => "deleteEvent",
         }
     }
 
@@ -210,6 +225,12 @@ impl OutboxOp {
                     },
                 ),
             ]),
+            OutboxOp::CreateEvent { id }
+            | OutboxOp::UpdateEvent { id }
+            | OutboxOp::DeleteEvent { id } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+            ]),
         }
     }
 
@@ -240,6 +261,9 @@ impl OutboxOp {
                 kind: v.get("rsvp")?.as_str()?.to_string(),
                 comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
             }),
+            "createEvent" => Some(OutboxOp::CreateEvent { id: id()? }),
+            "updateEvent" => Some(OutboxOp::UpdateEvent { id: id()? }),
+            "deleteEvent" => Some(OutboxOp::DeleteEvent { id: id()? }),
             _ => None,
         }
     }
@@ -2477,6 +2501,19 @@ mod outbox_tests {
             let encoded = op.to_json().to_string();
             let decoded = OutboxOp::from_json(&json::parse(&encoded).unwrap()).unwrap();
             assert_eq!(decoded, op);
+        }
+    }
+
+    #[test]
+    fn event_mutation_ops_round_trip_through_json() {
+        for op in [
+            OutboxOp::CreateEvent {
+                id: "local:e1".into(),
+            },
+            OutboxOp::UpdateEvent { id: "EV1".into() },
+            OutboxOp::DeleteEvent { id: "EV2".into() },
+        ] {
+            assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op));
         }
     }
 }

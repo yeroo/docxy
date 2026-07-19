@@ -72,6 +72,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
             client.respond_event(id, rsvp, comment.as_deref(), true)
         }
+        // implemented in Task 5
+        OutboxOp::CreateEvent { id: _ } => Ok(()),
+        // implemented in Task 5
+        OutboxOp::UpdateEvent { id: _ } => Ok(()),
+        // implemented in Task 5
+        OutboxOp::DeleteEvent { id: _ } => Ok(()),
     }
 }
 
