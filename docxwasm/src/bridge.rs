@@ -362,6 +362,8 @@ impl Session {
             "doc.metadata" => Ok(self.ctl_metadata()),
             "doc.stats" => Ok(self.ctl_stats()),
             "doc.replace-all" => self.ctl_replace_all(args),
+            "doc.format" => self.ctl_format(args),
+            "doc.set-style" => self.ctl_set_style(args),
             "doc.undo" => Ok(self.ctl_undo()),
             "doc.redo" => Ok(self.ctl_redo()),
             "doc.export-pdf" => Ok(self.ctl_export_pdf()),
@@ -823,6 +825,57 @@ impl Session {
         Ok(out)
     }
 
+    /// `{start, end?, patch}` -> `{formatted}`. `patch` is a JSON object (≥1
+    /// key), routed through `agent::RunPatch::parse` for validation/typing,
+    /// then applied over the block range as ONE undo checkpoint via
+    /// `agent::format_range` — mirrors docxy control.rs's `format`
+    /// byte-for-byte (same patch-pairs stringification, same error family,
+    /// same `{formatted}` reply key). No `undoSteps` field: the default tab
+    /// mapping (`steps=1`) is correct for a single-checkpoint verb, unlike
+    /// `doc.replace-range`/`doc.replace-all` above.
+    fn ctl_format(&mut self, args: &json::Json) -> Result<String, String> {
+        let start = args
+            .get_usize("start")
+            .ok_or("doc.format needs a 'start' index")?;
+        let end = args.get_usize("end").unwrap_or(start);
+        let patch_arg = args.get("patch").ok_or("doc.format needs a 'patch'")?;
+        let pairs = ctl_patch_pairs(patch_arg)?;
+        let patch = agent::RunPatch::parse(&pairs)?;
+        let formatted = agent::format_range(&mut self.editor, start, end, &patch)?;
+        self.finish_ctl_edit();
+        Ok(format!("{{\"formatted\":{formatted}}}"))
+    }
+
+    /// `{start, end?, style?, align?}` -> `{styled}`. At least one of
+    /// `style`/`align` is required. Mirrors docxy control.rs's `set_style`
+    /// byte-for-byte: `agent::validate_set_style_range` runs first (pure, no
+    /// `Package`), THEN `Package::ensure_styles` for a markdown-set style id
+    /// (never for `Normal` or an align-only call) — this session's own
+    /// `Package` in place of docxy's `App::pkg` — THEN the real mutation via
+    /// `agent::set_style_range`, which re-validates and pushes the ONE undo
+    /// checkpoint. No `undoSteps` field, same reasoning as `ctl_format`.
+    fn ctl_set_style(&mut self, args: &json::Json) -> Result<String, String> {
+        let start = args
+            .get_usize("start")
+            .ok_or("doc.set-style needs a 'start' index")?;
+        let end = args.get_usize("end").unwrap_or(start);
+        let style = args.get_str("style");
+        let align = match args.get_str("align") {
+            Some(a) => Some(ctl_parse_align(a)?),
+            None => None,
+        };
+
+        agent::validate_set_style_range(&self.editor.doc, start, end, style, align)?;
+        if let Some(s) = style {
+            if s != "Normal" {
+                self.pkg.ensure_styles(&[s]);
+            }
+        }
+        let styled = agent::set_style_range(&mut self.editor, start, end, style, align)?;
+        self.finish_ctl_edit();
+        Ok(format!("{{\"styled\":{styled}}}"))
+    }
+
     /// `{}` -> `{done, undoSteps:0}`. Undo/redo are not themselves undoable
     /// edits, so `undoSteps` is always `0` regardless of `done` — Task 7's
     /// tab adaptation fires its own host-orchestrated inverse edit event
@@ -1022,6 +1075,42 @@ fn ctl_markdown_flag(args: &json::Json) -> bool {
         .unwrap_or(false)
 }
 
+/// Build `agent::RunPatch`'s wire pairs from the `patch` object's own JSON
+/// values — docxcore stays JSON-free, so scalars are stringified here
+/// (`true`/`false` for booleans, the raw text for strings, the number's text
+/// for numbers). Mirrors `docxy::control`'s `patch_pairs` byte-for-byte.
+fn ctl_patch_pairs(patch: &json::Json) -> Result<Vec<(String, String)>, String> {
+    let json::Json::Obj(pairs) = patch else {
+        return Err("doc.format needs a 'patch' object".to_string());
+    };
+    Ok(pairs
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                json::Json::Str(s) => s.clone(),
+                json::Json::Bool(b) => b.to_string(),
+                json::Json::Num(n) => n.to_string(),
+                json::Json::Null | json::Json::Arr(_) | json::Json::Obj(_) => String::new(),
+            };
+            (k.clone(), text)
+        })
+        .collect())
+}
+
+/// Parse `left`/`center`/`right`/`justify` into `Align` for `doc.set-style`'s
+/// `align` key. Mirrors `docxy::control`'s `parse_align` byte-for-byte.
+fn ctl_parse_align(s: &str) -> Result<Align, String> {
+    match s {
+        "left" => Ok(Align::Left),
+        "center" => Ok(Align::Center),
+        "right" => Ok(Align::Right),
+        "justify" => Ok(Align::Justify),
+        other => Err(format!(
+            "bad align '{other}' (want left/center/right/justify)"
+        )),
+    }
+}
+
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
 /// defaulting to the whole document. Mirrors `docxy::control`'s `range_args`.
 fn ctl_range_args(args: &json::Json, n: usize) -> Result<(usize, usize), String> {
@@ -1143,6 +1232,7 @@ fn color_name(c: Color) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use docxcore::model::Inline;
     use docxcore::package::{new_package, save_package};
 
     /// A tiny real `.docx` (one paragraph) built through the package layer, so
@@ -1926,5 +2016,232 @@ mod tests {
         let out = s.ctl(r#"{"verb":"doc.blocks","args":{}}"#);
         assert!(out.contains("\"protection\":\"read-only\""), "{out}");
         assert!(out.contains("\"watermark\":\"CONFIDENTIAL\""), "{out}");
+    }
+
+    // ---- Wave-3 doc.format / doc.set-style (mirrors docxy control.rs) -----
+
+    /// The bold flags of every run in the first paragraph, in order — used to
+    /// spot-check `doc.format`'s SET-to-value determinism (not toggle).
+    fn run_bold_flags(s: &Session, block: usize) -> Vec<bool> {
+        let Block::Paragraph(p) = &s.editor.doc.body[block] else {
+            panic!("expected paragraph at {block}")
+        };
+        p.content
+            .iter()
+            .filter_map(|inl| match inl {
+                Inline::Run(r) => Some(r.props.bold),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctl_format_reply_is_exactly_formatted_and_ok_no_undo_steps() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":true}}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("\"formatted\":1"), "{out}");
+        assert!(
+            !out.contains("undoSteps"),
+            "doc.format must not carry an undoSteps field: {out}"
+        );
+        let obj = out.trim_start_matches('{').trim_end_matches('}');
+        let keys: Vec<&str> = obj
+            .split(',')
+            .map(|kv| kv.split(':').next().unwrap())
+            .collect();
+        assert_eq!(keys.len(), 2, "exact key set (formatted, ok): {out}");
+    }
+
+    #[test]
+    fn ctl_set_style_reply_is_exactly_styled_and_ok_no_undo_steps() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let out = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"style":"Quote"}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("\"styled\":1"), "{out}");
+        assert!(
+            !out.contains("undoSteps"),
+            "doc.set-style must not carry an undoSteps field: {out}"
+        );
+        let obj = out.trim_start_matches('{').trim_end_matches('}');
+        let keys: Vec<&str> = obj
+            .split(',')
+            .map(|kv| kv.split(':').next().unwrap())
+            .collect();
+        assert_eq!(keys.len(), 2, "exact key set (styled, ok): {out}");
+    }
+
+    #[test]
+    fn ctl_format_bold_true_then_false_is_set_not_toggle() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":true}}}"#);
+        assert_eq!(run_bold_flags(&s, 0), vec![true]);
+        // Applying bold:true again is a no-op — SET semantics, not toggle.
+        s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":true}}}"#);
+        assert_eq!(run_bold_flags(&s, 0), vec![true]);
+        s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":false}}}"#);
+        assert_eq!(run_bold_flags(&s, 0), vec![false]);
+    }
+
+    #[test]
+    fn ctl_format_one_undo_restores_exact_prior_document() {
+        let mut s = Session::open(&sample_docx_multi(&["A", "B"])).expect("open");
+        let before = s.editor.doc.clone();
+        let out = s.ctl(
+            r##"{"verb":"doc.format","args":{"start":0,"end":1,"patch":{"bold":true,"italic":true,"color":"#00FF00"}}}"##,
+        );
+        assert!(out.contains("\"formatted\":2"), "{out}");
+        assert_ne!(s.editor.doc, before);
+        s.dispatch("undo");
+        assert_eq!(
+            s.editor.doc, before,
+            "one undo must restore exact prior run props"
+        );
+    }
+
+    #[test]
+    fn ctl_set_style_one_undo_restores_exact_prior_document() {
+        let mut s = Session::open(&sample_docx_multi(&["A", "B"])).expect("open");
+        let before = s.editor.doc.clone();
+        let out = s.ctl(
+            r#"{"verb":"doc.set-style","args":{"start":0,"end":1,"style":"Heading1","align":"center"}}"#,
+        );
+        assert!(out.contains("\"styled\":2"), "{out}");
+        assert_ne!(s.editor.doc, before);
+        s.dispatch("undo");
+        assert_eq!(
+            s.editor.doc, before,
+            "one undo must restore exact prior style/align"
+        );
+    }
+
+    #[test]
+    fn ctl_set_style_heading1_ensures_the_style_part_on_a_bare_package() {
+        let mut s = Session::open(&sample_docx("Title")).expect("open");
+        let styles_before =
+            String::from_utf8_lossy(s.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(!styles_before.contains("Heading1"), "{styles_before}");
+
+        let out = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"style":"Heading1"}}"#);
+        assert!(out.contains("\"styled\":1"), "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+
+        let styles_after =
+            String::from_utf8_lossy(s.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(
+            styles_after.contains("w:styleId=\"Heading1\""),
+            "{styles_after}"
+        );
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn ctl_set_style_normal_only_does_not_ensure_styles() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let before = s.pkg.part("word/styles.xml").unwrap().to_vec();
+        let out = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"style":"Normal"}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(
+            s.pkg.part("word/styles.xml").unwrap(),
+            before.as_slice(),
+            "Normal must not touch styles.xml"
+        );
+    }
+
+    #[test]
+    fn ctl_set_style_align_only_does_not_ensure_styles() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        let before = s.pkg.part("word/styles.xml").unwrap().to_vec();
+        let out = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"align":"center"}}"#);
+        assert!(out.contains("\"styled\":1"), "{out}");
+        assert_eq!(
+            s.pkg.part("word/styles.xml").unwrap(),
+            before.as_slice(),
+            "an align-only call must not touch styles.xml"
+        );
+    }
+
+    #[test]
+    fn ctl_format_and_set_style_dirty_flag_contract() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+        assert!(!s.is_dirty());
+
+        // A validation failure must leave the session untouched.
+        let err = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{}}}"#);
+        assert!(err.contains("\"ok\":false"), "{err}");
+        assert!(
+            !s.is_dirty(),
+            "a rejected format must not dirty the session"
+        );
+
+        let err2 = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0}}"#);
+        assert!(err2.contains("\"ok\":false"), "{err2}");
+        assert!(
+            !s.is_dirty(),
+            "a rejected set-style must not dirty the session"
+        );
+
+        // Success dirties the session.
+        let ok = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":true}}}"#);
+        assert!(ok.contains("\"ok\":true"), "{ok}");
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn ctl_format_error_strings_match_control_rs_family() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+
+        let err = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{}}}"#);
+        assert!(err.contains("patch needs at least one key"), "{err}");
+
+        let err = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"nope":true}}}"#);
+        assert!(err.contains("unknown patch key 'nope'"), "{err}");
+
+        let err = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"color":"red"}}}"#);
+        assert!(
+            err.contains("bad color 'red' (want \\\"#RRGGBB\\\")"),
+            "{err}"
+        );
+
+        let err =
+            s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"highlight":"chartreuse"}}}"#);
+        assert!(err.contains("bad highlight 'chartreuse'"), "{err}");
+        for name in agent::HIGHLIGHT_NAMES {
+            assert!(err.contains(name), "{err} missing {name}");
+        }
+        assert!(err.contains("or none"), "{err}");
+
+        let err = s.ctl(r#"{"verb":"doc.format","args":{"start":0,"patch":{"size":"abc"}}}"#);
+        assert!(err.contains("bad size 'abc'"), "{err}");
+    }
+
+    #[test]
+    fn ctl_set_style_error_strings_match_control_rs_family() {
+        let mut s = Session::open(&sample_docx("A")).expect("open");
+
+        let err = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0}}"#);
+        assert_eq!(err, ctl_err("set-style needs 'style' or 'align'"), "{err}");
+
+        let err = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"style":"Bogus"}}"#);
+        assert!(err.contains("Bogus"), "{err}");
+        for id in agent::MARKDOWN_PARAGRAPH_STYLE_IDS {
+            assert!(err.contains(id), "{err} missing {id}");
+        }
+        assert!(err.contains("Normal"), "{err}");
+
+        let err = s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"align":"middle"}}"#);
+        assert!(err.contains("bad align 'middle'"), "{err}");
+        assert!(err.contains("left/center/right/justify"), "{err}");
+    }
+
+    #[test]
+    fn ctl_format_and_set_style_round_trip_through_markdown_export() {
+        let mut s = Session::open(&sample_docx_multi(&["Title", "body text"])).expect("open");
+        s.ctl(r#"{"verb":"doc.set-style","args":{"start":0,"style":"Heading1"}}"#);
+        s.ctl(r#"{"verb":"doc.format","args":{"start":1,"patch":{"bold":true}}}"#);
+        let out = s.ctl(r#"{"verb":"doc.export","args":{"format":"markdown"}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+        assert!(out.contains("**body text**"), "{out}");
     }
 }
