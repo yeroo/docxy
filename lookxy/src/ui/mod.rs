@@ -134,6 +134,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.apply_compose_action();
         return;
     }
+    // The create/edit event form is an overlay over the calendar, not a
+    // full-screen mode like compose — but it still needs first crack at
+    // every key while it's open, same as `file_picker` gets ahead of the
+    // compose view it sits on top of. Checked ahead of `calendar::handle_key`
+    // so `c`/`e`/navigation underneath it can't leak through while the form
+    // has focus.
+    if app.event_form.is_some() {
+        eventform::handle_key(app, key);
+        return;
+    }
     if app.mode == Mode::Calendar {
         calendar::handle_key(app, key);
         return;
@@ -886,5 +896,84 @@ mod tests {
         let (_, body) = app.store.draft(&id).unwrap().unwrap();
         assert!(body.content.contains("old"));
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+    }
+
+    // --- Event form: c/e bindings + routing --------------------------------
+
+    #[test]
+    fn c_opens_the_event_form_in_calendar_mode_and_routes_keys_to_it_ahead_of_calendar() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = Mode::Calendar;
+        assert!(app.event_form.is_none());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        assert!(app.event_form.is_some());
+
+        // While the form is open, a letter that's otherwise a calendar key
+        // ('t' = RSVP tentative) must type into the focused Title field
+        // instead of leaking through to `calendar::handle_key` — proof the
+        // form is routed to ahead of the calendar's own key handling.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.event_form.as_ref().unwrap().title, "t");
+        assert!(app.rsvp_prompt.is_none());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.event_form.is_none());
+    }
+
+    /// A UTC ISO-8601 timestamp `offset_secs` from the real "now" — same
+    /// "anchor at the actual clock" shape as `app::tests::seeded_event`
+    /// (private to that module, so kept as its own tiny copy here) — so a
+    /// seeded event's start/end always falls inside `agenda_window()`
+    /// regardless of what day the test suite happens to run on.
+    fn iso_from_now(offset_secs: i64) -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            + offset_secs;
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (y, m, d) = crate::ui::calendar::civil_from_days(days);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
+    }
+
+    #[test]
+    fn e_opens_the_event_form_prefilled_for_the_highlighted_event() {
+        use mailcore::store::NewEvent;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = Mode::Calendar;
+        app.store
+            .upsert_event(&NewEvent {
+                id: "e1".into(),
+                subject: "Standup".into(),
+                start_utc: iso_from_now(86_400),
+                end_utc: iso_from_now(86_400 + 1_800),
+                is_all_day: false,
+                location: "".into(),
+                organizer_name: "Boss".into(),
+                organizer_addr: "boss@example.com".into(),
+                response_status: "accepted".into(),
+                series_master_id: None,
+                body_preview: "".into(),
+                web_link: "".into(),
+                last_modified: "2020-01-01T00:00:00Z".into(),
+                body_html: "".into(),
+            })
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e1".into());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('e')));
+
+        let f = app.event_form.as_ref().expect("form opens");
+        assert_eq!(f.editing_id.as_deref(), Some("e1"));
+        assert_eq!(f.title, "Standup");
     }
 }

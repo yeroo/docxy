@@ -53,15 +53,18 @@ pub(crate) fn agenda_window() -> (String, String) {
 /// Keys while `App::mode` is `Calendar`: ↑/↓/j/k move the agenda selection
 /// (bounds-safe, clamped rather than wrapping — see
 /// `App::move_agenda_selection`), Enter opens the detail pane on whatever's
-/// highlighted, `g`/Esc return to the mail view, and `a`/`d`/`t` start an
+/// highlighted, `g`/Esc return to the mail view, `a`/`d`/`t` start an
 /// RSVP (accept/decline/tentative) on the highlighted row — routed here
 /// (rather than through `App::on_key_char`, the Mail-mode dispatch) so they
 /// can never clobber `a` (attachments) / `d` (delete)'s Mail-mode meanings;
-/// see `RsvpPrompt`. While the RSVP comment prompt is open, every key
-/// instead goes to `handle_rsvp_prompt_key` — checked first, ahead of the
-/// normal calendar keys, the same "prompt/popup takes over key handling"
-/// precedence `ui::handle_key` already gives the move-folder/attachments/
-/// search prompts over plain pane navigation.
+/// see `RsvpPrompt` — and `c`/`e` open the create/edit event form
+/// (`App::open_new_event`/`open_edit_event`; `ui::eventform::handle_key`
+/// takes over key handling from there, checked ahead of this function's own
+/// call in `ui::handle_key` once the form is open). While the RSVP comment
+/// prompt is open, every key instead goes to `handle_rsvp_prompt_key` —
+/// checked first, ahead of the normal calendar keys, the same "prompt/popup
+/// takes over key handling" precedence `ui::handle_key` already gives the
+/// move-folder/attachments/search prompts over plain pane navigation.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if app.rsvp_prompt.is_some() {
         handle_rsvp_prompt_key(app, key);
@@ -75,6 +78,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') => app.start_rsvp("accepted"),
         KeyCode::Char('d') => app.start_rsvp("declined"),
         KeyCode::Char('t') => app.start_rsvp("tentativelyAccepted"),
+        KeyCode::Char('c') => app.open_new_event(),
+        KeyCode::Char('e') => app.open_edit_event(),
         _ => {}
     }
 }

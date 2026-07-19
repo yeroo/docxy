@@ -199,12 +199,8 @@ fn parse_relative_minutes(s: &str) -> Option<i64> {
 /// HH:MM`) — the inverse direction of what `parse_start`/`parse_end` accept
 /// as input. Used by `App::open_new_event` (formatting the prefilled
 /// Start/End) and `App::open_edit_event` (formatting a stored event's
-/// UTC→local Start/End via `utc_iso_to_local`).
-///
-/// Both call sites are methods not yet bound to a key (Task 7 wires `c`/`e`
-/// in Calendar mode); `cfg_attr` silences `dead_code` only outside tests,
-/// same pattern as `parse_start`/`parse_end` below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// UTC→local Start/End via `utc_iso_to_local`), both bound to `c`/`e` in
+/// Calendar mode.
 pub fn format_local(t: LocalDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
@@ -216,24 +212,17 @@ pub fn format_local(t: LocalDateTime) -> String {
 /// via the same `to_epoch_min`/`from_epoch_min` day-count math every other
 /// conversion in this module uses. Used by `App::open_new_event` to compute
 /// the End prefill (Start + 1h) from whatever Start was rounded to.
-///
-/// See `format_local`'s doc comment for the same "not yet wired" `cfg_attr`
-/// note.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn add_minutes(t: LocalDateTime, minutes: i64) -> LocalDateTime {
     from_epoch_min(to_epoch_min(t) + minutes)
 }
 
-/// Not yet called from production code — a later task's create/edit-event
-/// form wiring is what will call this; `cfg_attr` silences `dead_code` only
-/// outside tests, same pattern already used for `Compose::new`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Called from `App::save_event_form` (Ctrl-Enter in the event form) to
+/// parse the Start field's display text back into a UTC ISO timestamp.
 pub fn parse_start(input: &str, now: LocalDateTime, offset_min: i64) -> Option<String> {
     Some(to_utc_iso(parse_local(input, now)?, offset_min))
 }
 
-/// See `parse_start` — same "not yet wired" note applies.
-#[cfg_attr(not(test), allow(dead_code))]
+/// See `parse_start` — called from the same place, for the End field.
 pub fn parse_end(
     input: &str,
     start_utc: &str,

@@ -1,22 +1,24 @@
 //! The create/edit event form: a full-screen-over-the-calendar overlay with
 //! Title/Start/End/All-day/Location/Attendees/Body fields, opened by
-//! `App::open_new_event`/`open_edit_event` (`c`/`e` in Calendar mode — wired
-//! in a later task alongside this module's own key handling) and drawn by
-//! `draw` whenever `App::event_form` is `Some` (see `ui::draw`'s Calendar
-//! branch).
+//! `App::open_new_event`/`open_edit_event` (`c`/`e` in Calendar mode) and
+//! drawn by `draw` whenever `App::event_form` is `Some` (see `ui::draw`'s
+//! Calendar branch).
 //!
-//! This task only covers the form's state (`EventForm`/`EventField`), the two
-//! entry points that populate it, and rendering — mirroring
-//! `ui::compose::draw_compose`'s field-row layout and focus highlighting.
-//! Key handling (Tab/Ctrl-Enter save/Esc cancel) and the attendee-autocomplete
-//! dropdown's actual content are later tasks' concern; the dropdown overlay
-//! is wired here in an overlay-safe way (a no-op while `autocomplete` is
-//! `None`, which it always is until that task sets it).
+//! Covers the form's state (`EventForm`/`EventField`), the two entry points
+//! that populate it, rendering (mirroring `ui::compose::draw_compose`'s
+//! field-row layout and focus highlighting), and key handling (`handle_key`):
+//! Tab cycles focus, Char/Backspace edit the focused text field (Space
+//! toggles All-day), Ctrl-Enter saves (`App::save_event_form`), Esc closes
+//! without saving. The attendee-autocomplete dropdown's actual content
+//! (search-as-you-type over the store) is a later task's concern; the
+//! dropdown overlay is wired here in an overlay-safe way (a no-op while
+//! `autocomplete` is `None`, which it always is until that task sets it).
 
 use crate::app::App;
 use crate::ui::border_style;
 
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -40,11 +42,10 @@ pub enum EventField {
 /// `Name <addr>; …` text (with contacts autocomplete). `error` is the inline
 /// validation message shown in the footer.
 pub struct EventForm {
-    /// Opaque to this module: `draw` doesn't render it, and nothing else
-    /// reads it back yet — Task 7's `save_event_form` is what checks it (new
-    /// vs. edit) once saving exists. Silences `dead_code` outside tests
-    /// only, same pattern as `ui::compose::Compose::draft_id`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Opaque to this module: `draw` doesn't render it. `App::save_event_form`
+    /// reads it to decide create (`None`) vs. update (`Some(id)`) — and, for
+    /// an update, whether `id` is a still-not-yet-synced `local:` id (see
+    /// that function's doc comment for why that changes what gets enqueued).
     pub editing_id: Option<String>,
     pub title: String,
     pub start: String,
@@ -236,6 +237,86 @@ fn draw_autocomplete(
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// Keys while the event form is open (checked ahead of the calendar's own
+/// key handling — see `ui::handle_key`): Tab cycles focus, Ctrl-Enter saves
+/// (`App::save_event_form`, which sets an inline `error` and leaves the form
+/// open on a validation failure — nothing here needs to react to that), Esc
+/// closes the form without saving. Otherwise, Char/Backspace edit whichever
+/// field currently has focus — Space on the All-day field toggles it instead
+/// of "typing" (there's no text there to edit); any other character while on
+/// All-day is ignored, same as compose's non-text fields ignore keys that
+/// don't apply to them. A no-op if the form isn't open (defensive; the only
+/// caller already checks `app.event_form.is_some()` first). Attendee
+/// autocomplete keys are Task 8's concern — none are handled here yet.
+pub fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.event_form.is_none() {
+        return;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && key.code == KeyCode::Enter {
+        app.save_event_form();
+        return;
+    }
+    if key.code == KeyCode::Esc {
+        app.event_form = None;
+        return;
+    }
+    let Some(form) = app.event_form.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Tab => cycle_focus(form),
+        KeyCode::Char(' ') if form.focus == EventField::AllDay => {
+            form.all_day = !form.all_day;
+        }
+        KeyCode::Char(c) => match form.focus {
+            EventField::Title => form.title.push(c),
+            EventField::Start => form.start.push(c),
+            EventField::End => form.end.push(c),
+            EventField::AllDay => {}
+            EventField::Location => form.location.push(c),
+            EventField::Attendees => form.attendees.push(c),
+            EventField::Body => form.body.push(c),
+        },
+        KeyCode::Backspace => match form.focus {
+            EventField::Title => {
+                form.title.pop();
+            }
+            EventField::Start => {
+                form.start.pop();
+            }
+            EventField::End => {
+                form.end.pop();
+            }
+            EventField::AllDay => {}
+            EventField::Location => {
+                form.location.pop();
+            }
+            EventField::Attendees => {
+                form.attendees.pop();
+            }
+            EventField::Body => {
+                form.body.pop();
+            }
+        },
+        _ => {}
+    }
+}
+
+/// `Title` → `Start` → `End` → `AllDay` → `Location` → `Attendees` → `Body`
+/// → `Title`.
+fn cycle_focus(form: &mut EventForm) {
+    form.focus = match form.focus {
+        EventField::Title => EventField::Start,
+        EventField::Start => EventField::End,
+        EventField::End => EventField::AllDay,
+        EventField::AllDay => EventField::Location,
+        EventField::Location => EventField::Attendees,
+        EventField::Attendees => EventField::Body,
+        EventField::Body => EventField::Title,
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +364,99 @@ mod tests {
         assert!(text.contains("Standup"));
         assert!(text.contains("2026-07-20 14:00"));
         assert!(text.contains("Invalid start time"));
+    }
+
+    #[test]
+    fn tab_cycles_focus_through_every_field_and_back_to_title() {
+        let mut app = App::for_test_with_seeded_store();
+        app.event_form = Some(blank_form());
+        let order = [
+            EventField::Start,
+            EventField::End,
+            EventField::AllDay,
+            EventField::Location,
+            EventField::Attendees,
+            EventField::Body,
+            EventField::Title,
+        ];
+        for expected in order {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+            assert!(app.event_form.as_ref().unwrap().focus == expected);
+        }
+    }
+
+    #[test]
+    fn char_and_backspace_edit_the_focused_text_field() {
+        let mut app = App::for_test_with_seeded_store();
+        app.event_form = Some(blank_form()); // focus starts on Title
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('X')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('Y')));
+        assert_eq!(app.event_form.as_ref().unwrap().title, "XY");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.event_form.as_ref().unwrap().title, "X");
+    }
+
+    #[test]
+    fn space_toggles_all_day_and_other_chars_on_it_do_nothing() {
+        let mut app = App::for_test_with_seeded_store();
+        let mut form = blank_form();
+        form.focus = EventField::AllDay;
+        app.event_form = Some(form);
+        assert!(!app.event_form.as_ref().unwrap().all_day);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')));
+        assert!(!app.event_form.as_ref().unwrap().all_day); // ignored, not text
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(' ')));
+        assert!(app.event_form.as_ref().unwrap().all_day);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.event_form.as_ref().unwrap().all_day); // toggles back off
+    }
+
+    #[test]
+    fn esc_closes_the_form_without_saving() {
+        let mut app = App::for_test_with_seeded_store();
+        let mut form = blank_form();
+        form.title = "Unsaved".into();
+        app.event_form = Some(form);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.event_form.is_none());
+        assert!(
+            app.store
+                .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_calls_save_and_closes_the_form_on_valid_input() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        let mut form = blank_form();
+        form.title = "Planning".into();
+        app.event_form = Some(form);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+
+        assert!(app.event_form.is_none()); // save_event_form ran and closed it
+        assert_eq!(app.agenda.len(), 1);
+        assert_eq!(app.agenda[0].subject, "Planning");
+    }
+
+    #[test]
+    fn handle_key_is_a_no_op_when_the_form_is_closed() {
+        let mut app = App::for_test_with_seeded_store();
+        assert!(app.event_form.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x'))); // must not panic
+        assert!(app.event_form.is_none());
     }
 }

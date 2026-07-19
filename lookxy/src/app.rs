@@ -795,13 +795,8 @@ impl App {
     /// prefilled in LOCAL time — Start to the next full hour, End to +1h
     /// after it — via `local_now`/`datetime::add_minutes`/
     /// `datetime::format_local`; nothing is written to the store, and
-    /// `datetime::parse_start`/`parse_end` (Task 7's save) re-parse this same
-    /// display text on Ctrl-Enter.
-    ///
-    /// Not yet bound to a key — Task 7 wires `c` (Calendar mode) to call
-    /// this; `cfg_attr` silences `dead_code` only outside tests, same
-    /// pattern already used for `datetime::parse_start`/`Compose::new`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `datetime::parse_start`/`parse_end` re-parse this same display text
+    /// on Ctrl-Enter (`save_event_form`).
     pub fn open_new_event(&mut self) {
         let now = local_now();
         // Round up to the next full hour: if already exactly on the hour,
@@ -834,11 +829,6 @@ impl App {
     /// nothing is selected/highlighted, the resolved id isn't in the
     /// currently-loaded `agenda` window, or `event_for_send` has nothing for
     /// it (a stale/foreign id).
-    ///
-    /// Not yet bound to a key — Task 7 wires `e` (Calendar mode) to call
-    /// this; see `open_new_event`'s doc comment for the same "not yet wired"
-    /// `cfg_attr` note.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_edit_event(&mut self) {
         let Some(id) = self
             .selected_event
@@ -878,16 +868,88 @@ impl App {
             all_day: send.is_all_day,
             location: send.location,
             attendees: attendees_text,
-            // Raw stored HTML, not stripped to plain text — a known
-            // simplification; Task 7's save re-escapes whatever's typed here
-            // as plain text, so an edited event's body round-trips through
-            // literal HTML source rather than rendered text until a later
-            // task adds proper HTML↔plain-text conversion for this field.
-            body: send.body_html,
+            // Plain text of the stored HTML (mirrors `open_draft`'s
+            // `compose_html::from_html(...).plain()`), not the raw HTML
+            // source — `save_event_form` re-escapes whatever's typed here
+            // with `escape_html`, so loading the raw HTML would double-escape
+            // it on save (`<p>x</p>` → `&lt;p&gt;x&lt;/p&gt;`). Loading the
+            // plain text instead makes the round trip stable.
+            body: compose_html::from_html(&send.body_html).plain(),
             focus: crate::ui::eventform::EventField::Title,
             autocomplete: None,
             error: None,
         });
+    }
+
+    /// Ctrl-Enter in the event form: parse + validate the times, build the
+    /// fields, and either create a new local event (+ `CreateEvent`) or
+    /// update the edited one (+ `UpdateEvent`). A parse/validation failure
+    /// sets an inline error on the form and leaves it open.
+    ///
+    /// For an edit whose id is still a not-yet-synced `local:` id, this
+    /// writes the fields to the store but does NOT also send
+    /// `SyncCommand::UpdateEvent` — that event still has a pending
+    /// `CreateEvent` op sitting in the outbox (from when it was first
+    /// created), which reads `Store::event_for_send` at drain time and so
+    /// picks up the just-written fields on its own. Enqueuing an `UpdateEvent`
+    /// on top would race it: if the create drains first, it reconciles
+    /// `local:X` → the real Graph id, and an `UpdateEvent{id: local:X}`
+    /// enqueued after that would find no such row anymore (quarantined as
+    /// "event not found"). Only a non-`local:` (already-synced) id gets an
+    /// `UpdateEvent` sent.
+    pub fn save_event_form(&mut self) {
+        let Some(form) = self.event_form.as_ref() else {
+            return;
+        };
+        let now = local_now();
+        let off = crate::ui::calendar::local_offset_minutes();
+        let Some(start_utc) = crate::datetime::parse_start(&form.start, now, off) else {
+            self.set_form_error("Invalid start time");
+            return;
+        };
+        let Some(end_utc) = crate::datetime::parse_end(&form.end, &start_utc, now, off) else {
+            self.set_form_error("Invalid end time");
+            return;
+        };
+        if end_utc < start_utc {
+            self.set_form_error("End is before start");
+            return;
+        }
+        let fields = mailcore::store::LocalEventFields {
+            subject: form.title.clone(),
+            start_utc,
+            end_utc,
+            is_all_day: form.all_day,
+            location: form.location.clone(),
+            body_html: compose_html::escape_html(&form.body), // plain text as HTML text
+            attendees: parse_attendee_pairs(&form.attendees),
+        };
+        let editing = form.editing_id.clone();
+        match editing {
+            Some(id) => {
+                let _ = self.store.update_event_fields(&id, &fields);
+                if !id.starts_with("local:") {
+                    let _ = self.sync.cmd_tx.send(SyncCommand::UpdateEvent { id });
+                }
+            }
+            None => {
+                let account = self.account.clone().unwrap_or_default();
+                if let Ok(id) = self.store.create_local_event(&fields, &account, &account) {
+                    let _ = self.sync.cmd_tx.send(SyncCommand::CreateEvent { id });
+                }
+            }
+        }
+        self.event_form = None;
+        self.reload_agenda();
+    }
+
+    /// Sets the event form's inline validation error, if the form is open —
+    /// a no-op otherwise (defensive; `save_event_form`, the only caller, only
+    /// calls this while `event_form` is known to be `Some`).
+    fn set_form_error(&mut self, msg: &str) {
+        if let Some(form) = self.event_form.as_mut() {
+            form.error = Some(msg.to_string());
+        }
     }
 
     // --- Triage actions ---------------------------------------------------
@@ -1966,13 +2028,8 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 /// The current wall-clock instant as local time — `ui::calendar::local_offset_minutes`
 /// (the same system offset the agenda itself renders with) applied to
 /// `SystemTime::now()`, then re-derived into calendar fields via
-/// `ui::calendar::civil_from_days`. `open_new_event`'s prefill seed (and
-/// `save_event_form`'s, in a later task).
-///
-/// Only called from `open_new_event` so far, which is itself not yet bound
-/// to a key (see its doc comment); `cfg_attr` silences `dead_code` only
-/// outside tests for the same reason.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `ui::calendar::civil_from_days`. `open_new_event`'s prefill seed, and
+/// `save_event_form`'s "now" for `datetime::parse_start`/`parse_end`.
 fn local_now() -> crate::datetime::LocalDateTime {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1989,6 +2046,48 @@ fn local_now() -> crate::datetime::LocalDateTime {
         hour: (rem / 3600) as u32,
         min: ((rem % 3600) / 60) as u32,
     }
+}
+
+/// Parses the event form's flat `attendees` text (`"Name <addr>; Name2
+/// <addr2>; bare@addr"`) into `(name, address)` pairs for
+/// `LocalEventFields::attendees` — the same shape `open_edit_event` formats
+/// it back into (`"{name} <{addr}>"` joined by `"; "`), so round-tripping an
+/// edited event's attendees through the form is stable.
+///
+/// Mirrors `mailcore::sync::outbox::parse_recipients`'s shape rather than
+/// calling it directly (it's `pub(crate)` to `mailcore`, unreachable from
+/// this crate): split on `;` first (the only separator `open_edit_event`'s
+/// formatting ever joins on, so always safe to split on — unlike `,`, which
+/// a "Surname, Given" display name can itself contain); each part with a
+/// `<...>`-wrapped address is one `(name, addr)` pair; a part with no
+/// `<...>` is the bare-address shape a hand-typed attendee list uses, where
+/// `,` IS a separator, split into one address-only (empty name) pair per
+/// non-empty piece.
+fn parse_attendee_pairs(field: &str) -> Vec<(String, String)> {
+    field
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .flat_map(parse_attendee_part)
+        .collect()
+}
+
+/// One `;`-separated part of `parse_attendee_pairs`'s input — see that
+/// function's doc comment for the `<...>`-wrapped vs. bare-address shapes.
+fn parse_attendee_part(part: &str) -> Vec<(String, String)> {
+    if let (Some(open), Some(close)) = (part.find('<'), part.rfind('>')) {
+        if open < close {
+            return vec![(
+                part[..open].trim().to_string(),
+                part[open + 1..close].trim().to_string(),
+            )];
+        }
+    }
+    part.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|addr| (String::new(), addr.to_string()))
+        .collect()
 }
 
 /// Builds the initial body HTML for a new message: empty when the signature is
@@ -3417,5 +3516,114 @@ pub(crate) mod tests {
         app.open_edit_event();
 
         assert!(app.event_form.is_none()); // refused
+    }
+
+    #[test]
+    fn saving_a_new_event_form_creates_and_enqueues_create_event() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "Planning".into();
+            f.start = "2026-07-20 14:00".into();
+            f.end = "2026-07-20 15:00".into();
+        }
+        app.save_event_form();
+        assert!(app.event_form.is_none()); // form closed on success
+        // a CreateEvent was enqueued and a local event exists
+        let cmd = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(cmd, Ok(SyncCommand::CreateEvent { .. })));
+    }
+
+    #[test]
+    fn saving_with_an_invalid_time_keeps_the_form_open() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "X".into();
+            f.start = "nonsense".into();
+        }
+        app.save_event_form();
+        assert!(app.event_form.is_some()); // still open — invalid start
+    }
+
+    /// SEAM 1: editing a not-yet-synced `local:` event must NOT enqueue an
+    /// `UpdateEvent` — that event still has a pending `CreateEvent` op in the
+    /// outbox from when it was first saved, and that op reads
+    /// `Store::event_for_send` at drain time, so it already carries whatever
+    /// this edit just wrote. Enqueuing `UpdateEvent` too would race it: if
+    /// the `CreateEvent` drains first, it reconciles `local:X` to the real
+    /// Graph id, and an `UpdateEvent{id: local:X}` sent after that finds no
+    /// such row anymore. See `App::save_event_form`'s doc comment.
+    #[test]
+    fn editing_a_local_not_yet_synced_event_enqueues_no_update_event() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "Planning".into();
+            f.start = "2026-07-20 14:00".into();
+            f.end = "2026-07-20 15:00".into();
+        }
+        app.save_event_form();
+
+        // Drain the CreateEvent the initial save enqueued, and capture the
+        // `local:` id it was for.
+        let id = match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::CreateEvent { id }) => id,
+            other => panic!("expected CreateEvent, got {other:?}"),
+        };
+        assert!(id.starts_with("local:"));
+
+        // Edit that same still-not-yet-synced event.
+        app.selected_event = Some(id.clone());
+        app.open_edit_event();
+        assert!(app.event_form.is_some());
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "Planning v2".into();
+        }
+        app.save_event_form();
+
+        // The fields were written to the store locally...
+        let send = app.store.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(send.subject, "Planning v2");
+        // ...but nothing further was enqueued: no second CreateEvent and,
+        // crucially, no UpdateEvent — only `update_event_fields` ran.
+        let mut leftover = Vec::new();
+        while let Ok(cmd) = app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            leftover.push(cmd);
+        }
+        assert!(
+            leftover.is_empty(),
+            "expected no SyncCommand from editing a local: event, got {leftover:?}"
+        );
+    }
+
+    /// SEAM 2: `open_edit_event` loads the PLAIN TEXT of the stored HTML body
+    /// (not the raw HTML source) into the form, so `save_event_form`'s
+    /// `escape_html(&form.body)` round-trips without double-escaping. Before
+    /// this fix, editing an event with an HTML body and re-saving it
+    /// unchanged would turn `<p>agenda</p>` into `&lt;p&gt;agenda&lt;/p&gt;`.
+    #[test]
+    fn editing_an_event_with_an_html_body_round_trips_without_double_escaping() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        // seeded_event's body_html is "<p>agenda</p>".
+        app.store
+            .upsert_event(&seeded_event("e3", "Planning", 1, None))
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e3".into());
+
+        app.open_edit_event();
+        // The form must hold the PLAIN TEXT, not the raw HTML source.
+        assert_eq!(app.event_form.as_ref().unwrap().body, "agenda");
+
+        // Re-save unchanged.
+        app.save_event_form();
+
+        let send = app.store.event_for_send("e3").unwrap().unwrap();
+        assert_eq!(send.body_html, "agenda"); // stable — not "&lt;p&gt;agenda&lt;/p&gt;"
     }
 }
