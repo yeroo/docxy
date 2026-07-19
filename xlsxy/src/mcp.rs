@@ -61,6 +61,7 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_pivots" => "pivot.list",
         "xlsxy_format" => "cell.format",
         "xlsxy_col_width" => "col.width",
+        "xlsxy_pivot_create" => "pivot.create",
         _ => return None,
     })
 }
@@ -544,6 +545,70 @@ fn tool_defs() -> Json {
             ],
             &["col", "width"],
         ),
+        tool(
+            "xlsxy_pivot_create",
+            "Create a REAL, persistent pivot table on a new sheet (first row of `range` = header \
+             names) — unlike `xlsxy_pivot`, this mutates the workbook: the pivot participates in \
+             `xlsxy_pivots` and its output is refreshed by `xlsxy_recalc`. Clears undo history \
+             like adding a sheet (an agent-level undo must remove both the created sheet and the \
+             pivot registration).",
+            vec![
+                (
+                    "range",
+                    prop(
+                        "string",
+                        "A1-style range, e.g. \"A1:D100\", first row = headers.",
+                    ),
+                ),
+                (
+                    "rows",
+                    prop_array(
+                        item_ty("string"),
+                        "Header names to group by, as pivot rows.",
+                    ),
+                ),
+                (
+                    "cols",
+                    prop_array(
+                        item_ty("string"),
+                        "Header names to group by, as pivot columns.",
+                    ),
+                ),
+                (
+                    "values",
+                    prop_array(
+                        item_obj(
+                            vec![
+                                (
+                                    "col",
+                                    prop("string", "Header name of the column to aggregate."),
+                                ),
+                                (
+                                    "agg",
+                                    prop(
+                                        "string",
+                                        "Aggregation: sum, count, countNums, average, max, min, \
+                                         product, stdDev, stdDevP, var, or varP.",
+                                    ),
+                                ),
+                            ],
+                            &["col", "agg"],
+                        ),
+                        "Measures to compute, each a {col, agg} pair.",
+                    ),
+                ),
+                (
+                    "name",
+                    prop(
+                        "string",
+                        "Destination sheet name for the pivot output (default: PivotN).",
+                    ),
+                ),
+                sheet(),
+                target(),
+            ],
+            &["range", "rows", "values"],
+        ),
     ])
 }
 
@@ -646,12 +711,14 @@ mod tests {
             // Wave-2: appended last, same relative order everywhere.
             "xlsxy_format",
             "xlsxy_col_width",
+            // Wave-3: appended last, same relative order everywhere.
+            "xlsxy_pivot_create",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -700,6 +767,11 @@ mod tests {
         assert_eq!(required_of("xlsxy_pivots"), "[]");
         assert_eq!(required_of("xlsxy_format"), "[\"range\",\"patch\"]");
         assert_eq!(required_of("xlsxy_col_width"), "[\"col\",\"width\"]");
+        // Matches xlsxy_pivot's actual required set exactly (cols/name/sheet optional).
+        assert_eq!(
+            required_of("xlsxy_pivot_create"),
+            "[\"range\",\"rows\",\"values\"]"
+        );
     }
 
     #[test]
@@ -746,6 +818,43 @@ mod tests {
         assert_eq!(
             item.get("required").unwrap().to_string(),
             "[\"col\",\"agg\"]"
+        );
+    }
+
+    /// Wave-3: `xlsxy_pivot_create`'s arg shape mirrors `xlsxy_pivot`'s
+    /// (range/rows/cols/values with the same nested shapes) plus an
+    /// additional optional `name` string.
+    #[test]
+    fn xlsxy_pivot_create_mirrors_xlsxy_pivot_plus_name() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let props_of = |name: &str| -> Json {
+            tools
+                .iter()
+                .find(|t| t.get_str("name") == Some(name))
+                .unwrap()
+                .get("inputSchema")
+                .unwrap()
+                .get("properties")
+                .unwrap()
+                .clone()
+        };
+        let pivot_props = props_of("xlsxy_pivot");
+        let create_props = props_of("xlsxy_pivot_create");
+        for key in ["range", "rows", "cols", "values", "sheet", "target"] {
+            assert_eq!(
+                pivot_props.get(key).unwrap().to_string(),
+                create_props.get(key).unwrap().to_string(),
+                "xlsxy_pivot_create.{key} must mirror xlsxy_pivot.{key} exactly"
+            );
+        }
+        let name_prop = create_props
+            .get("name")
+            .expect("xlsxy_pivot_create missing 'name' prop");
+        assert_eq!(name_prop.get_str("type"), Some("string"));
+        assert_eq!(
+            name_prop.get_str("description"),
+            Some("Destination sheet name for the pivot output (default: PivotN).")
         );
     }
 
@@ -849,6 +958,7 @@ mod tests {
         ("xlsxy_pivots", "pivot.list"),
         ("xlsxy_format", "cell.format"),
         ("xlsxy_col_width", "col.width"),
+        ("xlsxy_pivot_create", "pivot.create"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

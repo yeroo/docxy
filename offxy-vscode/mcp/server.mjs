@@ -504,6 +504,63 @@ function docxyToolDefs() {
       Object.fromEntries([target()]),
       [],
     ),
+    tool(
+      'docxy_format',
+      'Apply character formatting to every run in a block range — bold/italic/underline/strike ' +
+        'are set directly (not toggled), plus color/highlight/font/size. One undo checkpoint.',
+      Object.fromEntries([
+        ['start', prop('integer', 'First block index to format.')],
+        ['end', prop('integer', 'Last block index, inclusive (default: start).')],
+        [
+          'patch',
+          propObj(
+            Object.fromEntries([
+              ['bold', prop('boolean', 'Bold on/off (set directly, not toggled).')],
+              ['italic', prop('boolean', 'Italic on/off (set directly, not toggled).')],
+              ['underline', prop('boolean', 'Underline on/off (set directly, not toggled).')],
+              ['strike', prop('boolean', 'Strikethrough on/off (set directly, not toggled).')],
+              ['color', prop('string', 'Font color as "#RRGGBB".')],
+              [
+                'highlight',
+                prop(
+                  'string',
+                  'Highlight color: one of yellow, green, cyan, magenta, red, blue, lightGray, ' +
+                    'darkYellow, or "none" to clear.',
+                ),
+              ],
+              ['font', prop('string', 'Font name.')],
+              ['size', prop('number', 'Font size in points (fractional allowed).')],
+            ]),
+            [],
+            'Formatting to apply — at least one key required; an unknown key errors naming ' +
+              "it. Keys absent from the patch leave that aspect of each run's existing " +
+              'formatting untouched.',
+          ),
+        ],
+        target(),
+      ]),
+      ['start', 'patch'],
+    ),
+    tool(
+      'docxy_set_style',
+      'Set a paragraph style and/or alignment over a block range. At least one of ' +
+        "`style`/`align` is required. One undo checkpoint.",
+      Object.fromEntries([
+        ['start', prop('integer', 'First block index to style.')],
+        ['end', prop('integer', 'Last block index, inclusive (default: start).')],
+        [
+          'style',
+          prop(
+            'string',
+            'Paragraph style id: Heading1, Heading2, Heading3, Heading4, Heading5, Heading6, ' +
+              'Quote, SourceCode, or "Normal" to clear to the default style.',
+          ),
+        ],
+        ['align', prop('string', 'Horizontal alignment: "left", "center", "right", or "justify".')],
+        target(),
+      ]),
+      ['start'],
+    ),
   ];
 }
 
@@ -844,6 +901,43 @@ function xlsxyToolDefs() {
       ]),
       ['col', 'width'],
     ),
+    tool(
+      'xlsxy_pivot_create',
+      'Create a REAL, persistent pivot table on a new sheet (first row of `range` = header ' +
+        "names) — unlike `xlsxy_pivot`, this mutates the workbook: the pivot participates in " +
+        "`xlsxy_pivots` and its output is refreshed by `xlsxy_recalc`. Clears undo history " +
+        'like adding a sheet (an agent-level undo must remove both the created sheet and the ' +
+        'pivot registration).',
+      Object.fromEntries([
+        ['range', prop('string', 'A1-style range, e.g. "A1:D100", first row = headers.')],
+        ['rows', propArray(itemTy('string'), 'Header names to group by, as pivot rows.')],
+        ['cols', propArray(itemTy('string'), 'Header names to group by, as pivot columns.')],
+        [
+          'values',
+          propArray(
+            itemObj(
+              Object.fromEntries([
+                ['col', prop('string', 'Header name of the column to aggregate.')],
+                [
+                  'agg',
+                  prop(
+                    'string',
+                    'Aggregation: sum, count, countNums, average, max, min, ' +
+                      'product, stdDev, stdDevP, var, or varP.',
+                  ),
+                ],
+              ]),
+              ['col', 'agg'],
+            ),
+            'Measures to compute, each a {col, agg} pair.',
+          ),
+        ],
+        ['name', prop('string', 'Destination sheet name for the pivot output (default: PivotN).')],
+        sheet(),
+        target(),
+      ]),
+      ['range', 'rows', 'values'],
+    ),
   ];
 }
 
@@ -873,6 +967,8 @@ const DOCXY_VERBS = {
   docxy_replace_all: 'doc.replace-all',
   docxy_undo: 'doc.undo',
   docxy_redo: 'doc.redo',
+  docxy_format: 'doc.format',
+  docxy_set_style: 'doc.set-style',
 };
 
 const XLSXY_VERBS = {
@@ -906,6 +1002,7 @@ const XLSXY_VERBS = {
   xlsxy_pivots: 'pivot.list',
   xlsxy_format: 'cell.format',
   xlsxy_col_width: 'col.width',
+  xlsxy_pivot_create: 'pivot.create',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

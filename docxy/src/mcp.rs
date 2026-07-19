@@ -12,7 +12,7 @@
 use crate::control;
 use ctlcore::client;
 use ctlcore::json::Json;
-use ctlcore::mcp::{McpServer, prop, tool};
+use ctlcore::mcp::{McpServer, prop, prop_obj, tool};
 
 /// Serve MCP over stdio until stdin closes.
 pub fn run() -> std::io::Result<()> {
@@ -52,6 +52,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_replace_all" => "doc.replace-all",
         "docxy_undo" => "doc.undo",
         "docxy_redo" => "doc.redo",
+        "docxy_format" => "doc.format",
+        "docxy_set_style" => "doc.set-style",
         _ => return None,
     })
 }
@@ -97,8 +99,31 @@ pub(crate) fn blank_docx_bytes() -> Vec<u8> {
     docxcore::package::save_package(&docxcore::package::new_package(doc))
 }
 
+/// `doc.format`'s `patch.highlight` description, built from the actual
+/// [`docxcore::agent::HIGHLIGHT_NAMES`] enum (not re-derived by hand), so the
+/// accepted-name list can never drift from what `RunPatch::parse` really
+/// accepts. Copy this exact string into `server.mjs`'s mirror.
+fn highlight_desc() -> String {
+    format!(
+        "Highlight color: one of {}, or \"none\" to clear.",
+        docxcore::agent::HIGHLIGHT_NAMES.join(", ")
+    )
+}
+
+/// `doc.set-style`'s `style` description, built from the actual
+/// [`docxcore::agent::MARKDOWN_PARAGRAPH_STYLE_IDS`] set plus `Normal` (not
+/// re-derived by hand). Copy this exact string into `server.mjs`'s mirror.
+fn set_style_desc() -> String {
+    format!(
+        "Paragraph style id: {}, or \"Normal\" to clear to the default style.",
+        docxcore::agent::MARKDOWN_PARAGRAPH_STYLE_IDS.join(", ")
+    )
+}
+
 fn tool_defs() -> Json {
     let target = || ("target", prop("string", TARGET_DESC));
+    let highlight_desc = highlight_desc();
+    let set_style_desc = set_style_desc();
     Json::Arr(vec![
         tool(
             "docxy_list",
@@ -314,6 +339,79 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "docxy_format",
+            "Apply character formatting to every run in a block range — bold/italic/underline/strike \
+             are set directly (not toggled), plus color/highlight/font/size. One undo checkpoint.",
+            vec![
+                ("start", prop("integer", "First block index to format.")),
+                (
+                    "end",
+                    prop("integer", "Last block index, inclusive (default: start)."),
+                ),
+                (
+                    "patch",
+                    prop_obj(
+                        vec![
+                            (
+                                "bold",
+                                prop("boolean", "Bold on/off (set directly, not toggled)."),
+                            ),
+                            (
+                                "italic",
+                                prop("boolean", "Italic on/off (set directly, not toggled)."),
+                            ),
+                            (
+                                "underline",
+                                prop("boolean", "Underline on/off (set directly, not toggled)."),
+                            ),
+                            (
+                                "strike",
+                                prop(
+                                    "boolean",
+                                    "Strikethrough on/off (set directly, not toggled).",
+                                ),
+                            ),
+                            ("color", prop("string", "Font color as \"#RRGGBB\".")),
+                            ("highlight", prop("string", &highlight_desc)),
+                            ("font", prop("string", "Font name.")),
+                            (
+                                "size",
+                                prop("number", "Font size in points (fractional allowed)."),
+                            ),
+                        ],
+                        &[],
+                        "Formatting to apply — at least one key required; an unknown key errors \
+                         naming it. Keys absent from the patch leave that aspect of each run's \
+                         existing formatting untouched.",
+                    ),
+                ),
+                target(),
+            ],
+            &["start", "patch"],
+        ),
+        tool(
+            "docxy_set_style",
+            "Set a paragraph style and/or alignment over a block range. At least one of \
+             `style`/`align` is required. One undo checkpoint.",
+            vec![
+                ("start", prop("integer", "First block index to style.")),
+                (
+                    "end",
+                    prop("integer", "Last block index, inclusive (default: start)."),
+                ),
+                ("style", prop("string", &set_style_desc)),
+                (
+                    "align",
+                    prop(
+                        "string",
+                        "Horizontal alignment: \"left\", \"center\", \"right\", or \"justify\".",
+                    ),
+                ),
+                target(),
+            ],
+            &["start"],
+        ),
     ])
 }
 
@@ -407,12 +505,15 @@ mod tests {
             "docxy_replace_all",
             "docxy_undo",
             "docxy_redo",
+            // Wave-3: appended last, same relative order everywhere.
+            "docxy_format",
+            "docxy_set_style",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1 tools must be appended right after docxy_save, in this order"
+            "wave-1/wave-3 tools must be appended right after docxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -448,6 +549,8 @@ mod tests {
         assert_eq!(required_of("docxy_replace_all"), "[\"query\",\"text\"]");
         assert_eq!(required_of("docxy_undo"), "[]");
         assert_eq!(required_of("docxy_redo"), "[]");
+        assert_eq!(required_of("docxy_format"), "[\"start\",\"patch\"]");
+        assert_eq!(required_of("docxy_set_style"), "[\"start\"]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -489,6 +592,98 @@ mod tests {
         }
     }
 
+    /// Wave-3: `docxy_format.patch` is an object schema with the eight
+    /// optional typed properties (all described), and no required keys of
+    /// its own (the tool-level `required` covers `start`/`patch`).
+    #[test]
+    fn docxy_format_patch_schema_has_the_eight_optional_typed_properties() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let patch_schema = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("docxy_format"))
+            .unwrap()
+            .get("inputSchema")
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .get("patch")
+            .unwrap()
+            .clone();
+        assert_eq!(patch_schema.get_str("type"), Some("object"));
+        assert!(patch_schema.get_str("description").is_some());
+        assert_eq!(patch_schema.get("required").unwrap().to_string(), "[]");
+        let props = patch_schema.get("properties").unwrap();
+        let expected_types = [
+            ("bold", "boolean"),
+            ("italic", "boolean"),
+            ("underline", "boolean"),
+            ("strike", "boolean"),
+            ("color", "string"),
+            ("highlight", "string"),
+            ("font", "string"),
+            ("size", "number"),
+        ];
+        for (key, ty) in expected_types {
+            let p = props
+                .get(key)
+                .unwrap_or_else(|| panic!("patch missing key {key}"));
+            assert_eq!(p.get_str("type"), Some(ty), "wrong type for patch.{key}");
+            assert!(
+                p.get_str("description").is_some(),
+                "patch.{key} missing description"
+            );
+        }
+        // The highlight description lists every accepted name from the
+        // actual core enum, not a hand-typed copy that could drift.
+        let highlight_desc = props
+            .get("highlight")
+            .unwrap()
+            .get_str("description")
+            .unwrap();
+        for name in docxcore::agent::HIGHLIGHT_NAMES {
+            assert!(
+                highlight_desc.contains(name),
+                "highlight description missing '{name}': {highlight_desc}"
+            );
+        }
+        assert!(highlight_desc.contains("none"), "{highlight_desc}");
+    }
+
+    /// Wave-3: `docxy_set_style`'s `style` prop lists every accepted
+    /// paragraph style id (from the actual core set) plus `Normal`; `align`
+    /// lists left/center/right/justify; the tool description states the
+    /// ≥1-of-style/align rule (required is `["start"]` only — JSON Schema's
+    /// flat `required` can't express "at least one of").
+    #[test]
+    fn docxy_set_style_lists_accepted_style_ids_and_align_values() {
+        let defs = tool_defs();
+        let tools = defs.as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t.get_str("name") == Some("docxy_set_style"))
+            .unwrap();
+        let desc = tool.get_str("description").unwrap();
+        assert!(desc.contains("style"), "{desc}");
+        assert!(desc.contains("align"), "{desc}");
+        let props = tool.get("inputSchema").unwrap().get("properties").unwrap();
+        let style_desc = props.get("style").unwrap().get_str("description").unwrap();
+        for id in docxcore::agent::MARKDOWN_PARAGRAPH_STYLE_IDS {
+            assert!(
+                style_desc.contains(id),
+                "style description missing '{id}': {style_desc}"
+            );
+        }
+        assert!(style_desc.contains("Normal"), "{style_desc}");
+        let align_desc = props.get("align").unwrap().get_str("description").unwrap();
+        for v in ["left", "center", "right", "justify"] {
+            assert!(
+                align_desc.contains(v),
+                "align description missing '{v}': {align_desc}"
+            );
+        }
+    }
+
     /// Every forwarding tool → its exact spec verb string, pre-existing tools
     /// included (cheap, and it pins the whole surface, not just wave-1).
     const VERB_TABLE: &[(&str, &str)] = &[
@@ -511,6 +706,8 @@ mod tests {
         ("docxy_replace_all", "doc.replace-all"),
         ("docxy_undo", "doc.undo"),
         ("docxy_redo", "doc.redo"),
+        ("docxy_format", "doc.format"),
+        ("docxy_set_style", "doc.set-style"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
