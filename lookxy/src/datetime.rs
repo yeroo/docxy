@@ -44,8 +44,11 @@ fn to_utc_iso(t: LocalDateTime, offset_min: i64) -> String {
     )
 }
 
-/// UTC ISO → local instant (for the End field's `+rel` base).
-fn utc_iso_to_local(utc: &str, offset_min: i64) -> Option<LocalDateTime> {
+/// UTC ISO → local instant (for the End field's `+rel` base, and — now
+/// `pub(crate)` rather than private — for `App::open_edit_event`'s
+/// UTC→local conversion of a stored event's `start_utc`/`end_utc` into the
+/// form's display text; see `format_local`).
+pub(crate) fn utc_iso_to_local(utc: &str, offset_min: i64) -> Option<LocalDateTime> {
     // YYYY-MM-DDTHH:MM:SSZ
     let (date, rest) = utc.split_once('T')?;
     let (y, m, d) = parse_ymd(date)?;
@@ -190,6 +193,35 @@ fn parse_relative_minutes(s: &str) -> Option<i64> {
         "d" | "D" => Some(n * 1440),
         _ => None,
     }
+}
+
+/// Formats a local instant as the event form's display text (`YYYY-MM-DD
+/// HH:MM`) — the inverse direction of what `parse_start`/`parse_end` accept
+/// as input. Used by `App::open_new_event` (formatting the prefilled
+/// Start/End) and `App::open_edit_event` (formatting a stored event's
+/// UTC→local Start/End via `utc_iso_to_local`).
+///
+/// Both call sites are methods not yet bound to a key (Task 7 wires `c`/`e`
+/// in Calendar mode); `cfg_attr` silences `dead_code` only outside tests,
+/// same pattern as `parse_start`/`parse_end` below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_local(t: LocalDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        t.year, t.month, t.day, t.hour, t.min
+    )
+}
+
+/// Adds `minutes` to a local instant, handling hour/day/month/year rollover
+/// via the same `to_epoch_min`/`from_epoch_min` day-count math every other
+/// conversion in this module uses. Used by `App::open_new_event` to compute
+/// the End prefill (Start + 1h) from whatever Start was rounded to.
+///
+/// See `format_local`'s doc comment for the same "not yet wired" `cfg_attr`
+/// note.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn add_minutes(t: LocalDateTime, minutes: i64) -> LocalDateTime {
+    from_epoch_min(to_epoch_min(t) + minutes)
 }
 
 /// Not yet called from production code — a later task's create/edit-event

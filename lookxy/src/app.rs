@@ -191,6 +191,12 @@ pub struct App {
     /// message being composed), if any — see `ui::filepicker`. `Some` takes
     /// keys ahead of the compose view it's drawn over (see `ui::handle_key`).
     pub file_picker: Option<crate::ui::filepicker::FilePicker>,
+    /// The open create/edit event form (`c`/`e` in Calendar mode — bound in a
+    /// later task alongside this module's own key handling), if any — see
+    /// `ui::eventform`. `Some` is drawn as an overlay over the calendar
+    /// (`ui::draw`'s Calendar branch); populated by `open_new_event`/
+    /// `open_edit_event`, cleared by `save_event_form`/Esc (later tasks).
+    pub event_form: Option<crate::ui::eventform::EventForm>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -341,6 +347,7 @@ impl App {
             rsvp_prompt: None,
             confirm: None,
             file_picker: None,
+            event_form: None,
         };
         app.reload_folders();
         app.reload_account();
@@ -780,6 +787,107 @@ impl App {
             .sync
             .cmd_tx
             .send(SyncCommand::RespondEvent { id, kind, comment });
+    }
+
+    // --- Event form: open new/edit -----------------------------------------
+
+    /// `c` in Calendar mode: opens a blank event form. Start/End are
+    /// prefilled in LOCAL time — Start to the next full hour, End to +1h
+    /// after it — via `local_now`/`datetime::add_minutes`/
+    /// `datetime::format_local`; nothing is written to the store, and
+    /// `datetime::parse_start`/`parse_end` (Task 7's save) re-parse this same
+    /// display text on Ctrl-Enter.
+    ///
+    /// Not yet bound to a key — Task 7 wires `c` (Calendar mode) to call
+    /// this; `cfg_attr` silences `dead_code` only outside tests, same
+    /// pattern already used for `datetime::parse_start`/`Compose::new`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_new_event(&mut self) {
+        let now = local_now();
+        // Round up to the next full hour: if already exactly on the hour,
+        // stays put; otherwise advances into the next one (`add_minutes`
+        // handles the hour/day/month rollover via its epoch-minute math).
+        let minutes_to_next_hour = if now.min == 0 { 0 } else { 60 - now.min as i64 };
+        let start_dt = crate::datetime::add_minutes(now, minutes_to_next_hour);
+        let end_dt = crate::datetime::add_minutes(start_dt, 60);
+        self.event_form = Some(crate::ui::eventform::EventForm {
+            editing_id: None,
+            title: String::new(),
+            start: crate::datetime::format_local(start_dt),
+            end: crate::datetime::format_local(end_dt),
+            all_day: false,
+            location: String::new(),
+            attendees: String::new(),
+            body: String::new(),
+            focus: crate::ui::eventform::EventField::Title,
+            autocomplete: None,
+            error: None,
+        });
+    }
+
+    /// `e` in Calendar mode: opens the event form prefilled from
+    /// `self.selected_event` (falling back to the highlighted agenda row if
+    /// nothing's been opened into the detail pane yet) for editing. Refused —
+    /// a status notice instead of opening the form — when the event is part
+    /// of a recurring series (`series_master_id.is_some()`): recurring events
+    /// stay read + RSVP only (see the calendar-edit design spec). A no-op if
+    /// nothing is selected/highlighted, the resolved id isn't in the
+    /// currently-loaded `agenda` window, or `event_for_send` has nothing for
+    /// it (a stale/foreign id).
+    ///
+    /// Not yet bound to a key — Task 7 wires `e` (Calendar mode) to call
+    /// this; see `open_new_event`'s doc comment for the same "not yet wired"
+    /// `cfg_attr` note.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_edit_event(&mut self) {
+        let Some(id) = self
+            .selected_event
+            .clone()
+            .or_else(|| self.highlighted_event_id())
+        else {
+            return;
+        };
+        let Some(row) = self.agenda.iter().find(|e| e.id == id) else {
+            return;
+        };
+        if row.series_master_id.is_some() {
+            self.error_notice = Some("Recurring events can't be edited here.".to_string());
+            return;
+        }
+        let Ok(Some(send)) = self.store.event_for_send(&id) else {
+            return;
+        };
+        let attendees = self.store.event_attendees(&id).unwrap_or_default();
+        let offset = crate::ui::calendar::local_offset_minutes();
+        let start = crate::datetime::utc_iso_to_local(&send.start_utc, offset)
+            .map(crate::datetime::format_local)
+            .unwrap_or_default();
+        let end = crate::datetime::utc_iso_to_local(&send.end_utc, offset)
+            .map(crate::datetime::format_local)
+            .unwrap_or_default();
+        let attendees_text = attendees
+            .into_iter()
+            .map(|a| format!("{} <{}>", a.name, a.addr))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.event_form = Some(crate::ui::eventform::EventForm {
+            editing_id: Some(id),
+            title: send.subject,
+            start,
+            end,
+            all_day: send.is_all_day,
+            location: send.location,
+            attendees: attendees_text,
+            // Raw stored HTML, not stripped to plain text — a known
+            // simplification; Task 7's save re-escapes whatever's typed here
+            // as plain text, so an edited event's body round-trips through
+            // literal HTML source rather than rendered text until a later
+            // task adds proper HTML↔plain-text conversion for this field.
+            body: send.body_html,
+            focus: crate::ui::eventform::EventField::Title,
+            autocomplete: None,
+            error: None,
+        });
     }
 
     // --- Triage actions ---------------------------------------------------
@@ -1852,6 +1960,34 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         "attachment".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+/// The current wall-clock instant as local time — `ui::calendar::local_offset_minutes`
+/// (the same system offset the agenda itself renders with) applied to
+/// `SystemTime::now()`, then re-derived into calendar fields via
+/// `ui::calendar::civil_from_days`. `open_new_event`'s prefill seed (and
+/// `save_event_form`'s, in a later task).
+///
+/// Only called from `open_new_event` so far, which is itself not yet bound
+/// to a key (see its doc comment); `cfg_attr` silences `dead_code` only
+/// outside tests for the same reason.
+#[cfg_attr(not(test), allow(dead_code))]
+fn local_now() -> crate::datetime::LocalDateTime {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let local_secs = secs + crate::ui::calendar::local_offset_minutes() * 60;
+    let days = local_secs.div_euclid(86_400);
+    let rem = local_secs.rem_euclid(86_400);
+    let (year, month, day) = crate::ui::calendar::civil_from_days(days);
+    crate::datetime::LocalDateTime {
+        year,
+        month,
+        day,
+        hour: (rem / 3600) as u32,
+        min: ((rem % 3600) / 60) as u32,
     }
 }
 
@@ -3181,5 +3317,105 @@ pub(crate) mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    // --- Event form: open new/edit ------------------------------------------
+
+    /// `secs` seconds since the Unix epoch, formatted as the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ` — a local copy of `ui::calendar::unix_to_iso8601`
+    /// (private to that module) built on the now-`pub(crate)` `civil_from_days`.
+    fn unix_secs_to_iso(secs: i64) -> String {
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (y, m, d) = crate::ui::calendar::civil_from_days(days);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
+    }
+
+    /// A 30-minute event `days_offset` days from the real "now" (at noon UTC,
+    /// deliberately far from any local midnight rollover), for
+    /// `App::reload_agenda` tests — same "anchor at the actual clock" shape
+    /// as `ui::calendar`'s own `days_from_now` test helper (private to that
+    /// module, so kept as its own copy here).
+    fn seeded_event(
+        id: &str,
+        subject: &str,
+        days_offset: i64,
+        series_master_id: Option<String>,
+    ) -> mailcore::store::NewEvent {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let start_secs = now + days_offset * 86_400 + 12 * 3600;
+        let end_secs = start_secs + 1_800;
+        mailcore::store::NewEvent {
+            id: id.into(),
+            subject: subject.into(),
+            start_utc: unix_secs_to_iso(start_secs),
+            end_utc: unix_secs_to_iso(end_secs),
+            is_all_day: false,
+            location: "Room 1".into(),
+            organizer_name: "Boss".into(),
+            organizer_addr: "boss@example.com".into(),
+            response_status: "accepted".into(),
+            series_master_id,
+            body_preview: "".into(),
+            web_link: "".into(),
+            last_modified: "2020-01-01T00:00:00Z".into(),
+            body_html: "<p>agenda</p>".into(),
+        }
+    }
+
+    #[test]
+    fn open_new_event_starts_a_blank_form_with_prefilled_times() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        let f = app.event_form.as_ref().unwrap();
+        assert!(f.editing_id.is_none());
+        assert!(f.title.is_empty());
+        assert!(!f.start.is_empty() && !f.end.is_empty()); // prefilled (next hour / +1h)
+    }
+
+    #[test]
+    fn open_edit_event_prefills_from_the_selected_event() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.store
+            .upsert_event(&seeded_event("e1", "Standup", 1, None))
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e1".into());
+
+        app.open_edit_event();
+
+        let f = app.event_form.as_ref().unwrap();
+        assert_eq!(f.editing_id.as_deref(), Some("e1"));
+        assert_eq!(f.title, "Standup");
+    }
+
+    #[test]
+    fn open_edit_event_refuses_a_recurring_event() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.store
+            .upsert_event(&seeded_event(
+                "e2",
+                "Weekly Sync",
+                1,
+                Some("SERIES1".into()),
+            ))
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e2".into());
+
+        app.open_edit_event();
+
+        assert!(app.event_form.is_none()); // refused
     }
 }

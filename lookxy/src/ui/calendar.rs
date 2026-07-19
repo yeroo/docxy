@@ -491,8 +491,13 @@ fn to_local(iso_utc: &str) -> LocalDateTime {
 /// own zone. lookxy is Windows-only in practice (see `App::lookxy_dir`'s
 /// `%LOCALAPPDATA%` path); off Windows this is a fixed `0` (UTC) fallback so
 /// the crate still builds/tests elsewhere.
+///
+/// `pub(crate)` (was private) so `App::open_new_event`/`open_edit_event` (the
+/// event form's "now"/prefill and UTC→local display conversion) can reuse the
+/// exact same offset the agenda itself renders with, rather than duplicating
+/// the Win32 call.
 #[cfg(windows)]
-fn local_offset_minutes() -> i64 {
+pub(crate) fn local_offset_minutes() -> i64 {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct WinSystemTime {
@@ -546,7 +551,7 @@ fn local_offset_minutes() -> i64 {
 }
 
 #[cfg(not(windows))]
-fn local_offset_minutes() -> i64 {
+pub(crate) fn local_offset_minutes() -> i64 {
     0
 }
 
@@ -652,6 +657,7 @@ mod tests {
             organizer_name: "".into(),
             organizer_addr: "".into(),
             response_status: "none".into(),
+            series_master_id: None,
         }
     }
 

@@ -279,7 +279,12 @@ pub struct OutboxRow {
     pub attempts: i64,
 }
 
-/// An `events` row, as read back from the store.
+/// An `events` row, as read back from the store. `series_master_id` is
+/// `Some` when the event is an occurrence of a recurring series — lookxy's
+/// `App::open_edit_event`/`delete_selected_event` refuse to edit/delete those
+/// (recurring events stay read + RSVP only; see the calendar-edit design
+/// spec), so the flag has to travel with every row the agenda holds, not just
+/// `event_for_send`'s single-event read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRow {
     pub id: String,
@@ -291,6 +296,7 @@ pub struct EventRow {
     pub organizer_name: String,
     pub organizer_addr: String,
     pub response_status: String,
+    pub series_master_id: Option<String>,
 }
 
 /// An `event_attendees` row, as read back from the store.
@@ -304,10 +310,10 @@ pub struct AttendeeRow {
 
 /// The field set `upsert_event` writes to an `events` row.
 ///
-/// Same field set as `EventRow` plus the extra columns (`series_master_id`,
-/// `body_preview`, `web_link`, `last_modified`, `body_html`) that `EventRow`
-/// doesn't surface. `graph::model::Event` (Task 2) turned out to be a
-/// field-for-field superset of this (it additionally carries `attendees`),
+/// Same field set as `EventRow` plus the extra columns (`body_preview`,
+/// `web_link`, `last_modified`, `body_html`) that `EventRow` doesn't surface.
+/// `graph::model::Event` (Task 2) turned out to be a field-for-field
+/// superset of this (it additionally carries `attendees`),
 /// so rather than folding `NewEvent` away, the sync engine bridges the two
 /// via the `From<&Event> for NewEvent` conversion below — a straight
 /// per-field copy the engine runs for every event `calendar_view` returns.
@@ -1344,7 +1350,7 @@ impl Store {
     ) -> Result<Vec<EventRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, start_utc, end_utc, is_all_day, location,
-                    organizer_name, organizer_addr, response_status
+                    organizer_name, organizer_addr, response_status, series_master_id
              FROM events
              WHERE start_utc < ?2 AND end_utc > ?1
              ORDER BY start_utc ASC",
@@ -1361,6 +1367,7 @@ impl Store {
                     organizer_name: row.get(6)?,
                     organizer_addr: row.get(7)?,
                     response_status: row.get(8)?,
+                    series_master_id: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

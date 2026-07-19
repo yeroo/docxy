@@ -7,6 +7,7 @@
 mod attachments;
 pub(crate) mod calendar;
 pub(crate) mod compose;
+pub mod eventform;
 pub mod filepicker;
 mod folders;
 mod message_list;
@@ -39,6 +40,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     if app.mode == Mode::Calendar {
         calendar::draw_calendar(f, app);
+        // The create/edit event form (`c`/`e` — wired in a later task) is an
+        // overlay on top of the calendar, not a full-screen mode like
+        // compose — same "no-op unless open" shape as `eventform::draw`'s
+        // own doc comment describes.
+        eventform::draw(f, app);
         return;
     }
 
