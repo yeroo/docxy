@@ -9,8 +9,8 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, Message, OofStatus,
-    Person, Recipient, plain_to_html,
+    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, MasterCategory, Message,
+    OofStatus, Person, Recipient, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -489,6 +489,29 @@ impl GraphClient {
             .and_then(|e| e.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string))
+    }
+
+    /// GET `/me/outlook/masterCategories` — the mailbox's master category list.
+    pub fn get_master_categories(&self) -> Result<Vec<MasterCategory>, GraphError> {
+        let resp = self.send(Method::Get, "/me/outlook/masterCategories", None, &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?;
+        Ok(items.iter().filter_map(MasterCategory::from_json).collect())
+    }
+
+    /// PATCH `/me/messages/{id}` with `{"categories": [ …names… ]}` — sets the
+    /// message's assigned category names (an empty slice clears them).
+    pub fn set_message_categories(
+        &self,
+        id: &str,
+        categories: &[String],
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/messages/{id}");
+        let arr = Value::Array(categories.iter().map(|c| Value::Str(c.clone())).collect());
+        let body = Value::Object(vec![("categories".to_string(), arr)]).to_string();
+        self.send(Method::Patch, &path, Some(body), &[])?;
+        Ok(())
     }
 
     /// GET `/me/mailboxSettings` and parse its `automaticRepliesSetting` into
@@ -1772,6 +1795,42 @@ mod tests {
             c.calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z"),
             Err(GraphError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn get_master_categories_parses_value_array() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/outlook/masterCategories".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[{"id":"c1","displayName":"Work","color":"preset0"},{"id":"c2","displayName":"Urgent","color":"preset1"}]}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let cats = c.get_master_categories().unwrap();
+        assert_eq!(cats.len(), 2);
+        assert_eq!(cats[0].display_name, "Work");
+        assert_eq!(cats[1].color, "preset1");
+    }
+
+    #[test]
+    fn set_message_categories_patches_array() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.set_message_categories("M1", &["Work".to_string(), "Urgent".to_string()])
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let arr = sent.get("categories").and_then(Value::as_array).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("Work"));
     }
 
     #[test]
