@@ -3321,6 +3321,60 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_a_pivots_output_after_its_source_sheet_is_removed_skips_gracefully() {
+        // Wave-3 Task 4's mandatory regression test: removing a pivot's
+        // SOURCE sheet (its OWN output sheet survives, unlike the cascade
+        // tests above) must leave the pivot registration in place — merely
+        // stale, pointing at source data that no longer exists — and a
+        // subsequent refresh (the `wb.recalc` path) must skip it gracefully
+        // rather than panicking on the now-dangling `PivotSource::Range`
+        // sheet name.
+        use crate::pivot::refresh_pivots;
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        pkg.create_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 4, 2),
+            },
+            &frame,
+            &spec,
+            "Pivot1",
+        )
+        .expect("create_pivot");
+        assert_eq!(pkg.workbook.pivots[0].sheet, 1, "Pivot1 is sheet index 1");
+
+        // Remove sheet 0 (Sheet1 — the pivot's SOURCE, not its own output
+        // sheet). The pivot's own sheet (now index 0) survives.
+        assert!(pkg.remove_sheet(0));
+        assert_eq!(
+            pkg.workbook.pivots.len(),
+            1,
+            "pivot.list must still report the pivot — it's stale, not gone"
+        );
+        assert_eq!(pkg.workbook.sheets.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].name, "Pivot1");
+
+        // Refresh (the wb.recalc path) must not panic, and must skip this
+        // pivot gracefully rather than crash resolving its now-nonexistent
+        // "Sheet1" source.
+        let outcome = refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.changed.is_empty());
+        // The pivot registration is still there afterward (stale, not
+        // dropped by the failed refresh attempt).
+        assert_eq!(pkg.workbook.pivots.len(), 1);
+    }
+
+    #[test]
     fn dimension_is_updated() {
         let mut pkg = load_xlsx(&fixture()).expect("load");
         pkg.workbook.sheets[0].set_cell(99, 25, Cell::number(1.0));

@@ -82,6 +82,17 @@ struct RemovedSheetStash {
     /// removal — mirrors `sheet.remove`'s own viewport-reset rule, in
     /// reverse, on restore (see `ctl_sheet_restore_removed`).
     removed_active: bool,
+    /// Every pivot whose output lived on the removed sheet (`.sheet ==
+    /// removed_idx` — the SAME filter `SheetPackage::remove_sheet`'s own
+    /// cascade uses), captured before that cascade drops their OPC parts
+    /// and `workbook.pivots` entries. Wave-3 Task 4 review finding: Task
+    /// 3's `remove_sheet` cascade (added so `pivot.create`'s inverse is
+    /// "both or neither") silently broke this stash's own lossless-restore
+    /// contract for ANY workbook with pivots — a `sheet.remove` +
+    /// `sheet.restore-removed` round trip brought the sheet back WITHOUT
+    /// its pivot. Reconstituted on restore via `ctl_reregister_pivot`,
+    /// `.sheet` re-pointed at the restored sheet's NEW index.
+    pivots: Vec<gridcore::pivot::Pivot>,
 }
 
 /// A live editing session over one `.xlsx`.
@@ -674,6 +685,22 @@ impl Session {
             "find" => self.ctl_find(args),
             "wb.recalc" => {
                 self.engine.recalc_all(&mut self.pkg.workbook);
+                // Mirrors xlsxy control.rs's `wb.recalc` -> `App::recalc_and_refresh`:
+                // a plain engine recalc alone never touches pivot output —
+                // `refresh_pivots` recomputes each supported pivot from its
+                // (possibly just-edited) source range, then a follow-up
+                // targeted recalc propagates any resulting cell changes to
+                // formulas that read the pivot's output region. Skips
+                // gracefully (no crash, `out.skipped` counts it) when a
+                // pivot's source sheet has itself been removed — see
+                // gridcore's `refreshing_a_pivots_output_after_its_source_
+                // sheet_is_removed_skips_gracefully`.
+                let outcome = gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+                if !outcome.changed.is_empty() {
+                    self.engine
+                        .recalc_from(&mut self.pkg.workbook, &outcome.changed);
+                    self.dirty = true;
+                }
                 Ok("{\"recalculated\":true}".to_string())
             }
             "wb.info" => Ok(self.ctl_wb_info()),
@@ -693,6 +720,7 @@ impl Session {
             "sheet.stats" => self.ctl_sheet_stats(args),
             "chart.list" => Ok(self.ctl_chart_list()),
             "pivot.list" => Ok(self.ctl_pivot_list()),
+            "pivot.create" => self.ctl_pivot_create(args),
             "range.set" => self.ctl_range_set(args),
             "sheet.import-csv" => self.ctl_sheet_import_csv(args),
             "wb.replace-all" => self.ctl_wb_replace_all(args),
@@ -1100,7 +1128,7 @@ impl Session {
             .ok_or("sheet.pivot needs a 'values' array")?;
         let values = values_json
             .iter()
-            .map(ctl_parse_measure_arg)
+            .map(|v| ctl_parse_measure_arg("sheet.pivot", v))
             .collect::<Result<Vec<_>, _>>()?;
 
         let spec = pivot_spec_from_names(&frame, &rows, &cols, &values)
@@ -1123,6 +1151,88 @@ impl Session {
         }
         s.push_str("]}");
         Ok(s)
+    }
+
+    /// Create a REAL, persistent workbook pivot — arg shape identical to
+    /// the ad-hoc `sheet.pivot` (same header-name resolution, same 11 agg
+    /// strings, same unknown-column error family), plus an optional
+    /// destination `name`. Mirrors xlsxy control.rs's `pivot_create`
+    /// byte-for-byte (same error strings, same reply keys `{sheet, name}`),
+    /// plus the wasm-only `inverse`/`undoSteps` envelope (see the
+    /// bucket-table doc comment above). Builds it via
+    /// [`gridcore::xlsx::SheetPackage::create_pivot`] and lands the output
+    /// on a NEW sheet.
+    ///
+    /// Undo: clears history like `sheet.import-csv` — see the bucket-table
+    /// doc comment's `pivot.create` entry. The declared inverse is
+    /// `sheet.remove` on the returned `sheet` index; `SheetPackage::
+    /// remove_sheet` already cascades pivot removal (Task 3), so no
+    /// separate pivot-removal verb is needed.
+    fn ctl_pivot_create(&mut self, args: &json::Json) -> Result<String, String> {
+        let si = self.ctl_sheet_arg(args)?;
+        let rg = args
+            .get_str("range")
+            .ok_or("pivot.create needs a 'range'")?;
+        let (r1, c1, r2, c2) = ctl_parse_range(rg)?;
+        let frame = Frame::from_range(&self.pkg.workbook, si, (r1, c1, r2, c2));
+        if frame.names.is_empty() || frame.rows() == 0 {
+            return Err("pivot.create: the range needs a header row and data rows".into());
+        }
+
+        // Same leniency note as sheet.pivot: the MCP schema marks `rows`
+        // required; the code tolerates its absence (defaults to empty).
+        let rows = ctl_names_arg(args, "rows");
+        let cols = ctl_names_arg(args, "cols");
+        let values_json = args
+            .get("values")
+            .and_then(json::Json::as_array)
+            .ok_or("pivot.create needs a 'values' array")?;
+        let values = values_json
+            .iter()
+            .map(|v| ctl_parse_measure_arg("pivot.create", v))
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.is_empty() {
+            return Err("pivot.create needs at least one value field".into());
+        }
+        let spec = pivot_spec_from_names(&frame, &rows, &cols, &values)
+            .map_err(|col| format!("pivot.create: unknown column '{col}'"))?;
+
+        let sheet_name = match args.get_str("name") {
+            Some(n) => {
+                if n.is_empty() || n.contains(['[', ']', '*', '?', ':', '/', '\\']) {
+                    return Err("invalid sheet name".into());
+                }
+                if self.pkg.workbook.sheet_index(n).is_some() {
+                    return Err(format!("pivot.create: sheet name '{n}' is already taken"));
+                }
+                n.to_string()
+            }
+            None => ctl_unique_pivot_name(&self.pkg.workbook),
+        };
+
+        let source = gridcore::pivot::PivotSource::Range {
+            sheet: self.pkg.workbook.sheets[si].name.clone(),
+            rect: (r1, c1, r2, c2),
+        };
+        let idx = self
+            .pkg
+            .create_pivot(source, &frame, &spec, &sheet_name)
+            .ok_or("pivot.create: could not create the pivot")?;
+        let dest = self.pkg.workbook.pivots[idx].sheet;
+
+        // Same "can't be a cell-level undo" reasoning as sheet.import-csv.
+        self.undo.clear();
+        self.redo.clear();
+        self.rebuild_engine();
+        self.dirty = true;
+        let mut out = String::from("{\"sheet\":");
+        out.push_str(&dest.to_string());
+        out.push_str(",\"name\":");
+        json::push_str(&mut out, &sheet_name);
+        out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
+        out.push_str(&dest.to_string());
+        out.push_str("}},\"undoSteps\":0}");
+        Ok(out)
     }
 
     /// Side-effect-free formula preview: evaluates `formula` against the live
@@ -1341,6 +1451,20 @@ impl Session {
     //     prior width), whose own reply chains a working redo. `col` echoes
     //     NUMERICALLY (0-based) per Task 3's locked reply-shape decision —
     //     there is no paired ref-style field here to carry a letter form.
+    //   - `pivot.create` (Wave-3 Task 4): same bucket as `sheet.import-csv` —
+    //     a brand-new sheet plus a pivot-part registration isn't a
+    //     cell-level edit the wasm undo stack can invert, and there's no
+    //     cheap true inverse for creating a full pivot layout, so history is
+    //     cleared -> `"undoSteps":0` plus an `"inverse"` of `sheet.remove` on
+    //     the created sheet. That inverse is EXACT and "both or neither" for
+    //     free: the sheet never existed before (so removing it is a full
+    //     reversal) AND `SheetPackage::remove_sheet` already cascades pivot
+    //     removal (Task 3), so no separate pivot-removal verb is needed —
+    //     `pivot.create`'s own empirically-determined bucket (Task 3's
+    //     report §3), reused here rather than inventing a new one. Restoring
+    //     that same sheet afterward (`sheet.restore-removed`) must bring the
+    //     pivot back too, not just the sheet — see `RemovedSheetStash`'s
+    //     `pivots` field and `ctl_reregister_pivot`.
     // -----------------------------------------------------------------
 
     /// `{ref,text,author?,sheet?}` -> `{sheet,ref,undoSteps:0}` — plus the
@@ -1675,9 +1799,12 @@ impl Session {
     /// undo of an agent import) overwrites it; a named restore can then detect
     /// the mismatch and refuse rather than silently resurrecting the wrong
     /// sheet. Before removing, snapshots the sheet's full
-    /// `Sheet` value, its comments, and its sheet-scoped defined names into
-    /// `Session::removed_sheet_stash` ([`RemovedSheetStash`]), so the
-    /// inverse is a genuine restore, not a name-only placeholder. Errors on
+    /// `Sheet` value, its comments, its sheet-scoped defined names, AND
+    /// every pivot whose output lived on it (Task 4 fix — `remove_sheet`'s
+    /// pivot cascade, added for `pivot.create`'s inverse, would otherwise
+    /// silently outrun this stash), into `Session::removed_sheet_stash`
+    /// ([`RemovedSheetStash`]), so the inverse is a genuine restore, not a
+    /// name-only placeholder. Errors on
     /// the last sheet — checked FIRST, before any cloning, so a doomed call
     /// doesn't pay for a snapshot it's about to throw away. `sheet` is
     /// required (no default to active) — a destructive op shouldn't
@@ -1717,6 +1844,17 @@ impl Session {
             .cloned()
             .collect();
         let removed_active = self.active == si;
+        // Every pivot the impending `remove_sheet` cascade is about to drop
+        // — same filter (`.sheet == si`) the cascade itself uses, captured
+        // BEFORE the call so the stash has something to reconstitute from.
+        let pivots: Vec<gridcore::pivot::Pivot> = self
+            .pkg
+            .workbook
+            .pivots
+            .iter()
+            .filter(|p| p.sheet == si)
+            .cloned()
+            .collect();
         if !self.pkg.remove_sheet(si) {
             return Err("cannot remove the last sheet".into());
         }
@@ -1749,6 +1887,7 @@ impl Session {
             comments,
             defined_names,
             removed_active,
+            pivots,
         });
         let mut out = String::from(
             "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":",
@@ -1791,6 +1930,12 @@ impl Session {
     /// `sheet.remove` overwrites it, and a successful restore takes
     /// (clears) it via `Option::take` — so calling this with nothing
     /// stashed errors (`"nothing to restore"`).
+    ///
+    /// Also reconstitutes every pivot that lived on the removed sheet (Task
+    /// 4 fix — see [`RemovedSheetStash::pivots`] and
+    /// [`ctl_reregister_pivot`](Self::ctl_reregister_pivot)) and refreshes
+    /// them immediately, so `pivot.list` shows the pivot again and its
+    /// output is live without waiting for a follow-up `wb.recalc`.
     ///
     /// Active-sheet/viewport handling mirrors `sheet.remove`'s own rule in
     /// reverse: if the removed sheet WAS the active one, the restored sheet
@@ -1868,6 +2013,22 @@ impl Session {
                 formula: dn.formula,
             });
         }
+        // Reconstitute every pivot that lived on this sheet before removal
+        // (see `RemovedSheetStash::pivots`'s doc comment) — `.sheet`
+        // re-pointed at the restored sheet's NEW index. A pivot that fails
+        // to re-register (shouldn't happen for one that was live a moment
+        // ago; see `ctl_reregister_pivot`'s doc comment) is simply dropped
+        // rather than aborting the whole sheet restore.
+        let had_pivots = !stash.pivots.is_empty();
+        for piv in stash.pivots {
+            self.ctl_reregister_pivot(piv, new_idx);
+        }
+        if had_pivots {
+            // Makes the restored output live again immediately (matching
+            // `create_pivot`'s own "refresh right away" behavior), not just
+            // eventually-consistent on the next `wb.recalc`.
+            gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+        }
         if stash.removed_active {
             self.active = new_idx;
             self.cur = (0, 0);
@@ -1885,6 +2046,61 @@ impl Session {
         out.push_str(&new_idx.to_string());
         out.push_str("}},\"undoSteps\":0}");
         Ok(out)
+    }
+
+    /// Reinsert a pivot into `workbook.pivots`, pointed at `dest_sheet`, as
+    /// part of undoing `remove_sheet`'s pivot cascade
+    /// ([`ctl_sheet_restore_removed`]). `piv` is the FULL pivot as it stood
+    /// just before removal (row/col/data fields, filters, calculated
+    /// fields, grand-total/subtotal flags — every field
+    /// [`RemovedSheetStash::pivots`] captured), so the reconstituted pivot
+    /// is byte-identical to the destroyed one in every way that matters for
+    /// refresh and `pivot.list` — with ONE deliberate exception: its
+    /// underlying OPC part names (`part`/`cache_part`) are NOT preserved.
+    /// `remove_pivot` deletes those parts outright (table/cache XML,
+    /// content-type overrides, workbook rels), so there is nothing left to
+    /// point the old names at; this reuses [`SheetPackage::add_pivot`]
+    /// purely for its OPC-wiring side effects (fresh, currently-unused part
+    /// names, content-type overrides, a new workbook `<pivotCache>`
+    /// registration, a fresh destination-sheet rels entry) and then
+    /// overwrites its minimal placeholder `Pivot` entry with the fully
+    /// stashed one field-for-field. This is safe because the reconstituted
+    /// pivot is always marked `edited = true`: `save_xlsx` always rewrites
+    /// the table-definition XML from the model on the next save (same as
+    /// any `pivot.create`-made pivot, whose freshly-minted part is likewise
+    /// just a structural stub — see `SheetPackage::create_pivot`), so the
+    /// fresh part's own starting content never needs to matter. Returns the
+    /// new index into `workbook.pivots`; `None` when `dest_sheet` is out of
+    /// range or `piv.fields` is empty (both delegated to `add_pivot`'s own
+    /// guard — shouldn't occur for a pivot that was live a moment ago).
+    fn ctl_reregister_pivot(
+        &mut self,
+        mut piv: gridcore::pivot::Pivot,
+        dest_sheet: usize,
+    ) -> Option<usize> {
+        let default_measure =
+            piv.data_fields
+                .first()
+                .cloned()
+                .unwrap_or(gridcore::pivot::DataField {
+                    name: String::new(),
+                    field: 0,
+                    agg: Agg::Sum,
+                });
+        let idx = self.pkg.add_pivot(
+            piv.source.clone(),
+            piv.fields.clone(),
+            default_measure,
+            dest_sheet,
+            (piv.location.0, piv.location.1),
+        )?;
+        let fresh = &self.pkg.workbook.pivots[idx];
+        piv.sheet = dest_sheet;
+        piv.part = fresh.part.clone();
+        piv.cache_part = fresh.cache_part.clone();
+        piv.edited = true;
+        self.pkg.workbook.pivots[idx] = piv;
+        Some(idx)
     }
 
     /// `{sheet,name}` -> `{name,undoSteps:1}`. Reuses the interactive
@@ -2211,17 +2427,35 @@ fn ctl_names_arg(args: &json::Json, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One `{col, agg}` pair from `sheet.pivot`'s `values` array.
-fn ctl_parse_measure_arg(v: &json::Json) -> Result<(String, Agg), String> {
+/// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among
+/// existing sheet names. Distinct pattern from `ctl_unique_sheet_name`'s
+/// "Sheet"/"Sheet 2" (no space before the number) — Wave-3's convention for
+/// agent-created pivot sheets. Mirrors xlsxy control.rs's
+/// `unique_pivot_name`.
+fn ctl_unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("Pivot{n}");
+        if wb.sheet_index(&candidate).is_none() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// One `{col, agg}` pair from a pivot verb's `values` array — shared by
+/// `sheet.pivot` and `pivot.create`, `verb` names the caller in errors so
+/// parity between the two stays honest about which verb actually failed
+/// (mirrors the same fix in xlsxy control.rs's `parse_measure_arg`).
+fn ctl_parse_measure_arg(verb: &str, v: &json::Json) -> Result<(String, Agg), String> {
     let col = v
         .get_str("col")
-        .ok_or("sheet.pivot: each value needs a 'col'")?
+        .ok_or_else(|| format!("{verb}: each value needs a 'col'"))?
         .to_string();
     let agg_s = v
         .get_str("agg")
-        .ok_or("sheet.pivot: each value needs an 'agg'")?;
-    let agg =
-        Agg::from_verb_name(agg_s).ok_or_else(|| format!("sheet.pivot: unknown agg '{agg_s}'"))?;
+        .ok_or_else(|| format!("{verb}: each value needs an 'agg'"))?;
+    let agg = Agg::from_verb_name(agg_s).ok_or_else(|| format!("{verb}: unknown agg '{agg_s}'"))?;
     Ok((col, agg))
 }
 
@@ -2971,6 +3205,195 @@ mod tests {
         assert!(out.contains("\"rows\":[\"Region\"]"), "{out}");
         assert!(out.contains("\"cols\":[]"), "{out}");
         assert!(out.contains("\"values\":[\"Sum of Sales\"]"), "{out}");
+    }
+
+    // -- pivot.create: Wave-3 Task 4 (byte-parity mirror of xlsxy
+    // control.rs's `pivot_create`, plus the wasm-only inverse/undoSteps
+    // envelope) ----------------------------------------------------------
+
+    /// `pivot.create` args over `pivot_fixture`'s A1:B4 name/amount data,
+    /// same shape as xlsxy control.rs's own `pivot_create_args` test helper.
+    fn pivot_create_args(name: Option<&str>) -> String {
+        match name {
+            Some(n) => format!(
+                r#"{{"verb":"pivot.create","args":{{"range":"A1:B4","rows":["name"],"values":[{{"col":"amount","agg":"sum"}}],"name":"{n}"}}}}"#
+            ),
+            None => r#"{"verb":"pivot.create","args":{"range":"A1:B4","rows":["name"],"values":[{"col":"amount","agg":"sum"}]}}"#.to_string(),
+        }
+    }
+
+    #[test]
+    fn ctl_pivot_create_returns_sheet_and_name_lists_and_computes() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let out = s.ctl(&pivot_create_args(None));
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("\"name\":\"Pivot1\""), "{out}");
+        assert!(
+            out.contains("\"sheet\":1"),
+            "the pivot must land on a NEW sheet: {out}"
+        );
+
+        let lst = s.ctl(r#"{"verb":"pivot.list","args":{}}"#);
+        assert!(lst.contains("\"sheet\":1"), "{lst}");
+        assert!(lst.contains("\"rows\":[\"name\"]"), "{lst}");
+        assert!(lst.contains("\"values\":[\"Sum of amount\"]"), "{lst}");
+
+        // The output sheet already holds computed values (0-indexed row 2 =
+        // header, row 3 = first row group — "Alice" sorts first, total
+        // 10+20=30 — i.e. A1 ref "B4").
+        let g = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4","sheet":1}}"#);
+        assert!(g.contains("\"value\":30"), "{g}");
+    }
+
+    #[test]
+    fn ctl_pivot_create_default_names_are_unique_pivotn() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let r1 = s.ctl(&pivot_create_args(None));
+        assert!(r1.contains("\"name\":\"Pivot1\""), "{r1}");
+        let r2 = s.ctl(&pivot_create_args(None));
+        assert!(r2.contains("\"name\":\"Pivot2\""), "{r2}");
+    }
+
+    #[test]
+    fn ctl_pivot_create_explicit_name_is_used_and_duplicate_errors() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let r = s.ctl(&pivot_create_args(Some("ByName")));
+        assert!(r.contains("\"name\":\"ByName\""), "{r}");
+        let err = s.ctl(&pivot_create_args(Some("ByName")));
+        assert!(
+            err.contains("\"ok\":false") && err.contains("ByName"),
+            "{err}"
+        );
+        // Colliding with a plain (non-pivot) sheet name errors the same way.
+        let err2 = s.ctl(&pivot_create_args(Some("Sheet1")));
+        assert!(
+            err2.contains("\"ok\":false") && err2.contains("Sheet1"),
+            "{err2}"
+        );
+    }
+
+    #[test]
+    fn ctl_pivot_create_unknown_header_names_the_column_like_sheet_pivot() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let out = s.ctl(
+            r#"{"verb":"pivot.create","args":{"range":"A1:B4","rows":["nope"],"values":[{"col":"amount","agg":"sum"}]}}"#,
+        );
+        assert!(
+            out.contains("\"ok\":false") && out.contains("nope"),
+            "{out}"
+        );
+        assert!(out.contains("pivot.create:"), "{out}");
+    }
+
+    #[test]
+    fn ctl_pivot_create_needs_at_least_one_value_field() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let out = s
+            .ctl(r#"{"verb":"pivot.create","args":{"range":"A1:B4","rows":["name"],"values":[]}}"#);
+        assert!(
+            out.contains("\"ok\":false") && out.contains("value field"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ctl_pivot_create_clears_history_and_its_declared_inverse_is_both_or_neither() {
+        // Empirical bucket (Task 3's report §3, Task 4's brief): same as
+        // `sheet.import-csv` — a new sheet + pivot-part registration isn't a
+        // cell-level edit the wasm undo stack can invert, so history is
+        // cleared rather than pushing a true undo entry.
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        s.dispatch("set\t5\t0\thello"); // pushes one undo entry, must be wiped
+        let out = s.ctl(&pivot_create_args(None));
+        assert!(out.contains("\"undoSteps\":0"), "{out}");
+        assert!(
+            out.contains("\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":1}}"),
+            "{out}"
+        );
+
+        // History was cleared, not merely left un-added-to.
+        s.dispatch("undo");
+        s.dispatch("select\t5\t0");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("\"src\":\"hello\""),
+            "pivot.create must clear existing undo history: {v}"
+        );
+
+        // Applying the declared inverse removes BOTH the sheet AND the
+        // pivot registration — a both-or-neither check: neither survives
+        // alone (a sheet-only inverse leaving a dangling pivot.list entry,
+        // or a pivot-only removal leaving an orphaned sheet, is a defect).
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":1}}"#);
+        let v2 = s.view_json(None);
+        assert!(v2.contains("\"sheets\":[\"Sheet1\"]"), "{v2}");
+        let lst = s.ctl(r#"{"verb":"pivot.list","args":{}}"#);
+        assert!(lst.contains("\"pivots\":[]"), "{lst}");
+    }
+
+    #[test]
+    fn ctl_wb_recalc_refreshes_pivot_output_after_a_source_edit() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        s.ctl(&pivot_create_args(None));
+        // Bob's amount 20 -> 200 on the SOURCE sheet (Bob is the second
+        // source row, at A1 ref "B3"); the pivot output's Bob group lands
+        // at "B5" (0-indexed row 4: row2=header, row3=Alice, row4=Bob).
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B3","text":"200","sheet":0}}"#);
+        s.ctl(r#"{"verb":"wb.recalc","args":{}}"#);
+        let g = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B5","sheet":1}}"#);
+        assert!(g.contains("\"value\":200"), "{g}");
+    }
+
+    #[test]
+    fn ctl_sheet_remove_restore_round_trips_a_pivot_registration() {
+        // Wave-3 Task 4 review finding (mandatory fix): `remove_sheet`'s
+        // pivot cascade (Task 3, needed so `pivot.create`'s inverse is
+        // "both or neither") would otherwise silently outrun this stash —
+        // a sheet.remove + sheet.restore-removed round trip on a
+        // pivot-hosting sheet brought the sheet back WITHOUT its pivot,
+        // even though every cell value (including the pivot's own
+        // previously-computed output) was restored correctly.
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let out = s.ctl(&pivot_create_args(None));
+        assert!(
+            out.contains("\"sheet\":1") && out.contains("\"name\":\"Pivot1\""),
+            "{out}"
+        );
+
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":1}}"#);
+        let lst = s.ctl(r#"{"verb":"pivot.list","args":{}}"#);
+        assert!(
+            lst.contains("\"pivots\":[]"),
+            "the cascade must drop the pivot with its sheet: {lst}"
+        );
+
+        let restore = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(
+            restore.contains("\"sheet\":1") && restore.contains("\"name\":\"Pivot1\""),
+            "{restore}"
+        );
+
+        // pivot.list shows it again...
+        let lst2 = s.ctl(r#"{"verb":"pivot.list","args":{}}"#);
+        assert!(lst2.contains("\"sheet\":1"), "{lst2}");
+        assert!(lst2.contains("\"rows\":[\"name\"]"), "{lst2}");
+        assert!(lst2.contains("\"values\":[\"Sum of amount\"]"), "{lst2}");
+
+        // ...AND wb.recalc genuinely refreshes it — not just a stale
+        // metadata entry. Same B3 (source) -> B5 (output) edit as
+        // `ctl_wb_recalc_refreshes_pivot_output_after_a_source_edit`.
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B3","text":"200","sheet":0}}"#);
+        s.ctl(r#"{"verb":"wb.recalc","args":{}}"#);
+        let g = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B5","sheet":1}}"#);
+        assert!(g.contains("\"value\":200"), "{g}");
     }
 
     // -- comment.add / comment.remove: NOT on the undo stack ------------
