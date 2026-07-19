@@ -241,6 +241,48 @@ pub fn parse_end(
     Some(to_utc_iso(parse_local(s, now)?, offset_min))
 }
 
+/// Formats a day-count (days since the Unix epoch) as a floating all-day
+/// boundary: that date at nominal midnight-UTC.
+///
+/// Not yet called from production code — a later task's event-form save
+/// path is what will call `all_day_bounds` below; `cfg_attr` silences
+/// `dead_code` only outside tests, same pattern already used for
+/// `ui::compose::Compose::new`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn day_at_midnight_utc(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
+}
+
+/// Bounds for an all-day event from the form's Start/End fields. The *date* of
+/// each field is used (any time is ignored); the dates are floating (NOT
+/// offset-converted — an all-day date is absolute). Start is that date at
+/// midnight; End is the exclusive next-day midnight after the last inclusive
+/// day (the End field's date, or the Start date when End is missing/earlier).
+/// `None` if the Start field's date can't be parsed.
+///
+/// Not yet called from production code — see `day_at_midnight_utc` above.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn all_day_bounds(
+    start_input: &str,
+    end_input: &str,
+    now: LocalDateTime,
+) -> Option<(String, String)> {
+    let s = parse_local(start_input.trim(), now)?;
+    let start_days = days_from_civil(s.year, s.month, s.day);
+    let end_days = match parse_local(end_input.trim(), now) {
+        Some(e) => {
+            let ed = days_from_civil(e.year, e.month, e.day);
+            if ed >= start_days { ed } else { start_days }
+        }
+        None => start_days,
+    };
+    Some((
+        day_at_midnight_utc(start_days),
+        day_at_midnight_utc(end_days + 1),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +389,90 @@ mod tests {
         // valid boundaries still parse:
         assert!(parse_start("2024-02-29", now, 180).is_some()); // 2024 IS a leap year
         assert!(parse_start("2026-01-31", now, 180).is_some());
+    }
+
+    #[test]
+    fn all_day_bounds_single_day_is_start_to_next_midnight() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 10,
+            min: 0,
+        };
+        // same start/end date → a one-day event: [date, date+1)
+        assert_eq!(
+            all_day_bounds("2026-07-20", "2026-07-20", now),
+            Some(("2026-07-20T00:00:00Z".into(), "2026-07-21T00:00:00Z".into()))
+        );
+        // a blank/unparseable End also means a single day
+        assert_eq!(
+            all_day_bounds("2026-07-20", "", now),
+            Some(("2026-07-20T00:00:00Z".into(), "2026-07-21T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn all_day_bounds_multi_day_end_is_last_day_plus_one() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 10,
+            min: 0,
+        };
+        // 20th..=22nd inclusive → stored end = the 23rd (exclusive)
+        assert_eq!(
+            all_day_bounds("2026-07-20", "2026-07-22", now),
+            Some(("2026-07-20T00:00:00Z".into(), "2026-07-23T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn all_day_bounds_end_before_start_collapses_to_single_day() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 10,
+            min: 0,
+        };
+        assert_eq!(
+            all_day_bounds("2026-07-20", "2026-07-18", now),
+            Some(("2026-07-20T00:00:00Z".into(), "2026-07-21T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn all_day_bounds_ignores_time_and_handles_rollover_and_relative() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 12,
+            day: 31,
+            hour: 10,
+            min: 0,
+        };
+        // time part ignored; Dec 31 single day → end rolls to Jan 1 next year
+        assert_eq!(
+            all_day_bounds("2026-12-31 14:00", "2026-12-31 15:00", now),
+            Some(("2026-12-31T00:00:00Z".into(), "2027-01-01T00:00:00Z".into()))
+        );
+        // "today" resolves via `now`
+        assert_eq!(
+            all_day_bounds("today", "today", now),
+            Some(("2026-12-31T00:00:00Z".into(), "2027-01-01T00:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn all_day_bounds_rejects_unparseable_start() {
+        let now = LocalDateTime {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 10,
+            min: 0,
+        };
+        assert_eq!(all_day_bounds("not a date", "", now), None);
     }
 }
