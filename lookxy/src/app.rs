@@ -674,11 +674,16 @@ impl App {
     pub fn open_message(&mut self, id: &str) {
         self.selected_msg = Some(id.to_string());
         self.reading_scroll = 0;
-        self.reload_body();
         // A new message is open — any previously cached/requested inline
-        // images belonged to whatever was open before.
+        // images belonged to whatever was open before. Clear these BEFORE
+        // reload_body(): a cache-hit body triggers request_inline_images()
+        // synchronously as part of reload_body(), and it must see a fresh
+        // `requested_inline` so it (not this trailing call) is the one that
+        // marks cids and sends the fetches — otherwise both calls would see
+        // an empty set in turn and each cid gets fetched twice.
         self.inline_images.clear();
         self.requested_inline.clear();
+        self.reload_body();
         self.request_inline_images();
     }
 
@@ -3006,21 +3011,30 @@ pub(crate) mod tests {
 
         app.open_message("mimg"); // loads body + should request inline images
 
-        // A FetchInlineImage for att1/logo was enqueued (a FetchBody may also
-        // be queued ahead of it if the body wasn't already cached — it is
-        // here, but drain past anything else just in case).
+        // Exactly one FetchInlineImage for att1/logo should be enqueued (a
+        // FetchBody and/or FetchAttachments may also be queued — ignore
+        // those). Drain the whole queue rather than stopping at the first
+        // match, so a duplicate fetch for the same cid doesn't hide behind
+        // an early `break`.
         let cmd_rx = app.test_cmd_rx.as_ref().unwrap();
-        let mut found = None;
+        let mut logo_fetches = Vec::new();
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if matches!(cmd, SyncCommand::FetchInlineImage { .. }) {
-                found = Some(cmd);
-                break;
+            if let SyncCommand::FetchInlineImage {
+                ref attachment_id,
+                ref content_id,
+                ..
+            } = cmd
+            {
+                if content_id == "logo" {
+                    assert_eq!(attachment_id, "att1");
+                    logo_fetches.push(cmd);
+                }
             }
         }
-        assert!(
-            matches!(found, Some(SyncCommand::FetchInlineImage { ref attachment_id, ref content_id, .. })
-                if attachment_id == "att1" && content_id == "logo"),
-            "expected a FetchInlineImage for att1/logo, got {found:?}"
+        assert_eq!(
+            logo_fetches.len(),
+            1,
+            "expected exactly one FetchInlineImage for att1/logo, got {logo_fetches:?}"
         );
 
         // Delivering the bytes caches them by content_id:
