@@ -2900,7 +2900,10 @@ mod tests {
         wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::MessagesUpdated { .. })
         });
-        handle.cmd_tx.send(SyncCommand::FetchAutomaticReplies).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchAutomaticReplies)
+            .unwrap();
         wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::AutomaticRepliesFetched { replies }
                 if replies.status == crate::graph::model::OofStatus::AlwaysEnabled

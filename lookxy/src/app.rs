@@ -10,7 +10,7 @@ use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::client::RsvpKind;
-use mailcore::graph::model::{AttachmentKind, AttachmentMeta, Body};
+use mailcore::graph::model::{AttachmentKind, AttachmentMeta, AutomaticReplies, Body, OofStatus};
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 
@@ -585,7 +585,10 @@ impl App {
     /// or declining with a comment like "can't make it, quick call instead"
     /// must not quit the app).
     pub fn is_capturing_text(&self) -> bool {
-        self.search.is_some() || self.compose.is_some() || self.rsvp_prompt.is_some()
+        self.search.is_some()
+            || self.compose.is_some()
+            || self.rsvp_prompt.is_some()
+            || self.oof_form.is_some()
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt
@@ -784,6 +787,64 @@ impl App {
             .sync
             .cmd_tx
             .send(SyncCommand::RespondMeeting { message_id, kind });
+    }
+
+    /// `O`: open the automatic-replies editor and fetch the current config
+    /// (the form shows "loading…" until `AutomaticRepliesFetched` prefills it).
+    pub fn open_oof_form(&mut self) {
+        self.oof_form = Some(crate::ui::oofform::OofForm::loading_default());
+        let _ = self.sync.cmd_tx.send(SyncCommand::FetchAutomaticReplies);
+    }
+
+    /// Validate and write the automatic-replies form. When `status ==
+    /// Scheduled`, the Start/End text is parsed to UTC (inline error on a bad
+    /// value or an end at/before the start); other statuses ignore and clear
+    /// the window. Sends `SetAutomaticReplies` and leaves the form open — it
+    /// closes on `AutomaticRepliesUpdated`.
+    pub fn save_oof_form(&mut self) {
+        let Some(form) = self.oof_form.as_ref() else {
+            return;
+        };
+        let (start_utc, end_utc) = if form.status == OofStatus::Scheduled {
+            let now = local_now();
+            let off = crate::ui::calendar::local_offset_minutes();
+            let Some(start) = crate::datetime::parse_start(&form.start, now, off) else {
+                self.set_oof_error("Invalid start time");
+                return;
+            };
+            let Some(end) = crate::datetime::parse_end(&form.end, &start, now, off) else {
+                self.set_oof_error("Invalid end time");
+                return;
+            };
+            if end <= start {
+                self.set_oof_error("End must be after start");
+                return;
+            }
+            (start, end)
+        } else {
+            (String::new(), String::new())
+        };
+        let form = self.oof_form.as_ref().unwrap();
+        let replies = AutomaticReplies {
+            status: form.status,
+            external_audience: form.audience,
+            internal_message: form.internal.clone(),
+            external_message: form.external.clone(),
+            scheduled_start_utc: start_utc,
+            scheduled_end_utc: end_utc,
+        };
+        self.attachment_notice = Some("Saving…".to_string());
+        let _ = self
+            .sync
+            .cmd_tx
+            .send(SyncCommand::SetAutomaticReplies { replies });
+    }
+
+    /// Sets the OOF form's inline footer error (no-op if the form isn't open).
+    fn set_oof_error(&mut self, msg: &str) {
+        if let Some(form) = self.oof_form.as_mut() {
+            form.error = Some(msg.to_string());
+        }
     }
 
     /// Opens message `id` in the reading pane: records it as `selected_msg`
@@ -1348,6 +1409,7 @@ impl App {
             'A' => self.respond_meeting(RsvpKind::Accept),
             'D' => self.respond_meeting(RsvpKind::Decline),
             'T' => self.respond_meeting(RsvpKind::Tentative),
+            'O' => self.open_oof_form(),
             _ => {}
         }
     }
@@ -2582,6 +2644,115 @@ pub(crate) mod tests {
         // `open_message` queues a `FetchBody` (the body isn't cached) — drain it
         // so a following RSVP assertion sees only the command it triggered.
         while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn o_opens_the_oof_form_and_fetches() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_key_char('O');
+        assert!(app.oof_form.as_ref().unwrap().loading);
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::FetchAutomaticReplies) => {}
+            other => panic!("expected FetchAutomaticReplies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automatic_replies_fetched_prefills_the_form() {
+        use mailcore::graph::model::ExternalAudience;
+        let mut app = App::for_test_with_seeded_store();
+        app.open_oof_form();
+        app.on_sync_event(SyncEvent::AutomaticRepliesFetched {
+            replies: AutomaticReplies {
+                status: OofStatus::AlwaysEnabled,
+                external_audience: ExternalAudience::ContactsOnly,
+                internal_message: "Away".into(),
+                external_message: "Out".into(),
+                scheduled_start_utc: "".into(),
+                scheduled_end_utc: "".into(),
+            },
+        });
+        let form = app.oof_form.as_ref().unwrap();
+        assert!(!form.loading);
+        assert_eq!(form.status, OofStatus::AlwaysEnabled);
+        assert_eq!(form.internal, "Away");
+    }
+
+    #[test]
+    fn save_oof_form_scheduled_sends_set_with_parsed_utc() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_oof_form();
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain the fetch
+        let form = app.oof_form.as_mut().unwrap();
+        form.loading = false;
+        form.status = OofStatus::Scheduled;
+        form.start = "2026-07-20 09:00".into();
+        form.end = "2026-07-27 17:00".into();
+        form.internal = "Away".into();
+        app.save_oof_form();
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::SetAutomaticReplies { replies }) => {
+                assert_eq!(replies.status, OofStatus::Scheduled);
+                assert!(replies.scheduled_start_utc.ends_with('Z'));
+                assert!(!replies.scheduled_start_utc.is_empty());
+                assert!(!replies.scheduled_end_utc.is_empty());
+            }
+            other => panic!("expected SetAutomaticReplies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_oof_form_invalid_schedule_errors_and_sends_nothing() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_oof_form();
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain the fetch
+        let form = app.oof_form.as_mut().unwrap();
+        form.loading = false;
+        form.status = OofStatus::Scheduled;
+        form.start = "not a time".into();
+        app.save_oof_form();
+        assert!(app.oof_form.as_ref().unwrap().error.is_some());
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err()); // nothing sent
+    }
+
+    #[test]
+    fn save_oof_form_disabled_sends_empty_schedule() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_oof_form();
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain the fetch
+        let form = app.oof_form.as_mut().unwrap();
+        form.loading = false;
+        form.status = OofStatus::Disabled;
+        form.start = "garbage".into(); // ignored when not Scheduled
+        app.save_oof_form();
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::SetAutomaticReplies { replies }) => {
+                assert_eq!(replies.status, OofStatus::Disabled);
+                assert_eq!(replies.scheduled_start_utc, "");
+                assert_eq!(replies.scheduled_end_utc, "");
+            }
+            other => panic!("expected SetAutomaticReplies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automatic_replies_updated_closes_form_and_notifies() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_oof_form();
+        app.on_sync_event(SyncEvent::AutomaticRepliesUpdated);
+        assert!(app.oof_form.is_none());
+        assert_eq!(
+            app.attachment_notice.as_deref(),
+            Some("Automatic replies updated")
+        );
+    }
+
+    #[test]
+    fn oof_form_captures_text() {
+        let mut app = App::for_test_with_seeded_store();
+        assert!(!app.is_capturing_text());
+        app.open_oof_form();
+        assert!(app.is_capturing_text());
     }
 
     #[test]

@@ -9,9 +9,9 @@ pub(crate) mod calendar;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
-pub mod oofform;
 mod folders;
 mod message_list;
+pub mod oofform;
 mod reading;
 mod search;
 mod signin;
@@ -35,6 +35,12 @@ use ratatui::style::{Color, Style};
 /// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
 /// which are drawn on top of them, in that order).
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // The automatic-replies editor is a full-frame overlay openable from either
+    // mode; drawn first (like compose) so it covers the panes/calendar behind it.
+    if app.oof_form.is_some() {
+        oofform::draw(f, &*app);
+        return;
+    }
     if app.compose.is_some() {
         compose::draw_compose(f, &*app);
         return;
@@ -107,6 +113,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // usefully do without a token.
     if app.signin_modal.is_some() {
         handle_signin_key(app, key);
+        return;
+    }
+    // The automatic-replies editor (opened by `O`) gets first crack at every
+    // key while open — ahead of the panes/compose, though sign-in still wins.
+    if app.oof_form.is_some() {
+        oofform::handle_key(app, key);
         return;
     }
     // The file picker (opened over the composer to choose an attachment) —

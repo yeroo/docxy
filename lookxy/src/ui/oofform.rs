@@ -273,6 +273,85 @@ fn field_style(focused: bool, enabled: bool) -> Style {
     }
 }
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Key handling while the OOF form is open (routed from `ui::mod::handle_key`
+/// ahead of the pane/mode handlers, same precedence `eventform` gets). Tab/↓
+/// and Shift-Tab/↑ move focus; Space toggles the focused radio; Ctrl-S (and
+/// Enter outside the message editors) saves; Esc cancels; other keys edit the
+/// focused text field (the message editors accept Enter as a newline).
+pub fn handle_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Save/cancel are handled before taking the `&mut form` borrow so
+    // `save_oof_form` (which needs `&mut app`) is reachable.
+    match key.code {
+        KeyCode::Esc => {
+            app.oof_form = None;
+            return;
+        }
+        KeyCode::Char('s') if ctrl => {
+            app.save_oof_form();
+            return;
+        }
+        KeyCode::Enter => {
+            let save = match app.oof_form.as_mut() {
+                Some(form) if !form.loading => match form.focus {
+                    OofField::Internal => {
+                        form.internal.push('\n');
+                        false
+                    }
+                    OofField::External => {
+                        form.external.push('\n');
+                        false
+                    }
+                    _ => true,
+                },
+                _ => false,
+            };
+            if save {
+                app.save_oof_form();
+            }
+            return;
+        }
+        _ => {}
+    }
+    let Some(form) = app.oof_form.as_mut() else {
+        return;
+    };
+    if form.loading {
+        return; // ignore edits until the fetch lands
+    }
+    match key.code {
+        KeyCode::Tab | KeyCode::Down => form.next_field(),
+        KeyCode::BackTab | KeyCode::Up => form.prev_field(),
+        KeyCode::Char(' ') if form.focus == OofField::Status => form.cycle_status(),
+        KeyCode::Char(' ') if form.focus == OofField::Audience => form.cycle_audience(),
+        KeyCode::Backspace => {
+            if let Some(field) = editable_field(form) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(field) = editable_field(form) {
+                field.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The mutable text buffer for the focused field, or `None` for the radio
+/// fields (Status/Audience, which are edited via Space, not typing).
+fn editable_field(form: &mut OofForm) -> Option<&mut String> {
+    match form.focus {
+        OofField::Start => Some(&mut form.start),
+        OofField::End => Some(&mut form.end),
+        OofField::Internal => Some(&mut form.internal),
+        OofField::External => Some(&mut form.external),
+        OofField::Status | OofField::Audience => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
