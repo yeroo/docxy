@@ -9,7 +9,8 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, Body, DeltaPage, Event, MailFolder, Message, Person, Recipient,
+    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, Message, OofStatus,
+    Person, Recipient, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -490,6 +491,29 @@ impl GraphClient {
             .map(str::to_string))
     }
 
+    /// GET `/me/mailboxSettings` and parse its `automaticRepliesSetting` into
+    /// an [`AutomaticReplies`].
+    pub fn get_automatic_replies(&self) -> Result<AutomaticReplies, GraphError> {
+        let resp = self.send(Method::Get, "/me/mailboxSettings", None, &[])?;
+        let v = parse_body(resp)?;
+        AutomaticReplies::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("no automaticRepliesSetting".to_string()))
+    }
+
+    /// PATCH `/me/mailboxSettings` with the automatic-replies configuration.
+    /// The reply messages are `plain_to_html`-encoded; the scheduled datetimes
+    /// are sent ONLY when `status == Scheduled` (a non-scheduled write that
+    /// carried them would make Graph reject the PATCH or flip to scheduled).
+    pub fn set_automatic_replies(&self, r: &AutomaticReplies) -> Result<(), GraphError> {
+        self.send(
+            Method::Patch,
+            "/me/mailboxSettings",
+            Some(automatic_replies_body(r)),
+            &[],
+        )?;
+        Ok(())
+    }
+
     /// POST `/me/events` with the event body; returns the created `Event`
     /// (with its Graph-minted id). Graph sends invites to any attendees.
     pub fn create_event(&self, input: &EventInput) -> Result<Event, GraphError> {
@@ -750,6 +774,54 @@ fn value_array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], GraphError> {
     v.get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| GraphError::Parse(format!("response has no '{key}' array")))
+}
+
+/// Builds the PATCH body for `set_automatic_replies`:
+/// `{"automaticRepliesSetting": {...}}`. Scheduled start/end are included only
+/// for `OofStatus::Scheduled`.
+fn automatic_replies_body(r: &AutomaticReplies) -> String {
+    let mut setting = vec![
+        (
+            "status".to_string(),
+            Value::Str(r.status.as_wire().to_string()),
+        ),
+        (
+            "externalAudience".to_string(),
+            Value::Str(r.external_audience.as_wire().to_string()),
+        ),
+        (
+            "internalReplyMessage".to_string(),
+            Value::Str(plain_to_html(&r.internal_message)),
+        ),
+        (
+            "externalReplyMessage".to_string(),
+            Value::Str(plain_to_html(&r.external_message)),
+        ),
+    ];
+    if r.status == OofStatus::Scheduled {
+        setting.push((
+            "scheduledStartDateTime".to_string(),
+            utc_datetime_obj(&r.scheduled_start_utc),
+        ));
+        setting.push((
+            "scheduledEndDateTime".to_string(),
+            utc_datetime_obj(&r.scheduled_end_utc),
+        ));
+    }
+    Value::Object(vec![(
+        "automaticRepliesSetting".to_string(),
+        Value::Object(setting),
+    )])
+    .to_string()
+}
+
+/// A Graph `{"dateTime": <utc>, "timeZone": "UTC"}` object for a canonical UTC
+/// timestamp.
+fn utc_datetime_obj(utc: &str) -> Value {
+    Value::Object(vec![
+        ("dateTime".to_string(), Value::Str(utc.to_string())),
+        ("timeZone".to_string(), Value::Str("UTC".to_string())),
+    ])
 }
 
 /// Builds the JSON body shared by `create_draft` and `update_draft`:
@@ -1700,6 +1772,103 @@ mod tests {
             c.calendar_view("2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z"),
             Err(GraphError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn get_automatic_replies_parses_setting() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailboxSettings".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"automaticRepliesSetting":{"status":"alwaysEnabled","externalAudience":"all","internalReplyMessage":"<p>hi</p>","externalReplyMessage":"bye","scheduledStartDateTime":{"dateTime":"0001-01-01T00:00:00.0000000","timeZone":"UTC"},"scheduledEndDateTime":{"dateTime":"0001-01-01T00:00:00.0000000","timeZone":"UTC"}}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let r = c.get_automatic_replies().unwrap();
+        assert_eq!(r.status, OofStatus::AlwaysEnabled);
+        assert_eq!(r.internal_message, "hi");
+        assert_eq!(r.external_message, "bye");
+    }
+
+    #[test]
+    fn set_automatic_replies_scheduled_patches_full_body() {
+        use crate::graph::model::ExternalAudience;
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/mailboxSettings".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.set_automatic_replies(&AutomaticReplies {
+            status: OofStatus::Scheduled,
+            external_audience: ExternalAudience::ContactsOnly,
+            internal_message: "Away <b>&</b>\nback".into(),
+            external_message: "Out".into(),
+            scheduled_start_utc: "2026-07-20T09:00:00Z".into(),
+            scheduled_end_utc: "2026-07-27T17:00:00Z".into(),
+        })
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let setting = sent.get("automaticRepliesSetting").unwrap();
+        assert_eq!(
+            setting.get("status").and_then(Value::as_str),
+            Some("scheduled")
+        );
+        assert_eq!(
+            setting.get("externalAudience").and_then(Value::as_str),
+            Some("contactsOnly")
+        );
+        // plain_to_html escaped the `&`/`<`/`>` and encoded the newline.
+        assert_eq!(
+            setting.get("internalReplyMessage").and_then(Value::as_str),
+            Some("Away &lt;b&gt;&amp;&lt;/b&gt;<br>back")
+        );
+        // Scheduled → both datetime objects present, timeZone UTC.
+        assert_eq!(
+            setting
+                .get("scheduledStartDateTime")
+                .and_then(|d| d.get("dateTime"))
+                .and_then(Value::as_str),
+            Some("2026-07-20T09:00:00Z")
+        );
+        assert_eq!(
+            setting
+                .get("scheduledEndDateTime")
+                .and_then(|d| d.get("timeZone"))
+                .and_then(Value::as_str),
+            Some("UTC")
+        );
+    }
+
+    #[test]
+    fn set_automatic_replies_disabled_omits_datetimes() {
+        use crate::graph::model::ExternalAudience;
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/mailboxSettings".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.set_automatic_replies(&AutomaticReplies {
+            status: OofStatus::Disabled,
+            external_audience: ExternalAudience::All,
+            internal_message: "x".into(),
+            external_message: "y".into(),
+            scheduled_start_utc: "".into(),
+            scheduled_end_utc: "".into(),
+        })
+        .unwrap();
+        let reqs = srv.requests();
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let setting = sent.get("automaticRepliesSetting").unwrap();
+        assert!(setting.get("scheduledStartDateTime").is_none());
+        assert!(setting.get("scheduledEndDateTime").is_none());
     }
 
     #[test]
