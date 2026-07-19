@@ -7,6 +7,7 @@
 mod attachments;
 pub(crate) mod calendar;
 pub mod categories;
+pub mod categorypicker;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
@@ -95,6 +96,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     message_list::draw_move_picker(f, &*app);
     message_list::draw_confirm(f, &*app);
     attachments::draw(f, &*app);
+    categorypicker::draw(f, &*app);
     filepicker::draw(f, &*app);
     signin::draw(f, &*app);
 }
@@ -120,6 +122,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // key while open — ahead of the panes/compose, though sign-in still wins.
     if app.oof_form.is_some() {
         oofform::handle_key(app, key);
+        return;
+    }
+    // The category picker (opened by `l`/`L`) gets keys ahead of the panes.
+    if app.category_picker.is_some() {
+        categorypicker::handle_key(app, key);
         return;
     }
     // The file picker (opened over the composer to choose an attachment) —
@@ -177,6 +184,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => app.cancel_confirm(),
             _ => {}
         }
+        return;
+    }
+    // Esc in the Mail folder view clears an active category filter (`L`) —
+    // checked ahead of the pane handlers so it isn't swallowed. Only when a
+    // filter is set and no text prompt is capturing Esc.
+    if key.code == KeyCode::Esc
+        && app.mode == Mode::Mail
+        && app.category_filter.is_some()
+        && app.search.is_none()
+    {
+        app.clear_category_filter();
         return;
     }
     if app.mode == Mode::Calendar {

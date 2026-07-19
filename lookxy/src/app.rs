@@ -207,6 +207,11 @@ pub struct App {
     /// dots/chips and the picker's choices. Loaded from the store on
     /// `CategoriesUpdated` and at startup.
     pub master_categories: Vec<MasterCategory>,
+    /// The category picker overlay (assign or filter), when open.
+    pub category_picker: Option<crate::ui::categorypicker::CategoryPicker>,
+    /// The active category filter (`L`), or `None`. When set, `reload_messages`
+    /// shows only messages carrying this category (flat view).
+    pub category_filter: Option<String>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -421,6 +426,8 @@ impl App {
             event_form: None,
             oof_form: None,
             master_categories: Vec::new(),
+            category_picker: None,
+            category_filter: None,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -684,7 +691,7 @@ impl App {
             self.row_index = 0;
             return;
         };
-        if self.threaded {
+        if self.threaded && self.category_filter.is_none() {
             let expanded: std::collections::HashSet<String> = self
                 .threads
                 .iter()
@@ -708,6 +715,10 @@ impl App {
                 .store
                 .messages_in_folder(&folder, MESSAGE_PAGE_SIZE, 0)
                 .unwrap_or_default();
+            if let Some(cat) = &self.category_filter {
+                self.messages
+                    .retain(|m| m.categories.iter().any(|c| c == cat));
+            }
             if self.msg_index >= self.messages.len() {
                 self.msg_index = self.messages.len().saturating_sub(1);
             }
@@ -1424,6 +1435,8 @@ impl App {
             'D' => self.respond_meeting(RsvpKind::Decline),
             'T' => self.respond_meeting(RsvpKind::Tentative),
             'O' => self.open_oof_form(),
+            'l' => self.open_category_picker(crate::ui::categorypicker::PickerMode::Assign),
+            'L' => self.open_category_picker(crate::ui::categorypicker::PickerMode::Filter),
             _ => {}
         }
     }
@@ -1980,6 +1993,129 @@ impl App {
     /// once that lands. If the message genuinely has no attachments, this
     /// is a no-op — same "don't open a popup that can't work" pattern as
     /// `open_move_picker`.
+    /// `l`/`L`: open the category picker. Assign mode seeds each master
+    /// category preselected iff the highlighted message already has it (plus any
+    /// category on the message that isn't in the master list, so it can still be
+    /// toggled off); Filter mode just lists the master categories. Also refreshes
+    /// the master list so the choices are current.
+    pub fn open_category_picker(&mut self, mode: crate::ui::categorypicker::PickerMode) {
+        use crate::ui::categories::color_for;
+        use crate::ui::categorypicker::{CategoryItem, CategoryPicker, PickerMode};
+        let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCategories);
+        let (message_id, current): (Option<String>, Vec<String>) = match mode {
+            PickerMode::Assign => match self.highlighted_message_fields() {
+                Some((id, _)) => {
+                    let cats = self
+                        .messages
+                        .iter()
+                        .find(|m| m.id == id)
+                        .map(|m| m.categories.clone())
+                        .or_else(|| {
+                            self.threads
+                                .iter()
+                                .flat_map(|t| t.thread.messages.iter())
+                                .find(|m| m.id == id)
+                                .map(|m| m.categories.clone())
+                        })
+                        .unwrap_or_default();
+                    (Some(id), cats)
+                }
+                None => return, // nothing highlighted
+            },
+            PickerMode::Filter => (None, Vec::new()),
+        };
+        let mut names: Vec<String> = self
+            .master_categories
+            .iter()
+            .map(|c| c.display_name.clone())
+            .collect();
+        for c in &current {
+            if !names.contains(c) {
+                names.push(c.clone());
+            }
+        }
+        let items = names
+            .into_iter()
+            .map(|name| CategoryItem {
+                color: color_for(&self.master_categories, &name),
+                selected: current.contains(&name),
+                name,
+            })
+            .collect();
+        self.category_picker = Some(CategoryPicker {
+            mode,
+            message_id,
+            items,
+            index: 0,
+        });
+    }
+
+    /// Moves the picker's highlight by `delta`, clamped.
+    pub fn category_picker_select(&mut self, delta: isize) {
+        if let Some(p) = &mut self.category_picker {
+            let len = p.items.len();
+            if len == 0 {
+                return;
+            }
+            let max = (len - 1) as isize;
+            p.index = (p.index as isize + delta).clamp(0, max) as usize;
+        }
+    }
+
+    /// Space in Assign mode: toggles the highlighted item's `selected`.
+    pub fn category_picker_toggle(&mut self) {
+        if let Some(p) = &mut self.category_picker {
+            if p.mode == crate::ui::categorypicker::PickerMode::Assign {
+                if let Some(it) = p.items.get_mut(p.index) {
+                    it.selected = !it.selected;
+                }
+            }
+        }
+    }
+
+    /// Enter: Assign → send `SetCategories` with the selected names + close;
+    /// Filter → set `category_filter` to the highlighted category + reload.
+    pub fn apply_category_picker(&mut self) {
+        let Some(p) = self.category_picker.as_ref() else {
+            return;
+        };
+        match p.mode {
+            crate::ui::categorypicker::PickerMode::Assign => {
+                let Some(id) = p.message_id.clone() else {
+                    self.category_picker = None;
+                    return;
+                };
+                let names: Vec<String> = p
+                    .items
+                    .iter()
+                    .filter(|it| it.selected)
+                    .map(|it| it.name.clone())
+                    .collect();
+                self.store.set_categories(&id, &names);
+                self.reload_messages();
+                let _ = self.sync.cmd_tx.send(SyncCommand::SetCategories {
+                    id,
+                    categories: names,
+                });
+                self.category_picker = None;
+            }
+            crate::ui::categorypicker::PickerMode::Filter => {
+                if let Some(it) = p.items.get(p.index) {
+                    self.category_filter = Some(it.name.clone());
+                }
+                self.category_picker = None;
+                self.reload_messages();
+            }
+        }
+    }
+
+    /// Clears an active category filter (Esc in the folder view). No-op if none.
+    pub fn clear_category_filter(&mut self) {
+        if self.category_filter.take().is_some() {
+            self.reload_messages();
+        }
+    }
+
     pub fn open_attachments_popup(&mut self) {
         let Some((id, has_attachments)) = self.highlighted_message_fields() else {
             return;
@@ -2780,6 +2916,83 @@ pub(crate) mod tests {
         assert!(!app.is_capturing_text());
         app.open_oof_form();
         assert!(app.is_capturing_text());
+    }
+
+    #[test]
+    fn l_opens_assign_picker_seeded_from_message_and_applies() {
+        use crate::ui::categorypicker::PickerMode;
+        let mut app = App::for_test_with_seeded_store();
+        app.master_categories = vec![
+            mailcore::graph::model::MasterCategory {
+                display_name: "Work".into(),
+                color: "preset0".into(),
+            },
+            mailcore::graph::model::MasterCategory {
+                display_name: "Urgent".into(),
+                color: "preset1".into(),
+            },
+        ];
+        app.open_category_picker(PickerMode::Assign);
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain RefreshCategories
+        app.category_picker_toggle(); // toggle the first item on
+        app.apply_category_picker();
+        assert!(app.category_picker.is_none());
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::SetCategories { categories, .. }) => {
+                assert_eq!(categories.len(), 1);
+            }
+            other => panic!("expected SetCategories, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_shows_only_matching_and_clears() {
+        use crate::ui::categorypicker::PickerMode;
+        use mailcore::graph::model::{Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        app.master_categories = vec![mailcore::graph::model::MasterCategory {
+            display_name: "Work".into(),
+            color: "preset0".into(),
+        }];
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "w".into(),
+                    conversation_id: "c2".into(),
+                    subject: "Work item".into(),
+                    from: Recipient {
+                        name: "B".into(),
+                        address: "b@x".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-19T11:00:00Z".into(),
+                    sent: "".into(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "p".into(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec!["Work".into()],
+                },
+            )
+            .unwrap();
+        app.reload_messages();
+        app.open_category_picker(PickerMode::Filter);
+        app.apply_category_picker(); // highlight = "Work" (only master item)
+        assert_eq!(app.category_filter.as_deref(), Some("Work"));
+        assert!(
+            app.messages
+                .iter()
+                .all(|m| m.categories.contains(&"Work".to_string()))
+        );
+        assert_eq!(app.messages.len(), 1);
+        app.clear_category_filter();
+        assert!(app.category_filter.is_none());
+        assert!(app.messages.len() >= 2); // m1 back
     }
 
     #[test]
