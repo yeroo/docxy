@@ -382,6 +382,32 @@ impl From<&Attendee> for NewAttendee {
     }
 }
 
+/// The editable fields of an event the compose form collects — the input to
+/// `create_local_event`/`update_event_fields`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalEventFields {
+    pub subject: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub body_html: String,
+    pub attendees: Vec<(String, String)>, // (name, address)
+}
+
+/// Everything `sync::outbox` needs to build a `graph::client::EventInput` for a
+/// stored event (`event_for_send`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSendData {
+    pub subject: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub body_html: String,
+    pub attendees: Vec<(String, String)>,
+}
+
 /// The local mail database. Single-threaded access is assumed (the sync
 /// engine and TUI serialize their access through it); no internal locking.
 pub struct Store {
@@ -1385,6 +1411,122 @@ impl Store {
         Ok(body)
     }
 
+    /// Inserts a locally-created event with a fresh `local:` id and the given
+    /// organizer, so it shows in the agenda immediately (before it syncs to
+    /// Graph). `response_status` is `"organizer"`.
+    pub fn create_local_event(
+        &self,
+        f: &LocalEventFields,
+        organizer_name: &str,
+        organizer_addr: &str,
+    ) -> Result<String, StoreError> {
+        let id = local_draft_id(); // a unique "local:<hex>" id
+        self.upsert_event(&NewEvent {
+            id: id.clone(),
+            subject: f.subject.clone(),
+            start_utc: f.start_utc.clone(),
+            end_utc: f.end_utc.clone(),
+            is_all_day: f.is_all_day,
+            location: f.location.clone(),
+            organizer_name: organizer_name.to_string(),
+            organizer_addr: organizer_addr.to_string(),
+            response_status: "organizer".to_string(),
+            series_master_id: None,
+            body_preview: String::new(),
+            web_link: String::new(),
+            last_modified: String::new(),
+            body_html: f.body_html.clone(),
+        })?;
+        self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
+        Ok(id)
+    }
+
+    /// Overwrites a stored event's editable fields + attendees + body in place.
+    pub fn update_event_fields(&self, id: &str, f: &LocalEventFields) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE events SET subject = ?2, start_utc = ?3, end_utc = ?4, is_all_day = ?5,
+                    location = ?6, body_html = ?7 WHERE id = ?1",
+            params![
+                id,
+                f.subject,
+                f.start_utc,
+                f.end_utc,
+                f.is_all_day,
+                f.location,
+                f.body_html
+            ],
+        )?;
+        self.put_event_attendees(id, &to_new_attendees(&f.attendees))?;
+        Ok(())
+    }
+
+    /// Removes an event (and its attendees) locally.
+    pub fn delete_event(&self, id: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM event_attendees WHERE event_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM events WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reads a stored event's send-relevant fields (`None` if no such event).
+    pub fn event_for_send(&self, id: &str) -> Result<Option<EventSendData>, StoreError> {
+        let row = self.conn.query_row(
+            "SELECT subject, start_utc, end_utc, is_all_day, location, body_html FROM events WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        );
+        let (subject, start_utc, end_utc, is_all_day, location, body_html) = match row {
+            Ok(t) => t,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let attendees = self
+            .event_attendees(id)?
+            .into_iter()
+            .map(|a| (a.name, a.addr))
+            .collect();
+        Ok(Some(EventSendData {
+            subject,
+            start_utc,
+            end_utc,
+            is_all_day,
+            location,
+            body_html,
+            attendees,
+        }))
+    }
+
+    /// Re-points a `local:` event id to its Graph id after `create_event`
+    /// (mirrors `reconcile_id` for drafts): updates `events.id` and
+    /// `event_attendees.event_id` in one transaction.
+    pub fn reconcile_event_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        tx.execute(
+            "UPDATE events SET id = ?2 WHERE id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.execute(
+            "UPDATE event_attendees SET event_id = ?2 WHERE event_id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Locally sets an event's RSVP response status (`"accepted"`,
     /// `"declined"`, `"tentativelyAccepted"`, ...) — the optimistic half of
     /// an RSVP a later task's outbox will push to Graph. See `set_read` for
@@ -1609,6 +1751,21 @@ const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 /// an id as not-yet-synced-to-Graph throughout the store and sync engine.
 fn local_draft_id() -> String {
     format!("local:{}", to_hex(&crate::pkce::random_bytes(16)))
+}
+
+/// Converts the (name, address) pairs `LocalEventFields::attendees` collects
+/// into `NewAttendee`s, defaulting every attendee to required/no-response —
+/// the compose form doesn't collect attendee type or track RSVP state itself.
+fn to_new_attendees(pairs: &[(String, String)]) -> Vec<NewAttendee> {
+    pairs
+        .iter()
+        .map(|(name, addr)| NewAttendee {
+            name: name.clone(),
+            addr: addr.clone(),
+            r#type: "required".to_string(),
+            response: "none".to_string(),
+        })
+        .collect()
 }
 
 /// Lowercase-hex-encodes a byte slice (`format!("{b:02x}")` per byte,
@@ -2350,6 +2507,67 @@ mod calendar_tests {
         assert!(s.calendar_delta_link().unwrap().is_none());
         s.set_calendar_delta_link("LINK").unwrap();
         assert_eq!(s.calendar_delta_link().unwrap().as_deref(), Some("LINK"));
+    }
+
+    fn sample_fields() -> LocalEventFields {
+        LocalEventFields {
+            subject: "Sync".into(),
+            start_utc: "2026-07-20T11:00:00Z".into(),
+            end_utc: "2026-07-20T12:00:00Z".into(),
+            is_all_day: false,
+            location: "Room 1".into(),
+            body_html: "<p>agenda</p>".into(),
+            attendees: vec![("Bob".into(), "bob@x.com".into())],
+        }
+    }
+
+    #[test]
+    fn create_local_event_is_visible_and_readable_for_send() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        assert!(id.starts_with("local:"));
+        // shows in the window
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        assert!(rows.iter().any(|e| e.id == id && e.subject == "Sync"));
+        // read back for the outbox
+        let send = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(send.subject, "Sync");
+        assert_eq!(
+            send.attendees,
+            vec![("Bob".to_string(), "bob@x.com".to_string())]
+        );
+        assert_eq!(send.body_html, "<p>agenda</p>");
+    }
+
+    #[test]
+    fn reconcile_event_id_repoints_event_and_attendees() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        s.reconcile_event_id(&id, "EV1").unwrap();
+        assert!(s.event_for_send(&id).unwrap().is_none()); // old id gone
+        let send = s.event_for_send("EV1").unwrap().unwrap(); // under graph id
+        assert_eq!(send.attendees.len(), 1); // attendees moved too
+    }
+
+    #[test]
+    fn delete_event_removes_it() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        s.delete_event(&id).unwrap();
+        assert!(s.event_for_send(&id).unwrap().is_none());
+        assert!(
+            s.events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
