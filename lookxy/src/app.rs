@@ -197,6 +197,19 @@ pub struct App {
     /// (`ui::draw`'s Calendar branch); populated by `open_new_event`/
     /// `open_edit_event`, cleared by `save_event_form`/Esc (later tasks).
     pub event_form: Option<crate::ui::eventform::EventForm>,
+    /// The reading pane's vertical scroll offset, in body rows — reset to `0`
+    /// whenever a different message is opened (`open_message`). Clamped by
+    /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
+    /// `reading_scroll_end` against `reading_content_rows`/`reading_viewport`.
+    pub reading_scroll: usize,
+    /// The reading pane body's visible height in rows, as last recorded by
+    /// `ui::reading::draw` (which has `&mut App` for exactly this). Used only
+    /// to clamp `reading_scroll`.
+    pub reading_viewport: usize,
+    /// The reading pane body's total row count (text lines plus each inline
+    /// image's reserved `IMAGE_BOX_ROWS` band), as last recorded by
+    /// `ui::reading::draw`. Used only to clamp `reading_scroll`.
+    pub reading_content_rows: usize,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -349,6 +362,9 @@ impl App {
             confirm: None,
             file_picker: None,
             event_form: None,
+            reading_scroll: 0,
+            reading_viewport: 0,
+            reading_content_rows: 0,
         };
         app.reload_folders();
         app.reload_account();
@@ -626,7 +642,43 @@ impl App {
     /// and loads its body (see `reload_body`).
     pub fn open_message(&mut self, id: &str) {
         self.selected_msg = Some(id.to_string());
+        self.reading_scroll = 0;
         self.reload_body();
+    }
+
+    // --- Reading pane scroll -------------------------------------------
+
+    /// The furthest `reading_scroll` can go without scrolling past the last
+    /// content row — `reading_content_rows - reading_viewport`, floored at 0
+    /// (a body shorter than the viewport has nothing to scroll).
+    fn reading_max_scroll(&self) -> usize {
+        self.reading_content_rows
+            .saturating_sub(self.reading_viewport)
+    }
+
+    /// `j`/`k`/↓/↑ while the reading pane has focus: moves `reading_scroll`
+    /// by `delta` rows, clamped to `[0, reading_max_scroll()]`.
+    pub fn reading_scroll_by(&mut self, delta: isize) {
+        let max = self.reading_max_scroll() as isize;
+        self.reading_scroll = (self.reading_scroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// PageUp/PageDown while the reading pane has focus: scrolls by one
+    /// viewport's worth of rows (at least 1, so a not-yet-drawn viewport of
+    /// height 0 still moves).
+    pub fn reading_scroll_page(&mut self, dir: isize) {
+        let page = self.reading_viewport.max(1) as isize;
+        self.reading_scroll_by(dir * page);
+    }
+
+    /// Home while the reading pane has focus: jumps to the top.
+    pub fn reading_scroll_home(&mut self) {
+        self.reading_scroll = 0;
+    }
+
+    /// End while the reading pane has focus: jumps to the bottom.
+    pub fn reading_scroll_end(&mut self) {
+        self.reading_scroll = self.reading_max_scroll();
     }
 
     /// Re-reads the opened message's body from the store. If it's already
@@ -1940,7 +1992,7 @@ impl App {
     /// happens to use). A generously-sized buffer (120x40) so nothing the
     /// sign-in modal or status bar draws gets clipped out of the check.
     #[cfg(test)]
-    pub fn render_contains(&self, needle: &str) -> bool {
+    pub fn render_contains(&mut self, needle: &str) -> bool {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -2487,6 +2539,22 @@ pub(crate) mod tests {
             app.body.as_ref().map(|b| b.content.as_str()),
             Some("hello body")
         );
+    }
+
+    #[test]
+    fn reading_scroll_clamps_and_resets_on_open() {
+        let mut app = App::for_test_with_seeded_store();
+        app.reading_scroll = 0;
+        app.reading_viewport = 5; // 5 visible body rows
+        app.reading_content_rows = 20; // 20 total rows
+        app.reading_scroll_by(100); // way past the end
+        assert_eq!(app.reading_scroll, 15); // clamped to content(20) - viewport(5)
+        app.reading_scroll_by(-100);
+        assert_eq!(app.reading_scroll, 0);
+        // opening a message resets scroll
+        app.reading_scroll = 7;
+        app.open_message("m1");
+        assert_eq!(app.reading_scroll, 0);
     }
 
     #[test]

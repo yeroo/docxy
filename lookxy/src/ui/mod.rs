@@ -33,23 +33,23 @@ use ratatui::style::{Color, Style};
 /// entire frame instead — a full-screen mode, not an overlay over the
 /// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
 /// which are drawn on top of them, in that order).
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     if app.compose.is_some() {
-        compose::draw_compose(f, app);
+        compose::draw_compose(f, &*app);
         return;
     }
     if app.mode == Mode::Calendar {
-        calendar::draw_calendar(f, app);
+        calendar::draw_calendar(f, &*app);
         // The create/edit event form (`c`/`e` — wired in a later task) is an
         // overlay on top of the calendar, not a full-screen mode like
         // compose — same "no-op unless open" shape as `eventform::draw`'s
         // own doc comment describes.
-        eventform::draw(f, app);
+        eventform::draw(f, &*app);
         // The delete-confirm modal (`x`) is also an overlay on top of the
         // calendar — without this, `app.confirm` could be set (by
         // `App::delete_selected_event`) with nothing on screen to show it,
         // even though `handle_key` now routes Enter/Esc to it correctly.
-        message_list::draw_confirm(f, app);
+        message_list::draw_confirm(f, &*app);
         return;
     }
 
@@ -67,25 +67,28 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(rows[0]);
 
-    folders::draw(f, app, cols[0]);
+    folders::draw(f, &*app, cols[0]);
     if app.search.is_some() {
-        search::draw(f, app, cols[1]);
+        search::draw(f, &*app, cols[1]);
     } else {
-        message_list::draw(f, app, cols[1]);
+        message_list::draw(f, &*app, cols[1]);
     }
+    // The only pane that needs `&mut App`: it records the live viewport
+    // height and rendered content-row count each frame (`reading_viewport`/
+    // `reading_content_rows`) so scroll can clamp — see `App::reading_scroll_by`.
     reading::draw(f, app, cols[2]);
-    status_bar::draw(f, app, rows[1]);
+    status_bar::draw(f, &*app, rows[1]);
 
     // Drawn last (and over the full frame, not just the list column) so
     // popups sit on top of everything else. The sign-in modal is drawn
     // last of all — it's the one popup that can be showing with no
     // mailbox behind it at all (first run, no token), and it should win
     // over any other popup that somehow got left open.
-    message_list::draw_move_picker(f, app);
-    message_list::draw_confirm(f, app);
-    attachments::draw(f, app);
-    filepicker::draw(f, app);
-    signin::draw(f, app);
+    message_list::draw_move_picker(f, &*app);
+    message_list::draw_confirm(f, &*app);
+    attachments::draw(f, &*app);
+    filepicker::draw(f, &*app);
+    signin::draw(f, &*app);
 }
 
 /// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k),
@@ -180,6 +183,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Tab => cycle_focus(app),
+        // Reading-focused vertical keys scroll the reader instead of moving
+        // a selection (`move_selection`'s `Pane::Reading` arm is a no-op —
+        // there's nothing there to select over). These guarded arms must
+        // precede the unguarded ones below for the same keys.
+        KeyCode::Char('k') | KeyCode::Up if app.focus == Pane::Reading => app.reading_scroll_by(-1),
+        KeyCode::Char('j') | KeyCode::Down if app.focus == Pane::Reading => {
+            app.reading_scroll_by(1)
+        }
+        KeyCode::PageUp if app.focus == Pane::Reading => app.reading_scroll_page(-1),
+        KeyCode::PageDown if app.focus == Pane::Reading => app.reading_scroll_page(1),
+        KeyCode::Home if app.focus == Pane::Reading => app.reading_scroll_home(),
+        KeyCode::End if app.focus == Pane::Reading => app.reading_scroll_end(),
         KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1),
         KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1),
         KeyCode::Enter => activate(app),
@@ -387,8 +402,8 @@ mod tests {
     fn draws_three_panes_with_folder_names() {
         // Build an App over an in-memory store seeded with folder "Inbox" and one message.
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        let app = App::for_test_with_seeded_store();
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = App::for_test_with_seeded_store();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Inbox"));
@@ -758,7 +773,7 @@ mod tests {
     fn empty_store_renders_and_handles_keys_without_panicking() {
         let mut app = App::for_test_with_empty_store();
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
 
         // Drive every navigation and triage key, through every pane (Tab
         // cycles focus in between), with nothing to select. None of this
@@ -799,7 +814,7 @@ mod tests {
         ];
         for code in keys {
             handle_key(&mut app, KeyEvent::from(code));
-            term.draw(|f| draw(f, &app)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
         }
 
         assert!(app.selected_folder.is_none());
@@ -1059,7 +1074,7 @@ mod tests {
         });
 
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Delete event"));
