@@ -818,8 +818,10 @@ version = "0.1.0"
 dependencies = [
  "ctlcore",
  "editcore",
+ "image",
  "mailcore",
  "ratatui",
+ "ratatui-image",
  "unicode-width 0.2.0",
 ]
 

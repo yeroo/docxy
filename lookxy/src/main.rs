@@ -43,6 +43,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui_image::picker::Picker;
 
 /// Which of lookxy's CLI entry points a given argument vector selects. Kept
 /// as a pure decision separate from what each mode actually does — `--mcp`
@@ -162,6 +163,12 @@ fn run_tui(app: &mut App, ctl_rx: Option<Receiver<ctlcore::Request>>) -> io::Res
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall
+    // back to a half-block renderer if the query fails (e.g. a plain
+    // console) — same detection docxy uses (`main.rs`'s `run_tui`).
+    app.picker =
+        Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16))));
 
     // Restore the terminal even if `run` panics, so the user's shell isn't
     // left in raw mode / the alternate screen.

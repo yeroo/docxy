@@ -15,7 +15,7 @@
 use crate::app::{App, Pane};
 use crate::ui::border_style;
 
-use mailcore::htmlrender::{self, ImageRef, StyledLine, StyledSpan};
+use mailcore::htmlrender::{self, ImageRef, ImageSource, StyledLine, StyledSpan};
 use mailcore::store::MessageRow;
 
 use ratatui::Frame;
@@ -23,6 +23,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
+use std::collections::HashMap;
 
 /// Rows reserved in the reader for one inline image band. Task 6 paints real
 /// pixels into this space when the fetch succeeds; until then (and whenever
@@ -81,8 +85,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(visible), body_area);
 
     // Images: crop each band to the visible window (docxy's draw_images
-    // math, main.rs:3017-3065). In THIS task every box is the fallback;
-    // Task 6 paints pixels first and only falls back here.
+    // math, main.rs:3017-3065). Real pixels are tried first (when a
+    // graphics-capable `Picker` is present and the bytes have arrived);
+    // anything else — no picker, bytes not yet fetched, a decode/encode
+    // failure, or a Remote/Unsupported source — falls back to the box.
     for ib in &images {
         let wtop = scroll.saturating_sub(ib.row);
         let wbot = (scroll + vh).saturating_sub(ib.row).min(IMAGE_BOX_ROWS);
@@ -96,8 +102,62 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             width: body_area.width,
             height: (wbot - wtop) as u16,
         };
-        draw_image_fallback_rect(f, rect, &ib.img);
+        // Resolve bytes + a stable cache key from the source (immutable
+        // reads first, so the split-borrow call below never overlaps
+        // `&app.picker`/`&mut app.image_protocols`).
+        let resolved: Option<(String, &[u8])> = match &ib.img.src {
+            ImageSource::Cid(c) => app
+                .inline_images
+                .get(c)
+                .map(|b| (format!("cid:{c}"), b.as_slice())),
+            ImageSource::Data { bytes, .. } => {
+                Some((format!("data:{}", bytes.len()), bytes.as_slice()))
+            }
+            _ => None, // Remote / Unsupported → box
+        };
+        let painted = match (&app.picker, resolved) {
+            (Some(picker), Some((key, bytes))) => {
+                paint_inline_image(f, picker, &mut app.image_protocols, &key, bytes, rect)
+            }
+            _ => false,
+        };
+        if !painted {
+            draw_image_fallback_rect(f, rect, &ib.img);
+        }
     }
+}
+
+/// Tries to paint `bytes` (the image source resolved from `key`'s
+/// `ImageSource`) as real pixels into `rect`, using `picker`'s detected
+/// graphics protocol and `cache` to avoid re-decoding/re-encoding every
+/// frame. Returns `false` (caller falls back to the bordered box) on a
+/// decode or encode failure; `true` once the pixels are rendered.
+///
+/// Mirrors docxy's `encode` closure (`main.rs:2961-2974`) and paint call
+/// (`main.rs:3056`) — for email there's no mid-image crop-on-scroll: the
+/// whole decoded image is re-scaled to fit `rect` via `Resize::Fit(None)`,
+/// which is what a partially-scrolled band ends up doing here too (see the
+/// module doc comment).
+fn paint_inline_image(
+    f: &mut Frame,
+    picker: &Picker,
+    cache: &mut HashMap<String, Protocol>,
+    key: &str,
+    bytes: &[u8],
+    rect: Rect,
+) -> bool {
+    let cache_key = format!("{key}#{}x{}", rect.width, rect.height);
+    if !cache.contains_key(&cache_key) {
+        let Ok(img) = image::load_from_memory(bytes) else {
+            return false;
+        };
+        let Ok(proto) = picker.new_protocol(img, rect, Resize::Fit(None)) else {
+            return false;
+        };
+        cache.insert(cache_key.clone(), proto);
+    }
+    f.render_widget(Image::new(cache.get(&cache_key).unwrap()), rect);
+    true
 }
 
 /// The message named by `App::selected_msg`, if it's still in the currently
@@ -255,6 +315,41 @@ mod tests {
         .unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("[image: Logo]"));
+    }
+
+    /// With `app.picker == None` (every test `App`'s default — see
+    /// `App::picker`'s doc comment), a `cid:` image whose bytes ARE already
+    /// cached must still draw the fallback box rather than panicking trying
+    /// to paint pixels with no graphics capability. This is the one path
+    /// automated tests can exercise — real pixel output needs a real
+    /// graphics-capable terminal (verified manually, as docxy/xlsxy do).
+    #[test]
+    fn cid_image_without_graphics_capability_draws_the_box() {
+        let mut app = App::for_test_with_seeded_store();
+        assert!(app.picker.is_none());
+        app.store
+            .put_body(
+                "m1",
+                &Body {
+                    content_type: "html".into(),
+                    content: r#"<img src="cid:logo" alt="Logo">"#.into(),
+                },
+            )
+            .expect("seed body");
+        app.inline_images.insert("logo".into(), vec![0, 1, 2]); // bytes present but no Picker
+        app.open_message("m1");
+        app.inline_images.insert("logo".into(), vec![0, 1, 2]); // re-add (open cleared it)
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(text.contains("[image: Logo]"));
     }
 }

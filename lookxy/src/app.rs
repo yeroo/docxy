@@ -221,6 +221,20 @@ pub struct App {
     /// doesn't re-fire on every call (e.g. once per `AttachmentsUpdated`).
     /// Cleared alongside `inline_images` in `open_message`.
     requested_inline: std::collections::HashSet<String>,
+    /// The terminal graphics capability, detected once at startup
+    /// (`main::main`) via `Picker::from_query_stdio` (falling back to a fixed
+    /// font-cell size). `None` in every test `App` (`for_test_with_seeded_store`/
+    /// `for_test_with_empty_store` never set it), so tests always exercise
+    /// `ui::reading`'s fallback-box path; real pixels only ever paint on the
+    /// live TUI path. See `ui::reading::paint_inline_image`.
+    pub picker: Option<ratatui_image::picker::Picker>,
+    /// Decoded+encoded protocol cache for painted inline images, keyed by
+    /// `ui::reading::paint_inline_image`'s cache key (content-id/data-hash
+    /// plus the band's rendered dimensions) — so re-encoding only happens
+    /// once per (image, size), not every frame. Cleared alongside
+    /// `inline_images` in `open_message`, since a newly opened message's cids
+    /// are unrelated to whatever was cached for the previous one.
+    pub image_protocols: std::collections::HashMap<String, ratatui_image::protocol::Protocol>,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -378,6 +392,8 @@ impl App {
             reading_content_rows: 0,
             inline_images: std::collections::HashMap::new(),
             requested_inline: std::collections::HashSet::new(),
+            picker: None,
+            image_protocols: std::collections::HashMap::new(),
         };
         app.reload_folders();
         app.reload_account();
@@ -683,6 +699,7 @@ impl App {
         // an empty set in turn and each cid gets fetched twice.
         self.inline_images.clear();
         self.requested_inline.clear();
+        self.image_protocols.clear();
         self.reload_body();
         self.request_inline_images();
     }
