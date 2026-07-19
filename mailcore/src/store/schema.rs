@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
     ON messages(folder_id, received_at DESC);
 
+CREATE TABLE IF NOT EXISTS master_categories (
+    display_name TEXT PRIMARY KEY,
+    color        TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS contacts (
     address    TEXT PRIMARY KEY,
     name       TEXT NOT NULL DEFAULT '',

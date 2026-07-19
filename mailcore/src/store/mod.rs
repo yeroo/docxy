@@ -12,7 +12,8 @@ use std::path::Path;
 use rusqlite::{Connection, Row, params};
 
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, Message, Recipient,
+    AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, MasterCategory, Message,
+    Recipient,
 };
 use crate::json::{self, Value};
 
@@ -718,6 +719,38 @@ impl Store {
             "UPDATE messages SET categories = ?1 WHERE id = ?2",
             params![encode_categories(categories), id],
         );
+    }
+
+    /// Replaces the whole master category list in one transaction (Graph's
+    /// `/me/outlook/masterCategories` is not a delta endpoint — each fetch is
+    /// the full set, so replacing prunes deleted categories).
+    pub fn replace_master_categories(&self, cats: &[MasterCategory]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM master_categories", [])?;
+        for c in cats {
+            tx.execute(
+                "INSERT OR REPLACE INTO master_categories (display_name, color) VALUES (?1, ?2)",
+                params![c.display_name, c.color],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The master category list, ordered by display name.
+    pub fn master_categories(&self) -> Result<Vec<MasterCategory>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT display_name, color FROM master_categories ORDER BY display_name")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MasterCategory {
+                    display_name: row.get(0)?,
+                    color: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Locally marks a draft as sent (`is_draft = 0`) — the optimistic half
@@ -2006,6 +2039,36 @@ mod tests {
             rows[0].categories,
             vec!["Work".to_string(), "A B".to_string()]
         );
+    }
+
+    #[test]
+    fn master_categories_replace_and_read_round_trip() {
+        use crate::graph::model::MasterCategory;
+        let s = Store::open_in_memory().unwrap();
+        s.replace_master_categories(&[
+            MasterCategory {
+                display_name: "Work".into(),
+                color: "preset0".into(),
+            },
+            MasterCategory {
+                display_name: "Urgent".into(),
+                color: "preset1".into(),
+            },
+        ])
+        .unwrap();
+        let got = s.master_categories().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].display_name, "Urgent"); // ordered by name
+        assert_eq!(got[1].color, "preset0");
+        // Replace prunes the old set.
+        s.replace_master_categories(&[MasterCategory {
+            display_name: "Only".into(),
+            color: "none".into(),
+        }])
+        .unwrap();
+        let got = s.master_categories().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].display_name, "Only");
     }
 
     #[test]

@@ -393,6 +393,25 @@ pub fn plain_to_html(s: &str) -> String {
     out
 }
 
+/// One entry of the mailbox's master category list (Graph `outlookCategory`):
+/// a category's display name and its `color` (`"preset0"`…`"preset24"` or
+/// `"none"`). The UI maps `color` to a terminal color; the name is what a
+/// message's `categories` list references.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MasterCategory {
+    pub display_name: String,
+    pub color: String,
+}
+
+impl MasterCategory {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(MasterCategory {
+            display_name: str_field(v, "displayName"),
+            color: str_field(v, "color"),
+        })
+    }
+}
+
 /// One entry of a delta sync page: either an upserted message or the id of
 /// a message that was removed since the last sync.
 #[derive(Debug, Clone, PartialEq)]
@@ -678,6 +697,14 @@ mod tests {
         assert!(m.is_flagged);
         assert!(m.has_attachments);
         assert!(m.is_draft);
+    }
+
+    #[test]
+    fn master_category_parses_name_and_color() {
+        let v = parse(r#"{"id":"c1","displayName":"Work","color":"preset0"}"#).unwrap();
+        let c = MasterCategory::from_json(&v).unwrap();
+        assert_eq!(c.display_name, "Work");
+        assert_eq!(c.color, "preset0");
     }
 
     #[test]
