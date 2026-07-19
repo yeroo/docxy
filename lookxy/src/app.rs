@@ -849,13 +849,35 @@ impl App {
             return;
         };
         let attendees = self.store.event_attendees(&id).unwrap_or_default();
-        let offset = crate::ui::calendar::local_offset_minutes();
-        let start = crate::datetime::utc_iso_to_local(&send.start_utc, offset)
-            .map(crate::datetime::format_local)
-            .unwrap_or_default();
-        let end = crate::datetime::utc_iso_to_local(&send.end_utc, offset)
-            .map(crate::datetime::format_local)
-            .unwrap_or_default();
+        let (start, end) = if send.is_all_day {
+            // All-day dates are floating — never offset-converted (see
+            // `datetime::all_day_bounds`'s doc comment). Prefill as the exact
+            // inverse of `all_day_bounds`: Start is `start_utc`'s date;
+            // `end_utc` is the EXCLUSIVE next-day midnight after the last
+            // inclusive day, so End is `end_utc`'s date MINUS one day. Using
+            // `utc_iso_to_local` here (as the timed path below does) would
+            // prefill End from the exclusive boundary itself, and
+            // `all_day_bounds` would add another day to it on save — the
+            // event would grow by a day on every edit (BUG 1, whole-branch
+            // review).
+            let (sy, sm, sd) = crate::ui::calendar::date_of_utc(&send.start_utc);
+            let (ey, em, ed) = crate::ui::calendar::date_of_utc(&send.end_utc);
+            let end_days = crate::ui::calendar::days_from_civil(ey, em, ed) - 1;
+            let (ly, lm, ld) = crate::ui::calendar::civil_from_days(end_days);
+            (
+                format!("{sy:04}-{sm:02}-{sd:02}"),
+                format!("{ly:04}-{lm:02}-{ld:02}"),
+            )
+        } else {
+            let offset = crate::ui::calendar::local_offset_minutes();
+            let start = crate::datetime::utc_iso_to_local(&send.start_utc, offset)
+                .map(crate::datetime::format_local)
+                .unwrap_or_default();
+            let end = crate::datetime::utc_iso_to_local(&send.end_utc, offset)
+                .map(crate::datetime::format_local)
+                .unwrap_or_default();
+            (start, end)
+        };
         let attendees_text = attendees
             .into_iter()
             .map(|a| format!("{} <{}>", a.name, a.addr))
@@ -3643,6 +3665,47 @@ pub(crate) mod tests {
         }
         app.save_event_form();
         assert!(app.event_form.is_some()); // still open — invalid all-day date
+    }
+
+    /// BUG 1 (critical, whole-branch review): re-opening an all-day event for
+    /// editing and saving it back unchanged must reproduce the exact same
+    /// stored boundaries. `open_edit_event` used to prefill Start/End via
+    /// `utc_iso_to_local` (offset conversion), which for an all-day event is
+    /// wrong two ways: it prefills End from the *exclusive* `end_utc` (so
+    /// `all_day_bounds` treats it as the last inclusive day and adds another
+    /// day on save — the event grows by a day every edit), and on negative
+    /// UTC offsets it shifts the Start date a day earlier. Dates on an
+    /// all-day event are floating and must never be offset-converted — see
+    /// `datetime::all_day_bounds`'s doc comment.
+    #[test]
+    fn editing_an_all_day_event_round_trips_the_same_boundaries() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "Holiday".into();
+            f.all_day = true;
+            f.start = "2026-07-20".into();
+            f.end = "2026-07-20".into(); // one-day all-day
+        }
+        app.save_event_form();
+        let id = match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::CreateEvent { id }) => id,
+            other => panic!("expected CreateEvent, got {other:?}"),
+        };
+
+        // Re-open it for editing and save it back without changing anything.
+        app.selected_event = Some(id.clone());
+        app.open_edit_event();
+        assert!(app.event_form.is_some());
+        app.save_event_form();
+
+        // The stored boundaries must be unchanged: editing an all-day event
+        // must not grow or shift it.
+        let send = app.store.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(send.start_utc, "2026-07-20T00:00:00Z");
+        assert_eq!(send.end_utc, "2026-07-21T00:00:00Z");
+        assert!(send.is_all_day);
     }
 
     /// SEAM 1: editing a not-yet-synced `local:` event must NOT enqueue an

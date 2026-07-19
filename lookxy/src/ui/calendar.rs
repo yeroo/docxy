@@ -351,10 +351,13 @@ fn detail_header_lines(e: &EventRow) -> Vec<Line<'static>> {
     let start = to_local(&e.start_utc);
     let end = to_local(&e.end_utc);
     let when = if e.is_all_day {
-        format!(
-            "{:04}-{:02}-{:02} (all day)",
-            start.year, start.month, start.day
-        )
+        // All-day dates are floating — read the same absolute
+        // `date_of_utc` source the agenda buckets by, not `to_local`'s
+        // offset conversion (see BUG 2 in the whole-branch review: on
+        // negative UTC offsets `to_local` shifted this a day earlier than
+        // the agenda's own bucketing of the same event).
+        let (y, m, d) = date_of_utc(&e.start_utc);
+        format!("{y:04}-{m:02}-{d:02} (all day)")
     } else {
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}\u{2013}{:02}:{:02}",
@@ -515,7 +518,7 @@ fn to_local(iso_utc: &str) -> LocalDateTime {
 /// The `(year, month, day)` in the leading `YYYY-MM-DD` of a stored UTC
 /// timestamp — used for all-day events, whose date is absolute (floating) and
 /// must NOT be shifted by `to_local`'s offset conversion.
-fn date_of_utc(iso: &str) -> (i64, u32, u32) {
+pub(crate) fn date_of_utc(iso: &str) -> (i64, u32, u32) {
     // `iso` is an ASCII ISO-8601 `YYYY-MM-DDT…`; `get(..)` is bounds/UTF-8 safe.
     let year: i64 = iso.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(0);
     let month: u32 = iso.get(5..7).and_then(|s| s.parse().ok()).unwrap_or(1);
