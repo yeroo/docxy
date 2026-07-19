@@ -479,6 +479,124 @@ impl Attendee {
     }
 }
 
+/// The recurrence pattern kind lookxy can create — a subset of Graph's
+/// `recurrencePattern.type` (`absoluteMonthly` for `Monthly`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceKind {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl RecurrenceKind {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            RecurrenceKind::Daily => "daily",
+            RecurrenceKind::Weekly => "weekly",
+            RecurrenceKind::Monthly => "absoluteMonthly",
+        }
+    }
+    fn from_wire(s: &str) -> Option<RecurrenceKind> {
+        match s {
+            "daily" => Some(RecurrenceKind::Daily),
+            "weekly" => Some(RecurrenceKind::Weekly),
+            "absoluteMonthly" => Some(RecurrenceKind::Monthly),
+            _ => None,
+        }
+    }
+}
+
+/// A recurring event's pattern + range, as lookxy creates it. Serializes to
+/// Graph's `event.recurrence` (`to_json`); `from_json` round-trips it for the
+/// store (see `Store::event_for_send`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recurrence {
+    pub kind: RecurrenceKind,
+    pub interval: u32,
+    pub days_of_week: Vec<String>, // "monday".."sunday" (weekly)
+    pub day_of_month: u32,         // absoluteMonthly
+    pub start_date: String,        // "YYYY-MM-DD" (range.startDate)
+    pub until: Option<String>,     // "YYYY-MM-DD" (range endDate), None = noEnd
+}
+
+impl Recurrence {
+    pub fn to_json(&self) -> Value {
+        let mut pattern = vec![
+            (
+                "type".to_string(),
+                Value::Str(self.kind.as_wire().to_string()),
+            ),
+            ("interval".to_string(), Value::Num(self.interval as f64)),
+        ];
+        if self.kind == RecurrenceKind::Weekly {
+            pattern.push((
+                "daysOfWeek".to_string(),
+                Value::Array(
+                    self.days_of_week
+                        .iter()
+                        .map(|d| Value::Str(d.clone()))
+                        .collect(),
+                ),
+            ));
+            pattern.push((
+                "firstDayOfWeek".to_string(),
+                Value::Str("sunday".to_string()),
+            ));
+        }
+        if self.kind == RecurrenceKind::Monthly {
+            pattern.push((
+                "dayOfMonth".to_string(),
+                Value::Num(self.day_of_month as f64),
+            ));
+        }
+        let mut range = vec![
+            (
+                "type".to_string(),
+                Value::Str(if self.until.is_some() { "endDate" } else { "noEnd" }.to_string()),
+            ),
+            ("startDate".to_string(), Value::Str(self.start_date.clone())),
+        ];
+        if let Some(end) = &self.until {
+            range.push(("endDate".to_string(), Value::Str(end.clone())));
+        }
+        Value::Object(vec![
+            ("pattern".to_string(), Value::Object(pattern)),
+            ("range".to_string(), Value::Object(range)),
+        ])
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let pattern = v.get("pattern")?;
+        let range = v.get("range")?;
+        let kind = RecurrenceKind::from_wire(pattern.get("type")?.as_str()?)?;
+        let interval = pattern.get("interval").and_then(Value::as_i64).unwrap_or(1) as u32;
+        let days_of_week = pattern
+            .get("daysOfWeek")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let day_of_month = pattern.get("dayOfMonth").and_then(Value::as_i64).unwrap_or(0) as u32;
+        let start_date = str_field(range, "startDate");
+        let until = range
+            .get("endDate")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(Recurrence {
+            kind,
+            interval,
+            days_of_week,
+            day_of_month,
+            start_date,
+            until,
+        })
+    }
+}
+
 /// A calendar event, as returned by Graph's `/me/calendarView` and
 /// `/me/events` endpoints. `start_utc`/`end_utc` are always normalized to
 /// `YYYY-MM-DDTHH:MM:SSZ` by `to_utc` (see its docs) — callers never see
@@ -697,6 +815,96 @@ mod tests {
         assert!(m.is_flagged);
         assert!(m.has_attachments);
         assert!(m.is_draft);
+    }
+
+    #[test]
+    fn recurrence_weekly_to_json_round_trips() {
+        let r = Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 2,
+            days_of_week: vec!["monday".into(), "wednesday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: Some("2026-12-31".into()),
+        };
+        let v = r.to_json();
+        let pat = v.get("pattern").unwrap();
+        assert_eq!(pat.get("type").and_then(Value::as_str), Some("weekly"));
+        assert_eq!(pat.get("interval").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            pat.get("daysOfWeek").and_then(Value::as_array).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            pat.get("firstDayOfWeek").and_then(Value::as_str),
+            Some("sunday")
+        );
+        let range = v.get("range").unwrap();
+        assert_eq!(range.get("type").and_then(Value::as_str), Some("endDate"));
+        assert_eq!(
+            range.get("startDate").and_then(Value::as_str),
+            Some("2026-07-20")
+        );
+        assert_eq!(
+            range.get("endDate").and_then(Value::as_str),
+            Some("2026-12-31")
+        );
+        assert_eq!(Recurrence::from_json(&v).unwrap(), r); // round-trip
+    }
+
+    #[test]
+    fn recurrence_daily_and_monthly_shapes() {
+        let daily = Recurrence {
+            kind: RecurrenceKind::Daily,
+            interval: 1,
+            days_of_week: vec![],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: None,
+        };
+        let v = daily.to_json();
+        assert_eq!(
+            v.get("pattern").unwrap().get("type").and_then(Value::as_str),
+            Some("daily")
+        );
+        assert!(v.get("pattern").unwrap().get("daysOfWeek").is_none());
+        assert_eq!(
+            v.get("range").unwrap().get("type").and_then(Value::as_str),
+            Some("noEnd")
+        );
+        assert!(v.get("range").unwrap().get("endDate").is_none());
+        assert_eq!(Recurrence::from_json(&v).unwrap(), daily);
+
+        let monthly = Recurrence {
+            kind: RecurrenceKind::Monthly,
+            interval: 1,
+            days_of_week: vec![],
+            day_of_month: 15,
+            start_date: "2026-07-15".into(),
+            until: None,
+        };
+        let v = monthly.to_json();
+        assert_eq!(
+            v.get("pattern").unwrap().get("type").and_then(Value::as_str),
+            Some("absoluteMonthly")
+        );
+        assert_eq!(
+            v.get("pattern")
+                .unwrap()
+                .get("dayOfMonth")
+                .and_then(Value::as_i64),
+            Some(15)
+        );
+        assert_eq!(Recurrence::from_json(&v).unwrap(), monthly);
+    }
+
+    #[test]
+    fn recurrence_from_json_rejects_unknown_type() {
+        let v = crate::json::parse(
+            r#"{"pattern":{"type":"yearly","interval":1},"range":{"type":"noEnd","startDate":"2026-01-01"}}"#,
+        )
+        .unwrap();
+        assert!(Recurrence::from_json(&v).is_none());
     }
 
     #[test]
