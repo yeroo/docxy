@@ -280,6 +280,7 @@ pub struct ConfirmModal {
 pub enum ConfirmAction {
     DeleteThread(Vec<String>),
     MoveThread(Vec<String>, String), // (message ids, destination folder id)
+    DeleteEvent(String),
 }
 
 /// One visible line in the threaded list: a collapsible conversation header,
@@ -881,6 +882,37 @@ impl App {
         });
     }
 
+    /// `x` in Calendar mode: opens the confirm modal to delete the selected
+    /// event (falling back to the highlighted agenda row, same resolution
+    /// order as `open_edit_event`). Refused — a status notice, no modal —
+    /// when the event is part of a recurring series
+    /// (`series_master_id.is_some()`): recurring events stay read + RSVP only
+    /// (see the calendar-edit design spec). A no-op if nothing is
+    /// selected/highlighted or the resolved id isn't in the currently-loaded
+    /// `agenda` window. The actual delete happens on `confirm_yes` (see its
+    /// `ConfirmAction::DeleteEvent` arm), not here.
+    pub fn delete_selected_event(&mut self) {
+        let Some(id) = self
+            .selected_event
+            .clone()
+            .or_else(|| self.highlighted_event_id())
+        else {
+            return;
+        };
+        let Some(row) = self.agenda.iter().find(|e| e.id == id) else {
+            return;
+        };
+        if row.series_master_id.is_some() {
+            self.error_notice = Some("Recurring events can't be deleted here.".to_string());
+            return;
+        }
+        let prompt = format!("Delete event '{}'?", row.subject);
+        self.confirm = Some(ConfirmModal {
+            prompt,
+            action: ConfirmAction::DeleteEvent(id),
+        });
+    }
+
     /// Ctrl-Enter in the event form: parse + validate the times, build the
     /// fields, and either create a new local event (+ `CreateEvent`) or
     /// update the edited one (+ `UpdateEvent`). A parse/validation failure
@@ -1221,6 +1253,11 @@ impl App {
                         });
                     }
                 }
+            }
+            ConfirmAction::DeleteEvent(id) => {
+                let _ = self.store.delete_event(&id);
+                let _ = self.sync.cmd_tx.send(SyncCommand::DeleteEvent { id });
+                self.reload_agenda();
             }
         }
         self.reload_messages();
@@ -3636,5 +3673,45 @@ pub(crate) mod tests {
 
         let send = app.store.event_for_send("e3").unwrap().unwrap();
         assert_eq!(send.body_html, "agenda"); // stable — not "&lt;p&gt;agenda&lt;/p&gt;"
+    }
+
+    #[test]
+    fn deleting_an_event_confirms_then_removes_and_enqueues() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.store
+            .upsert_event(&seeded_event("e1", "Standup", 1, None))
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e1".into());
+
+        app.delete_selected_event();
+        assert!(app.confirm.is_some()); // confirm modal opened, nothing deleted yet
+        assert!(app.store.event_for_send("e1").unwrap().is_some());
+
+        app.confirm_yes(); // execute
+        assert!(app.confirm.is_none());
+        assert!(app.store.event_for_send("e1").unwrap().is_none()); // removed locally
+        let cmd = app.test_cmd_rx.as_ref().unwrap().try_recv();
+        assert!(matches!(cmd, Ok(SyncCommand::DeleteEvent { .. })));
+    }
+
+    #[test]
+    fn deleting_a_recurring_event_is_refused() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.store
+            .upsert_event(&seeded_event(
+                "e2",
+                "Weekly Sync",
+                1,
+                Some("SERIES1".into()),
+            ))
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some("e2".into());
+
+        app.delete_selected_event();
+        assert!(app.confirm.is_none()); // refused, no modal
     }
 }

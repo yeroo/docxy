@@ -57,10 +57,13 @@ pub(crate) fn agenda_window() -> (String, String) {
 /// RSVP (accept/decline/tentative) on the highlighted row — routed here
 /// (rather than through `App::on_key_char`, the Mail-mode dispatch) so they
 /// can never clobber `a` (attachments) / `d` (delete)'s Mail-mode meanings;
-/// see `RsvpPrompt` — and `c`/`e` open the create/edit event form
+/// see `RsvpPrompt` — `c`/`e` open the create/edit event form
 /// (`App::open_new_event`/`open_edit_event`; `ui::eventform::handle_key`
 /// takes over key handling from there, checked ahead of this function's own
-/// call in `ui::handle_key` once the form is open). While the RSVP comment
+/// call in `ui::handle_key` once the form is open) — and `x` opens the
+/// confirm modal to delete the highlighted event (`App::delete_selected_event`;
+/// `ui::handle_key` takes over Enter/Esc from there once the modal is open,
+/// same precedence as the form). While the RSVP comment
 /// prompt is open, every key instead goes to `handle_rsvp_prompt_key` —
 /// checked first, ahead of the normal calendar keys, the same "prompt/popup
 /// takes over key handling" precedence `ui::handle_key` already gives the
@@ -80,6 +83,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('t') => app.start_rsvp("tentativelyAccepted"),
         KeyCode::Char('c') => app.open_new_event(),
         KeyCode::Char('e') => app.open_edit_event(),
+        KeyCode::Char('x') => app.delete_selected_event(),
         _ => {}
     }
 }
