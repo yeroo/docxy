@@ -11,7 +11,8 @@ use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::client::RsvpKind;
 use mailcore::graph::model::{
-    AttachmentKind, AttachmentMeta, AutomaticReplies, Body, MasterCategory, OofStatus,
+    AttachmentKind, AttachmentMeta, AutomaticReplies, Body, MasterCategory, OofStatus, Recurrence,
+    RecurrenceKind,
 };
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
@@ -1184,6 +1185,10 @@ impl App {
             start: crate::datetime::format_local(start_dt),
             end: crate::datetime::format_local(end_dt),
             all_day: false,
+            repeat: None,
+            interval: "1".into(),
+            days: [false; 7],
+            until: String::new(),
             location: String::new(),
             attendees: String::new(),
             body: String::new(),
@@ -1261,6 +1266,10 @@ impl App {
             start,
             end,
             all_day: send.is_all_day,
+            repeat: None,
+            interval: "1".into(),
+            days: [false; 7],
+            until: String::new(),
             location: send.location,
             attendees: attendees_text,
             // Plain text of the stored HTML (mirrors `open_draft`'s
@@ -1352,6 +1361,62 @@ impl App {
             }
             (start_utc, end_utc)
         };
+        // Recurrence is create-only (repeat != None and not editing). Any
+        // validation failure sets an inline error and returns without sending.
+        let recurrence = if let Some(kind) = form.repeat.filter(|_| form.editing_id.is_none()) {
+            let interval: u32 = match form.interval.trim().parse() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    self.set_form_error("Invalid interval");
+                    return;
+                }
+            };
+            let start_date = start_utc.get(..10).unwrap_or("").to_string();
+            let day_of_month: u32 = start_utc
+                .get(8..10)
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(1);
+            const NAMES: [&str; 7] = [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            ];
+            let mut days_of_week: Vec<String> = (0..7)
+                .filter(|&i| form.days[i])
+                .map(|i| NAMES[i].to_string())
+                .collect();
+            if kind == RecurrenceKind::Weekly && days_of_week.is_empty() {
+                days_of_week.push(weekday_name_of(&start_utc));
+            }
+            let until = if form.until.trim().is_empty() {
+                None
+            } else {
+                let u = form.until.trim().to_string();
+                if crate::datetime::parse_start(&u, now, off).is_none() {
+                    self.set_form_error("Invalid until date");
+                    return;
+                }
+                if u < start_date {
+                    self.set_form_error("Until is before start");
+                    return;
+                }
+                Some(u)
+            };
+            Some(Recurrence {
+                kind,
+                interval,
+                days_of_week,
+                day_of_month,
+                start_date,
+                until,
+            })
+        } else {
+            None
+        };
         let fields = mailcore::store::LocalEventFields {
             subject: form.title.clone(),
             start_utc,
@@ -1360,6 +1425,7 @@ impl App {
             location: form.location.clone(),
             body_html: compose_html::escape_html(&form.body), // plain text as HTML text
             attendees: parse_attendee_pairs(&form.attendees),
+            recurrence,
         };
         let editing = form.editing_id.clone();
         match editing {
@@ -2678,6 +2744,25 @@ fn is_web_url(url: &str) -> bool {
 /// `SystemTime::now()`, then re-derived into calendar fields via
 /// `ui::calendar::civil_from_days`. `open_new_event`'s prefill seed, and
 /// `save_event_form`'s "now" for `datetime::parse_start`/`parse_end`.
+/// The Graph weekday name (`"monday".."sunday"`) of a canonical-UTC start
+/// timestamp's date, via the calendar module's civil-day math (matching
+/// `ui::calendar::weekday_abbrev`'s `(z + 4).rem_euclid(7)` Sunday-indexed
+/// convention). Used to default a weekly recurrence to the start's weekday.
+fn weekday_name_of(start_utc: &str) -> String {
+    const NAMES: [&str; 7] = [
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+    ];
+    let (y, m, d) = crate::ui::calendar::date_of_utc(start_utc);
+    let z = crate::ui::calendar::days_from_civil(y, m, d);
+    NAMES[(z + 4).rem_euclid(7) as usize].to_string()
+}
+
 fn local_now() -> crate::datetime::LocalDateTime {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2807,6 +2892,86 @@ pub(crate) mod tests {
             Ok(SyncCommand::FetchAutomaticReplies) => {}
             other => panic!("expected FetchAutomaticReplies, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn save_event_form_weekly_builds_recurrence() {
+        use crate::ui::eventform::{EventField, EventForm};
+        use mailcore::graph::model::RecurrenceKind;
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        let mut days = [false; 7];
+        days[0] = true; // Mon
+        days[2] = true; // Wed
+        app.event_form = Some(EventForm {
+            editing_id: None,
+            title: "Standup".into(),
+            start: "2026-07-20 09:00".into(),
+            end: "2026-07-20 09:15".into(),
+            all_day: false,
+            repeat: Some(RecurrenceKind::Weekly),
+            interval: "2".into(),
+            days,
+            until: "2026-12-31".into(),
+            location: String::new(),
+            attendees: String::new(),
+            body: String::new(),
+            focus: EventField::Title,
+            autocomplete: None,
+            error: None,
+        });
+        app.save_event_form();
+        assert!(app.event_form.is_none(), "form should close on success");
+        let ev = app
+            .store
+            .events_in_window("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z")
+            .unwrap();
+        let id = ev
+            .iter()
+            .find(|e| e.subject == "Standup")
+            .unwrap()
+            .id
+            .clone();
+        let sent = app.store.event_for_send(&id).unwrap().unwrap();
+        let rec = sent.recurrence.unwrap();
+        assert_eq!(rec.kind, RecurrenceKind::Weekly);
+        assert_eq!(rec.interval, 2);
+        assert_eq!(
+            rec.days_of_week,
+            vec!["monday".to_string(), "wednesday".to_string()]
+        );
+        assert_eq!(rec.until.as_deref(), Some("2026-12-31"));
+    }
+
+    #[test]
+    fn save_event_form_invalid_interval_errors_and_sends_nothing() {
+        use crate::ui::eventform::{EventField, EventForm};
+        use mailcore::graph::model::RecurrenceKind;
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.event_form = Some(EventForm {
+            editing_id: None,
+            title: "X".into(),
+            start: "2026-07-20 09:00".into(),
+            end: "2026-07-20 09:15".into(),
+            all_day: false,
+            repeat: Some(RecurrenceKind::Daily),
+            interval: "zero".into(),
+            days: [false; 7],
+            until: String::new(),
+            location: String::new(),
+            attendees: String::new(),
+            body: String::new(),
+            focus: EventField::Title,
+            autocomplete: None,
+            error: None,
+        });
+        app.save_event_form();
+        assert!(app.event_form.is_some()); // stayed open
+        assert_eq!(
+            app.event_form.as_ref().unwrap().error.as_deref(),
+            Some("Invalid interval")
+        );
     }
 
     #[test]

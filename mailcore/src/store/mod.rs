@@ -2985,7 +2985,9 @@ mod calendar_tests {
         assert_eq!(sent.recurrence, Some(rec));
 
         // A non-recurring event round-trips to None.
-        let id2 = s.create_local_event(&sample_fields(), "Me", "me@x").unwrap();
+        let id2 = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
         assert_eq!(s.event_for_send(&id2).unwrap().unwrap().recurrence, None);
     }
 

@@ -552,7 +552,14 @@ impl Recurrence {
         let mut range = vec![
             (
                 "type".to_string(),
-                Value::Str(if self.until.is_some() { "endDate" } else { "noEnd" }.to_string()),
+                Value::Str(
+                    if self.until.is_some() {
+                        "endDate"
+                    } else {
+                        "noEnd"
+                    }
+                    .to_string(),
+                ),
             ),
             ("startDate".to_string(), Value::Str(self.start_date.clone())),
         ];
@@ -580,7 +587,10 @@ impl Recurrence {
                     .collect()
             })
             .unwrap_or_default();
-        let day_of_month = pattern.get("dayOfMonth").and_then(Value::as_i64).unwrap_or(0) as u32;
+        let day_of_month = pattern
+            .get("dayOfMonth")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as u32;
         let start_date = str_field(range, "startDate");
         let until = range
             .get("endDate")
@@ -832,7 +842,10 @@ mod tests {
         assert_eq!(pat.get("type").and_then(Value::as_str), Some("weekly"));
         assert_eq!(pat.get("interval").and_then(Value::as_i64), Some(2));
         assert_eq!(
-            pat.get("daysOfWeek").and_then(Value::as_array).unwrap().len(),
+            pat.get("daysOfWeek")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(
@@ -864,7 +877,10 @@ mod tests {
         };
         let v = daily.to_json();
         assert_eq!(
-            v.get("pattern").unwrap().get("type").and_then(Value::as_str),
+            v.get("pattern")
+                .unwrap()
+                .get("type")
+                .and_then(Value::as_str),
             Some("daily")
         );
         assert!(v.get("pattern").unwrap().get("daysOfWeek").is_none());
@@ -885,7 +901,10 @@ mod tests {
         };
         let v = monthly.to_json();
         assert_eq!(
-            v.get("pattern").unwrap().get("type").and_then(Value::as_str),
+            v.get("pattern")
+                .unwrap()
+                .get("type")
+                .and_then(Value::as_str),
             Some("absoluteMonthly")
         );
         assert_eq!(

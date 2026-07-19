@@ -369,7 +369,7 @@ fn detail_header_lines(e: &EventRow) -> Vec<Line<'static>> {
             start.year, start.month, start.day, start.hour, start.minute, end.hour, end.minute
         )
     };
-    vec![
+    let mut lines = vec![
         Line::from(format!("Subject: {}", e.subject)),
         Line::from(format!("When: {when}")),
         Line::from(format!(
@@ -377,7 +377,12 @@ fn detail_header_lines(e: &EventRow) -> Vec<Line<'static>> {
             e.organizer_name, e.organizer_addr
         )),
         Line::from(format!("Location: {}", e.location)),
-    ]
+    ];
+    // A series occurrence (synced from Graph) carries a `series_master_id`.
+    if e.series_master_id.is_some() {
+        lines.push(Line::from("\u{21bb} repeats"));
+    }
+    lines
 }
 
 /// Attendee lines for the detail pane: `store.event_attendees(id)`, one row

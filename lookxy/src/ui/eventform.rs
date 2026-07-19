@@ -17,6 +17,7 @@
 
 use crate::app::App;
 use crate::ui::border_style;
+use mailcore::graph::model::RecurrenceKind;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -32,6 +33,10 @@ pub enum EventField {
     Start,
     End,
     AllDay,
+    Repeat,
+    Interval,
+    Days,
+    Until,
     Location,
     Attendees,
     Body,
@@ -52,6 +57,12 @@ pub struct EventForm {
     pub start: String,
     pub end: String,
     pub all_day: bool,
+    /// `None` = a single event; `Some(kind)` = repeat daily/weekly/monthly.
+    /// Recurrence is create-only (ignored on an edit) — see `save_event_form`.
+    pub repeat: Option<RecurrenceKind>,
+    pub interval: String, // numeric text, default "1"
+    pub days: [bool; 7],  // Mon..Sun toggles, for weekly
+    pub until: String,    // "YYYY-MM-DD" or "" (no end)
     pub location: String,
     pub attendees: String,
     pub body: String,
@@ -78,6 +89,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(3), // Start
             Constraint::Length(3), // End
             Constraint::Length(3), // All-day
+            Constraint::Length(3), // Repeat
+            Constraint::Length(3), // Every (interval)
+            Constraint::Length(3), // Days
+            Constraint::Length(3), // Until
             Constraint::Length(3), // Location
             Constraint::Length(3), // Attendees
             Constraint::Min(3),    // Body
@@ -107,28 +122,62 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     draw_field(f, rows[2], "End", &form.end, form.focus == EventField::End);
     draw_all_day(f, rows[3], form.all_day, form.focus == EventField::AllDay);
+    let repeat_label = match form.repeat {
+        None => "( )None  ( )Daily  ( )Weekly  ( )Monthly",
+        Some(RecurrenceKind::Daily) => "(x)Daily  [None/Daily/Weekly/Monthly — Space cycles]",
+        Some(RecurrenceKind::Weekly) => "(x)Weekly  [None/Daily/Weekly/Monthly — Space cycles]",
+        Some(RecurrenceKind::Monthly) => "(x)Monthly  [None/Daily/Weekly/Monthly — Space cycles]",
+    };
     draw_field(
         f,
         rows[4],
+        "Repeat",
+        repeat_label,
+        form.focus == EventField::Repeat,
+    );
+    draw_field(
+        f,
+        rows[5],
+        "Every (interval)",
+        &form.interval,
+        form.focus == EventField::Interval,
+    );
+    draw_field(
+        f,
+        rows[6],
+        "Days (1-7 = Mon-Sun)",
+        &render_days(&form.days),
+        form.focus == EventField::Days,
+    );
+    draw_field(
+        f,
+        rows[7],
+        "Until (blank = no end)",
+        &form.until,
+        form.focus == EventField::Until,
+    );
+    draw_field(
+        f,
+        rows[8],
         "Location",
         &form.location,
         form.focus == EventField::Location,
     );
     draw_field(
         f,
-        rows[5],
+        rows[9],
         "Attendees",
         &form.attendees,
         form.focus == EventField::Attendees,
     );
     draw_field(
         f,
-        rows[6],
+        rows[10],
         "Body",
         &form.body,
         form.focus == EventField::Body,
     );
-    draw_footer(f, rows[7], form.error.as_deref());
+    draw_footer(f, rows[11], form.error.as_deref());
 
     if let Some(ac) = &form.autocomplete {
         if ac.field == crate::ui::compose::ComposeField::To {
@@ -137,9 +186,19 @@ pub fn draw(f: &mut Frame, app: &App) {
             // `refresh_attendee_autocomplete`) as a stand-in "this dropdown
             // belongs to the Attendees field" marker — `EventField` isn't
             // what the shared `Autocomplete` keys off of.
-            draw_autocomplete(f, rows[5], frame_area, ac);
+            draw_autocomplete(f, rows[9], frame_area, ac);
         }
     }
+}
+
+/// The Days field's display text: `[x]Mon [ ]Tue …` over Mon–Sun.
+fn render_days(days: &[bool; 7]) -> String {
+    const ABBR: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    days.iter()
+        .zip(ABBR)
+        .map(|(on, a)| format!("[{}]{a}", if *on { "x" } else { " " }))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One single-line field: a bordered box, bright when focused
@@ -319,6 +378,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 form.all_day = !form.all_day;
                 false
             }
+            KeyCode::Char(' ') if form.focus == EventField::Repeat => {
+                form.repeat = match form.repeat {
+                    None => Some(RecurrenceKind::Daily),
+                    Some(RecurrenceKind::Daily) => Some(RecurrenceKind::Weekly),
+                    Some(RecurrenceKind::Weekly) => Some(RecurrenceKind::Monthly),
+                    Some(RecurrenceKind::Monthly) => None,
+                };
+                false
+            }
+            KeyCode::Char(c @ '1'..='7') if form.focus == EventField::Days => {
+                let i = c as usize - '1' as usize; // '1'->0 (Mon) .. '7'->6 (Sun)
+                form.days[i] = !form.days[i];
+                false
+            }
             KeyCode::Char(c) => match form.focus {
                 EventField::Title => {
                     form.title.push(c);
@@ -333,6 +406,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     false
                 }
                 EventField::AllDay => false,
+                EventField::Repeat => false,
+                EventField::Interval => {
+                    form.interval.push(c);
+                    false
+                }
+                EventField::Days => false, // non-digit chars ignored
+                EventField::Until => {
+                    form.until.push(c);
+                    false
+                }
                 EventField::Location => {
                     form.location.push(c);
                     false
@@ -360,6 +443,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     false
                 }
                 EventField::AllDay => false,
+                EventField::Repeat => false,
+                EventField::Interval => {
+                    form.interval.pop();
+                    false
+                }
+                EventField::Days => false,
+                EventField::Until => {
+                    form.until.pop();
+                    false
+                }
                 EventField::Location => {
                     form.location.pop();
                     false
@@ -422,7 +515,11 @@ fn cycle_focus(form: &mut EventForm) {
         EventField::Title => EventField::Start,
         EventField::Start => EventField::End,
         EventField::End => EventField::AllDay,
-        EventField::AllDay => EventField::Location,
+        EventField::AllDay => EventField::Repeat,
+        EventField::Repeat => EventField::Interval,
+        EventField::Interval => EventField::Days,
+        EventField::Days => EventField::Until,
+        EventField::Until => EventField::Location,
         EventField::Location => EventField::Attendees,
         EventField::Attendees => EventField::Body,
         EventField::Body => EventField::Title,
@@ -441,6 +538,10 @@ mod tests {
             start: "2026-07-20 14:00".into(),
             end: "2026-07-20 15:00".into(),
             all_day: false,
+            repeat: None,
+            interval: "1".into(),
+            days: [false; 7],
+            until: String::new(),
             location: String::new(),
             attendees: String::new(),
             body: String::new(),
@@ -486,6 +587,10 @@ mod tests {
             EventField::Start,
             EventField::End,
             EventField::AllDay,
+            EventField::Repeat,
+            EventField::Interval,
+            EventField::Days,
+            EventField::Until,
             EventField::Location,
             EventField::Attendees,
             EventField::Body,
@@ -588,8 +693,9 @@ mod tests {
         app.mode = crate::app::Mode::Calendar;
         app.open_new_event();
 
-        // Focus Attendees (Title -> Start -> End -> AllDay -> Location -> Attendees).
-        for _ in 0..5 {
+        // Focus Attendees (Title -> Start -> End -> AllDay -> Repeat ->
+        // Interval -> Days -> Until -> Location -> Attendees).
+        for _ in 0..9 {
             handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         }
         assert_eq!(
