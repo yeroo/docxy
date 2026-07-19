@@ -33,6 +33,8 @@
 //! | `doc.replace-all` | `{query, text, case_sensitive?}` | `{replaced}` |
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
+//! | `doc.format` | `{start, end?, patch}` | `{formatted}` — one undo checkpoint; `patch` keys: `bold`/`italic`/`underline`/`strike`/`color`/`highlight`/`font`/`size` (≥1 required), set-to-value semantics |
+//! | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — one undo checkpoint; ≥1 of `style`/`align` required |
 
 use crate::{App, DocFormat};
 use ctlcore::json::Json;
@@ -77,6 +79,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.metadata" => Ok(metadata(app)),
         "doc.stats" => Ok(stats(app)),
         "doc.replace-all" => replace_all(app, args),
+        "doc.format" => format(app, args),
+        "doc.set-style" => set_style(app, args),
         "doc.undo" => Ok(undo(app)),
         "doc.redo" => Ok(redo(app)),
         "doc.export-pdf" => export_pdf(app, args),
@@ -105,7 +109,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         app.dirty = true;
         // A content edit flashes this pane's agent-status dot, so a watcher sees
         // the document being worked on.
-        if matches!(verb, "doc.replace-range" | "doc.insert" | "doc.append") {
+        if matches!(
+            verb,
+            "doc.replace-range" | "doc.insert" | "doc.append" | "doc.format" | "doc.set-style"
+        ) {
             ctlcore::signal_activity();
         }
         // doc.replace-all/doc.undo/doc.redo can each legitimately no-op (no
@@ -504,6 +511,98 @@ fn replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
         ctlcore::signal_activity();
     }
     Ok(Json::obj(vec![("replaced", Json::Num(replaced as f64))]))
+}
+
+/// Build `agent::RunPatch`'s wire pairs from the `patch` object's own JSON
+/// values — docxcore stays JSON-free, so scalars are stringified here
+/// (`true`/`false` for booleans, the raw text for strings, the number's text
+/// for numbers). Mirrors xlsxy's `control.rs::patch_pairs` for
+/// `cell.format`, byte-for-byte (a sibling crate this one can't depend on).
+fn patch_pairs(patch: &Json) -> Result<Vec<(String, String)>, String> {
+    let Json::Obj(pairs) = patch else {
+        return Err("doc.format needs a 'patch' object".to_string());
+    };
+    Ok(pairs
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                Json::Str(s) => s.clone(),
+                Json::Bool(b) => b.to_string(),
+                Json::Num(n) => n.to_string(),
+                Json::Null | Json::Arr(_) | Json::Obj(_) => String::new(),
+            };
+            (k.clone(), text)
+        })
+        .collect())
+}
+
+/// `doc.format {start, end?, patch}` → `{formatted}`. `patch` is the same
+/// wire shape as `cell.format`'s (a JSON object, ≥1 key), routed through
+/// `agent::RunPatch::parse` for validation/typing, then applied over the
+/// block range as ONE undo checkpoint via `agent::format_range` — see that
+/// function's doc comment for the set-to-value semantics.
+fn format(app: &mut App, args: &Json) -> Result<Json, String> {
+    let start = args
+        .get_usize("start")
+        .ok_or("doc.format needs a 'start' index")?;
+    let end = args.get_usize("end").unwrap_or(start);
+    let patch_arg = args.get("patch").ok_or("doc.format needs a 'patch'")?;
+    let pairs = patch_pairs(patch_arg)?;
+    let patch = agent::RunPatch::parse(&pairs)?;
+    let formatted = agent::format_range(&mut app.editor, start, end, &patch)?;
+    finish_edit(app);
+    Ok(Json::obj(vec![("formatted", Json::Num(formatted as f64))]))
+}
+
+/// Parse `left`/`center`/`right`/`justify` into `docxcore::model::Align` for
+/// `doc.set-style`'s `align` key — the wire vocabulary matching what
+/// `Editor::set_align` accepts. Unlike gridcore's cell-format `Align` (no
+/// `Justify` variant), docxcore's `Align` enum has one, so it's included
+/// here per the design spec's "include it unless the core enum lacks it"
+/// rule.
+fn parse_align(s: &str) -> Result<docxcore::model::Align, String> {
+    use docxcore::model::Align;
+    match s {
+        "left" => Ok(Align::Left),
+        "center" => Ok(Align::Center),
+        "right" => Ok(Align::Right),
+        "justify" => Ok(Align::Justify),
+        other => Err(format!(
+            "bad align '{other}' (want left/center/right/justify)"
+        )),
+    }
+}
+
+/// `doc.set-style {start, end?, style?, align?}` → `{styled}`. At least one
+/// of `style`/`align` is required. `style` is one of the Wave-2 markdown
+/// paragraph style ids (`Heading1`-`Heading6`/`Quote`/`SourceCode`) or
+/// `Normal` (clears the paragraph style). Applying a markdown-set id ensures
+/// its definition in this package's `word/styles.xml` first (Wave-2's
+/// `ensure_styles`, strictly additive) — but only AFTER
+/// `agent::validate_set_style_range` confirms the call would otherwise
+/// succeed (Wave-2's validate-before-mutate ordering, matching
+/// `prepare_markdown_blocks`'s doc comment above), and never for `Normal` or
+/// an align-only call.
+fn set_style(app: &mut App, args: &Json) -> Result<Json, String> {
+    let start = args
+        .get_usize("start")
+        .ok_or("doc.set-style needs a 'start' index")?;
+    let end = args.get_usize("end").unwrap_or(start);
+    let style = args.get_str("style");
+    let align = match args.get_str("align") {
+        Some(a) => Some(parse_align(a)?),
+        None => None,
+    };
+
+    agent::validate_set_style_range(&app.editor.doc, start, end, style, align)?;
+    if let Some(s) = style {
+        if s != "Normal" {
+            app.pkg.ensure_styles(&[s]);
+        }
+    }
+    let styled = agent::set_style_range(&mut app.editor, start, end, style, align)?;
+    finish_edit(app);
+    Ok(Json::obj(vec![("styled", Json::Num(styled as f64))]))
 }
 
 /// `doc.undo`: unwind the last edit, if any. A no-op (`{done:false}`, empty
@@ -1604,5 +1703,292 @@ mod tests {
         assert!(dispatch(&mut app, "doc.path", &Json::Null).is_ok());
         let err = dispatch(&mut app, "doc.frobnicate", &Json::Null).unwrap_err();
         assert!(err.contains("unknown verb"));
+    }
+
+    // -------------------------------------------------------------------
+    // doc.format
+    // -------------------------------------------------------------------
+
+    fn patch_arg(pairs: Vec<(&str, Json)>) -> Json {
+        args(vec![("patch", Json::obj(pairs))])
+    }
+
+    fn run_bold_flags(app: &App, block: usize) -> Vec<bool> {
+        let Block::Paragraph(p) = &app.editor.doc.body[block] else {
+            panic!("expected a paragraph")
+        };
+        p.content
+            .iter()
+            .map(|i| match i {
+                docxcore::model::Inline::Run(r) => r.props.bold,
+                other => panic!("expected a run: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn format_bold_over_range_sets_every_run_bold() {
+        let mut app = app_with(&["A", "B"]);
+        let mut a = patch_arg(vec![("bold", Json::Bool(true))]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(0.0)));
+            pairs.push(("end".to_string(), Json::Num(1.0)));
+        }
+        let r = format(&mut app, &a).unwrap();
+        assert_eq!(r.get_usize("formatted"), Some(2));
+        assert_eq!(run_bold_flags(&app, 0), vec![true]);
+        assert_eq!(run_bold_flags(&app, 1), vec![true]);
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn format_patch_needs_at_least_one_key() {
+        let mut app = app_with(&["A"]);
+        let err = format(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("patch", Json::obj(vec![])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, "patch needs at least one key");
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn format_unknown_patch_key_is_named() {
+        let mut app = app_with(&["A"]);
+        let mut a = patch_arg(vec![("frobnicate", Json::Bool(true))]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(0.0)));
+        }
+        let err = format(&mut app, &a).unwrap_err();
+        assert!(err.contains("frobnicate"), "{err}");
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn format_bad_color_is_rejected() {
+        let mut app = app_with(&["A"]);
+        let mut a = patch_arg(vec![("color", Json::Str("red".into()))]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(0.0)));
+        }
+        let err = format(&mut app, &a).unwrap_err();
+        assert!(err.contains("color"), "{err}");
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn format_needs_a_patch_object() {
+        let mut app = app_with(&["A"]);
+        let err = format(&mut app, &args(vec![("start", Json::Num(0.0))])).unwrap_err();
+        assert!(err.contains("patch"), "{err}");
+    }
+
+    #[test]
+    fn format_is_one_undo_group() {
+        let mut app = app_with(&["A"]);
+        let before = app.editor.doc.clone();
+        let mut a = patch_arg(vec![
+            ("bold", Json::Bool(true)),
+            ("italic", Json::Bool(true)),
+            ("color", Json::Str("#00FF00".into())),
+        ]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(0.0)));
+        }
+        format(&mut app, &a).unwrap();
+        assert_ne!(app.editor.doc, before);
+        assert!(app.editor.undo());
+        assert_eq!(
+            app.editor.doc, before,
+            "one undo restores exact prior props"
+        );
+        assert!(!app.editor.undo());
+    }
+
+    #[test]
+    fn dispatch_routes_doc_format() {
+        let mut app = app_with(&["A"]);
+        let mut a = patch_arg(vec![("bold", Json::Bool(true))]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(0.0)));
+        }
+        assert!(dispatch(&mut app, "doc.format", &a).is_ok());
+        assert_eq!(run_bold_flags(&app, 0), vec![true]);
+    }
+
+    // -------------------------------------------------------------------
+    // doc.set-style
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn set_style_needs_style_or_align() {
+        let mut app = app_with(&["A"]);
+        let err = set_style(&mut app, &args(vec![("start", Json::Num(0.0))])).unwrap_err();
+        assert_eq!(err, "set-style needs 'style' or 'align'");
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn set_style_unknown_style_lists_the_accepted_set() {
+        let mut app = app_with(&["A"]);
+        let err = set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("style", Json::Str("Bogus".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("Bogus"), "{err}");
+        for id in docxcore::agent::MARKDOWN_PARAGRAPH_STYLE_IDS {
+            assert!(err.contains(*id), "{err} missing {id}");
+        }
+        assert!(err.contains("Normal"), "{err}");
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn set_style_bad_align_is_rejected() {
+        let mut app = app_with(&["A"]);
+        let err = set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("align", Json::Str("middle".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("middle"), "{err}");
+    }
+
+    #[test]
+    fn set_style_heading1_ensures_the_style_part_on_a_bare_package() {
+        let mut app = app_with(&["Title"]);
+        let styles_before =
+            String::from_utf8_lossy(app.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(!styles_before.contains("Heading1"), "{styles_before}");
+
+        let r = set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("style", Json::Str("Heading1".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("styled"), Some(1));
+
+        let styles = String::from_utf8_lossy(app.pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(styles.contains("w:styleId=\"Heading1\""), "{styles}");
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn set_style_normal_does_not_ensure_styles() {
+        let mut app = app_with(&["A"]);
+        let before = app.pkg.part("word/styles.xml").unwrap().to_vec();
+
+        set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("style", Json::Str("Normal".into())),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.pkg.part("word/styles.xml").unwrap(),
+            before.as_slice(),
+            "Normal must not touch styles.xml"
+        );
+    }
+
+    #[test]
+    fn set_style_align_only_does_not_ensure_styles() {
+        let mut app = app_with(&["A"]);
+        let before = app.pkg.part("word/styles.xml").unwrap().to_vec();
+
+        let r = set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("align", Json::Str("center".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_usize("styled"), Some(1));
+
+        assert_eq!(
+            app.pkg.part("word/styles.xml").unwrap(),
+            before.as_slice(),
+            "an align-only call must not touch styles.xml"
+        );
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn set_style_out_of_bounds_leaves_the_package_untouched() {
+        let mut app = app_with(&["A"]);
+        let before = app.pkg.part("word/styles.xml").unwrap().to_vec();
+        let err = set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("end", Json::Num(9.0)),
+                ("style", Json::Str("Heading1".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "{err}");
+        assert_eq!(app.pkg.part("word/styles.xml").unwrap(), before.as_slice());
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn dispatch_routes_doc_set_style() {
+        let mut app = app_with(&["A"]);
+        assert!(
+            dispatch(
+                &mut app,
+                "doc.set-style",
+                &args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("style", Json::Str("Quote".into())),
+                ]),
+            )
+            .is_ok()
+        );
+        let Block::Paragraph(p) = &app.editor.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.props.style_id.as_deref(), Some("Quote"));
+    }
+
+    #[test]
+    fn format_and_set_style_round_trip_through_markdown_export() {
+        let mut app = app_with(&["Title", "body text"]);
+        set_style(
+            &mut app,
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("style", Json::Str("Heading1".into())),
+            ]),
+        )
+        .unwrap();
+        let mut a = patch_arg(vec![("bold", Json::Bool(true))]);
+        if let Json::Obj(pairs) = &mut a {
+            pairs.push(("start".to_string(), Json::Num(1.0)));
+        }
+        format(&mut app, &a).unwrap();
+
+        let out = export(&app, &args(vec![("format", Json::Str("markdown".into()))])).unwrap();
+        let text = out.get_str("text").unwrap();
+        assert!(text.contains("# Title"), "heading missing: {text}");
+        assert!(text.contains("**body text**"), "bold missing: {text}");
     }
 }

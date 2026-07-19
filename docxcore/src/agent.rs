@@ -16,7 +16,7 @@
 //! caller knows which indices are paragraphs (the ones the edit verbs accept).
 
 use crate::editor::{Caret, Clip, Editor, Match};
-use crate::model::{Block, Document};
+use crate::model::{Align, Block, Document, Inline, ParProps, RunProps};
 
 /// One block's read-only summary, as reported by [`read`].
 pub struct BlockInfo {
@@ -460,6 +460,348 @@ pub fn redo(ed: &mut Editor) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Formatting verbs (undoable, via the Editor) — `doc.format` / `doc.set-style`
+// ---------------------------------------------------------------------------
+
+/// The character-formatting names [`RunPatch::parse`]'s `highlight` key
+/// accepts — the exact strings [`Editor::set_highlight`] stores verbatim on
+/// [`RunProps::highlight`], matching every value `docxy`'s own Highlight
+/// ribbon picker ever produces (`docxy/src/main.rs`'s `highlight_name`).
+/// `"none"` is also accepted, as a 9th wire value, but *clears* the highlight
+/// rather than naming a color — [`parse_highlight`] handles it specially, so
+/// it isn't listed here.
+pub const HIGHLIGHT_NAMES: &[&str] = &[
+    "yellow",
+    "green",
+    "cyan",
+    "magenta",
+    "red",
+    "blue",
+    "lightGray",
+    "darkYellow",
+];
+
+/// A `doc.format` patch: each field `Some` means the wire patch set that key;
+/// `None` means the key was absent, so [`format_range`] leaves that aspect of
+/// every touched run untouched. Field types mirror [`RunProps`]'s directly,
+/// except:
+/// - `bold`/`italic`/`underline`/`strike` are plain `bool`s (SET-to-value),
+///   not toggles — see [`format_range`]'s doc comment.
+/// - `size_half_pts` is this crate's half-point unit (what
+///   [`Editor::set_font_size`] takes); the wire key is `size` in whole/
+///   fractional **points** — [`RunPatch::parse`] converts.
+///
+/// Deliberately JSON-free, per `gridcore::format::FormatPatch`'s precedent (a
+/// sibling crate this one can't depend on, so the shape — not the code — is
+/// shared): a host builds `&[(String, String)]` wire pairs from its own JSON
+/// and hands them to [`RunPatch::parse`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunPatch {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub strike: Option<bool>,
+    pub color: Option<(u8, u8, u8)>,
+    /// `Some(None)` clears the highlight (wire `"none"`); `Some(Some(name))`
+    /// sets it to one of [`HIGHLIGHT_NAMES`]; `None` (the key was absent from
+    /// the patch) leaves every touched run's highlight untouched.
+    pub highlight: Option<Option<String>>,
+    pub font: Option<String>,
+    pub size_half_pts: Option<u32>,
+}
+
+impl RunPatch {
+    /// Parse wire key/value pairs into a [`RunPatch`].
+    ///
+    /// Errors (all `String`, meant to surface to the agent verbatim) mirror
+    /// `gridcore::format::FormatPatch::parse`'s family:
+    /// - no pairs at all → `"patch needs at least one key"`
+    /// - an unrecognized key → names the key
+    /// - `bold`/`italic`/`underline`/`strike` not `"true"`/`"false"`
+    /// - `color` not `"#RRGGBB"` → `"bad color '<v>' (want \"#RRGGBB\")"`
+    /// - `highlight` outside [`HIGHLIGHT_NAMES`] ∪ `{"none"}`
+    /// - `size` not a positive finite number
+    pub fn parse(pairs: &[(String, String)]) -> Result<RunPatch, String> {
+        if pairs.is_empty() {
+            return Err("patch needs at least one key".to_string());
+        }
+        let mut patch = RunPatch::default();
+        for (key, value) in pairs {
+            match key.as_str() {
+                "bold" => patch.bold = Some(parse_patch_bool("bold", value)?),
+                "italic" => patch.italic = Some(parse_patch_bool("italic", value)?),
+                "underline" => patch.underline = Some(parse_patch_bool("underline", value)?),
+                "strike" => patch.strike = Some(parse_patch_bool("strike", value)?),
+                "color" => patch.color = Some(parse_hex_color(value)?),
+                "highlight" => patch.highlight = Some(parse_highlight(value)?),
+                "font" => patch.font = Some(value.clone()),
+                "size" => patch.size_half_pts = Some(parse_size(value)?),
+                other => return Err(format!("unknown patch key '{other}'")),
+            }
+        }
+        Ok(patch)
+    }
+}
+
+fn parse_patch_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("'{key}' must be true or false, got '{other}'")),
+    }
+}
+
+/// Parse `"#RRGGBB"` (case-insensitive hex digits) into `(r, g, b)`. Copied
+/// byte-for-byte from `gridcore::format::parse_hex_color` (a sibling crate
+/// this one can't depend on) so `doc.format`'s `bad color '<v>'` wording and
+/// strict hex-digit rejection (no `u8::from_str_radix`-style leading `+`)
+/// match `cell.format`'s exactly.
+fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
+    let bad = || format!("bad color '{s}' (want \"#RRGGBB\")");
+    let hex = s.strip_prefix('#').ok_or_else(bad)?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return Err(bad());
+    }
+    fn hex_digit(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = hex.as_bytes();
+    let byte =
+        |i: usize| -> Option<u8> { Some((hex_digit(bytes[i])? << 4) | hex_digit(bytes[i + 1])?) };
+    match (byte(0), byte(2), byte(4)) {
+        (Some(r), Some(g), Some(b)) => Ok((r, g, b)),
+        _ => Err(bad()),
+    }
+}
+
+fn parse_highlight(value: &str) -> Result<Option<String>, String> {
+    if value == "none" {
+        return Ok(None);
+    }
+    if HIGHLIGHT_NAMES.contains(&value) {
+        return Ok(Some(value.to_string()));
+    }
+    Err(format!(
+        "bad highlight '{value}' (want one of {}, or none)",
+        HIGHLIGHT_NAMES.join(", ")
+    ))
+}
+
+/// Parse a whole/fractional POINTS value (`doc.format`'s wire `size` key)
+/// into the half-points [`Editor::set_font_size`] takes.
+fn parse_size(value: &str) -> Result<u32, String> {
+    let pts: f32 = value.parse().map_err(|_| format!("bad size '{value}'"))?;
+    if !pts.is_finite() || pts <= 0.0 {
+        return Err(format!("bad size '{value}'"));
+    }
+    Ok((pts * 2.0).round() as u32)
+}
+
+/// Push exactly ONE undo checkpoint for a block-range formatting operation
+/// ([`format_range`] / [`set_style_range`]), then leave the editor ready for
+/// the caller's own direct mutation of `ed.doc.body[start..=end]`.
+///
+/// Neither `Editor::checkpoint` nor the private `map_props`/`for_each_para`
+/// helpers behind its setters are `pub`, and this module doesn't touch
+/// `editor.rs` — so the only way to land exactly one entry on the Editor's
+/// own undo stack is through a real `pub` mutating call. [`Editor::set_align`]
+/// is the right shape: unlike the run-level setters (`set_color`/`set_font`/…,
+/// built on the private `map_props`, which checkpoints only when there's an
+/// active selection), `set_align` checkpoints unconditionally, even with none
+/// — falling back to just the caret's own paragraph. So clearing `ed.anchor`
+/// first and pointing the caret at `start` makes it touch exactly ONE
+/// paragraph (`start` itself, already confirmed to be one by the caller's
+/// `require_para` check), never any nested table-cell content a genuine
+/// multi-paragraph selection over `[start..=end]` could reach if a table sat
+/// inside the range — `Editor::selection_spans` flattens ALL paragraphs,
+/// including nested ones, between the anchor's and caret's positions in
+/// document order (see `all_paragraph_paths`), which is out of bounds for
+/// this wave's block-range-only granularity (tables mid-range are left
+/// untouched — see [`format_range`]'s doc comment). Passing back `start`'s
+/// own current align is an exact no-op value-wise, so the caller is free to
+/// immediately overwrite `ed.doc.body[start..=end]` (including `start`'s own
+/// align, if that's part of the patch) without colliding with this call's
+/// effect.
+fn checkpoint_for_block_range(ed: &mut Editor, start: usize) {
+    ed.anchor = None;
+    ed.caret = Caret::top(start, 0);
+    let align = ed.caret_para_props().align;
+    ed.set_align(align);
+}
+
+/// Apply `patch`'s SET-to-value fields to every run in `content` — both bare
+/// [`Inline::Run`]s and the runs inside an [`Inline::Hyperlink`]. Every other
+/// inline kind (tabs, breaks, footnote refs, …) is left untouched, matching
+/// `Editor`'s own char-range formatting helpers (`editor.rs`'s
+/// `edit_run_range`), which likewise never touches a `Tab`'s embedded
+/// `RunProps`.
+fn apply_run_patch(content: &mut [Inline], patch: &RunPatch) {
+    for inline in content.iter_mut() {
+        match inline {
+            Inline::Run(r) => apply_run_patch_props(&mut r.props, patch),
+            Inline::Hyperlink(h) => {
+                for r in h.runs.iter_mut() {
+                    apply_run_patch_props(&mut r.props, patch);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
+    if let Some(v) = patch.bold {
+        props.bold = v;
+    }
+    if let Some(v) = patch.italic {
+        props.italic = v;
+    }
+    if let Some(v) = patch.underline {
+        props.underline = v;
+    }
+    if let Some(v) = patch.strike {
+        props.strike = v;
+    }
+    if let Some((r, g, b)) = patch.color {
+        props.color = Some(format!("{r:02X}{g:02X}{b:02X}"));
+    }
+    if let Some(h) = &patch.highlight {
+        props.highlight = h.clone();
+    }
+    if let Some(f) = &patch.font {
+        props.font = Some(f.clone());
+    }
+    if let Some(sz) = patch.size_half_pts {
+        props.size_half_pts = Some(sz);
+    }
+}
+
+/// Format every run in paragraphs `[start..=end]` (inclusive) per `patch` —
+/// **SET-to-value** semantics: `bold:true` makes every touched run bold, full
+/// stop, whether it started bold, plain, or mixed within the range; it is
+/// **not** the toggle `Editor::toggle_bold` implements, so applying the same
+/// patch twice is idempotent. Non-paragraph blocks in the range (tables) are
+/// left untouched but still counted — see [`checkpoint_for_block_range`]'s
+/// doc comment for why this deliberately never recurses into a table's
+/// cells.
+///
+/// Returns the number of blocks in `[start..=end]` (== `end - start + 1`,
+/// matching `doc.format`'s `{formatted:N}` reply). ONE undo checkpoint
+/// regardless of how many of `patch`'s fields are set.
+pub fn format_range(
+    ed: &mut Editor,
+    start: usize,
+    end: usize,
+    patch: &RunPatch,
+) -> Result<usize, String> {
+    let n = ed.doc.body.len();
+    bounds(start, end, n)?;
+    require_para(&ed.doc.body, start)?;
+    require_para(&ed.doc.body, end)?;
+
+    checkpoint_for_block_range(ed, start);
+    for block in &mut ed.doc.body[start..=end] {
+        if let Block::Paragraph(p) = block {
+            apply_run_patch(&mut p.content, patch);
+        }
+    }
+    Ok(end - start + 1)
+}
+
+/// Apply paragraph style `style` (`w:pStyle`) directly: `"Normal"` clears it
+/// (and the resolved heading level) back to the default, matching
+/// `Editor::set_para_style(None)`'s effect; any other value is stored as-is,
+/// with the heading level re-resolved from it (`crate::load::heading_level`),
+/// matching `Editor::set_para_style(Some(id))`'s effect.
+fn apply_style_to_para(pr: &mut ParProps, style: &str) {
+    if style == "Normal" {
+        pr.style_id = None;
+        pr.heading_level = None;
+    } else {
+        pr.heading_level = crate::load::heading_level(style);
+        pr.style_id = Some(style.to_string());
+    }
+}
+
+/// Validate a would-be [`set_style_range`] call — bounds/paragraph-kind at
+/// both endpoints, at least one of `style`/`align` present, and (when given)
+/// `style` names one of [`MARKDOWN_PARAGRAPH_STYLE_IDS`] or `"Normal"`.
+///
+/// Pure (no `Editor`, no `Package`): a control surface must call this FIRST,
+/// before its own `Package::ensure_styles` mutation for a markdown-set style
+/// id — same validate-before-mutate ordering as `validate_replace_range`
+/// before `prepare_markdown_blocks` in `docxy::control` (see that function's
+/// doc comment) — then still let [`set_style_range`] re-validate on the real
+/// call, exactly as `replace_range_blocks` re-validates after
+/// `prepare_markdown_blocks` runs.
+pub fn validate_set_style_range(
+    doc: &Document,
+    start: usize,
+    end: usize,
+    style: Option<&str>,
+    align: Option<Align>,
+) -> Result<(), String> {
+    let n = doc.body.len();
+    bounds(start, end, n)?;
+    require_para(&doc.body, start)?;
+    require_para(&doc.body, end)?;
+    if style.is_none() && align.is_none() {
+        return Err("set-style needs 'style' or 'align'".to_string());
+    }
+    if let Some(s) = style {
+        if s != "Normal" && !MARKDOWN_PARAGRAPH_STYLE_IDS.contains(&s) {
+            return Err(format!(
+                "unknown style '{s}' (want one of {}, Normal)",
+                MARKDOWN_PARAGRAPH_STYLE_IDS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Set the paragraph style and/or alignment of paragraphs `[start..=end]`
+/// (inclusive). `style` is `None` (untouched), `"Normal"` (clears the style),
+/// or one of [`MARKDOWN_PARAGRAPH_STYLE_IDS`]; `align` is `None` (untouched)
+/// or an [`Align`] value. Non-paragraph blocks in the range are left
+/// untouched but still counted, same as [`format_range`].
+///
+/// The caller (a control surface) is responsible for `Package::ensure_styles`
+/// on a markdown-set `style` BEFORE this call — see
+/// [`validate_set_style_range`]'s doc comment; this function only touches the
+/// live `Document`, never a `Package`, so it never ensures anything itself.
+///
+/// Returns the number of blocks in `[start..=end]`. ONE undo checkpoint
+/// regardless of whether `style`, `align`, or both are set — see
+/// [`checkpoint_for_block_range`]'s doc comment.
+pub fn set_style_range(
+    ed: &mut Editor,
+    start: usize,
+    end: usize,
+    style: Option<&str>,
+    align: Option<Align>,
+) -> Result<usize, String> {
+    validate_set_style_range(&ed.doc, start, end, style, align)?;
+
+    checkpoint_for_block_range(ed, start);
+    for block in &mut ed.doc.body[start..=end] {
+        if let Block::Paragraph(p) = block {
+            if let Some(s) = style {
+                apply_style_to_para(&mut p.props, s);
+            }
+            if let Some(a) = align {
+                p.props.align = a;
+            }
+        }
+    }
+    Ok(end - start + 1)
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -495,7 +837,7 @@ pub fn bounds(start: usize, end: usize, n: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Document, Inline, ParProps, Paragraph, Run, RunProps};
+    use crate::model::{Document, Inline, ParProps, Paragraph, Run, RunProps, Table};
 
     /// A document of simple text paragraphs (same fixture shape as
     /// `docxy/src/control.rs`'s `doc_with`).
@@ -517,6 +859,52 @@ mod tests {
 
     fn paras(doc: &Document) -> Vec<String> {
         doc.body.iter().map(|b| b.plain_text()).collect()
+    }
+
+    /// A paragraph with one run per `(text, bold)` pair — used to build
+    /// mixed bold/plain selections for the `format_range` determinism tests.
+    fn para_with_runs(runs: &[(&str, bool)]) -> Block {
+        Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: runs
+                .iter()
+                .map(|&(t, bold)| {
+                    Inline::Run(Run {
+                        text: t.to_string(),
+                        props: RunProps {
+                            bold,
+                            ..RunProps::default()
+                        },
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    /// Every run's bold flag across a paragraph's content, in order — used to
+    /// assert `format_range`'s per-run effect on a mixed selection.
+    fn bold_flags(b: &Block) -> Vec<bool> {
+        let Block::Paragraph(p) = b else {
+            panic!("expected a paragraph: {b:?}")
+        };
+        p.content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => r.props.bold,
+                other => panic!("expected a run: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Build a [`RunPatch`] from `key: value` string pairs via
+    /// [`RunPatch::parse`] — the same host-buildable wire shape
+    /// `docxy::control` feeds it, so these tests exercise the real parser.
+    fn run_patch(pairs: &[(&str, &str)]) -> RunPatch {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|&(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        RunPatch::parse(&owned).unwrap()
     }
 
     #[test]
@@ -822,5 +1210,322 @@ mod tests {
         assert_eq!(paras(&ed.doc), vec!["B"]);
         // The redo stack is empty again.
         assert!(!redo(&mut ed));
+    }
+
+    // -----------------------------------------------------------------------
+    // RunPatch::parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_patch_parse_empty_pairs_errors() {
+        assert_eq!(
+            RunPatch::parse(&[]).unwrap_err(),
+            "patch needs at least one key"
+        );
+    }
+
+    #[test]
+    fn run_patch_parse_unknown_key_names_itself() {
+        let err = RunPatch::parse(&[("wat".to_string(), "1".to_string())]).unwrap_err();
+        assert!(err.contains("wat"), "{err}");
+    }
+
+    #[test]
+    fn run_patch_parse_bad_bool_is_rejected() {
+        let err = RunPatch::parse(&[("bold".to_string(), "yes".to_string())]).unwrap_err();
+        assert!(err.contains("bold"), "{err}");
+    }
+
+    #[test]
+    fn run_patch_parse_bad_color_is_rejected() {
+        for bad in ["FF0000", "#FF00", "#GGGGGG", "red", "#+00000"] {
+            let err = RunPatch::parse(&[("color".to_string(), bad.to_string())]).unwrap_err();
+            assert!(err.contains("color"), "input '{bad}': {err}");
+        }
+    }
+
+    #[test]
+    fn run_patch_parse_bad_highlight_is_rejected() {
+        let err = RunPatch::parse(&[("highlight".to_string(), "purple".to_string())]).unwrap_err();
+        assert!(err.contains("purple"), "{err}");
+    }
+
+    #[test]
+    fn run_patch_parse_bad_size_is_rejected() {
+        for bad in ["", "abc", "0", "-3", "NaN"] {
+            let err = RunPatch::parse(&[("size".to_string(), bad.to_string())]).unwrap_err();
+            assert!(err.contains("size"), "input '{bad}': {err}");
+        }
+    }
+
+    #[test]
+    fn run_patch_parse_every_key() {
+        let p = run_patch(&[
+            ("bold", "true"),
+            ("italic", "false"),
+            ("underline", "true"),
+            ("strike", "false"),
+            ("color", "#FF0000"),
+            ("highlight", "yellow"),
+            ("font", "Consolas"),
+            ("size", "10.5"),
+        ]);
+        assert_eq!(p.bold, Some(true));
+        assert_eq!(p.italic, Some(false));
+        assert_eq!(p.underline, Some(true));
+        assert_eq!(p.strike, Some(false));
+        assert_eq!(p.color, Some((255, 0, 0)));
+        assert_eq!(p.highlight, Some(Some("yellow".to_string())));
+        assert_eq!(p.font, Some("Consolas".to_string()));
+        // 10.5pt -> 21 half-points.
+        assert_eq!(p.size_half_pts, Some(21));
+    }
+
+    #[test]
+    fn run_patch_parse_highlight_none_clears() {
+        let p = run_patch(&[("highlight", "none")]);
+        assert_eq!(p.highlight, Some(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_range_bold_true_sets_every_run_regardless_of_starting_state() {
+        let mut doc = doc_with(&["placeholder"]);
+        doc.body[0] = para_with_runs(&[("a", true), ("b", false)]);
+        doc.body.push(para_with_runs(&[("c", false)]));
+        let mut ed = Editor::new(doc);
+
+        let n = format_range(&mut ed, 0, 1, &run_patch(&[("bold", "true")])).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(bold_flags(&ed.doc.body[0]), vec![true, true]);
+        assert_eq!(bold_flags(&ed.doc.body[1]), vec![true]);
+    }
+
+    #[test]
+    fn format_range_bold_false_clears_every_run() {
+        let mut doc = doc_with(&["placeholder"]);
+        doc.body[0] = para_with_runs(&[("a", true), ("b", true)]);
+        let mut ed = Editor::new(doc);
+
+        format_range(&mut ed, 0, 0, &run_patch(&[("bold", "false")])).unwrap();
+        assert_eq!(bold_flags(&ed.doc.body[0]), vec![false, false]);
+    }
+
+    #[test]
+    fn format_range_is_idempotent() {
+        let mut doc = doc_with(&["placeholder"]);
+        doc.body[0] = para_with_runs(&[("a", true), ("b", false)]);
+        let mut ed = Editor::new(doc);
+        let patch = run_patch(&[("bold", "true")]);
+
+        format_range(&mut ed, 0, 0, &patch).unwrap();
+        let once = ed.doc.clone();
+        format_range(&mut ed, 0, 0, &patch).unwrap();
+        assert_eq!(bold_flags(&ed.doc.body[0]), vec![true, true]);
+        // A second, identical application changes nothing further beyond the
+        // (harmless) checkpoint push — the resulting document is unchanged.
+        assert_eq!(ed.doc.body, once.body);
+    }
+
+    #[test]
+    fn format_range_is_one_checkpoint_and_undo_restores_exact_prior_props() {
+        let mut doc = doc_with(&["placeholder", "second"]);
+        doc.body[0] = para_with_runs(&[("a", true), ("b", false)]);
+        let mut ed = Editor::new(doc);
+        let before = ed.doc.clone();
+
+        // A multi-key patch — if this checkpointed once per field, more than
+        // one undo would be needed to fully revert.
+        let patch = run_patch(&[
+            ("bold", "true"),
+            ("italic", "true"),
+            ("color", "#00FF00"),
+            ("highlight", "yellow"),
+            ("font", "Consolas"),
+            ("size", "14"),
+        ]);
+        format_range(&mut ed, 0, 1, &patch).unwrap();
+        assert_ne!(
+            ed.doc, before,
+            "sanity: the patch actually changed something"
+        );
+
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo must restore EXACT prior props");
+        assert!(!ed.undo(), "only one checkpoint should have been pushed");
+    }
+
+    #[test]
+    fn format_range_bounds_and_require_para_errors_touch_nothing() {
+        let mut doc = doc_with(&["A"]);
+        doc.body.push(Block::Table(Table::default()));
+        let mut ed = Editor::new(doc);
+        let before = ed.doc.clone();
+        let patch = run_patch(&[("bold", "true")]);
+
+        let err = format_range(&mut ed, 0, 5, &patch).unwrap_err();
+        assert!(err.contains("out of bounds"), "{err}");
+        assert_eq!(ed.doc, before);
+
+        // Block 1 (the table) is not a paragraph — rejected as an endpoint.
+        let err2 = format_range(&mut ed, 0, 1, &patch).unwrap_err();
+        assert!(err2.contains("not a paragraph"), "{err2}");
+        assert_eq!(ed.doc, before);
+
+        assert!(!ed.undo(), "a rejected format must push no checkpoint");
+    }
+
+    #[test]
+    fn format_range_skips_a_table_block_mid_range_but_still_counts_it() {
+        let mut doc = doc_with(&["A", "B"]);
+        doc.body.insert(1, Block::Table(Table::default()));
+        // doc.body is now [A, Table, B]; A and B start plain (not bold).
+        let mut ed = Editor::new(doc);
+        let before_table = ed.doc.body[1].clone();
+
+        let n = format_range(&mut ed, 0, 2, &run_patch(&[("bold", "true")])).unwrap();
+        assert_eq!(n, 3, "the table block is counted");
+        assert_eq!(bold_flags(&ed.doc.body[0]), vec![true]);
+        assert_eq!(bold_flags(&ed.doc.body[2]), vec![true]);
+        assert_eq!(
+            ed.doc.body[1], before_table,
+            "the table itself must be left untouched"
+        );
+
+        assert!(ed.undo());
+        assert_eq!(paras(&ed.doc), vec!["A", "", "B"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // set_style_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_style_range_heading1_sets_style_and_heading_level_one_undo_reverts() {
+        let mut ed = Editor::new(doc_with(&["Title", "Also", "tail"]));
+        let before = ed.doc.clone();
+
+        let n = set_style_range(&mut ed, 0, 1, Some("Heading1"), None).unwrap();
+        assert_eq!(n, 2);
+        for i in 0..2 {
+            let Block::Paragraph(p) = &ed.doc.body[i] else {
+                panic!()
+            };
+            assert_eq!(p.props.style_id.as_deref(), Some("Heading1"));
+            assert_eq!(p.props.heading_level, Some(1));
+        }
+        // Untouched paragraph outside the range.
+        let Block::Paragraph(p2) = &ed.doc.body[2] else {
+            panic!()
+        };
+        assert_eq!(p2.props.style_id, None);
+
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn set_style_range_normal_clears_style_without_touching_align() {
+        let mut doc = doc_with(&["A"]);
+        if let Block::Paragraph(p) = &mut doc.body[0] {
+            p.props.style_id = Some("Heading2".to_string());
+            p.props.heading_level = Some(2);
+            p.props.align = Align::Right;
+        }
+        let mut ed = Editor::new(doc);
+
+        set_style_range(&mut ed, 0, 0, Some("Normal"), None).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.props.style_id, None);
+        assert_eq!(p.props.heading_level, None);
+        assert_eq!(
+            p.props.align,
+            Align::Right,
+            "align untouched by style-only call"
+        );
+    }
+
+    #[test]
+    fn set_style_range_align_only_is_one_checkpoint() {
+        let mut ed = Editor::new(doc_with(&["A", "B"]));
+        let before = ed.doc.clone();
+
+        set_style_range(&mut ed, 0, 1, None, Some(Align::Center)).unwrap();
+        for i in 0..2 {
+            let Block::Paragraph(p) = &ed.doc.body[i] else {
+                panic!()
+            };
+            assert_eq!(p.props.align, Align::Center);
+        }
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn set_style_range_style_and_align_together_is_one_checkpoint() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        let before = ed.doc.clone();
+
+        set_style_range(&mut ed, 0, 0, Some("Quote"), Some(Align::Justify)).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.props.style_id.as_deref(), Some("Quote"));
+        assert_eq!(p.props.align, Align::Justify);
+
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "one undo must restore both style and align");
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn set_style_range_needs_style_or_align_and_touches_nothing() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        let before = ed.doc.clone();
+        let err = set_style_range(&mut ed, 0, 0, None, None).unwrap_err();
+        assert_eq!(err, "set-style needs 'style' or 'align'");
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn set_style_range_unknown_style_lists_the_accepted_set() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        let before = ed.doc.clone();
+        let err = set_style_range(&mut ed, 0, 0, Some("Bogus"), None).unwrap_err();
+        assert!(err.contains("Bogus"), "{err}");
+        for id in MARKDOWN_PARAGRAPH_STYLE_IDS {
+            assert!(err.contains(*id), "{err} missing {id}");
+        }
+        assert!(err.contains("Normal"), "{err}");
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn set_style_range_bounds_and_require_para_errors_touch_nothing() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        let before = ed.doc.clone();
+        assert!(set_style_range(&mut ed, 0, 5, Some("Heading1"), None).is_err());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn validate_set_style_range_matches_what_set_style_range_itself_rejects() {
+        let doc = doc_with(&["A"]);
+        assert!(validate_set_style_range(&doc, 0, 0, None, None).is_err());
+        assert!(validate_set_style_range(&doc, 0, 0, Some("Bogus"), None).is_err());
+        assert!(validate_set_style_range(&doc, 0, 5, Some("Heading1"), None).is_err());
+        assert!(validate_set_style_range(&doc, 0, 0, Some("Heading1"), None).is_ok());
+        assert!(validate_set_style_range(&doc, 0, 0, None, Some(Align::Left)).is_ok());
+        assert!(validate_set_style_range(&doc, 0, 0, Some("Normal"), None).is_ok());
     }
 }
