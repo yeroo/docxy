@@ -436,6 +436,10 @@ impl App {
             // Folded into the existing catch-all rather than given a
             // dedicated arm so this compiles now without inventing a
             // toast/notice mechanism the brief doesn't ask for.
+            // TODO(mailcore task 5): render these bytes in the reading pane,
+            // keyed by `content_id`. Temporary no-op so the workspace builds
+            // now that mailcore emits this event; replaced in task 5.
+            SyncEvent::InlineImageReady { .. } => {}
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. } => {}

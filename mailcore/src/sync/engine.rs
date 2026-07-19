@@ -65,6 +65,16 @@ pub enum SyncCommand {
         attachment_id: String,
         dest: PathBuf,
     },
+    /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
+    /// into memory for rendering in the reading pane — distinct from
+    /// `SaveAttachment`, which writes to disk. `content_id` is echoed back on
+    /// [`SyncEvent::InlineImageReady`] so the UI can key the bytes by the
+    /// `cid:` the body references.
+    FetchInlineImage {
+        message_id: String,
+        attachment_id: String,
+        content_id: String,
+    },
     /// Push a draft's currently-stored fields to Graph (optimistic write
     /// already applied by the caller — compose autosaves via
     /// `Store::update_draft_fields` directly): enqueue
@@ -149,6 +159,13 @@ pub enum SyncEvent {
     /// An attachment's bytes were fetched and written to `path` (the `dest`
     /// from the triggering [`SyncCommand::SaveAttachment`]).
     AttachmentSaved { path: PathBuf },
+    /// An inline image's bytes were fetched (from
+    /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
+    InlineImageReady {
+        message_id: String,
+        content_id: String,
+        bytes: Vec<u8>,
+    },
     /// A reply/forward draft (from [`SyncCommand::ComposeReply`]/
     /// [`SyncCommand::ComposeForward`]) was stored; the UI should load it
     /// (`Store::draft`) and open the compose editor.
@@ -440,6 +457,11 @@ impl Engine {
                 attachment_id,
                 dest,
             } => self.save_attachment(&message_id, &attachment_id, dest),
+            SyncCommand::FetchInlineImage {
+                message_id,
+                attachment_id,
+                content_id,
+            } => self.fetch_inline_image(&message_id, &attachment_id, &content_id),
             SyncCommand::SaveDraft { id } => {
                 self.enqueue_and_drain(OutboxOp::SaveDraft { id });
             }
@@ -892,6 +914,28 @@ impl Engine {
                     ))),
                 }
             }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch one inline image's bytes and emit `SyncEvent::InlineImageReady`
+    /// with them, keyed by `content_id` — same Graph call as
+    /// `save_attachment`, but the bytes stay in memory for the reading pane
+    /// to render rather than being written to disk. Same signed-in guard and
+    /// `with_auth`/`react` handling as `save_attachment`.
+    fn fetch_inline_image(&mut self, message_id: &str, attachment_id: &str, content_id: &str) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_attachment_bytes(message_id, attachment_id)) {
+            Ok(bytes) => self.emit(SyncEvent::InlineImageReady {
+                message_id: message_id.to_string(),
+                content_id: content_id.to_string(),
+                bytes,
+            }),
             Err(e) => {
                 self.react(e);
             }
@@ -2429,6 +2473,77 @@ mod tests {
                 .any(|e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest))
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_inline_image_emits_bytes_with_content_id() {
+        // Same route fixture as save_attachment's test: GET the attachment
+        // returns base64 "hello".
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1/attachments/A1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"A1","contentBytes":"aGVsbG8="}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("fetch-inline-image");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchInlineImage {
+                message_id: "M1".into(),
+                attachment_id: "A1".into(),
+                content_id: "logo".into(),
+            })
+            .unwrap();
+
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::InlineImageReady { .. })
+        });
+        let evt = events
+            .into_iter()
+            .find(|e| matches!(e, SyncEvent::InlineImageReady { .. }))
+            .unwrap();
+        match evt {
+            SyncEvent::InlineImageReady {
+                message_id,
+                content_id,
+                bytes,
+            } => {
+                assert_eq!(message_id, "M1");
+                assert_eq!(content_id, "logo");
+                assert_eq!(bytes, b"hello");
+            }
+            other => panic!("expected InlineImageReady, got {other:?}"),
+        }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
