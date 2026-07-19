@@ -83,10 +83,7 @@ pub enum SyncCommand {
     /// local event row to update from the mail side. Emits
     /// [`SyncEvent::MeetingResponded`] on success, or [`SyncEvent::Error`] when
     /// the message resolves to no event.
-    RespondMeeting {
-        message_id: String,
-        kind: RsvpKind,
-    },
+    RespondMeeting { message_id: String, kind: RsvpKind },
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
     /// `SaveAttachment`, which writes to disk. `content_id` is echoed back on
@@ -183,10 +180,7 @@ pub enum SyncEvent {
     AttachmentSaved { path: PathBuf },
     /// A meeting invite was RSVP'd (from [`SyncCommand::RespondMeeting`]); the
     /// UI shows a confirmation and marks the message read.
-    MeetingResponded {
-        message_id: String,
-        kind: RsvpKind,
-    },
+    MeetingResponded { message_id: String, kind: RsvpKind },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -2769,11 +2763,10 @@ mod tests {
                 kind: RsvpKind::Accept,
             })
             .unwrap();
-        wait_for(
-            &handle.evt_rx,
-            |e| matches!(e, SyncEvent::MeetingResponded { message_id, kind }
-                if message_id == "M1" && *kind == RsvpKind::Accept),
-        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MeetingResponded { message_id, kind }
+                if message_id == "M1" && *kind == RsvpKind::Accept)
+        });
         // The accept POST actually hit Graph.
         assert!(srv.requests().iter().any(|r| r.path.ends_with("/accept")));
 

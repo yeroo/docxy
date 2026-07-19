@@ -505,10 +505,10 @@ impl App {
                 // change to Graph via the existing read path.
                 self.store.set_read(&message_id, true);
                 self.reload_messages();
-                let _ = self
-                    .sync
-                    .cmd_tx
-                    .send(SyncCommand::MarkRead { id: message_id, read: true });
+                let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
+                    id: message_id,
+                    read: true,
+                });
             }
             // A reply/forward draft (`SyncCommand::ComposeReply`/
             // `ComposeForward`) just landed in the store — open the composer

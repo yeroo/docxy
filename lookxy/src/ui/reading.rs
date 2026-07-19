@@ -57,8 +57,14 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    // Fixed header (From/Subject/Received + blank), then the scrolling body.
-    let header = header_lines(m);
+    // Fixed header (From/Subject/Received, an optional meeting-invite banner,
+    // + blank), then the scrolling body.
+    let mut header = header_lines(m);
+    if m.is_meeting_request {
+        header.push(Line::from(
+            "📅 Meeting invite — [A]ccept  [D]ecline  [T]entative",
+        ));
+    }
     let header_h = (header.len() as u16 + 1).min(inner.height);
     let header_area = Rect {
         height: header_h,
@@ -187,11 +193,10 @@ fn paint_inline_image(
     true
 }
 
-/// The message named by `App::selected_msg`, if it's still in the currently
-/// loaded (visible-folder) message list.
+/// The message named by `App::selected_msg`, resolved via the app's shared
+/// accessor (flat list or, in threaded mode, the built threads).
 fn selected_message(app: &App) -> Option<&MessageRow> {
-    let id = app.selected_msg.as_deref()?;
-    app.messages.iter().find(|m| m.id == id)
+    app.selected_message_row()
 }
 
 fn header_lines(m: &MessageRow) -> Vec<Line<'static>> {
@@ -385,6 +390,65 @@ mod tests {
     /// key would let a second same-length image paint over the first's
     /// cached protocol. Keying on content (a hash of the bytes) instead
     /// keeps them distinct, while identical bytes still share one key.
+    #[test]
+    fn renders_the_meeting_banner_for_an_invite_only() {
+        use mailcore::graph::model::{Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "invite1".into(),
+                    conversation_id: "c9".into(),
+                    subject: "Sprint review".into(),
+                    from: Recipient {
+                        name: "Boss".into(),
+                        address: "boss@x".into(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-18T10:00:00Z".into(),
+                    sent: "2026-07-18T09:00:00Z".into(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "invite".into(),
+                    is_draft: false,
+                    is_meeting_request: true,
+                },
+            )
+            .expect("seed invite");
+        app.reload_messages();
+
+        // Invite → banner present.
+        app.open_message("invite1");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Meeting invite"));
+        assert!(text.contains("[A]ccept"));
+
+        // Ordinary message → no banner.
+        app.open_message("m1");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!text.contains("Meeting invite"));
+    }
+
     #[test]
     fn data_image_key_distinguishes_same_length_different_content() {
         let a = data_image_key(b"AAAA");
