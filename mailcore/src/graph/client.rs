@@ -78,6 +78,18 @@ pub enum RsvpKind {
     Tentative,
 }
 
+/// The editable fields of an event, as the create/update calls serialize them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventInput {
+    pub subject: String,
+    pub start_utc: String, // YYYY-MM-DDTHH:MM:SSZ
+    pub end_utc: String,
+    pub is_all_day: bool,
+    pub location: String,
+    pub attendees: Vec<(String, String)>, // (name, address)
+    pub body_html: String,
+}
+
 /// The `$select` fields covering every header field `Message::from_json`
 /// reads, so delta pages carry everything the local store needs without
 /// an extra per-message fetch.
@@ -437,6 +449,36 @@ impl GraphClient {
         Ok(())
     }
 
+    /// POST `/me/events` with the event body; returns the created `Event`
+    /// (with its Graph-minted id). Graph sends invites to any attendees.
+    pub fn create_event(&self, input: &EventInput) -> Result<Event, GraphError> {
+        let resp = self.send(
+            Method::Post,
+            "/me/events",
+            Some(event_body_json(input)),
+            &[],
+        )?;
+        let v = parse_body(resp)?;
+        Event::from_json(&v).ok_or_else(|| GraphError::Parse("malformed created event".to_string()))
+    }
+
+    /// PATCH `/me/events/{id}` with the same body shape as `create_event`.
+    pub fn update_event(&self, id: &str, input: &EventInput) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}");
+        self.send(Method::Patch, &path, Some(event_body_json(input)), &[])?;
+        Ok(())
+    }
+
+    /// DELETE `/me/events/{id}` (cancels an organized event / removes an
+    /// invited one from the user's calendar).
+    pub fn delete_event(&self, id: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}");
+        self.send(Method::Delete, &path, None, &[])?;
+        Ok(())
+    }
+
     /// GET `/me/people` (top 200, relevance-ordered). Each returned person's
     /// primary address is its first `scoredEmailAddresses` entry; people with
     /// no email address are skipped. `rank` is the entry's position in the
@@ -691,6 +733,62 @@ fn draft_body_json(
         ("toRecipients".to_string(), recipients_json(to)),
         ("ccRecipients".to_string(), recipients_json(cc)),
         ("bccRecipients".to_string(), recipients_json(bcc)),
+    ])
+    .to_string()
+}
+
+/// Serializes an `EventInput` to the JSON body shared by `create_event` and
+/// `update_event`. `start`/`end` carry the UTC wall clock (the `Z` suffix
+/// stripped) with `timeZone:"UTC"`, matching how `calendar_view` reads events
+/// back under the `Prefer: outlook.timezone="UTC"` header.
+fn event_body_json(input: &EventInput) -> String {
+    let dt = |utc: &str| -> Value {
+        Value::Object(vec![
+            (
+                "dateTime".to_string(),
+                Value::Str(utc.trim_end_matches('Z').to_string()),
+            ),
+            ("timeZone".to_string(), Value::Str("UTC".to_string())),
+        ])
+    };
+    let attendees = Value::Array(
+        input
+            .attendees
+            .iter()
+            .map(|(name, addr)| {
+                Value::Object(vec![
+                    (
+                        "emailAddress".to_string(),
+                        Value::Object(vec![
+                            ("address".to_string(), Value::Str(addr.clone())),
+                            ("name".to_string(), Value::Str(name.clone())),
+                        ]),
+                    ),
+                    ("type".to_string(), Value::Str("required".to_string())),
+                ])
+            })
+            .collect(),
+    );
+    Value::Object(vec![
+        ("subject".to_string(), Value::Str(input.subject.clone())),
+        ("start".to_string(), dt(&input.start_utc)),
+        ("end".to_string(), dt(&input.end_utc)),
+        ("isAllDay".to_string(), Value::Bool(input.is_all_day)),
+        (
+            "location".to_string(),
+            Value::Object(vec![(
+                "displayName".to_string(),
+                Value::Str(input.location.clone()),
+            )]),
+        ),
+        ("attendees".to_string(), attendees),
+        (
+            "body".to_string(),
+            Value::Object(vec![
+                ("contentType".to_string(), Value::Str("HTML".to_string())),
+                ("content".to_string(), Value::Str(input.body_html.clone())),
+            ]),
+        ),
     ])
     .to_string()
 }
@@ -1837,5 +1935,87 @@ mod tests {
             covered = end_incl + 1;
         }
         assert_eq!(covered, big.len(), "PUT(s) cover the whole payload");
+    }
+
+    fn sample_input() -> EventInput {
+        EventInput {
+            subject: "Sync".into(),
+            start_utc: "2026-07-20T11:00:00Z".into(),
+            end_utc: "2026-07-20T12:00:00Z".into(),
+            is_all_day: false,
+            location: "Room 1".into(),
+            attendees: vec![("Bob".into(), "bob@x.com".into())],
+            body_html: "<p>agenda</p>".into(),
+        }
+    }
+
+    #[test]
+    fn create_event_posts_expected_body() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(), path_prefix: "/me/events".into(), status: 201, headers: vec![],
+            body: r#"{"id":"EV1","subject":"Sync","start":{"dateTime":"2026-07-20T11:00:00.0000000","timeZone":"UTC"},"end":{"dateTime":"2026-07-20T12:00:00.0000000","timeZone":"UTC"},"isAllDay":false,"location":{"displayName":"Room 1"},"organizer":{"emailAddress":{"name":"Me","address":"me@x"}},"responseStatus":{"response":"organizer"},"attendees":[],"bodyPreview":"agenda","webLink":"","lastModifiedDateTime":""}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let ev = c.create_event(&sample_input()).unwrap();
+        assert_eq!(ev.id, "EV1");
+        let body = srv.requests()[0].body.clone();
+        let sent = json::parse(&body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Sync"));
+        // start/end are {dateTime (no Z), timeZone: "UTC"}
+        let start = sent.get("start").unwrap();
+        assert_eq!(
+            start.get("dateTime").and_then(Value::as_str),
+            Some("2026-07-20T11:00:00")
+        );
+        assert_eq!(start.get("timeZone").and_then(Value::as_str), Some("UTC"));
+        assert_eq!(sent.get("isAllDay").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            sent.get("location")
+                .and_then(|l| l.get("displayName"))
+                .and_then(Value::as_str),
+            Some("Room 1")
+        );
+        let att = sent.get("attendees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            att[0]
+                .get("emailAddress")
+                .and_then(|e| e.get("address"))
+                .and_then(Value::as_str),
+            Some("bob@x.com")
+        );
+        assert_eq!(att[0].get("type").and_then(Value::as_str), Some("required"));
+    }
+
+    #[test]
+    fn update_event_patches_and_delete_hits_delete() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/EV1".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/events/EV2".into(),
+                status: 204,
+                headers: vec![],
+                body: "".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        c.update_event("EV1", &sample_input()).unwrap();
+        c.delete_event("EV2").unwrap();
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.method == "PATCH" && r.path.contains("/me/events/EV1"))
+        );
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.method == "DELETE" && r.path.contains("/me/events/EV2"))
+        );
     }
 }
