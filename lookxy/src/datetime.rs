@@ -243,12 +243,6 @@ pub fn parse_end(
 
 /// Formats a day-count (days since the Unix epoch) as a floating all-day
 /// boundary: that date at nominal midnight-UTC.
-///
-/// Not yet called from production code — a later task's event-form save
-/// path is what will call `all_day_bounds` below; `cfg_attr` silences
-/// `dead_code` only outside tests, same pattern already used for
-/// `ui::compose::Compose::new`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn day_at_midnight_utc(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
@@ -260,9 +254,6 @@ fn day_at_midnight_utc(days: i64) -> String {
 /// midnight; End is the exclusive next-day midnight after the last inclusive
 /// day (the End field's date, or the Start date when End is missing/earlier).
 /// `None` if the Start field's date can't be parsed.
-///
-/// Not yet called from production code — see `day_at_midnight_utc` above.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn all_day_bounds(
     start_input: &str,
     end_input: &str,

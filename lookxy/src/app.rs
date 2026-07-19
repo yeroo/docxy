@@ -935,18 +935,29 @@ impl App {
         };
         let now = local_now();
         let off = crate::ui::calendar::local_offset_minutes();
-        let Some(start_utc) = crate::datetime::parse_start(&form.start, now, off) else {
-            self.set_form_error("Invalid start time");
-            return;
+        let (start_utc, end_utc) = if form.all_day {
+            match crate::datetime::all_day_bounds(&form.start, &form.end, now) {
+                Some(bounds) => bounds,
+                None => {
+                    self.set_form_error("Invalid date");
+                    return;
+                }
+            }
+        } else {
+            let Some(start_utc) = crate::datetime::parse_start(&form.start, now, off) else {
+                self.set_form_error("Invalid start time");
+                return;
+            };
+            let Some(end_utc) = crate::datetime::parse_end(&form.end, &start_utc, now, off) else {
+                self.set_form_error("Invalid end time");
+                return;
+            };
+            if end_utc < start_utc {
+                self.set_form_error("End is before start");
+                return;
+            }
+            (start_utc, end_utc)
         };
-        let Some(end_utc) = crate::datetime::parse_end(&form.end, &start_utc, now, off) else {
-            self.set_form_error("Invalid end time");
-            return;
-        };
-        if end_utc < start_utc {
-            self.set_form_error("End is before start");
-            return;
-        }
         let fields = mailcore::store::LocalEventFields {
             subject: form.title.clone(),
             start_utc,
@@ -3594,6 +3605,44 @@ pub(crate) mod tests {
         }
         app.save_event_form();
         assert!(app.event_form.is_some()); // still open — invalid start
+    }
+
+    #[test]
+    fn saving_an_all_day_event_stores_midnight_boundaries_and_enqueues_create() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.title = "Holiday".into();
+            f.all_day = true;
+            f.start = "2026-07-20".into();
+            f.end = "2026-07-20".into(); // one-day all-day
+        }
+        app.save_event_form();
+        assert!(app.event_form.is_none()); // saved + closed
+        // a CreateEvent was enqueued...
+        let draft_id = match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::CreateEvent { id }) => id,
+            other => panic!("expected CreateEvent, got {other:?}"),
+        };
+        // ...and the stored event has midnight boundaries, end = start + 1 day, all-day set
+        let send = app.store.event_for_send(&draft_id).unwrap().unwrap();
+        assert_eq!(send.start_utc, "2026-07-20T00:00:00Z");
+        assert_eq!(send.end_utc, "2026-07-21T00:00:00Z");
+        assert!(send.is_all_day);
+    }
+
+    #[test]
+    fn saving_an_all_day_event_with_an_unparseable_date_keeps_the_form_open() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        app.open_new_event();
+        if let Some(f) = app.event_form.as_mut() {
+            f.all_day = true;
+            f.start = "nonsense".into();
+        }
+        app.save_event_form();
+        assert!(app.event_form.is_some()); // still open — invalid all-day date
     }
 
     /// SEAM 1: editing a not-yet-synced `local:` event must NOT enqueue an
