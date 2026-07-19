@@ -118,6 +118,7 @@ fn event_input_for(
         location: d.location,
         attendees: d.attendees,
         body_html: d.body_html,
+        recurrence: None,
     })
 }
 

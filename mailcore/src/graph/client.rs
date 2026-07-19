@@ -10,7 +10,7 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, MasterCategory, Message,
-    OofStatus, Person, Recipient, plain_to_html,
+    OofStatus, Person, Recipient, Recurrence, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -89,6 +89,9 @@ pub struct EventInput {
     pub location: String,
     pub attendees: Vec<(String, String)>, // (name, address)
     pub body_html: String,
+    /// The recurrence pattern for a repeating event, or `None` for a single
+    /// event. Serialized into the create/update body by `event_body_json`.
+    pub recurrence: Option<Recurrence>,
 }
 
 /// The `$select` fields covering every header field `Message::from_json`
@@ -905,7 +908,7 @@ fn event_body_json(input: &EventInput) -> String {
             })
             .collect(),
     );
-    Value::Object(vec![
+    let mut obj = vec![
         ("subject".to_string(), Value::Str(input.subject.clone())),
         ("start".to_string(), dt(&input.start_utc)),
         ("end".to_string(), dt(&input.end_utc)),
@@ -925,8 +928,11 @@ fn event_body_json(input: &EventInput) -> String {
                 ("content".to_string(), Value::Str(input.body_html.clone())),
             ]),
         ),
-    ])
-    .to_string()
+    ];
+    if let Some(rec) = &input.recurrence {
+        obj.push(("recurrence".to_string(), rec.to_json()));
+    }
+    Value::Object(obj).to_string()
 }
 
 /// Serializes recipients as Graph's `emailAddress` array shape:
@@ -2258,7 +2264,46 @@ mod tests {
             location: "Room 1".into(),
             attendees: vec![("Bob".into(), "bob@x.com".into())],
             body_html: "<p>agenda</p>".into(),
+            recurrence: None,
         }
+    }
+
+    #[test]
+    fn event_body_includes_recurrence_when_present() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let input = EventInput {
+            subject: "Standup".into(),
+            start_utc: "2026-07-20T09:00:00Z".into(),
+            end_utc: "2026-07-20T09:15:00Z".into(),
+            is_all_day: false,
+            location: "".into(),
+            attendees: vec![],
+            body_html: "".into(),
+            recurrence: Some(Recurrence {
+                kind: RecurrenceKind::Daily,
+                interval: 1,
+                days_of_week: vec![],
+                day_of_month: 0,
+                start_date: "2026-07-20".into(),
+                until: None,
+            }),
+        };
+        let body = json::parse(&event_body_json(&input)).unwrap();
+        assert!(body.get("recurrence").is_some());
+        assert_eq!(
+            body.get("recurrence")
+                .unwrap()
+                .get("pattern")
+                .unwrap()
+                .get("type")
+                .and_then(Value::as_str),
+            Some("daily")
+        );
+
+        let mut plain = input.clone();
+        plain.recurrence = None;
+        let body = json::parse(&event_body_json(&plain)).unwrap();
+        assert!(body.get("recurrence").is_none());
     }
 
     #[test]
