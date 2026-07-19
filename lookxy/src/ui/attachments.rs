@@ -68,7 +68,7 @@ fn line(a: &AttachmentMeta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailcore::graph::model::AttachmentMeta;
+    use mailcore::graph::model::{AttachmentKind, AttachmentMeta};
     use ratatui::{Terminal, backend::TestBackend};
 
     fn seed_attachment(app: &mut App) {
@@ -82,6 +82,8 @@ mod tests {
                     size: 2048,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");

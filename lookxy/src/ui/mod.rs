@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn attachments_popup_enter_sends_save_attachment_and_esc_closes_it() {
-        use mailcore::graph::model::AttachmentMeta;
+        use mailcore::graph::model::{AttachmentKind, AttachmentMeta};
 
         let mut app = App::for_test_with_seeded_store();
         app.store
@@ -702,6 +702,8 @@ mod tests {
                     size: 5,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");

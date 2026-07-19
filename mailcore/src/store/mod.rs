@@ -11,7 +11,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, Row, params};
 
-use crate::graph::model::{AttachmentMeta, Attendee, Body, Event, MailFolder, Message, Recipient};
+use crate::graph::model::{
+    AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, Message, Recipient,
+};
 use crate::json::{self, Value};
 
 mod schema;
@@ -473,6 +475,14 @@ impl Store {
         // ALTER and swallow the "duplicate column name" error it raises when
         // the column is already present (fresh DBs get it from schema.rs).
         let _ = conn.execute("ALTER TABLE attachments ADD COLUMN content_id TEXT", []);
+        // Same idempotent-migration pattern, for `attachments.kind`/
+        // `source_url` (added alongside `content_id` to support non-file
+        // attachments: itemAttachments and referenceAttachments).
+        let _ = conn.execute(
+            "ALTER TABLE attachments ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE attachments ADD COLUMN source_url TEXT", []);
         Ok(Store { conn })
     }
 
@@ -1052,8 +1062,8 @@ impl Store {
         )?;
         for a in atts {
             tx.execute(
-                "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline, content_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO attachments (id, message_id, name, content_type, size, is_inline, content_id, kind, source_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     a.id,
                     message_id,
@@ -1062,6 +1072,8 @@ impl Store {
                     a.size,
                     a.is_inline,
                     a.content_id,
+                    a.kind.as_db_str(),
+                    a.source_url,
                 ],
             )?;
         }
@@ -1073,7 +1085,7 @@ impl Store {
     /// id (not insertion order).
     pub fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, content_type, size, is_inline, content_id
+            "SELECT id, name, content_type, size, is_inline, content_id, kind, source_url
              FROM attachments
              WHERE message_id = ?1
              ORDER BY id",
@@ -1087,6 +1099,8 @@ impl Store {
                     size: row.get(3)?,
                     is_inline: row.get(4)?,
                     content_id: row.get(5)?,
+                    kind: AttachmentKind::from_db_str(&row.get::<_, String>(6)?),
+                    source_url: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2071,11 +2085,45 @@ mod tests {
                 size: 10,
                 is_inline: true,
                 content_id: Some("logo123".into()),
+                kind: AttachmentKind::File,
+                source_url: None,
             }],
         )
         .unwrap();
         let got = s.attachments("10").unwrap();
         assert_eq!(got[0].content_id.as_deref(), Some("logo123"));
+    }
+
+    #[test]
+    fn attachments_round_trip_kind_and_source_url() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.upsert_message("F", &msg("m1", false)).unwrap();
+        s.put_attachments(
+            "m1",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "Doc".into(),
+                content_type: "".into(),
+                size: 0,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::Reference,
+                source_url: Some("https://x/y".into()),
+            }],
+        )
+        .unwrap();
+        let got = s.attachments("m1").unwrap();
+        assert_eq!(got[0].kind, AttachmentKind::Reference);
+        assert_eq!(got[0].source_url.as_deref(), Some("https://x/y"));
     }
 
     #[test]
@@ -2108,6 +2156,8 @@ mod tests {
                 size: 1,
                 is_inline: false,
                 content_id: None,
+                kind: AttachmentKind::File,
+                source_url: None,
             }],
         )
         .unwrap();

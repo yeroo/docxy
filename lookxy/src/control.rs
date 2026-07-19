@@ -490,7 +490,7 @@ fn refresh(app: &App) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailcore::graph::model::{AttachmentMeta, MailFolder, Message, Recipient};
+    use mailcore::graph::model::{AttachmentKind, AttachmentMeta, MailFolder, Message, Recipient};
 
     fn args(pairs: Vec<(&str, Json)>) -> Json {
         Json::obj(pairs)
@@ -744,6 +744,8 @@ mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .unwrap();
@@ -801,6 +803,8 @@ mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .unwrap();

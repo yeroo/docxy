@@ -126,6 +126,35 @@ impl Body {
     }
 }
 
+/// Which Graph attachment kind this is (`@odata.type`). Determines what the
+/// UI does on save: `File` downloads its `contentBytes`; `Item` downloads its
+/// `/$value` MIME (`.eml`/`.ics`); `Reference` opens `source_url`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    File,
+    Item,
+    Reference,
+}
+
+impl AttachmentKind {
+    /// Short token stored in the `attachments.kind` column.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            AttachmentKind::File => "file",
+            AttachmentKind::Item => "item",
+            AttachmentKind::Reference => "reference",
+        }
+    }
+    /// Inverse of `as_db_str`; anything unrecognized reads back as `File`.
+    pub fn from_db_str(s: &str) -> AttachmentKind {
+        match s {
+            "item" => AttachmentKind::Item,
+            "reference" => AttachmentKind::Reference,
+            _ => AttachmentKind::File,
+        }
+    }
+}
+
 /// Metadata for an attachment (no bytes — those are fetched separately).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachmentMeta {
@@ -138,6 +167,10 @@ pub struct AttachmentMeta {
     /// resolve `<img src="cid:…">` in the body to this attachment. `None` for
     /// ordinary (non-inline) attachments.
     pub content_id: Option<String>,
+    pub kind: AttachmentKind,
+    /// The cloud link of a `referenceAttachment` (Graph `sourceUrl`); `None`
+    /// for other kinds.
+    pub source_url: Option<String>,
 }
 
 impl AttachmentMeta {
@@ -151,6 +184,15 @@ impl AttachmentMeta {
             content_id: {
                 let cid = str_field(v, "contentId");
                 if cid.is_empty() { None } else { Some(cid) }
+            },
+            kind: match v.get("@odata.type").and_then(Value::as_str) {
+                Some("#microsoft.graph.itemAttachment") => AttachmentKind::Item,
+                Some("#microsoft.graph.referenceAttachment") => AttachmentKind::Reference,
+                _ => AttachmentKind::File,
+            },
+            source_url: {
+                let u = str_field(v, "sourceUrl");
+                if u.is_empty() { None } else { Some(u) }
             },
         })
     }
@@ -583,6 +625,47 @@ mod tests {
         .unwrap();
         let a = AttachmentMeta::from_json(&v).unwrap();
         assert_eq!(a.content_id, None);
+    }
+
+    #[test]
+    fn attachment_meta_parses_item_kind() {
+        let v = crate::json::parse(
+            r##"{"@odata.type":"#microsoft.graph.itemAttachment","id":"a1","name":"Fwd: hi","contentType":"","size":0,"isInline":false}"##
+        ).unwrap();
+        let a = AttachmentMeta::from_json(&v).unwrap();
+        assert_eq!(a.kind, AttachmentKind::Item);
+        assert_eq!(a.source_url, None);
+    }
+
+    #[test]
+    fn attachment_meta_parses_reference_kind_with_source_url() {
+        let v = crate::json::parse(
+            r##"{"@odata.type":"#microsoft.graph.referenceAttachment","id":"a2","name":"Doc","contentType":"","size":0,"isInline":false,"sourceUrl":"https://contoso.sharepoint.com/x"}"##
+        ).unwrap();
+        let a = AttachmentMeta::from_json(&v).unwrap();
+        assert_eq!(a.kind, AttachmentKind::Reference);
+        assert_eq!(
+            a.source_url.as_deref(),
+            Some("https://contoso.sharepoint.com/x")
+        );
+    }
+
+    #[test]
+    fn attachment_meta_file_kind_is_default() {
+        let v = crate::json::parse(
+            r##"{"@odata.type":"#microsoft.graph.fileAttachment","id":"a3","name":"x.pdf","contentType":"application/pdf","size":5,"isInline":false}"##
+        ).unwrap();
+        let a = AttachmentMeta::from_json(&v).unwrap();
+        assert_eq!(a.kind, AttachmentKind::File);
+        // an absent @odata.type also defaults to File:
+        let v2 = crate::json::parse(
+            r#"{"id":"a4","name":"y","contentType":"","size":0,"isInline":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AttachmentMeta::from_json(&v2).unwrap().kind,
+            AttachmentKind::File
+        );
     }
 
     #[test]

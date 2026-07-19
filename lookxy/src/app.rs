@@ -2400,6 +2400,7 @@ fn signature_body_html(sig: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use mailcore::graph::model::AttachmentKind;
 
     /// Adds a second message to conversation `c1` (m1's conversation) so `c1`
     /// becomes a 2-message thread: from Bob, newer than m1, unread. Shared
@@ -2760,6 +2761,8 @@ pub(crate) mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -2792,6 +2795,8 @@ pub(crate) mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -2818,6 +2823,8 @@ pub(crate) mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -2860,6 +2867,8 @@ pub(crate) mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -2896,6 +2905,8 @@ pub(crate) mod tests {
                     size: 12,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -2926,6 +2937,8 @@ pub(crate) mod tests {
                         size: 1,
                         is_inline: false,
                         content_id: None,
+                        kind: AttachmentKind::File,
+                        source_url: None,
                     },
                     AttachmentMeta {
                         id: "a2".into(),
@@ -2934,6 +2947,8 @@ pub(crate) mod tests {
                         size: 1,
                         is_inline: false,
                         content_id: None,
+                        kind: AttachmentKind::File,
+                        source_url: None,
                     },
                 ],
             )
@@ -3055,6 +3070,8 @@ pub(crate) mod tests {
                     size: 3,
                     is_inline: true,
                     content_id: Some("logo".into()),
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .unwrap();
@@ -3122,6 +3139,8 @@ pub(crate) mod tests {
                     size: 3,
                     is_inline: true,
                     content_id: Some("<logo@x>".into()),
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .unwrap();
@@ -3225,6 +3244,8 @@ pub(crate) mod tests {
                     size: 3,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -3250,6 +3271,8 @@ pub(crate) mod tests {
                     size: 3,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed attachment");
@@ -3596,6 +3619,8 @@ pub(crate) mod tests {
                     size: 1,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed m1 attachment");
@@ -3609,6 +3634,8 @@ pub(crate) mod tests {
                     size: 1,
                     is_inline: false,
                     content_id: None,
+                    kind: AttachmentKind::File,
+                    source_url: None,
                 }],
             )
             .expect("seed m2 attachment");

@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS attachments (
     size         INTEGER NOT NULL DEFAULT 0,
     is_inline    INTEGER NOT NULL DEFAULT 0,
     content_id   TEXT,
+    kind         TEXT NOT NULL DEFAULT 'file',
+    source_url   TEXT,
     PRIMARY KEY (message_id, id)
 );
 
