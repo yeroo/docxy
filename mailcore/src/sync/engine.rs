@@ -18,7 +18,7 @@
 //! Secrets (access/refresh tokens) are never logged.
 
 use crate::auth::{self, AuthConfig, TokenSet};
-use crate::graph::client::{DeltaCursor, GraphClient, GraphError};
+use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
 use crate::graph::model::{DeltaItem, Message};
 use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
@@ -75,6 +75,17 @@ pub enum SyncCommand {
         message_id: String,
         attachment_id: String,
         dest_base: PathBuf,
+    },
+    /// RSVP to a meeting-invite email: resolve the invite's underlying event
+    /// (`GraphClient::meeting_event_id`) and `respond_event` on it
+    /// (`send_response = true`, no comment). A direct Graph call like
+    /// `SaveAttachment` — not an optimistic-local outbox op — since there's no
+    /// local event row to update from the mail side. Emits
+    /// [`SyncEvent::MeetingResponded`] on success, or [`SyncEvent::Error`] when
+    /// the message resolves to no event.
+    RespondMeeting {
+        message_id: String,
+        kind: RsvpKind,
     },
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
@@ -170,6 +181,12 @@ pub enum SyncEvent {
     /// An attachment's bytes were fetched and written to `path` (the `dest`
     /// from the triggering [`SyncCommand::SaveAttachment`]).
     AttachmentSaved { path: PathBuf },
+    /// A meeting invite was RSVP'd (from [`SyncCommand::RespondMeeting`]); the
+    /// UI shows a confirmation and marks the message read.
+    MeetingResponded {
+        message_id: String,
+        kind: RsvpKind,
+    },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -473,6 +490,9 @@ impl Engine {
                 attachment_id,
                 dest_base,
             } => self.save_item_attachment(&message_id, &attachment_id, dest_base),
+            SyncCommand::RespondMeeting { message_id, kind } => {
+                self.respond_meeting(&message_id, kind)
+            }
             SyncCommand::FetchInlineImage {
                 message_id,
                 attachment_id,
@@ -976,6 +996,41 @@ impl Engine {
                     ))),
                 }
             }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Resolve a meeting-invite message's underlying event
+    /// (`GraphClient::meeting_event_id`) and RSVP to it via `respond_event`
+    /// (`send_response = true`, no comment) — a direct Graph call like
+    /// `save_attachment`, not an outbox op. On success emit
+    /// `SyncEvent::MeetingResponded`; a message that resolves to no event
+    /// emits `SyncEvent::Error` ("not a meeting invite"); a Graph failure goes
+    /// through `react` for the standard auth/throttle/transport handling. Same
+    /// signed-in guard as `fetch_body`.
+    fn respond_meeting(&mut self, message_id: &str, kind: RsvpKind) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        let event_id = match self.with_auth(|c| c.meeting_event_id(message_id)) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                self.emit(SyncEvent::Error("not a meeting invite".to_string()));
+                return;
+            }
+            Err(e) => {
+                self.react(e);
+                return;
+            }
+        };
+        match self.with_auth(|c| c.respond_event(&event_id, kind, None, true)) {
+            Ok(()) => self.emit(SyncEvent::MeetingResponded {
+                message_id: message_id.to_string(),
+                kind,
+            }),
             Err(e) => {
                 self.react(e);
             }
@@ -2655,6 +2710,120 @@ mod tests {
             std::fs::read(&eml_path).unwrap(),
             b"Received: x\r\n\r\nbody"
         );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_meeting_resolves_event_and_posts_accept() {
+        let mut routes = backfill_routes();
+        // POST the accept (front so it wins over any generic prefix).
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/accept".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+        );
+        // GET the invite message with its expanded event id.
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"M1","event":{"id":"E1"}}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("respond-meeting");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondMeeting {
+                message_id: "M1".into(),
+                kind: RsvpKind::Accept,
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MeetingResponded { message_id, kind }
+                if message_id == "M1" && *kind == RsvpKind::Accept),
+        );
+        // The accept POST actually hit Graph.
+        assert!(srv.requests().iter().any(|r| r.path.ends_with("/accept")));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_meeting_without_event_emits_error() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"M1"}"#.into(), // no expanded event
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("respond-meeting-noevent");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondMeeting {
+                message_id: "M1".into(),
+                kind: RsvpKind::Decline,
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
