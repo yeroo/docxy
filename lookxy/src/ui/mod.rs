@@ -458,6 +458,7 @@ mod tests {
                     importance: "normal".into(),
                     preview: "second preview".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed second message");
@@ -515,6 +516,7 @@ mod tests {
                     importance: "normal".into(),
                     preview: "sent preview".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed message in second folder");
@@ -751,6 +753,7 @@ mod tests {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("update message to has_attachments=true");

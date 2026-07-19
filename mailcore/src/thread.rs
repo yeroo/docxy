@@ -115,6 +115,7 @@ mod tests {
             preview: String::new(),
             is_draft: false,
             bcc_recipients: String::new(),
+            is_meeting_request: false,
         }
     }
 

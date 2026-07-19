@@ -87,6 +87,7 @@ mod tests {
                     importance: "normal".into(),
                     preview: "numbers for next quarter".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed second message");

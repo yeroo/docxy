@@ -779,6 +779,7 @@ mod tests {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .unwrap();

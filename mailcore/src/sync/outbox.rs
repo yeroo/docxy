@@ -947,6 +947,7 @@ mod tests {
             importance: "normal".into(),
             preview: "".into(),
             is_draft: true,
+            is_meeting_request: false,
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -1047,6 +1048,7 @@ mod tests {
             importance: "normal".into(),
             preview: "".into(),
             is_draft: true,
+            is_meeting_request: false,
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store

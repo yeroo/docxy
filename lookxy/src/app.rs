@@ -2233,6 +2233,7 @@ impl App {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed message");
@@ -2493,6 +2494,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "re hi".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed m2");
@@ -2522,6 +2524,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "alone".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed m3");
@@ -3206,6 +3209,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("update message to has_attachments=true");
@@ -3240,6 +3244,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("seed message");
@@ -3786,6 +3791,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "hi there".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("mark m1 has_attachments");
@@ -3810,6 +3816,7 @@ pub(crate) mod tests {
                     importance: "normal".into(),
                     preview: "re hi".into(),
                     is_draft: false,
+                    is_meeting_request: false,
                 },
             )
             .expect("mark m2 has_attachments");

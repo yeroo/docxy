@@ -79,6 +79,9 @@ pub struct MessageRow {
     pub preview: String,
     pub is_draft: bool,
     pub bcc_recipients: String,
+    /// Mirror of `Message::is_meeting_request` — true for a meeting-invite
+    /// (`eventMessageRequest`) message. Drives the reader's RSVP banner.
+    pub is_meeting_request: bool,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -483,6 +486,14 @@ impl Store {
             [],
         );
         let _ = conn.execute("ALTER TABLE attachments ADD COLUMN source_url TEXT", []);
+        // Same idempotent-migration pattern as `is_draft`/`bcc_recipients`
+        // above, for `messages.is_meeting_request` (meeting-invite RSVP): the
+        // ALTER errors ("duplicate column name") on any DB already carrying it
+        // (every fresh DB gets it from schema.rs), so swallow that.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN is_meeting_request INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -548,8 +559,9 @@ impl Store {
             "INSERT INTO messages (
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
-                 is_read, is_flagged, has_attachments, importance, preview, is_draft
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                 is_meeting_request
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = excluded.conversation_id,
@@ -565,7 +577,8 @@ impl Store {
                  has_attachments = excluded.has_attachments,
                  importance = excluded.importance,
                  preview = excluded.preview,
-                 is_draft = excluded.is_draft",
+                 is_draft = excluded.is_draft,
+                 is_meeting_request = excluded.is_meeting_request",
             params![
                 m.id,
                 folder_id,
@@ -583,6 +596,7 @@ impl Store {
                 m.importance,
                 m.preview,
                 m.is_draft,
+                m.is_meeting_request,
             ],
         )?;
         Ok(())
@@ -608,7 +622,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients
+                    bcc_recipients, is_meeting_request
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
@@ -638,7 +652,7 @@ impl Store {
                  SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                         to_recipients, cc_recipients, received_at, sent_at,
                         is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                        bcc_recipients,
+                        bcc_recipients, is_meeting_request,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -654,7 +668,7 @@ impl Store {
              SELECT k.id, k.folder_id, k.conversation_id, k.subject, k.from_name, k.from_addr,
                     k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
                     k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft,
-                    k.bcc_recipients
+                    k.bcc_recipients, k.is_meeting_request
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -959,7 +973,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients
+                    bcc_recipients, is_meeting_request
              FROM messages
              WHERE id = ?1",
         )?;
@@ -1129,7 +1143,7 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients
+                    bcc_recipients, is_meeting_request
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
@@ -1880,6 +1894,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         preview: row.get(14)?,
         is_draft: row.get(15)?,
         bcc_recipients: row.get(16)?,
+        is_meeting_request: row.get(17)?,
     })
 }
 
@@ -1923,7 +1938,44 @@ mod tests {
             importance: "normal".into(),
             preview: "p".into(),
             is_draft: false,
+            is_meeting_request: false,
         }
+    }
+
+    #[test]
+    fn message_round_trips_is_meeting_request() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let mut m = msg("01", true);
+        m.is_meeting_request = true;
+        s.upsert_message("F", &m).unwrap();
+        let rows = s.messages_in_folder("F", 10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_meeting_request);
+    }
+
+    #[test]
+    fn is_meeting_request_migration_is_idempotent() {
+        // `Store::init` runs the ALTER even on a fresh DB (which already has
+        // the column from schema.rs); opening twice must not error.
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-mtg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        Store::open(&path).unwrap();
+        Store::open(&path).unwrap(); // second open re-runs init; must not panic/err
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2961,6 +3013,7 @@ mod search_tests {
             importance: "normal".into(),
             preview: "".into(),
             is_draft: false,
+            is_meeting_request: false,
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(

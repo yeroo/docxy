@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS messages (
     has_attachments INTEGER NOT NULL DEFAULT 0,
     importance      TEXT NOT NULL DEFAULT '',
     preview         TEXT NOT NULL DEFAULT '',
-    is_draft        INTEGER NOT NULL DEFAULT 0
+    is_draft        INTEGER NOT NULL DEFAULT 0,
+    is_meeting_request INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

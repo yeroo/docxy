@@ -80,6 +80,12 @@ pub struct Message {
     /// haven't been sent. Mirrored locally as `messages.is_draft` so a
     /// draft displays like any other message in its folder.
     pub is_draft: bool,
+    /// Graph's `@odata.type == "#microsoft.graph.eventMessageRequest"`: this
+    /// message is a meeting invite the user can RSVP to (see the reader's
+    /// meeting banner and `SyncCommand::RespondMeeting`). `@odata.type` is an
+    /// OData control annotation auto-emitted for derived resource types, so it
+    /// arrives with the normal delta response — no `$select` change needed.
+    pub is_meeting_request: bool,
 }
 
 impl Message {
@@ -105,6 +111,8 @@ impl Message {
             importance: str_field(v, "importance"),
             preview: str_field(v, "bodyPreview"),
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+            is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
+                == Some("#microsoft.graph.eventMessageRequest"),
         })
     }
 }
@@ -483,6 +491,27 @@ mod tests {
         assert!(m.is_flagged);
         assert!(m.has_attachments);
         assert!(m.is_draft);
+    }
+
+    #[test]
+    fn message_flags_event_message_request_as_meeting() {
+        let invite = parse(
+            r##"{"@odata.type":"#microsoft.graph.eventMessageRequest","id":"M1","conversationId":"C","subject":"Invite","from":{"emailAddress":{"name":"A","address":"a@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"importance":"normal","bodyPreview":""}"##,
+        )
+        .unwrap();
+        assert!(Message::from_json(&invite).unwrap().is_meeting_request);
+
+        let ordinary = parse(
+            r#"{"id":"M2","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"A","address":"a@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"importance":"normal","bodyPreview":""}"#,
+        )
+        .unwrap();
+        assert!(!Message::from_json(&ordinary).unwrap().is_meeting_request);
+
+        let response = parse(
+            r##"{"@odata.type":"#microsoft.graph.eventMessageResponse","id":"M3","conversationId":"C","subject":"RE","from":{"emailAddress":{"name":"A","address":"a@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"importance":"normal","bodyPreview":""}"##,
+        )
+        .unwrap();
+        assert!(!Message::from_json(&response).unwrap().is_meeting_request);
     }
 
     #[test]
