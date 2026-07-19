@@ -13,7 +13,7 @@ use rusqlite::{Connection, Row, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, MasterCategory, Message,
-    Recipient,
+    Recipient, Recurrence,
 };
 use crate::json::{self, Value};
 
@@ -435,6 +435,8 @@ pub struct LocalEventFields {
     pub location: String,
     pub body_html: String,
     pub attendees: Vec<(String, String)>, // (name, address)
+    /// The recurrence pattern for a repeating event (create-only), or `None`.
+    pub recurrence: Option<Recurrence>,
 }
 
 /// Everything `sync::outbox` needs to build a `graph::client::EventInput` for a
@@ -448,6 +450,8 @@ pub struct EventSendData {
     pub location: String,
     pub body_html: String,
     pub attendees: Vec<(String, String)>,
+    /// The recurrence pattern for a repeating event (create-only), or `None`.
+    pub recurrence: Option<Recurrence>,
 }
 
 /// The local mail database. Single-threaded access is assumed (the sync
@@ -493,6 +497,12 @@ impl Store {
         // swallowed) on every database that already has the column.
         let _ = conn.execute(
             "ALTER TABLE events ADD COLUMN body_html TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Same idempotent-migration pattern, for `events.recurrence` (recurring
+        // event creation): the serialized Graph recurrence JSON, or `''`.
+        let _ = conn.execute(
+            "ALTER TABLE events ADD COLUMN recurrence TEXT NOT NULL DEFAULT ''",
             [],
         );
         // Same idempotent-migration pattern as `is_draft`/`body_html` above:
@@ -1577,6 +1587,12 @@ impl Store {
             body_html: f.body_html.clone(),
         })?;
         self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
+        if let Some(rec) = &f.recurrence {
+            self.conn.execute(
+                "UPDATE events SET recurrence = ?1 WHERE id = ?2",
+                params![rec.to_json().to_string(), id],
+            )?;
+        }
         Ok(id)
     }
 
@@ -1614,7 +1630,7 @@ impl Store {
     /// Reads a stored event's send-relevant fields (`None` if no such event).
     pub fn event_for_send(&self, id: &str) -> Result<Option<EventSendData>, StoreError> {
         let row = self.conn.query_row(
-            "SELECT subject, start_utc, end_utc, is_all_day, location, body_html FROM events WHERE id = ?1",
+            "SELECT subject, start_utc, end_utc, is_all_day, location, body_html, recurrence FROM events WHERE id = ?1",
             params![id],
             |r| {
                 Ok((
@@ -1624,13 +1640,22 @@ impl Store {
                     r.get::<_, bool>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             },
         );
-        let (subject, start_utc, end_utc, is_all_day, location, body_html) = match row {
-            Ok(t) => t,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let (subject, start_utc, end_utc, is_all_day, location, body_html, recurrence_raw) =
+            match row {
+                Ok(t) => t,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        let recurrence = if recurrence_raw.is_empty() {
+            None
+        } else {
+            crate::json::parse(&recurrence_raw)
+                .ok()
+                .and_then(|v| Recurrence::from_json(&v))
         };
         let attendees = self
             .event_attendees(id)?
@@ -1645,6 +1670,7 @@ impl Store {
             location,
             body_html,
             attendees,
+            recurrence,
         }))
     }
 
@@ -2936,7 +2962,31 @@ mod calendar_tests {
             location: "Room 1".into(),
             body_html: "<p>agenda</p>".into(),
             attendees: vec![("Bob".into(), "bob@x.com".into())],
+            recurrence: None,
         }
+    }
+
+    #[test]
+    fn create_local_event_round_trips_recurrence() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let rec = Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: Some("2026-08-31".into()),
+        };
+        let mut f = sample_fields();
+        f.recurrence = Some(rec.clone());
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.recurrence, Some(rec));
+
+        // A non-recurring event round-trips to None.
+        let id2 = s.create_local_event(&sample_fields(), "Me", "me@x").unwrap();
+        assert_eq!(s.event_for_send(&id2).unwrap().unwrap().recurrence, None);
     }
 
     #[test]

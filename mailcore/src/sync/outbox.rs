@@ -118,7 +118,7 @@ fn event_input_for(
         location: d.location,
         attendees: d.attendees,
         body_html: d.body_html,
-        recurrence: None,
+        recurrence: d.recurrence,
     })
 }
 
@@ -803,6 +803,7 @@ mod tests {
             location: "Room 1".into(),
             body_html: "<p>agenda</p>".into(),
             attendees: vec![("Bob".into(), "bob@x.com".into())],
+            recurrence: None,
         }
     }
 

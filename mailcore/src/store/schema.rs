@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS events (
     body_preview     TEXT NOT NULL DEFAULT '',
     web_link         TEXT NOT NULL DEFAULT '',
     last_modified    TEXT NOT NULL DEFAULT '',
-    body_html        TEXT NOT NULL DEFAULT ''
+    body_html        TEXT NOT NULL DEFAULT '',
+    recurrence       TEXT NOT NULL DEFAULT ''
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
