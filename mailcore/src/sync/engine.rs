@@ -19,7 +19,7 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
-use crate::graph::model::{AutomaticReplies, DeltaItem, Message};
+use crate::graph::model::{AutomaticReplies, DeltaItem, Message, ScheduleEntry};
 use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
@@ -46,6 +46,14 @@ pub enum SyncCommand {
     /// Fetch the master category list (`GraphClient::get_master_categories`),
     /// store it, and emit [`SyncEvent::CategoriesUpdated`]. Direct call.
     RefreshCategories,
+    /// Fetch attendee availability (`GraphClient::get_schedule`) for a window
+    /// and emit [`SyncEvent::ScheduleFetched`]. Direct call, no store.
+    FetchSchedule {
+        schedules: Vec<String>,
+        start_utc: String,
+        end_utc: String,
+        interval_minutes: i64,
+    },
     /// Move a message to another folder: optimistic local re-file plus a queued
     /// Graph op. Graph mints a new id on move, which the next delta reconciles
     /// (old id `@removed`, new id added).
@@ -210,6 +218,9 @@ pub enum SyncEvent {
     AutomaticRepliesUpdated,
     /// The master category list changed; the UI re-reads `Store::master_categories`.
     CategoriesUpdated,
+    /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
+    /// its free/busy grid.
+    ScheduleFetched { entries: Vec<ScheduleEntry> },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -486,6 +497,12 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::SetCategories { id, categories });
             }
             SyncCommand::RefreshCategories => self.refresh_master_categories(),
+            SyncCommand::FetchSchedule {
+                schedules,
+                start_utc,
+                end_utc,
+                interval_minutes,
+            } => self.fetch_schedule(schedules, &start_utc, &end_utc, interval_minutes),
             SyncCommand::Move { id, dest } => {
                 // Optimistic local re-file, same pattern as MarkRead/SetFlag/
                 // Delete. Graph mints a new id on move; the next delta
@@ -647,6 +664,27 @@ impl Engine {
         }
 
         self.settle_state();
+    }
+
+    /// Fetch attendee availability and emit `ScheduleFetched`; a Graph failure
+    /// goes through `react`. Same signed-in guard as `fetch_body`.
+    fn fetch_schedule(
+        &mut self,
+        schedules: Vec<String>,
+        start_utc: &str,
+        end_utc: &str,
+        interval_minutes: i64,
+    ) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_schedule(&schedules, start_utc, end_utc, interval_minutes)) {
+            Ok(entries) => self.emit(SyncEvent::ScheduleFetched { entries }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
     }
 
     /// Best-effort master-category fetch → store + `CategoriesUpdated`. Any
@@ -3101,6 +3139,52 @@ mod tests {
                 .iter()
                 .any(|r| r.method == "PATCH" && r.path.contains("/me/mailboxSettings"))
         );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_schedule_emits_entries() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/calendar/getSchedule".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"scheduleId":"me@x","availabilityView":"000222"}]}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("fetch-schedule");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchSchedule {
+                schedules: vec!["me@x".into()],
+                start_utc: "2026-07-21T08:00:00Z".into(),
+                end_utc: "2026-07-21T18:00:00Z".into(),
+                interval_minutes: 30,
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ScheduleFetched { entries } if entries[0].email == "me@x")
+        });
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
