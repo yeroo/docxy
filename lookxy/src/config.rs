@@ -34,6 +34,11 @@ pub struct Config {
     /// (`agwintermctl notify`) over all sessions, when running inside agwinterm.
     /// Default false — the in-TUI banner always shows regardless.
     pub reminders_notify: bool,
+    /// Whether the one-time folder-tree default (expand the Inbox) has already
+    /// been applied. Set true the first time the Inbox is auto-expanded so the
+    /// user's later collapse choices are respected across restarts. Default
+    /// false (fresh install).
+    pub folder_tree_initialized: bool,
 }
 
 impl Default for Config {
@@ -49,6 +54,7 @@ impl Default for Config {
             threaded: true,
             signature: String::new(),
             reminders_notify: false,
+            folder_tree_initialized: false,
         }
     }
 }
@@ -113,6 +119,12 @@ impl Config {
         }
         if let Some(b) = value.get("reminders_notify").and_then(|v| v.as_bool()) {
             self.reminders_notify = b;
+        }
+        if let Some(b) = value
+            .get("folder_tree_initialized")
+            .and_then(|v| v.as_bool())
+        {
+            self.folder_tree_initialized = b;
         }
     }
 
@@ -224,6 +236,29 @@ pub fn persist_threaded_to(path: &Path, value: bool) -> std::io::Result<()> {
     };
     entries.retain(|(k, _)| k != "threaded");
     entries.push(("threaded".to_string(), Value::Bool(value)));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, Value::Object(entries).to_string())
+}
+
+/// Read-modify-write `path`, replacing only the `folder_tree_initialized` key
+/// and preserving every other key. Same shape as [`persist_threaded_to`];
+/// called once by `App::ensure_folder_tree_initialized` after the first-run
+/// Inbox expansion.
+pub fn persist_folder_tree_initialized_to(path: &Path, value: bool) -> std::io::Result<()> {
+    use mailcore::json::Value;
+
+    let mut entries: Vec<(String, Value)> = match std::fs::read_to_string(path) {
+        Ok(text) => match mailcore::json::parse(&text) {
+            Ok(Value::Object(e)) => e,
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    entries.retain(|(k, _)| k != "folder_tree_initialized");
+    entries.push(("folder_tree_initialized".to_string(), Value::Bool(value)));
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

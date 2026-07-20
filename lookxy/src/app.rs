@@ -220,6 +220,11 @@ pub struct App {
     /// When true, a firing reminder also raises an agwinterm overlay (see
     /// `notify_agwinterm`). Set from `Config::reminders_notify`; default false.
     pub reminders_notify: bool,
+    /// Whether the one-time folder-tree default (expand the Inbox) has run.
+    /// Loaded from `Config::folder_tree_initialized`; set true and persisted the
+    /// first time `ensure_folder_tree_initialized` expands the Inbox, so a later
+    /// user collapse is respected across restarts.
+    pub folder_tree_initialized: bool,
     /// Event ids already alerted this session (fire-once de-dup).
     pub alerted_reminders: std::collections::HashSet<String>,
     /// Pending reminder banner lines (front = currently shown).
@@ -478,6 +483,7 @@ impl App {
             category_picker: None,
             category_filter: None,
             reminders_notify: false,
+            folder_tree_initialized: false,
             alerted_reminders: std::collections::HashSet::new(),
             reminder_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
@@ -549,6 +555,9 @@ impl App {
                 self.error_notice = None;
                 self.reload_account();
                 self.reload_folders();
+                // First real folder sync is where a fresh install finally has an
+                // Inbox to auto-expand (the `App::new` load saw an empty store).
+                self.ensure_folder_tree_initialized();
             }
             SyncEvent::MessagesUpdated { folder_id }
                 if self.selected_folder.as_deref() == Some(folder_id.as_str()) =>
@@ -750,6 +759,32 @@ impl App {
             f.is_expanded = expanded;
         }
         self.rebuild_visible_folders();
+    }
+
+    /// One-time first-run default: expand the Inbox so its subfolders are
+    /// visible out of the box. A no-op once `folder_tree_initialized` is set (so
+    /// a later user collapse sticks), and a no-op until the Inbox has actually
+    /// synced in — so on a fresh install it stays pending across the empty
+    /// `App::new` load and fires when `FoldersUpdated` first brings folders.
+    /// Called from `main` after config is wired and from the `FoldersUpdated`
+    /// handler.
+    pub fn ensure_folder_tree_initialized(&mut self) {
+        if self.folder_tree_initialized {
+            return;
+        }
+        let Some(inbox) = self
+            .folders
+            .iter()
+            .find(|f| f.well_known_name.as_deref() == Some("inbox"))
+        else {
+            return; // Inbox not synced yet — try again on the next reload.
+        };
+        let id = inbox.id.clone();
+        self.set_folder_expanded(&id, true);
+        self.folder_tree_initialized = true;
+        if let Some(path) = &self.config_path {
+            let _ = crate::config::persist_folder_tree_initialized_to(path, true);
+        }
     }
 
     /// Folder pane `→`/`l`: expand the selected folder if it has collapsed
@@ -4952,6 +4987,28 @@ pub(crate) mod tests {
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn inbox_expands_once_on_first_run_then_respects_user() {
+        let mut app = App::for_test_with_folder_tree(); // initialized = false
+        let inbox_expanded = |a: &App| a.folders.iter().any(|f| f.id == "inbox" && f.is_expanded);
+        assert!(!inbox_expanded(&app)); // seeded collapsed
+        app.ensure_folder_tree_initialized();
+        assert!(inbox_expanded(&app)); // auto-expanded on first run
+
+        // User collapses the Inbox.
+        app.folder_index = app
+            .visible_folders
+            .iter()
+            .position(|v| v.row.id == "inbox")
+            .unwrap();
+        app.collapse_or_parent();
+        assert!(!inbox_expanded(&app));
+
+        // A later init attempt is a no-op — the flag was consumed.
+        app.ensure_folder_tree_initialized();
+        assert!(!inbox_expanded(&app));
     }
 
     #[test]

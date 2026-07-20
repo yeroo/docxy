@@ -133,7 +133,12 @@ fn main() -> io::Result<()> {
     app.threaded = config.threaded;
     app.signature = config.signature.clone();
     app.reminders_notify = config.reminders_notify;
+    app.folder_tree_initialized = config.folder_tree_initialized;
     app.config_path = crate::config::config_file_path();
+    // First-run default: expand the Inbox (no-op for returning users, and a
+    // no-op now if folders haven't synced yet — the FoldersUpdated handler
+    // retries once they arrive).
+    app.ensure_folder_tree_initialized();
     app.reload_messages();
 
     // Bring up the agent control surface. Best-effort: if the config
