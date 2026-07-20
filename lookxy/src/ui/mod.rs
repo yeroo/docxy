@@ -11,8 +11,8 @@ pub mod categorypicker;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
-pub mod freebusy;
 mod folders;
+pub mod freebusy;
 mod message_list;
 pub mod oofform;
 mod reading;
@@ -71,6 +71,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // compose — same "no-op unless open" shape as `eventform::draw`'s
         // own doc comment describes.
         eventform::draw(f, &*app);
+        freebusy::draw(f, &*app);
         // The delete-confirm modal (`x`) is also an overlay on top of the
         // calendar — without this, `app.confirm` could be set (by
         // `App::delete_selected_event`) with nothing on screen to show it,
@@ -164,6 +165,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // while open, in both modes.
     if app.rsvp_prompt.is_some() {
         calendar::handle_rsvp_prompt_key(app, key);
+        return;
+    }
+    // The free/busy overlay (Ctrl-B in the event form) captures keys while open.
+    if app.free_busy.is_some() {
+        freebusy::handle_key(app, key);
         return;
     }
     // The category picker (opened by `l`/`L`) gets keys ahead of the panes.

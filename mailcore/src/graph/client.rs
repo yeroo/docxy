@@ -2046,7 +2046,10 @@ mod tests {
             Some(30)
         );
         assert_eq!(
-            sent.get("schedules").and_then(Value::as_array).unwrap().len(),
+            sent.get("schedules")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(

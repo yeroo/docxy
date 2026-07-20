@@ -1377,7 +1377,6 @@ impl App {
         });
         self.free_busy = Some(crate::ui::freebusy::FreeBusyView {
             day_label: crate::ui::calendar::day_label(y, m, d),
-            interval_minutes: 30,
             slot_count: 20, // (18-8)*60/30
             entries: Vec::new(),
             loading: true,
@@ -3335,7 +3334,6 @@ pub(crate) mod tests {
         let mut app = App::for_test_with_seeded_store();
         app.free_busy = Some(crate::ui::freebusy::FreeBusyView {
             day_label: "Mon Jul 21".into(),
-            interval_minutes: 30,
             slot_count: 20,
             entries: Vec::new(),
             loading: true,

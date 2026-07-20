@@ -3182,9 +3182,10 @@ mod tests {
                 interval_minutes: 30,
             })
             .unwrap();
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::ScheduleFetched { entries } if entries[0].email == "me@x")
-        });
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::ScheduleFetched { entries } if entries[0].email == "me@x"),
+        );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
