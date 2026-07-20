@@ -213,6 +213,15 @@ pub struct App {
     /// The active category filter (`L`), or `None`. When set, `reload_messages`
     /// shows only messages carrying this category (flat view).
     pub category_filter: Option<String>,
+    /// When true, a firing reminder also raises an agwinterm overlay (see
+    /// `notify_agwinterm`). Set from `Config::reminders_notify`; default false.
+    pub reminders_notify: bool,
+    /// Event ids already alerted this session (fire-once de-dup).
+    pub alerted_reminders: std::collections::HashSet<String>,
+    /// Pending reminder banner lines (front = currently shown).
+    pub reminder_queue: std::collections::VecDeque<String>,
+    #[cfg(test)]
+    pub agwinterm_notify_invocations: std::cell::Cell<u32>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -429,6 +438,11 @@ impl App {
             master_categories: Vec::new(),
             category_picker: None,
             category_filter: None,
+            reminders_notify: false,
+            alerted_reminders: std::collections::HashSet::new(),
+            reminder_queue: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            agwinterm_notify_invocations: std::cell::Cell::new(0),
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -2059,6 +2073,65 @@ impl App {
     /// once that lands. If the message genuinely has no attachments, this
     /// is a no-op — same "don't open a popup that can't work" pattern as
     /// `open_move_picker`.
+    /// Scans the loaded agenda for events whose reminder window contains
+    /// `now_epoch` (`start − reminderMinutes·60 ≤ now < start`, and
+    /// `is_reminder_on`) and that haven't been alerted yet this session; each
+    /// fires exactly once — pushing a banner line and, when `reminders_notify`
+    /// is set, an agwinterm overlay. Called every main-loop tick.
+    pub fn check_due_reminders(&mut self, now_epoch: i64) {
+        // Collect first (immutable borrow of self.agenda) so the mutable writes
+        // below don't overlap the iteration.
+        let due: Vec<(String, String)> = self
+            .agenda
+            .iter()
+            .filter(|e| e.is_reminder_on && !self.alerted_reminders.contains(&e.id))
+            .filter_map(|e| {
+                let start = utc_to_epoch(&e.start_utc);
+                let remind_at = start - e.reminder_minutes.max(0) * 60;
+                if remind_at <= now_epoch && now_epoch < start {
+                    let phrase = starts_in_phrase(now_epoch, start, &e.start_utc);
+                    Some((e.id.clone(), format!("⏰ {} {}", e.subject, phrase)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, msg) in due {
+            self.alerted_reminders.insert(id);
+            self.reminder_queue.push_back(msg.clone());
+            if self.reminders_notify {
+                self.notify_agwinterm(&msg);
+            }
+        }
+    }
+
+    /// Dismisses the front reminder banner.
+    pub fn dismiss_reminder(&mut self) {
+        self.reminder_queue.pop_front();
+    }
+
+    /// Best-effort agwinterm overlay for a fired reminder. Production: only
+    /// inside agwinterm (`AGWINTERM_ENABLED=1`), spawns `agwintermctl notify
+    /// {msg} --title lookxy` argv-style (no shell), result ignored.
+    #[cfg(not(test))]
+    fn notify_agwinterm(&self, msg: &str) {
+        if std::env::var("AGWINTERM_ENABLED").as_deref() == Ok("1") {
+            let _ = std::process::Command::new("agwintermctl")
+                .arg("notify")
+                .arg(msg)
+                .arg("--title")
+                .arg("lookxy")
+                .spawn();
+        }
+    }
+
+    /// Test seam: count calls instead of spawning a process.
+    #[cfg(test)]
+    fn notify_agwinterm(&self, _msg: &str) {
+        self.agwinterm_notify_invocations
+            .set(self.agwinterm_notify_invocations.get() + 1);
+    }
+
     /// `l`/`L`: open the category picker. Assign mode seeds each master
     /// category preselected iff the highlighted message already has it (plus any
     /// category on the message that isn't in the master list, so it can still be
@@ -2744,6 +2817,31 @@ fn is_web_url(url: &str) -> bool {
 /// `SystemTime::now()`, then re-derived into calendar fields via
 /// `ui::calendar::civil_from_days`. `open_new_event`'s prefill seed, and
 /// `save_event_form`'s "now" for `datetime::parse_start`/`parse_end`.
+/// Epoch seconds for a canonical-UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp, via the
+/// calendar module's civil-day math. Used to compare event starts to `now`.
+pub(crate) fn utc_to_epoch(iso: &str) -> i64 {
+    let (y, m, d) = crate::ui::calendar::date_of_utc(iso);
+    let time = iso.split('T').nth(1).unwrap_or("").trim_end_matches('Z');
+    let mut parts = time.splitn(3, ':');
+    let h: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mi: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let s: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    crate::ui::calendar::days_from_civil(y, m, d) * 86400 + h * 3600 + mi * 60 + s
+}
+
+/// "starts now" (when `now >= start`) or "starts in N min (HH:MM)" — the local
+/// start time via `ui::calendar::to_local`.
+fn starts_in_phrase(now_epoch: i64, start_epoch: i64, start_utc: &str) -> String {
+    if now_epoch >= start_epoch {
+        return "starts now".to_string();
+    }
+    let mins = ((start_epoch - now_epoch) / 60).max(1);
+    format!(
+        "starts in {mins} min ({})",
+        crate::ui::calendar::local_hhmm(start_utc)
+    )
+}
+
 /// The Graph weekday name (`"monday".."sunday"`) of a canonical-UTC start
 /// timestamp's date, via the calendar module's civil-day math (matching
 /// `ui::calendar::weekday_abbrev`'s `(z + 4).rem_euclid(7)` Sunday-indexed
@@ -2892,6 +2990,88 @@ pub(crate) mod tests {
             Ok(SyncCommand::FetchAutomaticReplies) => {}
             other => panic!("expected FetchAutomaticReplies, got {other:?}"),
         }
+    }
+
+    fn reminder_row(id: &str, start_utc: &str, minutes: i64, on: bool) -> mailcore::store::EventRow {
+        mailcore::store::EventRow {
+            id: id.into(),
+            subject: "Standup".into(),
+            start_utc: start_utc.into(),
+            end_utc: "2026-07-20T10:00:00Z".into(),
+            is_all_day: false,
+            location: String::new(),
+            organizer_name: String::new(),
+            organizer_addr: String::new(),
+            response_status: "organizer".into(),
+            series_master_id: None,
+            reminder_minutes: minutes,
+            is_reminder_on: on,
+        }
+    }
+
+    #[test]
+    fn utc_to_epoch_known_values() {
+        assert_eq!(crate::app::utc_to_epoch("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(crate::app::utc_to_epoch("1970-01-01T00:01:00Z"), 60);
+        assert_eq!(crate::app::utc_to_epoch("1970-01-02T00:00:00Z"), 86400);
+    }
+
+    #[test]
+    fn check_due_reminders_fires_once_in_window() {
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E1", "2026-07-20T09:00:00Z", 15, true)];
+        let start = crate::app::utc_to_epoch("2026-07-20T09:00:00Z");
+        let now = start - 5 * 60; // 5 min before, inside the 15-min window
+        app.check_due_reminders(now);
+        assert_eq!(app.reminder_queue.len(), 1);
+        assert!(app.reminder_queue.front().unwrap().contains("Standup"));
+        app.check_due_reminders(now); // de-dup
+        assert_eq!(app.reminder_queue.len(), 1);
+    }
+
+    #[test]
+    fn check_due_reminders_respects_window_and_flag() {
+        let start = crate::app::utc_to_epoch("2026-07-20T09:00:00Z");
+
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E1", "2026-07-20T09:00:00Z", 15, false)]; // reminder off
+        app.check_due_reminders(start - 5 * 60);
+        assert!(app.reminder_queue.is_empty());
+
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E1", "2026-07-20T09:00:00Z", 15, true)];
+        app.check_due_reminders(start - 60 * 60); // before the 15-min window
+        assert!(app.reminder_queue.is_empty());
+        app.check_due_reminders(start + 60); // after start
+        assert!(app.reminder_queue.is_empty());
+    }
+
+    #[test]
+    fn agwinterm_notify_fires_only_when_flag_on() {
+        let now = crate::app::utc_to_epoch("2026-07-20T09:00:00Z") - 5 * 60;
+
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E1", "2026-07-20T09:00:00Z", 15, true)];
+        app.check_due_reminders(now); // flag off (default)
+        assert_eq!(app.agwinterm_notify_invocations.get(), 0);
+        assert_eq!(app.reminder_queue.len(), 1);
+
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E2", "2026-07-20T09:00:00Z", 15, true)];
+        app.reminders_notify = true;
+        app.check_due_reminders(now);
+        assert_eq!(app.agwinterm_notify_invocations.get(), 1);
+    }
+
+    #[test]
+    fn dismiss_reminder_pops_the_front() {
+        let mut app = App::for_test_with_seeded_store();
+        app.reminder_queue.push_back("a".into());
+        app.reminder_queue.push_back("b".into());
+        app.dismiss_reminder();
+        assert_eq!(app.reminder_queue.front().map(String::as_str), Some("b"));
+        app.dismiss_reminder();
+        assert!(app.reminder_queue.is_empty());
     }
 
     #[test]

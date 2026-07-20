@@ -132,6 +132,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new(store, handle, token_path);
     app.threaded = config.threaded;
     app.signature = config.signature.clone();
+    app.reminders_notify = config.reminders_notify;
     app.config_path = crate::config::config_file_path();
     app.reload_messages();
 
@@ -202,6 +203,7 @@ fn run(
 ) -> io::Result<()> {
     loop {
         drain_events(app);
+        app.check_due_reminders(now_unix_secs());
         drain_ctl(app, ctl_rx.as_ref());
 
         terminal.draw(|f| ui::draw(f, app))?;
@@ -249,6 +251,15 @@ fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
         app.on_sync_event(evt);
     }
+}
+
+/// Current wall-clock as UTC epoch seconds — the `now` fed to
+/// `App::check_due_reminders` each tick.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Drains every pending agent control [`ctlcore::Request`] without blocking

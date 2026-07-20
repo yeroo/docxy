@@ -510,6 +510,14 @@ fn unix_to_iso8601(secs: i64) -> String {
 /// Converts a UTC ISO-8601 string to local wall-clock time: parse to a Unix
 /// timestamp, add the system's local offset (`local_offset_minutes`), and
 /// re-derive the calendar fields from that shifted instant.
+/// The local wall-clock `HH:MM` of a canonical-UTC timestamp — used by the
+/// reminder banner ("starts in N min (HH:MM)"). Formats `to_local` (whose
+/// fields are private to this module) so callers don't need them.
+pub(crate) fn local_hhmm(iso_utc: &str) -> String {
+    let l = to_local(iso_utc);
+    format!("{:02}:{:02}", l.hour, l.minute)
+}
+
 fn to_local(iso_utc: &str) -> LocalDateTime {
     let utc_secs = parse_iso_utc(iso_utc);
     let local_secs = utc_secs + local_offset_minutes() * 60;
