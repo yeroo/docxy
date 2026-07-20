@@ -194,6 +194,14 @@
     paintTabs();
     $('cellref').textContent = view.cur.ref;
     if (document.activeElement !== $('fsrc')) $('fsrc').value = view.cur.src;
+    // Toolbar pressed state: mirror the active cell's format (view.cur, set
+    // by the wasm bridge's view_json). Align lights at most one of the three
+    // buttons; 'g' (General) lights none.
+    btnBold?.classList.toggle('on', !!view.cur.bold);
+    btnItalic?.classList.toggle('on', !!view.cur.italic);
+    btnAlignL?.classList.toggle('on', view.cur.align === 'l');
+    btnAlignC?.classList.toggle('on', view.cur.align === 'c');
+    btnAlignR?.classList.toggle('on', view.cur.align === 'r');
     // one-shot error from the wasm side (e.g. an invalid formula on `set`):
     // surface it as a tooltip on the cell reference box and a brief red flash
     // on the formula bar's border.
@@ -442,7 +450,7 @@
   }
 
   // ---- editing ---------------------------------------------------------------
-  const MUTATING = /^(set|clear|cut|paste|insrow|delrow|inscol|delcol|sheet\t(add|rename))/;
+  const MUTATING = /^(set|clear|cut|paste|insrow|delrow|inscol|delcol|sheet\t(add|rename)|fmt|decimals|autosum)/;
   /** Run a user-initiated command and, if it mutates the workbook, tell the
    *  host so VS Code lights the dirty dot and can drive undo/redo. */
   function userCmd(str) {
@@ -527,7 +535,7 @@
   // chrome's elements are all `position: absolute`, so within body's stacking
   // context they'd paint over a plain (non-positioned) `.empty-state` box
   // regardless of DOM order.
-  const CHROME_IDS = ['fbar', 'corner', 'colhdr', 'rowhdr', 'gridwrap', 'tabs'];
+  const CHROME_IDS = ['toolbar', 'fbar', 'corner', 'colhdr', 'rowhdr', 'gridwrap', 'tabs'];
   function setChromeVisible(visible) {
     for (const id of CHROME_IDS) {
       const el = $(id);
@@ -652,10 +660,81 @@
 
   // ---- boot ----------------------------------------------------------------
   document.body.innerHTML = `
+    <div id="toolbar"></div>
     <div id="fbar"><span id="cellref">A1</span><input id="fsrc" spellcheck="false" /></div>
     <div id="corner"></div><div id="colhdr"></div><div id="rowhdr"></div>
     <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="gridlines"></div><div id="cells"></div></div>
     <div id="tabs"></div>`;
+
+  // ---- Excel-2003-style toolbar --------------------------------------------
+  // Button groups, thin dividers between: clipboard, autosum, bold/italic,
+  // font/fill color, align, number format. Mirrors webview.js's
+  // buildToolbar() (docxy) — same box-model/interaction pattern, adapted to
+  // this grid's `fmt`/`decimals`/`autosum` verbs. Undo/redo are deliberately
+  // NOT here: Ctrl+Z/Y already route to VS Code's own undo stack, and a
+  // toolbar undo button would desync it.
+  let btnBold, btnItalic, btnAlignL, btnAlignC, btnAlignR;
+  function buildToolbar() {
+    const bar = $('toolbar');
+    function addSep() {
+      const s = document.createElement('span');
+      s.className = 'tb-sep';
+      bar.appendChild(s);
+    }
+    // Keep the grid's selection: don't let the button steal focus on
+    // mousedown, and return focus to #gridwrap after the click so keyboard
+    // navigation keeps working immediately.
+    function addButton(label, title, onClick, cls) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.title = title;
+      if (cls) b.classList.add(cls);
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', () => {
+        onClick();
+        $('gridwrap').focus();
+      });
+      bar.appendChild(b);
+      return b;
+    }
+    // A native color picker: a hidden <input type=color> triggered by its
+    // visible swatch button. `input`/`change` both fire `fmt\t<key>\t#hex`
+    // (input fires live as the OS picker drags a color; change fires once
+    // committed) — harmless to send twice, the second just repeats the patch.
+    function addColorButton(label, title, fmtKey) {
+      const input = document.createElement('input');
+      input.type = 'color';
+      input.value = '#000000';
+      bar.appendChild(input);
+      const send = () => userCmd(`fmt\t${fmtKey}\t${input.value}`);
+      input.addEventListener('input', send);
+      input.addEventListener('change', send);
+      addButton(label, title, () => input.click());
+    }
+
+    addButton('Cut', 'Cut', () => userCmd('cut'));
+    addButton('Copy', 'Copy', () => userCmd('copy'));
+    addButton('Paste', 'Paste', () => requestPaste());
+    addSep();
+    addButton('Σ', 'AutoSum', () => userCmd('autosum'));
+    addSep();
+    btnBold = addButton('B', 'Bold', () => userCmd('fmt\tbold\ttoggle'), 'tb-b');
+    btnItalic = addButton('I', 'Italic', () => userCmd('fmt\titalic\ttoggle'), 'tb-i');
+    addSep();
+    addColorButton('A', 'Font color', 'fontColor');
+    addColorButton('▨', 'Fill color', 'fillColor');
+    addSep();
+    btnAlignL = addButton('⯇', 'Align left', () => userCmd('fmt\talign\tleft'));
+    btnAlignC = addButton('≡', 'Center', () => userCmd('fmt\talign\tcenter'));
+    btnAlignR = addButton('⯈', 'Align right', () => userCmd('fmt\talign\tright'));
+    addSep();
+    addButton('$', 'Currency', () => userCmd('fmt\tnumFmt\t$#,##0.00'));
+    addButton('%', 'Percent', () => userCmd('fmt\tnumFmt\t0%'));
+    addButton(',', 'Comma', () => userCmd('fmt\tnumFmt\t#,##0.00'));
+    addButton('◂.0', 'Decrease decimal', () => userCmd('decimals\t-1'));
+    addButton('.0▸', 'Increase decimal', () => userCmd('decimals\t1'));
+  }
 
   /** Right-click context menu for a row/col header: insert/delete at `at`. */
   function headerMenu(e, kind, at) {
@@ -684,6 +763,7 @@
     const resp = await fetch(window.__OFFXY__.wasmUri);
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
     ex = instance.exports;
+    buildToolbar();
     const wrap = $('gridwrap');
     wrap.addEventListener('scroll', onScroll);
     wrap.addEventListener('mousedown', onMousedown);

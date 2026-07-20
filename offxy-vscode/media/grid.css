@@ -6,7 +6,34 @@ html, body { height: 100%; overflow: hidden;
   color: var(--vscode-editor-foreground);
   background: var(--vscode-editor-background); }
 
-#fbar { display: flex; align-items: center; gap: 6px; height: 28px;
+/* Excel-2003-style toolbar, above the formula bar: button groups (clipboard,
+   autosum, bold/italic, font/fill color, align, number format) separated by
+   thin dividers. Mirrors docxy's #toolbar (media/webview.css) — same box
+   model, hover/active/on states — adapted to this grid's ids/colors. */
+#toolbar { position: absolute; top: 0; left: 0; right: 0; height: 30px;
+  display: flex; align-items: center; gap: 1px; padding: 0 6px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-editorWidget-border, #0003);
+  user-select: none; }
+#toolbar button { min-width: 24px; height: 22px; padding: 0 5px; font: inherit;
+  color: var(--vscode-foreground); background: transparent;
+  border: 1px solid transparent; border-radius: 4px; cursor: pointer; }
+#toolbar button.tb-b { font-weight: bold; }
+#toolbar button.tb-i { font-style: italic; }
+#toolbar button:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2)); }
+#toolbar button:active { background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.3)); }
+/* Pressed state: bold/italic/align buttons reflect the active cell's format,
+   set in grid.js's paint(). */
+#toolbar button.on { background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.35));
+  border-color: var(--vscode-focusBorder, #007acc); }
+#toolbar .tb-sep { width: 1px; height: 16px; margin: 0 5px;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35)); }
+/* Color pickers are native <input type=color>, triggered by their swatch
+   button (grid.js) and never shown themselves. */
+#toolbar input[type="color"] { display: none; }
+
+#fbar { position: absolute; top: 30px; left: 0; right: 0;
+  display: flex; align-items: center; gap: 6px; height: 28px;
   padding: 0 8px; border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }
 #cellref { min-width: 64px; text-align: center; padding: 2px 6px;
   border: 1px solid var(--vscode-editorWidget-border, #0003);
@@ -15,7 +42,7 @@ html, body { height: 100%; overflow: hidden;
   color: var(--vscode-input-foreground); background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, transparent); outline: none; }
 
-#gridwrap { position: absolute; top: 28px; bottom: 24px; left: 0; right: 0; overflow: auto; }
+#gridwrap { position: absolute; top: 58px; bottom: 24px; left: 0; right: 0; overflow: auto; }
 #spacer { position: absolute; top: 0; left: 0; width: 1px; height: 1px; }
 /* The cell + gridline layers are offset by the sticky header gutters (44px
    row-number column, 22px column-header band) so that cell (0,0) paints
@@ -42,11 +69,11 @@ html, body { height: 100%; overflow: hidden;
 #colhdr, #rowhdr { position: absolute; z-index: 3; overflow: hidden;
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   color: var(--vscode-descriptionForeground); }
-#colhdr { top: 28px; left: 44px; right: 0; height: 22px;
+#colhdr { top: 58px; left: 44px; right: 0; height: 22px;
   border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }
-#rowhdr { top: 50px; left: 0; bottom: 24px; width: 44px;
+#rowhdr { top: 80px; left: 0; bottom: 24px; width: 44px;
   border-right: 1px solid var(--vscode-editorWidget-border, #0003); }
-#corner { position: absolute; top: 28px; left: 0; width: 44px; height: 22px; z-index: 4;
+#corner { position: absolute; top: 58px; left: 0; width: 44px; height: 22px; z-index: 4;
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   border-right: 1px solid var(--vscode-editorWidget-border, #0003);
   border-bottom: 1px solid var(--vscode-editorWidget-border, #0003); }

@@ -53,7 +53,23 @@ class El {
     this.children = [];
     this.listeners = new Map();
     this.dataset = {};
-    this.classList = { add: (c) => { this.className = (this.className || '') + ' ' + c; }, };
+    this.className = '';
+    // Real classList backed by `className` (a space-separated string), same
+    // source of truth production code reads/writes directly in a few places
+    // (e.g. `el.className = 'cell'`) — toggle(cls, force) matches the real
+    // DOM signature so grid.js's toolbar pressed-state code (paint()) can
+    // use it exactly as it would in a browser.
+    const parts = () => (this.className || '').split(' ').filter(Boolean);
+    this.classList = {
+      add: (c) => { const p = parts(); if (!p.includes(c)) { p.push(c); this.className = p.join(' '); } },
+      remove: (c) => { this.className = parts().filter((x) => x !== c).join(' '); },
+      contains: (c) => parts().includes(c),
+      toggle: (c, force) => {
+        const has = parts().includes(c);
+        const want = force === undefined ? !has : !!force;
+        if (want) this.classList.add(c); else this.classList.remove(c);
+      },
+    };
     this._tc = '';
     this.scrollTop = 0;
     this.scrollLeft = 0;
@@ -73,7 +89,7 @@ class El {
   remove() { this.isConnected = false; }
   addEventListener(t, fn) { this.listeners.set(t, fn); }
   fire(t, ev) { const fn = this.listeners.get(t); if (fn) fn(ev); }
-  focus() {} select() {} setSelectionRange() {}
+  focus() {} select() {} setSelectionRange() {} click() {}
   closest() { return null; }
   getBoundingClientRect() {
     // gridwrap is the only element the code measures; it fills the page below
@@ -211,4 +227,53 @@ assert.ok(curTop >= WRAP_TOP + COLHDR_H,
 assert.ok(curTop + CELL_H <= WRAP_TOP + wrap.clientHeight,
   `active cell (bottom ${curTop + CELL_H}) must be inside the viewport`);
 
-console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band');
+// ---- 4. toolbar: exists, wired to the fmt/decimals/autosum verbs, and a --
+//        button click doesn't disturb the grid selection --------------------
+const toolbar = byId.get('toolbar');
+assert.ok(toolbar, '#toolbar must exist');
+const toolbarButtons = toolbar.children.filter((c) => c.tagName === 'button');
+assert.ok(
+  toolbarButtons.length > 8,
+  `toolbar must have more than 8 buttons (got ${toolbarButtons.length})`,
+);
+
+const boldBtn = toolbarButtons.find((b) => b.title === 'Bold');
+assert.ok(boldBtn, 'a Bold button must exist');
+const cellrefBeforeToolbarClick = byId.get('cellref').textContent;
+boldBtn.fire('click');
+assert.equal(
+  byId.get('cellref').textContent, cellrefBeforeToolbarClick,
+  'a toolbar button click must not change the selection',
+);
+assert.ok(boldBtn.classList.contains('on'), 'Bold button must show pressed state right after toggling on');
+
+// Confirm the underlying cell (not just the button's own class) actually
+// flipped bold, via a follow-up ctl `cell.get` read — the same round trip an
+// agent or the host would use.
+let ctlSeq = 1000;
+function ctlCellGet(ref) {
+  const id = ++ctlSeq;
+  windowObj.dispatchMessage({
+    type: 'ctl', requestId: id, repaint: false,
+    payload: JSON.stringify({ verb: 'cell.get', args: { ref } }),
+  });
+  return JSON.parse(posted.find((m) => m.type === 'ctlResult' && m.requestId === id).payload);
+}
+const activeRef = byId.get('cellref').textContent;
+const afterToggleOn = ctlCellGet(activeRef);
+assert.ok(
+  afterToggleOn.ok && afterToggleOn.format && afterToggleOn.format.bold === true,
+  `active cell ${activeRef} must be bold after the toolbar click: ${JSON.stringify(afterToggleOn)}`,
+);
+
+// Toggle back off (active-cell-state semantics: the active cell is now bold,
+// so this click's target is "unbold") and confirm the pressed state clears.
+boldBtn.fire('click');
+assert.ok(!boldBtn.classList.contains('on'), 'Bold button must clear pressed state after toggling off');
+const afterToggleOff = ctlCellGet(activeRef);
+assert.ok(
+  !(afterToggleOff.format && afterToggleOff.format.bold === true),
+  `active cell ${activeRef} must not be bold after toggling back off: ${JSON.stringify(afterToggleOff)}`,
+);
+
+console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band; toolbar wired without disturbing selection');
