@@ -220,8 +220,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // Esc dismisses the front reminder banner (after the overlay handlers, so
     // an open overlay keeps Esc priority; ahead of the mode/pane handling so
-    // it isn't swallowed). Works in both Mail and Calendar mode.
-    if key.code == KeyCode::Esc && !app.reminder_queue.is_empty() {
+    // it isn't swallowed). Works in both Mail and Calendar mode — but NOT while
+    // a text field is capturing keystrokes (search prompt, RSVP comment), where
+    // Esc means "cancel that field"; the reminder stays queued for a later Esc.
+    if key.code == KeyCode::Esc && !app.reminder_queue.is_empty() && !app.is_capturing_text() {
         app.dismiss_reminder();
         return;
     }
