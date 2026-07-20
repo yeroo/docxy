@@ -35,11 +35,11 @@ function cssNum(selector, prop) {
   assert.ok(found, `grid.css must have a ${selector} rule`);
   return 0;
 }
-const WRAP_TOP = cssNum('#gridwrap', 'top');       // 28: below the formula bar
+const WRAP_TOP = cssNum('#gridwrap', 'top');       // 58: below the toolbar + formula bar
 const COLHDR_LEFT = cssNum('#colhdr', 'left');     // 44: row-number gutter width
-const COLHDR_TOP = cssNum('#colhdr', 'top');       // 28
+const COLHDR_TOP = cssNum('#colhdr', 'top');       // 58
 const COLHDR_H = cssNum('#colhdr', 'height');      // 22: column-header band height
-const ROWHDR_TOP = cssNum('#rowhdr', 'top');       // 50 = 28 + 22
+const ROWHDR_TOP = cssNum('#rowhdr', 'top');       // 80 = 58 + 22
 const CELLS_TOP = cssNum('#cells', 'top');         // the fix under test
 const CELLS_LEFT = cssNum('#cells', 'left');       // the fix under test
 assert.equal(ROWHDR_TOP, COLHDR_TOP + COLHDR_H, 'rowhdr sits directly below colhdr');
@@ -276,4 +276,58 @@ assert.ok(
   `active cell ${activeRef} must not be bold after toggling back off: ${JSON.stringify(afterToggleOff)}`,
 );
 
-console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band; toolbar wired without disturbing selection');
+// ---- 5. the edits counter, not a verb-name regex, decides {type:'edit'} ---
+//        (the AutoSum-desyncs-undo fix: a dispatched-but-no-op command must
+//        NOT tell the host an edit happened) --------------------------------
+const editMsgCount = () => posted.filter((m) => m.type === 'edit').length;
+
+// `activeRef` (B11, from section 4) is isolated: nothing above it in column
+// B (the data ends at row 3) and nothing to its left in row 11 — AutoSum
+// there is a legitimate no-op.
+assert.equal(activeRef, 'B11', 'sanity: still on the isolated B11 from section 4');
+const autosumBtn = toolbarButtons.find((b) => b.title === 'AutoSum');
+assert.ok(autosumBtn, 'an AutoSum button must exist');
+
+const editsBeforeNoopAutosum = editMsgCount();
+autosumBtn.fire('click');
+assert.equal(
+  editMsgCount(), editsBeforeNoopAutosum,
+  'AutoSum with nothing to sum must NOT post {type:"edit"} — no real undo group was pushed',
+);
+assert.equal(byId.get('cellref').textContent, activeRef, 'AutoSum no-op must not move the selection');
+const noopCell = ctlCellGet(activeRef);
+assert.equal(noopCell.text, '', 'AutoSum no-op must not write anything to the active cell');
+
+// Immediately after, a REAL edit (fmt) posts exactly one {type:'edit'} — the
+// counter isn't stuck off after a no-op, and doesn't over-fire either.
+boldBtn.fire('click');
+assert.equal(
+  editMsgCount(), editsBeforeNoopAutosum + 1,
+  'a real fmt edit right after a no-op must post exactly one {type:"edit"}',
+);
+boldBtn.fire('click'); // toggle back off, so this cell's state matches how it started
+
+// Copy never mutates -> never posts edit. Cut DOES (a real cell has content
+// to clear) -> posts exactly one. Re-selects B2 (section 2's data cell) to
+// exercise cut against a non-blank cell.
+const copyBtn = toolbarButtons.find((b) => b.title === 'Copy');
+const cutBtn = toolbarButtons.find((b) => b.title === 'Cut');
+assert.ok(copyBtn && cutBtn, 'Cut/Copy buttons must exist');
+const editsBeforeCopy = editMsgCount();
+copyBtn.fire('click');
+assert.equal(editMsgCount(), editsBeforeCopy, 'Copy must not post {type:"edit"}');
+
+// Reselect via keyboard, not the remembered `clickX`/`clickY` screen
+// coordinates from section 2 — the viewport has since scrolled (section 3),
+// so the same screen position no longer maps to the same cell.
+wrap.fire('keydown', { key: 'Home', ctrlKey: true, metaKey: false, shiftKey: false, preventDefault() {} });
+wrap.fire('keydown', { key: 'ArrowDown', ctrlKey: false, metaKey: false, shiftKey: false, preventDefault() {} });
+wrap.fire('keydown', { key: 'ArrowRight', ctrlKey: false, metaKey: false, shiftKey: false, preventDefault() {} });
+assert.equal(byId.get('cellref').textContent, 'B2', 'reselected B2 (has content) for the cut check');
+const editsBeforeCut = editMsgCount();
+cutBtn.fire('click');
+assert.equal(editMsgCount(), editsBeforeCut + 1, 'Cut over a non-blank cell must post exactly one {type:"edit"}');
+const afterCut = ctlCellGet('B2');
+assert.equal(afterCut.text, '', 'Cut must have cleared B2');
+
+console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band; toolbar wired without disturbing selection; edits counter (not a verb regex) gates {type:"edit"}');

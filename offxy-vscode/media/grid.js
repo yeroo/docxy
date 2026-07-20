@@ -450,12 +450,22 @@
   }
 
   // ---- editing ---------------------------------------------------------------
-  const MUTATING = /^(set|clear|cut|paste|insrow|delrow|inscol|delcol|sheet\t(add|rename)|fmt|decimals|autosum)/;
-  /** Run a user-initiated command and, if it mutates the workbook, tell the
-   *  host so VS Code lights the dirty dot and can drive undo/redo. */
+  /** Run a user-initiated command and, if it ACTUALLY mutated the workbook,
+   *  tell the host so VS Code lights the dirty dot and can drive undo/redo.
+   *  "Actually mutated" is read from the wasm session's own `edits` counter
+   *  (view_json's `edits` field, bumped once per real undo group pushed —
+   *  see gridwasm's `Session::edits`) rather than pattern-matching the verb
+   *  name: a verb-name regex can't tell a dispatched-but-no-op command (e.g.
+   *  `autosum` with nothing to sum, `cut`/`clear` over an already-blank
+   *  selection) from one that really changed the workbook, and posting
+   *  `edit` for a no-op desyncs the host's undo stack — its next Ctrl+Z pops
+   *  an unrelated prior edit instead of doing nothing. Comparing the counter
+   *  before/after is exact for every verb, including future ones, with no
+   *  regex to keep in sync. */
   function userCmd(str) {
+    const editsBefore = view ? view.edits : 0;
     cmd(str);
-    if (MUTATING.test(str)) vscode.postMessage({ type: 'edit' });
+    if (view && view.edits > editsBefore) vscode.postMessage({ type: 'edit' });
   }
 
   let editEl = null;

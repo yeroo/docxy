@@ -269,49 +269,82 @@ fn hex_color((r, g, b): (u8, u8, u8)) -> String {
 /// Adjust the decimal-place count of a number-format code by `delta`,
 /// clamped to `0..=9` — the pure rule behind the toolbar's increase/decrease
 /// decimal buttons (and any other host that wants the same Excel-familiar
-/// behavior). Preserves everything else about the code: a leading affix like
-/// `"$"` or a thousands-grouping prefix (`"#,##0"` vs `"0"`), and a trailing
-/// suffix like `"%"` — only the run of `0`s right after the first `.` grows
-/// or shrinks. An empty code or the literal `"General"` is treated as the
-/// bare integer format `"0"` (so `+1` on either yields `"0.0"`, matching
-/// Excel: the increase-decimal button works even on an unformatted cell).
+/// behavior).
 ///
-/// Current decimal count = the number of `0` characters immediately after
-/// the first `.` in the code (0 if the code has no `.`). Dropping the count
-/// to 0 removes the `.` entirely rather than leaving a trailing dot.
+/// Excel format codes can carry up to four `;`-separated sections
+/// (positive;negative;zero;text), locale/color tags in `[...]` brackets, and
+/// arbitrary quoted `"..."` literals — far too varied to patch in place
+/// without risking an internally-inconsistent result (a leftover section, a
+/// stray bracket). Real Excel's own decimal buttons don't try: they read the
+/// POSITIVE (first) section, then regenerate the whole code. This does the
+/// same: it takes only the first `;`-section as the working code, detects
+/// just the three affixes it understands — a leading `$`, a thousands group
+/// (a `,` anywhere in the section), and a trailing `%` — and its current
+/// decimal count, then REBUILDS a clean, minimal, single-section code at the
+/// clamped target count. Anything else in the original (locale brackets,
+/// `[Red]`, quoted literals, `_`/`*` alignment padding, other sections) is
+/// deliberately not reproduced, rather than risk emitting something
+/// internally inconsistent.
+///
+/// An empty code or the literal `"General"` is treated as the bare integer
+/// format `"0"` (so `+1` on either yields `"0.0"`, matching Excel: the
+/// increase-decimal button works even on an unformatted cell). Current
+/// decimal count = the number of `0` characters immediately after the first
+/// `.` in the (first-section) code, 0 if there's no `.`. A target count of 0
+/// omits the `.` entirely rather than leaving a trailing dot.
 pub fn adjust_decimals(code: &str, delta: i32) -> String {
     let base = if code.is_empty() || code.eq_ignore_ascii_case("general") {
         "0"
     } else {
         code
     };
-    if let Some(dot) = base.find('.') {
-        let (prefix, rest) = base.split_at(dot);
-        let after_dot = &rest[1..]; // skip the '.' itself
-        let zero_run = after_dot.bytes().take_while(|&b| b == b'0').count();
-        let suffix = &after_dot[zero_run..];
-        let new_count = (zero_run as i32 + delta).clamp(0, 9) as usize;
-        if new_count == 0 {
-            format!("{prefix}{suffix}")
-        } else {
-            format!("{prefix}.{}{suffix}", "0".repeat(new_count))
-        }
-    } else {
-        // No '.': current count is 0. Insert one right after the trailing
-        // digit/grouping run (before any non-numeric suffix like "%").
-        let core_end = base
+    let section = first_format_section(base);
+
+    let has_dollar = section.contains('$');
+    let has_group = section.contains(',');
+    let has_percent = section.trim_end().ends_with('%');
+    let current_decimals = match section.find('.') {
+        Some(dot) => section[dot + 1..]
             .bytes()
-            .rposition(|b| b == b'0' || b == b'#' || b == b',')
-            .map(|i| i + 1)
-            .unwrap_or(base.len());
-        let new_count = delta.clamp(0, 9) as usize;
-        if new_count == 0 {
-            base.to_string()
-        } else {
-            let (prefix, suffix) = base.split_at(core_end);
-            format!("{prefix}.{}{suffix}", "0".repeat(new_count))
+            .take_while(|&b| b == b'0')
+            .count(),
+        None => 0,
+    };
+    let new_decimals = (current_decimals as i32 + delta).clamp(0, 9) as usize;
+
+    let mut out = String::new();
+    if has_dollar {
+        out.push('$');
+    }
+    out.push_str(if has_group { "#,##0" } else { "0" });
+    if new_decimals > 0 {
+        out.push('.');
+        out.push_str(&"0".repeat(new_decimals));
+    }
+    if has_percent {
+        out.push('%');
+    }
+    out
+}
+
+/// The code up to (but not including) the first `;` that sits outside a
+/// bracketed `[...]` tag and outside a `"..."` quoted literal — Excel's
+/// section separator, and the two constructs a naive scan could mistake it
+/// for (a locale/currency bracket, or a semicolon inside literal text).
+/// Returns the whole string when there's no such separator.
+fn first_format_section(code: &str) -> &str {
+    let mut depth: i32 = 0;
+    let mut in_quotes = false;
+    for (i, ch) in code.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '[' if !in_quotes => depth += 1,
+            ']' if !in_quotes => depth = (depth - 1).max(0),
+            ';' if !in_quotes && depth == 0 => return &code[..i],
+            _ => {}
         }
     }
+    code
 }
 
 #[cfg(test)]
@@ -545,6 +578,38 @@ mod tests {
     fn adjust_decimals_is_case_insensitive_for_general() {
         assert_eq!(adjust_decimals("general", 1), "0.0");
         assert_eq!(adjust_decimals("GENERAL", 1), "0.0");
+    }
+
+    #[test]
+    fn adjust_decimals_multi_section_code_uses_only_the_first_section() {
+        // The negative section `[Red]-0.00` must be dropped entirely, not
+        // patched or dragged along — the result is a clean single-section
+        // code with no `;`/`[Red]` debris.
+        assert_eq!(adjust_decimals("0.00;[Red]-0.00", 1), "0.000");
+    }
+
+    #[test]
+    fn adjust_decimals_accounting_style_code_rebuilds_a_clean_single_section() {
+        // A real accounting-style code: currency, thousands grouping, and
+        // `_)`/parenthesized-negative padding/sections that this function
+        // deliberately does not try to preserve.
+        assert_eq!(adjust_decimals("$#,##0.00_);($#,##0.00)", -1), "$#,##0.0");
+    }
+
+    #[test]
+    fn first_format_section_ignores_semicolons_inside_brackets_and_quotes() {
+        // A `;` inside a `[...]` locale/currency tag or a `"..."` quoted
+        // literal is NOT a section separator — only a bare `;` is.
+        assert_eq!(
+            first_format_section("[$;-409]0.00;[Red]-0.00"),
+            "[$;-409]0.00"
+        );
+        assert_eq!(first_format_section("0.00\";\"0;-0.00"), "0.00\";\"0");
+        assert_eq!(
+            first_format_section("0.00"),
+            "0.00",
+            "no separator: the whole code"
+        );
     }
 
     #[test]

@@ -116,6 +116,14 @@ pub struct Session {
     /// The most recently `sheet.remove`d sheet, if any — see
     /// [`RemovedSheetStash`].
     removed_sheet_stash: Option<RemovedSheetStash>,
+    /// Incremented every time a REAL undo group lands on `undo` (i.e. a
+    /// genuine mutation was committed) — never touched by `do_undo`/
+    /// `do_redo`. The webview reads this from `view_json` and compares it
+    /// before/after a `dispatch` call to decide whether to tell the host
+    /// "this edit happened" (dirty dot, undo-stack entry), replacing a
+    /// verb-name regex that couldn't tell a no-op `autosum`/`cut`/`paste`
+    /// (nothing actually changed) from one that mutated.
+    edits: u64,
 }
 
 impl Session {
@@ -135,6 +143,7 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             removed_sheet_stash: None,
+            edits: 0,
         })
     }
 
@@ -360,6 +369,15 @@ impl Session {
                             idx,
                             name: name.to_string(),
                         });
+                        // A third genuine undo-group chokepoint alongside
+                        // `apply()`/`structural()`: this push happens
+                        // directly (see the comment above — a `SheetAdd`'s
+                        // inverse isn't expressible as either of those), so
+                        // it needs its own `edits` increment or the webview
+                        // would stop posting `{type:'edit'}` for "+ add
+                        // sheet" once the MUTATING regex it used to match
+                        // against is gone.
+                        self.edits += 1;
                         self.redo.clear();
                         self.active = idx;
                         self.cur = (0, 0);
@@ -401,6 +419,7 @@ impl Session {
             group.changes.push((r, c, before, after));
         }
         self.undo.push(UndoAction::Cells(group));
+        self.edits += 1;
         self.redo.clear();
         self.dirty = true;
     }
@@ -475,6 +494,7 @@ impl Session {
             names: self.pkg.workbook.defined_names.clone(),
         };
         self.undo.push(UndoAction::Structural { before, after });
+        self.edits += 1;
         self.redo.clear();
         self.dirty = true;
     }
@@ -553,6 +573,16 @@ impl Session {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
         let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+        // Same cap `ctl_cell_format` enforces, and for the same reason: a
+        // Select-All + a toolbar format click can span a huge used range,
+        // and this materializes a `Cell` (plus an undo snapshot entry) per
+        // coordinate — unbounded, that's an unbounded UI freeze. Surfaced
+        // exactly like any other one-shot dispatch error: `self.err`, no
+        // partial apply.
+        if let Err(e) = gridcore::format::check_format_range_cap(r1, c1, r2, c2) {
+            self.err = Some(e);
+            return;
+        }
         let sheet_idx = self.active;
         let snapshot: Vec<(u32, u32, Option<Cell>)> = {
             let sheet = &self.pkg.workbook.sheets[sheet_idx];
@@ -808,6 +838,11 @@ impl Session {
         out.push('"');
         out.push_str("},\"dirty\":");
         out.push_str(if self.dirty { "true" } else { "false" });
+        // The webview's `userCmd` compares this before/after a dispatch call
+        // to decide whether to tell the host "an edit happened" — see the
+        // `edits` field's doc comment on `Session`.
+        out.push_str(",\"edits\":");
+        out.push_str(&self.edits.to_string());
         if let Some(e) = self.err.take() {
             out.push_str(",\"err\":");
             json::push_str(&mut out, &e);
@@ -3040,6 +3075,72 @@ mod tests {
         assert!(
             v.contains("AutoSum: no numbers to sum"),
             "must surface an error: {v}"
+        );
+    }
+
+    #[test]
+    fn dispatch_autosum_no_op_does_not_bump_the_edits_counter_but_a_real_one_does() {
+        // The webview's `userCmd` (grid.js) posts `{type:'edit'}` to the host
+        // iff `edits` increased across a dispatch call — this is the fix for
+        // the bug where AutoSum-with-nothing-to-sum used to desync VS Code's
+        // undo stack via a verb-name regex that couldn't tell "dispatched"
+        // from "actually mutated".
+        let mut s = Session::open(&new_xlsx_bytes()).expect("open");
+        s.dispatch("select\t5\t5"); // isolated, blank neighbors
+        let edits_before = s.edits;
+        s.dispatch("autosum");
+        assert_eq!(
+            s.edits, edits_before,
+            "a no-op AutoSum must not bump the edits counter"
+        );
+        // A real edit right after DOES bump it by exactly one.
+        s.dispatch("set\t5\t5\t42");
+        assert_eq!(
+            s.edits,
+            edits_before + 1,
+            "a real edit must bump the edits counter by exactly one"
+        );
+    }
+
+    #[test]
+    fn do_undo_and_do_redo_never_bump_the_edits_counter() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t1\t1\t10");
+        let after_edit = s.edits;
+        s.dispatch("undo");
+        assert_eq!(s.edits, after_edit, "undo must not bump edits");
+        s.dispatch("redo");
+        assert_eq!(s.edits, after_edit, "redo must not bump edits");
+    }
+
+    #[test]
+    fn dispatch_fmt_rejects_a_selection_over_the_cap_and_touches_nothing() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // A single-column selection one row past the cap: CELL_FORMAT_CAP+1
+        // cells, same boundary gridcore::format's own suite pins.
+        s.dispatch(&format!(
+            "select\t0\t0\t{}\t0",
+            gridcore::format::CELL_FORMAT_CAP
+        ));
+        let undo_before = s.undo.len();
+        let edits_before = s.edits;
+        s.dispatch("fmt\tbold\ttoggle");
+        assert_eq!(
+            s.undo.len(),
+            undo_before,
+            "an oversized selection must not apply"
+        );
+        assert_eq!(
+            s.edits, edits_before,
+            "a rejected format must not bump edits"
+        );
+        let v = s.view_json(None);
+        assert!(
+            v.contains(&format!(
+                "cell.format: range too large (limit {} cells)",
+                gridcore::format::CELL_FORMAT_CAP
+            )),
+            "{v}"
         );
     }
 
