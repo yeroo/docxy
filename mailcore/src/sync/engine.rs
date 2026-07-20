@@ -1065,7 +1065,7 @@ impl Engine {
                 return;
             }
         };
-        match self.with_auth(|c| c.respond_event(&event_id, kind, None, true)) {
+        match self.with_auth(|c| c.respond_event(&event_id, kind, None, true, None)) {
             Ok(()) => self.emit(SyncEvent::MeetingResponded {
                 message_id: message_id.to_string(),
                 kind,

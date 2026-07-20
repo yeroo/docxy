@@ -454,6 +454,7 @@ impl GraphClient {
         kind: RsvpKind,
         comment: Option<&str>,
         send_response: bool,
+        proposed: Option<(String, String)>,
     ) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let action = match kind {
@@ -462,14 +463,29 @@ impl GraphClient {
             RsvpKind::Tentative => "tentativelyAccept",
         };
         let path = format!("/me/events/{id}/{action}");
-        let body = Value::Object(vec![
+        let mut obj = vec![
             (
                 "comment".to_string(),
                 Value::Str(comment.unwrap_or("").to_string()),
             ),
             ("sendResponse".to_string(), Value::Bool(send_response)),
-        ])
-        .to_string();
+        ];
+        if let Some((start, end)) = &proposed {
+            let dt = |utc: &str| {
+                Value::Object(vec![
+                    ("dateTime".to_string(), Value::Str(utc.to_string())),
+                    ("timeZone".to_string(), Value::Str("UTC".to_string())),
+                ])
+            };
+            obj.push((
+                "proposedNewTime".to_string(),
+                Value::Object(vec![
+                    ("start".to_string(), dt(start)),
+                    ("end".to_string(), dt(end)),
+                ]),
+            ));
+        }
+        let body = Value::Object(obj).to_string();
         self.send(Method::Post, &path, Some(body), &[])?;
         Ok(())
     }
@@ -1966,6 +1982,61 @@ mod tests {
     }
 
     #[test]
+    fn respond_event_decline_with_proposed_time_sends_proposed_new_time() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/decline".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event(
+            "E1",
+            RsvpKind::Decline,
+            Some("can we push?"),
+            true,
+            Some((
+                "2026-07-21T14:00:00Z".into(),
+                "2026-07-21T15:00:00Z".into(),
+            )),
+        )
+        .unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        let pnt = sent.get("proposedNewTime").unwrap();
+        assert_eq!(
+            pnt.get("start")
+                .unwrap()
+                .get("dateTime")
+                .and_then(Value::as_str),
+            Some("2026-07-21T14:00:00Z")
+        );
+        assert_eq!(
+            pnt.get("end")
+                .unwrap()
+                .get("timeZone")
+                .and_then(Value::as_str),
+            Some("UTC")
+        );
+    }
+
+    #[test]
+    fn respond_event_without_proposed_time_omits_the_key() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/accept".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event("E1", RsvpKind::Accept, None, true, None)
+            .unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert!(sent.get("proposedNewTime").is_none());
+    }
+
+    #[test]
     fn respond_event_accept_posts_comment_and_send_response() {
         let srv = FakeServer::start(vec![Route {
             method: "POST".into(),
@@ -1975,7 +2046,7 @@ mod tests {
             body: "".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.respond_event("E1", RsvpKind::Accept, Some("ok"), true)
+        c.respond_event("E1", RsvpKind::Accept, Some("ok"), true, None)
             .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "POST");
@@ -2007,9 +2078,9 @@ mod tests {
             },
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.respond_event("E1", RsvpKind::Decline, None, false)
+        c.respond_event("E1", RsvpKind::Decline, None, false, None)
             .unwrap();
-        c.respond_event("E1", RsvpKind::Tentative, None, false)
+        c.respond_event("E1", RsvpKind::Tentative, None, false, None)
             .unwrap();
         let reqs = srv.requests();
         assert!(reqs[0].path.ends_with("/decline"));
@@ -2027,7 +2098,7 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(
-            c.respond_event("E1", RsvpKind::Accept, None, true),
+            c.respond_event("E1", RsvpKind::Accept, None, true, None),
             Err(GraphError::Unauthorized)
         ));
     }
@@ -2044,7 +2115,7 @@ mod tests {
             body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.respond_event(raw_id, RsvpKind::Accept, None, true)
+        c.respond_event(raw_id, RsvpKind::Accept, None, true, None)
             .unwrap();
         let reqs = srv.requests();
         assert!(reqs[0].path.contains(encoded_id));

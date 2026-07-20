@@ -75,7 +75,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             // with a guessed action.
             let rsvp = rsvp_kind(kind)
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
-            client.respond_event(id, rsvp, comment.as_deref(), true)
+            client.respond_event(id, rsvp, comment.as_deref(), true, None)
         }
         OutboxOp::CreateEvent { id } => {
             let input = event_input_for(store, id)?;
