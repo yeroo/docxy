@@ -678,6 +678,8 @@ mod tests {
             web_link: "".into(),
             last_modified: "2020-01-01T00:00:00Z".into(),
             body_html: "<p>agenda</p>".into(),
+            reminder_minutes: 0,
+            is_reminder_on: false,
         }
     }
 
@@ -709,6 +711,8 @@ mod tests {
             organizer_addr: "".into(),
             response_status: "none".into(),
             series_master_id: None,
+            reminder_minutes: 0,
+            is_reminder_on: false,
         }
     }
 

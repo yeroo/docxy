@@ -30,6 +30,10 @@ pub struct Config {
     /// config — there's no runtime toggle or persistence for this, unlike
     /// `threaded`. Empty (the default) means no signature is appended.
     pub signature: String,
+    /// When true, a firing reminder also raises an agwinterm notification
+    /// (`agwintermctl notify`) over all sessions, when running inside agwinterm.
+    /// Default false — the in-TUI banner always shows regardless.
+    pub reminders_notify: bool,
 }
 
 impl Default for Config {
@@ -44,6 +48,7 @@ impl Default for Config {
             refresh_secs: 60,
             threaded: true,
             signature: String::new(),
+            reminders_notify: false,
         }
     }
 }
@@ -106,6 +111,9 @@ impl Config {
         if let Some(s) = value.get("signature").and_then(|v| v.as_str()) {
             self.signature = s.to_string();
         }
+        if let Some(b) = value.get("reminders_notify").and_then(|v| v.as_bool()) {
+            self.reminders_notify = b;
+        }
     }
 
     /// Overlays `LOOKXY_CLIENT_ID`/`LOOKXY_BACKFILL_DAYS`/`LOOKXY_REFRESH_SECS`
@@ -141,6 +149,14 @@ impl Config {
         }
         if let Ok(v) = std::env::var("LOOKXY_SIGNATURE") {
             self.signature = v;
+        }
+        if let Ok(v) = std::env::var("LOOKXY_REMINDERS_NOTIFY") {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("true") || v == "1" {
+                self.reminders_notify = true;
+            } else if v.eq_ignore_ascii_case("false") || v == "0" {
+                self.reminders_notify = false;
+            }
         }
     }
 }
@@ -455,6 +471,22 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, r#"{"signature":"--\nBoris"}"#).unwrap();
         assert_eq!(Config::load_from(Some(&path)).signature, "--\nBoris");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminders_notify_defaults_false_and_overlays_from_json() {
+        assert!(!Config::default().reminders_notify);
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-cfg-rem-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"reminders_notify": true}"#).unwrap();
+        let cfg = Config::load_from(Some(&path));
+        assert!(cfg.reminders_notify);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

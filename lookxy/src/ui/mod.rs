@@ -1031,6 +1031,8 @@ mod tests {
                 web_link: "".into(),
                 last_modified: "2020-01-01T00:00:00Z".into(),
                 body_html: "".into(),
+                reminder_minutes: 0,
+                is_reminder_on: false,
             })
             .unwrap();
         app.reload_agenda();
@@ -1075,6 +1077,8 @@ mod tests {
                 web_link: "".into(),
                 last_modified: "2020-01-01T00:00:00Z".into(),
                 body_html: "".into(),
+                reminder_minutes: 0,
+                is_reminder_on: false,
             })
             .unwrap();
         app.reload_agenda();
