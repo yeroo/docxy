@@ -292,6 +292,20 @@ impl Session {
                     }
                 }
             }
+            "fmt" => {
+                // `rest` is "<key>\t<value>" — split only once so a numFmt
+                // value keeps any inner tabs/chars intact.
+                let mut fp = rest.splitn(2, '\t');
+                let key = fp.next().unwrap_or("");
+                let value = fp.next().unwrap_or("");
+                self.apply_fmt(key, value);
+            }
+            "decimals" => {
+                if let Ok(delta) = rest.trim().parse::<i32>() {
+                    self.apply_decimals(delta);
+                }
+            }
+            "autosum" => self.do_autosum(),
             "undo" => self.do_undo(),
             "redo" => self.do_redo(),
             "insrow" | "delrow" | "inscol" | "delcol" => {
@@ -528,6 +542,153 @@ impl Session {
         rows.join("\n")
     }
 
+    /// Apply `patch` over every cell in the CURRENT SELECTION rectangle
+    /// (`self.cur`/`self.anchor`) as one undo group. The exact
+    /// snapshot→apply pattern `ctl_cell_format` uses (see that method):
+    /// snapshot each cell's existing style first (so the loop below never
+    /// observes an already-patched style from earlier in the same range),
+    /// compute the patched `Xf`, intern it, and hand the whole batch to
+    /// `apply()` — one `UndoGroup`, one `dispatch("undo")` to revert.
+    fn apply_format_to_selection(&mut self, patch: &FormatPatch) {
+        let (ar, ac) = self.anchor.unwrap_or(self.cur);
+        let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
+        let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+        let sheet_idx = self.active;
+        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+            let sheet = &self.pkg.workbook.sheets[sheet_idx];
+            let mut v = Vec::new();
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    v.push((r, c, sheet.cell(r, c).cloned()));
+                }
+            }
+            v
+        };
+        let mut changes = Vec::with_capacity(snapshot.len());
+        for (r, c, existing) in snapshot {
+            let cur_style = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+            let base_xf = self.pkg.workbook.styles.xf(cur_style);
+            let new_xf = apply_patch_to_xf(&base_xf, patch);
+            let idx = self.pkg.workbook.styles.intern(new_xf);
+            let mut cell = existing.unwrap_or_default();
+            cell.style = idx;
+            changes.push((r, c, cell));
+        }
+        self.apply(changes);
+    }
+
+    /// `fmt\t<key>\t<value>` — the toolbar's one-key format verbs.
+    /// `bold`/`italic` with value `"toggle"` read the ACTIVE cell's current
+    /// state and apply the FLIPPED state to the whole selection (Excel
+    /// semantics: the active cell decides the target, the selection
+    /// receives it). The other keys just parse `value` as that key's
+    /// [`FormatPatch`] field. An unrecognized key or a value `FormatPatch`
+    /// rejects is silently ignored — no partial format, no undo group.
+    fn apply_fmt(&mut self, key: &str, value: &str) {
+        let pair = match key {
+            "bold" | "italic" if value == "toggle" => {
+                let (cr, cc) = self.cur;
+                let active_style = self.pkg.workbook.sheets[self.active]
+                    .cell(cr, cc)
+                    .map(|cl| cl.style)
+                    .unwrap_or(0);
+                let xf = self.pkg.workbook.styles.xf(active_style);
+                let current = if key == "bold" { xf.bold } else { xf.italic };
+                let target = !current;
+                (
+                    key.to_string(),
+                    (if target { "true" } else { "false" }).to_string(),
+                )
+            }
+            "fontColor" | "fillColor" | "align" | "numFmt" => (key.to_string(), value.to_string()),
+            _ => return,
+        };
+        if let Ok(patch) = FormatPatch::parse(&[pair]) {
+            self.apply_format_to_selection(&patch);
+        }
+    }
+
+    /// `decimals\t<±n>` — increase/decrease the decimal-place count of the
+    /// ACTIVE cell's current number format (via [`gridcore::format::adjust_decimals`])
+    /// and apply the resulting code to the whole selection.
+    fn apply_decimals(&mut self, delta: i32) {
+        let (cr, cc) = self.cur;
+        let active_style = self.pkg.workbook.sheets[self.active]
+            .cell(cr, cc)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        let xf = self.pkg.workbook.styles.xf(active_style);
+        let current_code = xf.code.as_deref().unwrap_or("");
+        let new_code = gridcore::format::adjust_decimals(current_code, delta);
+        if let Ok(patch) = FormatPatch::parse(&[("numFmt".to_string(), new_code)]) {
+            self.apply_format_to_selection(&patch);
+        }
+    }
+
+    /// Whether `(r, c)` on the active sheet holds a numeric value — a
+    /// literal number OR a formula's cached numeric result. Used only by
+    /// `do_autosum`'s range guess.
+    fn is_numeric_cell(&self, r: u32, c: u32) -> bool {
+        self.pkg.workbook.sheets[self.active]
+            .cell(r, c)
+            .map(|cl| matches!(cl.value, CellValue::Number(_)))
+            .unwrap_or(false)
+    }
+
+    /// `autosum` — classic Excel range guess: the contiguous run of numeric
+    /// cells directly ABOVE the active cell; if there is none, the
+    /// contiguous run directly to its LEFT; if neither, a no-op that
+    /// surfaces `self.err` instead of writing `=SUM()` over nothing. Writes
+    /// the active cell as `=SUM(<range>)`, one undo group (via `apply`).
+    fn do_autosum(&mut self) {
+        let (r0, c0) = self.cur;
+        let mut top = None;
+        if r0 > 0 {
+            let mut r = r0 - 1;
+            loop {
+                if !self.is_numeric_cell(r, c0) {
+                    break;
+                }
+                top = Some(r);
+                if r == 0 {
+                    break;
+                }
+                r -= 1;
+            }
+        }
+        let range = if let Some(top_r) = top {
+            Some(((top_r, c0), (r0 - 1, c0)))
+        } else if c0 > 0 {
+            let mut left = None;
+            let mut c = c0 - 1;
+            loop {
+                if !self.is_numeric_cell(r0, c) {
+                    break;
+                }
+                left = Some(c);
+                if c == 0 {
+                    break;
+                }
+                c -= 1;
+            }
+            left.map(|left_c| ((r0, left_c), (r0, c0 - 1)))
+        } else {
+            None
+        };
+        let Some(((r1, c1), (r2, c2))) = range else {
+            self.err = Some("AutoSum: no numbers to sum".to_string());
+            return;
+        };
+        let formula = format!("SUM({}:{})", cell_name(r1, c1), cell_name(r2, c2));
+        let style = self.pkg.workbook.sheets[self.active]
+            .cell(r0, c0)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        let mut cell = Cell::formula(&formula);
+        cell.style = style;
+        self.apply(vec![(r0, c0, cell)]);
+    }
+
     /// Render the current viewport to the JSON the webview consumes. `copied`,
     /// when set, carries text the host should place on the OS clipboard (from
     /// a copy or cut command).
@@ -621,6 +782,30 @@ impl Session {
         out.push_str(",\"src\":");
         let src = self.cell_src(self.cur.0, self.cur.1);
         json::push_str(&mut out, &src);
+        // The active cell's format, so the toolbar can show pressed state
+        // (bold/italic buttons, the align group) without a separate round
+        // trip. `align` is the wire letter, not the full word — 'g' (not
+        // 'l'/'c'/'r') means General/no button lit, mirroring the `cells[]`
+        // alignment mapping just above but WITHOUT that mapping's
+        // value-dependent General fallback (the toolbar cares about the
+        // cell's actual style, not how a General number happens to render).
+        let active_style = self.pkg.workbook.sheets[self.active]
+            .cell(self.cur.0, self.cur.1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        let active_xf = self.pkg.workbook.styles.xf(active_style);
+        out.push_str(",\"bold\":");
+        out.push_str(if active_xf.bold { "true" } else { "false" });
+        out.push_str(",\"italic\":");
+        out.push_str(if active_xf.italic { "true" } else { "false" });
+        out.push_str(",\"align\":\"");
+        out.push_str(match active_xf.align {
+            Align::Left => "l",
+            Align::Center => "c",
+            Align::Right => "r",
+            Align::General => "g",
+        });
+        out.push('"');
         out.push_str("},\"dirty\":");
         out.push_str(if self.dirty { "true" } else { "false" });
         if let Some(e) = self.err.take() {
@@ -2675,6 +2860,213 @@ mod tests {
         assert_eq!(tsv, "Apple");
         let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
+    }
+
+    // -- interactive `fmt`/`decimals`/`autosum` (toolbar verbs) ------------
+
+    #[test]
+    fn dispatch_fmt_bold_toggle_flips_the_whole_selection_as_one_undo_group() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t0\t0\t1\t1"); // A1:B2, active cell A1
+        s.dispatch("fmt\tbold\ttoggle");
+        for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let style = s.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .map(|cl| cl.style)
+                .unwrap_or(0);
+            assert!(
+                s.pkg.workbook.styles.xf(style).bold,
+                "({r},{c}) must be bold after toggle"
+            );
+        }
+        // Values are untouched by the format-only edit.
+        assert_eq!(s.cell_src(1, 0), "Apple");
+        assert_eq!(s.cell_src(1, 1), "1.25");
+
+        s.dispatch("undo"); // ONE undo restores all four cells
+        for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let style = s.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .map(|cl| cl.style)
+                .unwrap_or(0);
+            assert!(
+                !s.pkg.workbook.styles.xf(style).bold,
+                "one undo must clear bold at ({r},{c})"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_fmt_bold_toggle_reads_the_active_cells_state_not_the_selections() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        // Pre-bold the active cell only; the rest of the selection starts
+        // unbold. Excel toggles OFF because the active cell is bold, and
+        // applies that target state to the WHOLE selection.
+        s.dispatch("select\t0\t0");
+        s.dispatch("fmt\tbold\ttoggle"); // A1 -> bold
+        let a1_style = s.pkg.workbook.sheets[0]
+            .cell(0, 0)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        assert!(s.pkg.workbook.styles.xf(a1_style).bold);
+
+        s.dispatch("select\t0\t0\t1\t1"); // A1:B2, active cell A1 (bold)
+        s.dispatch("fmt\tbold\ttoggle"); // must turn OFF for the whole range
+        for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let style = s.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .map(|cl| cl.style)
+                .unwrap_or(0);
+            assert!(
+                !s.pkg.workbook.styles.xf(style).bold,
+                "({r},{c}) must be un-bold: toggle followed the active cell"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_fmt_italic_align_font_color_fill_color_numfmt_apply_and_undo() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t1\t1"); // B2 (1.25)
+        s.dispatch("fmt\titalic\ttoggle");
+        s.dispatch("fmt\talign\tcenter");
+        s.dispatch("fmt\tfontColor\t#FF0000");
+        s.dispatch("fmt\tfillColor\t#00FF00");
+        s.dispatch("fmt\tnumFmt\t0.00%");
+        let style = s.pkg.workbook.sheets[0]
+            .cell(1, 1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        let xf = s.pkg.workbook.styles.xf(style);
+        assert!(xf.italic);
+        assert_eq!(xf.align, gridcore::sheet::Align::Center);
+        assert_eq!(xf.color, Some((255, 0, 0)));
+        assert_eq!(xf.fill, Some((0, 255, 0)));
+        assert_eq!(xf.code.as_deref(), Some("0.00%"));
+
+        for _ in 0..5 {
+            s.dispatch("undo");
+        }
+        let style = s.pkg.workbook.sheets[0]
+            .cell(1, 1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        let xf = s.pkg.workbook.styles.xf(style);
+        assert!(!xf.italic);
+        assert_eq!(xf.align, gridcore::sheet::Align::General);
+        assert_eq!(xf.color, None);
+        assert_eq!(xf.fill, None);
+        assert_ne!(xf.code.as_deref(), Some("0.00%"));
+    }
+
+    #[test]
+    fn dispatch_fmt_unknown_key_is_a_no_op() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let undo_before = s.undo.len();
+        s.dispatch("fmt\twrap\ttrue");
+        assert_eq!(
+            s.undo.len(),
+            undo_before,
+            "an unrecognized fmt key must not mutate"
+        );
+    }
+
+    #[test]
+    fn dispatch_decimals_increases_and_decreases_the_selections_numfmt() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t1\t1"); // B2 (1.25), unstyled -> General
+        s.dispatch("decimals\t1");
+        let style = s.pkg.workbook.sheets[0]
+            .cell(1, 1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        assert_eq!(s.pkg.workbook.styles.xf(style).code.as_deref(), Some("0.0"));
+        s.dispatch("decimals\t1");
+        let style = s.pkg.workbook.sheets[0]
+            .cell(1, 1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        assert_eq!(
+            s.pkg.workbook.styles.xf(style).code.as_deref(),
+            Some("0.00")
+        );
+        s.dispatch("decimals\t-1");
+        let style = s.pkg.workbook.sheets[0]
+            .cell(1, 1)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
+        assert_eq!(s.pkg.workbook.styles.xf(style).code.as_deref(), Some("0.0"));
+    }
+
+    #[test]
+    fn dispatch_autosum_guesses_the_column_above_run() {
+        let mut s = Session::open(&new_xlsx_bytes()).expect("open");
+        s.dispatch("set\t0\t0\t10"); // A1
+        s.dispatch("set\t1\t0\t20"); // A2
+        s.dispatch("set\t2\t0\t30"); // A3
+        s.dispatch("select\t3\t0"); // A4, active cell
+        s.dispatch("autosum");
+        assert_eq!(s.cell_src(3, 0), "=SUM(A1:A3)");
+        let v = s.view_json(None);
+        assert!(v.contains("\"src\":\"=SUM(A1:A3)\""), "{v}");
+        s.dispatch("select\t3\t0");
+        let v = s.view_json(None);
+        assert!(v.contains("60"), "SUM must evaluate: {v}");
+    }
+
+    #[test]
+    fn dispatch_autosum_falls_back_to_the_row_to_the_left_when_nothing_is_above() {
+        let mut s = Session::open(&new_xlsx_bytes()).expect("open");
+        s.dispatch("set\t0\t0\t5"); // A1
+        s.dispatch("set\t0\t1\t15"); // B1
+        s.dispatch("select\t0\t2"); // C1, active cell, nothing above (row 0)
+        s.dispatch("autosum");
+        assert_eq!(s.cell_src(0, 2), "=SUM(A1:B1)");
+    }
+
+    #[test]
+    fn dispatch_autosum_is_a_no_op_with_an_error_when_nothing_to_sum() {
+        let mut s = Session::open(&new_xlsx_bytes()).expect("open");
+        s.dispatch("select\t5\t5"); // isolated, blank neighbors
+        let undo_before = s.undo.len();
+        s.dispatch("autosum");
+        assert_eq!(
+            s.undo.len(),
+            undo_before,
+            "no-op must not push an undo group"
+        );
+        assert_eq!(s.cell_src(5, 5), "");
+        let v = s.view_json(None);
+        assert!(
+            v.contains("AutoSum: no numbers to sum"),
+            "must surface an error: {v}"
+        );
+    }
+
+    #[test]
+    fn view_json_cur_carries_the_active_cells_bold_italic_and_align() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("select\t1\t1"); // B2
+        s.dispatch("fmt\tbold\ttoggle");
+        s.dispatch("fmt\titalic\ttoggle");
+        s.dispatch("fmt\talign\tcenter");
+        let v = s.view_json(None);
+        assert!(v.contains("\"bold\":true"), "{v}");
+        assert!(v.contains("\"italic\":true"), "{v}");
+        assert!(v.contains("\"align\":\"c\""), "{v}");
+    }
+
+    #[test]
+    fn view_json_cur_align_defaults_to_g_for_general() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"bold\":false"), "{v}");
+        assert!(v.contains("\"italic\":false"), "{v}");
+        assert!(v.contains("\"align\":\"g\""), "{v}");
+    }
+
+    fn new_xlsx_bytes() -> Vec<u8> {
+        save_xlsx(&new_xlsx())
     }
 
     #[test]

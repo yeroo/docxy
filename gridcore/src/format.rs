@@ -266,6 +266,54 @@ fn hex_color((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02X}{g:02X}{b:02X}")
 }
 
+/// Adjust the decimal-place count of a number-format code by `delta`,
+/// clamped to `0..=9` — the pure rule behind the toolbar's increase/decrease
+/// decimal buttons (and any other host that wants the same Excel-familiar
+/// behavior). Preserves everything else about the code: a leading affix like
+/// `"$"` or a thousands-grouping prefix (`"#,##0"` vs `"0"`), and a trailing
+/// suffix like `"%"` — only the run of `0`s right after the first `.` grows
+/// or shrinks. An empty code or the literal `"General"` is treated as the
+/// bare integer format `"0"` (so `+1` on either yields `"0.0"`, matching
+/// Excel: the increase-decimal button works even on an unformatted cell).
+///
+/// Current decimal count = the number of `0` characters immediately after
+/// the first `.` in the code (0 if the code has no `.`). Dropping the count
+/// to 0 removes the `.` entirely rather than leaving a trailing dot.
+pub fn adjust_decimals(code: &str, delta: i32) -> String {
+    let base = if code.is_empty() || code.eq_ignore_ascii_case("general") {
+        "0"
+    } else {
+        code
+    };
+    if let Some(dot) = base.find('.') {
+        let (prefix, rest) = base.split_at(dot);
+        let after_dot = &rest[1..]; // skip the '.' itself
+        let zero_run = after_dot.bytes().take_while(|&b| b == b'0').count();
+        let suffix = &after_dot[zero_run..];
+        let new_count = (zero_run as i32 + delta).clamp(0, 9) as usize;
+        if new_count == 0 {
+            format!("{prefix}{suffix}")
+        } else {
+            format!("{prefix}.{}{suffix}", "0".repeat(new_count))
+        }
+    } else {
+        // No '.': current count is 0. Insert one right after the trailing
+        // digit/grouping run (before any non-numeric suffix like "%").
+        let core_end = base
+            .bytes()
+            .rposition(|b| b == b'0' || b == b'#' || b == b',')
+            .map(|i| i + 1)
+            .unwrap_or(base.len());
+        let new_count = delta.clamp(0, 9) as usize;
+        if new_count == 0 {
+            base.to_string()
+        } else {
+            let (prefix, suffix) = base.split_at(core_end);
+            format!("{prefix}.{}{suffix}", "0".repeat(new_count))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +506,45 @@ mod tests {
         assert!(check_format_range_cap(3, 3, 5, 5).is_ok());
         // A single cell is fine.
         assert!(check_format_range_cap(9, 9, 9, 9).is_ok());
+    }
+
+    #[test]
+    fn adjust_decimals_pinned_examples() {
+        // Every example pinned in the toolbar spec, verbatim.
+        assert_eq!(adjust_decimals("0", 1), "0.0");
+        assert_eq!(adjust_decimals("0.00", -1), "0.0");
+        assert_eq!(adjust_decimals("0.0", -1), "0");
+        assert_eq!(adjust_decimals("$#,##0.00", 1), "$#,##0.000");
+        assert_eq!(adjust_decimals("0%", 1), "0.0%");
+        assert_eq!(adjust_decimals("#,##0.00", -1), "#,##0.0");
+        assert_eq!(adjust_decimals("", 1), "0.0");
+        assert_eq!(adjust_decimals("General", 1), "0.0");
+    }
+
+    #[test]
+    fn adjust_decimals_clamps_at_zero_and_nine() {
+        assert_eq!(adjust_decimals("0", -1), "0", "can't go below 0 decimals");
+        assert_eq!(
+            adjust_decimals("0.0", -5),
+            "0",
+            "clamped at 0, not negative"
+        );
+        let mut code = "0".to_string();
+        for _ in 0..12 {
+            code = adjust_decimals(&code, 1);
+        }
+        assert_eq!(code, "0.000000000", "clamped at 9 decimals");
+        assert_eq!(
+            adjust_decimals(&code, 1),
+            code,
+            "stays at the 9-decimal clamp"
+        );
+    }
+
+    #[test]
+    fn adjust_decimals_is_case_insensitive_for_general() {
+        assert_eq!(adjust_decimals("general", 1), "0.0");
+        assert_eq!(adjust_decimals("GENERAL", 1), "0.0");
     }
 
     #[test]
