@@ -272,6 +272,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Tab => cycle_focus(app),
+        KeyCode::BackTab => cycle_focus_back(app),
+        // Back out of the current pane toward the folder list. Guarded to
+        // non-Folders so the Folders pane keeps `←`/`h` (and Esc) for tree
+        // collapse / no-op; there's nothing further left of Folders anyway.
+        KeyCode::Left | KeyCode::Char('h') if app.focus != Pane::Folders => focus_back(app),
+        KeyCode::Esc if app.focus != Pane::Folders => focus_back(app),
         // Reading-focused vertical keys scroll the reader instead of moving
         // a selection (`move_selection`'s `Pane::Reading` arm is a no-op —
         // there's nothing there to select over). These guarded arms must
@@ -361,6 +367,25 @@ fn cycle_focus(app: &mut App) {
         Pane::Folders => Pane::List,
         Pane::List => Pane::Reading,
         Pane::Reading => Pane::Folders,
+    };
+}
+
+/// `Shift+Tab` — the reverse of `cycle_focus`.
+fn cycle_focus_back(app: &mut App) {
+    app.focus = match app.focus {
+        Pane::Folders => Pane::Reading,
+        Pane::List => Pane::Folders,
+        Pane::Reading => Pane::List,
+    };
+}
+
+/// Step focus one pane to the left (Reading → List → Folders), bottoming out at
+/// Folders. Bound to `←`/`h`/`Esc` in the List/Reading panes so you can back out
+/// of an opened message — the Folders pane keeps `←`/`h` for tree collapse.
+fn focus_back(app: &mut App) {
+    app.focus = match app.focus {
+        Pane::Reading => Pane::List,
+        Pane::List | Pane::Folders => Pane::Folders,
     };
 }
 
@@ -486,6 +511,31 @@ mod tests {
     use mailcore::sync::engine::SyncCommand;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn shift_tab_reverse_cycles_panes() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::Reading;
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, Pane::List);
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, Pane::Folders);
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, Pane::Reading);
+    }
+
+    #[test]
+    fn left_and_esc_step_focus_back_from_reading_and_list() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::Reading;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.focus, Pane::List);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.focus, Pane::Folders);
+        // At Folders, `←`/`h` is reserved for tree collapse — focus stays put.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        assert_eq!(app.focus, Pane::Folders);
+    }
 
     #[test]
     fn reminder_banner_renders_front_and_more_count() {
