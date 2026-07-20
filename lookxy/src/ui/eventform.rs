@@ -326,6 +326,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.save_event_form();
         return;
     }
+    if ctrl && key.code == KeyCode::Char('b') {
+        app.open_free_busy();
+        return;
+    }
     if key.code == KeyCode::Esc {
         if let Some(form) = app.event_form.as_mut() {
             if form.autocomplete.is_some() {

@@ -673,6 +673,13 @@ pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// `Sun`/`Mon`/… for the day-count `z` (days since the Unix epoch, which was
 /// a Thursday) — `(z + 4).rem_euclid(7)` lands `z == 0` on index 4 (`Thu`),
 /// matching that anchor.
+/// A short calendar-date label like `Mon Jul 21` for a `(year, month, day)` —
+/// used by the free/busy overlay's title.
+pub(crate) fn day_label(y: i64, m: u32, d: u32) -> String {
+    let z = days_from_civil(y, m, d);
+    format!("{} {} {:02}", weekday_abbrev(z), month_abbrev(m), d)
+}
+
 fn weekday_abbrev(z: i64) -> &'static str {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     WEEKDAYS[(z + 4).rem_euclid(7) as usize]

@@ -222,6 +222,9 @@ pub struct App {
     pub reminder_queue: std::collections::VecDeque<String>,
     #[cfg(test)]
     pub agwinterm_notify_invocations: std::cell::Cell<u32>,
+    /// The free/busy availability overlay (opened by `Ctrl-B` in the event
+    /// form), when open.
+    pub free_busy: Option<crate::ui::freebusy::FreeBusyView>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -471,6 +474,7 @@ impl App {
             reminder_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
             agwinterm_notify_invocations: std::cell::Cell::new(0),
+            free_busy: None,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -598,12 +602,20 @@ impl App {
                 self.attachment_notice = Some("Automatic replies updated".to_string());
             }
             SyncEvent::CategoriesUpdated => self.reload_master_categories(),
+            SyncEvent::ScheduleFetched { entries } => {
+                if let Some(v) = self.free_busy.as_mut() {
+                    v.entries = entries;
+                    v.loading = false;
+                }
+            }
             SyncEvent::Error(msg) => {
-                // A fetch failure while the OOF form is open must clear its
-                // loading state so the user can still edit + save (a later PATCH
-                // sets from scratch), rather than leaving a stuck "loading…".
+                // A fetch failure while the OOF form / free-busy overlay is open
+                // must clear its loading state so it isn't stuck on "loading…".
                 if let Some(form) = self.oof_form.as_mut() {
                     form.loading = false;
+                }
+                if let Some(v) = self.free_busy.as_mut() {
+                    v.loading = false;
                 }
                 self.error_notice = Some(msg);
             }
@@ -1322,6 +1334,60 @@ impl App {
     }
 
     // --- Event form: open new/edit -----------------------------------------
+
+    /// `Ctrl-B` in the event form: fetch and show attendees' + the organizer's
+    /// availability for the form's Start date (08:00–18:00 local, 30-min
+    /// slots). Read-only.
+    pub fn open_free_busy(&mut self) {
+        let Some(form) = self.event_form.as_ref() else {
+            return;
+        };
+        // Emails: the organizer (own account) first, then attendee addresses.
+        let mut schedules: Vec<String> = Vec::new();
+        if let Some(me) = self.account.clone() {
+            if !me.is_empty() {
+                schedules.push(me);
+            }
+        }
+        for (_, addr) in parse_attendee_pairs(&form.attendees) {
+            if !addr.is_empty() && !schedules.contains(&addr) {
+                schedules.push(addr);
+            }
+        }
+        // Window: the Start field's date (first 10 chars if `YYYY-MM-DD…`, else
+        // today) at 08:00–18:00 local → UTC.
+        let now = local_now();
+        let off = crate::ui::calendar::local_offset_minutes();
+        let date = form
+            .start
+            .get(..10)
+            .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-')
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:04}-{:02}-{:02}", now.year, now.month, now.day));
+        let start_utc =
+            crate::datetime::parse_start(&format!("{date} 08:00"), now, off).unwrap_or_default();
+        let end_utc =
+            crate::datetime::parse_start(&format!("{date} 18:00"), now, off).unwrap_or_default();
+        let (y, m, d) = crate::ui::calendar::date_of_utc(&start_utc);
+        let _ = self.sync.cmd_tx.send(SyncCommand::FetchSchedule {
+            schedules,
+            start_utc,
+            end_utc,
+            interval_minutes: 30,
+        });
+        self.free_busy = Some(crate::ui::freebusy::FreeBusyView {
+            day_label: crate::ui::calendar::day_label(y, m, d),
+            interval_minutes: 30,
+            slot_count: 20, // (18-8)*60/30
+            entries: Vec::new(),
+            loading: true,
+        });
+    }
+
+    /// Esc in the free/busy overlay: close it (back to the event form).
+    pub fn close_free_busy(&mut self) {
+        self.free_busy = None;
+    }
 
     /// `c` in Calendar mode: opens a blank event form. Start/End are
     /// prefilled in LOCAL time — Start to the next full hour, End to +1h
@@ -3221,6 +3287,68 @@ pub(crate) mod tests {
         assert_eq!(app.reminder_queue.front().map(String::as_str), Some("b"));
         app.dismiss_reminder();
         assert!(app.reminder_queue.is_empty());
+    }
+
+    #[test]
+    fn open_free_busy_sends_fetch_with_organizer_and_attendees() {
+        use crate::ui::eventform::{EventField, EventForm};
+        let mut app = App::for_test_with_seeded_store();
+        app.account = Some("me@x".into());
+        app.event_form = Some(EventForm {
+            editing_id: None,
+            title: "Sync".into(),
+            start: "2026-07-21 14:00".into(),
+            end: "2026-07-21 15:00".into(),
+            all_day: false,
+            repeat: None,
+            interval: "1".into(),
+            days: [false; 7],
+            until: String::new(),
+            location: String::new(),
+            attendees: "Alice <alice@x>; bob@x".into(),
+            body: String::new(),
+            focus: EventField::Title,
+            autocomplete: None,
+            error: None,
+        });
+        app.open_free_busy();
+        assert!(app.free_busy.as_ref().unwrap().loading);
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::FetchSchedule {
+                schedules,
+                start_utc,
+                end_utc,
+                interval_minutes,
+            }) => {
+                assert_eq!(schedules, vec!["me@x", "alice@x", "bob@x"]);
+                assert!(start_utc.contains("2026-07-21") && start_utc.ends_with('Z'));
+                assert!(end_utc.ends_with('Z'));
+                assert_eq!(interval_minutes, 30);
+            }
+            other => panic!("expected FetchSchedule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schedule_fetched_fills_the_view() {
+        use mailcore::graph::model::ScheduleEntry;
+        let mut app = App::for_test_with_seeded_store();
+        app.free_busy = Some(crate::ui::freebusy::FreeBusyView {
+            day_label: "Mon Jul 21".into(),
+            interval_minutes: 30,
+            slot_count: 20,
+            entries: Vec::new(),
+            loading: true,
+        });
+        app.on_sync_event(SyncEvent::ScheduleFetched {
+            entries: vec![ScheduleEntry {
+                email: "me@x".into(),
+                availability: "000222".into(),
+            }],
+        });
+        let v = app.free_busy.as_ref().unwrap();
+        assert!(!v.loading);
+        assert_eq!(v.entries.len(), 1);
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod categorypicker;
 pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
+pub mod freebusy;
 mod folders;
 mod message_list;
 pub mod oofform;
