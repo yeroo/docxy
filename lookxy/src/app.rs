@@ -52,7 +52,11 @@ pub struct App {
     pub sync: SyncHandle,
     pub focus: Pane,
     pub folders: Vec<FolderRow>,
-    /// Index into `folders` of the currently highlighted row.
+    /// The folder pane's rendered tree: `folders` flattened depth-first with
+    /// only the rows reachable through expanded ancestors (see
+    /// `rebuild_visible_folders`). `folder_index` indexes THIS, not `folders`.
+    pub visible_folders: Vec<crate::ui::foldertree::VisibleFolder>,
+    /// Index into `visible_folders` of the currently highlighted row.
     pub folder_index: usize,
     pub messages: Vec<MessageRow>,
     /// Index into `messages` of the currently highlighted row.
@@ -428,6 +432,7 @@ impl App {
             sync,
             focus: Pane::Folders,
             folders: Vec::new(),
+            visible_folders: Vec::new(),
             folder_index: 0,
             messages: Vec::new(),
             msg_index: 0,
@@ -705,21 +710,35 @@ impl App {
     /// with `reload_messages` so the message list stays in step.
     pub fn reload_folders(&mut self) {
         self.folders = self.store.folders().unwrap_or_default();
-        match &self.selected_folder {
-            Some(id) => {
-                if let Some(idx) = self.folders.iter().position(|f| &f.id == id) {
-                    self.folder_index = idx;
-                } else {
-                    self.selected_folder = self.folders.first().map(|f| f.id.clone());
-                    self.folder_index = 0;
-                }
-            }
+        self.rebuild_visible_folders();
+        self.reload_messages();
+    }
+
+    /// Rebuilds `visible_folders` (the flattened, collapse-aware tree) from
+    /// `folders`, then reconciles the selection: keep `folder_index` pointing at
+    /// `selected_folder` when that row is still visible; otherwise clamp the
+    /// index into range and re-derive `selected_folder` from it (so a collapse
+    /// that hid the selection, or a folder that vanished on sync, still leaves a
+    /// valid highlighted row). Called by `reload_folders` and after every
+    /// expand/collapse.
+    pub fn rebuild_visible_folders(&mut self) {
+        self.visible_folders = crate::ui::foldertree::build_visible(&self.folders);
+        let pos = self
+            .selected_folder
+            .as_ref()
+            .and_then(|id| self.visible_folders.iter().position(|v| &v.row.id == id));
+        match pos {
+            Some(idx) => self.folder_index = idx,
             None => {
-                self.selected_folder = self.folders.first().map(|f| f.id.clone());
-                self.folder_index = 0;
+                self.folder_index = self
+                    .folder_index
+                    .min(self.visible_folders.len().saturating_sub(1));
+                self.selected_folder = self
+                    .visible_folders
+                    .get(self.folder_index)
+                    .map(|v| v.row.id.clone());
             }
         }
-        self.reload_messages();
     }
 
     /// True when the threaded folder view is what's on screen: threading is on,
@@ -2917,6 +2936,37 @@ impl App {
         app
     }
 
+    /// An `App` seeded with a small folder hierarchy for tree tests:
+    /// `Inbox` (well-known) with a child `EPAM`, plus a top-level `Sent`. All
+    /// collapsed by default; callers expand what they need and `reload_folders`.
+    #[cfg(test)]
+    pub fn for_test_with_folder_tree() -> App {
+        use mailcore::graph::model::MailFolder;
+        use std::sync::mpsc;
+        let store = Store::open_in_memory().expect("in-memory store");
+        for (id, name, parent, wkn) in [
+            ("inbox", "Inbox", None, Some("inbox")),
+            ("epam", "EPAM", Some("inbox"), None),
+            ("sent", "Sent", None, Some("sentitems")),
+        ] {
+            store
+                .upsert_folder(&MailFolder {
+                    id: id.into(),
+                    display_name: name.into(),
+                    parent_id: parent.map(Into::into),
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: wkn.map(Into::into),
+                })
+                .expect("seed folder");
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_evt_tx, evt_rx) = mpsc::channel();
+        let mut app = App::new(store, SyncHandle { cmd_tx, evt_rx }, PathBuf::new());
+        app.test_cmd_rx = Some(cmd_rx);
+        app
+    }
+
     /// Builds an `App` over an empty in-memory `Store` — no folders, no
     /// messages — wired to inert `SyncHandle` channels like
     /// `for_test_with_seeded_store` (no sync thread spawned). For tests
@@ -4847,6 +4897,34 @@ pub(crate) mod tests {
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn reload_folders_builds_the_visible_tree() {
+        let mut app = App::for_test_with_folder_tree();
+        // Collapsed by default: EPAM (child of Inbox) is hidden.
+        let ids: Vec<_> = app
+            .visible_folders
+            .iter()
+            .map(|v| v.row.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["inbox".to_string(), "sent".to_string()]);
+        // Expand Inbox → EPAM becomes visible at depth 1.
+        app.store.set_folder_expanded("inbox", true).unwrap();
+        app.reload_folders();
+        let shape: Vec<_> = app
+            .visible_folders
+            .iter()
+            .map(|v| (v.row.id.clone(), v.depth))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("inbox".to_string(), 0),
+                ("epam".to_string(), 1),
+                ("sent".to_string(), 0),
+            ]
+        );
     }
 
     #[test]

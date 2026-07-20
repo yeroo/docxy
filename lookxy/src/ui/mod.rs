@@ -12,6 +12,7 @@ pub(crate) mod compose;
 pub mod eventform;
 pub mod filepicker;
 mod folders;
+pub mod foldertree;
 pub mod freebusy;
 pub mod help;
 mod message_list;
@@ -413,9 +414,9 @@ fn focus_back(app: &mut App) {
 fn move_selection(app: &mut App, delta: isize) {
     match app.focus {
         Pane::Folders => {
-            if let Some(len) = nonzero(app.folders.len()) {
+            if let Some(len) = nonzero(app.visible_folders.len()) {
                 app.folder_index = wrapped(app.folder_index, delta, len);
-                app.selected_folder = Some(app.folders[app.folder_index].id.clone());
+                app.selected_folder = Some(app.visible_folders[app.folder_index].row.id.clone());
                 app.msg_index = 0;
                 app.reload_messages();
             }
