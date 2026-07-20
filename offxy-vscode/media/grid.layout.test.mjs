@@ -208,6 +208,23 @@ wrap.fire('mousedown', { clientX: clickX, clientY: clickY, shiftKey: false, prev
 assert.equal(gridlines.children[0], tileBefore,
   'a selection-only repaint (same window) must reuse the backdrop, not rebuild it');
 
+// ---- 2c. active cell un-tinted inside a selection (Excel) -------------------
+// The selection tint and the active-cell box must paint UNDER the data layer,
+// and the active-cell box must carry an opaque background, so the active cell
+// shows the normal cell background (stands out) instead of being covered by
+// the translucent selection shading.
+const selIdx = cells.children.findIndex((c) => c.id === 'selbox');
+const curIdx = cells.children.findIndex((c) => c.id === 'curbox');
+const firstData = cells.children.findIndex((c) => (c.className || '').includes('cell') && c.textContent);
+assert.ok(selIdx >= 0 && curIdx >= 0, 'selbox and curbox are painted');
+assert.ok(selIdx < firstData && curIdx < firstData,
+  'selection tint + active-cell cover must paint BEFORE (under) the data cells');
+// The opaque cover is a theme background declared in the #curbox CSS rule.
+const curboxRule = [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+  .find((r) => r[1].split(',').some((s) => s.trim() === '#curbox'));
+assert.ok(curboxRule && /background:\s*var\(/.test(curboxRule[2]),
+  'the #curbox active-cell box must declare an opaque theme background to punch itself out of the tint');
+
 // ---- 3. keyboard scroll-into-view clears the sticky headers -----------------
 // Shrink the viewport so arrowing down forces scrolling, then check the active
 // cell's screen rect is fully inside the uncovered band (below the column

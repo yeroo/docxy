@@ -81,11 +81,17 @@ html, body { height: 100%; overflow: hidden;
   border-right: 1px solid var(--vscode-editorWidget-border, #0002); }
 .hcell.on { color: var(--vscode-editor-foreground); font-weight: bold; }
 
-#selbox { position: absolute; pointer-events: none; z-index: 2;
+/* selbox (range tint) and curbox (active-cell box) paint UNDER the data
+   cells — set in grid.js's paint() by appending them before the data loop —
+   so no z-index here. The active cell's OPAQUE background covers the tint,
+   leaving it un-shaded (Excel highlights the active cell by background, not a
+   heavier border); the data cell's text/fill then paints on top of both. */
+#selbox { position: absolute; pointer-events: none;
   border: 2px solid var(--vscode-focusBorder, #007acc);
   background: color-mix(in srgb, var(--vscode-editor-selectionBackground, #264f78) 35%, transparent); }
-#curbox { position: absolute; pointer-events: none; z-index: 2;
-  border: 2px solid var(--vscode-focusBorder, #007acc); }
+#curbox { position: absolute; pointer-events: none;
+  border: 2px solid var(--vscode-focusBorder, #007acc);
+  background: var(--vscode-editor-background); }
 
 #tabs { position: absolute; bottom: 0; left: 0; right: 0; height: 24px;
   display: flex; align-items: stretch; gap: 2px; padding: 0 6px; overflow-x: auto;

@@ -143,8 +143,35 @@
       $('gridlines').replaceChildren(gf);
     }
 
-    // cells
     const frag = document.createDocumentFragment();
+    // Selection tint + active-cell box go FIRST so they paint UNDER the data
+    // layer: the translucent tint shows through the (transparent) data cells
+    // for a selected-but-not-active cell, while the active-cell box carries an
+    // OPAQUE background that punches the active cell out of the tint — so the
+    // active cell shows the normal cell background and stands out, exactly as
+    // Excel highlights the active cell within a selection (by background, not a
+    // heavier border). Data cells (text, fills) then paint on top and stay
+    // legible over both.
+    const sel = view.sel;
+    const selEl = document.createElement('div');
+    selEl.id = 'selbox';
+    selEl.style.top = sel.r * ROW_H + 'px';
+    selEl.style.left = originX + (colX[sel.c - left] ?? 0) + 'px';
+    selEl.style.height = (sel.r2 - sel.r + 1) * ROW_H + 'px';
+    let wsum = 0;
+    for (let c = sel.c; c <= sel.c2; c++) wsum += colWidthPx(c);
+    selEl.style.width = wsum + 'px';
+    frag.appendChild(selEl);
+    const curEl = document.createElement('div');
+    curEl.id = 'curbox';
+    const curR = rowOfRef(), curC = refCol();
+    curEl.style.top = curR * ROW_H + 'px';
+    curEl.style.left = originX + (colX[curC - left] ?? 0) + 'px';
+    curEl.style.height = ROW_H + 'px';
+    curEl.style.width = colWidthPx(curC) + 'px';
+    frag.appendChild(curEl);
+
+    // cells
     for (const cl of view.cells) {
       const el = document.createElement('div');
       el.className = 'cell';
@@ -160,26 +187,6 @@
       el.style.width = colWidthPx(cl.c) + 'px';
       frag.appendChild(el);
     }
-    // selection + active cell boxes
-    const sel = view.sel;
-    const selEl = document.createElement('div');
-    selEl.id = 'selbox';
-    selEl.style.top = sel.r * ROW_H + 'px';
-    selEl.style.left = originX + (colX[sel.c - left] ?? 0) + 'px';
-    selEl.style.height = (sel.r2 - sel.r + 1) * ROW_H + 'px';
-    let wsum = 0;
-    for (let c = sel.c; c <= sel.c2; c++) wsum += colWidthPx(c);
-    selEl.style.width = wsum + 'px';
-    frag.appendChild(selEl);
-    // active-cell outline: a tighter box than the (possibly multi-cell) selEl.
-    const curEl = document.createElement('div');
-    curEl.id = 'curbox';
-    const curR = rowOfRef(), curC = refCol();
-    curEl.style.top = curR * ROW_H + 'px';
-    curEl.style.left = originX + (colX[curC - left] ?? 0) + 'px';
-    curEl.style.height = ROW_H + 'px';
-    curEl.style.width = colWidthPx(curC) + 'px';
-    frag.appendChild(curEl);
     $('cells').replaceChildren(frag);
     // A repaint can land mid-edit (e.g. any select/scroll that fires while the
     // in-cell editor is open). replaceChildren() above would otherwise
