@@ -325,15 +325,43 @@ pub struct AttachmentsPopup {
     pub loading: bool,
 }
 
-/// State for the RSVP comment prompt opened by `a`/`d`/`t` in Calendar mode:
-/// the event being responded to, the response kind already decided by which
-/// key was pressed (one of `"accepted"`/`"declined"`/`"tentativelyAccepted"`
-/// — the exact `Store::set_event_response`/`SyncCommand::RespondEvent`
-/// vocabulary), and the in-progress one-line comment text.
+/// Which RSVP surface a prompt is for: a calendar `Event` (→ `RespondEvent`)
+/// or a mail-reader meeting invite `Message` (→ `RespondMeeting`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RsvpTarget {
+    Event(String),
+    Message(String),
+}
+
+/// The focused field in the RSVP prompt. Proposed-time fields only apply to
+/// decline/tentative (accept shows only `Comment`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsvpField {
+    ProposedStart,
+    ProposedEnd,
+    Comment,
+}
+
+/// State for the RSVP prompt opened by `a`/`d`/`t` in Calendar mode or `D`/`T`
+/// on a meeting invite in the mail reader. `kind` is the response-status
+/// vocabulary (`"accepted"`/`"declined"`/`"tentativelyAccepted"`). The
+/// proposed-time fields hold local-time text (`""` = no proposal) and only
+/// apply to decline/tentative.
 pub struct RsvpPrompt {
-    pub event_id: String,
+    pub target: RsvpTarget,
     pub kind: String,
     pub comment: String,
+    pub proposed_start: String,
+    pub proposed_end: String,
+    pub focus: RsvpField,
+}
+
+impl RsvpPrompt {
+    /// True when this RSVP kind can carry a proposed new time (decline or
+    /// tentative — never accept).
+    pub fn proposes(&self) -> bool {
+        self.kind == "declined" || self.kind == "tentativelyAccepted"
+    }
 }
 
 /// A conversation in the threaded folder view, plus whether it's expanded.
@@ -823,10 +851,13 @@ impl App {
             return;
         };
         self.attachment_notice = Some("Responding…".to_string());
-        let _ = self
-            .sync
-            .cmd_tx
-            .send(SyncCommand::RespondMeeting { message_id, kind });
+        let _ = self.sync.cmd_tx.send(SyncCommand::RespondMeeting {
+            message_id,
+            kind,
+            comment: None,
+            proposed_start_utc: None,
+            proposed_end_utc: None,
+        });
     }
 
     /// `O`: open the automatic-replies editor and fetch the current config
@@ -1115,66 +1146,179 @@ impl App {
         let Some(event_id) = self.highlighted_event_id() else {
             return;
         };
+        let focus = if kind == "declined" || kind == "tentativelyAccepted" {
+            RsvpField::ProposedStart
+        } else {
+            RsvpField::Comment
+        };
         self.rsvp_prompt = Some(RsvpPrompt {
-            event_id,
+            target: RsvpTarget::Event(event_id),
             kind: kind.to_string(),
             comment: String::new(),
+            proposed_start: String::new(),
+            proposed_end: String::new(),
+            focus,
         });
     }
 
-    /// Appends `s` to the in-progress RSVP comment; a no-op if the prompt
-    /// isn't open. Same shape as `type_query`.
-    pub fn type_rsvp_comment(&mut self, s: &str) {
-        if let Some(prompt) = &mut self.rsvp_prompt {
-            prompt.comment.push_str(s);
-        }
-    }
-
-    /// Removes the last character of the in-progress RSVP comment, if any.
-    /// A no-op if the prompt isn't open or the comment is already empty.
-    pub fn backspace_rsvp_comment(&mut self) {
-        if let Some(prompt) = &mut self.rsvp_prompt {
-            prompt.comment.pop();
-        }
-    }
-
-    /// Enter, on the RSVP comment prompt: submits with whatever comment was
-    /// typed (empty means no comment). A no-op if the prompt isn't open.
-    pub fn submit_rsvp(&mut self) {
-        let Some(prompt) = self.rsvp_prompt.take() else {
+    /// Mail reader `D`/`T` on an opened meeting invite: open the RSVP prompt
+    /// (with proposed-time fields) targeting the message. A no-op unless the
+    /// opened message is a meeting request (same guard as `respond_meeting`).
+    pub fn start_meeting_rsvp(&mut self, kind: &str) {
+        let Some(message_id) = self
+            .selected_message_row()
+            .filter(|m| m.is_meeting_request)
+            .map(|m| m.id.clone())
+        else {
             return;
         };
-        let comment = (!prompt.comment.is_empty()).then_some(prompt.comment);
-        self.apply_rsvp(prompt.event_id, prompt.kind, comment);
+        self.rsvp_prompt = Some(RsvpPrompt {
+            target: RsvpTarget::Message(message_id),
+            kind: kind.to_string(),
+            comment: String::new(),
+            proposed_start: String::new(),
+            proposed_end: String::new(),
+            focus: RsvpField::ProposedStart,
+        });
     }
 
-    /// Esc, on the RSVP comment prompt: sends the RSVP anyway, but with no
-    /// comment — Esc cancels *the comment*, not the whole response (per the
-    /// design brief: "an optional one-line comment prompt (Esc = no
-    /// comment)"). A no-op if the prompt isn't open.
+    /// Types into the focused RSVP field (comment or a proposed-time field).
+    pub fn type_rsvp_comment(&mut self, s: &str) {
+        if let Some(p) = &mut self.rsvp_prompt {
+            match p.focus {
+                RsvpField::ProposedStart => p.proposed_start.push_str(s),
+                RsvpField::ProposedEnd => p.proposed_end.push_str(s),
+                RsvpField::Comment => p.comment.push_str(s),
+            }
+        }
+    }
+
+    /// Backspaces the focused RSVP field.
+    pub fn backspace_rsvp_comment(&mut self) {
+        if let Some(p) = &mut self.rsvp_prompt {
+            match p.focus {
+                RsvpField::ProposedStart => {
+                    p.proposed_start.pop();
+                }
+                RsvpField::ProposedEnd => {
+                    p.proposed_end.pop();
+                }
+                RsvpField::Comment => {
+                    p.comment.pop();
+                }
+            }
+        }
+    }
+
+    /// Tab in the RSVP prompt: cycle focus. Accept skips the proposed-time
+    /// fields (Comment only).
+    pub fn cycle_rsvp_focus(&mut self) {
+        if let Some(p) = &mut self.rsvp_prompt {
+            p.focus = if p.proposes() {
+                match p.focus {
+                    RsvpField::ProposedStart => RsvpField::ProposedEnd,
+                    RsvpField::ProposedEnd => RsvpField::Comment,
+                    RsvpField::Comment => RsvpField::ProposedStart,
+                }
+            } else {
+                RsvpField::Comment
+            };
+        }
+    }
+
+    /// Enter on the RSVP prompt: parse the proposed window (both-or-neither;
+    /// `end > start`) when this kind proposes, then dispatch by target. A
+    /// parse/validation failure surfaces an error notice and leaves the prompt
+    /// open.
+    pub fn submit_rsvp(&mut self) {
+        let Some(prompt) = self.rsvp_prompt.as_ref() else {
+            return;
+        };
+        let proposed: Option<(String, String)> = if prompt.proposes()
+            && (!prompt.proposed_start.trim().is_empty()
+                || !prompt.proposed_end.trim().is_empty())
+        {
+            let now = local_now();
+            let off = crate::ui::calendar::local_offset_minutes();
+            let Some(start) = crate::datetime::parse_start(prompt.proposed_start.trim(), now, off)
+            else {
+                self.set_rsvp_error();
+                return;
+            };
+            let Some(end) = crate::datetime::parse_end(prompt.proposed_end.trim(), &start, now, off)
+            else {
+                self.set_rsvp_error();
+                return;
+            };
+            if end <= start {
+                self.set_rsvp_error();
+                return;
+            }
+            Some((start, end))
+        } else {
+            None
+        };
+        let prompt = self.rsvp_prompt.take().unwrap();
+        let comment = (!prompt.comment.is_empty()).then_some(prompt.comment.clone());
+        self.dispatch_rsvp(prompt.target, prompt.kind, comment, proposed);
+    }
+
+    /// Esc, on the RSVP prompt: send the plain RSVP (no comment, no proposal).
     pub fn cancel_rsvp_comment(&mut self) {
         let Some(prompt) = self.rsvp_prompt.take() else {
             return;
         };
-        self.apply_rsvp(prompt.event_id, prompt.kind, None);
+        self.dispatch_rsvp(prompt.target, prompt.kind, None, None);
     }
 
-    /// The shared tail of `submit_rsvp`/`cancel_rsvp_comment`: writes the
-    /// response optimistically (`Store::set_event_response`, immediately
-    /// reflected in the store — before Graph is even reached), reloads the
-    /// agenda so the response glyph updates right away, and fires
-    /// `SyncCommand::RespondEvent` so the engine enqueues the matching
-    /// outbox op and drains it — the same optimistic-store +
-    /// fire-and-forget-command pattern `mark_read`/`toggle_flag` already use
-    /// for mail triage. The UI never enqueues the outbox op itself; that's
-    /// the engine's job once this command lands.
-    fn apply_rsvp(&mut self, id: String, kind: String, comment: Option<String>) {
-        self.store.set_event_response(&id, &kind);
-        self.reload_agenda();
-        let _ = self
-            .sync
-            .cmd_tx
-            .send(SyncCommand::RespondEvent { id, kind, comment });
+    /// Surfaces a proposed-time validation error (the prompt has no inline
+    /// error field of its own; the transient notice suffices).
+    fn set_rsvp_error(&mut self) {
+        self.error_notice = Some("Invalid proposed time".to_string());
+    }
+
+    /// The shared dispatch: `Event` → optimistic `set_event_response` +
+    /// `reload_agenda` + `RespondEvent`; `Message` → `RespondMeeting` (kind
+    /// mapped from the status string to `RsvpKind`). The UI never enqueues the
+    /// outbox op itself.
+    fn dispatch_rsvp(
+        &mut self,
+        target: RsvpTarget,
+        kind: String,
+        comment: Option<String>,
+        proposed: Option<(String, String)>,
+    ) {
+        let (proposed_start_utc, proposed_end_utc) = match proposed {
+            Some((s, e)) => (Some(s), Some(e)),
+            None => (None, None),
+        };
+        match target {
+            RsvpTarget::Event(id) => {
+                self.store.set_event_response(&id, &kind);
+                self.reload_agenda();
+                let _ = self.sync.cmd_tx.send(SyncCommand::RespondEvent {
+                    id,
+                    kind,
+                    comment,
+                    proposed_start_utc,
+                    proposed_end_utc,
+                });
+            }
+            RsvpTarget::Message(message_id) => {
+                let rsvp = match kind.as_str() {
+                    "declined" => RsvpKind::Decline,
+                    "tentativelyAccepted" => RsvpKind::Tentative,
+                    _ => RsvpKind::Accept,
+                };
+                let _ = self.sync.cmd_tx.send(SyncCommand::RespondMeeting {
+                    message_id,
+                    kind: rsvp,
+                    comment,
+                    proposed_start_utc,
+                    proposed_end_utc,
+                });
+            }
+        }
     }
 
     // --- Event form: open new/edit -----------------------------------------
@@ -1512,8 +1656,8 @@ impl App {
             'F' => self.compose_forward(),
             't' => self.toggle_threaded(),
             'A' => self.respond_meeting(RsvpKind::Accept),
-            'D' => self.respond_meeting(RsvpKind::Decline),
-            'T' => self.respond_meeting(RsvpKind::Tentative),
+            'D' => self.start_meeting_rsvp("declined"),
+            'T' => self.start_meeting_rsvp("tentativelyAccepted"),
             'O' => self.open_oof_form(),
             'l' => self.open_category_picker(crate::ui::categorypicker::PickerMode::Assign),
             'L' => self.open_category_picker(crate::ui::categorypicker::PickerMode::Filter),
@@ -3346,12 +3490,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn calendar_decline_with_proposed_time_sends_respond_event() {
+        use crate::app::{RsvpField, RsvpTarget};
+        let mut app = App::for_test_with_seeded_store();
+        app.rsvp_prompt = Some(crate::app::RsvpPrompt {
+            target: RsvpTarget::Event("E1".into()),
+            kind: "declined".into(),
+            comment: String::new(),
+            proposed_start: "2026-07-21 14:00".into(),
+            proposed_end: "2026-07-21 15:00".into(),
+            focus: RsvpField::ProposedStart,
+        });
+        app.submit_rsvp();
+        let mut found = None;
+        while let Ok(cmd) = app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            if let SyncCommand::RespondEvent {
+                proposed_start_utc, ..
+            } = &cmd
+            {
+                found = proposed_start_utc.clone();
+                break;
+            }
+        }
+        assert!(found.is_some_and(|s| s.ends_with('Z')));
+        assert!(app.rsvp_prompt.is_none());
+    }
+
+    #[test]
+    fn mail_d_opens_prompt_and_a_is_instant() {
+        use crate::app::{RsvpField, RsvpTarget};
+        let mut app = App::for_test_with_seeded_store();
+        open_meeting_invite(&mut app);
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain open
+        app.on_key_char('A');
+        assert!(app.rsvp_prompt.is_none());
+        assert!(matches!(
+            app.test_cmd_rx.as_ref().unwrap().try_recv(),
+            Ok(SyncCommand::RespondMeeting { .. })
+        ));
+        app.on_key_char('D');
+        let p = app.rsvp_prompt.as_ref().unwrap();
+        assert!(matches!(p.target, RsvpTarget::Message(_)));
+        assert_eq!(p.focus, RsvpField::ProposedStart);
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+    }
+
+    #[test]
+    fn mail_decline_with_proposed_time_sends_respond_meeting() {
+        let mut app = App::for_test_with_seeded_store();
+        open_meeting_invite(&mut app);
+        while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {}
+        app.start_meeting_rsvp("declined");
+        let p = app.rsvp_prompt.as_mut().unwrap();
+        p.proposed_start = "2026-07-21 14:00".into();
+        p.proposed_end = "2026-07-21 15:00".into();
+        app.submit_rsvp();
+        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            Ok(SyncCommand::RespondMeeting {
+                kind,
+                proposed_start_utc,
+                ..
+            }) => {
+                assert_eq!(kind, mailcore::graph::client::RsvpKind::Decline);
+                assert!(proposed_start_utc.is_some());
+            }
+            other => panic!("expected RespondMeeting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn half_filled_proposed_time_errors_and_sends_nothing() {
+        use crate::app::{RsvpField, RsvpTarget};
+        let mut app = App::for_test_with_seeded_store();
+        app.rsvp_prompt = Some(crate::app::RsvpPrompt {
+            target: RsvpTarget::Event("E1".into()),
+            kind: "declined".into(),
+            comment: String::new(),
+            proposed_start: "2026-07-21 14:00".into(),
+            proposed_end: String::new(), // half-filled
+            focus: RsvpField::ProposedStart,
+        });
+        app.submit_rsvp();
+        assert!(app.rsvp_prompt.is_some()); // stayed open
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+        assert_eq!(app.error_notice.as_deref(), Some("Invalid proposed time"));
+    }
+
+    #[test]
     fn respond_meeting_on_an_invite_sends_command() {
         let mut app = App::for_test_with_seeded_store();
         open_meeting_invite(&mut app);
         app.respond_meeting(RsvpKind::Accept);
         match app.test_cmd_rx.as_ref().unwrap().try_recv() {
-            Ok(SyncCommand::RespondMeeting { message_id, kind }) => {
+            Ok(SyncCommand::RespondMeeting {
+                message_id, kind, ..
+            }) => {
                 assert_eq!(message_id, "invite1");
                 assert_eq!(kind, RsvpKind::Accept);
             }
@@ -3370,7 +3603,7 @@ pub(crate) mod tests {
 
     #[test]
     fn uppercase_a_d_t_route_to_respond_meeting_only_for_invites() {
-        // Ordinary mail: A/D/T send nothing.
+        // Ordinary mail: A/D/T do nothing (no command, no prompt).
         let mut app = App::for_test_with_seeded_store();
         app.open_message("m1");
         while app.test_cmd_rx.as_ref().unwrap().try_recv().is_ok() {} // drain open's FetchBody
@@ -3378,15 +3611,14 @@ pub(crate) mod tests {
         app.on_key_char('D');
         app.on_key_char('T');
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+        assert!(app.rsvp_prompt.is_none());
 
-        // Invite: each maps to the matching RsvpKind.
+        // Invite: 'D' opens the RSVP prompt with the matching kind (the send
+        // happens on submit — see mail_d_opens_prompt_and_a_is_instant).
         let mut app = App::for_test_with_seeded_store();
         open_meeting_invite(&mut app);
         app.on_key_char('D');
-        match app.test_cmd_rx.as_ref().unwrap().try_recv() {
-            Ok(SyncCommand::RespondMeeting { kind, .. }) => assert_eq!(kind, RsvpKind::Decline),
-            other => panic!("expected RespondMeeting Decline, got {other:?}"),
-        }
+        assert_eq!(app.rsvp_prompt.as_ref().unwrap().kind, "declined");
     }
 
     #[test]

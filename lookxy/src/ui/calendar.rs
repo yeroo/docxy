@@ -1045,6 +1045,7 @@ mod tests {
                 id: sent_id,
                 kind,
                 comment,
+                ..
             }) => {
                 assert_eq!(sent_id, id);
                 assert_eq!(kind, "accepted");
@@ -1083,6 +1084,7 @@ mod tests {
                 id: sent_id,
                 kind,
                 comment,
+                ..
             }) => {
                 assert_eq!(sent_id, id);
                 assert_eq!(kind, "declined");
