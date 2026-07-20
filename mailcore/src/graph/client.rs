@@ -10,7 +10,7 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, MasterCategory, Message,
-    OofStatus, Person, Recipient, Recurrence, plain_to_html,
+    OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -442,6 +442,44 @@ impl GraphClient {
             }
         }
         Ok(events)
+    }
+
+    /// POST `/me/calendar/getSchedule` — the availability of each address in
+    /// `schedules` over `[start_utc, end_utc)` at `interval_minutes` slots.
+    /// Returns each schedule's `availabilityView` digit string.
+    pub fn get_schedule(
+        &self,
+        schedules: &[String],
+        start_utc: &str,
+        end_utc: &str,
+        interval_minutes: i64,
+    ) -> Result<Vec<ScheduleEntry>, GraphError> {
+        let dt = |utc: &str| {
+            Value::Object(vec![
+                (
+                    "dateTime".to_string(),
+                    Value::Str(utc.trim_end_matches('Z').to_string()),
+                ),
+                ("timeZone".to_string(), Value::Str("UTC".to_string())),
+            ])
+        };
+        let body = Value::Object(vec![
+            (
+                "schedules".to_string(),
+                Value::Array(schedules.iter().map(|s| Value::Str(s.clone())).collect()),
+            ),
+            ("startTime".to_string(), dt(start_utc)),
+            ("endTime".to_string(), dt(end_utc)),
+            (
+                "availabilityViewInterval".to_string(),
+                Value::Num(interval_minutes as f64),
+            ),
+        ])
+        .to_string();
+        let resp = self.send(Method::Post, "/me/calendar/getSchedule", Some(body), &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?;
+        Ok(items.iter().filter_map(ScheduleEntry::from_json).collect())
     }
 
     /// POST `/me/events/{id}/accept|decline|tentativelyAccept` with
@@ -1979,6 +2017,45 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert_eq!(c.meeting_event_id("M2").unwrap(), None);
+    }
+
+    #[test]
+    fn get_schedule_posts_body_and_parses_view() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/calendar/getSchedule".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[{"scheduleId":"me@x","availabilityView":"000222"},{"scheduleId":"alice@x","availabilityView":"220000"}]}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let entries = c
+            .get_schedule(
+                &["me@x".to_string(), "alice@x".to_string()],
+                "2026-07-21T08:00:00Z",
+                "2026-07-21T18:00:00Z",
+                30,
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].email, "alice@x");
+        assert_eq!(entries[0].availability, "000222");
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert_eq!(
+            sent.get("availabilityViewInterval").and_then(Value::as_i64),
+            Some(30)
+        );
+        assert_eq!(
+            sent.get("schedules").and_then(Value::as_array).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            sent.get("startTime")
+                .unwrap()
+                .get("dateTime")
+                .and_then(Value::as_str),
+            Some("2026-07-21T08:00:00")
+        );
     }
 
     #[test]

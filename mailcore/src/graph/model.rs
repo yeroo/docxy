@@ -393,6 +393,24 @@ pub fn plain_to_html(s: &str) -> String {
     out
 }
 
+/// One schedule's availability from Graph `getSchedule`: the mailbox address
+/// (`scheduleId`) and its `availabilityView` digit string (one char per slot:
+/// `0` free, `1` tentative, `2` busy, `3` out-of-office, `4` working-elsewhere).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleEntry {
+    pub email: String,
+    pub availability: String,
+}
+
+impl ScheduleEntry {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(ScheduleEntry {
+            email: str_field(v, "scheduleId"),
+            availability: str_field(v, "availabilityView"),
+        })
+    }
+}
+
 /// One entry of the mailbox's master category list (Graph `outlookCategory`):
 /// a category's display name and its `color` (`"preset0"`…`"preset24"` or
 /// `"none"`). The UI maps `color` to a terminal color; the name is what a
@@ -960,6 +978,14 @@ mod tests {
         )
         .unwrap();
         assert!(Recurrence::from_json(&v).is_none());
+    }
+
+    #[test]
+    fn schedule_entry_parses_id_and_view() {
+        let v = parse(r#"{"scheduleId":"alice@x","availabilityView":"002200"}"#).unwrap();
+        let e = ScheduleEntry::from_json(&v).unwrap();
+        assert_eq!(e.email, "alice@x");
+        assert_eq!(e.availability, "002200");
     }
 
     #[test]
