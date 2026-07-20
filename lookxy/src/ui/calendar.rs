@@ -114,15 +114,16 @@ fn handle_rsvp_prompt_key(app: &mut App, key: KeyEvent) {
 /// (right). Bounds-safe on an empty agenda — `draw_agenda`/`draw_detail`
 /// both degrade to an empty list / a placeholder line rather than indexing
 /// anything directly.
-pub fn draw_calendar(f: &mut Frame, app: &App) {
+pub fn draw_calendar(f: &mut Frame, app: &App, area: Rect) {
     // Same vertical split as the mail three-pane layout (`ui::draw`): the
     // main area on top, a 1-row status bar pinned to the bottom — so
     // Calendar mode gets the same status surface (sync state + `error_notice`)
-    // instead of losing it entirely while this view is showing.
+    // instead of losing it entirely while this view is showing. `area` is the
+    // frame minus any reminder banner row (see `ui::draw`).
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(f.area());
+        .split(area);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -890,7 +891,7 @@ mod tests {
         assert_eq!(app.agenda.len(), 2);
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| draw_calendar(f, &app)).unwrap();
+        term.draw(|f| draw_calendar(f, &app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Standup"));
@@ -904,7 +905,7 @@ mod tests {
         assert!(app.agenda.is_empty());
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| draw_calendar(f, &app)).unwrap();
+        term.draw(|f| draw_calendar(f, &app, f.area())).unwrap();
     }
 
     #[test]
@@ -966,7 +967,7 @@ mod tests {
         assert_eq!(app.selected_event.as_deref(), Some("e1"));
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| draw_calendar(f, &app)).unwrap();
+        term.draw(|f| draw_calendar(f, &app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Standup"));
@@ -1053,7 +1054,7 @@ mod tests {
         }
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| draw_calendar(f, &app)).unwrap();
+        term.draw(|f| draw_calendar(f, &app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains('✓'), "the glyph must reflect the new status");

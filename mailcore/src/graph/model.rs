@@ -690,7 +690,10 @@ impl Event {
                 .get("reminderMinutesBeforeStart")
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-            is_reminder_on: v.get("isReminderOn").and_then(Value::as_bool).unwrap_or(false),
+            is_reminder_on: v
+                .get("isReminderOn")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }

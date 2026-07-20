@@ -37,6 +37,22 @@ use ratatui::style::{Color, Style};
 /// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
 /// which are drawn on top of them, in that order).
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Reminder banner: a 1-row strip at the top when reminders are queued; the
+    // Mail panes and the calendar lay out against the remaining `area`. The
+    // full-frame modal editors (compose/OOF) ignore it — a reminder that fires
+    // while one is open simply shows once it's closed.
+    let full = f.area();
+    let area = if app.reminder_queue.is_empty() {
+        full
+    } else {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(full);
+        draw_reminder_banner(f, app, split[0]);
+        split[1]
+    };
+
     // The automatic-replies editor is a full-frame overlay openable from either
     // mode; drawn first (like compose) so it covers the panes/calendar behind it.
     if app.oof_form.is_some() {
@@ -48,7 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     if app.mode == Mode::Calendar {
-        calendar::draw_calendar(f, &*app);
+        calendar::draw_calendar(f, &*app, area);
         // The create/edit event form (`c`/`e` — wired in a later task) is an
         // overlay on top of the calendar, not a full-screen mode like
         // compose — same "no-op unless open" shape as `eventform::draw`'s
@@ -65,7 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(f.area());
+        .split(area);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -99,6 +115,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     categorypicker::draw(f, &*app);
     filepicker::draw(f, &*app);
     signin::draw(f, &*app);
+}
+
+/// Renders the reminder banner (the front queued reminder, plus a `(+N more)`
+/// count and an `[Esc to dismiss]` hint) into `area` — a 1-row yellow strip.
+fn draw_reminder_banner(f: &mut Frame, app: &App, area: Rect) {
+    let front = app.reminder_queue.front().cloned().unwrap_or_default();
+    let more = app.reminder_queue.len().saturating_sub(1);
+    let extra = if more > 0 {
+        format!("  (+{more} more)")
+    } else {
+        String::new()
+    };
+    let text = format!("{front}{extra}   [Esc to dismiss]");
+    let para = ratatui::widgets::Paragraph::new(text)
+        .style(Style::default().fg(Color::Black).bg(Color::Yellow));
+    f.render_widget(para, area);
 }
 
 /// Moves focus (Tab), moves the selection in the focused pane (↑/↓, j/k),
@@ -184,6 +216,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => app.cancel_confirm(),
             _ => {}
         }
+        return;
+    }
+    // Esc dismisses the front reminder banner (after the overlay handlers, so
+    // an open overlay keeps Esc priority; ahead of the mode/pane handling so
+    // it isn't swallowed). Works in both Mail and Calendar mode.
+    if key.code == KeyCode::Esc && !app.reminder_queue.is_empty() {
+        app.dismiss_reminder();
         return;
     }
     // Esc in the Mail folder view clears an active category filter (`L`) —
@@ -429,6 +468,35 @@ mod tests {
     use mailcore::sync::engine::SyncCommand;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn reminder_banner_renders_front_and_more_count() {
+        let mut app = App::for_test_with_seeded_store();
+        app.reminder_queue
+            .push_back("⏰ Standup starts in 5 min (09:00)".into());
+        app.reminder_queue
+            .push_back("⏰ Review starts in 8 min (09:03)".into());
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Standup starts in 5 min"));
+        assert!(text.contains("+1 more"));
+        assert!(text.contains("Esc"));
+    }
+
+    #[test]
+    fn esc_dismisses_reminder_banner() {
+        let mut app = App::for_test_with_seeded_store();
+        app.reminder_queue.push_back("⏰ Standup".into());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.reminder_queue.is_empty());
+    }
 
     #[test]
     fn draws_three_panes_with_folder_names() {

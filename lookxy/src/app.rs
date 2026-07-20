@@ -2992,7 +2992,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn reminder_row(id: &str, start_utc: &str, minutes: i64, on: bool) -> mailcore::store::EventRow {
+    fn reminder_row(
+        id: &str,
+        start_utc: &str,
+        minutes: i64,
+        on: bool,
+    ) -> mailcore::store::EventRow {
         mailcore::store::EventRow {
             id: id.into(),
             subject: "Standup".into(),
