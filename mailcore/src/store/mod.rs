@@ -333,6 +333,8 @@ pub struct EventRow {
     pub organizer_addr: String,
     pub response_status: String,
     pub series_master_id: Option<String>,
+    pub reminder_minutes: i64,
+    pub is_reminder_on: bool,
 }
 
 /// An `event_attendees` row, as read back from the store.
@@ -375,6 +377,8 @@ pub struct NewEvent {
     pub web_link: String,
     pub last_modified: String,
     pub body_html: String,
+    pub reminder_minutes: i64,
+    pub is_reminder_on: bool,
 }
 
 /// The field set `put_event_attendees` writes for one `event_attendees` row —
@@ -407,6 +411,8 @@ impl From<&Event> for NewEvent {
             web_link: e.web_link.clone(),
             last_modified: e.last_modified.clone(),
             body_html: e.body_html.clone(),
+            reminder_minutes: e.reminder_minutes,
+            is_reminder_on: e.is_reminder_on,
         }
     }
 }
@@ -503,6 +509,16 @@ impl Store {
         // event creation): the serialized Graph recurrence JSON, or `''`.
         let _ = conn.execute(
             "ALTER TABLE events ADD COLUMN recurrence TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Same idempotent-migration pattern, for `events.reminder_minutes`/
+        // `is_reminder_on` (event reminders/alerts).
+        let _ = conn.execute(
+            "ALTER TABLE events ADD COLUMN reminder_minutes INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE events ADD COLUMN is_reminder_on INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // Same idempotent-migration pattern as `is_draft`/`body_html` above:
@@ -1311,8 +1327,8 @@ impl Store {
                  id, subject, start_utc, end_utc, is_all_day, location,
                  organizer_name, organizer_addr, response_status,
                  series_master_id, body_preview, web_link, last_modified,
-                 body_html
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 body_html, reminder_minutes, is_reminder_on
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                  subject = excluded.subject,
                  start_utc = excluded.start_utc,
@@ -1326,7 +1342,9 @@ impl Store {
                  body_preview = excluded.body_preview,
                  web_link = excluded.web_link,
                  last_modified = excluded.last_modified,
-                 body_html = excluded.body_html",
+                 body_html = excluded.body_html,
+                 reminder_minutes = excluded.reminder_minutes,
+                 is_reminder_on = excluded.is_reminder_on",
             params![
                 e.id,
                 e.subject,
@@ -1342,6 +1360,8 @@ impl Store {
                 e.web_link,
                 e.last_modified,
                 e.body_html,
+                e.reminder_minutes,
+                e.is_reminder_on,
             ],
         )?;
         Ok(())
@@ -1492,7 +1512,8 @@ impl Store {
     ) -> Result<Vec<EventRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, start_utc, end_utc, is_all_day, location,
-                    organizer_name, organizer_addr, response_status, series_master_id
+                    organizer_name, organizer_addr, response_status, series_master_id,
+                    reminder_minutes, is_reminder_on
              FROM events
              WHERE start_utc < ?2 AND end_utc > ?1
              ORDER BY start_utc ASC",
@@ -1510,6 +1531,8 @@ impl Store {
                     organizer_addr: row.get(7)?,
                     response_status: row.get(8)?,
                     series_master_id: row.get(9)?,
+                    reminder_minutes: row.get(10)?,
+                    is_reminder_on: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1585,6 +1608,8 @@ impl Store {
             web_link: String::new(),
             last_modified: String::new(),
             body_html: f.body_html.clone(),
+            reminder_minutes: 0,
+            is_reminder_on: false,
         })?;
         self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
         if let Some(rec) = &f.recurrence {
@@ -2694,7 +2719,24 @@ mod calendar_tests {
             web_link: "".into(),
             last_modified: "".into(),
             body_html: "".into(),
+            reminder_minutes: 0,
+            is_reminder_on: false,
         }
+    }
+
+    #[test]
+    fn events_round_trip_reminder_fields() {
+        let s = Store::open_in_memory().unwrap();
+        let mut e = ev("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        e.reminder_minutes = 15;
+        e.is_reminder_on = true;
+        s.upsert_event(&e).unwrap();
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        let row = rows.iter().find(|r| r.id == "E1").unwrap();
+        assert_eq!(row.reminder_minutes, 15);
+        assert!(row.is_reminder_on);
     }
 
     #[test]

@@ -628,6 +628,10 @@ pub struct Event {
     pub last_modified: String,
     pub body_html: String,
     pub attendees: Vec<Attendee>,
+    /// Graph `reminderMinutesBeforeStart`: minutes before `start` the reminder
+    /// fires. `is_reminder_on` gates whether a reminder exists at all.
+    pub reminder_minutes: i64,
+    pub is_reminder_on: bool,
 }
 
 impl Event {
@@ -682,6 +686,11 @@ impl Event {
                 .and_then(Value::as_array)
                 .map(|items| items.iter().filter_map(Attendee::from_json).collect())
                 .unwrap_or_default(),
+            reminder_minutes: v
+                .get("reminderMinutesBeforeStart")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            is_reminder_on: v.get("isReminderOn").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -825,6 +834,30 @@ mod tests {
         assert!(m.is_flagged);
         assert!(m.has_attachments);
         assert!(m.is_draft);
+    }
+
+    #[test]
+    fn event_parses_reminder_fields() {
+        let v = parse(
+            r#"{"id":"E1","subject":"Sync",
+                "start":{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-07-20T10:00:00.0000000","timeZone":"UTC"},
+                "isReminderOn":true,"reminderMinutesBeforeStart":15}"#,
+        )
+        .unwrap();
+        let e = Event::from_json(&v).unwrap();
+        assert_eq!(e.reminder_minutes, 15);
+        assert!(e.is_reminder_on);
+
+        let v2 = parse(
+            r#"{"id":"E2","subject":"x",
+                "start":{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-07-20T10:00:00.0000000","timeZone":"UTC"}}"#,
+        )
+        .unwrap();
+        let e2 = Event::from_json(&v2).unwrap();
+        assert_eq!(e2.reminder_minutes, 0);
+        assert!(!e2.is_reminder_on);
     }
 
     #[test]
