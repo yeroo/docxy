@@ -63,7 +63,13 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 .map_err(|e| GraphError::Parse(e.to_string()))?;
             Ok(())
         }
-        OutboxOp::RespondEvent { id, kind, comment } => {
+        OutboxOp::RespondEvent {
+            id,
+            kind,
+            comment,
+            proposed_start_utc,
+            proposed_end_utc,
+        } => {
             // An unrecognized `kind` must NOT silently fall back to
             // accepting: that's the worst possible default for an action
             // with an external, user-visible side effect (a corrupt outbox
@@ -75,7 +81,8 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             // with a guessed action.
             let rsvp = rsvp_kind(kind)
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
-            client.respond_event(id, rsvp, comment.as_deref(), true, None)
+            let proposed = proposed_start_utc.clone().zip(proposed_end_utc.clone());
+            client.respond_event(id, rsvp, comment.as_deref(), true, proposed)
         }
         OutboxOp::CreateEvent { id } => {
             let input = event_input_for(store, id)?;
@@ -400,6 +407,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("looking forward to it".into()),
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             },
         )
         .unwrap();
@@ -435,6 +444,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "declined".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             },
         )
         .unwrap();
@@ -463,6 +474,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "garbage".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             },
         );
         assert!(matches!(result, Err(GraphError::Parse(_))));

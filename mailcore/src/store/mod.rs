@@ -162,6 +162,8 @@ pub enum OutboxOp {
         id: String,
         kind: String,
         comment: Option<String>,
+        proposed_start_utc: Option<String>,
+        proposed_end_utc: Option<String>,
     },
     /// Push a locally-created/edited/deleted calendar event to Graph. `id` is
     /// the store's event id — a `local:` id (before its first `create_event`
@@ -236,7 +238,13 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
-            OutboxOp::RespondEvent { id, kind, comment } => Value::Object(vec![
+            OutboxOp::RespondEvent {
+                id,
+                kind,
+                comment,
+                proposed_start_utc,
+                proposed_end_utc,
+            } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
                 ("rsvp".to_string(), Value::Str(kind.clone())),
@@ -244,6 +252,20 @@ impl OutboxOp {
                     "comment".to_string(),
                     match comment {
                         Some(c) => Value::Str(c.clone()),
+                        None => Value::Null,
+                    },
+                ),
+                (
+                    "proposedStart".to_string(),
+                    match proposed_start_utc {
+                        Some(s) => Value::Str(s.clone()),
+                        None => Value::Null,
+                    },
+                ),
+                (
+                    "proposedEnd".to_string(),
+                    match proposed_end_utc {
+                        Some(s) => Value::Str(s.clone()),
                         None => Value::Null,
                     },
                 ),
@@ -296,6 +318,14 @@ impl OutboxOp {
                 id: id()?,
                 kind: v.get("rsvp")?.as_str()?.to_string(),
                 comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+                proposed_start_utc: v
+                    .get("proposedStart")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                proposed_end_utc: v
+                    .get("proposedEnd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             }),
             "createEvent" => Some(OutboxOp::CreateEvent { id: id()? }),
             "updateEvent" => Some(OutboxOp::UpdateEvent { id: id()? }),
@@ -3177,20 +3207,24 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("looking forward to it".into()),
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it"}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it","proposedStart":null,"proposedEnd":null}"#
         );
         assert_eq!(
             OutboxOp::RespondEvent {
                 id: "E1".into(),
                 kind: "declined".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"proposedStart":null,"proposedEnd":null}"#
         );
     }
 
@@ -3220,11 +3254,15 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("ok".into()),
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             },
             OutboxOp::RespondEvent {
                 id: "E2".into(),
                 kind: "tentativelyAccepted".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             },
         ];
         for op in ops {

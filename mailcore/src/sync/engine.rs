@@ -88,7 +88,13 @@ pub enum SyncCommand {
     /// local event row to update from the mail side. Emits
     /// [`SyncEvent::MeetingResponded`] on success, or [`SyncEvent::Error`] when
     /// the message resolves to no event.
-    RespondMeeting { message_id: String, kind: RsvpKind },
+    RespondMeeting {
+        message_id: String,
+        kind: RsvpKind,
+        comment: Option<String>,
+        proposed_start_utc: Option<String>,
+        proposed_end_utc: Option<String>,
+    },
     /// Fetch the mailbox's automatic-replies config
     /// (`GraphClient::get_automatic_replies`) and emit
     /// [`SyncEvent::AutomaticRepliesFetched`]. Direct call, no outbox.
@@ -143,6 +149,8 @@ pub enum SyncCommand {
         id: String,
         kind: String,
         comment: Option<String>,
+        proposed_start_utc: Option<String>,
+        proposed_end_utc: Option<String>,
     },
     /// Push a locally-created event (`Store::create_local_event`, already
     /// applied by the caller) to Graph: enqueue
@@ -510,9 +518,18 @@ impl Engine {
                 attachment_id,
                 dest_base,
             } => self.save_item_attachment(&message_id, &attachment_id, dest_base),
-            SyncCommand::RespondMeeting { message_id, kind } => {
-                self.respond_meeting(&message_id, kind)
-            }
+            SyncCommand::RespondMeeting {
+                message_id,
+                kind,
+                comment,
+                proposed_start_utc,
+                proposed_end_utc,
+            } => self.respond_meeting(
+                &message_id,
+                kind,
+                comment,
+                proposed_start_utc.zip(proposed_end_utc),
+            ),
             SyncCommand::FetchAutomaticReplies => self.fetch_automatic_replies(),
             SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
             SyncCommand::FetchInlineImage {
@@ -541,13 +558,25 @@ impl Engine {
             SyncCommand::ComposeReply { id, all } => self.compose_reply(&id, all),
             SyncCommand::ComposeForward { id } => self.compose_forward(&id),
             SyncCommand::RefreshCalendar => self.refresh_calendar(),
-            SyncCommand::RespondEvent { id, kind, comment } => {
+            SyncCommand::RespondEvent {
+                id,
+                kind,
+                comment,
+                proposed_start_utc,
+                proposed_end_utc,
+            } => {
                 // Optimistic local write, same pattern as MarkRead/SetFlag/
                 // Move/Delete: reflect the RSVP immediately, before the
                 // outbox drain even reaches Graph.
                 self.store.set_event_response(&id, &kind);
                 self.emit(SyncEvent::CalendarUpdated);
-                self.enqueue_and_drain(OutboxOp::RespondEvent { id, kind, comment });
+                self.enqueue_and_drain(OutboxOp::RespondEvent {
+                    id,
+                    kind,
+                    comment,
+                    proposed_start_utc,
+                    proposed_end_utc,
+                });
             }
             SyncCommand::CreateEvent { id } => {
                 self.enqueue_and_drain(OutboxOp::CreateEvent { id });
@@ -1049,7 +1078,13 @@ impl Engine {
     /// emits `SyncEvent::Error` ("not a meeting invite"); a Graph failure goes
     /// through `react` for the standard auth/throttle/transport handling. Same
     /// signed-in guard as `fetch_body`.
-    fn respond_meeting(&mut self, message_id: &str, kind: RsvpKind) {
+    fn respond_meeting(
+        &mut self,
+        message_id: &str,
+        kind: RsvpKind,
+        comment: Option<String>,
+        proposed: Option<(String, String)>,
+    ) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
@@ -1065,7 +1100,9 @@ impl Engine {
                 return;
             }
         };
-        match self.with_auth(|c| c.respond_event(&event_id, kind, None, true, None)) {
+        match self.with_auth(|c| {
+            c.respond_event(&event_id, kind, comment.as_deref(), true, proposed.clone())
+        }) {
             Ok(()) => self.emit(SyncEvent::MeetingResponded {
                 message_id: message_id.to_string(),
                 kind,
@@ -2838,6 +2875,9 @@ mod tests {
             .send(SyncCommand::RespondMeeting {
                 message_id: "M1".into(),
                 kind: RsvpKind::Accept,
+                comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             })
             .unwrap();
         wait_for(&handle.evt_rx, |e| {
@@ -2847,6 +2887,70 @@ mod tests {
         // The accept POST actually hit Graph.
         assert!(srv.requests().iter().any(|r| r.path.ends_with("/accept")));
 
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_meeting_with_proposed_time_posts_decline_with_proposed() {
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/E1/decline".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"M1","event":{"id":"E1"}}"#.into(),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("respond-meeting-proposed");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondMeeting {
+                message_id: "M1".into(),
+                kind: RsvpKind::Decline,
+                comment: Some("push please".into()),
+                proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
+                proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MeetingResponded { .. })
+        });
+        let posted = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.path.ends_with("/decline"))
+            .unwrap();
+        let sent = crate::json::parse(&posted.body).unwrap();
+        assert!(sent.get("proposedNewTime").is_some());
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2891,6 +2995,9 @@ mod tests {
             .send(SyncCommand::RespondMeeting {
                 message_id: "M1".into(),
                 kind: RsvpKind::Decline,
+                comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             })
             .unwrap();
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
@@ -3984,6 +4091,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("see you there".into()),
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             })
             .unwrap();
 
@@ -4074,6 +4183,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             })
             .unwrap();
         for _ in 0..4 {
@@ -4258,6 +4369,8 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: None,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
             })
             .unwrap();
         for _ in 0..4 {
