@@ -13,6 +13,7 @@ pub mod eventform;
 pub mod filepicker;
 mod folders;
 pub mod freebusy;
+pub mod help;
 mod message_list;
 pub mod oofform;
 mod reading;
@@ -77,6 +78,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // `App::delete_selected_event`) with nothing on screen to show it,
         // even though `handle_key` now routes Enter/Esc to it correctly.
         message_list::draw_confirm(f, &*app);
+        help::draw(f, &*app);
         return;
     }
 
@@ -119,6 +121,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // The RSVP prompt can be opened from the mail reader (`D`/`T` on an
     // invite); the Calendar branch already draws it via `draw_calendar`.
     calendar::draw_rsvp_prompt(f, &*app);
+    help::draw(f, &*app);
     signin::draw(f, &*app);
 }
 
@@ -153,6 +156,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // usefully do without a token.
     if app.signin_modal.is_some() {
         handle_signin_key(app, key);
+        return;
+    }
+    // The help overlay (`F1`/`?`) captures every key while open — ahead of all
+    // the other modals and panes, so Esc/`q` close it rather than leaking
+    // through. Sign-in still wins (help can't be open without a token).
+    if app.help {
+        help::handle_key(app, key);
         return;
     }
     // The automatic-replies editor (opened by `O`) gets first crack at every
@@ -232,6 +242,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => app.cancel_confirm(),
             _ => {}
         }
+        return;
+    }
+    // Open the help overlay — after the modal routers (so a modal keeps its
+    // keys) but before the Calendar short-circuit and the Mail popups, so it
+    // works from both modes. `F1` always opens; `?` only when no text field is
+    // capturing it (in search/compose/etc. `?` is a literal character).
+    if key.code == KeyCode::F(1) || (key.code == KeyCode::Char('?') && !app.is_capturing_text()) {
+        app.open_help();
         return;
     }
     // Esc dismisses the front reminder banner (after the overlay handlers, so

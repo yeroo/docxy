@@ -225,6 +225,9 @@ pub struct App {
     /// The free/busy availability overlay (opened by `Ctrl-B` in the event
     /// form), when open.
     pub free_busy: Option<crate::ui::freebusy::FreeBusyView>,
+    /// Whether the read-only help overlay (`F1`/`?`) is open. A modal like the
+    /// others: while open it captures every key and closes on Esc/F1/?/q.
+    pub help: bool,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
@@ -475,6 +478,7 @@ impl App {
             #[cfg(test)]
             agwinterm_notify_invocations: std::cell::Cell::new(0),
             free_busy: None,
+            help: false,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -670,6 +674,17 @@ impl App {
             || self.oof_form.is_some()
             || self.event_form.is_some()
             || self.free_busy.is_some()
+            || self.help
+    }
+
+    /// Opens the read-only help overlay (`F1`/`?`).
+    pub fn open_help(&mut self) {
+        self.help = true;
+    }
+
+    /// Closes the help overlay.
+    pub fn close_help(&mut self) {
+        self.help = false;
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt
