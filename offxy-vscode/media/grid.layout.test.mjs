@@ -170,6 +170,28 @@ wrap.fire('mousedown', { clientX: clickX, clientY: clickY, shiftKey: false, prev
 assert.equal(byId.get('cellref').textContent, 'B2',
   `clicking at the painted B2 position (${clickX},${clickY}) must select B2`);
 
+// ---- 2b. full-viewport gridlines: empty cells in the window are gridded -----
+// The data occupies A1:B3. Every OTHER cell in the fetched window must still
+// get a border-only grid tile, so the sheet looks gridded like Excel rather
+// than only where data happens to be.
+const gridlines = byId.get('gridlines');
+const gridAtEmpty = gridlines.children.find((c) =>
+  px(c.style.top) === 4 * 22 && px(c.style.left) === 0 && (c.className || '').includes('cell'));
+assert.ok(gridAtEmpty, 'the A5 position inside the window must have a backdrop grid tile');
+// The window is ~38 rows x ~23 cols (600/22 + overscan, 800/64 + overscan), so
+// a fully-gridded window is hundreds of tiles. Guards against a regression
+// back to "borders only where data is".
+const gridTiles = gridlines.children.filter((c) => (c.className || '').includes('cell')).length;
+assert.ok(gridTiles > 300,
+  `window must be fully gridded (got ${gridTiles} backdrop tiles; expected the whole visible window)`);
+// The backdrop is geometry-only: a selection-only repaint (same window) must
+// NOT rebuild it. Re-select an existing cell and confirm the tile identity is
+// preserved (replaceChildren was skipped).
+const tileBefore = gridlines.children[0];
+wrap.fire('mousedown', { clientX: clickX, clientY: clickY, shiftKey: false, preventDefault() {} });
+assert.equal(gridlines.children[0], tileBefore,
+  'a selection-only repaint (same window) must reuse the backdrop, not rebuild it');
+
 // ---- 3. keyboard scroll-into-view clears the sticky headers -----------------
 // Shrink the viewport so arrowing down forces scrolling, then check the active
 // cell's screen rect is fully inside the uncovered band (below the column
@@ -189,4 +211,4 @@ assert.ok(curTop >= WRAP_TOP + COLHDR_H,
 assert.ok(curTop + CELL_H <= WRAP_TOP + wrap.clientHeight,
   `active cell (bottom ${curTop + CELL_H}) must be inside the viewport`);
 
-console.log('grid layout OK: headers/cells aligned; click round-trip exact; scroll clears the header band');
+console.log('grid layout OK: headers/cells aligned; full-viewport gridlines; click round-trip exact; scroll clears the header band');

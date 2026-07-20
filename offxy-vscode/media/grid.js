@@ -26,6 +26,7 @@
   let view = null;      // last viewport JSON
   let colX = [0];       // prefix x of each col up to the fetched window's right edge
   let defW = 64;        // default column width in px
+  let lastGridKey = ''; // memo: the geometry the backdrop gridlines were built for
 
   const enc = new TextEncoder();
   const dec = new TextDecoder();
@@ -115,6 +116,32 @@
     // can scroll fully clear of the sticky headers.
     $('spacer').style.height = rows * ROW_H + COLHDR_H + 'px';
     $('spacer').style.width = cols * defW + HDR_W + 'px';
+
+    // Grid backdrop: a border-only tile for every cell in the fetched window,
+    // so the sheet is gridded like Excel across the whole viewport rather than
+    // only where data happens to sit. It's purely geometric (window + column
+    // widths), independent of data/selection, and lives in its own #gridlines
+    // layer beneath #cells — so it rebuilds only when the window scrolls or a
+    // column resizes, NOT on every select/edit repaint (a drag-select would
+    // otherwise churn hundreds of tiles per mousemove). Data cells paint on
+    // top in #cells with the same colX/ROW_H math, so borders line up exactly
+    // even for variable column widths. Bounded by the window, not the sheet.
+    const gridKey = top + ':' + left + ':' + nrows + ':' + ncols + ':' + colX.join(',');
+    if (gridKey !== lastGridKey) {
+      lastGridKey = gridKey;
+      const gf = document.createDocumentFragment();
+      for (let r = top; r < top + nrows; r++) {
+        for (let c = left; c < left + ncols; c++) {
+          const g = document.createElement('div');
+          g.className = 'cell';
+          g.style.top = r * ROW_H + 'px';
+          g.style.left = originX + colX[c - left] + 'px';
+          g.style.width = colWidthPx(c) + 'px';
+          gf.appendChild(g);
+        }
+      }
+      $('gridlines').replaceChildren(gf);
+    }
 
     // cells
     const frag = document.createDocumentFragment();
@@ -627,7 +654,7 @@
   document.body.innerHTML = `
     <div id="fbar"><span id="cellref">A1</span><input id="fsrc" spellcheck="false" /></div>
     <div id="corner"></div><div id="colhdr"></div><div id="rowhdr"></div>
-    <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="cells"></div></div>
+    <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="gridlines"></div><div id="cells"></div></div>
     <div id="tabs"></div>`;
 
   /** Right-click context menu for a row/col header: insert/delete at `at`. */
