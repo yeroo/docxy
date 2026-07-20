@@ -297,6 +297,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // collapse / no-op; there's nothing further left of Folders anyway.
         KeyCode::Left | KeyCode::Char('h') if app.focus != Pane::Folders => focus_back(app),
         KeyCode::Esc if app.focus != Pane::Folders => focus_back(app),
+        // Folder-tree expand/collapse (Folders pane only): `→`/`l` expand,
+        // `←`/`h` collapse-or-parent, `Space` toggle. Ahead of the generic
+        // `Char(c) => on_key_char` so `l`/`h`/space aren't read as triage keys.
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Pane::Folders => app.expand_selected(),
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Pane::Folders => {
+            app.collapse_or_parent()
+        }
+        KeyCode::Char(' ') if app.focus == Pane::Folders => app.toggle_selected_folder(),
         // Reading-focused vertical keys scroll the reader instead of moving
         // a selection (`move_selection`'s `Pane::Reading` arm is a no-op —
         // there's nothing there to select over). These guarded arms must

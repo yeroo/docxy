@@ -741,6 +741,61 @@ impl App {
         }
     }
 
+    /// Persists a folder's expand flag, updates the cached `folders` row to
+    /// match (so `rebuild_visible_folders`, which reads the cache, sees the new
+    /// state without a store round-trip), and rebuilds the visible tree.
+    fn set_folder_expanded(&mut self, id: &str, expanded: bool) {
+        let _ = self.store.set_folder_expanded(id, expanded);
+        if let Some(f) = self.folders.iter_mut().find(|f| f.id == id) {
+            f.is_expanded = expanded;
+        }
+        self.rebuild_visible_folders();
+    }
+
+    /// Folder pane `→`/`l`: expand the selected folder if it has collapsed
+    /// children.
+    pub fn expand_selected(&mut self) {
+        let Some(v) = self.visible_folders.get(self.folder_index) else {
+            return;
+        };
+        if v.has_children && !v.expanded {
+            let id = v.row.id.clone();
+            self.set_folder_expanded(&id, true);
+        }
+    }
+
+    /// Folder pane `←`/`h`: if the selected folder is expanded, collapse it;
+    /// otherwise move the selection up to its parent (Outlook behavior). A
+    /// no-op on a collapsed top-level leaf.
+    pub fn collapse_or_parent(&mut self) {
+        let Some(v) = self.visible_folders.get(self.folder_index) else {
+            return;
+        };
+        if v.has_children && v.expanded {
+            let id = v.row.id.clone();
+            self.set_folder_expanded(&id, false);
+        } else if let Some(parent) = v.row.parent_id.clone() {
+            if let Some(idx) = self.visible_folders.iter().position(|x| x.row.id == parent) {
+                self.folder_index = idx;
+                self.selected_folder = Some(parent);
+                self.msg_index = 0;
+                self.reload_messages();
+            }
+        }
+    }
+
+    /// Folder pane `Space`: flip the selected folder's expand state (no-op on a
+    /// leaf).
+    pub fn toggle_selected_folder(&mut self) {
+        let Some(v) = self.visible_folders.get(self.folder_index) else {
+            return;
+        };
+        if v.has_children {
+            let (id, expanded) = (v.row.id.clone(), v.expanded);
+            self.set_folder_expanded(&id, !expanded);
+        }
+    }
+
     /// True when the threaded folder view is what's on screen: threading is on,
     /// no search is active (search results stay flat), and we're in Mail mode.
     pub fn threaded_active(&self) -> bool {
@@ -4897,6 +4952,31 @@ pub(crate) mod tests {
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn expand_and_collapse_selected_folder() {
+        let mut app = App::for_test_with_folder_tree();
+        app.focus = Pane::Folders;
+        app.folder_index = 0; // Inbox
+        app.expand_selected();
+        assert!(app.visible_folders.iter().any(|v| v.row.id == "epam"));
+        app.collapse_or_parent();
+        assert!(!app.visible_folders.iter().any(|v| v.row.id == "epam"));
+    }
+
+    #[test]
+    fn collapse_on_a_child_moves_selection_to_its_parent() {
+        let mut app = App::for_test_with_folder_tree();
+        app.store.set_folder_expanded("inbox", true).unwrap();
+        app.reload_folders();
+        app.folder_index = app
+            .visible_folders
+            .iter()
+            .position(|v| v.row.id == "epam")
+            .unwrap();
+        app.collapse_or_parent(); // EPAM is a leaf → jump to parent
+        assert_eq!(app.selected_folder.as_deref(), Some("inbox"));
     }
 
     #[test]
