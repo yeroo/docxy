@@ -652,19 +652,24 @@ impl App {
         }
     }
 
-    /// Whether a text-input context is currently capturing keystrokes — the
-    /// search prompt (`/`), the compose view's fields/body, or the RSVP
-    /// comment prompt (`a`/`d`/`t` in Calendar mode). The event loop consults
+    /// Whether a modal is currently capturing keystrokes — the search prompt
+    /// (`/`), the compose view's fields/body, the RSVP comment prompt
+    /// (`a`/`d`/`t` in Calendar mode), the OOF form, the event form's text
+    /// fields, or the read-only free/busy overlay. The event loop consults
     /// this so a global hotkey like `q`-to-quit doesn't steal a character the
-    /// user is typing into the query, a compose field, or an RSVP comment
-    /// (searching for "quarterly", composing a message that mentions "quit",
-    /// or declining with a comment like "can't make it, quick call instead"
-    /// must not quit the app).
+    /// user is typing into the query, a compose field, an RSVP comment, or a
+    /// meeting title (searching for "quarterly", composing a message that
+    /// mentions "quit", declining with "can't make it, quick call instead",
+    /// or naming an event "Q3 review" must not quit the app). The free/busy
+    /// overlay captures no text but is modal: `q` should not quit the app out
+    /// from under it — only `Esc` closes it.
     pub fn is_capturing_text(&self) -> bool {
         self.search.is_some()
             || self.compose.is_some()
             || self.rsvp_prompt.is_some()
             || self.oof_form.is_some()
+            || self.event_form.is_some()
+            || self.free_busy.is_some()
     }
 
     /// Enter, while the sign-in modal is showing: only the `Required` prompt

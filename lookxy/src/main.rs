@@ -305,6 +305,24 @@ mod tests {
     }
 
     #[test]
+    fn q_in_the_event_form_types_into_the_field_rather_than_quitting() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_new_event();
+        let k = KeyEvent::from(KeyCode::Char('q'));
+        // Typing 'q' into a meeting title must not quit the whole app.
+        assert!(!is_global_quit(&app, &k));
+    }
+
+    #[test]
+    fn q_over_the_free_busy_overlay_does_not_quit() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_new_event();
+        app.open_free_busy();
+        let k = KeyEvent::from(KeyCode::Char('q'));
+        assert!(!is_global_quit(&app, &k));
+    }
+
+    #[test]
     fn ctrl_c_quits_even_while_the_search_prompt_is_capturing_text() {
         let mut app = App::for_test_with_seeded_store();
         app.start_search();
