@@ -58,6 +58,9 @@ pub struct FolderRow {
     pub delta_link: Option<String>,
     pub well_known_name: Option<String>,
     pub sort_order: Option<i64>,
+    /// Whether this folder is expanded in the folder-tree pane. Persisted;
+    /// preserved across syncs (`upsert_folder` never writes it).
+    pub is_expanded: bool,
 }
 
 /// A `messages` row, as read back from the store.
@@ -587,6 +590,14 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN categories TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Same idempotent-migration pattern, for `folders.is_expanded` (the
+        // folder-tree collapse state). Persisted per folder and deliberately
+        // left untouched by `upsert_folder`, so a re-sync never resets the
+        // user's expand/collapse choices.
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN is_expanded INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -617,7 +628,7 @@ impl Store {
     /// Junk, Archive, in that order), then everything else alphabetically.
     pub fn folders(&self) -> Result<Vec<FolderRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, display_name, total_count, unread_count, delta_link, well_known_name, sort_order
+            "SELECT id, parent_id, display_name, total_count, unread_count, delta_link, well_known_name, sort_order, is_expanded
              FROM folders
              ORDER BY CASE well_known_name
                  WHEN 'inbox' THEN 0
@@ -640,10 +651,21 @@ impl Store {
                     delta_link: row.get(5)?,
                     well_known_name: row.get(6)?,
                     sort_order: row.get(7)?,
+                    is_expanded: row.get::<_, i64>(8)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Sets a single folder's tree-expand flag (the folder-pane `→`/`←`/Space
+    /// toggle). A no-op if the id is unknown.
+    pub fn set_folder_expanded(&self, id: &str, expanded: bool) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET is_expanded = ?2 WHERE id = ?1",
+            params![id, expanded as i64],
+        )?;
+        Ok(())
     }
 
     /// Inserts or updates a message row, filing it under `folder_id`.
@@ -2178,6 +2200,26 @@ mod tests {
         let got = s.master_categories().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "Only");
+    }
+
+    #[test]
+    fn folder_expanded_persists_and_survives_resync() {
+        let s = Store::open_in_memory().unwrap();
+        let inbox = MailFolder {
+            id: "F1".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        };
+        s.upsert_folder(&inbox).unwrap();
+        assert!(!s.folders().unwrap()[0].is_expanded); // default collapsed
+        s.set_folder_expanded("F1", true).unwrap();
+        assert!(s.folders().unwrap()[0].is_expanded);
+        // A re-sync upsert must NOT reset the flag.
+        s.upsert_folder(&inbox).unwrap();
+        assert!(s.folders().unwrap()[0].is_expanded);
     }
 
     #[test]

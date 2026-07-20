@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS folders (
     unread_count    INTEGER NOT NULL DEFAULT 0,
     delta_link      TEXT,
     well_known_name TEXT,
-    sort_order      INTEGER
+    sort_order      INTEGER,
+    is_expanded     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
