@@ -114,6 +114,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     attachments::draw(f, &*app);
     categorypicker::draw(f, &*app);
     filepicker::draw(f, &*app);
+    // The RSVP prompt can be opened from the mail reader (`D`/`T` on an
+    // invite); the Calendar branch already draws it via `draw_calendar`.
+    calendar::draw_rsvp_prompt(f, &*app);
     signin::draw(f, &*app);
 }
 
@@ -154,6 +157,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // key while open — ahead of the panes/compose, though sign-in still wins.
     if app.oof_form.is_some() {
         oofform::handle_key(app, key);
+        return;
+    }
+    // The RSVP prompt (calendar a/d/t or mail-reader D/T) captures every key
+    // while open, in both modes.
+    if app.rsvp_prompt.is_some() {
+        calendar::handle_rsvp_prompt_key(app, key);
         return;
     }
     // The category picker (opened by `l`/`L`) gets keys ahead of the panes.

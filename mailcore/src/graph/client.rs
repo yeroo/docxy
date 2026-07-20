@@ -1996,10 +1996,7 @@ mod tests {
             RsvpKind::Decline,
             Some("can we push?"),
             true,
-            Some((
-                "2026-07-21T14:00:00Z".into(),
-                "2026-07-21T15:00:00Z".into(),
-            )),
+            Some(("2026-07-21T14:00:00Z".into(), "2026-07-21T15:00:00Z".into())),
         )
         .unwrap();
         let sent = json::parse(&srv.requests()[0].body).unwrap();

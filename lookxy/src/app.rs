@@ -1235,8 +1235,7 @@ impl App {
             return;
         };
         let proposed: Option<(String, String)> = if prompt.proposes()
-            && (!prompt.proposed_start.trim().is_empty()
-                || !prompt.proposed_end.trim().is_empty())
+            && (!prompt.proposed_start.trim().is_empty() || !prompt.proposed_end.trim().is_empty())
         {
             let now = local_now();
             let off = crate::ui::calendar::local_offset_minutes();
@@ -1245,7 +1244,8 @@ impl App {
                 self.set_rsvp_error();
                 return;
             };
-            let Some(end) = crate::datetime::parse_end(prompt.proposed_end.trim(), &start, now, off)
+            let Some(end) =
+                crate::datetime::parse_end(prompt.proposed_end.trim(), &start, now, off)
             else {
                 self.set_rsvp_error();
                 return;

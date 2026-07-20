@@ -69,10 +69,8 @@ pub(crate) fn agenda_window() -> (String, String) {
 /// takes over key handling" precedence `ui::handle_key` already gives the
 /// move-folder/attachments/search prompts over plain pane navigation.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
-    if app.rsvp_prompt.is_some() {
-        handle_rsvp_prompt_key(app, key);
-        return;
-    }
+    // The RSVP prompt is routed at the top of `ui::handle_key` now (it serves
+    // both Mail and Calendar), so it's already handled before we get here.
     match key.code {
         KeyCode::Esc | KeyCode::Char('g') => app.toggle_mode(),
         KeyCode::Up | KeyCode::Char('k') => app.move_agenda_selection(-1),
@@ -100,10 +98,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 /// submits with whatever was typed, Backspace edits it, and Esc submits with
 /// no comment (see `App::cancel_rsvp_comment`'s doc comment for why that's
 /// not "cancel the whole RSVP").
-fn handle_rsvp_prompt_key(app: &mut App, key: KeyEvent) {
+pub(crate) fn handle_rsvp_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => app.submit_rsvp(),
         KeyCode::Esc => app.cancel_rsvp_comment(),
+        KeyCode::Tab => app.cycle_rsvp_focus(),
         KeyCode::Backspace => app.backspace_rsvp_comment(),
         KeyCode::Char(c) => app.type_rsvp_comment(&c.to_string()),
         _ => {}
@@ -140,7 +139,7 @@ pub fn draw_calendar(f: &mut Frame, app: &App, area: Rect) {
 /// attachments/move-folder popups — see `ui::attachments::draw`) when
 /// `app.rsvp_prompt` is open; a no-op otherwise. Drawn last, on top of the
 /// agenda/detail panes.
-fn draw_rsvp_prompt(f: &mut Frame, app: &App) {
+pub(crate) fn draw_rsvp_prompt(f: &mut Frame, app: &App) {
     use ratatui::widgets::Clear;
 
     let Some(prompt) = &app.rsvp_prompt else {
@@ -152,18 +151,44 @@ fn draw_rsvp_prompt(f: &mut Frame, app: &App) {
         "tentativelyAccepted" => "Tentative",
         other => other,
     };
-    let area = crate::ui::centered_rect(60, 20, f.area());
+    let proposes = prompt.proposes();
+    let height = if proposes { 40 } else { 20 };
+    let area = crate::ui::centered_rect(70, height, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(
-            "{verb} \u{2014} comment (Enter: send, Esc: send without)"
+            "{verb} \u{2014} Tab: field  Enter: send  Esc: send without"
         ))
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow));
-    f.render_widget(
-        Paragraph::new(format!("{}_", prompt.comment)).block(block),
-        area,
-    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let field_line = |label: &str, value: &str, focused: bool| -> Line<'static> {
+        let caret = if focused { "_" } else { "" };
+        Line::from(format!("{label}: {value}{caret}"))
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if proposes {
+        lines.push(Line::from("Propose new time (blank = no proposal):"));
+        lines.push(field_line(
+            "  Proposed start",
+            &prompt.proposed_start,
+            prompt.focus == crate::app::RsvpField::ProposedStart,
+        ));
+        lines.push(field_line(
+            "  Proposed end",
+            &prompt.proposed_end,
+            prompt.focus == crate::app::RsvpField::ProposedEnd,
+        ));
+        lines.push(Line::from(""));
+    }
+    lines.push(field_line(
+        "Comment",
+        &prompt.comment,
+        prompt.focus == crate::app::RsvpField::Comment,
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// One line the agenda list renders: either a day header (a pure display
@@ -726,6 +751,43 @@ mod tests {
     }
 
     // --- pure date math ----------------------------------------------------
+
+    #[test]
+    fn rsvp_prompt_shows_proposed_rows_for_decline_only() {
+        use crate::app::{RsvpField, RsvpPrompt, RsvpTarget};
+        let mut app = App::for_test_with_seeded_store();
+        app.rsvp_prompt = Some(RsvpPrompt {
+            target: RsvpTarget::Event("E1".into()),
+            kind: "declined".into(),
+            comment: String::new(),
+            proposed_start: String::new(),
+            proposed_end: String::new(),
+            focus: RsvpField::ProposedStart,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_rsvp_prompt(f, &app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Proposed start"));
+        assert!(text.contains("Proposed end"));
+
+        app.rsvp_prompt.as_mut().unwrap().kind = "accepted".into();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_rsvp_prompt(f, &app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!text.contains("Proposed start"));
+    }
 
     #[test]
     fn days_from_civil_and_civil_from_days_round_trip() {
