@@ -3264,6 +3264,17 @@ mod outbox_tests {
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
+            // A declined RSVP that carries a proposed new time — the calendar
+            // propose-new-time path serializes this into the outbox, so the
+            // proposed window must survive to_json → from_json (a key-name
+            // mismatch would silently drop the proposal on drain).
+            OutboxOp::RespondEvent {
+                id: "E3".into(),
+                kind: "declined".into(),
+                comment: Some("can we push?".into()),
+                proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
+                proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
+            },
         ];
         for op in ops {
             let encoded = op.to_json().to_string();
