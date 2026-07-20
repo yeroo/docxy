@@ -7,9 +7,6 @@ use mailcore::store::FolderRow;
 use std::collections::{HashMap, HashSet};
 
 /// One row in the rendered folder tree: the folder plus its display metadata.
-// `depth`/`has_children`/`expanded` are consumed by the folder-pane keys and
-// the indented rendering in the following tasks; allow the gap until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VisibleFolder {
     pub row: FolderRow,
