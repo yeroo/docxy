@@ -1419,12 +1419,15 @@ impl Engine {
                 return;
             }
         };
-        // The redirect host must match the bind (`127.0.0.1`), NOT `localhost`:
-        // if `localhost` resolved to `::1` (IPv6) first, the browser redirect
-        // would hit nothing (the listener is IPv4-only) and sign-in would hang
-        // to the timeout. `127.0.0.1` is an equally valid Entra public-client
-        // loopback redirect host.
-        let redirect_uri = format!("http://127.0.0.1:{port}");
+        // The redirect host must be `localhost`, NOT `127.0.0.1`: Entra matches
+        // a public client's loopback redirect host *literally*, and the
+        // Microsoft Graph CLI client we ride registers `http://localhost` (with
+        // a dynamic port) but not `http://127.0.0.1` — sending the raw IP fails
+        // with AADSTS50011 (redirect URI mismatch). We still bind the listener
+        // on IPv4 `127.0.0.1`; the browser reaches it because it resolves
+        // `localhost` to the loopback address (falling back across ::1/127.0.0.1
+        // as needed). This mirrors what the Azure CLI and `mgc` do.
+        let redirect_uri = format!("http://localhost:{port}");
         let req = auth::begin_auth(&self.config.cfg, &redirect_uri);
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
@@ -3914,6 +3917,14 @@ mod tests {
             .find(|(k, _)| k == "redirect_uri")
             .map(|(_, v)| v.clone())
             .expect("authorize_url carries redirect_uri");
+        // Entra matches the loopback redirect host literally and the Graph CLI
+        // client registers `http://localhost` (not `http://127.0.0.1`), so the
+        // redirect we send MUST use the `localhost` host or sign-in fails with
+        // AADSTS50011.
+        assert!(
+            redirect_uri.starts_with("http://localhost:"),
+            "redirect_uri must use the localhost host, got {redirect_uri}"
+        );
         let state = params
             .iter()
             .find(|(k, _)| k == "state")
