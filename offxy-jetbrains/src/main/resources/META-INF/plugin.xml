@@ -1,0 +1,15 @@
+<idea-plugin>
+    <id>dev.yeroo.offxy</id>
+    <name>Offxy</name>
+    <vendor url="https://github.com/yeroo/docxy">yeroo</vendor>
+    <description><![CDATA[
+        Native Word <code>.docx</code> editor for JetBrains IDEs — no webview,
+        no Microsoft Office. The document engine is the dependency-free
+        <a href="https://github.com/yeroo/docxy">docxy</a> Rust core
+        (parse &rarr; render &rarr; edit &rarr; lossless save), compiled to
+        WebAssembly and executed on the JVM. Open documents advertise on the
+        docxy agent-control protocol, so AI assistants (Claude Code, Junie)
+        can read and edit them live.
+    ]]></description>
+    <depends>com.intellij.modules.platform</depends>
+</idea-plugin>
