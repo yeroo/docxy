@@ -858,12 +858,29 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
     let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
     // Anchor points based on flow direction.
     let (x1, y1, x2, y2) = anchors(d.dir, from, to);
-    let ox = x1.min(x2);
-    let oy = y1.min(y2);
-    let cx = (x1 - x2).abs().max(1);
-    let cy = (y1 - y2).abs().max(1);
-    let flip_h = if x2 < x1 { " flipH=\"1\"" } else { "" };
-    let flip_v = if y2 < y1 { " flipV=\"1\"" } else { "" };
+    // The single source of truth for the elbow shape: the same 4-point
+    // polyline the shared geometry (and later the webview SVG) draws. Emitting
+    // a custom geometry from these exact points — rather than a preset like
+    // `bentConnector3` (fixed 50%-of-width bend, ignorant of direction) —
+    // guarantees Word renders the identical path the geometry describes.
+    let pts = edge_points(d, e);
+    let ox = pts.iter().map(|p| p.0).min().unwrap_or(0);
+    let oy = pts.iter().map(|p| p.1).min().unwrap_or(0);
+    let maxx = pts.iter().map(|p| p.0).max().unwrap_or(0);
+    let maxy = pts.iter().map(|p| p.1).max().unwrap_or(0);
+    let cx = (maxx - ox).max(1);
+    let cy = (maxy - oy).max(1);
+    let mut path = String::new();
+    for (i, (px, py)) in pts.iter().enumerate() {
+        let (rx, ry) = (px - ox, py - oy);
+        if i == 0 {
+            path.push_str(&format!(
+                "<a:moveTo><a:pt x=\"{rx}\" y=\"{ry}\"/></a:moveTo>"
+            ));
+        } else {
+            path.push_str(&format!("<a:lnTo><a:pt x=\"{rx}\" y=\"{ry}\"/></a:lnTo>"));
+        }
+    }
     let label = if e.label.is_empty() {
         String::new()
     } else {
@@ -874,8 +891,12 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
          <wps:cNvPr id=\"{sid}\" name=\"Edge {sid}\"/>\
          <wps:cNvCnPr/>\
          <wps:spPr>\
-         <a:xfrm{flip_h}{flip_v}><a:off x=\"{ox}\" y=\"{oy}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-         <a:prstGeom prst=\"bentConnector3\"><a:avLst/></a:prstGeom>\
+         <a:xfrm><a:off x=\"{ox}\" y=\"{oy}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+         <a:custGeom>\
+         <a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>\
+         <a:rect l=\"0\" t=\"0\" r=\"{cx}\" b=\"{cy}\"/>\
+         <a:pathLst><a:path w=\"{cx}\" h=\"{cy}\">{path}</a:path></a:pathLst>\
+         </a:custGeom>\
          <a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
          <a:tailEnd type=\"triangle\"/></a:ln>\
          </wps:spPr>\
@@ -1042,8 +1063,9 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
 }
 
 /// The polyline vertices of an edge: a 4-point orthogonal elbow that routes
-/// through the midpoint between the two anchors (matching `bentConnector3`'s
-/// default `adj1=50000` bend).
+/// through the midpoint between the two anchors. This is the single source of
+/// truth for the edge's shape — `emit_connector` draws these exact points as a
+/// custom-geometry path, so Word and the webview renderer agree.
 fn edge_points(d: &Diagram, e: &Edge) -> Vec<(i64, i64)> {
     let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
     let (x1, y1, x2, y2) = anchors(d.dir, from, to);
@@ -1268,7 +1290,7 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains("prst=\"roundRect\"") || xml.contains("prst=\"rect\""));
-        assert!(xml.contains("prst=\"bentConnector3\""), "connector missing");
+        assert!(xml.contains("<a:custGeom>"), "connector missing");
         assert!(xml.contains("Start") && xml.contains("End"));
         assert_eq!(text, vec!["Start".to_string(), "End".to_string()]);
     }
@@ -1276,8 +1298,44 @@ mod tests {
     #[test]
     fn connectors_are_bent_not_straight() {
         let (xml, _) = to_drawing("flowchart TD\nA[Start]-->B[End]");
-        assert!(xml.contains("prst=\"bentConnector3\""), "{xml}");
+        assert!(xml.contains("<a:custGeom>"), "{xml}");
+        assert!(xml.contains("<a:moveTo>"), "{xml}");
         assert!(!xml.contains("straightConnector1"), "{xml}");
+        assert!(!xml.contains("bentConnector3"), "{xml}");
+    }
+
+    #[test]
+    fn connector_path_matches_geometry() {
+        // The DrawingML connector must draw the exact same polyline as the
+        // shared geometry's `edge_points` — for both branches of a TopDown
+        // diagram. If someone reverts to a fixed preset (e.g. bentConnector3),
+        // this test fails because the preset never varies its point count or
+        // bend axis with direction, but a custom-geometry path emits one
+        // `<a:lnTo>` per interior/end vertex of `edge_points`.
+        let g = geometry("flowchart TD\nA-->B\nA-->C");
+        let (xml, _) = to_drawing("flowchart TD\nA-->B\nA-->C");
+        assert_eq!(g.edges.len(), 2);
+        for edge in &g.edges {
+            let pts = &edge.points;
+            assert_eq!(pts.len(), 4, "expected a 4-point elbow: {pts:?}");
+            let ox = pts.iter().map(|p| p.0).min().unwrap();
+            let oy = pts.iter().map(|p| p.1).min().unwrap();
+            // The interior bend point (pts[1]), expressed relative to the
+            // connector's bounding box, must appear verbatim in an <a:lnTo>.
+            let (bx, by) = (pts[1].0 - ox, pts[1].1 - oy);
+            let needle = format!("<a:pt x=\"{bx}\" y=\"{by}\"/>");
+            assert!(
+                xml.contains(&needle),
+                "expected bend point {needle} in emitted XML: {xml}"
+            );
+        }
+        // A fixed preset never emits per-vertex <a:lnTo> path data at all.
+        let lnto_count = xml.matches("<a:lnTo>").count();
+        assert_eq!(
+            lnto_count,
+            g.edges.iter().map(|e| e.points.len() - 1).sum::<usize>(),
+            "expected one <a:lnTo> per non-initial vertex across all edges: {xml}"
+        );
     }
 
     #[test]
