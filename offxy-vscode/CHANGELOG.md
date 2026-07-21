@@ -21,8 +21,8 @@
   item instead of breaking the list into a separate paragraph. A committed
   corpus test asserts a second `from_markdown`/`to_markdown` pass is a no-op
   across headings, emphasis/code/strike, links, nested/ordered/task lists
-  with continuations, tables, fenced code, blockquotes, thematic breaks, and
-  math — the basis the new markdown editor's save-stability depends on.
+  with a continuation, tables, fenced code, blockquotes, and thematic breaks
+  — the basis the new markdown editor's save-stability depends on.
 - **New: the wave-3 agent styling + persistent-pivots surface** — the agent
   control surface (terminal apps, tabs, and both MCP servers) grows from 53
   to **56 tools**:

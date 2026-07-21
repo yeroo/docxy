@@ -1461,7 +1461,8 @@ mod tests {
 A paragraph with **bold**, *italic*, ~~strike~~, `code`, and a [link](https://x).
 
 - bullet one
-- bullet two continued text
+- bullet two
+  continued on a soft-wrapped line
   - nested bullet
 - [ ] todo
 - [x] done
@@ -1491,6 +1492,8 @@ code block
             "~~strike~~",
             "`code`",
             "[link](https://x)",
+            "continued on a soft-wrapped line",
+            "nested bullet",
             "- [ ] todo",
             "- [x] done",
             "1. first",
