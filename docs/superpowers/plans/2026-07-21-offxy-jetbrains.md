@@ -185,12 +185,15 @@
 
 ### Task 6: Formatting, snapshot undo, save, toolbar, markdown
 
-> **Status: CORE DONE** (formatting + snapshot undo + toolbar + Save All /
-> close-save; platform tests green). Platform findings encoded: custom
-> FileEditors need `DocumentReferenceProvider` for undo routing, and document
+> **Status: DONE.** Formatting + snapshot undo + toolbar + Save All /
+> close-save, markdown convert/export actions (ProjectView + Tools menu),
+> replace dialog, empty-file create flow, external-change reload (silent when
+> unmodified, keep-edits when modified). Platform findings encoded: custom
+> FileEditors need `DocumentReferenceProvider` for undo routing; document
 > writes are forbidden inside undo transactions (reconcile defers via
-> invokeLater). **Remaining:** markdown convert/export actions, replace
-> dialog, empty-file create flow, external-change reload.
+> invokeLater); and the formatting reconcile must stay OUTSIDE
+> executeCommand or its document patch becomes undoable and fights the
+> snapshot restore at stale offsets. 28 tests green.
 
 **Files:**
 - Create: `editor/Formatting.kt`, `editor/DocxToolbar.kt`, `actions/*.kt`, `editor/EmptyDocPanel.kt`
