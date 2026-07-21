@@ -1,11 +1,21 @@
 package dev.yeroo.offxy.editor
 
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.WriteAction
+import com.intellij.openapi.command.undo.DocumentReference
+import com.intellij.openapi.command.undo.DocumentReferenceManager
+import com.intellij.openapi.command.undo.DocumentReferenceProvider
+import com.intellij.openapi.fileEditor.FileDocumentManagerListener
 import com.intellij.openapi.fileEditor.FileEditor
 import com.intellij.openapi.fileEditor.FileEditorState
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.BulkFileListener
+import com.intellij.openapi.vfs.newvfs.events.VFileContentChangeEvent
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.util.Alarm
 import dev.yeroo.offxy.engine.ChicoryEngine
 import dev.yeroo.offxy.engine.DocxEngine
@@ -14,6 +24,9 @@ import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
 import java.beans.PropertyChangeListener
 import java.beans.PropertyChangeSupport
+import javax.swing.Box
+import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -21,64 +34,136 @@ import javax.swing.SwingConstants
 
 /**
  * FileEditor shell for a `.docx` tab: owns the engine and the [EditorView],
- * loads the file, keeps wrap width in sync with the viewport, and surfaces
- * the engine's dirty flag as [isModified]. Editing replay arrives in Task 5;
- * save/undo wiring in Task 6.
+ * loads the file (offering to mint a fresh document for empty files), keeps
+ * wrap width in sync with the viewport, follows external disk changes, and
+ * surfaces the engine's dirty flag as [isModified].
  */
 class DocxFileEditor(
     private val project: Project,
     private val docxFile: VirtualFile,
-) : UserDataHolderBase(), FileEditor,
-    com.intellij.openapi.command.undo.DocumentReferenceProvider {
+) : UserDataHolderBase(), FileEditor, DocumentReferenceProvider {
     private val engine: DocxEngine = ChicoryEngine()
     private val panel = JPanel(BorderLayout())
     private val changeSupport = PropertyChangeSupport(this)
     private val widthAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
     private var modified = false
+    private var savingToDisk = false
 
-    val view: EditorView?
+    var view: EditorView? = null
+        private set
     private var pipeline: EditPipeline? = null
+
+    var isDisposed = false
+        private set
 
     init {
         val bytes = docxFile.contentsToByteArray()
-        if (bytes.isNotEmpty() && engine.open(bytes)) {
-            val v = EditorView(project) { rid -> engine.media(rid) }
-            view = v
-            panel.add(DocxToolbar.create(project, this), BorderLayout.NORTH)
-            panel.add(v.editor.component, BorderLayout.CENTER)
-            Disposer.register(this, v)
-            v.applyRender(ViewModel(engine.render()))
-            val p = EditPipeline(engine, v) { json -> refreshFrom(json) }
-            pipeline = p
-            v.document.addDocumentListener(p, this)
-            v.editor.component.addComponentListener(object : ComponentAdapter() {
-                override fun componentResized(e: ComponentEvent) = scheduleWidthSync()
-            })
-            scheduleWidthSync()
-            // Save All / Ctrl+S also saves Offxy tabs.
-            com.intellij.openapi.application.ApplicationManager.getApplication().messageBus
-                .connect(this)
-                .subscribe(
-                    com.intellij.openapi.fileEditor.FileDocumentManagerListener.TOPIC,
-                    object : com.intellij.openapi.fileEditor.FileDocumentManagerListener {
-                        override fun beforeAllDocumentsSaving() = saveNow()
-                    },
-                )
-        } else {
-            view = null
-            val message =
-                if (bytes.isEmpty()) "“${docxFile.name}” is empty — it isn't a Word document yet."
-                else "Offxy could not read this .docx file."
-            panel.add(JLabel(message, SwingConstants.CENTER), BorderLayout.CENTER)
+        when {
+            bytes.isEmpty() -> showEmptyState()
+            !openInView(bytes) -> showMessage("Offxy could not read this .docx file.")
         }
+        // Follow external disk changes while the tab is open.
+        ApplicationManager.getApplication().messageBus.connect(this)
+            .subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+                override fun after(events: List<VFileEvent>) {
+                    if (savingToDisk || isDisposed) return
+                    if (events.any { it is VFileContentChangeEvent && it.file == docxFile }) {
+                        reloadFromDisk()
+                    }
+                }
+            })
+        // Save All / Ctrl+S also saves Offxy tabs.
+        ApplicationManager.getApplication().messageBus.connect(this)
+            .subscribe(FileDocumentManagerListener.TOPIC, object : FileDocumentManagerListener {
+                override fun beforeAllDocumentsSaving() = saveNow()
+            })
+    }
+
+    /** Open bytes into a live editor view (builds it on first use). */
+    private fun openInView(bytes: ByteArray): Boolean {
+        if (!engine.open(bytes)) return false
+        val existing = view
+        if (existing != null) {
+            existing.applyRender(ViewModel(engine.render()))
+            return true
+        }
+        val v = EditorView(project) { rid -> engine.media(rid) }
+        view = v
+        panel.removeAll()
+        panel.add(DocxToolbar.create(project, this), BorderLayout.NORTH)
+        panel.add(v.editor.component, BorderLayout.CENTER)
+        panel.revalidate()
+        panel.repaint()
+        Disposer.register(this, v)
+        v.applyRender(ViewModel(engine.render()))
+        val p = EditPipeline(engine, v) { json -> refreshFrom(json) }
+        pipeline = p
+        v.document.addDocumentListener(p, this)
+        v.editor.component.addComponentListener(object : ComponentAdapter() {
+            override fun componentResized(e: ComponentEvent) = scheduleWidthSync()
+        })
+        scheduleWidthSync()
+        return true
+    }
+
+    /** Empty file: offer to turn it into a real Word document in place. */
+    private fun showEmptyState() {
+        val box = JPanel()
+        box.layout = BoxLayout(box, BoxLayout.Y_AXIS)
+        val note = JLabel("“${docxFile.name}” is empty — it isn't a Word document yet.")
+        note.alignmentX = 0.5f
+        val button = JButton("Create new Word document")
+        button.alignmentX = 0.5f
+        button.addActionListener { createNewDocument() }
+        box.add(Box.createVerticalGlue())
+        box.add(note)
+        box.add(Box.createVerticalStrut(8))
+        box.add(button)
+        box.add(Box.createVerticalGlue())
+        panel.removeAll()
+        panel.add(box, BorderLayout.CENTER)
+        panel.revalidate()
+    }
+
+    /** Mint a fresh empty document over the (empty) file and open it. */
+    fun createNewDocument() {
+        val minted = ChicoryEngine.fromMarkdown("")
+        savingToDisk = true
+        try {
+            WriteAction.run<RuntimeException> { docxFile.setBinaryContent(minted) }
+        } finally {
+            savingToDisk = false
+        }
+        if (!openInView(minted)) showMessage("Offxy could not create the document.")
+    }
+
+    /** Re-open the on-disk bytes, discarding nothing the user typed: an
+     *  unmodified tab follows the disk silently; a modified tab keeps its
+     *  edits (last writer wins at the next save). */
+    fun reloadFromDisk() {
+        if (modified || view == null) return
+        val bytes = docxFile.contentsToByteArray()
+        if (bytes.isNotEmpty()) {
+            openInView(bytes)
+            markModified(false)
+        }
+    }
+
+    private fun showMessage(message: String) {
+        panel.removeAll()
+        panel.add(JLabel(message, SwingConstants.CENTER), BorderLayout.CENTER)
+        panel.revalidate()
     }
 
     /** Write the engine's lossless save bytes back to the file. */
     fun saveNow() {
         if (view == null || !modified) return
         val bytes = engine.save()
-        com.intellij.openapi.application.WriteAction.run<RuntimeException> {
-            docxFile.setBinaryContent(bytes)
+        savingToDisk = true
+        try {
+            WriteAction.run<RuntimeException> { docxFile.setBinaryContent(bytes) }
+        } finally {
+            savingToDisk = false
         }
         markModified(false)
     }
@@ -130,8 +215,8 @@ class DocxFileEditor(
 
     /** Routes platform undo/redo to this editor's edits: both the native text
      *  undo (standalone document) and the formatting snapshot undo (file). */
-    override fun getDocumentReferences(): Collection<com.intellij.openapi.command.undo.DocumentReference> {
-        val mgr = com.intellij.openapi.command.undo.DocumentReferenceManager.getInstance()
+    override fun getDocumentReferences(): Collection<DocumentReference> {
+        val mgr = DocumentReferenceManager.getInstance()
         return listOfNotNull(view?.document?.let { mgr.create(it) }, mgr.create(docxFile))
     }
 
@@ -146,9 +231,6 @@ class DocxFileEditor(
 
     override fun removePropertyChangeListener(listener: PropertyChangeListener) =
         changeSupport.removePropertyChangeListener(listener)
-
-    var isDisposed = false
-        private set
 
     override fun dispose() {
         isDisposed = true

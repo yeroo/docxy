@@ -16,4 +16,25 @@
     <extensions defaultExtensionNs="com.intellij">
         <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
     </extensions>
+
+    <actions>
+        <action id="offxy.convertMarkdown"
+                class="dev.yeroo.offxy.actions.ConvertMarkdownAction"
+                text="Convert Markdown to Word (.docx)"
+                description="Convert the selected Markdown file to a Word document">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+        <action id="offxy.exportMarkdown"
+                class="dev.yeroo.offxy.actions.ExportMarkdownAction"
+                text="Offxy: Export to Markdown"
+                description="Export the open Word document to a Markdown file">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="offxy.replace"
+                class="dev.yeroo.offxy.actions.ReplaceAction"
+                text="Offxy: Replace…"
+                description="Replace all occurrences in the open Word document">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
 </idea-plugin>

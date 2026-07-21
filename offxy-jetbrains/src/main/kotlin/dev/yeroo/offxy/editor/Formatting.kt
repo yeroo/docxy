@@ -36,9 +36,12 @@ object Formatting {
             engine.cmd("click\t$l\t$c\t0")
         }
 
+        // Reconcile OUTSIDE the command so the document patch stays truly
+        // undo-transparent — undo must revert via the snapshot only, never via
+        // a competing document-level reverse patch (they fight at stale offsets).
+        val json = engine.cmd(command)
+        editor.refreshFrom(json)
         CommandProcessor.getInstance().executeCommand(project, {
-            val json = engine.cmd(command)
-            editor.refreshFrom(json)
             UndoManager.getInstance(project)
                 .undoableActionPerformed(SnapshotUndo(editor, before))
         }, "Offxy: $command", null)
