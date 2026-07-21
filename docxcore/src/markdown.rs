@@ -1424,6 +1424,61 @@ mod tests {
     }
 
     #[test]
+    fn markdown_round_trip_is_idempotent_over_the_corpus() {
+        // Written in docxy's own canonical output style (one line per paragraph,
+        // two-space list nesting) so the FIRST pass is already a fixed point.
+        let corpus = "\
+# Heading 1
+
+## Heading 2
+
+A paragraph with **bold**, *italic*, ~~strike~~, `code`, and a [link](https://x).
+
+- bullet one
+- bullet two continued text
+  - nested bullet
+- [ ] todo
+- [x] done
+
+Another list, in ordered style:
+
+1. first
+2. second
+
+> a quote
+
+```
+code block
+```
+
+| a | b |
+| --- | --- |
+| 1 | 2 |
+
+---
+";
+        let once = to_markdown(&from_markdown(corpus));
+        let twice = to_markdown(&from_markdown(&once));
+        assert_eq!(once, twice, "second pass must equal the first (idempotent)");
+        // Spot-check the constructs survive the FIRST pass.
+        for needle in [
+            "# Heading 1",
+            "**bold**",
+            "~~strike~~",
+            "`code`",
+            "[link](https://x)",
+            "- [ ] todo",
+            "- [x] done",
+            "- first",
+            "> a quote",
+            "| a | b |",
+            "---",
+        ] {
+            assert!(once.contains(needle), "corpus lost {needle:?}:\n{once}");
+        }
+    }
+
+    #[test]
     fn escape_inline_still_escapes_real_metacharacters_but_not_brackets() {
         // `*` `` ` `` `~` `|` `\` still escape; `[` `]` do not.
         let e = escape_inline("a*b`c~d|e[f]g\\h");
