@@ -36,15 +36,29 @@ object Formatting {
             engine.cmd("click\t$l\t$c\t0")
         }
 
-        // Reconcile OUTSIDE the command so the document patch stays truly
-        // undo-transparent — undo must revert via the snapshot only, never via
-        // a competing document-level reverse patch (they fight at stale offsets).
-        val json = engine.cmd(command)
-        editor.refreshFrom(json)
+        withSnapshotUndo(project, editor, "Offxy: $command", before) {
+            editor.refreshFrom(engine.cmd(command))
+        }
+    }
+
+    /**
+     * Run an engine mutation as one platform undo step. The mutation runs
+     * OUTSIDE the command so its document reconcile stays truly
+     * undo-transparent — undo must revert via the snapshot only, never via a
+     * competing document-level reverse patch (they fight at stale offsets).
+     */
+    fun withSnapshotUndo(
+        project: Project,
+        editor: DocxFileEditor,
+        label: String,
+        before: ByteArray = editor.engine().save(),
+        mutate: () -> Unit,
+    ) {
+        mutate()
         CommandProcessor.getInstance().executeCommand(project, {
             UndoManager.getInstance(project)
                 .undoableActionPerformed(SnapshotUndo(editor, before))
-        }, "Offxy: $command", null)
+        }, label, null)
     }
 }
 

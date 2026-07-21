@@ -103,6 +103,11 @@ class DocxFileEditor(
             override fun componentResized(e: ComponentEvent) = scheduleWidthSync()
         })
         scheduleWidthSync()
+        // Advertise on the agent control surface (docxy --mcp sees this tab).
+        runCatching {
+            val server = CtlBridge.start(project, this)
+            Disposer.register(this, server)
+        }
         return true
     }
 
@@ -137,11 +142,12 @@ class DocxFileEditor(
         if (!openInView(minted)) showMessage("Offxy could not create the document.")
     }
 
-    /** Re-open the on-disk bytes, discarding nothing the user typed: an
-     *  unmodified tab follows the disk silently; a modified tab keeps its
-     *  edits (last writer wins at the next save). */
-    fun reloadFromDisk() {
-        if (modified || view == null) return
+    /** Re-open the on-disk bytes. By default an unmodified tab follows the
+     *  disk silently and a modified tab keeps its edits (last writer wins at
+     *  the next save); `force` (the ctl `doc.reload` semantics) drops unsaved
+     *  edits like the terminal app does. */
+    fun reloadFromDisk(force: Boolean = false) {
+        if ((modified && !force) || view == null) return
         val bytes = docxFile.contentsToByteArray()
         if (bytes.isNotEmpty()) {
             openInView(bytes)

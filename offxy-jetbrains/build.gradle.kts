@@ -73,3 +73,12 @@ tasks.processResources {
     // lands at the resource root (/docxwasm.wasm) without touching the src tree.
     from(buildWasm)
 }
+
+tasks.test {
+    // Editors under test advertise ctl discovery files here, not in the
+    // user's real %APPDATA%\docxy\ctl.
+    systemProperty(
+        "offxy.ctl.dir",
+        layout.buildDirectory.dir("ctl-test").get().asFile.absolutePath,
+    )
+}

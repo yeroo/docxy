@@ -174,6 +174,56 @@ class ViewModel(json: String) {
 internal object Json {
     fun parse(s: String): Any? = Cursor(s).value()
 
+    /** Serialize maps/lists/strings/numbers/booleans/null back to JSON. */
+    fun write(v: Any?): String = StringBuilder().also { emit(v, it) }.toString()
+
+    private fun emit(v: Any?, sb: StringBuilder) {
+        when (v) {
+            null -> sb.append("null")
+            is String -> quote(v, sb)
+            is Boolean -> sb.append(if (v) "true" else "false")
+            is Int, is Long -> sb.append(v.toString())
+            is Number -> sb.append(v.toString())
+            is Map<*, *> -> {
+                sb.append('{')
+                var first = true
+                for ((k, value) in v) {
+                    if (!first) sb.append(',')
+                    first = false
+                    quote(k.toString(), sb)
+                    sb.append(':')
+                    emit(value, sb)
+                }
+                sb.append('}')
+            }
+            is List<*> -> {
+                sb.append('[')
+                for ((i, item) in v.withIndex()) {
+                    if (i > 0) sb.append(',')
+                    emit(item, sb)
+                }
+                sb.append(']')
+            }
+            else -> quote(v.toString(), sb)
+        }
+    }
+
+    private fun quote(s: String, sb: StringBuilder) {
+        sb.append('"')
+        for (c in s) {
+            when {
+                c == '"' -> sb.append("\\\"")
+                c == '\\' -> sb.append("\\\\")
+                c == '\n' -> sb.append("\\n")
+                c == '\r' -> sb.append("\\r")
+                c == '\t' -> sb.append("\\t")
+                c.code < 0x20 -> sb.append("\\u%04x".format(c.code))
+                else -> sb.append(c)
+            }
+        }
+        sb.append('"')
+    }
+
     private class Cursor(val s: String) {
         var i = 0
 
