@@ -26,9 +26,10 @@ import javax.swing.SwingConstants
  * save/undo wiring in Task 6.
  */
 class DocxFileEditor(
-    @Suppress("unused") private val project: Project,
-    private val file: VirtualFile,
-) : UserDataHolderBase(), FileEditor {
+    private val project: Project,
+    private val docxFile: VirtualFile,
+) : UserDataHolderBase(), FileEditor,
+    com.intellij.openapi.command.undo.DocumentReferenceProvider {
     private val engine: DocxEngine = ChicoryEngine()
     private val panel = JPanel(BorderLayout())
     private val changeSupport = PropertyChangeSupport(this)
@@ -39,10 +40,11 @@ class DocxFileEditor(
     private var pipeline: EditPipeline? = null
 
     init {
-        val bytes = file.contentsToByteArray()
+        val bytes = docxFile.contentsToByteArray()
         if (bytes.isNotEmpty() && engine.open(bytes)) {
             val v = EditorView(project) { rid -> engine.media(rid) }
             view = v
+            panel.add(DocxToolbar.create(project, this), BorderLayout.NORTH)
             panel.add(v.editor.component, BorderLayout.CENTER)
             Disposer.register(this, v)
             v.applyRender(ViewModel(engine.render()))
@@ -53,12 +55,39 @@ class DocxFileEditor(
                 override fun componentResized(e: ComponentEvent) = scheduleWidthSync()
             })
             scheduleWidthSync()
+            // Save All / Ctrl+S also saves Offxy tabs.
+            com.intellij.openapi.application.ApplicationManager.getApplication().messageBus
+                .connect(this)
+                .subscribe(
+                    com.intellij.openapi.fileEditor.FileDocumentManagerListener.TOPIC,
+                    object : com.intellij.openapi.fileEditor.FileDocumentManagerListener {
+                        override fun beforeAllDocumentsSaving() = saveNow()
+                    },
+                )
         } else {
             view = null
             val message =
-                if (bytes.isEmpty()) "“${file.name}” is empty — it isn't a Word document yet."
+                if (bytes.isEmpty()) "“${docxFile.name}” is empty — it isn't a Word document yet."
                 else "Offxy could not read this .docx file."
             panel.add(JLabel(message, SwingConstants.CENTER), BorderLayout.CENTER)
+        }
+    }
+
+    /** Write the engine's lossless save bytes back to the file. */
+    fun saveNow() {
+        if (view == null || !modified) return
+        val bytes = engine.save()
+        com.intellij.openapi.application.WriteAction.run<RuntimeException> {
+            docxFile.setBinaryContent(bytes)
+        }
+        markModified(false)
+    }
+
+    fun markModified(value: Boolean) {
+        if (value != modified) {
+            val old = modified
+            modified = value
+            changeSupport.firePropertyChange("modified", old, modified)
         }
     }
 
@@ -81,13 +110,7 @@ class DocxFileEditor(
         val v = view ?: return
         val model = ViewModel(viewJson)
         v.reconcile(model)
-        if (model.dirty != modified) {
-            val old = modified
-            modified = model.dirty
-            // FileEditor.PROP_MODIFIED ("modified") — the constant's home varies
-            // across platform versions; the wire value is stable.
-            changeSupport.firePropertyChange("modified", old, modified)
-        }
+        markModified(model.dirty)
     }
 
     fun engine(): DocxEngine = engine
@@ -103,13 +126,20 @@ class DocxFileEditor(
 
     override fun getName(): String = "Offxy"
 
-    override fun getFile(): VirtualFile = file
+    override fun getFile(): VirtualFile = docxFile
+
+    /** Routes platform undo/redo to this editor's edits: both the native text
+     *  undo (standalone document) and the formatting snapshot undo (file). */
+    override fun getDocumentReferences(): Collection<com.intellij.openapi.command.undo.DocumentReference> {
+        val mgr = com.intellij.openapi.command.undo.DocumentReferenceManager.getInstance()
+        return listOfNotNull(view?.document?.let { mgr.create(it) }, mgr.create(docxFile))
+    }
 
     override fun setState(state: FileEditorState) {}
 
     override fun isModified(): Boolean = modified
 
-    override fun isValid(): Boolean = file.isValid
+    override fun isValid(): Boolean = docxFile.isValid
 
     override fun addPropertyChangeListener(listener: PropertyChangeListener) =
         changeSupport.addPropertyChangeListener(listener)
@@ -117,7 +147,14 @@ class DocxFileEditor(
     override fun removePropertyChangeListener(listener: PropertyChangeListener) =
         changeSupport.removePropertyChangeListener(listener)
 
+    var isDisposed = false
+        private set
+
     override fun dispose() {
+        isDisposed = true
+        // Unsaved edits are written back on close (JetBrains auto-save spirit;
+        // a confirmation prompt is a possible follow-up).
+        runCatching { saveNow() }
         engine.close()
     }
 }
