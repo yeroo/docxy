@@ -57,6 +57,8 @@
 
 ### Task 3: `segs` in `view_json` (Rust)
 
+> **Status: DONE** (commit `d3aae9e`). 16 docxwasm tests green.
+
 **Files:**
 - Modify: `docxwasm/src/bridge.rs`
 
@@ -84,6 +86,11 @@
 ---
 
 ### Task 4: `ViewModel` + `EditorView` — render into a real editor
+
+> **Status: DONE** (commit `d3ff38f`), except the `runIde` smoke (pending a
+> human eye). Guard enforcement proven in the platform test via
+> `startGuardedBlockChecking`. ANSI colors are fixed JBColor pairs for now
+> (scheme-derived mapping noted as follow-up).
 
 **Files:**
 - Create: `editor/ViewModel.kt`, `editor/EditorView.kt`, `editor/DocxFileEditor.kt`, `editor/DocxEditorProvider.kt`
@@ -133,6 +140,11 @@
 ---
 
 ### Task 5: `EditPipeline` — native edits replay into the engine
+
+> **Status: DONE** (commit `2d60ed4`), except the `runIde` manual pass. The
+> property test earned its keep immediately: it caught a line-diff off-by-one
+> in reconcile (dropped newline at patch boundaries); fixed by switching to
+> char-level common prefix/suffix. Deterministic + random suites green.
 
 **Files:**
 - Create: `editor/EditPipeline.kt`
