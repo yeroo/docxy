@@ -346,7 +346,11 @@ fn code_span(text: &str) -> String {
 fn escape_inline(text: &str) -> String {
     let mut s = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(c, '\\' | '*' | '`' | '[' | ']' | '~' | '|') {
+        // `[`/`]` are only special in link/image syntax, which `to_markdown`
+        // emits through its own link path — not via this function. Escaping
+        // bare brackets mangles task-list items (`- [ ]` -> `- \[ \]`) and other
+        // literal bracket text, so they are left alone.
+        if matches!(c, '\\' | '*' | '`' | '~' | '|') {
             s.push('\\');
         }
         s.push(c);
@@ -1365,6 +1369,35 @@ mod tests {
             p.content
                 .iter()
                 .any(|i| matches!(i, Inline::Run(r) if r.props.bold && r.props.italic))
+        );
+    }
+
+    #[test]
+    fn task_list_round_trips_as_literal_text() {
+        let src = "- [ ] todo\n- [x] done\n";
+        let out = to_markdown(&from_markdown(src));
+        assert!(
+            out.contains("- [ ] todo"),
+            "unchecked task survives: {out:?}"
+        );
+        assert!(out.contains("- [x] done"), "checked task survives: {out:?}");
+        assert!(!out.contains("\\["), "brackets are not escaped: {out:?}");
+    }
+
+    #[test]
+    fn escape_inline_still_escapes_real_metacharacters_but_not_brackets() {
+        // `*` `` ` `` `~` `|` `\` still escape; `[` `]` do not.
+        let e = escape_inline("a*b`c~d|e[f]g\\h");
+        assert!(
+            e.contains("\\*")
+                && e.contains("\\`")
+                && e.contains("\\~")
+                && e.contains("\\|")
+                && e.contains("\\\\")
+        );
+        assert!(
+            !e.contains("\\[") && !e.contains("\\]"),
+            "brackets not escaped: {e:?}"
         );
     }
 }
