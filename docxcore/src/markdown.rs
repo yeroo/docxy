@@ -350,6 +350,14 @@ fn escape_inline(text: &str) -> String {
         // emits through its own link path — not via this function. Escaping
         // bare brackets mangles task-list items (`- [ ]` -> `- \[ \]`) and other
         // literal bracket text, so they are left alone.
+        // Accepted tradeoff: literal prose containing `[text](url)` (typed as
+        // plain text, not created via the link path) re-parses as a real link
+        // on the next round-trip. Deliberate, not an oversight — task-list
+        // `[ ]`/`[x] ` never forms link syntax (no following `(url)`), and this
+        // function never sees text the link path itself emitted (that path
+        // brackets its own text independently), so the ambiguity is confined to
+        // hand-typed bracket-paren prose, which is rare and recoverable (the
+        // "link" just points nowhere useful, it doesn't lose or corrupt text).
         if matches!(c, '\\' | '*' | '`' | '~' | '|') {
             s.push('\\');
         }
@@ -501,7 +509,9 @@ pub fn from_markdown(src: &str) -> Document {
                     {
                         break;
                     }
-                    text.push(' ');
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
                     text.push_str(t);
                     i += 1;
                 }
@@ -1123,6 +1133,31 @@ mod tests {
         assert!(
             !out.contains("- first line\n\n"),
             "no spurious blank inside the list: {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_marker_continuation_has_no_leading_space() {
+        // An empty first line (`"- "`, nothing after the marker) followed by a
+        // continuation: the fold loop must guard the space the same way the
+        // plain-paragraph gather does (`if !text.is_empty()`), or the item's
+        // text picks up a spurious leading space before "cont".
+        let src = "- \n  cont\n";
+        let doc = from_markdown(src);
+        let paras: Vec<&Paragraph> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.props.num_id.is_some())
+            .collect();
+        assert_eq!(paras.len(), 1, "one list item");
+        assert_eq!(
+            paras[0].plain_text(),
+            "cont",
+            "no leading space before cont"
         );
     }
 

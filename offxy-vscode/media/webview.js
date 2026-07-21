@@ -186,11 +186,44 @@
   // Markdown mode, DISPLAY ONLY: a task-list item's model/save text is the
   // literal `[ ] `/`[x] `/`[X] ` that Markdown's own task-list syntax uses (see
   // docxcore's markdown.rs — round-tripped verbatim, never escaped). This only
-  // reskins that literal prefix into a checkbox glyph on the span text handed
-  // to the DOM below; it never calls `cmd`/`userCmd`, so the wasm model — and
-  // therefore `docx_save`/`docx_to_md` — still sees `[ ] `/`[x] ` untouched.
-  function mdCheckbox(text) {
-    return text.replace(/^\[ \] /, '☐ ').replace(/^\[[xX]\] /, '☑ ');
+  // reskins that literal 4-character prefix into a checkbox glyph in the DOM;
+  // it never calls `cmd`/`userCmd`, so the wasm model — and therefore
+  // `docx_save`/`docx_to_md` — still sees `[ ] `/`[x] ` untouched.
+  //
+  // The grid is a strict character grid: caret placement (`col * charW`) and
+  // click/drag hit-testing (`x / charW`) both work in MODEL columns. A naive
+  // text substitution (`"[ ] "` → `"☐ "`) would shrink 4 model columns down to
+  // 2 rendered characters, shifting every caret/click column after it on the
+  // line by ~2 — wrong pointer feedback, even though the model/save stay
+  // correct. `checkboxGlyph()` instead reports the glyph AND the leftover text
+  // separately, and the caller renders the glyph in its own `width:4ch` inline
+  // box (see `paint()` below) — pinning the glyph to exactly the 4 display
+  // columns the 4 model characters `[ ] `/`[x] ` occupy, so every column after
+  // it lines up with the model exactly as it did before the reskin.
+  const MD_CHECKBOX_RE = /^\[( |[xX])\] /;
+  function checkboxGlyph(text) {
+    const m = MD_CHECKBOX_RE.exec(text);
+    if (!m) return null;
+    return { glyph: m[1] === ' ' ? '☐' : '☑', rest: text.slice(4) };
+  }
+
+  /** Style one rendered span element from its wasm view-JSON span object
+   *  (bold/italic/underline/strike/dim/selected/color/link). Shared by the
+   *  plain-span path and the checkbox glyph's two-piece split below, so a
+   *  formatted task-list run (rare, but not impossible) keeps its formatting
+   *  on both the glyph box and the remainder text. */
+  function styleSpan(el, sp) {
+    if (sp.b) el.classList.add('b');
+    if (sp.i) el.classList.add('i');
+    if (sp.u) el.classList.add('u');
+    if (sp.s) el.classList.add('st');
+    if (sp.d) el.classList.add('dim');
+    if (sp.h) el.classList.add('sel');
+    if (sp.c) el.style.color = ANSI(sp.c);
+    if (sp.lnk) {
+      el.classList.add('link');
+      el.dataset.href = sp.lnk;
+    }
   }
 
   function paint() {
@@ -211,21 +244,36 @@
       // Scoping to that one index — and only when the line is actually a list
       // item — is what keeps a coincidental "[ ] " elsewhere in a paragraph (or
       // in a non-list paragraph entirely) from being misread as a task item.
+      // This "spans[1] is the content" assumption holds for every UI-driven edit
+      // (alignment ops are unreachable in markdown mode, see userCmd()'s guard),
+      // but the agent control surface (`doc.format`/`doc.set-style` with an
+      // align patch) can still reach the model directly and insert a lead span
+      // ahead of the marker — in that case the index no longer lines up with
+      // the checkbox text, and it just renders as the literal `[ ] ` string
+      // instead of the glyph (never corrupting anything, only degrading the
+      // cosmetic reskin back to plain text).
       const checkboxIdx = MD_MODE && line.list ? 1 : -1;
       spans.forEach((sp, si) => {
-        const el = document.createElement('span');
-        el.textContent = si === checkboxIdx ? mdCheckbox(sp.t) : sp.t;
-        if (sp.b) el.classList.add('b');
-        if (sp.i) el.classList.add('i');
-        if (sp.u) el.classList.add('u');
-        if (sp.s) el.classList.add('st');
-        if (sp.d) el.classList.add('dim');
-        if (sp.h) el.classList.add('sel');
-        if (sp.c) el.style.color = ANSI(sp.c);
-        if (sp.lnk) {
-          el.classList.add('link');
-          el.dataset.href = sp.lnk;
+        const cb = si === checkboxIdx ? checkboxGlyph(sp.t) : null;
+        if (cb) {
+          // Fixed-width box: exactly 4 display columns for the 4 model columns
+          // `[ ] `/`[x] ` occupied, regardless of the glyph's own font width.
+          const marker = document.createElement('span');
+          marker.textContent = cb.glyph;
+          marker.style.display = 'inline-block';
+          marker.style.width = '4ch';
+          marker.style.textAlign = 'left';
+          styleSpan(marker, sp);
+          div.appendChild(marker);
+          const rest = document.createElement('span');
+          rest.textContent = cb.rest;
+          styleSpan(rest, sp);
+          div.appendChild(rest);
+          return;
         }
+        const el = document.createElement('span');
+        el.textContent = sp.t;
+        styleSpan(el, sp);
         div.appendChild(el);
       });
       frag.appendChild(div);
