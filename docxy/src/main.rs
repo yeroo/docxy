@@ -2875,13 +2875,14 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let (mut lines, mut maps, mut images) = render_with_images(&self.editor.doc, &opts);
+            let (mut lines, mut maps, mut images, _mmd) =
+                render_with_images(&self.editor.doc, &opts);
             // While editing a header/footer, show the rest of the page (the parked
             // document body) dimmed and read-only below/above the editable surface,
             // the way Word greys out the body. The body's caret maps are dropped so
             // the caret stays in the header/footer being edited.
             if let Some(hf) = &self.hf_edit {
-                let (mut body, _bm, _bi) = render_with_images(&hf.body.doc, &opts);
+                let (mut body, _bm, _bi, _bmmd) = render_with_images(&hf.body.doc, &opts);
                 for l in &mut body {
                     for s in &mut l.spans {
                         s.style.dim = true;

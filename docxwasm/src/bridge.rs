@@ -137,7 +137,7 @@ impl Session {
     /// or cut command).
     pub fn view_json(&mut self, copied: Option<&str>) -> String {
         let opts = self.options();
-        let (lines, maps, images) = render::render_with_images(&self.editor.doc, &opts);
+        let (lines, maps, images, mermaid) = render::render_with_images(&self.editor.doc, &opts);
         let (cl, cc) = caret_screen(&maps, &self.editor.caret);
         // Pulled out before `maps` moves into `self.maps` below: whether each line
         // belongs to a list-item paragraph, so the webview can scope its Markdown-
@@ -220,6 +220,16 @@ impl Session {
                 out.push(',');
             }
             push_image(&mut out, ib);
+        }
+        out.push_str("],\"mermaid\":[");
+        for (mi, mb) in mermaid.iter().enumerate() {
+            if mi > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"row\":{},\"col\":{},\"cols\":{},\"rows\":{},\"geo\":{}}}",
+                mb.row, mb.col, mb.cols, mb.rows, mb.geometry_json
+            ));
         }
         out.push(']');
         if let Some(t) = copied {
@@ -1357,6 +1367,26 @@ mod tests {
             listed.contains("\"list\":true"),
             "list-item line missing its list flag: {listed}"
         );
+    }
+
+    #[test]
+    fn view_json_emits_mermaid_geometry() {
+        // Build a real `.docx` from a mermaid fence via the markdown path (the
+        // same conversion `markdown_to_docx` gives the VS Code host), so the
+        // document carries a `SmartArt` inline whose `raw` embeds the mermaid
+        // source (`mermaid::source_of` recovers it from the `descr="mermaid:...`
+        // marker `mermaid_para` writes).
+        let bytes = markdown_to_docx("```mermaid\nflowchart TD\nA[Start]-->B[End]\n```\n");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"mermaid\":["), "{v}");
+        assert!(v.contains("\"geo\":{\"canvasW\":"), "{v}");
+        assert!(v.contains("\"shape\":\"rect\""), "{v}");
+
+        // A plain (non-mermaid) doc has an empty array.
+        let bytes2 = markdown_to_docx("hello\n");
+        let mut s2 = Session::open(&bytes2).expect("open");
+        assert!(s2.view_json(None).contains("\"mermaid\":[]"));
     }
 
     #[test]
