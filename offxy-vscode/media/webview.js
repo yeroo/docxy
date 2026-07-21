@@ -25,6 +25,12 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
+  // The markdown editor (`.md` files) reuses this same webview; the provider
+  // flags it via `window.__OFFXY__.markdown` so the UI can constrain itself to
+  // what Markdown can actually represent (toolbar) and re-skin literal task-list
+  // text for display (checkboxes) — see buildToolbar() and mdCheckbox() below.
+  const MD_MODE = !!(window.__OFFXY__ && window.__OFFXY__.markdown);
+
   // ---- wasm marshalling ----------------------------------------------------
   const mem = () => new Uint8Array(ex.memory.buffer);
 
@@ -161,6 +167,16 @@
   // ---- painting ------------------------------------------------------------
   const ANSI = (name) => `var(--vscode-terminal-ansi${name})`;
 
+  // Markdown mode, DISPLAY ONLY: a task-list item's model/save text is the
+  // literal `[ ] `/`[x] `/`[X] ` that Markdown's own task-list syntax uses (see
+  // docxcore's markdown.rs — round-tripped verbatim, never escaped). This only
+  // reskins that literal prefix into a checkbox glyph on the span text handed
+  // to the DOM below; it never calls `cmd`/`userCmd`, so the wasm model — and
+  // therefore `docx_save`/`docx_to_md` — still sees `[ ] `/`[x] ` untouched.
+  function mdCheckbox(text) {
+    return text.replace(/^\[ \] /, '☐ ').replace(/^\[[xX]\] /, '☑ ');
+  }
+
   function paint() {
     const frag = document.createDocumentFragment();
     for (const line of lastView.lines) {
@@ -171,7 +187,7 @@
       }
       for (const sp of line) {
         const el = document.createElement('span');
-        el.textContent = sp.t;
+        el.textContent = MD_MODE ? mdCheckbox(sp.t) : sp.t;
         if (sp.b) el.classList.add('b');
         if (sp.i) el.classList.add('i');
         if (sp.u) el.classList.add('u');
@@ -426,7 +442,7 @@
     const bar = document.createElement('div');
     bar.id = 'toolbar';
     const SEP = '|';
-    const buttons = [
+    let buttons = [
       ['B', 'bold', 'Bold', 'tb-b'],
       ['I', 'italic', 'Italic', 'tb-i'],
       ['U', 'underline', 'Underline', 'tb-u'],
@@ -446,6 +462,31 @@
       ['A−', 'fontsize\t-2', 'Smaller'],
       ['A+', 'fontsize\t2', 'Larger'],
     ];
+    // Markdown mode can't represent underline, alignment, or font size — the
+    // model round-trips through Markdown text, which has no syntax for them.
+    // Bold/italic/strike, headings, and list ops all survive the md<->docx
+    // conversion, so those stay.
+    if (MD_MODE) {
+      const MD_HIDDEN = new Set([
+        'underline',
+        'align\tleft',
+        'align\tcenter',
+        'align\tright',
+        'fontsize\t-2',
+        'fontsize\t2',
+      ]);
+      buttons = buttons.filter((b) => !(b[1] && MD_HIDDEN.has(b[1])));
+      // Drop separators left leading or doubled-up by the op filter (checked
+      // against the last *kept* button, not the pre-filter array — two whole
+      // groups, align and font size, are adjacent survivors here, so a
+      // position-indexed check would miss the resulting double separator).
+      buttons = buttons.reduce((acc, b) => {
+        if (b[0] === SEP && (acc.length === 0 || acc[acc.length - 1][0] === SEP)) return acc;
+        acc.push(b);
+        return acc;
+      }, []);
+      if (buttons.length && buttons[buttons.length - 1][0] === SEP) buttons.pop();
+    }
     for (const [label, op, title, cls] of buttons) {
       if (label === SEP) {
         const s = document.createElement('span');
