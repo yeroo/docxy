@@ -201,6 +201,12 @@ pub struct LineMap {
     /// the page's edge and reopens it with the top border on the next page (as
     /// Word does). `None` for non-table or borderless lines.
     pub table_edge: Option<Rc<(String, String)>>,
+    /// True for every visual line of a list-item paragraph (`w:numPr`/
+    /// `para.props.num_id.is_some()`), including wrapped continuation lines.
+    /// Consumed by the webview to scope Markdown-mode's checkbox glyph
+    /// (`[ ] `/`[x] ` → ☐/☑) to actual list items instead of any line whose
+    /// text happens to start with that literal prefix.
+    pub list: bool,
 }
 
 impl LineMap {
@@ -211,6 +217,7 @@ impl LineMap {
             image: false,
             overflow: false,
             table_edge: None,
+            list: false,
         }
     }
     /// The segment containing the caret (path + offset), if any.
@@ -1477,7 +1484,13 @@ fn render_paragraph(
                     reserve = reserve.max(img.rows.saturating_sub(1));
                 }
             }
-            out.push((line, LineMap::one(lseg)));
+            out.push((
+                line,
+                LineMap {
+                    list: is_list,
+                    ..LineMap::one(lseg)
+                },
+            ));
             for _ in 0..reserve {
                 out.push((Line { spans: Vec::new() }, LineMap::default()));
             }

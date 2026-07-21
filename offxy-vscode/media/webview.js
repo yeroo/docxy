@@ -27,9 +27,25 @@
 
   // The markdown editor (`.md` files) reuses this same webview; the provider
   // flags it via `window.__OFFXY__.markdown` so the UI can constrain itself to
-  // what Markdown can actually represent (toolbar) and re-skin literal task-list
-  // text for display (checkboxes) — see buildToolbar() and mdCheckbox() below.
+  // what Markdown can actually represent (toolbar + op guard) and re-skin literal
+  // task-list text for display (checkboxes) — see buildToolbar(), userCmd(), and
+  // mdCheckbox() below.
   const MD_MODE = !!(window.__OFFXY__ && window.__OFFXY__.markdown);
+
+  // Ops Markdown's own syntax has no way to represent, so a save silently drops
+  // them. ONE source of truth, gating BOTH the toolbar (buildToolbar filters its
+  // button list against this) and every path that can still invoke an op with
+  // the toolbar hidden — keybindings (onKeydown) and the command-palette
+  // `command` message (both route through userCmd(), the single choke point
+  // guarded below). `align\tjustify` has no toolbar button at all (only a
+  // command-palette entry, offxy.alignJustify) but is just as unrepresentable
+  // in Markdown as left/center/right, so it's included here even though it was
+  // never in the toolbar's button list.
+  const MD_HIDDEN_OPS = new Set([
+    'underline',
+    'align\tleft', 'align\tcenter', 'align\tright', 'align\tjustify',
+    'fontsize\t-2', 'fontsize\t2',
+  ]);
 
   // ---- wasm marshalling ----------------------------------------------------
   const mem = () => new Uint8Array(ex.memory.buffer);
@@ -182,12 +198,23 @@
     for (const line of lastView.lines) {
       const div = document.createElement('div');
       div.className = 'line';
-      if (line.length === 0) {
+      const spans = line.sp;
+      if (spans.length === 0) {
         div.appendChild(document.createTextNode('​')); // keep empty lines tall
       }
-      for (const sp of line) {
+      // docxcore's render_paragraph always pushes the list marker (bullet glyph
+      // or the equivalent blank-space prefix on a wrapped continuation line) as
+      // its own span BEFORE the paragraph's own content spans, whenever the
+      // paragraph carries a numId — so on a real list-item line (`line.list`,
+      // from the wasm view's per-line flag) the checkbox-eligible text is always
+      // spans[1], never spans[0] (the marker) or anything later in the line.
+      // Scoping to that one index — and only when the line is actually a list
+      // item — is what keeps a coincidental "[ ] " elsewhere in a paragraph (or
+      // in a non-list paragraph entirely) from being misread as a task item.
+      const checkboxIdx = MD_MODE && line.list ? 1 : -1;
+      spans.forEach((sp, si) => {
         const el = document.createElement('span');
-        el.textContent = MD_MODE ? mdCheckbox(sp.t) : sp.t;
+        el.textContent = si === checkboxIdx ? mdCheckbox(sp.t) : sp.t;
         if (sp.b) el.classList.add('b');
         if (sp.i) el.classList.add('i');
         if (sp.u) el.classList.add('u');
@@ -200,7 +227,7 @@
           el.dataset.href = sp.lnk;
         }
         div.appendChild(el);
-      }
+      });
       frag.appendChild(div);
     }
     docEl.replaceChildren(frag);
@@ -268,8 +295,20 @@
   ]);
 
   /** Run a user-initiated command and, if it mutates, tell the host so VS Code
-   *  lights the dirty dot and can drive undo/redo. */
+   *  lights the dirty dot and can drive undo/redo.
+   *
+   *  This is the ONE choke point every user-facing entry to a formatting op
+   *  passes through — toolbar buttons (buildToolbar()'s click handler),
+   *  keybindings (onKeydown, e.g. Ctrl+U), and the command-palette `command`
+   *  host message (the `case 'command': userCmd(msg.op)` below) — so the
+   *  Markdown-mode guard here covers all three with no per-surface duplication.
+   *  In markdown mode, an op Markdown can't represent (MD_HIDDEN_OPS — the same
+   *  set buildToolbar() filters the toolbar against) is silently dropped instead
+   *  of reaching the wasm model, so it can never create formatting that would
+   *  vanish unannounced on the next save. Gated on MD_MODE only, so plain .docx
+   *  editing is entirely unaffected. */
   function userCmd(str) {
+    if (MD_MODE && MD_HIDDEN_OPS.has(str)) return;
     cmd(str);
     const op = str.split('\t', 1)[0];
     if (MUTATING.has(op)) {
@@ -465,17 +504,11 @@
     // Markdown mode can't represent underline, alignment, or font size — the
     // model round-trips through Markdown text, which has no syntax for them.
     // Bold/italic/strike, headings, and list ops all survive the md<->docx
-    // conversion, so those stay.
+    // conversion, so those stay. (userCmd() below enforces the same set as a
+    // no-op guard, so these ops are unreachable even via keybinding/palette —
+    // hiding the button here is about decluttering, not the only defense.)
     if (MD_MODE) {
-      const MD_HIDDEN = new Set([
-        'underline',
-        'align\tleft',
-        'align\tcenter',
-        'align\tright',
-        'fontsize\t-2',
-        'fontsize\t2',
-      ]);
-      buttons = buttons.filter((b) => !(b[1] && MD_HIDDEN.has(b[1])));
+      buttons = buttons.filter((b) => !(b[1] && MD_HIDDEN_OPS.has(b[1])));
       // Drop separators left leading or doubled-up by the op filter (checked
       // against the last *kept* button, not the pre-filter array — two whole
       // groups, align and font size, are adjacent survivors here, so a
