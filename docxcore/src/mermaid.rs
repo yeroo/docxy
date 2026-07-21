@@ -875,7 +875,7 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
          <wps:cNvCnPr/>\
          <wps:spPr>\
          <a:xfrm{flip_h}{flip_v}><a:off x=\"{ox}\" y=\"{oy}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-         <a:prstGeom prst=\"straightConnector1\"><a:avLst/></a:prstGeom>\
+         <a:prstGeom prst=\"bentConnector3\"><a:avLst/></a:prstGeom>\
          <a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
          <a:tailEnd type=\"triangle\"/></a:ln>\
          </wps:spPr>\
@@ -1041,12 +1041,22 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
     }
 }
 
-/// The polyline vertices of an edge. Task 4 replaces this with elbow routing;
-/// for now it is the two straight anchor endpoints.
+/// The polyline vertices of an edge: a 4-point orthogonal elbow that routes
+/// through the midpoint between the two anchors (matching `bentConnector3`'s
+/// default `adj1=50000` bend).
 fn edge_points(d: &Diagram, e: &Edge) -> Vec<(i64, i64)> {
     let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
     let (x1, y1, x2, y2) = anchors(d.dir, from, to);
-    vec![(x1, y1), (x2, y2)]
+    match d.dir {
+        Dir::TopDown => {
+            let my = (y1 + y2) / 2;
+            vec![(x1, y1), (x1, my), (x2, my), (x2, y2)]
+        }
+        Dir::LeftRight => {
+            let mx = (x1 + x2) / 2;
+            vec![(x1, y1), (mx, y1), (mx, y2), (x2, y2)]
+        }
+    }
 }
 
 /// A serializable snapshot of a laid-out diagram: the single geometry both the
@@ -1258,12 +1268,28 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains("prst=\"roundRect\"") || xml.contains("prst=\"rect\""));
-        assert!(
-            xml.contains("prst=\"straightConnector1\""),
-            "connector missing"
-        );
+        assert!(xml.contains("prst=\"bentConnector3\""), "connector missing");
         assert!(xml.contains("Start") && xml.contains("End"));
         assert_eq!(text, vec!["Start".to_string(), "End".to_string()]);
+    }
+
+    #[test]
+    fn connectors_are_bent_not_straight() {
+        let (xml, _) = to_drawing("flowchart TD\nA[Start]-->B[End]");
+        assert!(xml.contains("prst=\"bentConnector3\""), "{xml}");
+        assert!(!xml.contains("straightConnector1"), "{xml}");
+    }
+
+    #[test]
+    fn edge_points_are_orthogonal_elbow() {
+        let g = geometry("flowchart TD\nA[Start]-->B[End]");
+        let pts = &g.edges[0].points;
+        // 4-point elbow: start, down to mid-y, across, into target.
+        assert_eq!(pts.len(), 4);
+        // TopDown: consecutive segments alternate vertical / horizontal.
+        assert_eq!(pts[0].0, pts[1].0); // vertical first
+        assert_eq!(pts[1].1, pts[2].1); // horizontal
+        assert_eq!(pts[2].0, pts[3].0); // vertical into target
     }
 
     #[test]
