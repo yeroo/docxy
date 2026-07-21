@@ -69,12 +69,25 @@ class CtlBridgePlatformTest : BasePlatformTestCase() {
             assertEquals(false, info["modified"])
             assertTrue((info["path"] as String).contains("bridge.docx"))
 
-            // Wasm-side verbs are conformant-unimplemented until docx_ctl lands
-            // (flips to real replies with the agent-access artifact).
-            val outline = ctlCall(port, """{"token":"$token","verb":"doc.outline","id":2}""")
-            if (outline["ok"] == false) {
-                assertEquals("not yet implemented", outline["error"])
-            }
+            // Wasm-side verbs ride docx_ctl (live since the agent-access work
+            // merged): doc.read must return the live text.
+            val read = ctlCall(port, """{"token":"$token","verb":"doc.read","id":2}""")
+            assertEquals(true, read["ok"])
+            @Suppress("UNCHECKED_CAST")
+            val readResult = read["result"] as Map<String, Any?>
+            assertTrue(
+                "doc.read should carry the text: $readResult",
+                (readResult["text"] as? String)?.contains("Bridge test") == true,
+            )
+
+            // Undo is IDE-owned on JetBrains tabs.
+            val undo = ctlCall(port, """{"token":"$token","verb":"doc.undo","id":9}""")
+            assertEquals(false, undo["ok"])
+            assertTrue((undo["error"] as String).startsWith("undo is IDE-owned"))
+
+            // Internal composition verb is rejected, as on every surface.
+            val blocks = ctlCall(port, """{"token":"$token","verb":"doc.blocks","id":10}""")
+            assertEquals("unknown verb 'doc.blocks'", blocks["error"])
 
             // doc.save writes the engine bytes to the file and clears modified.
             com.intellij.openapi.command.WriteCommandAction.runWriteCommandAction(project) {

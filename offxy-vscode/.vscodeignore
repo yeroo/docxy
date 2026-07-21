@@ -1,6 +1,10 @@
 # Files kept OUT of the packaged .vsix. Everything not matched here ships.
 # (A .vscodeignore is required so vsce doesn't fall back to .gitignore, which
 #  excludes media/*.wasm — the wasm MUST be in the vsix.)
+#
+# mcp/** (the bundled dependency-free MCP stdio server, mcp/server.mjs) is
+# deliberately NOT excluded below — it ships as plain .mjs, unbundled, since
+# it's launched directly via `node <extensionPath>/mcp/server.mjs`.
 
 # Source & build tooling (only the bundled out/ + media/ ship)
 src/**

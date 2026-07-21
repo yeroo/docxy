@@ -42,9 +42,12 @@ claude mcp add docxy -- docxy --mcp     # Claude Code
 ```
 
 JetBrains AI Assistant / Junie: add `docxy --mcp` as an MCP server in its
-settings. Agent edits repaint the tab live and are one Ctrl+Z away from
-undone. (Read/edit verbs light up with the `docx_ctl` engine build from the
-agent-access plan; `doc.path`/`doc.save`/`doc.reload`/`doc.open` work today.)
+settings. Agent reads and edits go through the same `docx_ctl` engine surface
+the VS Code tabs use (outline/read/find/replace/insert/append/format/styles/
+comments/metadata/…); edits repaint the tab live and land as one IDE undo
+step each. `doc.undo`/`doc.redo` are rejected on JetBrains tabs (undo is
+IDE-owned) and `doc.export-pdf` is a follow-up; see the "JetBrains tabs"
+section of [agent-control.md](../docs/agent-control.md#jetbrains-tabs).
 
 ## Install
 

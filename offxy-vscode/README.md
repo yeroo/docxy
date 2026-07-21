@@ -113,6 +113,36 @@ Development Host, and open any `.docx` or `.xlsx` file.
 - **Empty-file create flow** — opening a 0-byte `.xlsx` offers to create a new
   workbook in its place.
 
+## Edit Markdown files (WYSIWYG)
+
+Alongside `.docx` and `.xlsx`, offxy can open a `.md` file in the same
+no-ribbon document editor: right-click the editor tab (or open the command
+palette) and choose **Reopen Editor With → Docxy Markdown**. This is
+**opt-in** — `.md` files still open as plain text by default; nothing
+changes for markdown editing until you explicitly reopen a file this way.
+
+- **Saves back as markdown, never `.docx`.** The file loads via
+  `markdownToDocx` (in-memory docx bytes, so the same rendering/editing
+  engine as the Word editor can be reused) and saves via `docxToMarkdown`
+  back to the `.md` file. No `.docx` is ever written next to it.
+- **One-time reflow, then stable.** The first save re-emits the document as
+  docxy's canonical markdown — hard-wrapped prose is unwrapped to one line
+  per paragraph, since the editor's model has no memory of the source's line
+  breaks. After that first save the file is stable: further open/edit/save
+  cycles don't touch unrelated content. Task lists (`- [ ]` / `- [x]`),
+  nested bullet/ordered lists, and soft-wrapped list-item continuations
+  round-trip byte-faithfully.
+- **Markdown-mode formatting.** The toolbar (and its command-palette/
+  keyboard-shortcut equivalents) hides and disables formatting Markdown
+  can't represent — underline, paragraph alignment, font size — so you can't
+  create formatting that would silently disappear on save. Bold, italic,
+  strikethrough, headings, and bulleted/numbered lists all remain, since
+  Markdown expresses each of them directly.
+- **Task-list checkboxes.** A list item whose text starts with `[ ] ` or
+  `[x] ` renders as a ☐ / ☑ glyph instead of the literal brackets. This is
+  display-only — the underlying text (and what gets saved) is still the
+  literal `[ ]` / `[x]` markdown.
+
 ## Architecture
 
 | Layer | Where | Role |
@@ -129,6 +159,68 @@ keystroke); the host owns the file lifecycle. They talk over a small
 light the dirty dot and route undo/redo back into the wasm editor.
 
 See [../VSCODE.md](../VSCODE.md) for the full design.
+
+## AI assistants
+
+Every open `.docx`/`.xlsx` tab exposes the same agent [control surface](../docs/agent-control.md)
+as the `docxy`/`xlsxy` terminal apps — an AI assistant can read and edit the
+**live, in-memory** document (including unsaved changes), with the edit
+landing on VS Code's own undo stack and repainting the tab instantly, exactly
+like driving a terminal pane. See ["VS Code tabs"](../docs/agent-control.md#vs-code-tabs)
+for the two ways a tab's semantics differ from a terminal instance.
+
+- **GitHub Copilot (agent mode)** — automatic. This extension registers
+  `mcp/server.mjs`, its bundled dependency-free MCP bridge, as an MCP server
+  provider on activation (`contributes.mcpServerDefinitionProviders` +
+  `vscode.lm.registerMcpServerDefinitionProvider`, VS Code ≥ 1.101).
+  Copilot's agent mode discovers the tools with no configuration.
+- **Claude Code** — one-liner:
+
+  ```sh
+  claude mcp add offxy -- node <extension-path>/mcp/server.mjs
+  ```
+
+  `<extension-path>` is wherever VS Code installed this extension — typically
+  `~/.vscode/extensions/yeroo.offxy-0.3.0` (Windows:
+  `%USERPROFILE%\.vscode\extensions\yeroo.offxy-0.3.0`). **Caveat:** that path
+  is *versioned* — it changes on every extension update, so the registration
+  silently goes stale after an upgrade until you re-run `claude mcp add` with
+  the new path. If you already have the `docxy`/`xlsxy` terminal binaries on
+  `PATH`, `claude mcp add docxy -- docxy --mcp` (and the `xlsxy` equivalent)
+  sidesteps the versioned-path problem entirely — see
+  [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
+- **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (56
+  tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
+  `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
+  `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
+  `docxy_comments`, `docxy_notes`, `docxy_header`, `docxy_footer`,
+  `docxy_metadata`, `docxy_stats`, `docxy_replace_all`, `docxy_undo`,
+  `docxy_redo`, `docxy_format`, `docxy_set_style` (23) —
+  `docxy_replace_range`/`docxy_insert`/`docxy_append` each take an optional
+  `markdown` flag to splice formatted Markdown (headings, bold, lists,
+  tables, links) into the document instead of plain text, and
+  `docxy_format`/`docxy_set_style` apply direct run-level formatting (bold,
+  color, highlight, font, size) and paragraph styles/alignment to a block
+  range — and
+  `xlsxy_list`, `xlsxy_new`, `xlsxy_status`, `xlsxy_sheets`, `xlsxy_read`,
+  `xlsxy_get`, `xlsxy_set`, `xlsxy_clear`,
+  `xlsxy_find`, `xlsxy_recalc`, `xlsxy_save`, `xlsxy_comments`,
+  `xlsxy_comment_add`, `xlsxy_comment_remove`, `xlsxy_range_set`,
+  `xlsxy_export_csv`, `xlsxy_import_csv`, `xlsxy_pivot`, `xlsxy_replace_all`,
+  `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
+  `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
+  `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
+  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`
+  (33) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
+  on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`). It's
+  a thin bridge — it opens no document itself, only forwards to whichever
+  `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
+  running (the `_new` tools are the exception: they create the file on disk
+  themselves, then hand off to an instance via the same open forwarding);
+  pass `target` (a substring of the instance/pane id) to disambiguate
+  when several are open, or call `docxy_list`/`xlsxy_list` to see what's
+  running.
 
 ## Install
 

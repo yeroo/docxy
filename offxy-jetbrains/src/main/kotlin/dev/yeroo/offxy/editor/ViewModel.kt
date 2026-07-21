@@ -50,7 +50,14 @@ class ViewModel(json: String) {
         val root = Json.parse(json) as Map<String, Any?>
 
         lines = (root["lines"] as List<Any?>).map { line ->
-            (line as List<Any?>).map { sp ->
+            // A line is `{"sp":[…spans…], "list":true?}` (post markdown-editor
+            // work); tolerate the older bare span-array shape too.
+            val spans = when (line) {
+                is Map<*, *> -> line["sp"] as? List<Any?> ?: emptyList<Any?>()
+                is List<*> -> line
+                else -> emptyList<Any?>()
+            }
+            spans.map { sp ->
                 @Suppress("UNCHECKED_CAST")
                 val m = sp as Map<String, Any?>
                 Span(

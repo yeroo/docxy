@@ -247,4 +247,52 @@ mod tests {
     fn no_comments_part_is_empty() {
         assert!(parse_comments_xml("<w:comments/>").is_empty());
     }
+
+    /// Full [`parse_comments`] pipeline (`word/comments.xml` +
+    /// `word/document.xml` anchors) against a real [`Package`], the shape
+    /// `docxy`'s `doc.comments` control verb marshals directly into JSON.
+    #[test]
+    fn parse_comments_from_package_orders_by_anchor_and_fills_quoted_text() {
+        use crate::package::load_package;
+        use crate::zipwrite::write_zip;
+
+        let comments_xml = r#"<?xml version="1.0"?><w:comments xmlns:w="x">
+            <w:comment w:id="2" w:author="Bob" w:initials="B" w:date="2020-02-02T00:00:00Z">
+              <w:p><w:r><w:t>second thought</w:t></w:r></w:p>
+            </w:comment>
+            <w:comment w:id="1" w:author="Ann" w:initials="A" w:date="2020-01-01T00:00:00Z">
+              <w:p><w:r><w:t>first thought</w:t></w:r></w:p>
+            </w:comment>
+        </w:comments>"#;
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p>
+              <w:commentRangeStart w:id="1"/><w:r><w:t>alpha</w:t></w:r><w:commentRangeEnd w:id="1"/>
+              <w:r><w:commentReference w:id="1"/></w:r>
+            </w:p>
+            <w:p>
+              <w:commentRangeStart w:id="2"/><w:r><w:t>beta</w:t></w:r><w:commentRangeEnd w:id="2"/>
+              <w:r><w:commentReference w:id="2"/></w:r>
+            </w:p>
+        </w:body></w:document>"#;
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/comments.xml".into(), comments_xml.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        let cs = parse_comments(&pkg);
+        assert_eq!(cs.len(), 2);
+        // Anchored in the body as id 1, then id 2 — despite comments.xml
+        // listing id 2 first.
+        assert_eq!(cs[0].id, "1");
+        assert_eq!(cs[0].author, "Ann");
+        assert_eq!(cs[0].text, "first thought");
+        assert_eq!(cs[0].quoted, "alpha");
+        assert_eq!(cs[1].id, "2");
+        assert_eq!(cs[1].quoted, "beta");
+    }
 }

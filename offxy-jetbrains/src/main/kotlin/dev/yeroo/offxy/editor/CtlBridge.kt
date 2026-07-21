@@ -26,11 +26,17 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 object CtlBridge {
     private val seq = AtomicInteger(0)
-    private val MUTATING = setOf("doc.replace-range", "doc.insert", "doc.append")
+    private val MUTATING = setOf(
+        "doc.replace-range", "doc.insert", "doc.append",
+        "doc.replace-all", "doc.format", "doc.set-style",
+    )
 
     fun start(project: Project, editor: DocxFileEditor): CtlServer {
+        // The pid keeps two IDE processes on a same-basename file from
+        // minting colliding instance ids (the VS Code tabs' convention).
         val instance =
-            "docxy-jetbrains-${Discovery.sanitize(editor.file.nameWithoutExtension)}-${seq.incrementAndGet()}"
+            "docxy-jetbrains-${Discovery.sanitize(editor.file.nameWithoutExtension)}-" +
+                "${ProcessHandle.current().pid()}-${seq.incrementAndGet()}"
         val server = CtlServer(instance) { verb, args -> onEdtWithTimeout(project, editor, verb, args) }
         server.start()
         return server
@@ -67,6 +73,15 @@ object CtlBridge {
     ): Any? {
         if (editor.isDisposed) throw CtlException("editor closed")
         return when (verb) {
+            // Undo is IDE-owned on JetBrains tabs: the engine's internal stack
+            // also records replayed user edits, so driving it externally would
+            // desync the two stacks. Agents make the inverse edit instead.
+            "doc.undo", "doc.redo" ->
+                throw CtlException("undo is IDE-owned on JetBrains tabs — make the inverse edit instead")
+            // The host-side exclusive-create write is a follow-up.
+            "doc.export-pdf" -> throw CtlException("not yet implemented")
+            // Internal composition verb, rejected externally on every surface.
+            "doc.blocks" -> throw CtlException("unknown verb 'doc.blocks'")
             "doc.path" -> pathInfo(editor)
             "doc.save" -> {
                 editor.saveNow()
@@ -131,10 +146,13 @@ object CtlBridge {
             "modified" to editor.isModified,
         )
         editor.engine().ctl("""{"verb":"doc.blocks","args":{}}""")?.let { raw ->
+            // docx_ctl replies are the result object merged with "ok":true
+            // (control.rs's envelope), not nested under a "result" key.
             @Suppress("UNCHECKED_CAST")
             val reply = Json.parse(raw) as? Map<String, Any?>
-            val result = reply?.get("result") as? Map<*, *>
-            (result?.get("total") as? Long)?.let { info["blocks"] = it }
+            if (reply?.get("ok") == true) {
+                (reply["total"] as? Long)?.let { info["blocks"] = it }
+            }
         }
         return info
     }

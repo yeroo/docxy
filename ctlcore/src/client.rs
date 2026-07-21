@@ -170,6 +170,100 @@ pub fn resolve_target(dir: &Path, app: &str, target: Option<&str>) -> Result<Cli
     }
 }
 
+/// Like [`resolve_target`], but for tools that can proceed without any
+/// instance: zero live instances with no `target` is `Ok(None)` instead of an
+/// error. A `target` that matches nothing, or an ambiguous candidate set, is
+/// still an error — a bad target must not be silently ignored.
+pub fn resolve_target_for_new(
+    dir: &Path,
+    app: &str,
+    target: Option<&str>,
+) -> Result<Option<Client>, String> {
+    let prefix = format!("{app}-");
+    let mut live: Vec<_> = discover_live(dir)
+        .into_iter()
+        .filter(|i| i.instance.starts_with(&prefix))
+        .collect();
+    if let Some(target) = target {
+        live.retain(|i| i.instance.contains(target));
+        if live.is_empty() {
+            return Err(format!("no running {app} matches target \"{target}\""));
+        }
+    }
+    match live.len() {
+        0 => Ok(None),
+        1 => Ok(Some(live.remove(0).client())),
+        _ => {
+            let names: Vec<&str> = live.iter().map(|i| i.instance.as_str()).collect();
+            Err(format!(
+                "several {app} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// The shared engine of the `docxy_new`/`xlsxy_new` MCP tools: create a new
+/// file from `blank` bytes at `args.path` (absolutized against this process's
+/// cwd — the creating process and the target instance have different cwds, so
+/// the absolute path is used both for creation and in the open request), then
+/// open it in the resolved `app` instance via `open_verb`. Resolution runs
+/// FIRST so a bad or ambiguous target creates nothing; with no target and no
+/// live instance the file is still created and `opened` is false. Refuses to
+/// overwrite an existing file.
+pub fn new_file(
+    dir: &Path,
+    app: &str,
+    open_verb: &str,
+    blank: &[u8],
+    args: &Json,
+) -> Result<Json, String> {
+    let path = args.get_str("path").ok_or("missing path")?;
+    let abs = std::path::absolute(Path::new(path)).map_err(|e| format!("bad path: {e}"))?;
+    let client = resolve_target_for_new(dir, app, args.get_str("target"))?;
+    if abs.exists() {
+        return Err(format!("already exists: {}", abs.display()));
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
+    }
+    // create_new: exclusive-create, so a file appearing between the exists
+    // check above and this open errors instead of being truncated.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&abs)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("already exists: {}", abs.display())
+            } else {
+                format!("create failed: {e}")
+            }
+        })?;
+    std::io::Write::write_all(&mut f, blank).map_err(|e| format!("create failed: {e}"))?;
+    let abs_str = abs.display().to_string();
+    match client {
+        Some(client) => {
+            client
+                .call(
+                    open_verb,
+                    Json::obj(vec![("path", Json::Str(abs_str.clone()))]),
+                )
+                .map_err(|e| format!("created {abs_str} but open failed: {e}"))?;
+            let name = client.instance().instance.clone();
+            Ok(Json::obj(vec![
+                ("path", Json::Str(abs_str)),
+                ("opened", Json::Bool(true)),
+                ("instance", Json::Str(name)),
+            ]))
+        }
+        None => Ok(Json::obj(vec![
+            ("path", Json::Str(abs_str)),
+            ("opened", Json::Bool(false)),
+        ])),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +311,76 @@ mod tests {
         .unwrap();
         assert_eq!(discover(&dir).len(), 1);
         assert_eq!(discover_live(&dir).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_file_without_instance_creates_and_reports_unopened() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_new_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("fresh.docx");
+        let args = Json::obj(vec![("path", Json::Str(out.display().to_string()))]);
+        let r = new_file(&dir, "docxy", "doc.open", b"BLANK", &args).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"BLANK");
+        assert_eq!(r.get("opened").and_then(Json::as_bool), Some(false));
+        assert!(r.get_str("path").unwrap().contains("fresh.docx"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_file_refuses_overwrite_and_bad_target_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_new_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.docx");
+        std::fs::write(&existing, b"OLD").unwrap();
+        let args = Json::obj(vec![("path", Json::Str(existing.display().to_string()))]);
+        let err = new_file(&dir, "docxy", "doc.open", b"BLANK", &args).unwrap_err();
+        assert!(err.starts_with("already exists: "), "{err}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"OLD");
+
+        // A target that matches nothing errors and writes nothing.
+        let fresh = dir.join("never.docx");
+        let args = Json::obj(vec![
+            ("path", Json::Str(fresh.display().to_string())),
+            ("target", Json::Str("nope".into())),
+        ]);
+        let err = new_file(&dir, "docxy", "doc.open", b"BLANK", &args).unwrap_err();
+        assert_eq!(err, "no running docxy matches target \"nope\"");
+        assert!(!fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_file_with_live_instance_creates_then_opens() {
+        let dir = std::env::temp_dir().join(format!("ctlcore_new_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, rx) = serve(&dir, "docxy-new-test").unwrap();
+        let (tx, opened_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for req in rx {
+                if req.verb == "doc.open" {
+                    tx.send(req.args.get_str("path").unwrap_or("").to_string())
+                        .ok();
+                    req.reply_ok(Json::obj(vec![("path", Json::Str("x".into()))]));
+                } else {
+                    req.reply_err("nope");
+                }
+            }
+        });
+        let out = dir.join("opened.docx");
+        let args = Json::obj(vec![("path", Json::Str(out.display().to_string()))]);
+        let r = new_file(&dir, "docxy", "doc.open", b"BLANK", &args).unwrap();
+        assert_eq!(r.get("opened").and_then(Json::as_bool), Some(true));
+        assert_eq!(r.get_str("instance"), Some("docxy-new-test"));
+        // The instance received the SAME absolute path that was created.
+        let sent = opened_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(sent, r.get_str("path").unwrap());
+        assert!(out.exists());
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
