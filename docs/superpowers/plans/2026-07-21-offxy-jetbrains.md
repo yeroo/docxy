@@ -226,6 +226,14 @@
 
 ### Task 7: Agent ctl bridge
 
+> **Status: DONE** (32 tests green, incl. an end-to-end TCP test against a
+> live editor with EDT hopping). Wire strings byte-match ctlcore
+> (`unauthorized: bad or missing token`, `invalid json: …`, `missing verb`);
+> discovery/refresh/dispose lifecycle tested; `doc.path` matches control.rs's
+> `path_info` (blocks omitted until wasm `doc.blocks` exists); tests write
+> discovery files to a build-local dir via the `offxy.ctl.dir` property.
+> Manual `docxy --mcp` cross-check pending a human session.
+
 **Files:**
 - Create: `ctl/CtlServer.kt`, `ctl/Discovery.kt`
 - Modify: `editor/DocxFileEditor.kt`, `plugin.xml` (appLifecycleListener if needed for shutdown cleanup)
