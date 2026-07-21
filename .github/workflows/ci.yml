@@ -80,3 +80,29 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  jetbrains:
+    name: jetbrains plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build and test the plugin
+        working-directory: offxy-jetbrains
+        # buildWasm (a Gradle task) runs the cargo wasm build; `build` runs
+        # the whole Kotlin test suite including the IntelliJ platform tests
+        # (headless) and the edit-pipeline property test.
+        run: ./gradlew build buildPlugin --no-daemon
+      - name: Upload plugin zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: offxy-jetbrains-zip
+          path: offxy-jetbrains/build/distributions/*.zip

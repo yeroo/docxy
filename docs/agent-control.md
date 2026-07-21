@@ -116,6 +116,18 @@ send doc.replace-range '{"start":1,"text":"A tighter second paragraph."}'
 send doc.save '{}'
 ```
 
+## JetBrains tabs
+
+Documents open in the [offxy-jetbrains](../offxy-jetbrains) plugin advertise
+on this same surface: instance `docxy-jetbrains-<basename>-<n>` in docxy's
+ctl dir, identical wire protocol and token semantics. Any `docxy --mcp`
+session lists IDE tabs next to terminal panes; disambiguate with `target` as
+usual. Differences from a terminal pane: `doc.reload` re-reads the file
+(dropping unsaved edits, same as the TUI); agent edits register on the IDE's
+undo stack (one verb = one Ctrl+Z step); and until the `docx_ctl` engine
+build lands, the read/edit verbs answer `not yet implemented` while
+`doc.path`/`doc.save`/`doc.reload`/`doc.open` are served by the IDE host.
+
 ## The other editors
 
 **xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` by index or name):

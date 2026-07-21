@@ -133,6 +133,41 @@ jobs:
         with:
           files: offxy-vscode/*.vsix
 
+  jetbrains:
+    name: package JetBrains plugin
+    permissions:
+      contents: write # attach the plugin zip to the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build the plugin zip
+        working-directory: offxy-jetbrains
+        run: ./gradlew buildPlugin --no-daemon
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: offxy-jetbrains-zip
+          path: offxy-jetbrains/build/distributions/*.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: offxy-jetbrains/build/distributions/*.zip
+
   publish:
     name: publish to crates.io
     needs: build
