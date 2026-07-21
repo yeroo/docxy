@@ -60,6 +60,13 @@ struct Node {
     w: i64,
     h: i64,
     rank: i32,
+    fill: Option<String>,
+    stroke: Option<String>,
+    text_color: Option<String>,
+    // Populated by a later task (subgraph containment); read once that task
+    // groups nodes into `Diagram::subgraphs`.
+    #[allow(dead_code)]
+    subgraph: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +87,22 @@ struct Diagram {
     dir: Dir,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    subgraphs: Vec<Subgraph>,
+}
+
+#[derive(Debug, Clone)]
+struct Subgraph {
+    title: String,
+    // Populated by a later task (subgraph parsing/nesting); read once that
+    // task assigns node membership and parent/child subgraph relationships.
+    #[allow(dead_code)]
+    members: Vec<usize>,
+    #[allow(dead_code)]
+    parent: Option<usize>,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
 }
 
 // ===========================================================================
@@ -147,6 +170,10 @@ fn parse(src: &str) -> Diagram {
                 w: 0,
                 h: 0,
                 rank: -1,
+                fill: None,
+                stroke: None,
+                text_color: None,
+                subgraph: None,
             });
             index.insert(id.to_string(), i);
             i
@@ -184,7 +211,12 @@ fn parse(src: &str) -> Diagram {
         parse_statement(line, &mut nodes, &mut edges, &mut get);
     }
 
-    Diagram { dir, nodes, edges }
+    Diagram {
+        dir,
+        nodes,
+        edges,
+        subgraphs: Vec::new(),
+    }
 }
 
 /// Parse one statement: `A[x] --> B(y) -->|lbl| C`, or a lone `A[x]`.
@@ -626,10 +658,7 @@ fn emit_node(node: &Node, sid: i32) -> String {
 fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
     let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
     // Anchor points based on flow direction.
-    let (x1, y1, x2, y2) = match d.dir {
-        Dir::TopDown => (from.x + from.w / 2, from.y + from.h, to.x + to.w / 2, to.y),
-        Dir::LeftRight => (from.x + from.w, from.y + from.h / 2, to.x, to.y + to.h / 2),
-    };
+    let (x1, y1, x2, y2) = anchors(d.dir, from, to);
     let ox = x1.min(x2);
     let oy = y1.min(y2);
     let cx = (x1 - x2).abs().max(1);
@@ -743,6 +772,195 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+// ===========================================================================
+// Shared geometry (DrawingML emitter + webview renderer)
+// ===========================================================================
+
+/// The (start, end) anchor points of an edge, by flow direction.
+fn anchors(dir: Dir, from: &Node, to: &Node) -> (i64, i64, i64, i64) {
+    match dir {
+        Dir::TopDown => (from.x + from.w / 2, from.y + from.h, to.x + to.w / 2, to.y),
+        Dir::LeftRight => (from.x + from.w, from.y + from.h / 2, to.x, to.y + to.h / 2),
+    }
+}
+
+/// Parse + lay out `src`, returning the shared geometry both renderers consume.
+pub fn geometry(src: &str) -> DiagramGeometry {
+    let mut d = parse(src);
+    layout(&mut d);
+    build_geometry(&d)
+}
+
+fn build_geometry(d: &Diagram) -> DiagramGeometry {
+    let (canvas_w, canvas_h) = canvas_extent(d);
+    let nodes = d
+        .nodes
+        .iter()
+        .map(|n| NodeGeom {
+            x: n.x,
+            y: n.y,
+            w: n.w,
+            h: n.h,
+            shape: n.shape.prst(),
+            fill: n.fill.clone().unwrap_or_else(|| DEFAULT_FILL.to_string()),
+            stroke: n
+                .stroke
+                .clone()
+                .unwrap_or_else(|| DEFAULT_STROKE.to_string()),
+            text_color: n
+                .text_color
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TEXT.to_string()),
+            label: n.label.clone(),
+        })
+        .collect();
+    let edges = d
+        .edges
+        .iter()
+        .map(|e| EdgeGeom {
+            points: edge_points(d, e),
+            label: e.label.clone(),
+        })
+        .collect();
+    let subgraphs = d
+        .subgraphs
+        .iter()
+        .map(|g| SubgraphGeom {
+            x: g.x,
+            y: g.y,
+            w: g.w,
+            h: g.h,
+            title: g.title.clone(),
+        })
+        .collect();
+    DiagramGeometry {
+        canvas_w,
+        canvas_h,
+        nodes,
+        edges,
+        subgraphs,
+    }
+}
+
+/// The polyline vertices of an edge. Task 4 replaces this with elbow routing;
+/// for now it is the two straight anchor endpoints.
+fn edge_points(d: &Diagram, e: &Edge) -> Vec<(i64, i64)> {
+    let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
+    let (x1, y1, x2, y2) = anchors(d.dir, from, to);
+    vec![(x1, y1), (x2, y2)]
+}
+
+/// A serializable snapshot of a laid-out diagram: the single geometry both the
+/// DrawingML emitter (Word) and the webview SVG renderer consume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagramGeometry {
+    pub canvas_w: i64,
+    pub canvas_h: i64,
+    pub nodes: Vec<NodeGeom>,
+    pub edges: Vec<EdgeGeom>,
+    pub subgraphs: Vec<SubgraphGeom>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeGeom {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub shape: &'static str,
+    pub fill: String,
+    pub stroke: String,
+    pub text_color: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeGeom {
+    pub points: Vec<(i64, i64)>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubgraphGeom {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub title: String,
+}
+
+const DEFAULT_FILL: &str = "DAE8FC";
+const DEFAULT_STROKE: &str = "6C8EBF";
+const DEFAULT_TEXT: &str = "000000";
+
+impl DiagramGeometry {
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("{\"canvasW\":");
+        s.push_str(&self.canvas_w.to_string());
+        s.push_str(",\"canvasH\":");
+        s.push_str(&self.canvas_h.to_string());
+        s.push_str(",\"nodes\":[");
+        for (i, n) in self.nodes.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"shape\":\"{}\",\"fill\":\"{}\",\"stroke\":\"{}\",\"textColor\":\"{}\",\"label\":",
+                n.x, n.y, n.w, n.h, n.shape, n.fill, n.stroke, n.text_color
+            ));
+            json_str(&mut s, &n.label);
+            s.push('}');
+        }
+        s.push_str("],\"edges\":[");
+        for (i, e) in self.edges.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"points\":[");
+            for (j, (x, y)) in e.points.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("[{x},{y}]"));
+            }
+            s.push_str("],\"label\":");
+            json_str(&mut s, &e.label);
+            s.push('}');
+        }
+        s.push_str("],\"subgraphs\":[");
+        for (i, g) in self.subgraphs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"title\":",
+                g.x, g.y, g.w, g.h
+            ));
+            json_str(&mut s, &g.title);
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Minimal JSON string escaping (quotes, backslash, control chars).
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +1052,41 @@ mod tests {
         assert_eq!(d.nodes.len(), 1);
         assert_eq!(d.nodes[0].label, "well-known node");
         assert_eq!(d.edges.len(), 0);
+    }
+
+    #[test]
+    fn geometry_matches_layout() {
+        let g = geometry("flowchart TD\nA[Start]-->B[End]");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.nodes[0].label, "Start");
+        // Defaults applied when no classDef/style is present.
+        assert_eq!(g.nodes[0].fill, "DAE8FC");
+        assert_eq!(g.nodes[0].stroke, "6C8EBF");
+        assert_eq!(g.nodes[0].text_color, "000000");
+        assert!(g.canvas_w > 0 && g.canvas_h > 0);
+        // Edge endpoints touch the node anchor band (TopDown: from-bottom → to-top).
+        let pts = &g.edges[0].points;
+        assert_eq!(pts.first().copied().unwrap().1, g.nodes[0].y + g.nodes[0].h);
+        assert_eq!(pts.last().copied().unwrap().1, g.nodes[1].y);
+    }
+
+    #[test]
+    fn geometry_json_is_wellformed() {
+        let j = geometry("flowchart TD\nA-->B").to_json();
+        assert!(j.starts_with("{\"canvasW\":"));
+        assert!(
+            j.contains("\"nodes\":[")
+                && j.contains("\"edges\":[")
+                && j.contains("\"subgraphs\":[]")
+        );
+        assert!(j.contains("\"shape\":\"rect\""));
+    }
+
+    #[test]
+    fn geometry_totality_on_garbage() {
+        // Never panics on malformed input.
+        let _ = geometry("flowchart TD\n)(*&^%$\n--> --> -->");
+        let _ = geometry("");
     }
 }
