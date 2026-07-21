@@ -141,11 +141,80 @@ const MARKER: &str = "mermaid:";
 // Parsing
 // ===========================================================================
 
+/// A `classDef`'s parsed color spec: `fill:#f9a,stroke:#900,color:#fff`. Only
+/// `#hex` values are honored this slice; named colors and non-color props
+/// (e.g. `stroke-width:2px`) are ignored.
+#[derive(Debug, Clone, Default)]
+struct ClassStyle {
+    fill: Option<String>,
+    stroke: Option<String>,
+    color: Option<String>,
+}
+
+/// A deferred `class`/`:::`/`style` directive, resolved once every node exists.
+enum PendingStyle {
+    /// `class ID name` / `ID:::name` → look up `name` in `classdefs`.
+    Class(String),
+    /// `style ID fill:#..,stroke:#..` → apply directly.
+    Direct(ClassStyle),
+}
+
+/// Parse `fill:#f9a,stroke:#900,stroke-width:2px,color:#fff` into a ClassStyle.
+/// Only `#hex` values are honored this slice; everything else (named colors,
+/// px widths) is ignored.
+fn parse_style_defs(spec: &str) -> ClassStyle {
+    let mut cs = ClassStyle::default();
+    for part in spec.split(',') {
+        let Some((k, v)) = part.split_once(':') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        let hex = normalize_hex(v);
+        match k {
+            "fill" => cs.fill = hex,
+            "stroke" => cs.stroke = hex,
+            "color" => cs.color = hex,
+            _ => {}
+        }
+    }
+    cs
+}
+
+/// `#f9a` / `#ff99aa` → `FF99AA`; anything not a 3/6-digit hex → `None`.
+fn normalize_hex(v: &str) -> Option<String> {
+    let h = v.strip_prefix('#')?;
+    let h = match h.len() {
+        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
+        6 => h.to_string(),
+        _ => return None,
+    };
+    if h.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(h.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+fn apply_class_style(node: &mut Node, cs: &ClassStyle) {
+    if cs.fill.is_some() {
+        node.fill = cs.fill.clone();
+    }
+    if cs.stroke.is_some() {
+        node.stroke = cs.stroke.clone();
+    }
+    if cs.color.is_some() {
+        node.text_color = cs.color.clone();
+    }
+}
+
 fn parse(src: &str) -> Diagram {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut dir = Dir::TopDown;
+    let mut classdefs: std::collections::HashMap<String, ClassStyle> =
+        std::collections::HashMap::new();
+    let mut pending: Vec<(String, PendingStyle)> = Vec::new();
 
     let mut get =
         |id: &str, label: Option<&str>, shape: Option<NodeShape>, nodes: &mut Vec<Node>| -> usize {
@@ -203,12 +272,61 @@ fn parse(src: &str) -> Diagram {
             get(&id, Some(&label), Some(NodeShape::Round), &mut nodes);
             continue;
         }
+        // `classDef name spec` → register a reusable color style.
+        if let Some(rest) = line.strip_prefix("classDef ") {
+            if let Some((name, spec)) = rest.trim().split_once(char::is_whitespace) {
+                classdefs.insert(name.trim().to_string(), parse_style_defs(spec.trim()));
+            }
+            continue;
+        }
+        // `class id1,id2 name` → apply a registered classDef to node(s).
+        if let Some(rest) = line.strip_prefix("class ") {
+            if let Some((ids, name)) = rest.trim().rsplit_once(char::is_whitespace) {
+                for id in ids.split(',') {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        pending
+                            .push((id.to_string(), PendingStyle::Class(name.trim().to_string())));
+                    }
+                }
+            }
+            continue;
+        }
+        // `style id spec` → apply a direct color spec to one node.
+        if let Some(rest) = line.strip_prefix("style ") {
+            if let Some((id, spec)) = rest.trim().split_once(char::is_whitespace) {
+                pending.push((
+                    id.trim().to_string(),
+                    PendingStyle::Direct(parse_style_defs(spec.trim())),
+                ));
+            }
+            continue;
+        }
         // Skip obvious non-graph directives.
         if is_directive(line) {
             continue;
         }
         // Parse a (possibly chained) edge sequence, or a lone node declaration.
-        parse_statement(line, &mut nodes, &mut edges, &mut get);
+        parse_statement(line, &mut nodes, &mut edges, &mut pending, &mut get);
+    }
+
+    // Resolve deferred color directives now that every node exists (so forward
+    // references like `class B warn` before B is otherwise touched still
+    // resolve). Apply order: all class-membership first, then all direct
+    // `style` — a direct style must win over class membership.
+    for (target, style) in &pending {
+        if let PendingStyle::Class(name) = style {
+            if let (Some(&i), Some(cs)) = (index.get(target.as_str()), classdefs.get(name)) {
+                apply_class_style(&mut nodes[i], cs);
+            }
+        }
+    }
+    for (target, style) in &pending {
+        if let PendingStyle::Direct(cs) = style {
+            if let Some(&i) = index.get(target.as_str()) {
+                apply_class_style(&mut nodes[i], cs);
+            }
+        }
     }
 
     Diagram {
@@ -224,6 +342,7 @@ fn parse_statement(
     line: &str,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
+    pending: &mut Vec<(String, PendingStyle)>,
     get: &mut impl FnMut(&str, Option<&str>, Option<NodeShape>, &mut Vec<Node>) -> usize,
 ) {
     // A sequence-style message carries its text after a colon: `A->>B: Hi`. When
@@ -242,11 +361,14 @@ fn parse_statement(
     for seg in segments {
         match seg {
             Seg::Node(tok) => {
-                let (id, label, shape) = parse_node_token(&tok);
+                let (id, label, shape, class_name) = parse_node_token(&tok);
                 if id.is_empty() {
                     continue;
                 }
                 let idx = get(&id, label.as_deref(), shape, nodes);
+                if let Some(name) = class_name {
+                    pending.push((id.clone(), PendingStyle::Class(name)));
+                }
                 if let Some(p) = prev {
                     edges.push(Edge {
                         from: p,
@@ -344,13 +466,22 @@ fn push_node(out: &mut Vec<Seg>, buf: &mut String) {
 }
 
 /// Parse `id[Label]` / `id(Label)` / `id{Label}` / `id((Label))` / `id([Label])`
-/// / bare `id`. Returns `(id, label, shape)`.
-fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>) {
+/// / bare `id`, with an optional trailing `:::className` (applies a
+/// `classDef` inline, e.g. `A[Hot]:::warn`). Returns `(id, label, shape,
+/// class_name)`.
+fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>, Option<String>) {
     let tok = tok.trim();
+    let (tok, class_name) = match tok.find(":::") {
+        Some(pos) => (
+            tok[..pos].trim(),
+            Some(tok[pos + 3..].trim().to_string()).filter(|s| !s.is_empty()),
+        ),
+        None => (tok, None),
+    };
     // Find the first opening bracket.
     let open = tok.find(['[', '(', '{']);
     let Some(open) = open else {
-        return (sanitize_id(tok), None, None);
+        return (sanitize_id(tok), None, None, class_name);
     };
     let id = sanitize_id(tok[..open].trim());
     let rest = &tok[open..];
@@ -367,7 +498,7 @@ fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>) {
     } else {
         (NodeShape::Rect, rest.to_string())
     };
-    (id, Some(clean_label(&label)), Some(shape))
+    (id, Some(clean_label(&label)), Some(shape), class_name)
 }
 
 fn strip_pair(s: &str, open: &str, close: &str) -> Option<String> {
@@ -632,6 +763,8 @@ fn canvas_extent(d: &Diagram) -> (i64, i64) {
 }
 
 fn emit_node(node: &Node, sid: i32) -> String {
+    let fill = node.fill.as_deref().unwrap_or("DAE8FC");
+    let stroke = node.stroke.as_deref().unwrap_or("6C8EBF");
     format!(
         "<wps:wsp>\
          <wps:cNvPr id=\"{sid}\" name=\"Node {sid}\"/>\
@@ -639,8 +772,8 @@ fn emit_node(node: &Node, sid: i32) -> String {
          <wps:spPr>\
          <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
          <a:prstGeom prst=\"{prst}\"><a:avLst/></a:prstGeom>\
-         <a:solidFill><a:srgbClr val=\"DAE8FC\"/></a:solidFill>\
-         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"6C8EBF\"/></a:solidFill></a:ln>\
+         <a:solidFill><a:srgbClr val=\"{fill}\"/></a:solidFill>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{stroke}\"/></a:solidFill></a:ln>\
          </wps:spPr>\
          <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>\
          <w:r><w:t xml:space=\"preserve\">{label}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
@@ -1088,5 +1221,36 @@ mod tests {
         // Never panics on malformed input.
         let _ = geometry("flowchart TD\n)(*&^%$\n--> --> -->");
         let _ = geometry("");
+    }
+
+    #[test]
+    fn classdef_and_membership_apply_colors() {
+        let src = "flowchart TD\n\
+            classDef warn fill:#f9a,stroke:#900,color:#fff\n\
+            A[Hot]:::warn --> B[Cold]\n\
+            class B warn";
+        let g = geometry(src);
+        let a = g.nodes.iter().find(|n| n.label == "Hot").unwrap();
+        assert_eq!(a.fill, "FF99AA"); // #f9a expands to FF99AA
+        assert_eq!(a.stroke, "990000");
+        assert_eq!(a.text_color, "FFFFFF");
+        let b = g.nodes.iter().find(|n| n.label == "Cold").unwrap();
+        assert_eq!(b.fill, "FF99AA"); // via `class B warn`
+    }
+
+    #[test]
+    fn style_directive_overrides_class() {
+        let src = "flowchart TD\n\
+            classDef c fill:#111\n\
+            A:::c\n\
+            style A fill:#222";
+        let g = geometry(src);
+        assert_eq!(g.nodes[0].fill, "222222"); // direct style wins over class
+    }
+
+    #[test]
+    fn non_hex_color_is_ignored() {
+        let g = geometry("flowchart TD\nstyle A fill:red\nA-->B");
+        assert_eq!(g.nodes[0].fill, "DAE8FC"); // named color ignored → default
     }
 }
