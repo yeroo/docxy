@@ -12,4 +12,8 @@
         can read and edit them live.
     ]]></description>
     <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
+    </extensions>
 </idea-plugin>
