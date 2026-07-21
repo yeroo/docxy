@@ -119,4 +119,41 @@ mod tests {
         assert_eq!(notes[1].text, "Second note.");
         assert!(!notes[0].endnote);
     }
+
+    /// Full [`parse_notes`] pipeline (footnotes part, then endnotes part)
+    /// against a real [`Package`], the shape `docxy`'s `doc.notes` control
+    /// verb marshals directly into JSON.
+    #[test]
+    fn parse_notes_from_package_combines_footnotes_then_endnotes() {
+        use crate::package::load_package;
+        use crate::zipwrite::write_zip;
+
+        let footnotes = "<w:footnotes xmlns:w=\"x\">\
+            <w:footnote w:id=\"1\"><w:p><w:r><w:t>a foot note</w:t></w:r></w:p></w:footnote>\
+            </w:footnotes>";
+        let endnotes = "<w:endnotes xmlns:w=\"x\">\
+            <w:endnote w:id=\"1\"><w:p><w:r><w:t>an end note</w:t></w:r></w:p></w:endnote>\
+            </w:endnotes>";
+        let document_xml =
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body><w:p/></w:body></w:document>";
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/footnotes.xml".into(), footnotes.into()),
+            ("word/endnotes.xml".into(), endnotes.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        let ns = parse_notes(&pkg);
+        assert_eq!(ns.len(), 2);
+        assert_eq!(ns[0].id, 1);
+        assert_eq!(ns[0].text, "a foot note");
+        assert!(!ns[0].endnote);
+        assert_eq!(ns[1].id, 1);
+        assert_eq!(ns[1].text, "an end note");
+        assert!(ns[1].endnote);
+    }
 }

@@ -1504,7 +1504,16 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             p.1 = patch_ref_attr(&xml, "<location", &full).into_bytes();
         }
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.cache_part) {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Keep the cache's `<worksheetSource sheet="…">` in sync with the
+            // model — e.g. after `rename_sheet` rewrites `piv.source`. Renaming
+            // doesn't set `piv.edited` (that flag is for field-layout changes,
+            // and would force a wholesale table-definition rewrite it doesn't
+            // need), so this is the only place the persisted source-sheet name
+            // gets corrected.
+            if let crate::pivot::PivotSource::Range { sheet, .. } = &piv.source {
+                xml = patch_worksheet_source_sheet(&xml, sheet);
+            }
             p.1 = set_refresh_on_load(&xml).into_bytes();
         }
     }
@@ -1832,6 +1841,32 @@ fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
     };
     let mut out = xml.to_string();
     out.replace_range(vs..vs + ve, new_ref);
+    out
+}
+
+/// Replace the `sheet="…"` attribute value of a pivot cache's
+/// `<worksheetSource>` element — keeps the persisted cache in sync with
+/// [`crate::pivot::PivotSource::Range`]'s `sheet` after it changes in the
+/// model (namely a `rename_sheet` of the pivot's source sheet, which doesn't
+/// set `edited` and so wouldn't otherwise touch this part). A no-op when the
+/// element or attribute is missing — e.g. a `PivotSource::Table` cache's
+/// `<worksheetSource name="…"/>` has no `sheet` attribute at all.
+fn patch_worksheet_source_sheet(xml: &str, new_sheet: &str) -> String {
+    let Some(el) = xml.find("<worksheetSource") else {
+        return xml.to_string();
+    };
+    let Some(end) = xml[el..].find('>').map(|i| el + i) else {
+        return xml.to_string();
+    };
+    let Some(rel) = xml[el..end].find("sheet=\"") else {
+        return xml.to_string();
+    };
+    let vs = el + rel + "sheet=\"".len();
+    let Some(ve) = xml[vs..].find('"') else {
+        return xml.to_string();
+    };
+    let mut out = xml.to_string();
+    out.replace_range(vs..vs + ve, &esc_attr(new_sheet));
     out
 }
 
@@ -2227,11 +2262,171 @@ impl SheetPackage {
         Some(self.workbook.pivots.len() - 1)
     }
 
+    /// Build a REAL, persistent pivot with the full row/col/value layout
+    /// already applied — the constructor-style counterpart to `add_pivot` +
+    /// the TUI's interactive field editor (Ctrl-P then r/c/v per field).
+    /// Lands the output on a new sheet named `sheet_name` and refreshes it,
+    /// so the caller gets back computed values, not just an empty shell.
+    /// `spec`'s row/col/measure indices must already be resolved against
+    /// `frame` (e.g. via `pivot_spec_from_names`). Returns the new pivot's
+    /// index into `workbook.pivots` (`.sheet` on it is the destination
+    /// sheet); `None` when the source has no headers/rows or no measures.
+    pub fn create_pivot(
+        &mut self,
+        source: crate::pivot::PivotSource,
+        frame: &crate::frame::Frame,
+        spec: &crate::frame::PivotSpec,
+        sheet_name: &str,
+    ) -> Option<usize> {
+        if frame.names.is_empty() || frame.rows() == 0 || spec.measures.is_empty() {
+            return None;
+        }
+        let data_fields: Vec<crate::pivot::DataField> = spec
+            .measures
+            .iter()
+            .map(|m| crate::pivot::DataField {
+                name: m.name.clone(),
+                field: m.col,
+                agg: m.agg,
+            })
+            .collect();
+        let dest = self.add_sheet(sheet_name);
+        // Infallible: `add_pivot` only returns `None` for an out-of-range
+        // `dest_sheet` or empty `fields`. `dest` was just pushed by
+        // `add_sheet` above (always in range), and `fields` is
+        // `frame.names`, already checked non-empty by the guard at the top
+        // of this function — so a `?` here would be silently unreachable
+        // AND, on the impossible path, leak the freshly-added `dest` sheet
+        // (never removed, no pivot registered). `expect` makes the
+        // impossibility explicit instead.
+        let idx = self
+            .add_pivot(
+                source,
+                frame.names.clone(),
+                data_fields[0].clone(),
+                dest,
+                (2, 0),
+            )
+            .expect("dest just created (in range) and fields is frame.names (non-empty)");
+        let p = &mut self.workbook.pivots[idx];
+        p.row_fields = spec.rows.clone();
+        p.col_fields = spec.cols.clone();
+        p.data_fields = data_fields;
+        p.edited = true;
+        crate::pivot::refresh_pivots(&mut self.workbook);
+        Some(idx)
+    }
+
+    /// Remove pivot `idx` from `workbook.pivots`: drops its table/cache
+    /// parts, their content-type overrides, the workbook-rels relationship +
+    /// `<pivotCache>` registration for the cache, and the destination
+    /// sheet's relationship to the table part. The exact inverse of
+    /// `add_pivot`/`create_pivot` — nothing else in the codebase unregisters
+    /// a pivot, so this is the "remove both or neither" half of the
+    /// pivot-creation inverse (pair with `remove_sheet` when the pivot's
+    /// sheet was created solely to hold it). Returns false when `idx` is out
+    /// of range.
+    pub fn remove_pivot(&mut self, idx: usize) -> bool {
+        if idx >= self.workbook.pivots.len() {
+            return false;
+        }
+        let piv = self.workbook.pivots.remove(idx);
+        self.parts
+            .retain(|(n, _)| *n != piv.part && *n != piv.cache_part);
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "[Content_Types].xml")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.part));
+            let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.cache_part));
+            p.1 = xml.into_bytes();
+        }
+        // workbook.xml.rels: drop the cache relationship, remembering its rId.
+        let cache_target = piv.cache_part.trim_start_matches("xl/").to_string();
+        let mut cache_rid = String::new();
+        if let Some(p) = self
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
+        {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some(rel_pos) = xml.find(&format!("Target=\"{cache_target}\"")) {
+                if let Some(id_pos) = xml[..rel_pos].rfind("Id=\"") {
+                    let s = id_pos + 4;
+                    if let Some(e) = xml[s..].find('\"') {
+                        cache_rid = xml[s..s + e].to_string();
+                    }
+                }
+            }
+            p.1 = remove_element_containing(
+                &xml,
+                "<Relationship",
+                &format!("Target=\"{cache_target}\""),
+            )
+            .into_bytes();
+        }
+        // workbook.xml: drop the <pivotCache> entry that referenced it.
+        if !cache_rid.is_empty() {
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
+                p.1 = remove_element_containing(
+                    &xml,
+                    "<pivotCache",
+                    &format!("r:id=\"{cache_rid}\""),
+                )
+                .into_bytes();
+            }
+        }
+        // Destination sheet's rels: drop its relationship to the table part.
+        if let Some(sheet_part) = self.sheet_parts.get(piv.sheet) {
+            let ws_dir = sheet_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            let ws_file = sheet_part
+                .rsplit_once('/')
+                .map(|(_, f)| f)
+                .unwrap_or(sheet_part);
+            let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+            let table_file = piv
+                .part
+                .rsplit_once('/')
+                .map(|(_, f)| f)
+                .unwrap_or(&piv.part);
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == &rels_part) {
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
+                p.1 = remove_element_containing(&xml, "<Relationship", table_file).into_bytes();
+            }
+        }
+        true
+    }
+
     /// Remove the sheet at `idx`. Returns false (and does nothing) when it
     /// is the last sheet — a workbook must keep at least one.
+    ///
+    /// Any pivot whose output lives on `idx` goes with it — a sheet-only
+    /// removal would otherwise leave its `workbook.pivots` entry dangling
+    /// (Wave-3's "remove both or neither" rule for `pivot.create`'s
+    /// inverse). Pivots on later sheets keep pointing at the right sheet as
+    /// indices shift down, same as `defined_names` scopes below.
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
             return false;
+        }
+        let dead: Vec<usize> = self
+            .workbook
+            .pivots
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.sheet == idx)
+            .map(|(i, _)| i)
+            .collect();
+        for i in dead.into_iter().rev() {
+            self.remove_pivot(i);
+        }
+        for p in &mut self.workbook.pivots {
+            if p.sheet > idx {
+                p.sheet -= 1;
+            }
         }
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
@@ -2718,6 +2913,47 @@ mod tests {
         assert!(!d.bold && !d.italic && d.fill.is_none() && d.align == Align::General);
     }
 
+    /// The Task-3 contract: a `cell.format`-style patch (built via
+    /// [`crate::format::FormatPatch`]/[`crate::format::apply_patch_to_xf`],
+    /// exactly as xlsxy's `control.rs` uses them) survives `save_xlsx` →
+    /// `load_xlsx` intact — not just an `Xf` authored directly.
+    #[test]
+    fn format_patch_style_round_trips_through_save_and_load() {
+        use crate::format::{FormatPatch, apply_patch_to_xf};
+        use crate::sheet::Align;
+
+        let pairs = vec![
+            ("bold".to_string(), "true".to_string()),
+            ("fillColor".to_string(), "#ABCDEF".to_string()),
+            ("align".to_string(), "center".to_string()),
+            ("numFmt".to_string(), "0.00".to_string()),
+        ];
+        let patch = FormatPatch::parse(&pairs).unwrap();
+
+        let mut pkg = new_xlsx();
+        let base = pkg.workbook.styles.xf(0);
+        let xf = apply_patch_to_xf(&base, &patch);
+        let idx = pkg.workbook.styles.intern(xf);
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                value: CellValue::Number(1.5),
+                style: idx,
+                ..Cell::default()
+            },
+        );
+
+        let bytes = save_xlsx(&pkg);
+        let pkg2 = load_xlsx(&bytes).expect("reload format-patch styles");
+        let cell = pkg2.workbook.sheets[0].cell(0, 0).unwrap();
+        let xf2 = pkg2.workbook.styles.xf(cell.style);
+        assert!(xf2.bold);
+        assert_eq!(xf2.fill, Some((0xAB, 0xCD, 0xEF)));
+        assert_eq!(xf2.align, Align::Center);
+        assert_eq!(xf2.code.as_deref(), Some("0.00"));
+    }
+
     #[test]
     fn text_with_special_chars_round_trips() {
         let mut pkg = new_xlsx();
@@ -2841,6 +3077,346 @@ mod tests {
         // The last sheet cannot be removed.
         let mut pkg5 = pkg4.clone();
         assert!(!pkg5.remove_sheet(0));
+    }
+
+    /// PERSISTENCE PROBE (Wave-3 Task 3, Part B): build a pivot the way the
+    /// TUI's `create_pivot_from` does — source rows on Sheet1, `add_pivot`
+    /// onto a fresh sheet, a row/col/value layout via `refresh_pivots` — then
+    /// `save_xlsx` → `load_xlsx` and assert the definition survives in
+    /// `workbook.pivots` AND `refresh_pivots` recomputes on the reload.
+    #[test]
+    fn pivot_survives_save_load_round_trip() {
+        let mut pkg = new_xlsx();
+        // Source data: Region/Product/Sales, header + 4 rows (Sheet1).
+        let rows: [[&str; 3]; 5] = [
+            ["Region", "Product", "Sales"],
+            ["East", "Widget", "10"],
+            ["East", "Gadget", "20"],
+            ["West", "Widget", "30"],
+            ["West", "Gadget", "40"],
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let cell = if r == 0 {
+                    Cell::text(v)
+                } else if c == 2 {
+                    Cell::number(v.parse().unwrap())
+                } else {
+                    Cell::text(v)
+                };
+                pkg.workbook.sheets[0].set_cell(r as u32, c as u32, cell);
+            }
+        }
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        assert_eq!(frame.names, vec!["Region", "Product", "Sales"]);
+        let measure = crate::pivot::DataField {
+            name: "Sum of Sales".into(),
+            field: 2,
+            agg: crate::frame::Agg::Sum,
+        };
+        let dest = pkg.add_sheet("Pivot");
+        let idx = pkg
+            .add_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                frame.names.clone(),
+                measure,
+                dest,
+                (2, 0),
+            )
+            .expect("add_pivot");
+        // Mirror the field editor: Region on rows (like Ctrl-P, 'r').
+        pkg.workbook.pivots[idx].row_fields = vec![0];
+        pkg.workbook.pivots[idx].edited = true;
+        let outcome = crate::pivot::refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 1, "refresh before save should succeed");
+        // Sanity: the output sheet actually holds computed values pre-save.
+        let sum_before = pkg.workbook.sheets[dest]
+            .cell(3, 1)
+            .map(|c| c.value.clone());
+        assert!(
+            matches!(sum_before, Some(CellValue::Number(_))),
+            "expected a computed value on the pivot output sheet, got {sum_before:?}"
+        );
+
+        let bytes = save_xlsx(&pkg);
+        let mut pkg2 = load_xlsx(&bytes).expect("reload with pivot");
+
+        assert_eq!(
+            pkg2.workbook.pivots.len(),
+            1,
+            "pivot definition lost on reload"
+        );
+        let p2 = &pkg2.workbook.pivots[0];
+        assert_eq!(p2.row_fields, vec![0], "row layout lost on reload");
+        assert_eq!(p2.data_fields.len(), 1);
+        assert_eq!(p2.data_fields[0].agg, crate::frame::Agg::Sum);
+        assert!(!p2.unsupported, "pivot round-tripped as unsupported");
+
+        let outcome2 = crate::pivot::refresh_pivots(&mut pkg2.workbook);
+        assert_eq!(
+            outcome2.refreshed, 1,
+            "refresh_pivots must recompute after reload"
+        );
+        let sum_after = pkg2.workbook.sheets[dest]
+            .cell(3, 1)
+            .map(|c| c.value.clone());
+        assert_eq!(
+            sum_before, sum_after,
+            "recomputed pivot values differ after round-trip"
+        );
+    }
+
+    /// A blank workbook with Region/Product/Sales data on Sheet1 (header +
+    /// 4 rows), for `create_pivot`/`remove_pivot` tests.
+    fn pkg_with_sales_data() -> SheetPackage {
+        let mut pkg = new_xlsx();
+        let rows: [[&str; 3]; 5] = [
+            ["Region", "Product", "Sales"],
+            ["East", "Widget", "10"],
+            ["East", "Gadget", "20"],
+            ["West", "Widget", "30"],
+            ["West", "Gadget", "40"],
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let cell = if r > 0 && c == 2 {
+                    Cell::number(v.parse().unwrap())
+                } else {
+                    Cell::text(v)
+                };
+                pkg.workbook.sheets[0].set_cell(r as u32, c as u32, cell);
+            }
+        }
+        pkg
+    }
+
+    #[test]
+    fn create_pivot_builds_full_layout_and_computes_on_a_new_sheet() {
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        let idx = pkg
+            .create_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                &frame,
+                &spec,
+                "Pivot1",
+            )
+            .expect("create_pivot");
+        let piv = &pkg.workbook.pivots[idx];
+        assert_eq!(piv.row_fields, vec![0]);
+        assert!(piv.col_fields.is_empty());
+        assert_eq!(piv.data_fields.len(), 1);
+        assert_eq!(piv.data_fields[0].agg, crate::frame::Agg::Sum);
+        let dest = piv.sheet;
+        assert_eq!(pkg.workbook.sheets[dest].name, "Pivot1");
+        assert_ne!(dest, 0, "pivot must land on a NEW sheet, not the source");
+        // Already refreshed: the output sheet holds computed values. Row 2
+        // is the location's header row ("Sum of Sales"); row 3 is the first
+        // row group ("East").
+        let east_sum = pkg.workbook.sheets[dest]
+            .cell(3, 1)
+            .map(|c| c.value.clone());
+        assert_eq!(east_sum, Some(CellValue::Number(30.0)));
+
+        // No headers/rows or no measures: a clean None, no partial sheet left.
+        let empty_frame = crate::frame::Frame::default();
+        let n_sheets = pkg.workbook.sheets.len();
+        assert!(
+            pkg.create_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                &empty_frame,
+                &spec,
+                "Pivot2",
+            )
+            .is_none()
+        );
+        assert_eq!(
+            pkg.workbook.sheets.len(),
+            n_sheets,
+            "a failed create_pivot must not leave a dangling sheet"
+        );
+    }
+
+    #[test]
+    fn remove_pivot_is_the_exact_inverse_of_create_pivot() {
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        let idx = pkg
+            .create_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                &frame,
+                &spec,
+                "Pivot1",
+            )
+            .expect("create_pivot");
+        let before = pkg.clone();
+        assert!(pkg.remove_pivot(idx));
+        assert!(pkg.workbook.pivots.is_empty(), "pivot registration remains");
+        // Save/load still succeeds — no dangling relationship/content-type
+        // pointing at the parts remove_pivot dropped.
+        let bytes = save_xlsx(&pkg);
+        let reloaded = load_xlsx(&bytes).expect("reload after remove_pivot");
+        assert!(reloaded.workbook.pivots.is_empty());
+        // The output sheet itself is untouched by remove_pivot alone —
+        // callers that also want the sheet gone call remove_sheet (which
+        // cascades pivot removal itself; see the next test).
+        assert_eq!(pkg.workbook.sheets.len(), before.workbook.sheets.len());
+
+        assert!(!pkg.remove_pivot(0), "no pivots left to remove");
+    }
+
+    #[test]
+    fn removing_a_pivots_sheet_cascades_the_pivot_registration_both_or_neither() {
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        let idx = pkg
+            .create_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                &frame,
+                &spec,
+                "Pivot1",
+            )
+            .expect("create_pivot");
+        let dest = pkg.workbook.pivots[idx].sheet;
+        assert!(pkg.remove_sheet(dest));
+        assert!(
+            pkg.workbook.pivots.is_empty(),
+            "sheet.remove-style cascade must also drop the pivot registration \
+             (a sheet-only inverse leaving a dangling pivot entry is a defect)"
+        );
+        assert_eq!(pkg.workbook.sheets.len(), 1);
+        // Round-trips clean: no orphaned pivot part refs survive the removal.
+        let bytes = save_xlsx(&pkg);
+        let reloaded = load_xlsx(&bytes).expect("reload after cascaded removal");
+        assert!(reloaded.workbook.pivots.is_empty());
+        assert_eq!(reloaded.workbook.sheets.len(), 1);
+    }
+
+    #[test]
+    fn removing_an_unrelated_sheet_shifts_a_surviving_pivots_sheet_index() {
+        // Pivot lands on sheet 1 (Sheet1=0, Pivot1=1). Adding a sheet BEFORE
+        // it, then removing that inserted sheet, must shift the pivot's
+        // `.sheet` back down rather than leaving it stale or cascading it
+        // away (it wasn't the pivot's own sheet).
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        let idx = pkg
+            .create_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                &frame,
+                &spec,
+                "Pivot1",
+            )
+            .expect("create_pivot");
+        assert_eq!(pkg.workbook.pivots[idx].sheet, 1);
+        // Remove sheet 0 (Sheet1, the source data — unrelated to the pivot's
+        // OWN sheet at index 1) and check the pivot's index shifts to 0.
+        assert!(pkg.remove_sheet(0));
+        assert_eq!(
+            pkg.workbook.pivots[0].sheet, 0,
+            "surviving pivot's sheet index must shift down with the removal"
+        );
+        assert_eq!(pkg.workbook.sheets[0].name, "Pivot1");
+    }
+
+    #[test]
+    fn refreshing_a_pivots_output_after_its_source_sheet_is_removed_skips_gracefully() {
+        // Wave-3 Task 4's mandatory regression test: removing a pivot's
+        // SOURCE sheet (its OWN output sheet survives, unlike the cascade
+        // tests above) must leave the pivot registration in place — merely
+        // stale, pointing at source data that no longer exists — and a
+        // subsequent refresh (the `wb.recalc` path) must skip it gracefully
+        // rather than panicking on the now-dangling `PivotSource::Range`
+        // sheet name.
+        use crate::pivot::refresh_pivots;
+        let mut pkg = pkg_with_sales_data();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 4, 2));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        pkg.create_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 4, 2),
+            },
+            &frame,
+            &spec,
+            "Pivot1",
+        )
+        .expect("create_pivot");
+        assert_eq!(pkg.workbook.pivots[0].sheet, 1, "Pivot1 is sheet index 1");
+
+        // Remove sheet 0 (Sheet1 — the pivot's SOURCE, not its own output
+        // sheet). The pivot's own sheet (now index 0) survives.
+        assert!(pkg.remove_sheet(0));
+        assert_eq!(
+            pkg.workbook.pivots.len(),
+            1,
+            "pivot.list must still report the pivot — it's stale, not gone"
+        );
+        assert_eq!(pkg.workbook.sheets.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].name, "Pivot1");
+
+        // Refresh (the wb.recalc path) must not panic, and must skip this
+        // pivot gracefully rather than crash resolving its now-nonexistent
+        // "Sheet1" source.
+        let outcome = refresh_pivots(&mut pkg.workbook);
+        assert_eq!(outcome.refreshed, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.changed.is_empty());
+        // The pivot registration is still there afterward (stale, not
+        // dropped by the failed refresh attempt).
+        assert_eq!(pkg.workbook.pivots.len(), 1);
     }
 
     #[test]
@@ -3011,6 +3587,74 @@ mod tests {
         let (r, c) = crate::sheet::parse_cell_name("B4").unwrap();
         assert_eq!(
             pkg3.workbook.sheets[1].cell(r, c).unwrap().value,
+            CellValue::Number(130.0)
+        );
+    }
+
+    #[test]
+    fn renaming_a_pivots_source_sheet_keeps_it_wired() {
+        use crate::pivot::{PivotSource, refresh_pivots};
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        assert_eq!(
+            pkg.workbook.pivots[0].source,
+            PivotSource::Range {
+                sheet: "Data".into(),
+                rect: (0, 0, 4, 2)
+            }
+        );
+
+        // Rename the pivot's SOURCE sheet (index 0, "Data"). Without
+        // rewriting `PivotSource::Range { sheet }` this orphans the pivot:
+        // `refresh_pivots` looks the name up and just skips silently.
+        crate::edit::rename_sheet(&mut pkg.workbook, 0, "Numbers");
+        assert_eq!(
+            pkg.workbook.pivots[0].source,
+            PivotSource::Range {
+                sheet: "Numbers".into(),
+                rect: (0, 0, 4, 2)
+            },
+            "pivot source must follow the rename, case-insensitively matched"
+        );
+
+        let outcome = refresh_pivots(&mut pkg.workbook);
+        assert_eq!(
+            (outcome.refreshed, outcome.skipped),
+            (1, 0),
+            "renamed source must still resolve — no silent skip"
+        );
+        let val = |report: &Sheet, name: &str| {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            report
+                .cell(r, c)
+                .map(|cl| cl.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(val(&pkg.workbook.sheets[1], "B4"), CellValue::Number(40.0));
+
+        // A further edit on the (renamed) source sheet is picked up on the
+        // next refresh — proof the wiring isn't just a one-shot coincidence.
+        let (r, c) = crate::sheet::parse_cell_name("C2").unwrap();
+        pkg.workbook.sheets[0].set_cell(r, c, crate::sheet::Cell::number(100.0));
+        let outcome2 = refresh_pivots(&mut pkg.workbook);
+        assert_eq!((outcome2.refreshed, outcome2.skipped), (1, 0));
+        assert_eq!(val(&pkg.workbook.sheets[1], "B4"), CellValue::Number(130.0));
+
+        // Save/load: the renamed source name round-trips through the cache
+        // part and refresh still resolves it after reload.
+        let bytes = save_xlsx(&pkg);
+        let mut pkg2 = load_xlsx(&bytes).unwrap();
+        assert_eq!(
+            pkg2.workbook.pivots[0].source,
+            PivotSource::Range {
+                sheet: "Numbers".into(),
+                rect: (0, 0, 4, 2)
+            },
+            "renamed source sheet lost on reload"
+        );
+        let outcome3 = refresh_pivots(&mut pkg2.workbook);
+        assert_eq!((outcome3.refreshed, outcome3.skipped), (1, 0));
+        assert_eq!(
+            val(&pkg2.workbook.sheets[1], "B4"),
             CellValue::Number(130.0)
         );
     }

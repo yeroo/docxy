@@ -10,7 +10,7 @@
     "url": "https://github.com/yeroo/docxy"
   },
   "engines": {
-    "vscode": "^1.84.0"
+    "vscode": "^1.101.0"
   },
   "categories": [
     "Visualization",
@@ -27,6 +27,7 @@
     "spreadsheet"
   ],
   "main": "./out/extension.js",
+  "activationEvents": [],
   "contributes": {
     "customEditors": [
       {
@@ -92,7 +93,13 @@
           "when": "activeCustomEditorId == offxy.docxEditor"
         }
       ]
-    }
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "offxy",
+        "label": "Offxy"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
@@ -101,11 +108,13 @@
     "build": "npm run build:wasm && npm run build:ext",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
     "typecheck": "tsc --noEmit",
+    "test:mcp-parity": "node mcp/parity.test.mjs",
+    "test:grid-layout": "node media/grid.layout.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",
-    "@types/vscode": "^1.84.0",
+    "@types/vscode": "^1.101.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.4.0"
   }
