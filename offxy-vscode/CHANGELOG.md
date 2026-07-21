@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **New: a WYSIWYG editor for Markdown files** (`offxy.markdownEditor`,
+  opt-in via **Reopen Editor With → Docxy Markdown** — `.md` still opens as
+  plain text by default). Reuses the Word editor's rendering/editing engine:
+  a `.md` file loads through `markdownToDocx` and saves back through
+  `docxToMarkdown`, so the on-disk file stays markdown throughout — no
+  `.docx` is ever written. The toolbar (and its command-palette/keyboard
+  equivalents) hides and disables formatting Markdown can't represent
+  (underline, alignment, font size); task-list items (`- [ ]` / `- [x]`)
+  render as ☐ / ☑ (display-only — the saved text is still literal
+  `[ ]`/`[x]`). The first save re-emits the file as canonical markdown
+  (hard-wrapped prose unwraps to one line per paragraph); after that,
+  open/edit/save cycles are stable.
+- **Fixed: the markdown round-trip (`docxcore`) is now faithful and
+  idempotent** for the constructs docxy supports — task lists no longer get
+  mangled by bracket-escaping (`- [ ]` used to round-trip as `- \[ \]`), and
+  a soft-wrapped continuation line under a list item now stays part of that
+  item instead of breaking the list into a separate paragraph. A committed
+  corpus test asserts a second `from_markdown`/`to_markdown` pass is a no-op
+  across headings, emphasis/code/strike, links, nested/ordered/task lists
+  with continuations, tables, fenced code, blockquotes, thematic breaks, and
+  math — the basis the new markdown editor's save-stability depends on.
 - **New: the wave-3 agent styling + persistent-pivots surface** — the agent
   control surface (terminal apps, tabs, and both MCP servers) grows from 53
   to **56 tools**:
