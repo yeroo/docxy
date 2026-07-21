@@ -11,6 +11,137 @@
 //   docx_save(handle)->resultPtr
 // A "result" buffer is [u32 little-endian length][payload bytes].
 
+// ---- mermaid geometry -> inline SVG (Task 7 of the mermaid-flowchart-quality
+// plan) --------------------------------------------------------------------
+// Draws the SAME `DiagramGeometry` (docxcore's `mermaid.rs`) that the Word
+// exporter turns into DrawingML shapes, as an SVG overlay here — so a
+// flowchart looks the same in both places. `geo`'s coordinates are EMU
+// (English Metric Units, 914400 per inch — the OOXML DrawingML unit); the
+// SVG's viewBox uses them directly as user units, and the caller's overlay
+// element (sized in real pixels from the character-grid metrics) scales the
+// whole picture down to screen size. Because the user-unit scale is EMU
+// (values in the hundreds of thousands to millions), every absolute length
+// drawn inside the SVG — stroke width, font size, arrowhead size — must ALSO
+// be chosen in EMU, not small CSS-pixel defaults: a "2px" stroke or "14px"
+// font would shrink to an invisible sub-pixel sliver once the viewBox is
+// scaled down to a roughly one-inch-tall grid cell.
+//
+// `buildMermaidSvg` is pure (no DOM access) and declared at the TOP LEVEL of
+// this script, outside the webview IIFE below — mirroring how
+// `grid.layout.test.mjs` runs `grid.js` unmodified inside a Node `vm` sandbox
+// to reach its behavior (this project has no module system for these webview
+// scripts; they load as plain `<script src=...>` tags, see extension.ts). A
+// top-level `function` declaration in non-strict script code becomes a
+// property of the global object it runs against — `window.buildMermaidSvg` in
+// a real browser tab, or a property of the sandbox object `vm.runInContext`
+// ran the script against in `media/mermaid-svg.test.mjs` — so the test can
+// call it directly without this file needing an export statement.
+const MMD_STROKE = 12700; // 1pt in EMU: node border / edge line width
+const MMD_FONT_NODE = 130000; // ~10.2pt in EMU: node label size
+const MMD_FONT_TITLE = 115000; // subgraph title size
+const MMD_FONT_EDGE = 110000; // edge label size
+const MMD_ARROW = 140000; // arrowhead marker box side, in EMU (userSpaceOnUse)
+
+function escMermaidText(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** geo: `DiagramGeometry` JSON (canvasW/canvasH, nodes[], edges[], subgraphs[])
+ *  -> a self-contained `<svg>...</svg>` string. Z-order (back to front, per the
+ *  brief): subgraph bands + titles, then edges, then nodes + their labels,
+ *  then edge labels (drawn last so they sit legibly on top of any edge line
+ *  crossing under them). */
+function buildMermaidSvg(geo) {
+  const canvasW = geo.canvasW || 0;
+  const canvasH = geo.canvasH || 0;
+  const parts = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${canvasW} ${canvasH}" ` +
+      `width="100%" height="100%" preserveAspectRatio="xMidYMid meet">`
+  );
+  parts.push(
+    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" ' +
+      `markerWidth="${MMD_ARROW}" markerHeight="${MMD_ARROW}" markerUnits="userSpaceOnUse" ` +
+      'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#333333"/></marker></defs>'
+  );
+
+  // Subgraph bands first — background, behind edges and nodes.
+  for (const sg of geo.subgraphs || []) {
+    parts.push(
+      `<rect x="${sg.x}" y="${sg.y}" width="${sg.w}" height="${sg.h}" ` +
+        `rx="${Math.min(sg.w, sg.h) * 0.02}" fill="#F5F5F5" stroke="#999999" stroke-width="${MMD_STROKE}"/>`
+    );
+    if (sg.title) {
+      parts.push(
+        `<text x="${sg.x + MMD_FONT_TITLE * 0.3}" y="${sg.y + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">${escMermaidText(sg.title)}</text>`
+      );
+    }
+  }
+
+  // Edges next — under the nodes they connect.
+  for (const e of geo.edges || []) {
+    const pts = (e.points || []).map((p) => `${p[0]},${p[1]}`).join(' ');
+    parts.push(
+      `<polyline points="${pts}" fill="none" stroke="#333333" ` +
+        `stroke-width="${MMD_STROKE}" marker-end="url(#arrow)"/>`
+    );
+  }
+
+  // Nodes on top of edges, each with a centered label.
+  for (const n of geo.nodes || []) {
+    const fill = '#' + (n.fill || 'FFFFFF');
+    const stroke = '#' + (n.stroke || '000000');
+    const textColor = '#' + (n.textColor || '000000');
+    const cx = n.x + n.w / 2;
+    const cy = n.y + n.h / 2;
+    if (n.shape === 'diamond') {
+      const pts = `${cx},${n.y} ${n.x + n.w},${cy} ${cx},${n.y + n.h} ${n.x},${cy}`;
+      parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
+    } else if (n.shape === 'ellipse' || n.shape === 'circle') {
+      parts.push(
+        `<ellipse cx="${cx}" cy="${cy}" rx="${n.w / 2}" ry="${n.h / 2}" ` +
+          `fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`
+      );
+    } else {
+      // rect / roundRect (any other/unknown shape tag falls back to a plain rect).
+      const rx = n.shape === 'roundRect' ? Math.min(n.w, n.h) * 0.15 : 0;
+      parts.push(
+        `<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="${rx}" ` +
+          `fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`
+      );
+    }
+    parts.push(
+      `<text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="middle" ` +
+        `font-size="${MMD_FONT_NODE}" fill="${textColor}">${escMermaidText(n.label)}</text>`
+    );
+  }
+
+  // Edge labels last, on top of everything, with a white backing rect so an
+  // edge line crossing under a label doesn't visually cut through the text.
+  for (const e of geo.edges || []) {
+    if (!e.label) continue;
+    const pts = e.points || [];
+    const mid = pts[Math.floor(pts.length / 2)] || pts[0] || [0, 0];
+    const w = String(e.label).length * MMD_FONT_EDGE * 0.62 + MMD_FONT_EDGE;
+    const h = MMD_FONT_EDGE * 1.6;
+    parts.push(
+      `<rect x="${mid[0] - w / 2}" y="${mid[1] - h / 2}" width="${w}" height="${h}" fill="#FFFFFF"/>`
+    );
+    parts.push(
+      `<text x="${mid[0]}" y="${mid[1]}" text-anchor="middle" dominant-baseline="middle" ` +
+        `font-size="${MMD_FONT_EDGE}" fill="#333333">${escMermaidText(e.label)}</text>`
+    );
+  }
+
+  parts.push('</svg>');
+  return parts.join('');
+}
+
 (function () {
   const vscode = acquireVsCodeApi();
   const docEl = document.getElementById('doc');
@@ -150,6 +281,36 @@
     return uri;
   }
 
+  let mmdEls = [];
+  /** Overlay each mermaid diagram's real geometry as inline SVG, positioned
+   *  over its reserved grid box with the same col/row -> px math paintImages()
+   *  uses (PAD_L/PAD_T + metrics). A diagram with zero laid-out nodes (the
+   *  geometry builder found nothing to draw) is left to the label-box text
+   *  fallback already painted underneath by render_with_images's `text_box` —
+   *  that's why this only ever adds elements, never draws in place of the
+   *  text; the text is the fallback, this is the enhancement on top of it. */
+  function paintMermaid() {
+    for (const el of mmdEls) el.remove();
+    mmdEls = [];
+    for (const mb of lastView.mermaid || []) {
+      if (!mb.geo || !mb.geo.nodes || mb.geo.nodes.length === 0) continue;
+      const left = PAD_L + mb.col * metrics.charW;
+      const top = PAD_T + mb.row * metrics.lineH;
+      const w = mb.cols * metrics.charW;
+      const h = mb.rows * metrics.lineH;
+      const el = document.createElement('div');
+      el.className = 'docimg'; // reuses the image overlay's position:absolute
+                                // + pointer-events:none rule — no new CSS needed.
+      el.innerHTML = buildMermaidSvg(mb.geo);
+      el.style.left = left + 'px';
+      el.style.top = top + 'px';
+      el.style.width = w + 'px';
+      el.style.height = h + 'px';
+      docEl.appendChild(el);
+      mmdEls.push(el);
+    }
+  }
+
   let imgEls = [];
   function paintImages() {
     for (const el of imgEls) el.remove();
@@ -280,8 +441,10 @@
     }
     docEl.replaceChildren(frag);
     imgEls = []; // replaceChildren removed the old overlays
+    mmdEls = [];
     placeCaret();
     paintImages();
+    paintMermaid();
     updateStatus();
   }
 
