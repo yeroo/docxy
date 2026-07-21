@@ -206,6 +206,30 @@ impl Session {
             push_image(&mut out, ib);
         }
         out.push(']');
+        // Editable column ranges per visual line ([c0, c1) — c1 is one past the
+        // last char), straight from the caret maps. Hosts that place edit guards
+        // over decorations (list markers, table borders) consume this; the
+        // webview ignores unknown fields.
+        out.push_str(",\"segs\":[");
+        for (li, m) in self.maps.iter().enumerate() {
+            if li > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            for (si, seg) in m.segs.iter().enumerate() {
+                if si > 0 {
+                    out.push(',');
+                }
+                let (a, b) = seg.col_range();
+                out.push('[');
+                out.push_str(&a.to_string());
+                out.push(',');
+                out.push_str(&b.to_string());
+                out.push(']');
+            }
+            out.push(']');
+        }
+        out.push(']');
         if let Some(t) = copied {
             out.push_str(",\"copied\":");
             json::push_str(&mut out, t);
@@ -664,6 +688,44 @@ mod tests {
             );
             assert_eq!(after.0, before.0, "caret left its line after {n} space(s)");
         }
+    }
+
+    #[test]
+    fn segs_cover_a_plain_paragraph() {
+        let bytes = sample_docx("Hello world");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        // One visual line whose single editable segment spans the 11 chars.
+        assert!(v.contains("\"segs\":[[[0,11]]"), "segs missing/wrong: {v}");
+    }
+
+    #[test]
+    fn segs_follow_soft_wrap() {
+        let bytes = sample_docx("aaaa bbbb cccc dddd eeee");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("width\t10");
+        let v = s.view_json(None);
+        let segs = v.split("\"segs\":").nth(1).expect("segs in view");
+        // Wrapped into multiple lines, each line's segment starting at col 0.
+        let per_line: Vec<&str> = segs.matches("[[0,").collect();
+        assert!(per_line.len() >= 2, "expected >=2 wrapped lines: {v}");
+    }
+
+    #[test]
+    fn segs_exclude_list_markers() {
+        let bytes = sample_docx("Item one");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("selectall");
+        s.dispatch("list\tbullet");
+        let v = s.view_json(None);
+        let segs = v.split("\"segs\":").nth(1).expect("segs in view");
+        // The marker occupies the leading columns: the first line's first seg
+        // must start past column 0.
+        assert!(
+            !segs.starts_with("[[[0,"),
+            "list marker columns must not be editable: {v}"
+        );
+        assert!(segs.starts_with("[[["), "first line should have a seg: {v}");
     }
 
     #[test]
