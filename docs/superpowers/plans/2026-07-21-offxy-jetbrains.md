@@ -262,6 +262,24 @@
 
 ### Task 8: Full verification, CI, docs
 
+> **Status: DONE** (CI verification in flight on PR #30, branch
+> `claude/offxy-jetbrains`). Rust gates green (fmt/clippy/24 workspace test
+> suites); 32 plugin tests green on a forced rerun (fresh property seeds —
+> note: Gradle's build cache replays test results after `clean`, use
+> `--rerun` for fresh seeds). CI: `jetbrains` job in ci.yml; release
+> workflow attaches the plugin zip. Docs: plugin README/CHANGELOG, root
+> README section, agent-control.md "JetBrains tabs".
+>
+> **Manual e2e checklist (Boris):**
+> - `./gradlew runIde` → open `corpus/files/complex0.docx`: typing feel
+>   (async catch-up), tables/lists/images render, theme light/dark.
+> - Edit → undo/redo (text + a toolbar formatting) → save → reopen in the
+>   TUI (`cargo run -p docxy -- <file>`) → fidelity.
+> - Empty file → Create flow; convert a `.md` from the project view.
+> - `docxy --mcp` session: `docxy_list` shows `docxy-jetbrains-*`;
+>   `doc.path`/`doc.save` round-trip; terminal + IDE disambiguated by
+>   `target`. (Read/edit verbs after the agent-access `docx_ctl` lands.)
+
 **Files:**
 - Modify: `.github/workflows/` (gradle job + release asset), root `README.md`, `docs/agent-control.md` (JetBrains subsection)
 - Create: `offxy-jetbrains/README.md`, `offxy-jetbrains/CHANGELOG.md`
