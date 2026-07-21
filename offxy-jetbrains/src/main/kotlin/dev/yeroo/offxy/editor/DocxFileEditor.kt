@@ -36,6 +36,7 @@ class DocxFileEditor(
     private var modified = false
 
     val view: EditorView?
+    private var pipeline: EditPipeline? = null
 
     init {
         val bytes = file.contentsToByteArray()
@@ -45,6 +46,9 @@ class DocxFileEditor(
             panel.add(v.editor.component, BorderLayout.CENTER)
             Disposer.register(this, v)
             v.applyRender(ViewModel(engine.render()))
+            val p = EditPipeline(engine, v) { json -> refreshFrom(json) }
+            pipeline = p
+            v.document.addDocumentListener(p, this)
             v.editor.component.addComponentListener(object : ComponentAdapter() {
                 override fun componentResized(e: ComponentEvent) = scheduleWidthSync()
             })
@@ -87,6 +91,11 @@ class DocxFileEditor(
     }
 
     fun engine(): DocxEngine = engine
+
+    /** Test hook: run any deferred edit reconciliation now. */
+    fun flushEdits() {
+        pipeline?.flush()
+    }
 
     override fun getComponent(): JComponent = panel
 

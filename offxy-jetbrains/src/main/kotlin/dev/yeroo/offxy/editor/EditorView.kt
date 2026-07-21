@@ -78,37 +78,22 @@ class EditorView(
      */
     fun reconcile(v: ViewModel) {
         val old = document.text
-        if (old != v.text) {
-            val oldLines = old.split('\n')
-            val newLines = v.text.split('\n')
-            var prefix = 0
-            while (prefix < oldLines.size && prefix < newLines.size &&
-                oldLines[prefix] == newLines[prefix]
-            ) prefix++
-            var suffix = 0
-            while (suffix < oldLines.size - prefix && suffix < newLines.size - prefix &&
-                oldLines[oldLines.size - 1 - suffix] == newLines[newLines.size - 1 - suffix]
-            ) suffix++
-
-            val startOff = oldLines.take(prefix).sumOf { it.length + 1 }
-            val oldEnd = old.length - suffix(oldLines, suffix)
-            val newEnd = v.text.length - suffix(newLines, suffix)
+        val new = v.text
+        if (old != new) {
+            // Char-level common prefix/suffix — minimal single replace, correct
+            // by construction (no line-boundary arithmetic to get wrong).
+            var p = 0
+            while (p < old.length && p < new.length && old[p] == new[p]) p++
+            var s = 0
+            while (s < old.length - p && s < new.length - p &&
+                old[old.length - 1 - s] == new[new.length - 1 - s]
+            ) s++
             selfWrite {
-                document.replaceString(
-                    startOff.coerceAtMost(old.length),
-                    oldEnd.coerceIn(startOff, old.length),
-                    v.text.substring(startOff.coerceAtMost(v.text.length), newEnd.coerceIn(startOff, v.text.length)),
-                )
+                document.replaceString(p, old.length - s, new.substring(p, new.length - s))
             }
         }
         this.view = v
         applyMarkup(v)
-    }
-
-    private fun suffix(lines: List<String>, n: Int): Int {
-        var chars = 0
-        for (k in 0 until n) chars += lines[lines.size - 1 - k].length + 1
-        return if (n == 0) 0 else chars - if (n == lines.size) 1 else 0
     }
 
     private fun selfWrite(body: () -> Unit) {
