@@ -185,6 +185,13 @@
 
 ### Task 6: Formatting, snapshot undo, save, toolbar, markdown
 
+> **Status: CORE DONE** (formatting + snapshot undo + toolbar + Save All /
+> close-save; platform tests green). Platform findings encoded: custom
+> FileEditors need `DocumentReferenceProvider` for undo routing, and document
+> writes are forbidden inside undo transactions (reconcile defers via
+> invokeLater). **Remaining:** markdown convert/export actions, replace
+> dialog, empty-file create flow, external-change reload.
+
 **Files:**
 - Create: `editor/Formatting.kt`, `editor/DocxToolbar.kt`, `actions/*.kt`, `editor/EmptyDocPanel.kt`
 - Modify: `plugin.xml`, `editor/DocxFileEditor.kt`
