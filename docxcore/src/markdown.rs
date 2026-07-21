@@ -1423,10 +1423,36 @@ mod tests {
         assert!(!out.contains("\\["), "brackets are not escaped: {out:?}");
     }
 
+    /// Run one lap of the editor's real save path: parse Markdown, splice into
+    /// a `.docx` package (this is what assigns/reserves numbering ids), save
+    /// to bytes, reload (so numbering.xml is parsed back the way a real open
+    /// would see it), then serialize back to Markdown using the *marker-aware*
+    /// `to_markdown_with` + `compute_markers` — the same pair the editor's
+    /// save path uses (see `docxwasm/src/bridge.rs` and `docxy/src/main.rs`).
+    fn editor_round_trip(md: &str) -> String {
+        let doc = from_markdown(md);
+        let pkg = crate::package::new_markdown_package(doc);
+        let bytes = crate::package::save_package(&pkg);
+        let reloaded = crate::package::load_package(&bytes).expect("reload");
+        let numbering = reloaded
+            .part("word/numbering.xml")
+            .map(|b| {
+                crate::numbering::parse_numbering_xml(
+                    std::str::from_utf8(b).expect("numbering.xml is utf8"),
+                )
+            })
+            .unwrap_or_default();
+        let markers = crate::numbering::compute_markers(&reloaded.document, &numbering);
+        to_markdown_with(&reloaded.document, &markers)
+    }
+
     #[test]
     fn markdown_round_trip_is_idempotent_over_the_corpus() {
         // Written in docxy's own canonical output style (one line per paragraph,
         // two-space list nesting) so the FIRST pass is already a fixed point.
+        // Exercised through the editor's real save path (marker-aware), not the
+        // bare `to_markdown`, so ordered-list markers are preserved as they are
+        // in an actual `.md` file save.
         let corpus = "\
 # Heading 1
 
@@ -1439,8 +1465,6 @@ A paragraph with **bold**, *italic*, ~~strike~~, `code`, and a [link](https://x)
   - nested bullet
 - [ ] todo
 - [x] done
-
-Another list, in ordered style:
 
 1. first
 2. second
@@ -1457,8 +1481,8 @@ code block
 
 ---
 ";
-        let once = to_markdown(&from_markdown(corpus));
-        let twice = to_markdown(&from_markdown(&once));
+        let once = editor_round_trip(corpus);
+        let twice = editor_round_trip(&once);
         assert_eq!(once, twice, "second pass must equal the first (idempotent)");
         // Spot-check the constructs survive the FIRST pass.
         for needle in [
@@ -1469,7 +1493,7 @@ code block
             "[link](https://x)",
             "- [ ] todo",
             "- [x] done",
-            "- first",
+            "1. first",
             "> a quote",
             "| a | b |",
             "---",
