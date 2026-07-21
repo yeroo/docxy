@@ -482,16 +482,30 @@ pub fn from_markdown(src: &str) -> Document {
             body.push(parse_table(&rows));
             continue;
         }
-        // List (consecutive items, possibly nested by indentation).
+        // List (consecutive items; each item may span soft-wrapped/continued
+        // lines that are not themselves new list markers or new blocks).
         if list_item(line).is_some() {
             while i < lines.len() {
-                match list_item(lines[i]) {
-                    Some((ilvl, ordered, content)) => {
-                        body.push(list_para(ilvl, ordered, content));
-                        i += 1;
+                let Some((ilvl, ordered, first)) = list_item(lines[i]) else {
+                    break;
+                };
+                i += 1;
+                let mut text = first.to_string();
+                // Fold in continuation lines belonging to THIS item.
+                while i < lines.len() {
+                    let l = lines[i];
+                    let t = l.trim();
+                    if t.is_empty()
+                        || list_item(l).is_some()
+                        || starts_block(l, lines.get(i + 1).copied())
+                    {
+                        break;
                     }
-                    None => break,
+                    text.push(' ');
+                    text.push_str(t);
+                    i += 1;
                 }
+                body.push(list_para(ilvl, ordered, &text));
             }
             continue;
         }
@@ -1085,6 +1099,31 @@ mod tests {
             })
             .collect();
         assert_eq!(lvls, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn list_item_continuation_lines_merge_into_the_item() {
+        // The second line is an indented soft-wrap of the first item, not a new block.
+        let src = "- first line\n  still the first item\n- second item\n";
+        let doc = from_markdown(src);
+        // Exactly two list paragraphs, and the first carries both lines' text.
+        let paras: Vec<&Paragraph> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.props.num_id.is_some())
+            .collect();
+        assert_eq!(paras.len(), 2, "two list items, not three blocks");
+        assert_eq!(paras[0].plain_text(), "first line still the first item");
+        // And it round-trips without inserting a blank line inside the list.
+        let out = to_markdown(&doc);
+        assert!(
+            !out.contains("- first line\n\n"),
+            "no spurious blank inside the list: {out:?}"
+        );
     }
 
     #[test]
