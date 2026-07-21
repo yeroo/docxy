@@ -746,6 +746,45 @@ fn layout(d: &mut Diagram) {
     }
 
     layout_subgraphs(d);
+    normalize_origin(d);
+}
+
+// A subgraph box straddles negative coordinates whenever it encloses the
+// diagram's top/left-most node (typically the node at rank 0, cross 0):
+// `layout_subgraphs` sets `x = minx - SG_PAD`, `y = miny - SG_PAD - SG_TITLE_H`,
+// which is negative there. `canvas_extent` never shifts the origin — it only
+// maxes over `x+w`/`y+h` starting from a (0,0) viewBox/frame — so a negative
+// box clips its title band and top/left border in BOTH renderers. Fix by
+// translating everything (nodes + sized subgraphs) so the minimum coordinate
+// is >= 0. Edges are NOT translated here: `edge_points`/`emit_connector` read
+// node positions live at build/emit time (no cached copies), so shifting the
+// nodes moves the edges automatically.
+fn normalize_origin(d: &mut Diagram) {
+    let mut min_x = d.nodes.iter().map(|n| n.x).min().unwrap_or(0);
+    let mut min_y = d.nodes.iter().map(|n| n.y).min().unwrap_or(0);
+    for g in &d.subgraphs {
+        if g.w == 0 && g.h == 0 {
+            continue; // never sized (empty subgraph) — excluded from geometry too
+        }
+        min_x = min_x.min(g.x);
+        min_y = min_y.min(g.y);
+    }
+    if min_x >= 0 && min_y >= 0 {
+        return;
+    }
+    let dx = -min_x.min(0);
+    let dy = -min_y.min(0);
+    for n in &mut d.nodes {
+        n.x += dx;
+        n.y += dy;
+    }
+    for g in &mut d.subgraphs {
+        if g.w == 0 && g.h == 0 {
+            continue;
+        }
+        g.x += dx;
+        g.y += dy;
+    }
 }
 
 // Bounding box per subgraph = union of member node rects, padded, with a title
@@ -1017,6 +1056,10 @@ fn emit_subgraph(g: &Subgraph, sid: i32) -> String {
 fn emit_node(node: &Node, sid: i32) -> String {
     let fill = node.fill.as_deref().unwrap_or("DAE8FC");
     let stroke = node.stroke.as_deref().unwrap_or("6C8EBF");
+    // Honor `textColor` in Word too (standard WordprocessingML run properties
+    // inside `wps:txbx`/`w:txbxContent`), so a `classDef ... color:#fff` node
+    // isn't black-on-dark in Word while showing correctly in the webview.
+    let text = node.text_color.as_deref().unwrap_or("000000");
     format!(
         "<wps:wsp>\
          <wps:cNvPr id=\"{sid}\" name=\"Node {sid}\"/>\
@@ -1028,7 +1071,7 @@ fn emit_node(node: &Node, sid: i32) -> String {
          <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{stroke}\"/></a:solidFill></a:ln>\
          </wps:spPr>\
          <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>\
-         <w:r><w:t xml:space=\"preserve\">{label}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <w:r><w:rPr><w:color w:val=\"{text}\"/></w:rPr><w:t xml:space=\"preserve\">{label}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
          <wps:bodyPr rot=\"0\" anchor=\"ctr\"><a:noAutofit/></wps:bodyPr>\
          </wps:wsp>",
         x = node.x,
@@ -1625,6 +1668,27 @@ mod tests {
     }
 
     #[test]
+    fn node_text_color_reaches_word_run() {
+        // The geometry/webview honor `textColor`; the Word emitter must too,
+        // or a `classDef x color:#fff` node renders white in the webview and
+        // black in Word (a break of the Word==webview invariant).
+        let (xml, _) = to_drawing("flowchart TD\nclassDef w color:#fff\nA:::w");
+        assert!(
+            xml.contains("<w:color w:val=\"FFFFFF\"/>"),
+            "expected white run color in Word XML: {xml}"
+        );
+    }
+
+    #[test]
+    fn node_default_text_color_is_black_in_word() {
+        let (xml, _) = to_drawing("flowchart TD\nA-->B");
+        assert!(
+            xml.contains("<w:color w:val=\"000000\"/>"),
+            "expected default black run color in Word XML: {xml}"
+        );
+    }
+
+    #[test]
     fn style_directive_overrides_class() {
         let src = "flowchart TD\n\
             classDef c fill:#111\n\
@@ -1656,6 +1720,28 @@ mod tests {
         let b = g.nodes.iter().find(|n| n.label == "Beta").unwrap();
         assert!(sg.x <= a.x && sg.y <= a.y);
         assert!(sg.x + sg.w >= b.x + b.w && sg.y + sg.h >= b.y + b.h);
+    }
+
+    #[test]
+    fn node_at_origin_subgraph_not_clipped() {
+        // A is the top/left-most node (rank 0, cross 0 => x=0, y=0) and is a
+        // member of "Group One". `layout_subgraphs` pads outward from the
+        // member bounding box: x = minx - SG_PAD, y = miny - SG_PAD -
+        // SG_TITLE_H. With A at the origin that box goes negative — and
+        // `canvas_extent` never shifts the origin to compensate, so the
+        // title band and top/left border get clipped in both the Word
+        // inline frame (fixed x/y offsets) and the webview
+        // (`viewBox="0 0 canvasW canvasH"`). Against the pre-fix code this
+        // assertion fails: the subgraph's y lands around -411480 EMU.
+        let src = "flowchart TD\nsubgraph Group One\nA-->B\nend\nB-->C";
+        let g = geometry(src);
+        assert_eq!(g.subgraphs.len(), 1);
+        for sg in &g.subgraphs {
+            assert!(sg.x >= 0 && sg.y >= 0, "subgraph clipped: {sg:?}");
+        }
+        for n in &g.nodes {
+            assert!(n.x >= 0 && n.y >= 0, "node clipped: {n:?}");
+        }
     }
 
     #[test]
