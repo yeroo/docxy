@@ -32,6 +32,12 @@
 
 ### Task 1: Scaffold the Gradle plugin project
 
+> **Status: DONE** (commit `3981624`). JDK 17 (temurin) + Gradle installed via
+> scoop; wasm32-unknown-unknown target had to be `rustup target add`ed. The
+> wasm ships into resources via `processResources { from(buildWasm) }` — a
+> Copy task into `src/main/resources` trips Gradle's implicit-dependency check
+> against `patchPluginXml`.
+
 **Files:**
 - Create: `offxy-jetbrains/build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`, wrapper files, `src/main/resources/META-INF/plugin.xml`, `.gitignore` (build/, .gradle/, the copied wasm)
 
@@ -47,6 +53,14 @@
 ---
 
 ### Task 2: `DocxEngine` + `ChicoryEngine`, tests, and the performance gate
+
+> **Status: DONE, GATE MISSED on the largest doc** (commit `e4a2c6a`). All
+> engine tests green. Benchmark: complex0.docx (220 KB) p50 60 ms / p95
+> 62.6 ms — over the 50 ms line, and steady-state (500-iteration warmup
+> changes nothing). But latency is linear in document size: 20 KB
+> sample.docx is 6.7 ms, small docs 0.35 ms. Root cause is the protocol
+> (full-document render+serialize per keystroke), not Chicory overhead.
+> STOPPED per gate for Boris's call: accept / Panama FFI / windowed render.
 
 **Files:**
 - Create: `src/main/kotlin/dev/yeroo/offxy/engine/DocxEngine.kt`, `engine/ChicoryEngine.kt`
