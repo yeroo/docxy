@@ -113,6 +113,36 @@ Development Host, and open any `.docx` or `.xlsx` file.
 - **Empty-file create flow** — opening a 0-byte `.xlsx` offers to create a new
   workbook in its place.
 
+## Edit Markdown files (WYSIWYG)
+
+Alongside `.docx` and `.xlsx`, offxy can open a `.md` file in the same
+no-ribbon document editor: right-click the editor tab (or open the command
+palette) and choose **Reopen Editor With → Docxy Markdown**. This is
+**opt-in** — `.md` files still open as plain text by default; nothing
+changes for markdown editing until you explicitly reopen a file this way.
+
+- **Saves back as markdown, never `.docx`.** The file loads via
+  `markdownToDocx` (in-memory docx bytes, so the same rendering/editing
+  engine as the Word editor can be reused) and saves via `docxToMarkdown`
+  back to the `.md` file. No `.docx` is ever written next to it.
+- **One-time reflow, then stable.** The first save re-emits the document as
+  docxy's canonical markdown — hard-wrapped prose is unwrapped to one line
+  per paragraph, since the editor's model has no memory of the source's line
+  breaks. After that first save the file is stable: further open/edit/save
+  cycles don't touch unrelated content. Task lists (`- [ ]` / `- [x]`),
+  nested bullet/ordered lists, and soft-wrapped list-item continuations
+  round-trip byte-faithfully.
+- **Markdown-mode formatting.** The toolbar (and its command-palette/
+  keyboard-shortcut equivalents) hides and disables formatting Markdown
+  can't represent — underline, paragraph alignment, font size — so you can't
+  create formatting that would silently disappear on save. Bold, italic,
+  strikethrough, headings, and bulleted/numbered lists all remain, since
+  Markdown expresses each of them directly.
+- **Task-list checkboxes.** A list item whose text starts with `[ ] ` or
+  `[x] ` renders as a ☐ / ☑ glyph instead of the literal brackets. This is
+  display-only — the underlying text (and what gets saved) is still the
+  literal `[ ]` / `[x]` markdown.
+
 ## Architecture
 
 | Layer | Where | Role |

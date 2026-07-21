@@ -139,6 +139,11 @@ impl Session {
         let opts = self.options();
         let (lines, maps, images) = render::render_with_images(&self.editor.doc, &opts);
         let (cl, cc) = caret_screen(&maps, &self.editor.caret);
+        // Pulled out before `maps` moves into `self.maps` below: whether each line
+        // belongs to a list-item paragraph, so the webview can scope its Markdown-
+        // mode checkbox glyph to real list items (not any line whose text happens
+        // to start with `[ ] `/`[x] `).
+        let line_is_list: Vec<bool> = maps.iter().map(|m| m.list).collect();
         self.maps = maps;
 
         let mut out = String::with_capacity(lines.len() * 48 + 64);
@@ -147,7 +152,12 @@ impl Session {
             if li > 0 {
                 out.push(',');
             }
-            out.push('[');
+            // Each line is `{"sp":[...spans...]}`, plus `"list":true` when this
+            // line belongs to a list-item paragraph (see `LineMap::list`) — the
+            // webview uses that flag to scope Markdown mode's task-list checkbox
+            // glyph to real list items instead of any line whose text happens to
+            // start with the literal `[ ] `/`[x] ` prefix.
+            out.push_str("{\"sp\":[");
             for (si, span) in line.spans.iter().enumerate() {
                 if si > 0 {
                     out.push(',');
@@ -185,6 +195,10 @@ impl Session {
                 out.push('}');
             }
             out.push(']');
+            if line_is_list.get(li).copied().unwrap_or(false) {
+                out.push_str(",\"list\":true");
+            }
+            out.push('}');
         }
         out.push_str("],\"caret\":{\"line\":");
         out.push_str(&cl.to_string());
@@ -1319,6 +1333,30 @@ mod tests {
         // The list marker makes the paragraph's first line wider than before.
         assert_ne!(before, after, "list toggle changed nothing");
         assert!(after.contains("Item one"));
+    }
+
+    #[test]
+    fn view_json_flags_list_item_lines() {
+        // Plain paragraph: no `"list"` flag at all (LineMap::list defaults false,
+        // and view_json only emits `"list":true` — never `"list":false`).
+        let bytes = sample_docx("Item one");
+        let mut s = Session::open(&bytes).expect("open");
+        let plain = s.view_json(None);
+        assert!(
+            !plain.contains("\"list\""),
+            "plain paragraph must not carry a list flag: {plain}"
+        );
+
+        // Same paragraph, toggled into a bulleted list: its line now carries
+        // `"list":true` — this is what the webview scopes the Markdown-mode
+        // checkbox glyph to (see Task 5's fix-wave, offxy-vscode/media/webview.js).
+        s.dispatch("selectall");
+        s.dispatch("list\tbullet");
+        let listed = s.view_json(None);
+        assert!(
+            listed.contains("\"list\":true"),
+            "list-item line missing its list flag: {listed}"
+        );
     }
 
     #[test]

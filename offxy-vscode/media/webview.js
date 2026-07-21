@@ -25,6 +25,28 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
+  // The markdown editor (`.md` files) reuses this same webview; the provider
+  // flags it via `window.__OFFXY__.markdown` so the UI can constrain itself to
+  // what Markdown can actually represent (toolbar + op guard) and re-skin literal
+  // task-list text for display (checkboxes) — see buildToolbar(), userCmd(), and
+  // mdCheckbox() below.
+  const MD_MODE = !!(window.__OFFXY__ && window.__OFFXY__.markdown);
+
+  // Ops Markdown's own syntax has no way to represent, so a save silently drops
+  // them. ONE source of truth, gating BOTH the toolbar (buildToolbar filters its
+  // button list against this) and every path that can still invoke an op with
+  // the toolbar hidden — keybindings (onKeydown) and the command-palette
+  // `command` message (both route through userCmd(), the single choke point
+  // guarded below). `align\tjustify` has no toolbar button at all (only a
+  // command-palette entry, offxy.alignJustify) but is just as unrepresentable
+  // in Markdown as left/center/right, so it's included here even though it was
+  // never in the toolbar's button list.
+  const MD_HIDDEN_OPS = new Set([
+    'underline',
+    'align\tleft', 'align\tcenter', 'align\tright', 'align\tjustify',
+    'fontsize\t-2', 'fontsize\t2',
+  ]);
+
   // ---- wasm marshalling ----------------------------------------------------
   const mem = () => new Uint8Array(ex.memory.buffer);
 
@@ -161,30 +183,99 @@
   // ---- painting ------------------------------------------------------------
   const ANSI = (name) => `var(--vscode-terminal-ansi${name})`;
 
+  // Markdown mode, DISPLAY ONLY: a task-list item's model/save text is the
+  // literal `[ ] `/`[x] `/`[X] ` that Markdown's own task-list syntax uses (see
+  // docxcore's markdown.rs — round-tripped verbatim, never escaped). This only
+  // reskins that literal 4-character prefix into a checkbox glyph in the DOM;
+  // it never calls `cmd`/`userCmd`, so the wasm model — and therefore
+  // `docx_save`/`docx_to_md` — still sees `[ ] `/`[x] ` untouched.
+  //
+  // The grid is a strict character grid: caret placement (`col * charW`) and
+  // click/drag hit-testing (`x / charW`) both work in MODEL columns. A naive
+  // text substitution (`"[ ] "` → `"☐ "`) would shrink 4 model columns down to
+  // 2 rendered characters, shifting every caret/click column after it on the
+  // line by ~2 — wrong pointer feedback, even though the model/save stay
+  // correct. `checkboxGlyph()` instead reports the glyph AND the leftover text
+  // separately, and the caller renders the glyph in its own `width:4ch` inline
+  // box (see `paint()` below) — pinning the glyph to exactly the 4 display
+  // columns the 4 model characters `[ ] `/`[x] ` occupy, so every column after
+  // it lines up with the model exactly as it did before the reskin.
+  const MD_CHECKBOX_RE = /^\[( |[xX])\] /;
+  function checkboxGlyph(text) {
+    const m = MD_CHECKBOX_RE.exec(text);
+    if (!m) return null;
+    return { glyph: m[1] === ' ' ? '☐' : '☑', rest: text.slice(4) };
+  }
+
+  /** Style one rendered span element from its wasm view-JSON span object
+   *  (bold/italic/underline/strike/dim/selected/color/link). Shared by the
+   *  plain-span path and the checkbox glyph's two-piece split below, so a
+   *  formatted task-list run (rare, but not impossible) keeps its formatting
+   *  on both the glyph box and the remainder text. */
+  function styleSpan(el, sp) {
+    if (sp.b) el.classList.add('b');
+    if (sp.i) el.classList.add('i');
+    if (sp.u) el.classList.add('u');
+    if (sp.s) el.classList.add('st');
+    if (sp.d) el.classList.add('dim');
+    if (sp.h) el.classList.add('sel');
+    if (sp.c) el.style.color = ANSI(sp.c);
+    if (sp.lnk) {
+      el.classList.add('link');
+      el.dataset.href = sp.lnk;
+    }
+  }
+
   function paint() {
     const frag = document.createDocumentFragment();
     for (const line of lastView.lines) {
       const div = document.createElement('div');
       div.className = 'line';
-      if (line.length === 0) {
+      const spans = line.sp;
+      if (spans.length === 0) {
         div.appendChild(document.createTextNode('​')); // keep empty lines tall
       }
-      for (const sp of line) {
+      // docxcore's render_paragraph always pushes the list marker (bullet glyph
+      // or the equivalent blank-space prefix on a wrapped continuation line) as
+      // its own span BEFORE the paragraph's own content spans, whenever the
+      // paragraph carries a numId — so on a real list-item line (`line.list`,
+      // from the wasm view's per-line flag) the checkbox-eligible text is always
+      // spans[1], never spans[0] (the marker) or anything later in the line.
+      // Scoping to that one index — and only when the line is actually a list
+      // item — is what keeps a coincidental "[ ] " elsewhere in a paragraph (or
+      // in a non-list paragraph entirely) from being misread as a task item.
+      // This "spans[1] is the content" assumption holds for every UI-driven edit
+      // (alignment ops are unreachable in markdown mode, see userCmd()'s guard),
+      // but the agent control surface (`doc.format`/`doc.set-style` with an
+      // align patch) can still reach the model directly and insert a lead span
+      // ahead of the marker — in that case the index no longer lines up with
+      // the checkbox text, and it just renders as the literal `[ ] ` string
+      // instead of the glyph (never corrupting anything, only degrading the
+      // cosmetic reskin back to plain text).
+      const checkboxIdx = MD_MODE && line.list ? 1 : -1;
+      spans.forEach((sp, si) => {
+        const cb = si === checkboxIdx ? checkboxGlyph(sp.t) : null;
+        if (cb) {
+          // Fixed-width box: exactly 4 display columns for the 4 model columns
+          // `[ ] `/`[x] ` occupied, regardless of the glyph's own font width.
+          const marker = document.createElement('span');
+          marker.textContent = cb.glyph;
+          marker.style.display = 'inline-block';
+          marker.style.width = '4ch';
+          marker.style.textAlign = 'left';
+          styleSpan(marker, sp);
+          div.appendChild(marker);
+          const rest = document.createElement('span');
+          rest.textContent = cb.rest;
+          styleSpan(rest, sp);
+          div.appendChild(rest);
+          return;
+        }
         const el = document.createElement('span');
         el.textContent = sp.t;
-        if (sp.b) el.classList.add('b');
-        if (sp.i) el.classList.add('i');
-        if (sp.u) el.classList.add('u');
-        if (sp.s) el.classList.add('st');
-        if (sp.d) el.classList.add('dim');
-        if (sp.h) el.classList.add('sel');
-        if (sp.c) el.style.color = ANSI(sp.c);
-        if (sp.lnk) {
-          el.classList.add('link');
-          el.dataset.href = sp.lnk;
-        }
+        styleSpan(el, sp);
         div.appendChild(el);
-      }
+      });
       frag.appendChild(div);
     }
     docEl.replaceChildren(frag);
@@ -252,8 +343,20 @@
   ]);
 
   /** Run a user-initiated command and, if it mutates, tell the host so VS Code
-   *  lights the dirty dot and can drive undo/redo. */
+   *  lights the dirty dot and can drive undo/redo.
+   *
+   *  This is the ONE choke point every user-facing entry to a formatting op
+   *  passes through — toolbar buttons (buildToolbar()'s click handler),
+   *  keybindings (onKeydown, e.g. Ctrl+U), and the command-palette `command`
+   *  host message (the `case 'command': userCmd(msg.op)` below) — so the
+   *  Markdown-mode guard here covers all three with no per-surface duplication.
+   *  In markdown mode, an op Markdown can't represent (MD_HIDDEN_OPS — the same
+   *  set buildToolbar() filters the toolbar against) is silently dropped instead
+   *  of reaching the wasm model, so it can never create formatting that would
+   *  vanish unannounced on the next save. Gated on MD_MODE only, so plain .docx
+   *  editing is entirely unaffected. */
   function userCmd(str) {
+    if (MD_MODE && MD_HIDDEN_OPS.has(str)) return;
     cmd(str);
     const op = str.split('\t', 1)[0];
     if (MUTATING.has(op)) {
@@ -426,7 +529,7 @@
     const bar = document.createElement('div');
     bar.id = 'toolbar';
     const SEP = '|';
-    const buttons = [
+    let buttons = [
       ['B', 'bold', 'Bold', 'tb-b'],
       ['I', 'italic', 'Italic', 'tb-i'],
       ['U', 'underline', 'Underline', 'tb-u'],
@@ -446,6 +549,25 @@
       ['A−', 'fontsize\t-2', 'Smaller'],
       ['A+', 'fontsize\t2', 'Larger'],
     ];
+    // Markdown mode can't represent underline, alignment, or font size — the
+    // model round-trips through Markdown text, which has no syntax for them.
+    // Bold/italic/strike, headings, and list ops all survive the md<->docx
+    // conversion, so those stay. (userCmd() below enforces the same set as a
+    // no-op guard, so these ops are unreachable even via keybinding/palette —
+    // hiding the button here is about decluttering, not the only defense.)
+    if (MD_MODE) {
+      buttons = buttons.filter((b) => !(b[1] && MD_HIDDEN_OPS.has(b[1])));
+      // Drop separators left leading or doubled-up by the op filter (checked
+      // against the last *kept* button, not the pre-filter array — two whole
+      // groups, align and font size, are adjacent survivors here, so a
+      // position-indexed check would miss the resulting double separator).
+      buttons = buttons.reduce((acc, b) => {
+        if (b[0] === SEP && (acc.length === 0 || acc[acc.length - 1][0] === SEP)) return acc;
+        acc.push(b);
+        return acc;
+      }, []);
+      if (buttons.length && buttons[buttons.length - 1][0] === SEP) buttons.pop();
+    }
     for (const [label, op, title, cls] of buttons) {
       if (label === SEP) {
         const s = document.createElement('span');

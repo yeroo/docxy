@@ -210,6 +210,12 @@ since it only clears a reference rather than requiring one. `align` accepts
 left/center/right/justify)"` otherwise). **ONE undo checkpoint per call**,
 whether `style`, `align`, or both are given together.
 
+On a `.md` (markdown-editor) tab, `doc.format`'s `underline`/`size` keys and
+`doc.set-style`'s `align` still apply to the live buffer and report success —
+but Markdown has no syntax for underline, alignment, or font size, so the next
+save (`docx_to_md`) silently drops them; an agent formatting a markdown tab
+this way won't see the change survive a save/reload.
+
 ## MCP (native tools in Claude Code)
 
 `docxy --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
