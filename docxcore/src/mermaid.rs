@@ -226,8 +226,12 @@ fn parse(src: &str) -> Diagram {
                    sg_stack: &[usize],
                    subgraphs: &mut Vec<Subgraph>|
      -> usize {
-        let i = if let Some(&i) = index.get(id) {
+        if let Some(&i) = index.get(id) {
             // Upgrade a bare node when a later mention carries a label/shape.
+            // Membership was frozen at creation (below); an existing node's
+            // `subgraph`/membership is never revisited here — otherwise a
+            // node first seen outside any subgraph, then re-mentioned inside
+            // one, would wrongly get claimed by that later subgraph.
             if let Some(l) = label {
                 if !l.is_empty() {
                     nodes[i].label = l.to_string();
@@ -239,6 +243,10 @@ fn parse(src: &str) -> Diagram {
             i
         } else {
             let i = nodes.len();
+            // Freeze membership now, at first mention: the innermost subgraph
+            // open right now (or None if no subgraph is open). This is
+            // decided exactly once, at creation, and never changed again.
+            let sg = sg_stack.last().copied();
             nodes.push(Node {
                 label: label.filter(|l| !l.is_empty()).unwrap_or(id).to_string(),
                 shape: shape.unwrap_or(NodeShape::Rect),
@@ -250,25 +258,14 @@ fn parse(src: &str) -> Diagram {
                 fill: None,
                 stroke: None,
                 text_color: None,
-                subgraph: None,
+                subgraph: sg,
             });
             index.insert(id.to_string(), i);
+            if let Some(sg) = sg {
+                subgraphs[sg].members.push(i);
+            }
             i
-        };
-        // Membership = the innermost subgraph open at first mention: only set
-        // it (and register the node in that subgraph's member list) if not
-        // already set.
-        if let Some(&top) = sg_stack.last() {
-            if nodes[i].subgraph.is_none() {
-                nodes[i].subgraph = Some(top);
-            }
-            if let Some(sg) = nodes[i].subgraph {
-                if !subgraphs[sg].members.contains(&i) {
-                    subgraphs[sg].members.push(i);
-                }
-            }
         }
-        i
     };
 
     for (lineno, raw_line) in src.lines().enumerate() {
@@ -924,7 +921,16 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
         depth
     });
     for si in sg_order {
-        shapes.push_str(&emit_subgraph(&d.subgraphs[si], sid));
+        let g = &d.subgraphs[si];
+        // A subgraph never sized by `layout_subgraphs` (zero members, zero
+        // child subgraphs) is a degenerate box — skip it rather than emit a
+        // zero-area `roundRect` that wastes a shape id. A real subgraph is
+        // always padded to `w>0, h>0`, so `w==0 && h==0` reliably means
+        // "never sized".
+        if g.w == 0 && g.h == 0 {
+            continue;
+        }
+        shapes.push_str(&emit_subgraph(g, sid));
         sid += 1;
     }
 
@@ -1225,6 +1231,10 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
     let subgraphs = d
         .subgraphs
         .iter()
+        // A never-sized subgraph (zero members, zero child subgraphs) stays
+        // at (0,0,0,0); a real subgraph is always padded to `w>0, h>0`, so
+        // filter those out here to match `emit_drawing` skipping them too.
+        .filter(|g| !(g.w == 0 && g.h == 0))
         .map(|g| SubgraphGeom {
             x: g.x,
             y: g.y,
@@ -1669,5 +1679,48 @@ mod tests {
             a.x <= b.x && a.y <= b.y && a.x + a.w >= b.x + b.w && a.y + a.h >= b.y + b.h
         };
         assert!(contains(o, i) || contains(i, o));
+    }
+
+    #[test]
+    fn node_first_seen_outside_stays_outside() {
+        // A is first declared outside any subgraph; a later mention inside S
+        // must NOT retroactively claim it. Against the old
+        // `subgraph.is_none()` "undecided" flag, A's still-`None` field
+        // looked undecided and got reassigned to S on the second mention —
+        // this test fails against that logic and passes against
+        // freeze-at-creation.
+        let src = "flowchart TD\nA-->B\nsubgraph S\nA-->C\nend";
+        let d = parse(src);
+        let a_idx = d.nodes.iter().position(|n| n.label == "A").unwrap();
+        assert_eq!(
+            d.nodes[a_idx].subgraph, None,
+            "A must stay outside every subgraph"
+        );
+        assert_eq!(d.subgraphs.len(), 1);
+        let sg = &d.subgraphs[0];
+        assert!(
+            !sg.members.contains(&a_idx),
+            "S must not claim A as a member: {:?}",
+            sg.members
+        );
+        // C, first seen inside S, is correctly a member.
+        let c_idx = d.nodes.iter().position(|n| n.label == "C").unwrap();
+        assert!(sg.members.contains(&c_idx));
+    }
+
+    #[test]
+    fn empty_subgraph_is_not_emitted() {
+        let src = "flowchart TD\nsubgraph S\nend\nA-->B";
+        let g = geometry(src);
+        assert!(
+            g.subgraphs.is_empty(),
+            "an empty subgraph must not be geometry-visible: {:?}",
+            g.subgraphs
+        );
+        let (xml, _) = to_drawing(src);
+        assert!(
+            !xml.contains("cx=\"0\" cy=\"0\""),
+            "no zero-area container should be emitted: {xml}"
+        );
     }
 }
