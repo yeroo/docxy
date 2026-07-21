@@ -625,6 +625,8 @@ fn layout(d: &mut Diagram) {
         by_rank[node.rank.max(0) as usize].push(i);
     }
 
+    order_ranks(&mut by_rank, d);
+
     // Place each rank. The "cross axis" packs siblings; the "main axis" steps by
     // rank. For TopDown: main = y (rank), cross = x. For LeftRight: swapped.
     let mut main_pos: i64 = 0;
@@ -660,6 +662,70 @@ fn layout(d: &mut Diagram) {
                     cross += h + SIBLING_GAP;
                 }
             }
+        }
+    }
+}
+
+// Reduce edge crossings: alternate down/up sweeps, ordering each rank by the
+// median of its neighbors' positions in the adjacent rank. Stable, bounded.
+fn order_ranks(by_rank: &mut [Vec<usize>], d: &Diagram) {
+    // pos[node] = its current index within its rank.
+    let mut pos = vec![0usize; d.nodes.len()];
+    let sync = |by_rank: &[Vec<usize>], pos: &mut [usize]| {
+        for rank in by_rank {
+            for (i, &n) in rank.iter().enumerate() {
+                pos[n] = i;
+            }
+        }
+    };
+    sync(by_rank, &mut pos);
+    let median = |neighbors: &[usize], pos: &[usize]| -> f64 {
+        if neighbors.is_empty() {
+            return -1.0;
+        }
+        let mut ps: Vec<usize> = neighbors.iter().map(|&n| pos[n]).collect();
+        ps.sort_unstable();
+        let m = ps.len() / 2;
+        if ps.len() % 2 == 1 {
+            ps[m] as f64
+        } else {
+            (ps[m - 1] + ps[m]) as f64 / 2.0
+        }
+    };
+    for sweep in 0..4 {
+        let down = sweep % 2 == 0;
+        let idxs: Vec<usize> = if down {
+            (0..by_rank.len()).collect()
+        } else {
+            (0..by_rank.len()).rev().collect()
+        };
+        for r in idxs {
+            // Neighbors in the adjacent rank toward the sweep source.
+            let mut keyed: Vec<(f64, usize)> = by_rank[r]
+                .iter()
+                .map(|&n| {
+                    let neighbors: Vec<usize> = d
+                        .edges
+                        .iter()
+                        .filter_map(|e| {
+                            if down && e.to == n {
+                                Some(e.from)
+                            } else if !down && e.from == n {
+                                Some(e.to)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (median(&neighbors, &pos), n)
+                })
+                .collect();
+            // Nodes with no neighbor (key -1) keep their relative spot: `sort_by`
+            // is stable, so equal keys (including all the -1s) preserve their
+            // original relative order.
+            keyed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            by_rank[r] = keyed.into_iter().map(|(_, n)| n).collect();
+            sync(by_rank, &mut pos);
         }
     }
 }
@@ -1094,6 +1160,22 @@ fn json_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Count edge crossings given each node's within-rank order index.
+#[cfg(test)]
+fn crossing_count(d: &Diagram, order: &std::collections::HashMap<usize, usize>) -> usize {
+    let mut cross = 0;
+    for (i, e1) in d.edges.iter().enumerate() {
+        for e2 in &d.edges[i + 1..] {
+            let (a1, b1) = (order[&e1.from], order[&e1.to]);
+            let (a2, b2) = (order[&e2.from], order[&e2.to]);
+            if (a1 < a2 && b1 > b2) || (a1 > a2 && b1 < b2) {
+                cross += 1;
+            }
+        }
+    }
+    cross
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1212,36 @@ mod tests {
         assert_eq!(d.nodes[0].rank, 0); // A
         assert_eq!(d.nodes[1].rank, 1); // B
         assert_eq!(d.nodes[2].rank, 2); // C (longest path A→B→C)
+    }
+
+    #[test]
+    fn ordering_reduces_crossings() {
+        // A graph that crosses in naive insertion order.
+        // (Complete bipartite K2,2 between {A,B} and {X,Y} — i.e. all 4 edges
+        // A-X, B-Y, A-Y, B-X present, as in the original brief's example — is
+        // topologically forced to exactly 1 crossing regardless of ordering,
+        // so no algorithm can bring it to 0. This omits A-->X to make 0
+        // crossings reachable while still exercising the reorder; see
+        // task-3-report.md for the derivation.)
+        let mut d = parse("flowchart TD\nB-->Y\nA-->Y\nB-->X");
+        layout(&mut d);
+        // After layout, read each node's within-rank order from its cross coordinate.
+        let mut by_rank: std::collections::HashMap<i32, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, n) in d.nodes.iter().enumerate() {
+            by_rank.entry(n.rank).or_default().push(i);
+        }
+        for v in by_rank.values_mut() {
+            v.sort_by_key(|&i| d.nodes[i].x); // TopDown: cross axis is x
+        }
+        let mut order = std::collections::HashMap::new();
+        for v in by_rank.values() {
+            for (pos, &i) in v.iter().enumerate() {
+                order.insert(i, pos);
+            }
+        }
+        // With reduction, this configuration reaches 0 crossings.
+        assert_eq!(crossing_count(&d, &order), 0);
     }
 
     #[test]
