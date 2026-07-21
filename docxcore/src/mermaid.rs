@@ -429,8 +429,10 @@ fn parse_statement(
 ) {
     // A sequence-style message carries its text after a colon: `A->>B: Hi`. When
     // the part before the colon holds an arrow, treat the tail as the edge label.
-    let (graph_part, msg_label) = match line.split_once(':') {
-        Some((h, t)) if has_arrow(h) => (h, Some(t.trim().to_string())),
+    // The split must land on a standalone `:`, not one that's part of the
+    // `:::className` inline-class operator (e.g. `B --> C[Deploy]:::warn`).
+    let (graph_part, msg_label) = match message_colon(line) {
+        Some(i) if has_arrow(&line[..i]) => (&line[..i], Some(line[i + 1..].trim().to_string())),
         _ => (line, None),
     };
     let edges_before = edges.len();
@@ -483,6 +485,25 @@ fn parse_statement(
 /// Whether a fragment contains a Mermaid link operator.
 fn has_arrow(s: &str) -> bool {
     s.contains("--") || s.contains("->") || s.contains("==") || s.contains(">>")
+}
+
+/// The byte index of the first "standalone" `:` in `line` — one that is not
+/// immediately preceded or followed by another `:`. This excludes colons that
+/// are part of a `::` or `:::` run (the inline-class operator), so only a
+/// real sequence-diagram message separator (`A->>B: Hi`) is matched.
+fn message_colon(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let prev_colon = i > 0 && bytes[i - 1] == b':';
+        let next_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+        if !prev_colon && !next_colon {
+            return Some(i);
+        }
+    }
+    None
 }
 
 enum Seg {
@@ -1608,6 +1629,12 @@ mod tests {
     }
 
     #[test]
+    fn sequence_message_colon_still_parses() {
+        let d = parse("sequenceDiagram\nA->>B: Hello");
+        assert!(d.edges.iter().any(|e| e.label == "Hello"), "{:?}", d.edges);
+    }
+
+    #[test]
     fn non_arrow_dashes_are_not_edges() {
         // A hyphenated label shouldn't be split into an edge.
         let d = parse("graph TD\nA[well-known node]");
@@ -1665,6 +1692,23 @@ mod tests {
         assert_eq!(a.text_color, "FFFFFF");
         let b = g.nodes.iter().find(|n| n.label == "Cold").unwrap();
         assert_eq!(b.fill, "FF99AA"); // via `class B warn`
+    }
+
+    #[test]
+    fn inline_class_on_chained_node_styles_it() {
+        // `:::warn` after a node reached via `-->` (not the first node on the
+        // line) must not be mistaken for a sequence-message colon.
+        let src = "flowchart TD\nclassDef warn fill:#ffffcc\nB --> C[Deploy]:::warn";
+        let g = geometry(src);
+        let deploy = g.nodes.iter().find(|n| n.label == "Deploy").unwrap();
+        assert_eq!(deploy.fill, "FFFFCC");
+        assert!(
+            !g.nodes
+                .iter()
+                .any(|n| n.label.contains("warn") || n.label.contains("::warn")),
+            "phantom node from misparsed :::warn: {:?}",
+            g.nodes
+        );
     }
 
     #[test]

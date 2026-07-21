@@ -14,5 +14,5 @@ flowchart TB
   end
   UI --> DL
   DL --> EFF
-  EFF --> Work
+  EFF --> UI
 ```
