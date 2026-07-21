@@ -262,8 +262,13 @@
 
 ### Task 8: Full verification, CI, docs
 
-> **Status: DONE** (CI verification in flight on PR #30, branch
-> `claude/offxy-jetbrains`). Rust gates green (fmt/clippy/24 workspace test
+> **Status: DONE — CI green** (PR #30, run 29866066365: all six jobs incl.
+> `jetbrains plugin`; a first run failed on gradlew's missing exec bit,
+> fixed via `git update-index --chmod=+x`). Post-merge with origin/main
+> (PRs #28/#29): `docx_ctl` is live, so the agent bridge serves real
+> read/edit verbs; view JSON lines became `{"sp":[…]}` (ViewModel adapted);
+> instance names carry the pid; `doc.undo`/`doc.redo` rejected (IDE-owned
+> undo), `doc.export-pdf` deferred — see agent-control.md "JetBrains tabs". Rust gates green (fmt/clippy/24 workspace test
 > suites); 32 plugin tests green on a forced rerun (fresh property seeds —
 > note: Gradle's build cache replays test results after `clean`, use
 > `--rerun` for fresh seeds). CI: `jetbrains` job in ci.yml; release
