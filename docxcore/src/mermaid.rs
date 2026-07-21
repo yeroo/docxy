@@ -63,9 +63,7 @@ struct Node {
     fill: Option<String>,
     stroke: Option<String>,
     text_color: Option<String>,
-    // Populated by a later task (subgraph containment); read once that task
-    // groups nodes into `Diagram::subgraphs`.
-    #[allow(dead_code)]
+    // The innermost `subgraph` open at this node's first mention, if any.
     subgraph: Option<usize>,
 }
 
@@ -93,11 +91,9 @@ struct Diagram {
 #[derive(Debug, Clone)]
 struct Subgraph {
     title: String,
-    // Populated by a later task (subgraph parsing/nesting); read once that
-    // task assigns node membership and parent/child subgraph relationships.
-    #[allow(dead_code)]
+    // Node indices assigned to this subgraph (its innermost containing block).
     members: Vec<usize>,
-    #[allow(dead_code)]
+    // The immediately-enclosing subgraph, for nesting.
     parent: Option<usize>,
     x: i64,
     y: i64,
@@ -215,21 +211,33 @@ fn parse(src: &str) -> Diagram {
     let mut classdefs: std::collections::HashMap<String, ClassStyle> =
         std::collections::HashMap::new();
     let mut pending: Vec<(String, PendingStyle)> = Vec::new();
+    let mut subgraphs: Vec<Subgraph> = Vec::new();
+    let mut sg_stack: Vec<usize> = Vec::new();
 
-    let mut get =
-        |id: &str, label: Option<&str>, shape: Option<NodeShape>, nodes: &mut Vec<Node>| -> usize {
-            if let Some(&i) = index.get(id) {
-                // Upgrade a bare node when a later mention carries a label/shape.
-                if let Some(l) = label {
-                    if !l.is_empty() {
-                        nodes[i].label = l.to_string();
-                    }
+    // `sg_stack`/`subgraphs` are threaded through as explicit parameters (like
+    // `nodes` already is) rather than captured by the closure — capturing them
+    // would hold a borrow for the closure's whole lifetime, which conflicts
+    // with the main loop's own `sg_stack.push`/`.pop()` on `subgraph`/`end`
+    // lines.
+    let mut get = |id: &str,
+                   label: Option<&str>,
+                   shape: Option<NodeShape>,
+                   nodes: &mut Vec<Node>,
+                   sg_stack: &[usize],
+                   subgraphs: &mut Vec<Subgraph>|
+     -> usize {
+        let i = if let Some(&i) = index.get(id) {
+            // Upgrade a bare node when a later mention carries a label/shape.
+            if let Some(l) = label {
+                if !l.is_empty() {
+                    nodes[i].label = l.to_string();
                 }
-                if let Some(s) = shape {
-                    nodes[i].shape = s;
-                }
-                return i;
             }
+            if let Some(s) = shape {
+                nodes[i].shape = s;
+            }
+            i
+        } else {
             let i = nodes.len();
             nodes.push(Node {
                 label: label.filter(|l| !l.is_empty()).unwrap_or(id).to_string(),
@@ -247,6 +255,21 @@ fn parse(src: &str) -> Diagram {
             index.insert(id.to_string(), i);
             i
         };
+        // Membership = the innermost subgraph open at first mention: only set
+        // it (and register the node in that subgraph's member list) if not
+        // already set.
+        if let Some(&top) = sg_stack.last() {
+            if nodes[i].subgraph.is_none() {
+                nodes[i].subgraph = Some(top);
+            }
+            if let Some(sg) = nodes[i].subgraph {
+                if !subgraphs[sg].members.contains(&i) {
+                    subgraphs[sg].members.push(i);
+                }
+            }
+        }
+        i
+    };
 
     for (lineno, raw_line) in src.lines().enumerate() {
         let line = strip_comment(raw_line).trim();
@@ -269,7 +292,36 @@ fn parse(src: &str) -> Diagram {
             .or_else(|| line.strip_prefix("actor "))
         {
             let (id, label) = participant(rest);
-            get(&id, Some(&label), Some(NodeShape::Round), &mut nodes);
+            get(
+                &id,
+                Some(&label),
+                Some(NodeShape::Round),
+                &mut nodes,
+                &sg_stack,
+                &mut subgraphs,
+            );
+            continue;
+        }
+        // `subgraph [id[Title]]` → open a (possibly nested) container.
+        if let Some(rest) = line.strip_prefix("subgraph") {
+            let title = parse_subgraph_title(rest);
+            let idx = subgraphs.len();
+            subgraphs.push(Subgraph {
+                title,
+                members: Vec::new(),
+                parent: sg_stack.last().copied(),
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            });
+            sg_stack.push(idx);
+            continue;
+        }
+        // `end` → close the innermost open subgraph (a no-op, still consumed,
+        // when not nested — e.g. sequence-diagram `loop`/`alt`/`opt` blocks).
+        if line == "end" {
+            sg_stack.pop();
             continue;
         }
         // `classDef name spec` → register a reusable color style.
@@ -307,7 +359,15 @@ fn parse(src: &str) -> Diagram {
             continue;
         }
         // Parse a (possibly chained) edge sequence, or a lone node declaration.
-        parse_statement(line, &mut nodes, &mut edges, &mut pending, &mut get);
+        parse_statement(
+            line,
+            &mut nodes,
+            &mut edges,
+            &mut pending,
+            &sg_stack,
+            &mut subgraphs,
+            &mut get,
+        );
     }
 
     // Resolve deferred color directives now that every node exists (so forward
@@ -333,8 +393,24 @@ fn parse(src: &str) -> Diagram {
         dir,
         nodes,
         edges,
-        subgraphs: Vec::new(),
+        subgraphs,
     }
+}
+
+/// The title of a `subgraph` line: the text after `subgraph` (already stripped
+/// of the keyword by the caller), with an `id[Title]` wrapper unwrapped if
+/// present; a bare `subgraph` yields an empty title.
+fn parse_subgraph_title(rest: &str) -> String {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return String::new();
+    }
+    if let Some(open) = rest.find('[') {
+        if rest.ends_with(']') {
+            return clean_label(&rest[open + 1..rest.len() - 1]);
+        }
+    }
+    rest.to_string()
 }
 
 /// Parse one statement: `A[x] --> B(y) -->|lbl| C`, or a lone `A[x]`.
@@ -343,7 +419,16 @@ fn parse_statement(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
     pending: &mut Vec<(String, PendingStyle)>,
-    get: &mut impl FnMut(&str, Option<&str>, Option<NodeShape>, &mut Vec<Node>) -> usize,
+    sg_stack: &[usize],
+    subgraphs: &mut Vec<Subgraph>,
+    get: &mut impl FnMut(
+        &str,
+        Option<&str>,
+        Option<NodeShape>,
+        &mut Vec<Node>,
+        &[usize],
+        &mut Vec<Subgraph>,
+    ) -> usize,
 ) {
     // A sequence-style message carries its text after a colon: `A->>B: Hi`. When
     // the part before the colon holds an arrow, treat the tail as the edge label.
@@ -365,7 +450,7 @@ fn parse_statement(
                 if id.is_empty() {
                     continue;
                 }
-                let idx = get(&id, label.as_deref(), shape, nodes);
+                let idx = get(&id, label.as_deref(), shape, nodes, sg_stack, subgraphs);
                 if let Some(name) = class_name {
                     pending.push((id.clone(), PendingStyle::Class(name)));
                 }
@@ -587,8 +672,6 @@ fn is_directive(line: &str) -> bool {
     let l = line.trim();
     l.starts_with("title ")
         || l.starts_with("direction ")
-        || l.starts_with("subgraph")
-        || l == "end"
         || l.starts_with("class ")
         || l.starts_with("style ")
         || l.starts_with("classDef ")
@@ -662,6 +745,61 @@ fn layout(d: &mut Diagram) {
                     cross += h + SIBLING_GAP;
                 }
             }
+        }
+    }
+
+    layout_subgraphs(d);
+}
+
+// Bounding box per subgraph = union of member node rects, padded, with a title
+// band at the top. Process innermost→outermost so nesting stays strict.
+const SG_PAD: i64 = EMU_PER_INCH / 5; // 0.2"
+const SG_TITLE_H: i64 = EMU_PER_INCH / 4; // 0.25"
+fn layout_subgraphs(d: &mut Diagram) {
+    // Order indices by depth (deepest first) so an outer box can include an
+    // inner box that has already been sized.
+    let depth = |mut idx: usize, d: &Diagram| {
+        let mut n = 0;
+        while let Some(p) = d.subgraphs[idx].parent {
+            idx = p;
+            n += 1;
+        }
+        n
+    };
+    let mut order: Vec<usize> = (0..d.subgraphs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(depth(i, d)));
+    for si in order {
+        let mut minx = i64::MAX;
+        let mut miny = i64::MAX;
+        let mut maxx = i64::MIN;
+        let mut maxy = i64::MIN;
+        let mut any = false;
+        // Member nodes.
+        for n in &d.nodes {
+            if n.subgraph == Some(si) {
+                minx = minx.min(n.x);
+                miny = miny.min(n.y);
+                maxx = maxx.max(n.x + n.w);
+                maxy = maxy.max(n.y + n.h);
+                any = true;
+            }
+        }
+        // Child subgraphs already sized.
+        for c in &d.subgraphs {
+            if c.parent == Some(si) {
+                minx = minx.min(c.x);
+                miny = miny.min(c.y);
+                maxx = maxx.max(c.x + c.w);
+                maxy = maxy.max(c.y + c.h);
+                any = true;
+            }
+        }
+        let g = &mut d.subgraphs[si];
+        if any {
+            g.x = minx - SG_PAD;
+            g.y = miny - SG_PAD - SG_TITLE_H;
+            g.w = (maxx - minx) + 2 * SG_PAD;
+            g.h = (maxy - miny) + 2 * SG_PAD + SG_TITLE_H;
         }
     }
 }
@@ -773,7 +911,24 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
     let mut shapes = String::new();
     let mut sid = 2; // 1 is the docPr id
 
-    // Connectors first (drawn beneath nodes).
+    // Subgraph containers first (drawn behind connectors and nodes),
+    // outermost→innermost so an inner box draws on top of its parent.
+    let mut sg_order: Vec<usize> = (0..d.subgraphs.len()).collect();
+    sg_order.sort_by_key(|&i| {
+        let mut idx = i;
+        let mut depth = 0;
+        while let Some(p) = d.subgraphs[idx].parent {
+            idx = p;
+            depth += 1;
+        }
+        depth
+    });
+    for si in sg_order {
+        shapes.push_str(&emit_subgraph(&d.subgraphs[si], sid));
+        sid += 1;
+    }
+
+    // Connectors next (drawn beneath nodes).
     for e in &d.edges {
         shapes.push_str(&emit_connector(d, e, sid));
         sid += 1;
@@ -815,6 +970,7 @@ fn canvas_extent(d: &Diagram) -> (i64, i64) {
         .nodes
         .iter()
         .map(|n| n.x + n.w)
+        .chain(d.subgraphs.iter().map(|g| g.x + g.w))
         .max()
         .unwrap_or(MIN_NODE_W)
         .max(MIN_NODE_W);
@@ -822,10 +978,34 @@ fn canvas_extent(d: &Diagram) -> (i64, i64) {
         .nodes
         .iter()
         .map(|n| n.y + n.h)
+        .chain(d.subgraphs.iter().map(|g| g.y + g.h))
         .max()
         .unwrap_or(NODE_H)
         .max(NODE_H);
     (w, h)
+}
+
+fn emit_subgraph(g: &Subgraph, sid: i32) -> String {
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Group {sid}\"/>\
+         <wps:cNvSpPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"roundRect\"><a:avLst/></a:prstGeom>\
+         <a:solidFill><a:srgbClr val=\"F5F5F5\"/></a:solidFill>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"999999\"/></a:solidFill></a:ln>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"left\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"t\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = g.x,
+        y = g.y,
+        w = g.w,
+        h = g.h,
+        t = xml_escape_text(&g.title),
+    )
 }
 
 fn emit_node(node: &Node, sid: i32) -> String {
@@ -1448,5 +1628,46 @@ mod tests {
     fn non_hex_color_is_ignored() {
         let g = geometry("flowchart TD\nstyle A fill:red\nA-->B");
         assert_eq!(g.nodes[0].fill, "DAE8FC"); // named color ignored → default
+    }
+
+    #[test]
+    fn subgraph_box_contains_members() {
+        let src = "flowchart TD\n\
+            subgraph Group One\n\
+            A[Alpha] --> B[Beta]\n\
+            end\n\
+            B --> C[Gamma]";
+        let g = geometry(src);
+        assert_eq!(g.subgraphs.len(), 1);
+        let sg = &g.subgraphs[0];
+        assert_eq!(sg.title, "Group One");
+        // Box encloses A and B, excludes C.
+        let a = g.nodes.iter().find(|n| n.label == "Alpha").unwrap();
+        let b = g.nodes.iter().find(|n| n.label == "Beta").unwrap();
+        assert!(sg.x <= a.x && sg.y <= a.y);
+        assert!(sg.x + sg.w >= b.x + b.w && sg.y + sg.h >= b.y + b.h);
+    }
+
+    #[test]
+    fn subgraph_emits_container_shape() {
+        let (xml, _) = to_drawing("flowchart TD\nsubgraph S\nA-->B\nend");
+        assert!(xml.contains("roundRect"), "{xml}"); // container (or round nodes)
+        assert!(
+            xml.contains(">S<") || xml.contains("preserve\">S"),
+            "title missing: {xml}"
+        );
+    }
+
+    #[test]
+    fn nested_subgraphs_nest() {
+        let src = "flowchart TD\nsubgraph Outer\nsubgraph Inner\nA-->B\nend\nend";
+        let g = geometry(src);
+        assert_eq!(g.subgraphs.len(), 2);
+        // One box strictly contains the other.
+        let (o, i) = (&g.subgraphs[0], &g.subgraphs[1]);
+        let contains = |a: &SubgraphGeom, b: &SubgraphGeom| {
+            a.x <= b.x && a.y <= b.y && a.x + a.w >= b.x + b.w && a.y + a.h >= b.y + b.h
+        };
+        assert!(contains(o, i) || contains(i, o));
     }
 }
