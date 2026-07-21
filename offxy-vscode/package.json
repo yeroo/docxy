@@ -49,6 +49,16 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "offxy.markdownEditor",
+        "displayName": "Docxy Markdown",
+        "selector": [
+          {
+            "filenamePattern": "*.md"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "commands": [
@@ -110,6 +120,7 @@
     "typecheck": "tsc --noEmit",
     "test:mcp-parity": "node mcp/parity.test.mjs",
     "test:grid-layout": "node media/grid.layout.test.mjs",
+    "test:md-roundtrip": "node media/markdown-roundtrip.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

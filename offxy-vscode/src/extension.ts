@@ -41,8 +41,23 @@ interface EditorSpec {
    *  file's basename before display. */
   emptyPrompt?: string;
   /** Mint a fresh empty document's bytes for the empty-file create flow (both
-   *  the open-time modal and the webview's in-tab `createNew` message). */
+   *  the open-time modal and the webview's in-tab `createNew` message). These
+   *  are webview-native bytes (docx, for both the docx and markdown editors) —
+   *  when writing them to disk as a new file's initial content, route through
+   *  `toFileBytes` first (see `seedNewDocument`). */
   mintEmpty?: (context: vscode.ExtensionContext) => Promise<Uint8Array>;
+  /** Convert on-disk file bytes into the bytes the webview `docx_open`s.
+   *  Default identity (the file already holds the editor's native bytes).
+   *  The markdown editor uses this to turn `.md` text into in-memory docx
+   *  bytes via `markdownToDocx` — no `.docx` file is ever written. */
+  fromFileBytes?: (raw: Uint8Array, ctx: vscode.ExtensionContext) => Promise<Uint8Array>;
+  /** Convert the webview's saved bytes (docx) back to the on-disk file bytes.
+   *  Default identity. The markdown editor uses this to turn the edited docx
+   *  model back into markdown text via `docxToMarkdown`. */
+  toFileBytes?: (webviewBytes: Uint8Array, ctx: vscode.ExtensionContext) => Promise<Uint8Array>;
+  /** When true, the webview runs in markdown mode (constrained toolbar +
+   *  checkbox rendering); passed to the webview via `window.__OFFXY__`. */
+  markdown?: boolean;
   /** Agent control-surface identity for this editor's tabs: which terminal
    *  app they masquerade as on the ctl wire (`docs/agent-control.md`), plus
    *  the wasm verb sets `CtlServer` needs — which verbs route to
@@ -55,6 +70,72 @@ interface EditorSpec {
   };
 }
 
+/** The docx editor's agent control-surface identity (see `EditorSpec.ctl`),
+ *  hoisted out of `EDITORS` so the markdown editor spec below can clone it
+ *  (new `Set` instances) without a self-referential `EDITORS[0].ctl` read
+ *  during `EDITORS`'s own initializer — `EDITORS` isn't assigned yet at that
+ *  point (TDZ), so that read would throw at module-load time. */
+const DOCX_CTL: EditorSpec['ctl'] = {
+  app: 'docxy',
+  // 'doc.blocks' is deliberately NOT in this set: it's an internal-only
+  // verb `fullPathInfo()` calls directly (bypassing this gate), used to
+  // compose `doc.path`'s reply. Terminal docxy's control.rs has no
+  // `doc.blocks` arm, so exposing it here to external agents would let a
+  // VS Code tab answer a verb a terminal instance rejects as "unknown
+  // verb" — breaking "indistinguishable from a terminal instance".
+  //
+  // 'doc.export-pdf' is also deliberately absent: `CtlServer` special-cases
+  // it (host-assisted write; see `CtlServer.exportPdf`) ahead of this gate,
+  // so it's reachable without being listed here — listing it would route it
+  // through the plain wasm pass-through, which returns internal `pdfBase64`
+  // instead of writing the file.
+  wasmVerbs: new Set([
+    'doc.outline',
+    'doc.read',
+    'doc.find',
+    'doc.replace-range',
+    'doc.insert',
+    'doc.append',
+    // Wave-1 read verbs (no repaint, no edit event).
+    'doc.export',
+    'doc.comments',
+    'doc.notes',
+    'doc.header',
+    'doc.footer',
+    'doc.metadata',
+    'doc.stats',
+    // Wave-1 mutating verbs.
+    'doc.replace-all',
+    'doc.undo',
+    'doc.redo',
+    // Wave-3 mutating verbs (block-range formatting).
+    'doc.format',
+    'doc.set-style',
+  ]),
+  mutatingVerbs: new Set([
+    'doc.replace-range',
+    'doc.insert',
+    'doc.append',
+    // 'doc.replace-all' fires an edit event only when it actually replaced
+    // something: `handleLine`'s no-op gate skips firing when undoSteps is 0
+    // (a zero-match run — the wasm leaves no undo checkpoint), so no dead
+    // undo entry lands and the doc isn't dirtied. A real replace (undoSteps
+    // >0) takes the bucket-A `undoSteps` replay path in `onMutated`.
+    // 'doc.undo'/'redo' take the inverse-wasm-op adaptation (onMutated
+    // Case 1); `handleLine` skips firing them entirely when `{done:false}`.
+    'doc.replace-all',
+    'doc.undo',
+    'doc.redo',
+    // Wave-3: doc.format/doc.set-style land ONE true wasm-undo-stack
+    // checkpoint each (agent::format_range/set_style_range push exactly
+    // one, same mechanism doc.insert/append/replace-all use) — bucket A,
+    // default steps=1 (neither carries an undoSteps field on the wire;
+    // see docxwasm's ctl_format/ctl_set_style doc comments).
+    'doc.format',
+    'doc.set-style',
+  ]),
+};
+
 const EDITORS: EditorSpec[] = [
   {
     viewType: 'offxy.docxEditor',
@@ -65,65 +146,28 @@ const EDITORS: EditorSpec[] = [
     emptyPrompt:
       '“{name}” is empty — it isn\'t a Word document yet. Create a new Word document in its place?',
     mintEmpty: (ctx) => markdownToDocx(ctx, ''),
+    ctl: DOCX_CTL,
+  },
+  {
+    viewType: 'offxy.markdownEditor',
+    label: 'Markdown document',
+    script: 'webview.js',
+    style: 'webview.css',
+    wasm: 'docxwasm.wasm',
+    markdown: true,
+    emptyPrompt:
+      '“{name}” is empty. Start a new Markdown document here?',
+    // Empty md file → an empty docx model for the webview.
+    mintEmpty: (ctx) => markdownToDocx(ctx, ''),
+    // `.md` text on disk  <->  in-memory docx bytes for the webview.
+    fromFileBytes: (raw, ctx) => markdownToDocx(ctx, new TextDecoder().decode(raw)),
+    toFileBytes: async (bytes, ctx) => new TextEncoder().encode(await docxToMarkdown(ctx, bytes)),
+    // Same docxy control surface as the docx editor (below), but with its own
+    // `Set` instances — the two editors must not share mutable Set references.
     ctl: {
       app: 'docxy',
-      // 'doc.blocks' is deliberately NOT in this set: it's an internal-only
-      // verb `fullPathInfo()` calls directly (bypassing this gate), used to
-      // compose `doc.path`'s reply. Terminal docxy's control.rs has no
-      // `doc.blocks` arm, so exposing it here to external agents would let a
-      // VS Code tab answer a verb a terminal instance rejects as "unknown
-      // verb" — breaking "indistinguishable from a terminal instance".
-      //
-      // 'doc.export-pdf' is also deliberately absent: `CtlServer` special-cases
-      // it (host-assisted write; see `CtlServer.exportPdf`) ahead of this gate,
-      // so it's reachable without being listed here — listing it would route it
-      // through the plain wasm pass-through, which returns internal `pdfBase64`
-      // instead of writing the file.
-      wasmVerbs: new Set([
-        'doc.outline',
-        'doc.read',
-        'doc.find',
-        'doc.replace-range',
-        'doc.insert',
-        'doc.append',
-        // Wave-1 read verbs (no repaint, no edit event).
-        'doc.export',
-        'doc.comments',
-        'doc.notes',
-        'doc.header',
-        'doc.footer',
-        'doc.metadata',
-        'doc.stats',
-        // Wave-1 mutating verbs.
-        'doc.replace-all',
-        'doc.undo',
-        'doc.redo',
-        // Wave-3 mutating verbs (block-range formatting).
-        'doc.format',
-        'doc.set-style',
-      ]),
-      mutatingVerbs: new Set([
-        'doc.replace-range',
-        'doc.insert',
-        'doc.append',
-        // 'doc.replace-all' fires an edit event only when it actually replaced
-        // something: `handleLine`'s no-op gate skips firing when undoSteps is 0
-        // (a zero-match run — the wasm leaves no undo checkpoint), so no dead
-        // undo entry lands and the doc isn't dirtied. A real replace (undoSteps
-        // >0) takes the bucket-A `undoSteps` replay path in `onMutated`.
-        // 'doc.undo'/'redo' take the inverse-wasm-op adaptation (onMutated
-        // Case 1); `handleLine` skips firing them entirely when `{done:false}`.
-        'doc.replace-all',
-        'doc.undo',
-        'doc.redo',
-        // Wave-3: doc.format/doc.set-style land ONE true wasm-undo-stack
-        // checkpoint each (agent::format_range/set_style_range push exactly
-        // one, same mechanism doc.insert/append/replace-all use) — bucket A,
-        // default steps=1 (neither carries an undoSteps field on the wire;
-        // see docxwasm's ctl_format/ctl_set_style doc comments).
-        'doc.format',
-        'doc.set-style',
-      ]),
+      wasmVerbs: new Set(DOCX_CTL.wasmVerbs),
+      mutatingVerbs: new Set(DOCX_CTL.mutatingVerbs),
     },
   },
   {
@@ -552,11 +596,33 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
 
   // --- document lifecycle ---------------------------------------------------
 
+  /** Convert on-disk bytes into the webview-native bytes `document.initialContent`
+   *  holds (identity unless `spec.fromFileBytes` is set). A genuinely empty file
+   *  (0 bytes — the "new file" case) is passed through as-is, NOT run through
+   *  the transform: `openInWebview`'s empty-file detection
+   *  (`document.initialContent.length === 0`) drives the create/mint prompt, and
+   *  `markdownToDocx(ctx, '')` produces non-empty docx bytes — running it here
+   *  unconditionally would hide every empty `.md` from that prompt. */
+  private async fromDisk(raw: Uint8Array): Promise<Uint8Array> {
+    if (raw.length === 0 || !this.spec.fromFileBytes) {
+      return raw;
+    }
+    return this.spec.fromFileBytes(raw, this.context);
+  }
+
+  /** Convert the webview's saved bytes (always webview-native, e.g. docx) into
+   *  the bytes actually written to disk (identity unless `spec.toFileBytes` is
+   *  set — the markdown editor's docx-bytes-to-markdown-text conversion). */
+  private async toDisk(bytes: Uint8Array): Promise<Uint8Array> {
+    return this.spec.toFileBytes ? this.spec.toFileBytes(bytes, this.context) : bytes;
+  }
+
   async openCustomDocument(uri: vscode.Uri): Promise<BinaryDocument> {
-    const content =
+    const raw =
       uri.scheme === 'untitled'
         ? new Uint8Array()
         : await vscode.workspace.fs.readFile(uri);
+    const content = await this.fromDisk(raw);
     return new BinaryDocument(uri, content);
   }
 
@@ -654,7 +720,8 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
       },
 
       reload: async () => {
-        const bytes = await vscode.workspace.fs.readFile(document.uri);
+        const raw = await vscode.workspace.fs.readFile(document.uri);
+        const bytes = await this.fromDisk(raw);
         document.initialContent = bytes;
         document.panel?.webview.postMessage({
           type: 'open',
@@ -948,14 +1015,18 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     });
   }
 
-  /** Mint a fresh empty document and write it over the (empty) file. */
+  /** Mint a fresh empty document and write it over the (empty) file.
+   *  `mintEmpty` always returns webview-native bytes (docx) — `document.initialContent`
+   *  takes those directly (it's what `openInWebview` hands the webview), but the
+   *  on-disk write goes through `toDisk` so the markdown editor writes an empty
+   *  `.md` (not docx bytes) as the new file's content. */
   private async seedNewDocument(document: BinaryDocument): Promise<void> {
     if (!this.spec.mintEmpty) {
       return;
     }
     const bytes = await this.spec.mintEmpty(this.context);
     if (document.uri.scheme !== 'untitled') {
-      await vscode.workspace.fs.writeFile(document.uri, bytes);
+      await vscode.workspace.fs.writeFile(document.uri, await this.toDisk(bytes));
     }
     document.initialContent = bytes;
   }
@@ -1045,11 +1116,13 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
 
   private async saveAs(document: BinaryDocument, target: vscode.Uri): Promise<void> {
     const bytes = await document.requestBytes();
-    await vscode.workspace.fs.writeFile(target, bytes);
+    await vscode.workspace.fs.writeFile(target, await this.toDisk(bytes));
   }
 
   async revertCustomDocument(document: BinaryDocument): Promise<void> {
-    const bytes = await vscode.workspace.fs.readFile(document.uri);
+    const raw = await vscode.workspace.fs.readFile(document.uri);
+    const bytes = await this.fromDisk(raw);
+    document.initialContent = bytes;
     document.panel?.webview.postMessage({
       type: 'open',
       data: Buffer.from(bytes).toString('base64'),
@@ -1062,7 +1135,7 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     _cancellation: vscode.CancellationToken,
   ): Promise<vscode.CustomDocumentBackup> {
     const bytes = await document.requestBytes();
-    await vscode.workspace.fs.writeFile(ctx.destination, bytes);
+    await vscode.workspace.fs.writeFile(ctx.destination, await this.toDisk(bytes));
     return {
       id: ctx.destination.toString(),
       delete: async () => {
@@ -1107,7 +1180,7 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
 <body>
   <div id="doc" tabindex="0" aria-label="Document" spellcheck="false"></div>
   <div id="status" role="status"></div>
-  <script nonce="${nonce}">window.__OFFXY__ = { wasmUri: "${wasmUri}" };</script>
+  <script nonce="${nonce}">window.__OFFXY__ = { wasmUri: "${wasmUri}", markdown: ${this.spec.markdown === true} };</script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
