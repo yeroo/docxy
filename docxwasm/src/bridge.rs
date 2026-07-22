@@ -1118,10 +1118,78 @@ impl Session {
         save_package(&self.pkg)
     }
 
+    /// Like [`Session::save`], but first replaces every mermaid diagram in the
+    /// saved copy of the document with a Word-native picture, embedding
+    /// webview-rendered image bytes via [`docxcore::mermaid_embed::embed_images`].
+    ///
+    /// `images_json` is a JSON array of
+    /// `{"source":string,"pngOff":int,"pngLen":int,"svgOff":int,"svgLen":int,"wEmu":int,"hEmu":int}`
+    /// — each entry's PNG/SVG bytes are a slice of the two concatenated blobs
+    /// (`png_blob`/`svg_blob`), keeping the wire format to one JSON string plus
+    /// two flat byte buffers rather than duplicating image bytes into JSON. A
+    /// malformed or out-of-range entry is skipped rather than panicking; an
+    /// empty/`"[]"` array embeds nothing, so the result equals `save()`.
+    ///
+    /// The live, on-screen document (`self.editor.doc`) is left untouched —
+    /// only a clone is embedded into and serialized — so the SmartArt shapes
+    /// keep rendering in the editor after this call; only the returned bytes
+    /// carry pictures.
+    pub fn save_with_mermaid_images(
+        &mut self,
+        images_json: &str,
+        png_blob: &[u8],
+        svg_blob: &[u8],
+    ) -> Vec<u8> {
+        let images = parse_mermaid_images(images_json, png_blob, svg_blob);
+        let mut doc = self.editor.doc.clone();
+        docxcore::mermaid_embed::embed_images(&mut self.pkg, &mut doc, &images);
+        self.pkg.document = doc;
+        self.dirty = false;
+        save_package(&self.pkg)
+    }
+
     #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+}
+
+/// Parse `save_with_mermaid_images`'s `images_json` descriptor array into
+/// [`docxcore::mermaid_embed::MermaidImage`]s, slicing each entry's PNG/SVG
+/// bytes out of the two concatenated blobs. Entries with a missing/wrong-typed
+/// field, or an out-of-range `off`/`len` pair, are skipped rather than
+/// panicking — a bad descriptor just leaves that one diagram un-embedded.
+fn parse_mermaid_images(
+    images_json: &str,
+    png_blob: &[u8],
+    svg_blob: &[u8],
+) -> Vec<docxcore::mermaid_embed::MermaidImage> {
+    let Ok(json::Json::Arr(items)) = json::Json::parse(images_json) else {
+        return Vec::new();
+    };
+    // A valid `off..off+len` sub-slice of `blob`, or `None` if malformed/OOB.
+    fn slice(blob: &[u8], off: Option<usize>, len: Option<usize>) -> Option<&[u8]> {
+        let (off, len) = (off?, len?);
+        let end = off.checked_add(len)?;
+        blob.get(off..end)
+    }
+    items
+        .iter()
+        .filter_map(|item| {
+            let source = item.get_str("source")?.to_string();
+            let png = slice(png_blob, item.get_usize("pngOff"), item.get_usize("pngLen"))?.to_vec();
+            let svg = slice(svg_blob, item.get_usize("svgOff"), item.get_usize("svgLen"))?.to_vec();
+            let w_emu = item.get("wEmu")?.as_i64()?;
+            let h_emu = item.get("hEmu")?.as_i64()?;
+            Some(docxcore::mermaid_embed::MermaidImage {
+                source,
+                png,
+                svg,
+                w_emu,
+                h_emu,
+            })
+        })
+        .collect()
 }
 
 /// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
@@ -1378,6 +1446,54 @@ mod tests {
         let mut s2 = Session::open(&out).expect("reopen");
         let v = s2.view_json(None);
         assert!(v.contains("Zabc"), "edit not persisted: {v}");
+    }
+
+    #[test]
+    fn save_with_images_embeds_and_round_trips() {
+        let doc = docxcore::markdown::from_markdown("```mermaid\nflowchart TD\nA-->B\n```\n");
+        let bytes = save_package(&docxcore::package::new_markdown_package(doc));
+        let mut s = Session::open(&bytes).expect("open");
+        let json = r#"[{"source":"flowchart TD\nA-->B","pngOff":0,"pngLen":4,"svgOff":0,"svgLen":6,"wEmu":3000000,"hEmu":1500000}]"#;
+        let out = s.save_with_mermaid_images(json, &[0x89, 0x50, 0x4E, 0x47], b"<svg/>");
+        assert!(
+            !s.is_dirty(),
+            "dirty should clear after save_with_mermaid_images"
+        );
+
+        // Saved package embeds a picture; source survives a reload.
+        let reloaded = load_package(&out).expect("reload");
+        assert!(
+            docxcore::markdown::to_markdown(&reloaded.document).contains("flowchart TD"),
+            "mermaid source did not survive the embed round-trip"
+        );
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains("svgBlip"), "expected embedded svgBlip");
+        assert!(out_str.contains("pic:pic"), "expected embedded pic:pic");
+
+        // A plain save() is unchanged: the live doc still holds the SmartArt
+        // shape, not a picture, so no image path leaks into it.
+        let plain = s.save();
+        assert!(
+            !String::from_utf8_lossy(&plain).contains("svgBlip"),
+            "plain save() must not carry the embedded image"
+        );
+    }
+
+    #[test]
+    fn save_with_images_empty_array_equals_plain_save() {
+        let doc = docxcore::markdown::from_markdown("```mermaid\nflowchart TD\nA-->B\n```\n");
+        let bytes = save_package(&docxcore::package::new_markdown_package(doc.clone()));
+
+        let mut s1 = Session::open(&bytes).expect("open");
+        let via_empty = s1.save_with_mermaid_images("[]", &[], &[]);
+
+        let mut s2 = Session::open(&bytes).expect("open");
+        let via_plain = s2.save();
+
+        assert_eq!(
+            via_empty, via_plain,
+            "an empty images array must behave exactly like save()"
+        );
     }
 
     #[test]
