@@ -291,22 +291,29 @@ fn parse_participant(st: &mut ParseState, rest: &str) {
 
 /// Finds a standalone word `word` in `s` (surrounded by whitespace),
 /// returning the byte index where it starts.
+///
+/// UTF-8 safe: only ever slices `s` at indices produced by `char_indices`
+/// (always valid start boundaries) after confirming the candidate's end
+/// index is also a char boundary, so this never panics on multi-byte input
+/// (e.g. `participant 中 as 日本語`).
 fn find_word(s: &str, word: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
     let wlen = word.len();
-    if wlen == 0 || bytes.len() < wlen {
+    if wlen == 0 || s.len() < wlen {
         return None;
     }
-    let mut i = 0usize;
-    while i + wlen <= bytes.len() {
-        if s[i..i + wlen].eq_ignore_ascii_case(word) {
-            let before_ok = i == 0 || s.as_bytes()[i - 1].is_ascii_whitespace();
-            let after_ok = i + wlen == bytes.len() || s.as_bytes()[i + wlen].is_ascii_whitespace();
+    for (i, _) in s.char_indices() {
+        let end = i + wlen;
+        if end > s.len() || !s.is_char_boundary(end) {
+            continue;
+        }
+        if s[i..end].eq_ignore_ascii_case(word) {
+            let before_ok = i == 0 || s[..i].chars().next_back().is_some_and(char::is_whitespace);
+            let after_ok =
+                end == s.len() || s[end..].chars().next().is_some_and(char::is_whitespace);
             if before_ok && after_ok {
                 return Some(i);
             }
         }
-        i += 1;
     }
     None
 }
@@ -460,5 +467,25 @@ mod tests {
     #[test]
     fn parse_is_total_on_garbage() {
         let _ = parse("sequenceDiagram\nend\nelse\n->> :\nNote over ZZ");
+    }
+
+    #[test]
+    fn participant_label_with_multibyte_unicode() {
+        let d =
+            parse("sequenceDiagram\nparticipant U as José\nparticipant 中 as 日本語\nU->>中: msg");
+        assert_eq!(d.participants.len(), 2);
+        assert_eq!(d.participants[0].id, "U");
+        assert_eq!(d.participants[0].label, "José");
+        assert_eq!(d.participants[1].id, "中");
+        assert_eq!(d.participants[1].label, "日本語");
+        assert_eq!(d.messages.len(), 1);
+        assert_eq!(d.messages[0].from, 0);
+        assert_eq!(d.messages[0].to, 1);
+        assert_eq!(d.messages[0].text, "msg");
+    }
+
+    #[test]
+    fn parse_is_total_on_multibyte_tokens() {
+        let _ = parse("sequenceDiagram\nparticipant 🚀\nNote over 🚀: café\n");
     }
 }
