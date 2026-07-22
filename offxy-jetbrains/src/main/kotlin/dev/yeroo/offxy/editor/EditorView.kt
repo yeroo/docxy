@@ -50,6 +50,8 @@ class EditorView(
     private val highlighters = ArrayList<RangeHighlighter>()
     private val imageCache = HashMap<String, Image?>()
 
+    private var snapping = false
+
     init {
         editor.settings.apply {
             isLineNumbersShown = false
@@ -60,6 +62,77 @@ class EditorView(
             additionalLinesCount = 1
             isAdditionalPageAtBottom = false
         }
+        // The platform's default guarded-block rejection pops a modal error
+        // dialog from inside a write action (AWT-in-write-action assertion in
+        // 2024.2). Replace it with a quiet, deferred hint.
+        com.intellij.openapi.editor.actionSystem.EditorActionManager.getInstance()
+            .setReadonlyFragmentModificationHandler(document) {
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    if (!editor.isDisposed) {
+                        com.intellij.codeInsight.hint.HintManager.getInstance()
+                            .showInformationHint(editor, "Document structure — text can't go here")
+                    }
+                }
+            }
+        // Decorations are selectable (copying a table as text must work) but
+        // the caret never RESTS on them: with no active selection, a caret
+        // landing inside a guard gap or on a decoration-only line snaps to
+        // the nearest editable position in its direction of travel.
+        editor.caretModel.addCaretListener(object : com.intellij.openapi.editor.event.CaretListener {
+            override fun caretPositionChanged(event: com.intellij.openapi.editor.event.CaretEvent) {
+                if (snapping || suppressListener) return
+                if (editor.selectionModel.hasSelection()) return
+                val v = view ?: return
+                val caret = event.caret ?: return
+                val target = snapTarget(v, event.newPosition, event.oldPosition) ?: return
+                snapping = true
+                try {
+                    caret.moveToOffset(target)
+                } finally {
+                    snapping = false
+                }
+            }
+        })
+    }
+
+    /** Nearest editable offset for a caret at [pos], or null if it's fine.
+     *  Direction of travel (from [old]) decides which side to snap to. */
+    private fun snapTarget(
+        v: ViewModel,
+        pos: com.intellij.openapi.editor.LogicalPosition,
+        old: com.intellij.openapi.editor.LogicalPosition?,
+    ): Int? {
+        if (pos.line >= v.lineCount()) return null
+        val goingDown = old == null || pos.line >= old.line
+        var line = pos.line
+        var lineSegs = v.segs.getOrNull(line) ?: return null
+        if (lineSegs.isEmpty()) {
+            // Decoration-only line (table rule, image row): hop to the nearest
+            // line with editable text, first in the travel direction.
+            val step = if (goingDown) 1 else -1
+            var l = line
+            while (l in v.segs.indices && v.segs[l].isEmpty()) l += step
+            if (l !in v.segs.indices) {
+                l = line
+                while (l in v.segs.indices && v.segs[l].isEmpty()) l -= step
+                if (l !in v.segs.indices) return null
+            }
+            line = l
+            lineSegs = v.segs[line]
+        }
+        val col = pos.column
+        // Caret positions on the boundary of a seg (start, or one past the
+        // last char) are legitimate resting places.
+        if (line == pos.line && lineSegs.any { col >= it.first && col <= it.last + 1 }) return null
+        val seg = lineSegs.minByOrNull { seg ->
+            when {
+                col < seg.first -> seg.first - col
+                col > seg.last + 1 -> col - (seg.last + 1)
+                else -> 0
+            }
+        } ?: return null
+        val targetCol = col.coerceIn(seg.first, seg.last + 1)
+        return v.gridToOffset(line, targetCol)
     }
 
     fun currentView(): ViewModel? = view
@@ -69,6 +142,21 @@ class EditorView(
         selfWrite { document.setText(v.text) }
         this.view = v
         applyMarkup(v)
+        ensureCaretOffDecorations()
+    }
+
+    /** Snap the caret out of decorations right now (no movement event needed —
+     *  covers the freshly-opened document whose caret starts at offset 0). */
+    fun ensureCaretOffDecorations() {
+        val v = view ?: return
+        if (editor.selectionModel.hasSelection()) return
+        val target = snapTarget(v, editor.caretModel.logicalPosition, null) ?: return
+        snapping = true
+        try {
+            editor.caretModel.moveToOffset(target)
+        } finally {
+            snapping = false
+        }
     }
 
     /**
