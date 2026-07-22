@@ -71,10 +71,15 @@ section of [agent-control.md](../docs/agent-control.md#jetbrains-tabs).
 
 ## Install
 
-Grab `offxy-jetbrains-<version>.zip` from the
+**JetBrains Marketplace** (once the listing is approved): Settings →
+Plugins → Marketplace → search **“Offxy”** → Install.
+
+**From disk:** grab `offxy-jetbrains-<version>.zip` from the
 [releases](https://github.com/yeroo/docxy/releases) page, then in your IDE:
-**Settings → Plugins → ⚙ → Install Plugin from Disk…** Requires any
-IntelliJ-platform IDE 2024.2 or newer (IDEA, PyCharm, WebStorm, …).
+**Settings → Plugins → ⚙ → Install Plugin from Disk…**
+
+Requires any IntelliJ-platform IDE 2024.2 or newer (IDEA, PyCharm,
+WebStorm, …).
 
 ## Build from source
 

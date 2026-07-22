@@ -3,14 +3,36 @@
     <name>Offxy</name>
     <vendor url="https://github.com/yeroo/docxy">yeroo</vendor>
     <description><![CDATA[
-        Native Word <code>.docx</code> editor for JetBrains IDEs — no webview,
-        no Microsoft Office. The document engine is the dependency-free
-        <a href="https://github.com/yeroo/docxy">docxy</a> Rust core
-        (parse &rarr; render &rarr; edit &rarr; lossless save), compiled to
-        WebAssembly and executed on the JVM. Open documents advertise on the
-        docxy agent-control protocol, so AI assistants (Claude Code, Junie)
-        can read and edit them live.
+        <p><b>Native Word (.docx) and Excel (.xlsx) editors</b> for JetBrains
+        IDEs &mdash; no webview, no Microsoft Office, no native binaries. The
+        engines are the dependency-free
+        <a href="https://github.com/yeroo/docxy">docxy</a> Rust cores
+        (parse &rarr; render &rarr; edit &rarr; <b>lossless save</b>),
+        compiled to WebAssembly and executed on the JVM by Chicory.</p>
+        <p><b>Word:</b> documents render in a real IDE editor over a live,
+        editable buffer &mdash; native typing speed on any document size,
+        styles/tables/lists/images, guarded document structure, platform
+        find and undo, a formatting toolbar, TOC navigation, and
+        Markdown &harr; docx conversion.</p>
+        <p><b>Excel:</b> a virtualized grid over a windowed viewport
+        protocol &mdash; formulas with live recalculation, a formula bar,
+        number formats, insert/delete rows and columns with reference
+        rewriting, sheets, TSV clipboard, and one-transaction-one-undo.</p>
+        <p><b>AI-assistant ready:</b> every open tab advertises on the
+        <a href="https://github.com/yeroo/docxy/blob/main/docs/agent-control.md">agent
+        control surface</a>, so Claude Code, Junie, or any MCP client can
+        read and edit live documents &mdash; each agent edit is one Ctrl+Z
+        away.</p>
+        <p>Saving preserves everything the editors don't model,
+        byte-for-byte &mdash; your document's structure survives the
+        round-trip.</p>
     ]]></description>
+    <change-notes><![CDATA[
+        <p>0.1.0 &mdash; initial release: native docx editor (editable
+        IDE buffer over the docxy engine), native xlsx grid editor
+        (formulas, formatting, structural edits), agent control surface
+        for AI assistants.</p>
+    ]]></change-notes>
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">

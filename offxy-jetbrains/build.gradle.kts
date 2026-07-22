@@ -42,9 +42,23 @@ intellijPlatform {
         id = "dev.yeroo.offxy"
         name = "Offxy"
         version = project.version.toString()
+        vendor {
+            name = "yeroo"
+            url = "https://github.com/yeroo/docxy"
+        }
         ideaVersion {
             sinceBuild = "242"
             untilBuild = provider { null }
+        }
+    }
+    // First Marketplace upload is manual (web UI); afterwards
+    // `./gradlew publishPlugin` pushes updates with a permanent token.
+    publishing {
+        token = providers.environmentVariable("JETBRAINS_MARKETPLACE_TOKEN")
+    }
+    pluginVerification {
+        ides {
+            recommended()
         }
     }
 }

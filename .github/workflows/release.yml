@@ -168,6 +168,21 @@ jobs:
         with:
           files: offxy-jetbrains/build/distributions/*.zip
 
+      - name: Publish to JetBrains Marketplace
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+        working-directory: offxy-jetbrains
+        # The FIRST upload must be manual (Marketplace rule); this step keeps
+        # subsequent tagged releases in sync. Skips cleanly when the token
+        # secret isn't configured — same stance as the crates.io publish.
+        run: |
+          if [ -z "${JETBRAINS_MARKETPLACE_TOKEN:-}" ]; then
+            echo "JETBRAINS_MARKETPLACE_TOKEN not set — skipping Marketplace publish."
+            exit 0
+          fi
+          ./gradlew publishPlugin --no-daemon
+
   publish:
     name: publish to crates.io
     needs: build
