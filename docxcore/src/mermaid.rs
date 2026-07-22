@@ -175,6 +175,13 @@ pub fn to_drawing(src: &str) -> (String, Vec<String>) {
 /// The node labels of a Mermaid source, in declaration order — used to fill the
 /// terminal box when a generated diagram is reloaded from a `.docx`.
 pub fn labels(src: &str) -> Vec<String> {
+    if crate::mermaid_seq::is_sequence(src) {
+        return crate::mermaid_seq::parse(src)
+            .participants
+            .iter()
+            .map(|p| p.label.clone())
+            .collect();
+    }
     parse(src).nodes.into_iter().map(|n| n.label).collect()
 }
 
@@ -2238,5 +2245,24 @@ mod tests {
         assert!(json.contains("\"kind\":\"sequence\""));
         let (_, _, fj) = geometry_box("flowchart TD\nA-->B");
         assert!(fj.contains("\"nodes\":[")); // flowchart geometry
+    }
+
+    #[test]
+    fn labels_dispatches_sequence() {
+        let ls = labels(
+            "sequenceDiagram\nparticipant U as User / AI\nparticipant DL as Desktop\nU->>DL: go\nalt cond\n U->>DL: x\nelse other\n DL->>U: y\nend",
+        );
+        assert_eq!(ls, vec!["User / AI".to_string(), "Desktop".to_string()]);
+        // No flowchart pseudo-node leaking through from the `alt`/`else` lines.
+        assert!(
+            !ls.iter()
+                .any(|l| l.contains("else") || l.contains("cond") || l.contains("other"))
+        );
+    }
+
+    #[test]
+    fn labels_flowchart_unchanged() {
+        let ls = labels("flowchart TD\nA[Start]-->B[End]");
+        assert_eq!(ls, vec!["Start".to_string(), "End".to_string()]);
     }
 }
