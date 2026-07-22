@@ -253,6 +253,10 @@ pub struct App {
     pub ribbon_rect: Rect,
     /// The File backstage overlay, when open.
     pub backstage: Option<crate::ui::backstage::Backstage>,
+    /// The backstage's left-menu and right-content rects (recorded by
+    /// `backstage::draw`), for mouse hit-testing.
+    pub bs_menu_rect: Rect,
+    pub bs_content_rect: Rect,
     // --- Mouse hit-test regions, recorded each frame by `ui::draw` (default
     // zero, so a click before the first draw hits nothing). ---
     /// The rail column's on-screen rect.
@@ -533,6 +537,8 @@ impl App {
             ribbon_focus: crate::ui::ribbon::Focus::None,
             ribbon_rect: Rect::ZERO,
             backstage: None,
+            bs_menu_rect: Rect::ZERO,
+            bs_content_rect: Rect::ZERO,
             rail_rect: Rect::ZERO,
             folders_rect: Rect::ZERO,
             folders_row0: 0,
@@ -1189,11 +1195,17 @@ impl App {
     /// or before the first draw records the pane rects (they start zero, and a
     /// zero rect `contains` nothing).
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        // The backstage handles its own clicks (menu / tabs / toggles).
+        if self.backstage.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                self.backstage_mouse(m.column, m.row);
+            }
+            return;
+        }
         if self.signin_modal.is_some()
             || self.compose.is_some()
             || self.oof_form.is_some()
             || self.help
-            || self.backstage.is_some()
             || self.link_prompt.is_some()
         {
             return;
@@ -1299,7 +1311,7 @@ impl App {
     /// Keys while the backstage is open (menu ↑/↓, Enter/→ activate, Esc close;
     /// inside Settings, ↑/↓ pick a toggle, Enter/Space flips it, ←/Esc returns).
     pub fn backstage_key(&mut self, key: ratatui::crossterm::event::KeyCode) {
-        use crate::ui::backstage::{ITEMS, Item, SETTINGS_ROWS};
+        use crate::ui::backstage::{ITEMS, SETTINGS_ROWS};
         use ratatui::crossterm::event::KeyCode;
         let Some(state) = self
             .backstage
@@ -1328,16 +1340,64 @@ impl App {
                     self.mutate_backstage(|b| b.sel = (b.sel + 1).min(ITEMS.len() - 1))
                 }
                 KeyCode::Esc => self.close_backstage(),
-                KeyCode::Enter | KeyCode::Right => match ITEMS[sel.min(ITEMS.len() - 1)] {
-                    Item::AutoReplies => {
-                        self.close_backstage();
-                        self.open_oof_form();
-                    }
-                    Item::Settings => self.mutate_backstage(|b| b.in_settings = true),
-                    Item::Exit => self.quit = true,
-                },
+                KeyCode::Enter | KeyCode::Right => self.activate_backstage_item(sel),
                 _ => {}
             }
+        }
+    }
+
+    /// A click inside the backstage: the tab strip (row 0) leaves it, a left-menu
+    /// item activates that item, and a Settings toggle row flips it.
+    fn backstage_mouse(&mut self, x: u16, y: u16) {
+        use crate::ui::backstage::{ITEMS, SETTINGS_FIRST_ROW};
+        let pos = Position { x, y };
+        // Row 0 = the tab strip (File selected). Clicking a tab leaves.
+        if y == 0 {
+            if let crate::ui::ribbon::Hit::Tab(i) = self.ribbon.hit(x, 0, false) {
+                self.close_backstage();
+                if i != 0 && self.ribbon.tab_has_body(i) {
+                    self.ribbon.set_active(i);
+                    self.ribbon_open = true;
+                    self.ribbon_focus = crate::ui::ribbon::Focus::Tab(i);
+                }
+            }
+            return;
+        }
+        // A Settings toggle row.
+        let in_settings = self.backstage.as_ref().is_some_and(|b| b.in_settings);
+        if in_settings && self.bs_content_rect.contains(pos) {
+            let row = y.wrapping_sub(self.bs_content_rect.y);
+            if (SETTINGS_FIRST_ROW..SETTINGS_FIRST_ROW + 2).contains(&row) {
+                let idx = (row - SETTINGS_FIRST_ROW) as usize;
+                self.mutate_backstage(|b| {
+                    b.settings_sel = idx;
+                    b.in_settings = true;
+                });
+                self.toggle_setting(idx);
+            }
+            return;
+        }
+        // A left-menu item → activate it (same as Enter).
+        if self.bs_menu_rect.contains(pos) {
+            let idx = y.wrapping_sub(self.bs_menu_rect.y) as usize;
+            if idx < ITEMS.len() {
+                self.mutate_backstage(|b| b.sel = idx);
+                self.activate_backstage_item(idx);
+            }
+        }
+    }
+
+    /// Runs backstage menu item `idx` (Enter or a mouse click): Automatic
+    /// Replies opens the OOF editor, Settings enters its toggles, Exit quits.
+    fn activate_backstage_item(&mut self, idx: usize) {
+        use crate::ui::backstage::{ITEMS, Item};
+        match ITEMS[idx.min(ITEMS.len() - 1)] {
+            Item::AutoReplies => {
+                self.close_backstage();
+                self.open_oof_form();
+            }
+            Item::Settings => self.mutate_backstage(|b| b.in_settings = true),
+            Item::Exit => self.quit = true,
         }
     }
 
@@ -5756,6 +5816,57 @@ pub(crate) mod tests {
         app.ribbon_focus = crate::ui::ribbon::Focus::None;
         app.open_backstage();
         assert!(app.is_capturing_text());
+    }
+
+    #[test]
+    fn clicking_a_backstage_menu_item_activates_it() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_backstage();
+        app.bs_menu_rect = Rect::new(0, 1, 20, 3); // 3 rows: AutoReplies/Settings/Exit
+        // Click "Exit" (the third menu row, y = 1 + 2).
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn clicking_a_backstage_tab_leaves_the_backstage() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_backstage();
+        // Row 0 is the tab strip; click the Home header (x within its column).
+        let home_x = 2 + "File".len() as u16 + 3 + 1; // after "  File   "
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: home_x,
+            row: 0,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.backstage.is_none());
+    }
+
+    #[test]
+    fn clicking_a_settings_toggle_flips_it() {
+        use crate::ui::backstage::SETTINGS_FIRST_ROW;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        app.open_backstage();
+        app.mutate_backstage(|b| {
+            b.sel = 1;
+            b.in_settings = true;
+        }); // Settings, toggles focused
+        app.bs_content_rect = Rect::new(20, 1, 40, 8);
+        // Click the first toggle row (Threaded).
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 25,
+            row: 1 + SETTINGS_FIRST_ROW,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.threaded);
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     // The File backstage is a full-frame overlay like compose/OOF.
     if app.backstage.is_some() {
-        backstage::draw(f, &*app);
+        backstage::draw(f, app);
         return;
     }
 

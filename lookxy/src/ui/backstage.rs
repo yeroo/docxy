@@ -5,13 +5,12 @@
 //! the actions live on `App`.
 
 use crate::app::App;
-use crate::ui::centered_rect;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 /// The vertical menu items, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +51,6 @@ impl Backstage {
             settings_sel: 0,
         }
     }
-
-    pub fn selected_item(&self) -> Item {
-        ITEMS[self.sel.min(ITEMS.len() - 1)]
-    }
 }
 
 impl Default for Backstage {
@@ -64,70 +59,109 @@ impl Default for Backstage {
     }
 }
 
-/// Renders the backstage full-frame when open; a no-op otherwise.
-pub fn draw(f: &mut Frame, app: &App) {
-    let Some(bs) = &app.backstage else {
+/// The screen y (relative to the content rect's top) of the first Settings
+/// toggle row — content lines are: "Settings", blank, toggle0, toggle1, …
+pub const SETTINGS_FIRST_ROW: u16 = 2;
+
+/// Renders the backstage full-frame when open; a no-op otherwise. Matches the
+/// docxy/xlsxy backstage: the ribbon tab strip on top (File selected, the other
+/// tabs still visible + clickable), a left menu, and a right content pane.
+/// Records the menu/content rects for mouse hit-testing.
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let Some((sel, in_settings, settings_sel)) = app
+        .backstage
+        .as_ref()
+        .map(|b| (b.sel, b.in_settings, b.settings_sel))
+    else {
         return;
     };
-    let area = centered_rect(80, 70, f.area());
+    let (threaded, reminders) = (app.threaded, app.reminders_notify);
+
+    let area = f.area();
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title("File \u{2014} Esc to close")
-        .borders(Borders::ALL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let rev = Style::default().add_modifier(Modifier::REVERSED);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    // Tab strip with File selected; the other tabs stay visible so a click
+    // leaves the backstage (see `App::backstage_mouse`).
+    let mut tabline = app.ribbon.render_tabs_as(0);
+    tabline
+        .spans
+        .push(Span::styled("   (click a tab or Esc to leave)", dim));
+    f.render_widget(Paragraph::new(tabline), rows[0]);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
-        .split(inner);
+        .constraints([Constraint::Length(20), Constraint::Min(10)])
+        .split(rows[1]);
+    app.bs_menu_rect = cols[0];
+    app.bs_content_rect = cols[1];
 
     // Left menu.
-    let items: Vec<ListItem> = ITEMS
+    let menu_lines: Vec<Line> = ITEMS
         .iter()
-        .map(|it| ListItem::new(format!("  {}", it.label())))
+        .enumerate()
+        .map(|(i, it)| {
+            let on = i == sel;
+            let style = if on && !in_settings {
+                accent
+            } else if on {
+                rev
+            } else {
+                Style::default()
+            };
+            Line::styled(format!(" {:<16}", it.label()), style)
+        })
         .collect();
-    let menu = List::new(items).highlight_style(if bs.in_settings {
-        Style::new().add_modifier(Modifier::DIM)
-    } else {
-        Style::new().bg(Color::Blue).fg(Color::White)
-    });
-    let mut state = ListState::default();
-    state.select(Some(bs.sel));
-    f.render_stateful_widget(menu, cols[0], &mut state);
+    f.render_widget(
+        Paragraph::new(menu_lines)
+            .block(Block::default().borders(Borders::RIGHT).border_style(dim)),
+        cols[0],
+    );
 
     // Right content.
-    let content: Vec<Line> = match bs.selected_item() {
+    let content: Vec<Line> = match ITEMS[sel.min(ITEMS.len() - 1)] {
         Item::AutoReplies => vec![
-            Line::from("Automatic Replies (Out-of-Office)"),
             Line::from(""),
-            Line::from("Enter to open the editor."),
+            Line::from("  Automatic Replies (Out-of-Office)"),
+            Line::from(""),
+            Line::from("  Enter to open the editor."),
         ],
         Item::Settings => {
             let mark = |on: bool| if on { "[x]" } else { "[ ]" };
-            let rows = [
-                ("Threaded conversation view", app.threaded),
-                ("Reminder desktop notifications", app.reminders_notify),
+            let toggles = [
+                ("Threaded conversation view", threaded),
+                ("Reminder desktop notifications", reminders),
             ];
-            let mut lines = vec![Line::from("Settings"), Line::from("")];
-            for (i, (label, on)) in rows.iter().enumerate() {
-                let style = if bs.in_settings && bs.settings_sel == i {
-                    Style::new().bg(Color::Blue).fg(Color::White)
+            // Line 0 = "Settings", line 1 blank, then the toggles at
+            // SETTINGS_FIRST_ROW — kept in lockstep with mouse hit-testing.
+            let mut lines = vec![Line::from("  Settings"), Line::from("")];
+            for (i, (label, on)) in toggles.iter().enumerate() {
+                let style = if in_settings && settings_sel == i {
+                    accent
                 } else {
-                    Style::new()
+                    Style::default()
                 };
                 lines.push(Line::styled(format!("  {} {label}", mark(*on)), style));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(
-                "Enter/\u{2192} to edit, Space/Enter to toggle, \u{2190}/Esc to go back.",
+            lines.push(Line::styled(
+                "  Enter to edit \u{b7} Space/Enter toggle \u{b7} \u{2190}/Esc back",
+                dim,
             ));
             lines
         }
         Item::Exit => vec![
-            Line::from("Exit lookxy"),
             Line::from(""),
-            Line::from("Enter to quit."),
+            Line::from("  Exit lookxy"),
+            Line::from(""),
+            Line::from("  Enter to quit."),
         ],
     };
     f.render_widget(Paragraph::new(content), cols[1]);
