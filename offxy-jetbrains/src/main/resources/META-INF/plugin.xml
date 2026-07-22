@@ -1,0 +1,47 @@
+<idea-plugin>
+    <id>dev.yeroo.offxy</id>
+    <name>Offxy</name>
+    <vendor url="https://github.com/yeroo/docxy">yeroo</vendor>
+    <description><![CDATA[
+        Native Word <code>.docx</code> editor for JetBrains IDEs — no webview,
+        no Microsoft Office. The document engine is the dependency-free
+        <a href="https://github.com/yeroo/docxy">docxy</a> Rust core
+        (parse &rarr; render &rarr; edit &rarr; lossless save), compiled to
+        WebAssembly and executed on the JVM. Open documents advertise on the
+        docxy agent-control protocol, so AI assistants (Claude Code, Junie)
+        can read and edit them live.
+    ]]></description>
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Claim docx away from the platform's Native ("open in associated
+             application") type, so double-click opens an editor tab instead
+             of launching Word. -->
+        <fileType name="Offxy Word Document"
+                  implementationClass="dev.yeroo.offxy.editor.DocxFileType"
+                  fieldName="INSTANCE"
+                  extensions="docx"/>
+        <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
+    </extensions>
+
+    <actions>
+        <action id="offxy.convertMarkdown"
+                class="dev.yeroo.offxy.actions.ConvertMarkdownAction"
+                text="Convert Markdown to Word (.docx)"
+                description="Convert the selected Markdown file to a Word document">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+        <action id="offxy.exportMarkdown"
+                class="dev.yeroo.offxy.actions.ExportMarkdownAction"
+                text="Offxy: Export to Markdown"
+                description="Export the open Word document to a Markdown file">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="offxy.replace"
+                class="dev.yeroo.offxy.actions.ReplaceAction"
+                text="Offxy: Replace…"
+                description="Replace all occurrences in the open Word document">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

@@ -260,6 +260,21 @@ The architecture — the wasm ABIs, the host ↔ webview split, and how VS Code'
 edit events stay in lockstep with each engine's own undo stack — is written up
 in [VSCODE.md](VSCODE.md).
 
+## Offxy in JetBrains IDEs — native, no webview
+
+The [`offxy-jetbrains`](offxy-jetbrains) plugin brings the Word editor to
+IntelliJ-platform IDEs (2024.2+) with **no webview at all**: the *same*
+`docxwasm.wasm` artifact runs on the JVM via [Chicory](https://chicory.dev)
+(a pure-Java wasm runtime — no native code, no per-platform builds), and the
+document renders in a **real IntelliJ editor** over a live, editable
+`Document`. Typing is native-editor fast on any document size — the engine
+follows your edits asynchronously and reconciles the view — while list
+markers and table borders are guarded (read-only) regions, styles are editor
+highlighters, platform find/undo/save just work, and every open tab
+advertises on the same [agent control surface](docs/agent-control.md) the
+terminal apps use, so Claude Code and Junie can read and edit it live. See
+[offxy-jetbrains/README.md](offxy-jetbrains/README.md).
+
 ## Install
 
 ```sh

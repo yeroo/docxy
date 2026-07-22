@@ -398,6 +398,35 @@ See the [extension's README](../offxy-vscode/README.md#ai-assistants) for how
 to point an AI assistant at these tabs (Copilot: automatic; Claude Code: a
 one-liner).
 
+## JetBrains tabs
+
+Documents open in the [offxy-jetbrains](../offxy-jetbrains) plugin advertise
+on this same surface: instance `docxy-jetbrains-<basename>-<pid>-<n>` in
+docxy's ctl dir (pid keeps two IDE windows on a same-basename file distinct,
+as with VS Code tabs), identical wire protocol and token semantics. Any
+`docxy --mcp` session lists IDE tabs next to terminal panes and VS Code tabs;
+disambiguate with `target` as usual. The `doc.*` verb surface is served by
+the same `docx_ctl` engine the VS Code tabs use; host verbs
+(`doc.path`/`doc.save`/`doc.reload`/`doc.open`) are answered by the IDE.
+Differences from a terminal pane:
+
+- **`doc.open` opens a new tab**, not an in-place swap — same caveat as
+  VS Code tabs above: re-resolve `target` to reach the new file's instance.
+- **`doc.reload` drops unsaved edits** (terminal semantics) and, unlike a
+  VS Code tab, correctly clears the IDE's dirty indicator.
+- **Mutating verbs land as one IDE undo step each** (a snapshot-backed
+  entry) — an agent edit is one Ctrl+Z away, interleaved cleanly with the
+  user's own typing.
+- **`doc.undo`/`doc.redo` are rejected** ("undo is IDE-owned…"): the tab's
+  undo stack belongs to the platform; driving the engine's internal stack
+  from outside would desync them. Agents undo by asking the user, or by
+  making the inverse edit.
+- **`doc.export-pdf` is not yet implemented** on JetBrains tabs (the
+  host-side exclusive-create write is a follow-up); `doc.export`
+  (markdown/text of the live buffer) works.
+- `doc.blocks` is internal (composes `doc.path`) and answers
+  `unknown verb 'doc.blocks'` externally, same as every other surface.
+
 ## The other editors
 
 **xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` selects by index or
