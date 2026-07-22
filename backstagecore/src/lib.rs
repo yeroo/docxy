@@ -4,6 +4,8 @@
 //! via [`BackstageHost`] and acts on the returned [`BackstageEvent`].
 mod host;
 mod input;
+mod render;
 mod state;
 pub use host::{BackstageEvent, BackstageHost};
+pub use render::draw;
 pub use state::{Backstage, BackstageLayout, Entry, ITEMS, Item, Pane};
