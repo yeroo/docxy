@@ -258,6 +258,10 @@ impl Ribbon {
     pub fn has_act(&self, act: Act) -> bool {
         self.placed.iter().any(|p| p.act == act)
     }
+    #[cfg(test)]
+    pub fn toggle_on(&self, act: Act) -> bool {
+        self.active_toggles.contains(&act)
+    }
 
     /// The action a focused button would trigger.
     pub fn focus_act(&self, f: Focus) -> Option<(Act, &'static str)> {

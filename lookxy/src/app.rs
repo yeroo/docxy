@@ -1599,10 +1599,26 @@ impl App {
             return;
         }
         self.mode = mode;
+        // The Home tab shows mail actions in Mail mode, event actions in Calendar.
+        self.ribbon.set_home_context(mode == Mode::Calendar);
         if mode == Mode::Calendar {
             self.reload_agenda();
             let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
         }
+    }
+
+    /// Feed the ribbon which toggle buttons are currently "on" (drawn inverted)
+    /// — called each frame before the ribbon draws.
+    pub fn sync_ribbon_toggles(&mut self) {
+        use crate::ui::ribbon::Act;
+        let mut on = Vec::new();
+        if self.threaded {
+            on.push(Act::Threaded);
+        }
+        if self.category_filter.is_some() {
+            on.push(Act::CategoryFilter);
+        }
+        self.ribbon.set_toggles(on);
     }
 
     /// Re-reads the agenda window (`ui::calendar::agenda_window`, anchored at
@@ -5408,6 +5424,26 @@ pub(crate) mod tests {
             modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
         });
         assert!(app.reading_scroll > 0);
+    }
+
+    #[test]
+    fn home_tab_is_context_aware_and_threaded_toggle_reflects_state() {
+        use crate::ui::ribbon::Act;
+        let mut app = App::for_test_with_seeded_store();
+        app.ribbon.set_active(1); // Home
+        assert!(app.ribbon.has_act(Act::Compose));
+        assert!(!app.ribbon.has_act(Act::NewEvent));
+
+        app.set_mode(Mode::Calendar);
+        app.ribbon.set_active(1); // Home (now calendar context)
+        assert!(app.ribbon.has_act(Act::NewEvent));
+        assert!(!app.ribbon.has_act(Act::Compose));
+
+        // Toggle state: Threaded is on by default; Category Filter is off.
+        app.threaded = true;
+        app.sync_ribbon_toggles();
+        assert!(app.ribbon.toggle_on(Act::Threaded));
+        assert!(!app.ribbon.toggle_on(Act::CategoryFilter));
     }
 
     #[test]

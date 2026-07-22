@@ -80,6 +80,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(ribbon_h), Constraint::Min(0)])
         .split(area);
+    app.sync_ribbon_toggles();
     draw_ribbon(f, app, ribbon_split[0]);
     app.ribbon_rect = ribbon_split[0];
     let area = ribbon_split[1];
