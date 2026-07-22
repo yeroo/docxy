@@ -630,13 +630,13 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, parent_id, display_name, total_count, unread_count, delta_link, well_known_name, sort_order, is_expanded
              FROM folders
-             ORDER BY CASE well_known_name
-                 WHEN 'inbox' THEN 0
-                 WHEN 'drafts' THEN 1
-                 WHEN 'sentitems' THEN 2
-                 WHEN 'deleteditems' THEN 3
-                 WHEN 'junkemail' THEN 4
-                 WHEN 'archive' THEN 5
+             ORDER BY CASE
+                 WHEN well_known_name = 'inbox' OR LOWER(display_name) = 'inbox' THEN 0
+                 WHEN well_known_name = 'drafts' THEN 1
+                 WHEN well_known_name = 'sentitems' THEN 2
+                 WHEN well_known_name = 'deleteditems' THEN 3
+                 WHEN well_known_name = 'junkemail' THEN 4
+                 WHEN well_known_name = 'archive' THEN 5
                  ELSE 99
              END, display_name",
         )?;
@@ -2200,6 +2200,25 @@ mod tests {
         let got = s.master_categories().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "Only");
+    }
+
+    #[test]
+    fn inbox_sorts_first_even_without_a_well_known_name() {
+        let s = Store::open_in_memory().unwrap();
+        // An "Inbox" whose wellKnownName didn't come through, plus a user folder
+        // that would sort before "Inbox" alphabetically.
+        for (id, name) in [("f2", "Archive Stuff"), ("f1", "Inbox")] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: name.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(s.folders().unwrap()[0].display_name, "Inbox");
     }
 
     #[test]

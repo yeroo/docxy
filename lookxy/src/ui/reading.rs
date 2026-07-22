@@ -445,7 +445,7 @@ fn to_ratatui_span(span: &StyledSpan, focused_url: Option<&str>) -> Span<'static
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     if span.link.is_some() {
-        style = style.fg(Color::Blue);
+        style = style.fg(Color::LightBlue);
     }
     if focused_url.is_some() && span.link.as_deref() == focused_url {
         style = style.add_modifier(Modifier::REVERSED);
@@ -466,7 +466,10 @@ mod tests {
             link: Some("https://x".into()),
             ..Default::default()
         };
-        assert_eq!(to_ratatui_span(&span, None).style.fg, Some(Color::Blue));
+        assert_eq!(
+            to_ratatui_span(&span, None).style.fg,
+            Some(Color::LightBlue)
+        );
     }
 
     #[test]

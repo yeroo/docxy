@@ -458,15 +458,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if app.focus == Pane::Folders => nav_left(app),
         KeyCode::Char('l') if app.focus == Pane::Folders => nav_right(app),
         KeyCode::Char(' ') if app.focus == Pane::Folders => app.toggle_selected_folder(),
-        // Ctrl+↑/↓ in the reader jump between links (ahead of the plain scroll
-        // arms below, which match the same Up/Down without the modifier).
+        // Ctrl+↑/↓ jump between links whenever a message is open — whether it's
+        // been activated (focus Reading) or is just previewing under the list
+        // cursor. Ahead of the plain scroll/move arms, which match the same
+        // Up/Down without the modifier.
         KeyCode::Up
-            if app.focus == Pane::Reading && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            if app.selected_msg.is_some() && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             app.focus_link(-1)
         }
         KeyCode::Down
-            if app.focus == Pane::Reading && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            if app.selected_msg.is_some() && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             app.focus_link(1)
         }
