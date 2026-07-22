@@ -427,6 +427,16 @@ Differences from a terminal pane:
 - `doc.blocks` is internal (composes `doc.path`) and answers
   `unknown verb 'doc.blocks'` externally, same as every other surface.
 
+**Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
+serve the full xlsxy verb surface through `grid_ctl`, with the same host-verb
+split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
+`wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
+driving the engine's own undo stack — the same mechanism the grid UI uses,
+detected generically via the engine's `edits` counter. Divergence from
+VS Code tabs: an agent `sheet.remove` is not restorable from the IDE's undo
+(no single-slot stash wiring yet); `sheet.restore-removed` still works over
+the wire.
+
 ## The other editors
 
 **xlsxy** (spreadsheet; A1-style refs/ranges, `sheet` selects by index or

@@ -25,6 +25,10 @@
 
 ### Task 1: `WasmBinding` extraction + `GridEngine` + tests + benchmark
 
+> **Status: DONE.** Docx suite untouched; JSON parser learned floats (colw
+> carries them). Benchmark (3MB/29-sheet corpus workbook): view-scroll p95
+> 0.5ms, set+recalc p95 591ms (pivot-web recalc; typical books are ms).
+
 **Files:**
 - Create: `engine/WasmBinding.kt`, `engine/GridEngine.kt`
 - Modify: `engine/ChicoryEngine.kt` (extend the base; public surface unchanged)
@@ -55,6 +59,8 @@
 
 ### Task 2: File type, provider, read-only grid rendering
 
+> **Status: DONE.** XlsxFileType pinned by test; window-refresh test covers scrolled cells.
+
 **Files:**
 - Create: `grid/XlsxFileType.kt`, `grid/XlsxEditorProvider.kt`, `grid/XlsxFileEditor.kt`, `grid/GridPanel.kt`, `grid/GridViewModel.kt` (parse the view JSON)
 - Modify: `plugin.xml` (fileType + provider)
@@ -71,6 +77,8 @@
 ---
 
 ### Task 3: Editing — cells, formula bar, clipboard, undo, save
+
+> **Status: DONE.** setValueAt is the single commit path; bad formulas balloon without mutating; engine-stack undo verified via platform UndoManager.
 
 **Files:**
 - Create: `grid/FormulaBar.kt`
@@ -90,6 +98,8 @@
 
 ### Task 4: Sheets, structural ops, formatting toolbar, empty-file
 
+> **Status: DONE.**
+
 **Files:**
 - Create: `grid/SheetTabs.kt`, `grid/GridToolbar.kt`
 - Modify: `grid/GridPanel.kt`, `grid/XlsxFileEditor.kt`, `plugin.xml` (actions if palette-exposed)
@@ -104,6 +114,8 @@
 ---
 
 ### Task 5: xlsxy agent ctl bridge
+
+> **Status: DONE.** Mutation detected via the edits counter (no verb list); Discovery app-parameterized; e2e TCP test incl. platform-undo of an agent cell.set.
 
 **Files:**
 - Create: `grid/GridCtlBridge.kt`
@@ -121,6 +133,8 @@
 ---
 
 ### Task 6: Docs + verification
+
+> **Status: DONE — CI green** (PR #34, run 29923344365, all six jobs). 59 tests total.
 
 **Files:**
 - Modify: `offxy-jetbrains/README.md` (+ xlsx section), `CHANGELOG.md`, `TESTPLAN.md` (grid sections), `docs/agent-control.md` (JetBrains tabs: xlsxy paragraph), root `README.md` (JetBrains section mentions both formats)

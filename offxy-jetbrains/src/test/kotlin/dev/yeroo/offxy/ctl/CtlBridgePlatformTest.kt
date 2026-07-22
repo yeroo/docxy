@@ -19,7 +19,7 @@ import java.nio.file.Paths
  *  drives host verbs. Ctl requests hop to the EDT, so the test does socket
  *  I/O on a pooled thread while pumping the EDT. */
 class CtlBridgePlatformTest : BasePlatformTestCase() {
-    private fun ctlDir() = Paths.get(System.getProperty("offxy.ctl.dir"))
+    private fun ctlDir() = Paths.get(System.getProperty("offxy.ctl.dir")).resolve("docxy")
 
     private fun discoveryFor(name: String): Map<String, Any?> {
         val file = Files.list(ctlDir()).use { stream ->

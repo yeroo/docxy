@@ -8,11 +8,12 @@ import java.nio.file.StandardCopyOption
 /** Discovery-file plumbing, ctlcore-compatible: `dir/<instance>.json` holding
  *  `{"instance","port","token","pid"}`, written atomically (tmp + rename). */
 object Discovery {
-    /** Docxy's ctl dir: `%APPDATA%\docxy\ctl` (Windows) or
-     *  `$XDG_CONFIG_HOME/docxy/ctl` (fallback `~/.config`). The
-     *  `offxy.ctl.dir` system property overrides for tests. */
-    fun ctlDir(): Path {
-        System.getProperty("offxy.ctl.dir")?.let { return Paths.get(it) }
+    /** An app's ctl dir: `%APPDATA%\<app>\ctl` (Windows) or
+     *  `$XDG_CONFIG_HOME/<app>/ctl` (fallback `~/.config`). The
+     *  `offxy.ctl.dir` system property overrides the base for tests
+     *  (files land under `<override>/<app>`). */
+    fun ctlDir(app: String = "docxy"): Path {
+        System.getProperty("offxy.ctl.dir")?.let { return Paths.get(it).resolve(app) }
         val appData = System.getenv("APPDATA")
         val base = when {
             System.getProperty("os.name", "").startsWith("Windows") && appData != null ->
@@ -21,7 +22,7 @@ object Discovery {
                 System.getenv("XDG_CONFIG_HOME")?.let { Paths.get(it) }
                     ?: Paths.get(System.getProperty("user.home"), ".config")
         }
-        return base.resolve("docxy").resolve("ctl")
+        return base.resolve(app).resolve("ctl")
     }
 
     /** Instance-name sanitizer, matching the agent-access convention:

@@ -321,11 +321,15 @@ internal object Json {
             return sb.toString()
         }
 
-        private fun num(): Long {
+        private fun num(): Any {
             val start = i
             if (s[i] == '-') i++
-            while (i < s.length && s[i].isDigit()) i++
-            return s.substring(start, i).toLong()
+            while (i < s.length &&
+                (s[i].isDigit() || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-')
+            ) i++
+            val text = s.substring(start, i)
+            return if (text.any { it == '.' || it == 'e' || it == 'E' }) text.toDouble()
+            else text.toLong()
         }
     }
 }

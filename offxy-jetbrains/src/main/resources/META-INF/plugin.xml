@@ -22,6 +22,11 @@
                   fieldName="INSTANCE"
                   extensions="docx"/>
         <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
+        <fileType name="Offxy Excel Workbook"
+                  implementationClass="dev.yeroo.offxy.grid.XlsxFileType"
+                  fieldName="INSTANCE"
+                  extensions="xlsx"/>
+        <fileEditorProvider implementation="dev.yeroo.offxy.grid.XlsxEditorProvider"/>
     </extensions>
 
     <actions>
