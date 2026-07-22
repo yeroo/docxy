@@ -65,6 +65,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Reading",
         &[
             ("\u{2191} / \u{2193}", "scroll"),
+            ("Tab / Shift-Tab", "next / prev link"),
+            ("Enter", "open focused link"),
             ("PgUp / PgDn", "prev / next message"),
             ("Home / End", "top / bottom"),
             ("\u{2190} / Esc", "back to list"),

@@ -29,7 +29,7 @@ mod status_bar;
 use crate::app::{App, Mode, Pane};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 
@@ -449,20 +449,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if app.focus == Pane::Folders => nav_left(app),
         KeyCode::Char('l') if app.focus == Pane::Folders => nav_right(app),
         KeyCode::Char(' ') if app.focus == Pane::Folders => app.toggle_selected_folder(),
-        // Ctrl+↑/↓ jump between links whenever a message is open — whether it's
-        // been activated (focus Reading) or is just previewing under the list
-        // cursor. Ahead of the plain scroll/move arms, which match the same
-        // Up/Down without the modifier.
-        KeyCode::Up
-            if app.selected_msg.is_some() && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            app.focus_link(-1)
-        }
-        KeyCode::Down
-            if app.selected_msg.is_some() && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            app.focus_link(1)
-        }
+        // Tab / Shift+Tab step between the links in the open message (browser
+        // style). Modifier-free on purpose: Ctrl+arrow's modifier is dropped on
+        // Windows auto-repeat, which leaked the repeats into plain scroll/move.
+        KeyCode::Tab if app.selected_msg.is_some() => app.focus_link(1),
+        KeyCode::BackTab if app.selected_msg.is_some() => app.focus_link(-1),
         // Reading-focused vertical keys scroll the reader instead of moving a
         // selection. These guarded arms must precede the unguarded ones below.
         KeyCode::Char('k') | KeyCode::Up if app.focus == Pane::Reading => app.reading_scroll_by(-1),
@@ -745,6 +736,34 @@ mod tests {
         assert_eq!(app.focus, Pane::Folders);
         handle_key(&mut app, KeyEvent::from(KeyCode::Left)); // top-level folder → Rail
         assert_eq!(app.focus, Pane::Rail);
+    }
+
+    #[test]
+    fn tab_steps_through_links_when_a_message_is_open() {
+        use crate::ui::reading::BodyLink;
+        let mut app = App::for_test_with_seeded_store();
+        app.selected_msg = Some("m1".into());
+        app.reading_viewport = 10;
+        app.body_links = vec![
+            BodyLink {
+                line: 0,
+                col: 0,
+                width: 3,
+                url: "https://a".into(),
+            },
+            BodyLink {
+                line: 1,
+                col: 0,
+                width: 3,
+                url: "https://b".into(),
+            },
+        ];
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focused_link, Some(0));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focused_link, Some(1));
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focused_link, Some(0));
     }
 
     #[test]
