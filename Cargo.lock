@@ -410,6 +410,7 @@ name = "docxy"
 version = "0.4.0"
 dependencies = [
  "arboard",
+ "backstagecore",
  "ctlcore",
  "docxcore",
  "image",
