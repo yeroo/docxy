@@ -6006,11 +6006,14 @@ mod tests {
     }
 
     #[test]
-    fn start_screen_navigation_clamps_and_digits_pick() {
-        // backstagecore::Start clamps at the ends (no wraparound).
+    fn start_screen_navigation_wraps_and_digits_pick() {
+        // backstagecore::Start wraps at the ends: Up on the first item lands on
+        // the last (there are 4 items: indices 0..=3).
         let mut app = app_with(&["x"]);
         app.start_screen = true;
-        app.on_key(KeyEvent::from(KeyCode::Up)); // already first — clamps
+        app.on_key(KeyEvent::from(KeyCode::Up)); // first → wraps to last
+        assert_eq!(app.start.sel(), 3);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // last → wraps to first
         assert_eq!(app.start.sel(), 0);
         app.on_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(app.start.sel(), 1);

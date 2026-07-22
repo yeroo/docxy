@@ -34,8 +34,11 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         .min(bs.entries.len().saturating_sub(list_h));
     bs.refresh_preview(host, preview_w); // fill the preview cache at the pane width
 
-    f.render_widget(Clear, area);
+    // Clear only the menu + content region (rows[1..]); row 0 holds the app's
+    // ribbon tab strip and must never be wiped, whether the app draws it before
+    // or after this call.
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    f.render_widget(Clear, rows[1]);
     let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).split(rows[1]);
 
     let dim = Style::default().add_modifier(Modifier::DIM);

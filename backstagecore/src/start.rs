@@ -47,15 +47,17 @@ impl Start {
         self.sel
     }
 
-    /// Handle a key while the start card is shown.
+    /// Handle a key while the start card is shown. Up/Down (and `k`/`j`,
+    /// Shift+Tab/Tab) move the highlight and wrap at the ends.
     pub fn key(&mut self, key: KeyEvent) -> StartEvent {
+        let last = self.items.len().saturating_sub(1);
         match key.code {
-            KeyCode::Up => {
-                self.sel = self.sel.saturating_sub(1);
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                self.sel = if self.sel == 0 { last } else { self.sel - 1 };
                 StartEvent::None
             }
-            KeyCode::Down => {
-                self.sel = (self.sel + 1).min(self.items.len().saturating_sub(1));
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                self.sel = if self.sel >= last { 0 } else { self.sel + 1 };
                 StartEvent::None
             }
             KeyCode::Char(c @ '1'..='9') => {
