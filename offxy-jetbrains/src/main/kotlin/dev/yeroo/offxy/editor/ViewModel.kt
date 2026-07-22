@@ -132,6 +132,20 @@ class ViewModel(json: String) {
         return lineStarts[l] + col.coerceIn(0, lineLength(l))
     }
 
+    /** The hyperlink at a document offset (`#anchor` = internal), or null. */
+    fun linkAt(offset: Int): String? {
+        for ((i, line) in lines.withIndex()) {
+            val start = lineStarts[i]
+            var col = 0
+            for (sp in line) {
+                val a = start + col
+                col += sp.text.length
+                if (sp.link != null && offset >= a && offset < start + col) return sp.link
+            }
+        }
+        return null
+    }
+
     /** Styled runs as absolute document-offset ranges (for highlighters). */
     fun styledRanges(): List<Pair<IntRange, Span>> {
         val out = ArrayList<Pair<IntRange, Span>>()

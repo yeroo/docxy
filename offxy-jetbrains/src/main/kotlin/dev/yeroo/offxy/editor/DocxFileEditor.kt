@@ -87,7 +87,7 @@ class DocxFileEditor(
             existing.applyRender(ViewModel(engine.render()))
             return true
         }
-        val v = EditorView(project) { rid -> engine.media(rid) }
+        val v = EditorView(project, { rid -> engine.media(rid) }, ::followLink)
         view = v
         panel.removeAll()
         panel.add(DocxToolbar.create(project, this), BorderLayout.NORTH)
@@ -209,6 +209,21 @@ class DocxFileEditor(
     /** Test hook: run any deferred edit reconciliation now. */
     fun flushEdits() {
         pipeline?.flush()
+    }
+
+    /** Follow a rendered hyperlink: `#anchor` (TOC entry, cross-reference)
+     *  jumps to the bookmark's block via the engine's `goto`; anything else
+     *  opens externally. */
+    fun followLink(href: String) {
+        val v = view ?: return
+        if (href.startsWith("#")) {
+            refreshFrom(engine.cmd("goto\t${href.removePrefix("#")}"))
+            val model = v.currentView() ?: return
+            v.editor.caretModel.moveToOffset(model.gridToOffset(model.caretLine, model.caretCol))
+            v.editor.scrollingModel.scrollToCaret(com.intellij.openapi.editor.ScrollType.CENTER)
+        } else {
+            com.intellij.ide.BrowserUtil.browse(href)
+        }
     }
 
     override fun getComponent(): JComponent = panel

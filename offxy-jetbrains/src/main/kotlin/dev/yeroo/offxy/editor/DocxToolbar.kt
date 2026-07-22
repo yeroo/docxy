@@ -46,6 +46,10 @@ object DocxToolbar {
                 }
 
                 override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+
+                // No icons — the labels (B, I, H1, …) ARE the buttons. Without
+                // this, icon-less toolbar actions render as empty squares.
+                override fun displayTextInToolbar(): Boolean = true
             })
         }
         val toolbar = ActionManager.getInstance()

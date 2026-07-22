@@ -38,6 +38,7 @@ import javax.imageio.ImageIO
 class EditorView(
     private val project: Project?,
     private val media: (String) -> ByteArray,
+    private val onLink: (String) -> Unit = {},
 ) : Disposable {
     val document: Document = EditorFactory.getInstance().createDocument("")
     val editor: EditorEx = EditorFactory.getInstance().createEditor(document, project) as EditorEx
@@ -78,6 +79,20 @@ class EditorView(
         // the caret never RESTS on them: with no active selection, a caret
         // landing inside a guard gap or on a decoration-only line snaps to
         // the nearest editable position in its direction of travel.
+        // Ctrl+click follows links: TOC entries / cross-references (#anchor)
+        // jump inside the document; URLs open in the browser.
+        editor.addEditorMouseListener(object : com.intellij.openapi.editor.event.EditorMouseListener {
+            override fun mouseClicked(e: com.intellij.openapi.editor.event.EditorMouseEvent) {
+                if (!(e.mouseEvent.isControlDown || e.mouseEvent.isMetaDown)) return
+                if (e.mouseEvent.button != java.awt.event.MouseEvent.BUTTON1) return
+                if (e.area != com.intellij.openapi.editor.event.EditorMouseEventArea.EDITING_AREA) return
+                val v = view ?: return
+                val pos = editor.xyToLogicalPosition(e.mouseEvent.point)
+                val link = v.linkAt(editor.logicalPositionToOffset(pos)) ?: return
+                e.consume()
+                onLink(link)
+            }
+        })
         editor.caretModel.addCaretListener(object : com.intellij.openapi.editor.event.CaretListener {
             override fun caretPositionChanged(event: com.intellij.openapi.editor.event.CaretEvent) {
                 if (snapping || suppressListener) return

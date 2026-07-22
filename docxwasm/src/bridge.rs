@@ -20,7 +20,7 @@ use docxcore::agent;
 use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
-use docxcore::model::{Align, Block};
+use docxcore::model::{Align, Block, Inline};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
@@ -348,6 +348,10 @@ impl Session {
             "click" => {
                 mutated = false;
                 self.do_click(rest);
+            }
+            "goto" => {
+                mutated = false;
+                self.do_goto(rest.trim());
             }
             _ => mutated = false,
         }
@@ -1047,6 +1051,34 @@ impl Session {
         }
     }
 
+    /// `goto\t<anchor>` — move the caret to the block holding the named
+    /// bookmark (a TOC entry's or cross-reference's target). No-op when the
+    /// bookmark doesn't exist. Mirrors the TUI's `jump_to_anchor`, but moves
+    /// the caret (host-agnostic) instead of the scroll position.
+    fn do_goto(&mut self, anchor: &str) {
+        if anchor.is_empty() {
+            return;
+        }
+        let needle = format!("w:name=\"{anchor}\"");
+        let Some(bi) = self
+            .editor
+            .doc
+            .body
+            .iter()
+            .position(|b| block_has_bookmark(b, &needle))
+        else {
+            return;
+        };
+        // First rendered line of that block, via the caret maps.
+        for m in &self.maps {
+            if let Some(seg) = m.segs.iter().find(|s| s.path.first() == Some(&bi)) {
+                self.editor.clear_selection();
+                self.editor.caret = Caret::at(seg.path.clone(), seg.start);
+                return;
+            }
+        }
+    }
+
     /// `click\t<line>\t<col>\t<select>` — place (or extend to) the caret at a grid
     /// cell.
     fn do_click(&mut self, rest: &str) {
@@ -1187,6 +1219,23 @@ fn ctl_parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String
             let v = parse(s)?;
             Ok((v, v))
         }
+    }
+}
+
+/// Does a block (recursively, through table cells) hold a `<w:bookmarkStart>`
+/// whose raw XML contains `needle` (the `w:name="…"` attribute)? Same logic as
+/// the TUI's jump-to-anchor.
+fn block_has_bookmark(b: &Block, needle: &str) -> bool {
+    match b {
+        Block::Paragraph(p) => p.content.iter().any(
+            |i| matches!(i, Inline::Raw(s) if s.contains("bookmarkStart") && s.contains(needle)),
+        ),
+        Block::Table(t) => t.rows.iter().any(|r| {
+            r.cells
+                .iter()
+                .any(|c| c.blocks.iter().any(|bb| block_has_bookmark(bb, needle)))
+        }),
+        Block::Raw(_) => false,
     }
 }
 
@@ -1461,6 +1510,30 @@ mod tests {
             );
             assert_eq!(after.0, before.0, "caret left its line after {n} space(s)");
         }
+    }
+
+    #[test]
+    fn goto_jumps_to_a_bookmark() {
+        let xml = "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <w:body>\
+             <w:p><w:r><w:t>First paragraph up top.</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Middle filler paragraph.</w:t></w:r></w:p>\
+             <w:p><w:bookmarkStart w:id=\"0\" w:name=\"target\"/><w:r><w:t>Landing zone.</w:t></w:r><w:bookmarkEnd w:id=\"0\"/></w:p>\
+             </w:body></w:document>";
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+        let bytes = save_package(&new_package(doc));
+        let mut s = Session::open(&bytes).expect("open");
+        s.view_json(None); // populate the caret maps
+        let before = caret_of(&s.view_json(None));
+        s.dispatch("goto\ttarget");
+        let after = caret_of(&s.view_json(None));
+        assert!(
+            after.0 > before.0,
+            "goto should move the caret down: {before:?} -> {after:?}"
+        );
+        // Unknown anchors are a clean no-op.
+        s.dispatch("goto\tnope");
+        assert_eq!(caret_of(&s.view_json(None)), after);
     }
 
     #[test]
