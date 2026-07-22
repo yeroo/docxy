@@ -407,6 +407,7 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "ribboncore",
  "windows-sys 0.61.2",
 ]
 

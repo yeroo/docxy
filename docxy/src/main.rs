@@ -1081,7 +1081,11 @@ impl App {
     /// Rows the ribbon currently occupies: 1 for the collapsed tab strip, or the
     /// strip + body + yellow hint bar when expanded.
     fn ribbon_height(&self) -> usize {
-        if self.ribbon_open { 1 + 5 + 1 } else { 1 }
+        if self.ribbon_open {
+            ribbon::EXPANDED_H as usize // tab strip + closed body box (6)
+        } else {
+            1
+        }
     }
 
     /// Handle a key while the ribbon has focus. Returns `Some(quit)` if consumed,
@@ -1358,10 +1362,6 @@ impl App {
         let mut lines = vec![self.ribbon.render_tabs(self.ribbon_focus)];
         if self.ribbon_open {
             lines.extend(self.ribbon.render_body(self.ribbon_focus));
-            lines.push(
-                self.ribbon
-                    .render_hint(self.ribbon_focus, self.ribbon.width()),
-            );
         }
         f.render_widget(Paragraph::new(Text::from(lines)), area);
     }
