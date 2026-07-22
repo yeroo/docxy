@@ -329,8 +329,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down if app.focus == Pane::Reading => {
             app.reading_scroll_by(1)
         }
-        KeyCode::PageUp if app.focus == Pane::Reading => app.reading_scroll_page(-1),
-        KeyCode::PageDown if app.focus == Pane::Reading => app.reading_scroll_page(1),
+        KeyCode::PageUp if app.focus == Pane::Reading => {
+            app.open_sibling_message(-1);
+        }
+        KeyCode::PageDown if app.focus == Pane::Reading => {
+            app.open_sibling_message(1);
+        }
         KeyCode::Home if app.focus == Pane::Reading => app.reading_scroll_home(),
         KeyCode::End if app.focus == Pane::Reading => app.reading_scroll_end(),
         KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1),

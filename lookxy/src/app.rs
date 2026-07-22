@@ -241,8 +241,8 @@ pub struct App {
     pub help: bool,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
-    /// `reading_scroll_by`/`reading_scroll_page`/`reading_scroll_home`/
-    /// `reading_scroll_end` against `reading_content_rows`/`reading_viewport`.
+    /// `reading_scroll_by`/`reading_scroll_home`/`reading_scroll_end` against
+    /// `reading_content_rows`/`reading_viewport`.
     pub reading_scroll: usize,
     /// The reading pane body's visible height in rows, as last recorded by
     /// `ui::reading::draw` (which has `&mut App` for exactly this). Used only
@@ -1009,6 +1009,53 @@ impl App {
         }
     }
 
+    /// PgUp/PgDn in the reader: step to the previous/next selectable message,
+    /// open it, mark it read, and keep focus in the reader. Moves the list
+    /// cursor in step (flat: `msg_index ± 1`; threaded: the next/prev
+    /// `Row::Message` in `visible_rows`, skipping headers). Returns false — and
+    /// changes nothing — at the ends. Drafts are stepped onto but not opened.
+    pub fn open_sibling_message(&mut self, delta: isize) -> bool {
+        let step = delta.signum();
+        let target = if self.threaded_active() {
+            let mut i = self.row_index as isize;
+            loop {
+                i += step;
+                if i < 0 || i as usize >= self.visible_rows.len() {
+                    break None;
+                }
+                if let Row::Message(t, m) = self.visible_rows[i as usize] {
+                    break self.threads[t]
+                        .thread
+                        .messages
+                        .get(m)
+                        .map(|msg| (i as usize, msg.id.clone(), msg.is_draft));
+                }
+            }
+        } else {
+            let next = self.msg_index as isize + step;
+            if next < 0 || next as usize >= self.messages.len() {
+                None
+            } else {
+                self.messages
+                    .get(next as usize)
+                    .map(|m| (next as usize, m.id.clone(), m.is_draft))
+            }
+        };
+        let Some((cursor, id, is_draft)) = target else {
+            return false;
+        };
+        if self.threaded_active() {
+            self.row_index = cursor;
+        } else {
+            self.msg_index = cursor;
+        }
+        if !is_draft {
+            self.open_message(&id);
+            self.mark_message_read(&id);
+        }
+        true
+    }
+
     /// Opens the message under the list cursor into the reader **without**
     /// marking it read — the auto-preview that follows Up/Down and entry into
     /// the list, so browsing never consumes unread state. Threaded: a header
@@ -1183,14 +1230,6 @@ impl App {
     pub fn reading_scroll_by(&mut self, delta: isize) {
         let max = self.reading_max_scroll() as isize;
         self.reading_scroll = (self.reading_scroll as isize + delta).clamp(0, max) as usize;
-    }
-
-    /// PageUp/PageDown while the reading pane has focus: scrolls by one
-    /// viewport's worth of rows (at least 1, so a not-yet-drawn viewport of
-    /// height 0 still moves).
-    pub fn reading_scroll_page(&mut self, dir: isize) {
-        let page = self.reading_viewport.max(1) as isize;
-        self.reading_scroll_by(dir * page);
     }
 
     /// Home while the reading pane has focus: jumps to the top.
@@ -5086,6 +5125,24 @@ pub(crate) mod tests {
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn pgdn_in_the_reader_opens_and_reads_the_next_message() {
+        let mut app = App::for_test_with_seeded_store();
+        seed_second_in_c1(&app); // adds m2@11:00 (newer) alongside m1@10:00
+        app.threaded = false;
+        app.reload_messages();
+        app.focus = Pane::Reading;
+        // Flat list is newest-first: index 0 = m2, index 1 = m1.
+        app.msg_index = 0;
+        app.open_message("m2");
+        let moved = app.open_sibling_message(1); // → m1 (older, next down)
+        assert!(moved);
+        assert_eq!(app.selected_msg.as_deref(), Some("m1"));
+        assert_eq!(app.focus, Pane::Reading); // stays active
+        assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
+        assert!(!app.open_sibling_message(1)); // no-op past the end
     }
 
     #[test]
