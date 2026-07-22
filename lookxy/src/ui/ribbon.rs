@@ -133,6 +133,10 @@ pub struct Ribbon {
     active_toggles: Vec<Act>,
 }
 
+/// The app's ribbon accent — lookxy's tab names are blue (docxy light blue,
+/// xlsxy green, yppxy yellow — one colour per app in the suite).
+const ACCENT: Color = Color::Blue;
+
 /// Rows inside the expanded ribbon body (0 = first button row).
 const ROW0: usize = 1;
 const ROW1: usize = 2;
@@ -369,13 +373,13 @@ impl Ribbon {
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
             let style = if !engaged {
-                Style::default()
+                Style::default().fg(ACCENT) // idle: app-coloured tab names
             } else if i == self.active {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else if Some(i) == focused_tab {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
             };
             spans.push(Span::styled(t.to_string(), style));
             spans.push(Span::raw("   "));
@@ -714,6 +718,19 @@ mod tests {
         assert!(r.has_act(Act::Compose));
         assert!(r.button_count() > 0);
         assert!(!r.tab_has_body(0)); // File opens the backstage
+    }
+
+    #[test]
+    fn idle_tab_names_use_the_app_accent() {
+        let r = Ribbon::new();
+        let line = r.render_tabs(Focus::None);
+        // The first non-padding span is a tab name, coloured with the accent.
+        let first = line
+            .spans
+            .iter()
+            .find(|s| s.content.trim() == "File")
+            .unwrap();
+        assert_eq!(first.style.fg, Some(ACCENT));
     }
 
     #[test]

@@ -875,7 +875,7 @@ impl Ribbon {
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
             let style = if !engaged {
-                Style::default() // idle: plain, nothing inverted
+                Style::default().fg(Color::LightBlue) // idle: app accent (docxy)
             } else if i == self.active {
                 Style::default().fg(Color::Black).bg(Color::White) // active tab
             } else if Some(i) == focused_tab {

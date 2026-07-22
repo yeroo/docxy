@@ -338,7 +338,9 @@ impl Ribbon {
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
             let style = if !engaged {
-                Style::default().add_modifier(Modifier::DIM)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::DIM) // idle: app accent (xlsxy)
             } else if i == self.active {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else if Some(i) == focused_tab {
