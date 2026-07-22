@@ -27,8 +27,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ShimClsid = '{7B3F9E20-4C1A-4E8B-A2D6-9F5C1E0B7A31}'
-$Classes   = 'HKCU:\Software\Classes'
+$ShimClsid  = '{7B3F9E20-4C1A-4E8B-A2D6-9F5C1E0B7A31}'   # our own coclass
+$ExcelClsid = '{00024500-0000-0000-C000-000000000046}'   # Excel's real coclass
+$Classes    = 'HKCU:\Software\Classes'
 
 if (-not (Test-Path -LiteralPath $Exe)) {
     throw "xlcomshim.exe not found at $Exe. Build it first: cargo build --release -p xlcomshim"
@@ -51,12 +52,23 @@ function Set-Default($path, $value) {
     Set-ItemProperty -Path $path -Name '(default)' -Value $value
 }
 
+# Late-bound path: the Excel.Application ProgID -> our shim CLSID.
 Set-Default "$Classes\Excel.Application"               "Docxy Spreadsheet Application"
 Set-Default "$Classes\Excel.Application\CLSID"         $ShimClsid
 Set-Default "$Classes\CLSID\$ShimClsid"               "Docxy spreadsheet automation server"
 Set-Default "$Classes\CLSID\$ShimClsid\LocalServer32" ('"{0}" /automation' -f $Exe)
 Set-Default "$Classes\CLSID\$ShimClsid\ProgID"        "Excel.Application"
 
-Write-Host "Registered Excel.Application -> $ShimClsid -> $Exe (HKCU, per-user)."
+# Early-bound path: shadow Excel's REAL coclass CLSID in HKCU so a .NET client
+# that does `new Excel.Application()` (activates by the fixed CLSID, not the
+# ProgID) also reaches the shim. HKLM's Excel is untouched; deleting this HKCU
+# key restores it for this user.
+$g = ("HKCU already maps the Excel CLSID to {0}. Re-run with -Force." -f `
+    (Get-ItemProperty "$Classes\CLSID\$ExcelClsid\LocalServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)')
+$exLs = (Get-ItemProperty "$Classes\CLSID\$ExcelClsid\LocalServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
+if ($exLs -and $exLs -notmatch 'xlcomshim' -and -not $Force) { throw $g }
+Set-Default "$Classes\CLSID\$ExcelClsid\LocalServer32" ('"{0}" /automation' -f $Exe)
+
+Write-Host "Registered Excel.Application (ProgID + coclass) -> $Exe (HKCU, per-user)."
 Write-Host 'Test:  $x = New-Object -ComObject Excel.Application; $x.Version; $x.Quit()'
 Write-Host 'Undo:  tools\comshim\unregister-shim.ps1'

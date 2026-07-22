@@ -57,6 +57,12 @@ mod win {
     /// {00024500-…}. `Excel.Application` (the ProgID) points here in HKCU.
     const SHIM_CLSID: GUID = GUID::from_u128(0x7b3f9e20_4c1a_4e8b_a2d6_9f5c1e0b7a31);
 
+    /// Microsoft Excel's real coclass CLSID. We register a class object for it
+    /// too, so an **early-bound** client (`new Excel.Application()` activates by
+    /// this fixed CLSID, not the ProgID) reaches this server when the registry
+    /// switch shadows it into HKCU. We never write this key into HKLM.
+    const EXCEL_CLSID: GUID = GUID::from_u128(0x00024500_0000_0000_c000_000000000046);
+
     const DISPID_UNKNOWN: i32 = -1;
 
     // Excel's sheet extents, used when `Worksheet.Cells` (no index) yields a
@@ -229,21 +235,28 @@ mod win {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
             log("server starting; registering class object");
             let factory: IClassFactory = ExcelClassFactory.into();
-            let cookie = CoRegisterClassObject(
-                &SHIM_CLSID,
-                &factory,
-                CLSCTX_LOCAL_SERVER,
-                REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
-            )?;
+            // Register the same factory for both our shim CLSID (ProgID path) and
+            // Excel's real CLSID (early-bound activation path).
+            let mut cookies = Vec::new();
+            for clsid in [SHIM_CLSID, EXCEL_CLSID] {
+                cookies.push(CoRegisterClassObject(
+                    &clsid,
+                    &factory,
+                    CLSCTX_LOCAL_SERVER,
+                    REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
+                )?);
+            }
             CoResumeClassObjects()?;
-            log("class object registered; entering message loop");
+            log("class objects registered; entering message loop");
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
             log("message loop exited; revoking + uninitializing");
-            CoRevokeClassObject(cookie)?;
+            for c in cookies {
+                let _ = CoRevokeClassObject(c);
+            }
             CoUninitialize();
         }
         Ok(())
