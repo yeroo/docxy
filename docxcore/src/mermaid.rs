@@ -438,35 +438,44 @@ fn parse_statement(
     let edges_before = edges.len();
     let line = graph_part;
     let segments = split_edges(line);
-    // segments alternate: node, (edge-label, node), (edge-label, node), …
-    let mut prev: Option<usize> = None;
+    // segments alternate: node-group, (edge-label, node-group), …, where a
+    // node-group is one or more `&`-joined node tokens (`A & B --> C & D`).
+    let mut prev_group: Vec<usize> = Vec::new();
     let mut pending_label = String::new();
-    let mut first = true;
     for seg in segments {
         match seg {
             Seg::Node(tok) => {
-                let (id, label, shape, class_name) = parse_node_token(&tok);
-                if id.is_empty() {
+                let mut group: Vec<usize> = Vec::new();
+                for member in split_ampersand(&tok) {
+                    let (id, label, shape, class_name) = parse_node_token(&member);
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let idx = get(&id, label.as_deref(), shape, nodes, sg_stack, subgraphs);
+                    if let Some(name) = class_name {
+                        pending.push((id.clone(), PendingStyle::Class(name)));
+                    }
+                    group.push(idx);
+                }
+                if group.is_empty() {
                     continue;
                 }
-                let idx = get(&id, label.as_deref(), shape, nodes, sg_stack, subgraphs);
-                if let Some(name) = class_name {
-                    pending.push((id.clone(), PendingStyle::Class(name)));
+                if !prev_group.is_empty() {
+                    for &p in &prev_group {
+                        for &c in &group {
+                            edges.push(Edge {
+                                from: p,
+                                to: c,
+                                label: pending_label.clone(),
+                            });
+                        }
+                    }
+                    pending_label.clear();
                 }
-                if let Some(p) = prev {
-                    edges.push(Edge {
-                        from: p,
-                        to: idx,
-                        label: std::mem::take(&mut pending_label),
-                    });
-                }
-                prev = Some(idx);
-                first = false;
+                prev_group = group;
             }
             Seg::Arrow(label) => {
                 pending_label = label;
-                // A leading arrow with no left node: ignore.
-                let _ = first;
             }
         }
     }
@@ -509,6 +518,33 @@ fn message_colon(line: &str) -> Option<usize> {
 enum Seg {
     Node(String),
     Arrow(String),
+}
+
+/// Split a node segment on top-level `&` (Mermaid group operator), keeping `&`
+/// inside a `[...]`/`(...)`/`{...}` label intact. Empty pieces are dropped.
+fn split_ampersand(tok: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    for c in tok.chars() {
+        match c {
+            '[' | '(' | '{' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ']' | ')' | '}' => {
+                depth -= 1;
+                buf.push(c);
+            }
+            '&' if depth == 0 => out.push(std::mem::take(&mut buf)),
+            _ => buf.push(c),
+        }
+    }
+    out.push(buf);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Split a line into alternating node / arrow segments. Arrows are runs built
@@ -1489,6 +1525,46 @@ mod tests {
         let d = parse("graph TD\nA -->|yes| B");
         assert_eq!(d.edges.len(), 1);
         assert_eq!(d.edges[0].label, "yes");
+    }
+
+    #[test]
+    fn ampersand_fan_out_targets() {
+        let d = parse("flowchart TD\nA -->|x| B & C & D");
+        // 3 edges A→B, A→C, A→D, all labelled x.
+        assert_eq!(d.edges.len(), 3);
+        let labels: Vec<&str> = d.edges.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.iter().all(|l| *l == "x"));
+        // No phantom node whose label contains '&'.
+        assert!(d.nodes.iter().all(|n| !n.label.contains('&')));
+        assert_eq!(d.nodes.len(), 4); // A,B,C,D
+    }
+
+    #[test]
+    fn ampersand_fan_out_sources_and_product() {
+        let d = parse("flowchart TD\nA & B --> C");
+        assert_eq!(d.edges.len(), 2); // A→C, B→C
+        let d2 = parse("flowchart TD\nA & B --> C & D");
+        assert_eq!(d2.edges.len(), 4); // cross-product
+        let d3 = parse("flowchart TD\nA --> B & C --> D");
+        // A→B, A→C, then B→D, C→D
+        assert_eq!(d3.edges.len(), 4);
+    }
+
+    #[test]
+    fn ampersand_in_label_is_not_a_separator() {
+        let d = parse("flowchart TD\nX[a & b] --> Y");
+        assert_eq!(d.nodes.len(), 2);
+        assert!(d.nodes.iter().any(|n| n.label == "a & b"));
+        assert_eq!(d.edges.len(), 1);
+    }
+
+    #[test]
+    fn context_map_fan_out_expands() {
+        // The Aliaksei context map fan-outs must become many edges, not phantom nodes.
+        let src = "graph LR\n  IA[Identity]\n  IA -->|claims| DL & POOL & OE & CAT";
+        let d = parse(src);
+        assert_eq!(d.edges.len(), 4);
+        assert!(d.nodes.iter().all(|n| !n.label.contains('&')));
     }
 
     #[test]
