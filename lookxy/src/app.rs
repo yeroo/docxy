@@ -240,6 +240,16 @@ pub struct App {
     /// Whether the read-only help overlay (`F1`/`?`) is open. A modal like the
     /// others: while open it captures every key and closes on Esc/F1/?/q.
     pub help: bool,
+    /// The ribbon (tabs/buttons). Always shows its tab strip; the button body
+    /// expands on F9 / a tab click.
+    pub ribbon: crate::ui::ribbon::Ribbon,
+    /// Whether the ribbon's button body is expanded.
+    pub ribbon_open: bool,
+    /// Keyboard focus within the ribbon (`None` = the panes have focus).
+    pub ribbon_focus: crate::ui::ribbon::Focus,
+    /// Rows the ribbon occupies on screen this frame (recorded by `ui::draw`),
+    /// for mouse hit-testing.
+    pub ribbon_h: u16,
     // --- Mouse hit-test regions, recorded each frame by `ui::draw` (default
     // zero, so a click before the first draw hits nothing). ---
     /// The rail column's on-screen rect.
@@ -507,6 +517,10 @@ impl App {
             agwinterm_notify_invocations: std::cell::Cell::new(0),
             free_busy: None,
             help: false,
+            ribbon: crate::ui::ribbon::Ribbon::new(),
+            ribbon_open: false,
+            ribbon_focus: crate::ui::ribbon::Focus::None,
+            ribbon_h: 1,
             rail_rect: Rect::ZERO,
             folders_rect: Rect::ZERO,
             folders_row0: 0,

@@ -69,6 +69,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The ribbon sits at the very top of both modes: a 1-row tab strip when
+    // collapsed, or the full body (tabs + buttons + hint) when expanded.
+    let ribbon_h = if app.ribbon_open {
+        ribbon::EXPANDED_H
+    } else {
+        1
+    };
+    let ribbon_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(ribbon_h), Constraint::Min(0)])
+        .split(area);
+    draw_ribbon(f, app, ribbon_split[0]);
+    app.ribbon_h = ribbon_h;
+    let area = ribbon_split[1];
+
     // The level-0 rail sits to the left of both the Mail panes and the Calendar
     // agenda (but not under the full-frame compose/OOF editors, which returned
     // above). Everything below lays out against the remaining `area`.
@@ -153,6 +168,65 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     signin::draw(f, &*app);
 }
 
+/// Keys while the ribbon has focus: arrows move (switching the active tab live
+/// when the cursor lands on another tab that has a body); `Enter` runs the
+/// focused button; `Esc` leaves and collapses. (Enter dispatch lands in the
+/// next task.)
+fn ribbon_key(app: &mut App, key: KeyEvent) {
+    use ribbon::{Dir, Focus};
+    let dir = match key.code {
+        KeyCode::Left => Some(Dir::Left),
+        KeyCode::Right => Some(Dir::Right),
+        KeyCode::Up => Some(Dir::Up),
+        KeyCode::Down => Some(Dir::Down),
+        _ => None,
+    };
+    if let Some(dir) = dir {
+        let next = app.ribbon.nav(app.ribbon_focus, dir);
+        if let Focus::Tab(t) = next {
+            app.ribbon.set_active(t); // switch the body live (no-op for File)
+        }
+        app.ribbon_focus = next;
+        return;
+    }
+    if key.code == KeyCode::Esc {
+        app.ribbon_focus = Focus::None;
+        app.ribbon_open = false;
+    }
+}
+
+/// Renders the ribbon into `area`: the tab strip on the first row, and — when
+/// `ribbon_open` — the button body and the hint bar beneath it.
+fn draw_ribbon(f: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Paragraph;
+    if area.height == 0 {
+        return;
+    }
+    let tabs = app.ribbon.render_tabs(app.ribbon_focus);
+    f.render_widget(Paragraph::new(tabs), Rect { height: 1, ..area });
+    if app.ribbon_open && area.height >= ribbon::EXPANDED_H {
+        let body = app.ribbon.render_body(app.ribbon_focus);
+        let body_h = body.len() as u16;
+        f.render_widget(
+            Paragraph::new(body),
+            Rect {
+                y: area.y + 1,
+                height: body_h,
+                ..area
+            },
+        );
+        let hint = app.ribbon.render_hint(app.ribbon_focus, area.width);
+        f.render_widget(
+            Paragraph::new(hint),
+            Rect {
+                y: area.y + 1 + body_h,
+                height: 1,
+                ..area
+            },
+        );
+    }
+}
+
 /// Renders the reminder banner (the front queued reminder, plus a `(+N more)`
 /// count and an `[Esc to dismiss]` hint) into `area` — a 1-row yellow strip.
 fn draw_reminder_banner(f: &mut Frame, app: &App, area: Rect) {
@@ -191,6 +265,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // through. Sign-in still wins (help can't be open without a token).
     if app.help {
         help::handle_key(app, key);
+        return;
+    }
+    // F9 toggles ribbon focus: on → focus the tab strip (expanded); off →
+    // collapse and hand focus back to the panes.
+    if key.code == KeyCode::F(9) {
+        if app.ribbon_focus == ribbon::Focus::None {
+            app.ribbon_open = true;
+            app.ribbon_focus = ribbon::Focus::Tab(app.ribbon.active_tab());
+        } else {
+            app.ribbon_focus = ribbon::Focus::None;
+            app.ribbon_open = false;
+        }
+        return;
+    }
+    // While the ribbon has focus, arrows navigate it and Esc leaves.
+    if app.ribbon_focus != ribbon::Focus::None {
+        ribbon_key(app, key);
         return;
     }
     // The automatic-replies editor (opened by `O`) gets first crack at every
@@ -567,6 +658,21 @@ mod tests {
     use mailcore::sync::engine::SyncCommand;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn f9_focuses_the_ribbon_arrows_move_tabs_esc_leaves() {
+        let mut app = App::for_test_with_seeded_store();
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(9)));
+        assert!(app.ribbon_open);
+        assert!(matches!(app.ribbon_focus, ribbon::Focus::Tab(_)));
+        let before = app.ribbon.active_tab();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right));
+        // Moving right lands on the next tab with a body → the active tab advances.
+        assert_ne!(app.ribbon.active_tab(), before);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.ribbon_focus, ribbon::Focus::None);
+        assert!(!app.ribbon_open);
+    }
 
     #[test]
     fn rail_up_down_switches_mail_and_calendar() {

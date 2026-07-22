@@ -9,8 +9,8 @@
 //! Every glyph is single-width so the layout is exact. The focused/hovered
 //! button's description shows in a black-on-yellow hint bar at the bottom edge.
 
-// The App wiring (fields, key/mouse routing, dispatch) lands in the next task;
-// until then the model/render/hit/nav are exercised only by unit tests.
+// A few methods (mouse `hit`, `focus_act`, `set_toggles`) are consumed by the
+// mouse/dispatch tasks that follow; allow the short-lived gap.
 #![allow(dead_code)]
 
 use ratatui::style::{Color, Modifier, Style};
