@@ -9,10 +9,6 @@
 //! Every glyph is single-width so the layout is exact. The focused/hovered
 //! button's description shows in a black-on-yellow hint bar at the bottom edge.
 
-// A few methods (mouse `hit`, `focus_act`, `set_toggles`) are consumed by the
-// mouse/dispatch tasks that follow; allow the short-lived gap.
-#![allow(dead_code)]
-
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -50,10 +46,6 @@ pub enum Act {
     CategoryFilter,
     // Help
     Help,
-    // File backstage
-    AutoReplies,
-    Settings,
-    Exit,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -138,7 +130,6 @@ pub struct Ribbon {
     tab_groups: Vec<Vec<Group>>,
     placed: Vec<Placed>,
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive) of each tab header
-    width: u16,
     active_toggles: Vec<Act>,
 }
 
@@ -163,7 +154,6 @@ impl Ribbon {
             ],
             placed: Vec::new(),
             tab_cols: Vec::new(),
-            width: 0,
             active_toggles: Vec::new(),
         };
         r.layout();
@@ -231,7 +221,7 @@ impl Ribbon {
             }
             gx += g.width as u16 + 3; // pad(1)+content+pad(1) + next "│"
         }
-        self.width = gx;
+        let _content_width = gx; // ribbon body width; not needed past layout
         self.tab_cols.clear();
         let mut tx = 2u16;
         for t in &self.tabs {
@@ -244,11 +234,9 @@ impl Ribbon {
     pub fn active_tab(&self) -> usize {
         self.active
     }
+    #[cfg(test)]
     pub fn tab_label(&self, i: usize) -> Option<&'static str> {
         self.tabs.get(i).copied()
-    }
-    pub fn width(&self) -> u16 {
-        self.width
     }
     #[cfg(test)]
     pub fn button_count(&self) -> usize {

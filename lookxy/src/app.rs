@@ -1193,9 +1193,6 @@ impl App {
             Act::Threaded => self.toggle_threaded(),
             Act::CategoryFilter => self.open_category_picker(PickerMode::Filter),
             Act::Help => self.open_help(),
-            Act::AutoReplies => self.open_oof_form(),
-            Act::Exit => self.quit = true,
-            Act::Settings => self.open_backstage(),
             Act::Todo(name) => self.error_notice = Some(format!("{name} not implemented yet")),
         }
     }
@@ -1299,8 +1296,10 @@ impl App {
         self.rebuild_visible_folders();
     }
 
-    /// Send/Receive: ask the sync engine to refresh mail and calendar now.
+    /// Send/Receive: ask the sync engine to refresh mail (re-enumerate folders,
+    /// re-run every folder's delta, drain the outbox) and the calendar now.
     pub fn send_receive(&mut self) {
+        let _ = self.sync.cmd_tx.send(SyncCommand::Refresh);
         let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
     }
 
@@ -5575,6 +5574,24 @@ pub(crate) mod tests {
         let mut app = App::for_test_with_seeded_store();
         app.run_ribbon_act(crate::ui::ribbon::Act::Help);
         assert!(app.help);
+    }
+
+    #[test]
+    fn send_receive_asks_the_engine_to_refresh() {
+        let mut app = App::for_test_with_seeded_store();
+        app.send_receive();
+        // Drains what got queued: a mail Refresh and a calendar RefreshCalendar.
+        let rx = app.test_cmd_rx.as_ref().unwrap();
+        let mut saw_refresh = false;
+        let mut saw_calendar = false;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                SyncCommand::Refresh => saw_refresh = true,
+                SyncCommand::RefreshCalendar => saw_calendar = true,
+                _ => {}
+            }
+        }
+        assert!(saw_refresh && saw_calendar);
     }
 
     #[test]

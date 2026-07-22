@@ -19,6 +19,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("\u{2191} / \u{2193} (j/k)", "move within a level"),
             ("/", "search"),
             ("F1 / ?", "this help"),
+            ("F9", "ribbon (or click a tab)"),
+            ("mouse", "click to select, click again to open"),
             ("q", "quit"),
         ],
     ),
