@@ -66,11 +66,19 @@ mod win {
     }
 
     pub fn run() -> Result<()> {
-        let out = std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| default_out_path());
+        let arg1 = std::env::args().nth(1);
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+
+            // Registration modes (per-user; what the VDI runs to enable the
+            // out-of-process path — registers our LIBID + each interface's
+            // ProxyStubClsid32 -> oleaut {00020424} + TypeLib -> our LIBID).
+            match arg1.as_deref() {
+                Some("register") => return register(&arg2_path(), true),
+                Some("unregister") => return register(&arg2_path(), false),
+                _ => {}
+            }
+            let out = arg1.unwrap_or_else(default_out_path);
 
             let src = load_excel()?;
 
@@ -276,6 +284,31 @@ mod win {
             let k = (*attr).typekind;
             rti.ReleaseTypeAttr(attr);
             Some(k)
+        }
+    }
+
+    fn arg2_path() -> String {
+        std::env::args().nth(2).unwrap_or_else(default_out_path)
+    }
+
+    /// Register (or unregister) our typelib per-user. RegisterTypeLibForUser
+    /// writes, under HKCU\Software\Classes: TypeLib\{our LIBID}\… -> the .tlb
+    /// file, and for each interface it defines Interface\{IID}\{ ProxyStubClsid32
+    /// = {00020424} (oleaut), TypeLib = {our LIBID} }. That is exactly what the
+    /// universal marshaller needs to build vtable proxies for the shim's dual
+    /// interfaces where no Office is installed.
+    unsafe fn register(path: &str, on: bool) -> Result<()> {
+        unsafe {
+            let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
+            if on {
+                let tl: ITypeLib = LoadTypeLibEx(PCWSTR(w.as_ptr()), REGKIND_NONE)?;
+                RegisterTypeLibForUser(&tl, PCWSTR(w.as_ptr()), PCWSTR::null())?;
+                println!("registered typelib (per-user) from {path}");
+            } else {
+                UnRegisterTypeLibForUser(&DOCXY_LIBID, 1, 9, 0, SYS_WIN64)?;
+                println!("unregistered typelib (per-user)");
+            }
+            Ok(())
         }
     }
 

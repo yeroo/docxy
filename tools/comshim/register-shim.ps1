@@ -69,6 +69,25 @@ $exLs = (Get-ItemProperty "$Classes\CLSID\$ExcelClsid\LocalServer32" -Name '(def
 if ($exLs -and $exLs -notmatch 'xlcomshim' -and -not $Force) { throw $g }
 Set-Default "$Classes\CLSID\$ExcelClsid\LocalServer32" ('"{0}" /automation' -f $Exe)
 
+# Type library: required only for EARLY-BOUND OUT-OF-PROCESS marshalling on a
+# machine with no Office. The oleaut universal marshaller {00020424} reads a
+# registered typelib to build vtable proxies for the shim's dual interfaces;
+# with no Office there is none, so we ship + register our own (docxy-excel.tlb).
+# Registered per-user (writes TypeLib\{our LIBID} + Interface\{IID}\{TypeLib,
+# ProxyStubClsid32} under HKCU). Late-bound and in-process paths don't need it.
+# The .tlb is a build artifact produced on a machine WITH Excel (mktypelib reads
+# Excel's typelib); it cannot be regenerated where Office is absent, so it ships
+# alongside the exe.
+$mk  = Join-Path (Split-Path $Exe) 'mktypelib.exe'
+$tlb = Join-Path $PSScriptRoot 'docxy-excel.tlb'
+if ((Test-Path -LiteralPath $mk) -and (Test-Path -LiteralPath $tlb)) {
+    & $mk register $tlb | Out-Null
+    Write-Host "Registered type library (per-user) from $tlb"
+} else {
+    Write-Host "NOTE: type library NOT registered (need mktypelib.exe next to the exe and docxy-excel.tlb here)."
+    Write-Host "      Early-bound out-of-process marshalling on a no-Office machine requires it."
+}
+
 Write-Host "Registered Excel.Application (ProgID + coclass) -> $Exe (HKCU, per-user)."
 Write-Host 'Test:  $x = New-Object -ComObject Excel.Application; $x.Version; $x.Quit()'
 Write-Host 'Undo:  tools\comshim\unregister-shim.ps1'

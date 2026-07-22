@@ -17,6 +17,13 @@ $Classes    = 'HKCU:\Software\Classes'
 
 Remove-Item "$Classes\CLSID\$ShimClsid" -Recurse -Force -ErrorAction SilentlyContinue
 
+# Unregister our per-user type library (no-op if it was never registered).
+$mk  = Join-Path $PSScriptRoot '..\..\target\release\mktypelib.exe'
+$tlb = Join-Path $PSScriptRoot 'docxy-excel.tlb'
+if ((Test-Path -LiteralPath $mk) -and (Test-Path -LiteralPath $tlb)) {
+    try { & $mk unregister $tlb | Out-Null } catch { }
+}
+
 # Remove the HKCU Excel-CLSID shadow only if it points at our shim (never touch
 # a mapping we didn't create; HKLM's real Excel is never in play here).
 $exLs = (Get-ItemProperty "$Classes\CLSID\$ExcelClsid\LocalServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
