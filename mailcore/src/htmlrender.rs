@@ -106,6 +106,22 @@ pub const INDENT_SPACES: usize = 2;
 /// in a malformed/full-document body.
 pub(crate) const SKIP_CONTENT_TAGS: [&str; 4] = ["script", "style", "head", "title"];
 
+/// Detects a bare `http(s)` URL inside a whitespace-delimited word and returns
+/// the cleaned target — so URLs written as plain text (common in `text/plain`
+/// mail, e.g. `<https://…>` or `see https://…`) become colourable/clickable
+/// links even without an `<a>` tag. Skips leading delimiters (`<`, `(`, …) by
+/// starting at the scheme, and trims trailing punctuation/delimiters.
+fn autolink(word: &str) -> Option<String> {
+    let start = word.find("https://").or_else(|| word.find("http://"))?;
+    let url = word[start..].trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':' | '!' | '?'
+        )
+    });
+    (url.len() >= 10).then(|| url.to_string())
+}
+
 /// A single word (a whitespace-delimited run of characters) plus the
 /// styling/link state active when it was collected. The unit `render_html`
 /// accumulates per block and `wrap_words` consumes to build `StyledLine`s.
@@ -167,7 +183,12 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                         bold: bold > 0,
                         italic: italic > 0,
                         underline: underline > 0,
-                        link: link_stack.last().filter(|h| !h.is_empty()).cloned(),
+                        // An explicit <a href> wins; else autolink a bare URL.
+                        link: link_stack
+                            .last()
+                            .filter(|h| !h.is_empty())
+                            .cloned()
+                            .or_else(|| autolink(w)),
                     });
                 }
             }
@@ -331,6 +352,7 @@ pub fn render_text(plain: &str, width: usize) -> Vec<StyledLine> {
             .split_whitespace()
             .map(|w| Word {
                 text: w.to_string(),
+                link: autolink(w),
                 ..Default::default()
             })
             .collect();
@@ -793,6 +815,31 @@ mod tests {
         let joined: String = spans.iter().map(|s| s.text.clone()).collect();
         assert!(!joined.contains("[1]"));
         assert!(!joined.contains("https://x")); // URL is only in `link`, not shown
+    }
+
+    #[test]
+    fn bare_urls_autolink_in_plain_text() {
+        // A plain-text body with a URL wrapped in angle brackets (common in mail).
+        let lines = render_text("See <https://acme.com/path> for details.", 80);
+        let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.link.as_deref() == Some("https://acme.com/path")),
+            "expected the bare URL to autolink: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn bare_urls_autolink_in_html_text() {
+        let lines = render_html("<p>see https://acme.com/x, thanks</p>", 80);
+        let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        // The trailing comma is trimmed from the link target.
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.link.as_deref() == Some("https://acme.com/x"))
+        );
     }
 
     #[test]
