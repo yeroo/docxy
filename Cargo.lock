@@ -2048,6 +2048,7 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "ribboncore",
  "unicode-width 0.2.0",
 ]
 
