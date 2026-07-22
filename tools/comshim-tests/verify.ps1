@@ -15,10 +15,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Exe = "$PSScriptRoot\..\..\target\release\xlcomshim.exe",
+    [string]$Exe,
     [string]$Out = "$env:TEMP\xlcomshim-smoke.xlsx"
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Exe) { $Exe = Join-Path $PSScriptRoot '..\..\target\release\xlcomshim.exe' }
 $tools = "$PSScriptRoot\..\comshim"
 Remove-Item $Out -ErrorAction SilentlyContinue
 

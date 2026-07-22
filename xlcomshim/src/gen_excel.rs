@@ -3,7 +3,7 @@
 // are layered on in main.rs. include!d inside `mod win`.
 
 #[interface("000208D5-0000-0000-C000-000000000046")]
-unsafe trait _Application: IDispatch {
+unsafe trait IApplication: IDispatch {
     unsafe fn s7(&self) -> HRESULT;
     unsafe fn s8(&self) -> HRESULT;
     unsafe fn s9(&self) -> HRESULT;
@@ -473,7 +473,7 @@ unsafe trait _Application: IDispatch {
     unsafe fn s473(&self) -> HRESULT;
 }
 
-impl _Application_Impl for Application_Impl {
+impl IApplication_Impl for Application_Impl {
     unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
     unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
     unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
@@ -941,6 +941,1627 @@ impl _Application_Impl for Application_Impl {
     unsafe fn s471(&self) -> HRESULT { E_NOTIMPL }
     unsafe fn s472(&self) -> HRESULT { E_NOTIMPL }
     unsafe fn s473(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("000208DB-0000-0000-C000-000000000046")]
+unsafe trait IWorkbooks: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+}
+
+impl IWorkbooks_Impl for Workbooks_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("000208DA-0000-0000-C000-000000000046")]
+unsafe trait IWorkbook: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self) -> HRESULT;
+    unsafe fn s32(&self) -> HRESULT;
+    unsafe fn s33(&self) -> HRESULT;
+    unsafe fn s34(&self) -> HRESULT;
+    unsafe fn s35(&self) -> HRESULT;
+    unsafe fn s36(&self) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+    unsafe fn s44(&self) -> HRESULT;
+    unsafe fn s45(&self) -> HRESULT;
+    unsafe fn s46(&self) -> HRESULT;
+    unsafe fn s47(&self) -> HRESULT;
+    unsafe fn s48(&self) -> HRESULT;
+    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s50(&self) -> HRESULT;
+    unsafe fn s51(&self) -> HRESULT;
+    unsafe fn s52(&self) -> HRESULT;
+    unsafe fn s53(&self) -> HRESULT;
+    unsafe fn s54(&self) -> HRESULT;
+    unsafe fn s55(&self) -> HRESULT;
+    unsafe fn s56(&self) -> HRESULT;
+    unsafe fn s57(&self) -> HRESULT;
+    unsafe fn s58(&self) -> HRESULT;
+    unsafe fn s59(&self) -> HRESULT;
+    unsafe fn s60(&self) -> HRESULT;
+    unsafe fn s61(&self) -> HRESULT;
+    unsafe fn s62(&self) -> HRESULT;
+    unsafe fn s63(&self) -> HRESULT;
+    unsafe fn s64(&self) -> HRESULT;
+    unsafe fn s65(&self) -> HRESULT;
+    unsafe fn s66(&self) -> HRESULT;
+    unsafe fn s67(&self) -> HRESULT;
+    unsafe fn s68(&self) -> HRESULT;
+    unsafe fn s69(&self) -> HRESULT;
+    unsafe fn s70(&self) -> HRESULT;
+    unsafe fn s71(&self) -> HRESULT;
+    unsafe fn s72(&self) -> HRESULT;
+    unsafe fn s73(&self) -> HRESULT;
+    unsafe fn s74(&self) -> HRESULT;
+    unsafe fn s75(&self) -> HRESULT;
+    unsafe fn s76(&self) -> HRESULT;
+    unsafe fn s77(&self) -> HRESULT;
+    unsafe fn s78(&self) -> HRESULT;
+    unsafe fn s79(&self) -> HRESULT;
+    unsafe fn s80(&self) -> HRESULT;
+    unsafe fn s81(&self) -> HRESULT;
+    unsafe fn s82(&self) -> HRESULT;
+    unsafe fn s83(&self) -> HRESULT;
+    unsafe fn s84(&self) -> HRESULT;
+    unsafe fn s85(&self) -> HRESULT;
+    unsafe fn s86(&self) -> HRESULT;
+    unsafe fn s87(&self) -> HRESULT;
+    unsafe fn s88(&self) -> HRESULT;
+    unsafe fn s89(&self) -> HRESULT;
+    unsafe fn s90(&self) -> HRESULT;
+    unsafe fn s91(&self) -> HRESULT;
+    unsafe fn s92(&self) -> HRESULT;
+    unsafe fn s93(&self) -> HRESULT;
+    unsafe fn s94(&self) -> HRESULT;
+    unsafe fn s95(&self) -> HRESULT;
+    unsafe fn s96(&self) -> HRESULT;
+    unsafe fn s97(&self) -> HRESULT;
+    unsafe fn s98(&self) -> HRESULT;
+    unsafe fn s99(&self) -> HRESULT;
+    unsafe fn s100(&self) -> HRESULT;
+    unsafe fn s101(&self) -> HRESULT;
+    unsafe fn s102(&self) -> HRESULT;
+    unsafe fn s103(&self) -> HRESULT;
+    unsafe fn s104(&self) -> HRESULT;
+    unsafe fn s105(&self) -> HRESULT;
+    unsafe fn s106(&self) -> HRESULT;
+    unsafe fn s107(&self) -> HRESULT;
+    unsafe fn s108(&self) -> HRESULT;
+    unsafe fn s109(&self) -> HRESULT;
+    unsafe fn s110(&self) -> HRESULT;
+    unsafe fn s111(&self) -> HRESULT;
+    unsafe fn s112(&self) -> HRESULT;
+    unsafe fn s113(&self) -> HRESULT;
+    unsafe fn s114(&self) -> HRESULT;
+    unsafe fn s115(&self) -> HRESULT;
+    unsafe fn s116(&self) -> HRESULT;
+    unsafe fn s117(&self) -> HRESULT;
+    unsafe fn s118(&self) -> HRESULT;
+    unsafe fn s119(&self) -> HRESULT;
+    unsafe fn s120(&self) -> HRESULT;
+    unsafe fn s121(&self) -> HRESULT;
+    unsafe fn s122(&self) -> HRESULT;
+    unsafe fn s123(&self) -> HRESULT;
+    unsafe fn s124(&self) -> HRESULT;
+    unsafe fn s125(&self) -> HRESULT;
+    unsafe fn s126(&self) -> HRESULT;
+    unsafe fn s127(&self) -> HRESULT;
+    unsafe fn s128(&self) -> HRESULT;
+    unsafe fn s129(&self) -> HRESULT;
+    unsafe fn s130(&self) -> HRESULT;
+    unsafe fn s131(&self) -> HRESULT;
+    unsafe fn s132(&self) -> HRESULT;
+    unsafe fn s133(&self) -> HRESULT;
+    unsafe fn s134(&self) -> HRESULT;
+    unsafe fn s135(&self) -> HRESULT;
+    unsafe fn s136(&self) -> HRESULT;
+    unsafe fn s137(&self) -> HRESULT;
+    unsafe fn s138(&self) -> HRESULT;
+    unsafe fn s139(&self) -> HRESULT;
+    unsafe fn s140(&self) -> HRESULT;
+    unsafe fn s141(&self) -> HRESULT;
+    unsafe fn s142(&self) -> HRESULT;
+    unsafe fn s143(&self) -> HRESULT;
+    unsafe fn s144(&self) -> HRESULT;
+    unsafe fn s145(&self) -> HRESULT;
+    unsafe fn s146(&self) -> HRESULT;
+    unsafe fn s147(&self) -> HRESULT;
+    unsafe fn s148(&self) -> HRESULT;
+    unsafe fn s149(&self) -> HRESULT;
+    unsafe fn s150(&self) -> HRESULT;
+    unsafe fn s151(&self) -> HRESULT;
+    unsafe fn s152(&self) -> HRESULT;
+    unsafe fn s153(&self) -> HRESULT;
+    unsafe fn s154(&self) -> HRESULT;
+    unsafe fn s155(&self) -> HRESULT;
+    unsafe fn s156(&self) -> HRESULT;
+    unsafe fn s157(&self) -> HRESULT;
+    unsafe fn s158(&self) -> HRESULT;
+    unsafe fn s159(&self) -> HRESULT;
+    unsafe fn s160(&self) -> HRESULT;
+    unsafe fn s161(&self) -> HRESULT;
+    unsafe fn s162(&self) -> HRESULT;
+    unsafe fn s163(&self) -> HRESULT;
+    unsafe fn s164(&self) -> HRESULT;
+    unsafe fn s165(&self) -> HRESULT;
+    unsafe fn s166(&self) -> HRESULT;
+    unsafe fn s167(&self) -> HRESULT;
+    unsafe fn s168(&self) -> HRESULT;
+    unsafe fn s169(&self) -> HRESULT;
+    unsafe fn s170(&self) -> HRESULT;
+    unsafe fn s171(&self) -> HRESULT;
+    unsafe fn s172(&self) -> HRESULT;
+    unsafe fn s173(&self) -> HRESULT;
+    unsafe fn s174(&self) -> HRESULT;
+    unsafe fn s175(&self) -> HRESULT;
+    unsafe fn s176(&self) -> HRESULT;
+    unsafe fn s177(&self) -> HRESULT;
+    unsafe fn s178(&self) -> HRESULT;
+    unsafe fn s179(&self) -> HRESULT;
+    unsafe fn s180(&self) -> HRESULT;
+    unsafe fn s181(&self) -> HRESULT;
+    unsafe fn s182(&self) -> HRESULT;
+    unsafe fn s183(&self) -> HRESULT;
+    unsafe fn s184(&self) -> HRESULT;
+    unsafe fn s185(&self) -> HRESULT;
+    unsafe fn s186(&self) -> HRESULT;
+    unsafe fn s187(&self) -> HRESULT;
+    unsafe fn s188(&self) -> HRESULT;
+    unsafe fn s189(&self) -> HRESULT;
+    unsafe fn s190(&self) -> HRESULT;
+    unsafe fn s191(&self) -> HRESULT;
+    unsafe fn s192(&self) -> HRESULT;
+    unsafe fn s193(&self) -> HRESULT;
+    unsafe fn s194(&self) -> HRESULT;
+    unsafe fn s195(&self) -> HRESULT;
+    unsafe fn s196(&self) -> HRESULT;
+    unsafe fn s197(&self) -> HRESULT;
+    unsafe fn s198(&self) -> HRESULT;
+    unsafe fn s199(&self) -> HRESULT;
+    unsafe fn s200(&self) -> HRESULT;
+    unsafe fn s201(&self) -> HRESULT;
+    unsafe fn s202(&self) -> HRESULT;
+    unsafe fn s203(&self) -> HRESULT;
+    unsafe fn s204(&self) -> HRESULT;
+    unsafe fn s205(&self) -> HRESULT;
+    unsafe fn s206(&self) -> HRESULT;
+    unsafe fn s207(&self) -> HRESULT;
+    unsafe fn s208(&self) -> HRESULT;
+    unsafe fn s209(&self) -> HRESULT;
+    unsafe fn s210(&self) -> HRESULT;
+    unsafe fn s211(&self) -> HRESULT;
+    unsafe fn s212(&self) -> HRESULT;
+    unsafe fn s213(&self) -> HRESULT;
+    unsafe fn s214(&self) -> HRESULT;
+    unsafe fn s215(&self) -> HRESULT;
+    unsafe fn s216(&self) -> HRESULT;
+    unsafe fn s217(&self) -> HRESULT;
+    unsafe fn s218(&self) -> HRESULT;
+    unsafe fn s219(&self) -> HRESULT;
+    unsafe fn s220(&self) -> HRESULT;
+    unsafe fn s221(&self) -> HRESULT;
+    unsafe fn s222(&self) -> HRESULT;
+    unsafe fn s223(&self) -> HRESULT;
+    unsafe fn s224(&self) -> HRESULT;
+    unsafe fn s225(&self) -> HRESULT;
+    unsafe fn s226(&self) -> HRESULT;
+    unsafe fn s227(&self) -> HRESULT;
+    unsafe fn s228(&self) -> HRESULT;
+    unsafe fn s229(&self) -> HRESULT;
+    unsafe fn s230(&self) -> HRESULT;
+    unsafe fn s231(&self) -> HRESULT;
+    unsafe fn s232(&self) -> HRESULT;
+    unsafe fn s233(&self) -> HRESULT;
+    unsafe fn s234(&self) -> HRESULT;
+    unsafe fn s235(&self) -> HRESULT;
+    unsafe fn s236(&self) -> HRESULT;
+    unsafe fn s237(&self) -> HRESULT;
+    unsafe fn s238(&self) -> HRESULT;
+    unsafe fn s239(&self) -> HRESULT;
+    unsafe fn s240(&self) -> HRESULT;
+    unsafe fn s241(&self) -> HRESULT;
+    unsafe fn s242(&self) -> HRESULT;
+    unsafe fn s243(&self) -> HRESULT;
+    unsafe fn s244(&self) -> HRESULT;
+    unsafe fn s245(&self) -> HRESULT;
+    unsafe fn s246(&self) -> HRESULT;
+    unsafe fn s247(&self) -> HRESULT;
+    unsafe fn s248(&self) -> HRESULT;
+    unsafe fn s249(&self) -> HRESULT;
+    unsafe fn s250(&self) -> HRESULT;
+    unsafe fn s251(&self) -> HRESULT;
+    unsafe fn s252(&self) -> HRESULT;
+    unsafe fn s253(&self) -> HRESULT;
+    unsafe fn s254(&self) -> HRESULT;
+    unsafe fn s255(&self) -> HRESULT;
+    unsafe fn s256(&self) -> HRESULT;
+    unsafe fn s257(&self) -> HRESULT;
+    unsafe fn s258(&self) -> HRESULT;
+    unsafe fn s259(&self) -> HRESULT;
+    unsafe fn s260(&self) -> HRESULT;
+    unsafe fn s261(&self) -> HRESULT;
+    unsafe fn s262(&self) -> HRESULT;
+    unsafe fn s263(&self) -> HRESULT;
+    unsafe fn s264(&self) -> HRESULT;
+    unsafe fn s265(&self) -> HRESULT;
+    unsafe fn s266(&self) -> HRESULT;
+    unsafe fn s267(&self) -> HRESULT;
+    unsafe fn s268(&self) -> HRESULT;
+    unsafe fn s269(&self) -> HRESULT;
+    unsafe fn s270(&self) -> HRESULT;
+    unsafe fn s271(&self) -> HRESULT;
+    unsafe fn s272(&self) -> HRESULT;
+    unsafe fn s273(&self) -> HRESULT;
+    unsafe fn s274(&self) -> HRESULT;
+    unsafe fn s275(&self) -> HRESULT;
+    unsafe fn s276(&self) -> HRESULT;
+    unsafe fn s277(&self) -> HRESULT;
+    unsafe fn s278(&self) -> HRESULT;
+    unsafe fn s279(&self) -> HRESULT;
+    unsafe fn s280(&self) -> HRESULT;
+    unsafe fn s281(&self) -> HRESULT;
+    unsafe fn s282(&self) -> HRESULT;
+    unsafe fn s283(&self) -> HRESULT;
+    unsafe fn s284(&self) -> HRESULT;
+    unsafe fn s285(&self) -> HRESULT;
+    unsafe fn s286(&self) -> HRESULT;
+}
+
+impl IWorkbook_Impl for Workbook_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s158(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s159(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s160(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s161(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s162(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s163(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s164(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s165(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s166(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s167(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s168(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s169(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s170(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s171(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s172(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s173(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s174(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s175(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s176(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s177(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s178(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s179(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s180(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s181(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s182(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s183(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s184(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s185(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s186(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s187(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s188(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s189(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s190(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s191(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s192(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s193(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s194(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s195(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s196(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s197(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s198(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s199(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s200(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s201(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s202(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s203(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s204(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s205(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s206(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s207(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s208(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s209(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s210(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s211(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s212(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s213(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s214(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s215(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s216(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s217(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s218(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s219(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s220(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s221(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s222(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s223(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s224(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s225(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s226(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s227(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s228(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s229(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s230(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s231(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s232(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s233(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s234(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s235(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s236(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s237(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s238(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s239(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s240(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s241(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s242(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s243(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s244(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s245(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s246(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s247(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s248(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s249(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s250(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s251(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s252(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s253(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s254(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s255(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s256(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s257(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s258(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s259(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s260(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s261(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s262(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s263(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s264(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s265(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s266(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s267(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s268(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s269(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s270(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s271(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s272(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s273(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s274(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s275(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s276(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s277(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s278(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s279(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s280(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s281(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s282(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s283(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s284(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s285(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s286(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("000208D7-0000-0000-C000-000000000046")]
+unsafe trait ISheets: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+}
+
+impl ISheets_Impl for Worksheets_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("000208D8-0000-0000-C000-000000000046")]
+unsafe trait IWorksheet: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self) -> HRESULT;
+    unsafe fn s32(&self) -> HRESULT;
+    unsafe fn s33(&self) -> HRESULT;
+    unsafe fn s34(&self) -> HRESULT;
+    unsafe fn s35(&self) -> HRESULT;
+    unsafe fn s36(&self) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+    unsafe fn s44(&self) -> HRESULT;
+    unsafe fn s45(&self) -> HRESULT;
+    unsafe fn s46(&self) -> HRESULT;
+    unsafe fn s47(&self) -> HRESULT;
+    unsafe fn s48(&self) -> HRESULT;
+    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s50(&self) -> HRESULT;
+    unsafe fn s51(&self) -> HRESULT;
+    unsafe fn s52(&self) -> HRESULT;
+    unsafe fn s53(&self) -> HRESULT;
+    unsafe fn s54(&self) -> HRESULT;
+    unsafe fn s55(&self) -> HRESULT;
+    unsafe fn s56(&self) -> HRESULT;
+    unsafe fn s57(&self) -> HRESULT;
+    unsafe fn s58(&self) -> HRESULT;
+    unsafe fn s59(&self) -> HRESULT;
+    unsafe fn s60(&self) -> HRESULT;
+    unsafe fn s61(&self) -> HRESULT;
+    unsafe fn s62(&self) -> HRESULT;
+    unsafe fn s63(&self) -> HRESULT;
+    unsafe fn s64(&self) -> HRESULT;
+    unsafe fn s65(&self) -> HRESULT;
+    unsafe fn s66(&self) -> HRESULT;
+    unsafe fn s67(&self) -> HRESULT;
+    unsafe fn s68(&self) -> HRESULT;
+    unsafe fn s69(&self) -> HRESULT;
+    unsafe fn s70(&self) -> HRESULT;
+    unsafe fn s71(&self) -> HRESULT;
+    unsafe fn s72(&self) -> HRESULT;
+    unsafe fn s73(&self) -> HRESULT;
+    unsafe fn s74(&self) -> HRESULT;
+    unsafe fn s75(&self) -> HRESULT;
+    unsafe fn s76(&self) -> HRESULT;
+    unsafe fn s77(&self) -> HRESULT;
+    unsafe fn s78(&self) -> HRESULT;
+    unsafe fn s79(&self) -> HRESULT;
+    unsafe fn s80(&self) -> HRESULT;
+    unsafe fn s81(&self) -> HRESULT;
+    unsafe fn s82(&self) -> HRESULT;
+    unsafe fn s83(&self) -> HRESULT;
+    unsafe fn s84(&self) -> HRESULT;
+    unsafe fn s85(&self) -> HRESULT;
+    unsafe fn s86(&self) -> HRESULT;
+    unsafe fn s87(&self) -> HRESULT;
+    unsafe fn s88(&self) -> HRESULT;
+    unsafe fn s89(&self) -> HRESULT;
+    unsafe fn s90(&self) -> HRESULT;
+    unsafe fn s91(&self) -> HRESULT;
+    unsafe fn s92(&self) -> HRESULT;
+    unsafe fn s93(&self) -> HRESULT;
+    unsafe fn s94(&self) -> HRESULT;
+    unsafe fn s95(&self) -> HRESULT;
+    unsafe fn s96(&self) -> HRESULT;
+    unsafe fn s97(&self) -> HRESULT;
+    unsafe fn s98(&self) -> HRESULT;
+    unsafe fn s99(&self) -> HRESULT;
+    unsafe fn s100(&self) -> HRESULT;
+    unsafe fn s101(&self) -> HRESULT;
+    unsafe fn s102(&self) -> HRESULT;
+    unsafe fn s103(&self) -> HRESULT;
+    unsafe fn s104(&self) -> HRESULT;
+    unsafe fn s105(&self) -> HRESULT;
+    unsafe fn s106(&self) -> HRESULT;
+    unsafe fn s107(&self) -> HRESULT;
+    unsafe fn s108(&self) -> HRESULT;
+    unsafe fn s109(&self) -> HRESULT;
+    unsafe fn s110(&self) -> HRESULT;
+    unsafe fn s111(&self) -> HRESULT;
+    unsafe fn s112(&self) -> HRESULT;
+    unsafe fn s113(&self) -> HRESULT;
+    unsafe fn s114(&self) -> HRESULT;
+    unsafe fn s115(&self) -> HRESULT;
+    unsafe fn s116(&self) -> HRESULT;
+    unsafe fn s117(&self) -> HRESULT;
+    unsafe fn s118(&self) -> HRESULT;
+    unsafe fn s119(&self) -> HRESULT;
+    unsafe fn s120(&self) -> HRESULT;
+    unsafe fn s121(&self) -> HRESULT;
+    unsafe fn s122(&self) -> HRESULT;
+    unsafe fn s123(&self) -> HRESULT;
+    unsafe fn s124(&self) -> HRESULT;
+    unsafe fn s125(&self) -> HRESULT;
+    unsafe fn s126(&self) -> HRESULT;
+    unsafe fn s127(&self) -> HRESULT;
+    unsafe fn s128(&self) -> HRESULT;
+    unsafe fn s129(&self) -> HRESULT;
+    unsafe fn s130(&self) -> HRESULT;
+    unsafe fn s131(&self) -> HRESULT;
+    unsafe fn s132(&self) -> HRESULT;
+    unsafe fn s133(&self) -> HRESULT;
+    unsafe fn s134(&self) -> HRESULT;
+    unsafe fn s135(&self) -> HRESULT;
+    unsafe fn s136(&self) -> HRESULT;
+    unsafe fn s137(&self) -> HRESULT;
+    unsafe fn s138(&self) -> HRESULT;
+    unsafe fn s139(&self) -> HRESULT;
+    unsafe fn s140(&self) -> HRESULT;
+    unsafe fn s141(&self) -> HRESULT;
+    unsafe fn s142(&self) -> HRESULT;
+    unsafe fn s143(&self) -> HRESULT;
+    unsafe fn s144(&self) -> HRESULT;
+    unsafe fn s145(&self) -> HRESULT;
+    unsafe fn s146(&self) -> HRESULT;
+    unsafe fn s147(&self) -> HRESULT;
+    unsafe fn s148(&self) -> HRESULT;
+    unsafe fn s149(&self) -> HRESULT;
+    unsafe fn s150(&self) -> HRESULT;
+    unsafe fn s151(&self) -> HRESULT;
+    unsafe fn s152(&self) -> HRESULT;
+    unsafe fn s153(&self) -> HRESULT;
+    unsafe fn s154(&self) -> HRESULT;
+    unsafe fn s155(&self) -> HRESULT;
+    unsafe fn s156(&self) -> HRESULT;
+    unsafe fn s157(&self) -> HRESULT;
+}
+
+impl IWorksheet_Impl for Worksheet_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("00020846-0000-0000-C000-000000000046")]
+unsafe trait IRange: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self) -> HRESULT;
+    unsafe fn s32(&self) -> HRESULT;
+    unsafe fn s33(&self) -> HRESULT;
+    unsafe fn s34(&self) -> HRESULT;
+    unsafe fn s35(&self) -> HRESULT;
+    unsafe fn s36(&self) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+    unsafe fn s44(&self) -> HRESULT;
+    unsafe fn s45(&self) -> HRESULT;
+    unsafe fn s46(&self) -> HRESULT;
+    unsafe fn s47(&self) -> HRESULT;
+    unsafe fn s48(&self) -> HRESULT;
+    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s50(&self) -> HRESULT;
+    unsafe fn s51(&self) -> HRESULT;
+    unsafe fn s52(&self) -> HRESULT;
+    unsafe fn s53(&self) -> HRESULT;
+    unsafe fn s54(&self) -> HRESULT;
+    unsafe fn s55(&self) -> HRESULT;
+    unsafe fn s56(&self) -> HRESULT;
+    unsafe fn s57(&self) -> HRESULT;
+    unsafe fn s58(&self) -> HRESULT;
+    unsafe fn s59(&self) -> HRESULT;
+    unsafe fn s60(&self) -> HRESULT;
+    unsafe fn s61(&self) -> HRESULT;
+    unsafe fn s62(&self) -> HRESULT;
+    unsafe fn s63(&self) -> HRESULT;
+    unsafe fn s64(&self) -> HRESULT;
+    unsafe fn s65(&self) -> HRESULT;
+    unsafe fn s66(&self) -> HRESULT;
+    unsafe fn s67(&self) -> HRESULT;
+    unsafe fn s68(&self) -> HRESULT;
+    unsafe fn s69(&self) -> HRESULT;
+    unsafe fn s70(&self) -> HRESULT;
+    unsafe fn s71(&self) -> HRESULT;
+    unsafe fn s72(&self) -> HRESULT;
+    unsafe fn s73(&self) -> HRESULT;
+    unsafe fn s74(&self) -> HRESULT;
+    unsafe fn s75(&self) -> HRESULT;
+    unsafe fn s76(&self) -> HRESULT;
+    unsafe fn s77(&self) -> HRESULT;
+    unsafe fn s78(&self) -> HRESULT;
+    unsafe fn s79(&self) -> HRESULT;
+    unsafe fn s80(&self) -> HRESULT;
+    unsafe fn s81(&self) -> HRESULT;
+    unsafe fn s82(&self) -> HRESULT;
+    unsafe fn s83(&self) -> HRESULT;
+    unsafe fn s84(&self) -> HRESULT;
+    unsafe fn s85(&self) -> HRESULT;
+    unsafe fn s86(&self) -> HRESULT;
+    unsafe fn s87(&self) -> HRESULT;
+    unsafe fn s88(&self) -> HRESULT;
+    unsafe fn s89(&self) -> HRESULT;
+    unsafe fn s90(&self) -> HRESULT;
+    unsafe fn s91(&self) -> HRESULT;
+    unsafe fn s92(&self) -> HRESULT;
+    unsafe fn s93(&self) -> HRESULT;
+    unsafe fn s94(&self) -> HRESULT;
+    unsafe fn s95(&self) -> HRESULT;
+    unsafe fn s96(&self) -> HRESULT;
+    unsafe fn s97(&self) -> HRESULT;
+    unsafe fn s98(&self) -> HRESULT;
+    unsafe fn s99(&self) -> HRESULT;
+    unsafe fn s100(&self) -> HRESULT;
+    unsafe fn s101(&self) -> HRESULT;
+    unsafe fn s102(&self) -> HRESULT;
+    unsafe fn s103(&self) -> HRESULT;
+    unsafe fn s104(&self) -> HRESULT;
+    unsafe fn s105(&self) -> HRESULT;
+    unsafe fn s106(&self) -> HRESULT;
+    unsafe fn s107(&self) -> HRESULT;
+    unsafe fn s108(&self) -> HRESULT;
+    unsafe fn s109(&self) -> HRESULT;
+    unsafe fn s110(&self) -> HRESULT;
+    unsafe fn s111(&self) -> HRESULT;
+    unsafe fn s112(&self) -> HRESULT;
+    unsafe fn s113(&self) -> HRESULT;
+    unsafe fn s114(&self) -> HRESULT;
+    unsafe fn s115(&self) -> HRESULT;
+    unsafe fn s116(&self) -> HRESULT;
+    unsafe fn s117(&self) -> HRESULT;
+    unsafe fn s118(&self) -> HRESULT;
+    unsafe fn s119(&self) -> HRESULT;
+    unsafe fn s120(&self) -> HRESULT;
+    unsafe fn s121(&self) -> HRESULT;
+    unsafe fn s122(&self) -> HRESULT;
+    unsafe fn s123(&self) -> HRESULT;
+    unsafe fn s124(&self) -> HRESULT;
+    unsafe fn s125(&self) -> HRESULT;
+    unsafe fn s126(&self) -> HRESULT;
+    unsafe fn s127(&self) -> HRESULT;
+    unsafe fn s128(&self) -> HRESULT;
+    unsafe fn s129(&self) -> HRESULT;
+    unsafe fn s130(&self) -> HRESULT;
+    unsafe fn s131(&self) -> HRESULT;
+    unsafe fn s132(&self) -> HRESULT;
+    unsafe fn s133(&self) -> HRESULT;
+    unsafe fn s134(&self) -> HRESULT;
+    unsafe fn s135(&self) -> HRESULT;
+    unsafe fn s136(&self) -> HRESULT;
+    unsafe fn s137(&self) -> HRESULT;
+    unsafe fn s138(&self) -> HRESULT;
+    unsafe fn s139(&self) -> HRESULT;
+    unsafe fn s140(&self) -> HRESULT;
+    unsafe fn s141(&self) -> HRESULT;
+    unsafe fn s142(&self) -> HRESULT;
+    unsafe fn s143(&self) -> HRESULT;
+    unsafe fn s144(&self) -> HRESULT;
+    unsafe fn s145(&self) -> HRESULT;
+    unsafe fn s146(&self) -> HRESULT;
+    unsafe fn s147(&self) -> HRESULT;
+    unsafe fn s148(&self) -> HRESULT;
+    unsafe fn s149(&self) -> HRESULT;
+    unsafe fn s150(&self) -> HRESULT;
+    unsafe fn s151(&self) -> HRESULT;
+    unsafe fn s152(&self) -> HRESULT;
+    unsafe fn s153(&self) -> HRESULT;
+    unsafe fn s154(&self) -> HRESULT;
+    unsafe fn s155(&self) -> HRESULT;
+    unsafe fn s156(&self) -> HRESULT;
+    unsafe fn s157(&self) -> HRESULT;
+    unsafe fn s158(&self) -> HRESULT;
+    unsafe fn s159(&self) -> HRESULT;
+    unsafe fn s160(&self) -> HRESULT;
+    unsafe fn s161(&self) -> HRESULT;
+    unsafe fn s162(&self) -> HRESULT;
+    unsafe fn s163(&self) -> HRESULT;
+    unsafe fn s164(&self) -> HRESULT;
+    unsafe fn s165(&self) -> HRESULT;
+    unsafe fn s166(&self) -> HRESULT;
+    unsafe fn s167(&self) -> HRESULT;
+    unsafe fn s168(&self) -> HRESULT;
+    unsafe fn s169(&self) -> HRESULT;
+    unsafe fn s170(&self) -> HRESULT;
+    unsafe fn s171(&self) -> HRESULT;
+    unsafe fn s172(&self) -> HRESULT;
+    unsafe fn s173(&self) -> HRESULT;
+    unsafe fn s174(&self) -> HRESULT;
+    unsafe fn s175(&self) -> HRESULT;
+    unsafe fn s176(&self) -> HRESULT;
+    unsafe fn s177(&self) -> HRESULT;
+    unsafe fn s178(&self) -> HRESULT;
+    unsafe fn s179(&self) -> HRESULT;
+    unsafe fn s180(&self) -> HRESULT;
+    unsafe fn s181(&self) -> HRESULT;
+    unsafe fn s182(&self) -> HRESULT;
+    unsafe fn s183(&self) -> HRESULT;
+    unsafe fn s184(&self) -> HRESULT;
+    unsafe fn s185(&self) -> HRESULT;
+    unsafe fn s186(&self) -> HRESULT;
+    unsafe fn s187(&self) -> HRESULT;
+    unsafe fn s188(&self) -> HRESULT;
+    unsafe fn s189(&self) -> HRESULT;
+    unsafe fn s190(&self) -> HRESULT;
+    unsafe fn s191(&self) -> HRESULT;
+    unsafe fn s192(&self) -> HRESULT;
+    unsafe fn s193(&self) -> HRESULT;
+    unsafe fn s194(&self) -> HRESULT;
+    unsafe fn s195(&self) -> HRESULT;
+    unsafe fn s196(&self) -> HRESULT;
+    unsafe fn s197(&self) -> HRESULT;
+    unsafe fn s198(&self) -> HRESULT;
+    unsafe fn s199(&self) -> HRESULT;
+    unsafe fn s200(&self) -> HRESULT;
+    unsafe fn s201(&self) -> HRESULT;
+    unsafe fn s202(&self) -> HRESULT;
+    unsafe fn s203(&self) -> HRESULT;
+    unsafe fn s204(&self) -> HRESULT;
+    unsafe fn s205(&self) -> HRESULT;
+    unsafe fn s206(&self) -> HRESULT;
+    unsafe fn s207(&self) -> HRESULT;
+    unsafe fn s208(&self) -> HRESULT;
+    unsafe fn s209(&self) -> HRESULT;
+    unsafe fn s210(&self) -> HRESULT;
+    unsafe fn s211(&self) -> HRESULT;
+    unsafe fn s212(&self) -> HRESULT;
+    unsafe fn s213(&self) -> HRESULT;
+    unsafe fn s214(&self) -> HRESULT;
+    unsafe fn s215(&self) -> HRESULT;
+    unsafe fn s216(&self) -> HRESULT;
+    unsafe fn s217(&self) -> HRESULT;
+    unsafe fn s218(&self) -> HRESULT;
+    unsafe fn s219(&self) -> HRESULT;
+    unsafe fn s220(&self) -> HRESULT;
+    unsafe fn s221(&self) -> HRESULT;
+    unsafe fn s222(&self) -> HRESULT;
+    unsafe fn s223(&self) -> HRESULT;
+    unsafe fn s224(&self) -> HRESULT;
+    unsafe fn s225(&self) -> HRESULT;
+    unsafe fn s226(&self) -> HRESULT;
+    unsafe fn s227(&self) -> HRESULT;
+    unsafe fn s228(&self) -> HRESULT;
+    unsafe fn s229(&self) -> HRESULT;
+    unsafe fn s230(&self) -> HRESULT;
+    unsafe fn s231(&self) -> HRESULT;
+    unsafe fn s232(&self) -> HRESULT;
+    unsafe fn s233(&self) -> HRESULT;
+    unsafe fn s234(&self) -> HRESULT;
+    unsafe fn s235(&self) -> HRESULT;
+    unsafe fn s236(&self) -> HRESULT;
+    unsafe fn s237(&self) -> HRESULT;
+    unsafe fn s238(&self) -> HRESULT;
+    unsafe fn s239(&self) -> HRESULT;
+    unsafe fn s240(&self) -> HRESULT;
+    unsafe fn s241(&self) -> HRESULT;
+    unsafe fn s242(&self) -> HRESULT;
+    unsafe fn s243(&self) -> HRESULT;
+    unsafe fn s244(&self) -> HRESULT;
+    unsafe fn s245(&self) -> HRESULT;
+    unsafe fn s246(&self) -> HRESULT;
+    unsafe fn s247(&self) -> HRESULT;
+    unsafe fn s248(&self) -> HRESULT;
+    unsafe fn s249(&self) -> HRESULT;
+    unsafe fn s250(&self) -> HRESULT;
+    unsafe fn s251(&self) -> HRESULT;
+    unsafe fn s252(&self) -> HRESULT;
+    unsafe fn s253(&self) -> HRESULT;
+    unsafe fn s254(&self) -> HRESULT;
+    unsafe fn s255(&self) -> HRESULT;
+    unsafe fn s256(&self) -> HRESULT;
+    unsafe fn s257(&self) -> HRESULT;
+    unsafe fn s258(&self) -> HRESULT;
+    unsafe fn s259(&self) -> HRESULT;
+}
+
+impl IRange_Impl for Range_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s158(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s159(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s160(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s161(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s162(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s163(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s164(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s165(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s166(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s167(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s168(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s169(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s170(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s171(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s172(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s173(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s174(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s175(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s176(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s177(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s178(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s179(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s180(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s181(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s182(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s183(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s184(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s185(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s186(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s187(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s188(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s189(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s190(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s191(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s192(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s193(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s194(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s195(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s196(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s197(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s198(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s199(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s200(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s201(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s202(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s203(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s204(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s205(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s206(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s207(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s208(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s209(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s210(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s211(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s212(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s213(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s214(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s215(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s216(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s217(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s218(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s219(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s220(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s221(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s222(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s223(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s224(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s225(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s226(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s227(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s228(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s229(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s230(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s231(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s232(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s233(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s234(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s235(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s236(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s237(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s238(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s239(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s240(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s241(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s242(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s243(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s244(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s245(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s246(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s247(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s248(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s249(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s250(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s251(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s252(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s253(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s254(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s255(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s256(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s257(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s258(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s259(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("0002084D-0000-0000-C000-000000000046")]
+unsafe trait IFont: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self) -> HRESULT;
+    unsafe fn s32(&self) -> HRESULT;
+    unsafe fn s33(&self) -> HRESULT;
+    unsafe fn s34(&self) -> HRESULT;
+    unsafe fn s35(&self) -> HRESULT;
+    unsafe fn s36(&self) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+}
+
+impl IFont_Impl for Font_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
+}
+
+#[interface("00020870-0000-0000-C000-000000000046")]
+unsafe trait IInterior: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self) -> HRESULT;
+    unsafe fn s14(&self) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+}
+
+impl IInterior_Impl for Interior_Impl {
+    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
 }
 
 

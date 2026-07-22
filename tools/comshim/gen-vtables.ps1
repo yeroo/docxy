@@ -22,9 +22,19 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $Out) { $Out = Join-Path $PSScriptRoot '..\..\xlcomshim\src\gen_excel.rs' }
 
-# interface name in the dump -> the Rust struct that implements it
+# dump interface name -> @{ trait = <Rust interface trait>; struct = <implementing struct> }
+# Trait names are I-prefixed so they never collide with the struct names
+# (Range/Font/Workbooks/Interior would otherwise clash). Note both `.Sheets` and
+# `.Worksheets` return the same `Sheets` interface, implemented by our Worksheets.
 $map = [ordered]@{
-    '_Application' = 'Application'
+    '_Application' = @{ trait = 'IApplication'; struct = 'Application' }
+    'Workbooks'    = @{ trait = 'IWorkbooks';   struct = 'Workbooks' }
+    '_Workbook'    = @{ trait = 'IWorkbook';    struct = 'Workbook' }
+    'Sheets'       = @{ trait = 'ISheets';      struct = 'Worksheets' }
+    '_Worksheet'   = @{ trait = 'IWorksheet';   struct = 'Worksheet' }
+    'Range'        = @{ trait = 'IRange';       struct = 'Range' }
+    'Font'         = @{ trait = 'IFont';        struct = 'Font' }
+    'Interior'     = @{ trait = 'IInterior';    struct = 'Interior' }
 }
 
 $lines = Get-Content -LiteralPath $Dump
@@ -35,7 +45,8 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine()
 
 foreach ($iface in $map.Keys) {
-    $struct = $map[$iface]
+    $trait  = $map[$iface].trait
+    $struct = $map[$iface].struct
     # locate the interface header
     $start = ($lines | Select-String -SimpleMatch "INTERFACE $iface " | Select-Object -First 1).LineNumber
     if (-not $start) { throw "interface $iface not found in dump" }
@@ -55,15 +66,15 @@ foreach ($iface in $map.Keys) {
     }
 
     [void]$sb.AppendLine("#[interface(`"$iid`")]")
-    [void]$sb.AppendLine("unsafe trait $iface`: IDispatch {")
+    [void]$sb.AppendLine("unsafe trait $trait`: IDispatch {")
     foreach ($n in $slots) { [void]$sb.AppendLine("    unsafe fn s$n(&self) -> HRESULT;") }
     [void]$sb.AppendLine("}")
     [void]$sb.AppendLine()
-    [void]$sb.AppendLine("impl ${iface}_Impl for ${struct}_Impl {")
+    [void]$sb.AppendLine("impl ${trait}_Impl for ${struct}_Impl {")
     foreach ($n in $slots) { [void]$sb.AppendLine("    unsafe fn s$n(&self) -> HRESULT { E_NOTIMPL }") }
     [void]$sb.AppendLine("}")
     [void]$sb.AppendLine()
-    Write-Host ("{0}: {1} vtable slots (7..{2})" -f $iface, $slots.Count, ($slots[-1]))
+    Write-Host ("{0} -> {1} on {2}: {3} slots (7..{4})" -f $iface, $trait, $struct, $slots.Count, ($slots[-1]))
 }
 
 Set-Content -LiteralPath $Out -Value $sb.ToString() -Encoding UTF8
