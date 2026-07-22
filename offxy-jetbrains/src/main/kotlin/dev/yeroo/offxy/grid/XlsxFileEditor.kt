@@ -118,7 +118,20 @@ class XlsxFileEditor(
         panel.revalidate()
         panel.repaint()
         installContextMenu(g)
+        // Advertise on the agent control surface (xlsxy --mcp sees this tab).
+        runCatching {
+            val server = GridCtlBridge.start(project, this)
+            com.intellij.openapi.util.Disposer.register(this, server)
+        }
         return true
+    }
+
+    /** Ctl-side undo registration — same engine-stack step as UI edits. */
+    fun registerAgentUndo(project: Project, verb: String) {
+        com.intellij.openapi.command.CommandProcessor.getInstance().executeCommand(project, {
+            com.intellij.openapi.command.undo.UndoManager.getInstance(project)
+                .undoableActionPerformed(GridUndo(this))
+        }, "Offxy agent: $verb", null)
     }
 
     private var sheetTabs: SheetTabs? = null
