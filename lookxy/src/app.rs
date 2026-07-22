@@ -182,10 +182,9 @@ pub struct App {
     /// display), this can index straight into `agenda` without needing to
     /// skip anything.
     pub agenda_index: usize,
-    /// The event opened in the detail pane (Enter on the agenda), if any —
-    /// the calendar's equivalent of `selected_msg`. Independent of
-    /// `agenda_index`, same as the reading pane's `selected_msg` doesn't
-    /// track `msg_index` — see `open_selected_event`.
+    /// An explicitly-targeted event for edit/delete, if any — the calendar's
+    /// equivalent of `selected_msg`. `open_edit_event`/`delete_selected_event`
+    /// fall back to the highlighted agenda row when this is `None`.
     pub selected_event: Option<String>,
     /// The in-progress RSVP comment prompt (`a`/`d`/`t` on the highlighted
     /// agenda row), if any — see `start_rsvp`. Captures which event and
@@ -1343,25 +1342,14 @@ impl App {
 
     // --- Calendar -----------------------------------------------------
 
-    /// `g`: switches between the mail three-pane view and the calendar
-    /// agenda + detail view (`ui::calendar::draw_calendar`). Entering
-    /// Calendar reloads the agenda from whatever's already in the store and
-    /// fires a fire-and-forget `SyncCommand::RefreshCalendar` so the view
-    /// feels responsive right when it's opened, rather than waiting on the
-    /// engine's own periodic tick — the same "show cached state, kick off a
-    /// refresh" shape `open_message`/`reload_body` already use for mail
-    /// bodies. Leaving Calendar is a plain mode flip: the agenda/selection
-    /// state is left as-is so re-entering doesn't lose the user's place.
-    pub fn toggle_mode(&mut self) {
-        match self.mode {
-            Mode::Mail => self.set_mode(Mode::Calendar),
-            Mode::Calendar => self.set_mode(Mode::Mail),
-        }
-    }
-
-    /// Switches to `mode` (the rail's Up/Down). Entering Calendar refreshes the
-    /// agenda window and asks the sync engine for fresh calendar data, exactly
-    /// as `toggle_mode` did; a no-op when already in `mode`.
+    /// Switches to `mode` (the rail's Up/Down). Entering Calendar reloads the
+    /// agenda from whatever's already in the store and fires a fire-and-forget
+    /// `SyncCommand::RefreshCalendar` so the view feels responsive right when
+    /// it's opened, rather than waiting on the engine's periodic tick — the
+    /// same "show cached state, kick off a refresh" shape `open_message`/
+    /// `reload_body` use for mail bodies. Leaving Calendar is a plain flip; the
+    /// agenda/selection state is left as-is so re-entering keeps the user's
+    /// place. A no-op when already in `mode`.
     pub fn set_mode(&mut self, mode: Mode) {
         if self.mode == mode {
             return;
@@ -1398,13 +1386,6 @@ impl App {
         let last = self.agenda.len() as isize - 1;
         let next = (self.agenda_index as isize + delta).clamp(0, last);
         self.agenda_index = next as usize;
-    }
-
-    /// Enter, in Calendar mode: opens the detail pane on the currently
-    /// highlighted agenda row. A no-op (`selected_event` stays `None`) on an
-    /// empty agenda.
-    pub fn open_selected_event(&mut self) {
-        self.selected_event = self.agenda.get(self.agenda_index).map(|e| e.id.clone());
     }
 
     /// The id of the event currently highlighted in the agenda, if any (an

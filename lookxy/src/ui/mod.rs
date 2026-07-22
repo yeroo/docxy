@@ -1235,8 +1235,8 @@ mod tests {
     /// Regression test for the merge-blocker where `handle_key` returned from
     /// the `Mode::Calendar` branch before ever reaching the `app.confirm`
     /// check: `x` set `app.confirm`, but the following Enter was routed to
-    /// `calendar::handle_key` instead, which treats Enter as
-    /// `open_selected_event` — so the delete could never actually be
+    /// `calendar::handle_key` instead, which treats Enter as an agenda action
+    /// — so the delete could never actually be
     /// confirmed. This drives the exact same two keystrokes a user would
     /// press and must FAIL before the routing fix (the event would still
     /// exist and no `DeleteEvent` would have been enqueued).

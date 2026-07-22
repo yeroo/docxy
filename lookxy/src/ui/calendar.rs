@@ -17,7 +17,7 @@
 //! the other direction (UTC → local wall-clock, not "seconds since epoch →
 //! UTC calendar date").
 
-use crate::app::App;
+use crate::app::{App, Pane};
 use crate::ui::border_style;
 
 use mailcore::htmlrender::{self, StyledLine, StyledSpan};
@@ -72,10 +72,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // The RSVP prompt is routed at the top of `ui::handle_key` now (it serves
     // both Mail and Calendar), so it's already handled before we get here.
     match key.code {
-        KeyCode::Esc | KeyCode::Char('g') => app.toggle_mode(),
+        // Left/Esc step out of the agenda to the rail (the only way back to
+        // Mail now that `g` is gone); Right/Enter descend into the highlighted
+        // event's edit form (same as `e`).
+        KeyCode::Left | KeyCode::Esc => app.focus = Pane::Rail,
         KeyCode::Up | KeyCode::Char('k') => app.move_agenda_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_agenda_selection(1),
-        KeyCode::Enter => app.open_selected_event(),
+        KeyCode::Right | KeyCode::Enter => app.open_edit_event(),
         KeyCode::Char('a') => app.start_rsvp("accepted"),
         KeyCode::Char('d') => app.start_rsvp("declined"),
         KeyCode::Char('t') => app.start_rsvp("tentativelyAccepted"),
@@ -913,12 +916,17 @@ mod tests {
     // --- App wiring / rendering ---------------------------------------------
 
     #[test]
-    fn esc_also_returns_to_mail_from_calendar() {
+    fn left_and_esc_from_the_agenda_return_to_the_rail() {
         let mut app = App::for_test_with_seeded_store();
-        app.toggle_mode();
-        assert_eq!(app.mode, Mode::Calendar);
+        app.mode = Mode::Calendar;
+        app.focus = Pane::Folders; // "in the agenda" (non-rail)
+        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        assert_eq!(app.focus, Pane::Rail);
+        assert_eq!(app.mode, Mode::Calendar); // Left doesn't leave Calendar; the rail does
+
+        app.focus = Pane::Folders;
         crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert_eq!(app.mode, Mode::Mail);
+        assert_eq!(app.focus, Pane::Rail);
     }
 
     #[test]
@@ -937,7 +945,7 @@ mod tests {
                 "Planning",
             ))
             .unwrap();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert_eq!(app.agenda.len(), 2);
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -951,7 +959,7 @@ mod tests {
     #[test]
     fn empty_calendar_renders_without_panicking() {
         let mut app = App::for_test_with_empty_store();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert!(app.agenda.is_empty());
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -961,12 +969,10 @@ mod tests {
     #[test]
     fn navigation_on_an_empty_agenda_does_not_panic_and_stays_put() {
         let mut app = App::for_test_with_empty_store();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         app.move_agenda_selection(-1);
         app.move_agenda_selection(1);
         assert_eq!(app.agenda_index, 0);
-        app.open_selected_event();
-        assert!(app.selected_event.is_none());
     }
 
     #[test]
@@ -980,7 +986,7 @@ mod tests {
         app.store
             .upsert_event(&sample_event("e2", &day2, &an_hour_after(&day2), "Second"))
             .unwrap();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert_eq!(app.agenda.len(), 2);
         assert_eq!(app.agenda_index, 0);
 
@@ -1011,10 +1017,9 @@ mod tests {
                 }],
             )
             .unwrap();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
 
-        app.open_selected_event();
-        assert_eq!(app.selected_event.as_deref(), Some("e1"));
+        app.selected_event = Some("e1".into());
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| draw_calendar(f, &app, f.area())).unwrap();
@@ -1028,7 +1033,7 @@ mod tests {
     #[test]
     fn calendar_updated_event_reloads_the_agenda() {
         let mut app = App::for_test_with_seeded_store();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert!(app.agenda.is_empty());
 
         let day1 = days_from_now(1);
@@ -1051,7 +1056,7 @@ mod tests {
         let mut e = sample_event("e1", &day1, &an_hour_after(&day1), "Standup");
         e.response_status = "none".into();
         app.store.upsert_event(&e).unwrap();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert_eq!(app.agenda.len(), 1);
         assert_eq!(app.agenda_index, 0);
         "e1".to_string()
@@ -1160,7 +1165,7 @@ mod tests {
         use std::sync::mpsc;
 
         let mut app = App::for_test_with_empty_store();
-        app.toggle_mode();
+        app.set_mode(Mode::Calendar);
         assert!(app.agenda.is_empty());
         let (cmd_tx, cmd_rx) = mpsc::channel();
         app.sync.cmd_tx = cmd_tx;
