@@ -17,6 +17,7 @@ pub mod freebusy;
 pub mod help;
 mod message_list;
 pub mod oofform;
+pub mod rail;
 mod reading;
 mod search;
 mod signin;
@@ -66,6 +67,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         compose::draw_compose(f, &*app);
         return;
     }
+
+    // The level-0 rail sits to the left of both the Mail panes and the Calendar
+    // agenda (but not under the full-frame compose/OOF editors, which returned
+    // above). Everything below lays out against the remaining `area`.
+    let rail_split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(rail::WIDTH), Constraint::Min(0)])
+        .split(area);
+    rail::draw(f, &*app, rail_split[0]);
+    let area = rail_split[1];
+
     if app.mode == Mode::Calendar {
         calendar::draw_calendar(f, &*app, area);
         // The create/edit event form (`c`/`e` — wired in a later task) is an
@@ -273,6 +285,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.clear_category_filter();
         return;
     }
+    // Level-0 rail (both modes): Up/Down switch section, Right/Enter enter it.
+    // Checked before the Calendar branch so the rail owns its keys in either
+    // mode; nothing sits to the left of the rail.
+    if app.focus == Pane::Rail {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.set_mode(Mode::Mail),
+            KeyCode::Down | KeyCode::Char('j') => app.set_mode(Mode::Calendar),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.focus = Pane::Folders,
+            _ => {}
+        }
+        return;
+    }
     if app.mode == Mode::Calendar {
         calendar::handle_key(app, key);
         return;
@@ -391,7 +415,7 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
 /// `Folders` → `List` → `Reading` → `Folders`.
 fn cycle_focus(app: &mut App) {
     app.focus = match app.focus {
-        Pane::Folders => Pane::List,
+        Pane::Rail | Pane::Folders => Pane::List,
         Pane::List => Pane::Reading,
         Pane::Reading => Pane::Folders,
     };
@@ -400,7 +424,7 @@ fn cycle_focus(app: &mut App) {
 /// `Shift+Tab` — the reverse of `cycle_focus`.
 fn cycle_focus_back(app: &mut App) {
     app.focus = match app.focus {
-        Pane::Folders => Pane::Reading,
+        Pane::Rail | Pane::Folders => Pane::Reading,
         Pane::List => Pane::Folders,
         Pane::Reading => Pane::List,
     };
@@ -412,7 +436,7 @@ fn cycle_focus_back(app: &mut App) {
 fn focus_back(app: &mut App) {
     app.focus = match app.focus {
         Pane::Reading => Pane::List,
-        Pane::List | Pane::Folders => Pane::Folders,
+        Pane::Rail | Pane::List | Pane::Folders => Pane::Folders,
     };
 }
 
@@ -436,7 +460,7 @@ fn move_selection(app: &mut App, delta: isize) {
                 app.msg_index = wrapped(app.msg_index, delta, len);
             }
         }
-        Pane::Reading => {}
+        Pane::Rail | Pane::Reading => {}
     }
 }
 
@@ -465,7 +489,7 @@ fn activate(app: &mut App) {
                 }
             }
         }
-        Pane::Reading => {}
+        Pane::Rail | Pane::Reading => {}
     }
 }
 
@@ -538,6 +562,17 @@ mod tests {
     use mailcore::sync::engine::SyncCommand;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn rail_up_down_switches_mail_and_calendar() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::Rail;
+        assert_eq!(app.mode, Mode::Mail);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.mode, Mode::Calendar);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.mode, Mode::Mail);
+    }
 
     #[test]
     fn shift_tab_reverse_cycles_panes() {

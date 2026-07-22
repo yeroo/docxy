@@ -21,6 +21,8 @@ use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
 /// `Reading` → `Folders` (see `ui::handle_key`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
+    /// Level 0: the Mail/Calendar rail. Left of the folder pane.
+    Rail,
     Folders,
     List,
     Reading,
@@ -1226,12 +1228,22 @@ impl App {
     /// state is left as-is so re-entering doesn't lose the user's place.
     pub fn toggle_mode(&mut self) {
         match self.mode {
-            Mode::Mail => {
-                self.mode = Mode::Calendar;
-                self.reload_agenda();
-                let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
-            }
-            Mode::Calendar => self.mode = Mode::Mail,
+            Mode::Mail => self.set_mode(Mode::Calendar),
+            Mode::Calendar => self.set_mode(Mode::Mail),
+        }
+    }
+
+    /// Switches to `mode` (the rail's Up/Down). Entering Calendar refreshes the
+    /// agenda window and asks the sync engine for fresh calendar data, exactly
+    /// as `toggle_mode` did; a no-op when already in `mode`.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if mode == Mode::Calendar {
+            self.reload_agenda();
+            let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
         }
     }
 
