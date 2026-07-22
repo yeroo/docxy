@@ -987,7 +987,10 @@ impl App {
     /// composer. `Rail`/`Reading` have nothing to activate.
     pub fn activate_selected(&mut self) {
         match self.focus {
-            Pane::Folders => self.focus = Pane::List,
+            Pane::Folders => {
+                self.focus = Pane::List;
+                self.preview_selected_message();
+            }
             Pane::List => {
                 if self.threaded_active() {
                     self.activate_thread_row();
@@ -1003,6 +1006,32 @@ impl App {
                 }
             }
             Pane::Rail | Pane::Reading => {}
+        }
+    }
+
+    /// Opens the message under the list cursor into the reader **without**
+    /// marking it read — the auto-preview that follows Up/Down and entry into
+    /// the list, so browsing never consumes unread state. Threaded: a header
+    /// previews its latest message, a message row previews itself. Drafts are
+    /// skipped (they open in the composer via Enter, not previewed). A no-op
+    /// when that message is already the one open (avoids reload churn).
+    pub fn preview_selected_message(&mut self) {
+        let target = if self.threaded_active() {
+            match self.selected_row() {
+                Some(Row::Header(t)) => self.threads[t].thread.messages.last(),
+                Some(Row::Message(t, m)) => self.threads[t].thread.messages.get(m),
+                None => None,
+            }
+            .map(|m| (m.id.clone(), m.is_draft))
+        } else {
+            self.messages
+                .get(self.msg_index)
+                .map(|m| (m.id.clone(), m.is_draft))
+        };
+        if let Some((id, is_draft)) = target {
+            if !is_draft && self.selected_msg.as_deref() != Some(id.as_str()) {
+                self.open_message(&id);
+            }
         }
     }
 
@@ -5057,6 +5086,21 @@ pub(crate) mod tests {
         });
         app.on_key_enter();
         assert!(!app.last_sent_command_is_signin());
+    }
+
+    #[test]
+    fn arrowing_the_list_previews_without_marking_read() {
+        let mut app = App::for_test_with_seeded_store(); // one unread msg "m1"
+        app.focus = Pane::List;
+        app.preview_selected_message();
+        assert_eq!(app.selected_msg.as_deref(), Some("m1"));
+        assert_eq!(app.focus, Pane::List); // still in the list
+        let unread = app
+            .messages
+            .iter()
+            .find(|m| m.id == "m1")
+            .map(|m| !m.is_read);
+        assert_eq!(unread, Some(true)); // preview did NOT mark read
     }
 
     #[test]

@@ -418,6 +418,7 @@ fn nav_right(app: &mut App) {
                 move_selection(app, 1); // drop onto the newly-revealed first child
             } else {
                 app.focus = Pane::List;
+                app.preview_selected_message(); // preview the first message on arrival
             }
         }
         Pane::List => app.list_right(),
@@ -465,6 +466,7 @@ fn move_selection(app: &mut App, delta: isize) {
             } else if let Some(len) = nonzero(app.messages.len()) {
                 app.msg_index = wrapped(app.msg_index, delta, len);
             }
+            app.preview_selected_message(); // auto-open under the cursor (no mark-read)
         }
         Pane::Rail | Pane::Reading => {}
     }
