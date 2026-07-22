@@ -1,6 +1,7 @@
-//! The level-0 rail: a narrow leftmost column with two icons — ✉ Mail and
-//! 📅 Calendar — the active section highlighted. Selecting a section here (rail
-//! Up/Down) is the only way to switch Mail⇄Calendar now that `g` is gone.
+//! The level-0 rail: a narrow leftmost column with two labels — `M` Mail and
+//! 📅 Calendar — centered, the active section highlighted. Selecting a section
+//! here (rail Up/Down) is the only way to switch Mail⇄Calendar now that `g` is
+//! gone.
 
 use crate::app::{App, Mode, Pane};
 use crate::ui::border_style;
@@ -9,22 +10,31 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, List, ListItem};
 
-/// Width of the rail column (border + a couple of glyph cells).
+/// Width of the rail column (2 border cells + a 3-wide label cell).
 pub const WIDTH: u16 = 5;
+
+/// Centers `label` (of display width `w`) within the `inner` columns, so the
+/// letter/emoji sits in the middle of the rail rather than hugging the border.
+fn centered(label: &str, w: usize, inner: usize) -> String {
+    let pad = inner.saturating_sub(w);
+    let left = pad / 2;
+    format!("{}{}{}", " ".repeat(left), label, " ".repeat(pad - left))
+}
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Pane::Rail;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style(focused));
+    let inner = area.width.saturating_sub(2) as usize;
 
-    // ✉ Mail, 📅 Calendar. Highlight the active section.
-    let rows = [(Mode::Mail, "\u{2709}"), (Mode::Calendar, "\u{1f4c5}")];
+    // `M` Mail, 📅 Calendar (label, display width). Highlight the active section.
+    let rows = [(Mode::Mail, "M", 1usize), (Mode::Calendar, "\u{1f4c5}", 2)];
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|(mode, icon)| {
+        .map(|(mode, label, w)| {
             let style = if *mode == app.mode {
                 Style::new()
                     .fg(Color::Blue)
@@ -32,16 +42,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::new().add_modifier(Modifier::DIM)
             };
-            ListItem::new(Line::styled(format!(" {icon}"), style))
+            ListItem::new(Line::styled(centered(label, *w, inner), style))
         })
         .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(match app.mode {
-        Mode::Mail => 0,
-        Mode::Calendar => 1,
-    }));
-    f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    f.render_widget(List::new(items).block(block), area);
 }
 
 #[cfg(test)]
@@ -50,7 +55,13 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn draws_both_section_icons() {
+    fn centers_labels_within_the_column() {
+        assert_eq!(centered("M", 1, 3), " M ");
+        assert_eq!(centered("\u{1f4c5}", 2, 3), "\u{1f4c5} ");
+    }
+
+    #[test]
+    fn draws_both_section_labels() {
         let app = App::for_test_with_seeded_store();
         let mut term = Terminal::new(TestBackend::new(5, 10)).unwrap();
         term.draw(|f| draw(f, &app, f.area())).unwrap();
@@ -61,7 +72,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains('\u{2709}')); // ✉
+        assert!(text.contains('M'));
         assert!(text.contains('\u{1f4c5}')); // 📅
     }
 }
