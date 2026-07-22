@@ -55,23 +55,33 @@ intellijPlatform {
 // checks give staleness for free: the cargo build reruns only when the Rust
 // sources changed, and is skipped entirely while the artifact is fresh.
 
-val wasmArtifact = file("../target/wasm32-unknown-unknown/release/docxwasm.wasm")
+val cargoBin = file(System.getProperty("user.home") + "/.cargo/bin/cargo.exe")
+    .takeIf { it.exists() }?.absolutePath ?: "cargo"
 
 val buildWasm by tasks.registering(Exec::class) {
     workingDir = file("..")
-    val cargo = file(System.getProperty("user.home") + "/.cargo/bin/cargo.exe")
-        .takeIf { it.exists() }?.absolutePath ?: "cargo"
-    commandLine(cargo, "build", "-p", "docxwasm", "--target", "wasm32-unknown-unknown", "--release")
+    commandLine(cargoBin, "build", "-p", "docxwasm", "--target", "wasm32-unknown-unknown", "--release")
     inputs.dir("../docxwasm/src")
     inputs.dir("../docxcore/src")
     inputs.dir("../opccore/src")
-    outputs.file(wasmArtifact)
+    outputs.file(file("../target/wasm32-unknown-unknown/release/docxwasm.wasm"))
+}
+
+val buildGridWasm by tasks.registering(Exec::class) {
+    workingDir = file("..")
+    commandLine(cargoBin, "build", "-p", "gridwasm", "--target", "wasm32-unknown-unknown", "--release")
+    inputs.dir("../gridwasm/src")
+    inputs.dir("../gridcore/src")
+    inputs.dir("../opccore/src")
+    outputs.file(file("../target/wasm32-unknown-unknown/release/gridwasm.wasm"))
 }
 
 tasks.processResources {
-    // from(task) wires both the file and the task dependency; the artifact
-    // lands at the resource root (/docxwasm.wasm) without touching the src tree.
+    // from(task) wires both the file and the task dependency; the artifacts
+    // land at the resource root (/docxwasm.wasm, /gridwasm.wasm) without
+    // touching the src tree.
     from(buildWasm)
+    from(buildGridWasm)
 }
 
 tasks.test {
