@@ -41,30 +41,18 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
     f.render_widget(Clear, rows[1]);
     let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).split(rows[1]);
 
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let accent = Style::default().fg(Color::Black).bg(host.accent());
-    let rev = Style::default().add_modifier(Modifier::REVERSED);
-
     // left menu
     let menu_focus = bs.pane == Pane::Menu;
-    let menu_lines: Vec<RLine> = ITEMS
-        .iter()
-        .map(|it| {
-            let on = *it == bs.item;
-            let style = if on && menu_focus {
-                accent
-            } else if on {
-                rev
-            } else {
-                Style::default()
-            };
-            RLine::styled(format!(" {:<12}", it.label()), style)
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(menu_lines)
-            .block(RBlock::default().borders(Borders::RIGHT).border_style(dim)),
+    let labels: Vec<&str> = ITEMS.iter().map(|it| it.label()).collect();
+    let sel_index = ITEMS.iter().position(|it| *it == bs.item).unwrap_or(0);
+    crate::draw_menu_column(
+        f,
         cols[0],
+        &labels,
+        sel_index,
+        menu_focus,
+        host.accent(),
+        12,
     );
 
     // right content pane

@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 
 /// The vertical menu items, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, area);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let accent = Style::default().fg(Color::Black).bg(Color::Cyan);
-    let rev = Style::default().add_modifier(Modifier::REVERSED);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -104,26 +103,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.bs_content_rect = cols[1];
 
     // Left menu.
-    let menu_lines: Vec<Line> = ITEMS
-        .iter()
-        .enumerate()
-        .map(|(i, it)| {
-            let on = i == sel;
-            let style = if on && !in_settings {
-                accent
-            } else if on {
-                rev
-            } else {
-                Style::default()
-            };
-            Line::styled(format!(" {:<16}", it.label()), style)
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(menu_lines)
-            .block(Block::default().borders(Borders::RIGHT).border_style(dim)),
-        cols[0],
-    );
+    let labels: Vec<&str> = ITEMS.iter().map(|it| it.label()).collect();
+    backstagecore::draw_menu_column(f, cols[0], &labels, sel, !in_settings, Color::Cyan, 16);
 
     // Right content.
     let content: Vec<Line> = match ITEMS[sel.min(ITEMS.len() - 1)] {

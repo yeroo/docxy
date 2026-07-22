@@ -20,6 +20,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# Shared backstage chrome (the styled left-menu column), also used by
+# docxy/xlsxy/yppxy's File backstage.
+backstagecore = { version = "0.1.0", path = "../backstagecore" }
 # Path + version so `lookxy` can be published once `mailcore` is on crates.io.
 mailcore = { version = "0.1.0", path = "../mailcore" }
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
