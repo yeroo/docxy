@@ -1,4 +1,4 @@
-// Throwaway: print the mermaid geometry JSON for a source file. NOT committed.
+// Dev tool: print the mermaid geometry JSON for a source file (Phase-2 visual harness).
 // Usage: cargo run --example dump_geo -- path/to/diagram.mmd
 use std::io::Read;
 
