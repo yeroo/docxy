@@ -76,9 +76,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(rail::WIDTH), Constraint::Min(0)])
         .split(area);
     rail::draw(f, &*app, rail_split[0]);
+    app.rail_rect = rail_split[0];
     let area = rail_split[1];
 
     if app.mode == Mode::Calendar {
+        // No Mail panes on screen — clear their hit rects so a stale one from a
+        // previous Mail frame can't catch a click over the agenda.
+        app.folders_rect = Rect::ZERO;
+        app.list_rect = Rect::ZERO;
+        app.reading_rect = Rect::ZERO;
         calendar::draw_calendar(f, &*app, area);
         // The create/edit event form (`c`/`e` — wired in a later task) is an
         // overlay on top of the calendar, not a full-screen mode like
@@ -108,6 +114,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Percentage(40),
         ])
         .split(rows[0]);
+
+    // Record pane rects for mouse hit-testing (first content row is inside each
+    // pane's border, hence `+ 1`).
+    app.folders_rect = cols[0];
+    app.folders_row0 = cols[0].y + 1;
+    app.list_rect = cols[1];
+    app.list_row0 = cols[1].y + 1;
+    app.reading_rect = cols[2];
 
     folders::draw(f, &*app, cols[0]);
     if app.search.is_some() {

@@ -16,6 +16,8 @@ use mailcore::graph::model::{
 };
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
+use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 /// Which pane currently has keyboard focus. Tab cycles `Folders` → `List` →
 /// `Reading` → `Folders` (see `ui::handle_key`).
@@ -238,6 +240,20 @@ pub struct App {
     /// Whether the read-only help overlay (`F1`/`?`) is open. A modal like the
     /// others: while open it captures every key and closes on Esc/F1/?/q.
     pub help: bool,
+    // --- Mouse hit-test regions, recorded each frame by `ui::draw` (default
+    // zero, so a click before the first draw hits nothing). ---
+    /// The rail column's on-screen rect.
+    pub rail_rect: Rect,
+    /// The folder pane's rect, and the screen y of its first visible folder row
+    /// (inside the border) so a click row maps to a `visible_folders` index.
+    pub folders_rect: Rect,
+    pub folders_row0: u16,
+    /// The message list's rect + first row y (maps a click to `msg_index`/
+    /// `row_index`).
+    pub list_rect: Rect,
+    pub list_row0: u16,
+    /// The reading pane's rect.
+    pub reading_rect: Rect,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_home`/`reading_scroll_end` against
@@ -491,6 +507,12 @@ impl App {
             agwinterm_notify_invocations: std::cell::Cell::new(0),
             free_busy: None,
             help: false,
+            rail_rect: Rect::ZERO,
+            folders_rect: Rect::ZERO,
+            folders_row0: 0,
+            list_rect: Rect::ZERO,
+            list_row0: 0,
+            reading_rect: Rect::ZERO,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -1053,6 +1075,55 @@ impl App {
             self.mark_message_read(&id);
         }
         true
+    }
+
+    /// Routes a mouse event: left-click focuses the pane under the pointer and
+    /// selects the clicked row (rail → switch section; folders → select;
+    /// message list → select; reading → focus). Wheel and click-to-activate are
+    /// added in the next task. A no-op while a full-frame modal owns the screen,
+    /// or before the first draw records the pane rects (they start zero, and a
+    /// zero rect `contains` nothing).
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.signin_modal.is_some()
+            || self.compose.is_some()
+            || self.oof_form.is_some()
+            || self.help
+        {
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            self.on_left_click(m.column, m.row);
+        }
+    }
+
+    fn on_left_click(&mut self, x: u16, y: u16) {
+        let pos = Position { x, y };
+        if self.rail_rect.contains(pos) {
+            let row = y.saturating_sub(self.rail_rect.y + 1);
+            self.set_mode(if row == 0 { Mode::Mail } else { Mode::Calendar });
+            self.focus = Pane::Rail;
+        } else if self.folders_rect.contains(pos) {
+            self.focus = Pane::Folders;
+            let idx = y.saturating_sub(self.folders_row0) as usize;
+            if idx < self.visible_folders.len() {
+                self.folder_index = idx;
+                self.selected_folder = Some(self.visible_folders[idx].row.id.clone());
+                self.msg_index = 0;
+                self.reload_messages();
+            }
+        } else if self.list_rect.contains(pos) {
+            self.focus = Pane::List;
+            let idx = y.saturating_sub(self.list_row0) as usize;
+            if self.threaded_active() {
+                if idx < self.visible_rows.len() {
+                    self.row_index = idx;
+                }
+            } else if idx < self.messages.len() {
+                self.msg_index = idx;
+            }
+        } else if self.reading_rect.contains(pos) {
+            self.focus = Pane::Reading;
+        }
     }
 
     /// Opens the message under the list cursor into the reader **without**
@@ -5124,6 +5195,45 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Pane::Reading); // stays active
         assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
         assert!(!app.open_sibling_message(1)); // no-op past the end
+    }
+
+    #[test]
+    fn clicking_a_folder_row_selects_it() {
+        let mut app = App::for_test_with_folder_tree();
+        app.store.set_folder_expanded("inbox", true).unwrap();
+        app.reload_folders();
+        // Simulate the rects draw() records: folders pane at x=5, first row at y=1.
+        app.folders_rect = Rect::new(5, 0, 20, 10);
+        app.folders_row0 = 1;
+        let sent_idx = app
+            .visible_folders
+            .iter()
+            .position(|v| v.row.id == "sent")
+            .unwrap();
+        let sent_row = app.folders_row0 + sent_idx as u16;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row: sent_row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected_folder.as_deref(), Some("sent"));
+        assert_eq!(app.focus, Pane::Folders);
+    }
+
+    #[test]
+    fn clicking_the_rail_calendar_row_switches_section() {
+        let mut app = App::for_test_with_seeded_store();
+        app.rail_rect = Rect::new(0, 0, 5, 4);
+        // Inner rows start at rail_rect.y + 1; Calendar is the second (row 1).
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, Mode::Calendar);
+        assert_eq!(app.focus, Pane::Rail);
     }
 
     #[test]
