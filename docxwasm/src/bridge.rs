@@ -1390,6 +1390,19 @@ mod tests {
     }
 
     #[test]
+    fn view_json_sequence_kind() {
+        // Same markdown → docx path as `view_json_emits_mermaid_geometry`, but
+        // for a `sequenceDiagram` fence: the geometry JSON should be tagged
+        // `"kind":"sequence"` (from `mermaid_seq::geometry`), not the flowchart
+        // shape.
+        let bytes = markdown_to_docx("```mermaid\nsequenceDiagram\nA->>B: hi\n```\n");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"mermaid\":["), "{v}");
+        assert!(v.contains("\"kind\":\"sequence\""), "{v}");
+    }
+
+    #[test]
     fn replace_all_rewrites_and_persists() {
         let bytes = sample_docx("red fish red fish");
         let mut s = Session::open(&bytes).expect("open");

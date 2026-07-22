@@ -1586,8 +1586,8 @@ fn emit_block_item(
         // renders underneath for the terminal/PDF/no-webview fallback).
         Inline::SmartArt { text, raw } => {
             if let Some(src) = crate::mermaid::source_of(raw) {
-                let geo = crate::mermaid::geometry(&src);
-                let (cols, rows) = mermaid_box_cells(geo.canvas_w, geo.canvas_h, width);
+                let (cw, ch, gjson) = crate::mermaid::geometry_box(&src);
+                let (cols, rows) = mermaid_box_cells(cw, ch, width);
                 let row = out.len();
                 let blocks = smartart_blocks(text);
                 out.extend(text_box(&blocks, None, width, opts, images, mermaid));
@@ -1596,7 +1596,7 @@ fn emit_block_item(
                     col: 0,
                     cols,
                     rows,
-                    geometry_json: geo.to_json(),
+                    geometry_json: gjson,
                 });
             } else {
                 let blocks = smartart_blocks(text);

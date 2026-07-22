@@ -163,6 +163,9 @@ struct Subgraph {
 /// diagram, plus the node-label lines for the terminal box. Returns
 /// `(drawing_xml, text_lines)`.
 pub fn to_drawing(src: &str) -> (String, Vec<String>) {
+    if crate::mermaid_seq::is_sequence(src) {
+        return crate::mermaid_seq::to_drawing(src);
+    }
     let mut d = parse(src);
     layout(&mut d);
     let text: Vec<String> = d.nodes.iter().map(|n| n.label.clone()).collect();
@@ -1472,6 +1475,21 @@ pub fn geometry(src: &str) -> DiagramGeometry {
     build_geometry(&d)
 }
 
+/// Canvas `(width, height, geometry_json)` for any Mermaid source, dispatching
+/// on kind — a `sequenceDiagram` routes to [`mermaid_seq::geometry`], anything
+/// else to the flowchart [`geometry`]. This is the single seam `render.rs`'s
+/// SmartArt arm calls, so the terminal/PDF cell sizing and the webview overlay
+/// both size themselves off the same kind-appropriate canvas.
+pub fn geometry_box(src: &str) -> (i64, i64, String) {
+    if crate::mermaid_seq::is_sequence(src) {
+        let g = crate::mermaid_seq::geometry(src);
+        (g.canvas_w, g.canvas_h, g.to_json())
+    } else {
+        let g = geometry(src);
+        (g.canvas_w, g.canvas_h, g.to_json())
+    }
+}
+
 fn build_geometry(d: &Diagram) -> DiagramGeometry {
     let (canvas_w, canvas_h) = canvas_extent(d);
     let nodes = d
@@ -2202,5 +2220,23 @@ mod tests {
         // and layout didn't panic on a non-node endpoint.
         assert_eq!(g.edges.len(), 1);
         assert!(g.edges[0].points.len() >= 2);
+    }
+
+    #[test]
+    fn to_drawing_dispatches_sequence() {
+        let (xml, _) = to_drawing("sequenceDiagram\nA->>B: hi");
+        assert!(xml.contains("prstDash")); // lifeline → sequence path
+        // A flowchart is unaffected.
+        let (fx, _) = to_drawing("flowchart TD\nA-->B");
+        assert!(fx.contains("<a:custGeom>")); // flowchart connector, unchanged
+    }
+
+    #[test]
+    fn geometry_box_tags_kind() {
+        let (w, h, json) = geometry_box("sequenceDiagram\nA->>B: hi");
+        assert!(w > 0 && h > 0);
+        assert!(json.contains("\"kind\":\"sequence\""));
+        let (_, _, fj) = geometry_box("flowchart TD\nA-->B");
+        assert!(fj.contains("\"nodes\":[")); // flowchart geometry
     }
 }
