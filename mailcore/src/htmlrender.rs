@@ -133,10 +133,9 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
     let mut bold: u32 = 0;
     let mut italic: u32 = 0;
     let mut underline: u32 = 0;
-    // (href, footnote number); number is 0 for an `<a>` with no/empty href
-    // (no footnote to append on close).
-    let mut link_stack: Vec<(String, usize)> = Vec::new();
-    let mut footnotes: Vec<String> = Vec::new();
+    // The href of each open `<a>` (empty = an `<a>` with no/empty href, which
+    // contributes no link). Links render inline; there is no footnote list.
+    let mut link_stack: Vec<String> = Vec::new();
     let mut cells_in_row: u32 = 0;
     // While `Some(tag)`, we're inside a dropped subtree rooted at `tag`
     // (see `SKIP_CONTENT_TAGS`); `depth` counts re-opens of that same tag
@@ -168,9 +167,7 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                         bold: bold > 0,
                         italic: italic > 0,
                         underline: underline > 0,
-                        link: link_stack
-                            .last()
-                            .and_then(|(h, n)| (*n > 0).then(|| h.clone())),
+                        link: link_stack.last().filter(|h| !h.is_empty()).cloned(),
                     });
                 }
             }
@@ -220,13 +217,7 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                             .find(|(k, _)| k == "href")
                             .map(|(_, v)| v.clone())
                             .unwrap_or_default();
-                        if href.is_empty() {
-                            link_stack.push((String::new(), 0));
-                        } else {
-                            let n = footnotes.len() + 1;
-                            footnotes.push(href.clone());
-                            link_stack.push((href, n));
-                        }
+                        link_stack.push(href);
                     }
                     "img" => {
                         flush(&mut lines, &mut words, indent, width);
@@ -277,21 +268,7 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
                 }
                 "tr" => flush(&mut lines, &mut words, indent, width),
                 "a" => {
-                    if let Some((href, n)) = link_stack.pop() {
-                        if n > 0 {
-                            let marker = format!("[{n}]");
-                            match words.last_mut() {
-                                Some(last) if last.link.as_deref() == Some(href.as_str()) => {
-                                    last.text.push_str(&marker);
-                                }
-                                _ => words.push(Word {
-                                    text: marker,
-                                    link: Some(href),
-                                    ..Default::default()
-                                }),
-                            }
-                        }
-                    }
+                    link_stack.pop();
                 }
                 _ => {}
             },
@@ -299,22 +276,6 @@ pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
     }
 
     flush(&mut lines, &mut words, indent, width);
-
-    if !footnotes.is_empty() {
-        push_blank_separator(&mut lines);
-        for (i, url) in footnotes.iter().enumerate() {
-            lines.push(StyledLine {
-                indent: 0,
-                spans: vec![StyledSpan {
-                    text: format!("[{}] {}", i + 1, url),
-                    link: Some(url.clone()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            });
-        }
-    }
-
     trim_trailing_blank(&mut lines);
     lines
 }
@@ -423,6 +384,26 @@ fn wrap_words(words: &[Word], width: usize) -> Vec<Vec<StyledSpan>> {
     let mut cur_len = 0usize;
     for w in words {
         let wlen = w.text.chars().count();
+        // Hard-wrap a word that can't fit on a line by itself (e.g. a long bare
+        // URL): break it into width-sized chunks, each on its own line, rather
+        // than letting it overflow the pane.
+        if wlen > width {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            let chars: Vec<char> = w.text.chars().collect();
+            for chunk in chars.chunks(width) {
+                out.push(vec![StyledSpan {
+                    text: chunk.iter().collect(),
+                    bold: w.bold,
+                    italic: w.italic,
+                    underline: w.underline,
+                    link: w.link.clone(),
+                }]);
+            }
+            continue;
+        }
         if !cur.is_empty() && cur_len + 1 + wlen > width {
             out.push(std::mem::take(&mut cur));
             cur_len = 0;
@@ -799,15 +780,37 @@ mod tests {
         assert!(lines.len() >= 2);
     }
     #[test]
-    fn links_become_footnotes() {
+    fn links_render_inline_without_footnotes() {
         let lines = render_html(r#"<a href="https://x">click</a>"#, 80);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.text.clone())
-            .collect();
-        assert!(joined.contains("click"));
-        assert!(joined.contains("https://x"));
+        let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        // The anchor text carries its href inline — and there's no `[1]` marker
+        // and no footnote appendix line.
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "click" && s.link.as_deref() == Some("https://x"))
+        );
+        let joined: String = spans.iter().map(|s| s.text.clone()).collect();
+        assert!(!joined.contains("[1]"));
+        assert!(!joined.contains("https://x")); // URL is only in `link`, not shown
+    }
+
+    #[test]
+    fn a_long_unbroken_url_hard_wraps() {
+        let long = "https://acme.example.com/".to_string() + &"a".repeat(180);
+        let lines = render_html(&format!("<a href=\"{long}\">{long}</a>"), 40);
+        assert!(lines.len() >= 2, "expected the long URL to wrap");
+        for l in &lines {
+            let w: usize = l.spans.iter().map(|s| s.text.chars().count()).sum();
+            assert!(w <= 40, "line {:?} exceeds width", l);
+        }
+        // Every chunk keeps the link.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| s.link.as_deref() == Some(long.as_str()))
+        );
     }
     #[test]
     fn decodes_entities_and_wraps() {
@@ -892,17 +895,19 @@ mod tests {
     }
 
     #[test]
-    fn multiple_links_get_distinct_footnote_numbers() {
+    fn distinct_links_keep_their_own_hrefs() {
         let lines = render_html(r#"<a href="https://a">A</a> <a href="https://b">B</a>"#, 80);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.text.clone())
-            .collect();
-        assert!(joined.contains("A[1]"));
-        assert!(joined.contains("B[2]"));
-        assert!(joined.contains("[1] https://a"));
-        assert!(joined.contains("[2] https://b"));
+        let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text.contains('A') && s.link.as_deref() == Some("https://a"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text.contains('B') && s.link.as_deref() == Some("https://b"))
+        );
     }
 
     #[test]
@@ -944,13 +949,9 @@ mod tests {
     #[test]
     fn unquoted_href_with_slashes_does_not_hang() {
         let lines = render_html(r#"<a href=https://example.com/path?a=1>link</a>"#, 80);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.text.clone())
-            .collect();
-        assert!(joined.contains("link"));
-        assert!(joined.contains("https://example.com/path?a=1"));
+        let spans: Vec<&StyledSpan> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(spans.iter().any(|s| s.text.contains("link")
+            && s.link.as_deref() == Some("https://example.com/path?a=1")));
     }
 
     /// Never panic (or hang) on gnarly/malformed markup: unclosed tags,
