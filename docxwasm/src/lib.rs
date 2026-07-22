@@ -152,6 +152,39 @@ pub extern "C" fn docx_save(handle: u32) -> *mut u8 {
     with_session(handle, |s| s.save())
 }
 
+/// Like [`docx_save`], but first replaces every mermaid SmartArt drawing with
+/// a Word-native picture embedding webview-rasterized PNG/SVG bytes — thin
+/// marshalling over [`bridge::Session::save_with_mermaid_images`], which does
+/// the actual embedding.
+///
+/// `images_json`/`png_blob`/`svg_blob` are three independent host-written
+/// buffers (three `ptr`/`len` pairs) rather than one combined buffer: the
+/// webview already holds the JSON descriptor string and the two concatenated
+/// image blobs as separate typed arrays, so passing them separately avoids
+/// making the host interleave text and binary data into one allocation. An
+/// unknown `handle` yields an empty result, same as every other
+/// `with_session`-backed export.
+///
+/// # Safety
+/// Each `ptr`/`len` pair must describe a live host allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn docx_save_with_mermaid_images(
+    handle: u32,
+    json_ptr: *const u8,
+    json_len: usize,
+    png_ptr: *const u8,
+    png_len: usize,
+    svg_ptr: *const u8,
+    svg_len: usize,
+) -> *mut u8 {
+    let images_json = String::from_utf8_lossy(unsafe { input(json_ptr, json_len) }).into_owned();
+    let png_blob = unsafe { input(png_ptr, png_len) };
+    let svg_blob = unsafe { input(svg_ptr, svg_len) };
+    with_session(handle, |s| {
+        s.save_with_mermaid_images(&images_json, png_blob, svg_blob)
+    })
+}
+
 // ---- agent control surface -------------------------------------------------
 
 /// Route one agent control request (JSON `{"verb":…,"args":{…}}`, see
@@ -282,5 +315,71 @@ mod tests {
         // SAFETY: null/0 is the documented empty-input case for `input()`.
         let out = read_result(unsafe { docx_ctl(999_999, std::ptr::null(), 0) });
         assert!(out.contains("\"ok\":false"), "{out}");
+    }
+
+    /// Marshalling-only test: the three-buffer C-ABI wrapper correctly
+    /// forwards to `Session::save_with_mermaid_images`, which already has its
+    /// own thorough coverage in `docxwasm/src/bridge.rs`'s test module — this
+    /// just confirms the ptr/len plumbing across the boundary doesn't drop or
+    /// misalign a buffer.
+    #[test]
+    fn docx_save_with_mermaid_images_marshals_across_the_boundary() {
+        let bytes = bridge::markdown_to_docx("```mermaid\nflowchart TD\nA-->B\n```\n");
+        let doc_ptr = write_into_wasm(&bytes);
+        // SAFETY: `doc_ptr`/`bytes.len()` is the allocation just written.
+        let handle = unsafe { docx_open(doc_ptr, bytes.len()) };
+        unsafe { docx_free(doc_ptr, bytes.len()) };
+        assert_ne!(handle, 0, "expected a live session handle");
+
+        let json =
+            br#"[{"source":"flowchart TD\nA-->B","pngOff":0,"pngLen":4,"svgOff":0,"svgLen":6,"wEmu":3000000,"hEmu":1500000}]"#;
+        let png = [0x89u8, 0x50, 0x4E, 0x47];
+        let svg = b"<svg/>";
+        let json_ptr = write_into_wasm(json);
+        let png_ptr = write_into_wasm(&png);
+        let svg_ptr = write_into_wasm(svg);
+
+        // SAFETY: each ptr/len pair is a live allocation just written above.
+        let out = read_result(unsafe {
+            docx_save_with_mermaid_images(
+                handle,
+                json_ptr,
+                json.len(),
+                png_ptr,
+                png.len(),
+                svg_ptr,
+                svg.len(),
+            )
+        });
+        unsafe {
+            docx_free(json_ptr, json.len());
+            docx_free(png_ptr, png.len());
+            docx_free(svg_ptr, svg.len());
+        }
+
+        assert!(out.contains("pic:pic"), "expected embedded pic:pic: {out}");
+        assert!(out.contains("svgBlip"), "expected embedded svgBlip: {out}");
+
+        docx_close(handle);
+    }
+
+    #[test]
+    fn docx_save_with_mermaid_images_reports_unknown_handle_as_empty() {
+        // SAFETY: null/0 is the documented empty-input case for `input()`.
+        let out = read_result(unsafe {
+            docx_save_with_mermaid_images(
+                999_999,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+            )
+        });
+        assert!(
+            out.is_empty(),
+            "unknown handle must yield an empty result, got {out:?}"
+        );
     }
 }
