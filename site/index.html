@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Docxy — the office suite for your terminal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Open, edit and save real Word, Excel and Project files — in a TUI, in your IDE, or through your AI agent. Zero-dependency Rust engines, MCP servers, faithful OOXML.">
+<meta property="og:title" content="Docxy — the office suite for your terminal">
+<meta property="og:description" content="Real .docx, .xlsx and .mpp editing in the terminal, your IDE, and your AI agent's hands. Zero-dependency Rust engines. MIT.">
+<meta property="og:url" content="https://docxy.dev/">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='14' fill='%2310141B'/%3E%3Ctext x='50' y='72' font-size='62' font-family='monospace' font-weight='bold' fill='%234478C8' text-anchor='middle'%3E%E2%96%AE%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --paper: #FAF9F5;
+    --ink: #21262E;
+    --ink-soft: #5A6472;
+    --line: #E3E0D8;
+    --card: #FFFFFF;
+    --term-bg: #10141B;
+    --term-chrome: #1A202B;
+    --term-ink: #C8D0DA;
+    --term-dim: #5F6B7A;
+    --acc-doc: #4478C8;
+    --acc-grid: #2E9E5B;
+    --acc-plan: #D98E2B;
+    --acc-mail: #28A8EA;
+    --acc-doc-ink: #35619F;
+    --mono: ui-monospace, "Cascadia Code", Consolas, "JetBrains Mono", Menlo, monospace;
+    --body: "Segoe UI", Calibri, Seravek, "Helvetica Neue", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0E1116;
+      --ink: #D6DBE3;
+      --ink-soft: #8A94A3;
+      --line: #232A35;
+      --card: #151A22;
+      --acc-doc-ink: #6D9BE0;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0E1116;
+    --ink: #D6DBE3;
+    --ink-soft: #8A94A3;
+    --line: #232A35;
+    --card: #151A22;
+    --acc-doc-ink: #6D9BE0;
+  }
+  :root[data-theme="light"] {
+    --paper: #FAF9F5;
+    --ink: #21262E;
+    --ink-soft: #5A6472;
+    --line: #E3E0D8;
+    --card: #FFFFFF;
+    --acc-doc-ink: #35619F;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  a { color: var(--acc-doc-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--acc-doc);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- nav ---- */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 0 18px;
+  }
+  .wordmark {
+    font-family: var(--mono); font-size: 20px; font-weight: 700;
+    color: var(--ink); letter-spacing: -0.5px;
+  }
+  .wordmark .caret {
+    display: inline-block; width: 0.55em; height: 1.05em;
+    background: var(--acc-doc); vertical-align: text-bottom; margin-left: 2px;
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .caret { animation: none; }
+  }
+  .nav-links { display: flex; gap: 22px; font-size: 15px; }
+  .nav-links a { color: var(--ink-soft); }
+
+  /* ---- hero ---- */
+  header.hero { padding: 44px 0 30px; }
+  .hero-grid {
+    display: grid; grid-template-columns: minmax(300px, 5fr) 7fr;
+    gap: 40px; align-items: center;
+  }
+  @media (max-width: 880px) { .hero-grid { grid-template-columns: 1fr; } }
+  .eyebrow {
+    font-family: var(--mono); font-size: 13px; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--ink-soft); margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 700;
+    font-size: clamp(30px, 4.2vw, 44px); line-height: 1.15;
+    letter-spacing: -1px; margin: 0 0 18px; text-wrap: balance;
+  }
+  h1 .prompt { color: var(--acc-doc); }
+  .lede { font-size: 19px; color: var(--ink-soft); margin: 0 0 26px; max-width: 34em; }
+  .lede strong { color: var(--ink); font-weight: 600; }
+  .install {
+    font-family: var(--mono); font-size: 14.5px;
+    background: var(--term-bg); color: var(--term-ink);
+    border-radius: 8px; padding: 13px 18px; display: inline-block;
+    white-space: nowrap; overflow-x: auto; max-width: 100%;
+  }
+  .install .dollar { color: var(--acc-grid); user-select: none; }
+  .hero-links { margin-top: 14px; font-size: 15px; display: flex; gap: 18px; flex-wrap: wrap; }
+
+  /* ---- terminal window ---- */
+  .term {
+    background: var(--term-bg); border-radius: 10px;
+    box-shadow: 0 18px 50px -18px rgba(8, 12, 20, 0.55);
+    overflow: hidden; border: 1px solid #232A35;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--term-chrome); padding: 9px 12px;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; opacity: 0.9; }
+  .term-tabs { display: flex; gap: 2px; margin-left: 12px; }
+  .term-tabs button {
+    font-family: var(--mono); font-size: 12.5px; border: 0; cursor: pointer;
+    background: transparent; color: var(--term-dim);
+    padding: 4px 11px; border-radius: 5px;
+  }
+  .term-tabs button[aria-selected="true"] { background: var(--term-bg); color: var(--term-ink); }
+  .term-tabs button:hover { color: var(--term-ink); }
+  .term pre {
+    margin: 0; padding: 14px 16px; font-family: var(--mono);
+    font-size: 12.5px; line-height: 1.42; color: var(--term-ink);
+    overflow-x: auto; tab-size: 4; font-variant-numeric: tabular-nums;
+  }
+  .term pre[hidden] { display: none; }
+  .t-dim { color: var(--term-dim); }
+  .t-doc { color: #7AA5E8; }
+  .t-grid { color: #57C784; }
+  .t-plan { color: #E8AC55; }
+  .t-mail { color: #63BFF0; }
+  .t-inv { background: #2A3342; }
+  .t-note { color: var(--term-dim); font-style: italic; }
+
+  /* ---- sections ---- */
+  section { padding: 42px 0; border-top: 1px solid var(--line); }
+  h2 {
+    font-family: var(--mono); font-size: clamp(22px, 2.6vw, 28px);
+    letter-spacing: -0.5px; margin: 0 0 8px; text-wrap: balance;
+  }
+  .section-sub { color: var(--ink-soft); margin: 0 0 30px; max-width: 44em; }
+
+  .pillars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px; }
+  @media (max-width: 760px) { .pillars { grid-template-columns: 1fr; } }
+  .pillar h3 {
+    font-family: var(--mono); font-size: 16.5px; margin: 0 0 8px;
+  }
+  .pillar h3::before { content: "▸ "; color: var(--acc-doc); }
+  .pillar p { margin: 0; font-size: 15.5px; color: var(--ink-soft); }
+  .pillar code {
+    font-family: var(--mono); font-size: 13px; color: var(--ink);
+    background: var(--line); padding: 1px 6px; border-radius: 4px;
+  }
+
+  /* ---- app cards ---- */
+  .apps { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+  @media (max-width: 760px) { .apps { grid-template-columns: 1fr; } }
+  .app {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 22px 24px 20px; border-top-width: 3px;
+  }
+  .app.doc  { border-top-color: var(--acc-doc); }
+  .app.grid { border-top-color: var(--acc-grid); }
+  .app.plan { border-top-color: var(--acc-plan); }
+  .app.mail { border-top-color: var(--acc-mail); }
+  .app-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .app-head h3 { font-family: var(--mono); font-size: 19px; margin: 0; }
+  .app-head .ext { font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); }
+  .badge {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--acc-mail);
+    border: 1px solid var(--acc-mail); border-radius: 20px; padding: 1px 9px;
+  }
+  .app p { margin: 0; font-size: 15px; color: var(--ink-soft); }
+
+  /* ---- mcp transcript ---- */
+  .mcp-grid {
+    display: grid; grid-template-columns: minmax(280px, 4fr) 6fr; gap: 36px;
+    align-items: start;
+  }
+  @media (max-width: 880px) { .mcp-grid { grid-template-columns: 1fr; } }
+  .mcp-copy p { color: var(--ink-soft); font-size: 15.5px; }
+  .mcp-copy .add-cmds { font-family: var(--mono); font-size: 13.5px; line-height: 2; }
+
+  /* ---- engineering ---- */
+  .facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+  @media (max-width: 760px) { .facts { grid-template-columns: repeat(2, 1fr); } }
+  .fact { border-left: 2px solid var(--line); padding-left: 16px; }
+  .fact b {
+    display: block; font-family: var(--mono); font-size: 22px;
+    letter-spacing: -0.5px; font-variant-numeric: tabular-nums;
+  }
+  .fact span { font-size: 13.5px; color: var(--ink-soft); }
+
+  footer {
+    border-top: 1px solid var(--line); padding: 28px 0 40px;
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    color: var(--ink-soft); font-size: 14px;
+  }
+  footer .fm { font-family: var(--mono); font-size: 13px; }
+</style>
+
+<div class="wrap">
+  <nav>
+    <span class="wordmark">docxy<span class="caret" aria-hidden="true"></span></span>
+    <span class="nav-links">
+      <a href="#suite">Suite</a>
+      <a href="#agents">Agents</a>
+      <a href="#engineering">Engineering</a>
+      <a href="https://github.com/yeroo/docxy">GitHub</a>
+    </span>
+  </nav>
+
+  <header class="hero">
+    <div class="hero-grid">
+      <div>
+        <p class="eyebrow">The office suite for developers</p>
+        <h1><span class="prompt">~ $</span> office,<br>in the terminal.</h1>
+        <p class="lede">Open, edit and save <strong>real Word, Excel and Project files</strong> — in a TUI, in your IDE, or through your AI&nbsp;agent. Faithful OOXML in and out, real engines underneath.</p>
+        <code class="install"><span class="dollar">$</span> cargo install docxy xlsxy yppxy</code>
+        <div class="hero-links">
+          <a href="https://github.com/yeroo/docxy">Source on GitHub →</a>
+          <a href="https://crates.io/crates/docxy">crates.io →</a>
+        </div>
+      </div>
+
+      <div class="term" id="hero-term">
+        <div class="term-bar">
+          <span class="dot" style="background:#E0604F"></span>
+          <span class="dot" style="background:#D9A23C"></span>
+          <span class="dot" style="background:#4FA76B"></span>
+          <div class="term-tabs" role="tablist" aria-label="Suite demos">
+            <button role="tab" aria-selected="true"  data-pane="pane-doc">docxy</button>
+            <button role="tab" aria-selected="false" data-pane="pane-grid">xlsxy</button>
+            <button role="tab" aria-selected="false" data-pane="pane-plan">yppxy</button>
+            <button role="tab" aria-selected="false" data-pane="pane-mail">lookxy</button>
+          </div>
+        </div>
+<pre id="pane-doc" role="tabpanel">
+<span class="t-doc">  File   Home   Styles   Insert   Review   View</span>
+<span class="t-dim">0····+····1····+····2····+····3····+····4····+····5····+····6</span>
+<span class="t-inv"> Report¶                                                     </span>
+ ────────────────────────────────────────────────────────────
+ A sharper, agent-written opening line.¶
+ Supporting detail follows here.¶
+ Appended via MCP.¶
+
+<span class="t-dim"> report.docx   F9 ribbon · ^S save · ^Z undo · ^F find</span>
+<span class="t-note"> — edited live by an agent over MCP; every change undoable</span></pre>
+<pre id="pane-grid" role="tabpanel" hidden>
+<span class="t-grid">  File   Home   Insert   Review   View</span>
+ D1      │ =SUM(A1:A5)*2
+<span class="t-dim">        A        B        C        D        E        F</span>
+<span class="t-dim">  1</span>       10                        <span class="t-inv">300</span>
+<span class="t-dim">  2</span>       20
+<span class="t-dim">  3</span>       30       <span class="t-dim">recalculated</span>
+<span class="t-dim">  4</span>       40       <span class="t-dim">by a real</span>
+<span class="t-dim">  5</span>       50       <span class="t-dim">calc engine</span>
+<span class="t-grid"> ⊞ 1/2 [ Data ]  Calc Zone</span>
+<span class="t-dim"> calc-refs.xlsx   ^S save · ^Z undo · ^T sheet · F9 ribbon</span></pre>
+<pre id="pane-plan" role="tabpanel" hidden>
+<span class="t-plan">  File   Task   Schedule   View</span>
+<span class="t-dim"> Task                    Dur   Slack │ 3/2    3/9</span>
+ ▾ Phase                        0d   │ <span class="t-plan">▟▬▬▬▬▬▬▬▬▬▬▟</span>
+   • A                    3d    0d   │ <span class="t-plan">███</span>
+   • B                    1d    0d   │    <span class="t-plan">█</span>
+   • Ship it              2d    0d   │     <span class="t-plan">██</span>
+<span class="t-dim"> summary *  finish 2026-03-09   4 task(s), 3 critical</span>
+<span class="t-note"> — CPM scheduler: change a duration, watch dependents move</span></pre>
+<pre id="pane-mail" role="tabpanel" hidden>
+<span class="t-mail">  File   Home   Send / Receive   View</span>
+<span class="t-dim"> Inbox — 3 unread</span>
+ <span class="t-inv">● Corpus CI          calc conformance: 538/538 green   9:12</span>
+ ● Dependabot         3 PRs ready to merge              8:40
+ ○ OpenSSF Scorecard  weekly report                     7:05
+<span class="t-dim"> ⏎ read · r reply · a archive · / search</span>
+<span class="t-note"> — lookxy: mail read + triage, in preview</span></pre>
+      </div>
+    </div>
+  </header>
+
+  <section id="suite">
+    <h2>One suite. Three surfaces.</h2>
+    <p class="section-sub">The same zero-dependency Rust engines render your documents everywhere you work — no format converters, no cloud round-trips.</p>
+    <div class="pillars">
+      <div class="pillar">
+        <h3>In the terminal</h3>
+        <p>Four TUIs with ribbons, live formula recalculation, a real terminal Gantt, images over kitty/iTerm2/Sixel — and vim keys. SSH in and edit the quarterly report.</p>
+      </div>
+      <div class="pillar">
+        <h3>In your agent</h3>
+        <p>Every editor ships an MCP server and a live control surface. Agents read and edit the <em>open</em> document — changes land on the undo stack and repaint while you watch.</p>
+      </div>
+      <div class="pillar">
+        <h3>In your IDE</h3>
+        <p><code>offxy</code> for VS Code and JetBrains opens .docx and .xlsx as first-class editor tabs, powered by the same engines compiled to WebAssembly. Visual Studio: coming soon.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>The applications</h2>
+    <p class="section-sub">Each one opens the real file format — not an import, not an approximation — and saves it back losslessly.</p>
+    <div class="apps">
+      <div class="app doc">
+        <div class="app-head"><h3>docxy</h3><span class="ext">.docx · .md</span></div>
+        <p>Word processor: tables, styles, lists, images (WMF/EMF included), comments, footnotes, find &amp; replace, PDF and Markdown export.</p>
+      </div>
+      <div class="app grid">
+        <div class="app-head"><h3>xlsxy</h3><span class="ext">.xlsx · .csv</span></div>
+        <p>Spreadsheet with a real calculation engine — dynamic arrays, pivots, defined names — conformance-tested against Excel's own cached results across a 500-workbook corpus.</p>
+      </div>
+      <div class="app plan">
+        <div class="app-head"><h3>yppxy</h3><span class="ext">.mpp · .xml</span></div>
+        <p>Project scheduler with a Critical Path Method engine: dependencies, slack, resource leveling, baselines — and a Gantt chart drawn in character cells.</p>
+      </div>
+      <div class="app mail">
+        <div class="app-head"><h3>lookxy</h3><span class="ext">mail</span><span class="badge">preview</span></div>
+        <p>Mail reading and triage for the terminal, with the same agent control surface as the rest of the suite.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="agents">
+    <h2>Your agent gets hands.</h2>
+    <div class="mcp-grid">
+      <div class="mcp-copy">
+        <p>Register once, and Claude Code (or any MCP client) can drive the live editor: read the open workbook, set a cell, tighten a paragraph, relink a schedule — while the pane repaints in front of you.</p>
+        <p>Edits go through each app's own edit path: <strong>undoable, recalculated, rescheduled</strong>. No stale files, no clobbered unsaved work.</p>
+        <p class="add-cmds">
+          claude mcp add docxy -- docxy --mcp<br>
+          claude mcp add xlsxy -- xlsxy --mcp<br>
+          claude mcp add yppxy -- yppxy --mcp
+        </p>
+      </div>
+      <div class="term">
+        <div class="term-bar">
+          <span class="dot" style="background:#E0604F"></span>
+          <span class="dot" style="background:#D9A23C"></span>
+          <span class="dot" style="background:#4FA76B"></span>
+        </div>
+<pre>
+<span class="t-dim"># the agent, editing a live spreadsheet</span>
+<span class="t-grid">→</span> xlsxy_set {"ref":"D1","text":"=SUM(A1:A5)*2"}
+<span class="t-grid">←</span> {"ok":true,"result":{"ref":"D1","value":300,
+     "formula":"=SUM(A1:A5)*2","text":"300"}}
+
+<span class="t-dim"># …and a live schedule</span>
+<span class="t-plan">→</span> yppxy_link {"uid":4,"pred":3}
+<span class="t-plan">←</span> {"ok":true,"result":{"name":"Ship it",
+     "start":"2026-03-04 08:00","critical":true}}
+
+<span class="t-dim"># the pane in your terminal just repainted. undo works.</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="engineering">
+    <h2>Engineering you can audit.</h2>
+    <p class="section-sub">The core crates — OPC/ZIP, WordprocessingML, SpreadsheetML, scheduling — are dependency-free Rust: hand-written ZIP, XML, and PDF, nothing in the supply chain but the standard library.</p>
+    <div class="facts">
+      <div class="fact"><b>0</b><span>dependencies in the core parsing &amp; engine crates</span></div>
+      <div class="fact"><b>900+</b><span>tests, plus corpus conformance against real Office files</span></div>
+      <div class="fact"><b>3</b><span>MCP servers shipping today — one per editor</span></div>
+      <div class="fact"><b>MIT</b><span>licensed, OpenSSF-scorecarded, on crates.io</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <span class="fm">docxy · xlsxy · yppxy · lookxy</span>
+    <span>
+      <a href="https://github.com/yeroo/docxy">GitHub</a> ·
+      <a href="https://crates.io/crates/docxy">crates.io</a> ·
+      MIT © 2026
+    </span>
+  </footer>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('.term-tabs button');
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    tabs.forEach(b => b.setAttribute('aria-selected', String(b === btn)));
+    document.querySelectorAll('#hero-term pre').forEach(p =>
+      p.hidden = (p.id !== btn.dataset.pane));
+  }));
+</script>
+</body>
+</html>
