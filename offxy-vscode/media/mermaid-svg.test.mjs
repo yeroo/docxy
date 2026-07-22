@@ -112,3 +112,70 @@ const thickWidth = Number(thickLine.match(/stroke-width="([\d.]+)"/)[1]);
 assert.ok(thickWidth > solidWidth, 'thick edge must have a larger stroke-width than solid');
 
 console.log('mermaid svg OK');
+
+// ---- sequence diagram: `buildMermaidSvg` dispatches on `geo.kind` (Task 5 of
+// the mermaid-sequence plan) to `buildSequenceSvg`, a separate renderer for
+// the `SequenceGeometry` JSON shape docxcore's `mermaid_seq.rs` emits
+// (participants, lifelines, messages, alt/else frames, notes) — the sequence
+// analog of the flowchart geometry exercised above. Fixture matches the
+// brief: 2 participants/lifelines, 1 message, 1 frame with an else-divider,
+// 1 note whose text ('n & <ote>') proves escaping survives the sequence path
+// too. -----------------------------------------------------------------------
+const seqGeo = {
+  kind: 'sequence',
+  canvasW: 3000000,
+  canvasH: 2000000,
+  participants: [
+    { x: 0, y: 0, w: 900000, h: 400000, label: 'A' },
+    { x: 1500000, y: 0, w: 900000, h: 400000, label: 'B' },
+  ],
+  lifelines: [
+    { x: 450000, y1: 400000, y2: 1900000 },
+    { x: 1950000, y1: 400000, y2: 1900000 },
+  ],
+  messages: [
+    { x1: 450000, y1: 700000, x2: 1950000, y2: 700000, text: 'm1', dashed: false, self: false },
+  ],
+  frames: [
+    { x: 200000, y: 550000, w: 2000000, h: 900000, label: 'c', elseLabel: 'd', elseY: 1000000 },
+  ],
+  notes: [{ x: 300000, y: 1500000, w: 1800000, h: 300000, text: 'n & <ote>' }],
+};
+
+const seqSvg = buildMermaidSvg(seqGeo);
+assert.ok(/<svg/.test(seqSvg), 'sequence must produce an <svg> root');
+assert.ok(
+  new RegExp(`viewBox="0 0 ${seqGeo.canvasW} ${seqGeo.canvasH}"`).test(seqSvg),
+  'viewBox must use canvasW/canvasH'
+);
+
+const seqRects = [...seqSvg.matchAll(/<rect[^>]*\/>/g)].map((m) => m[0]);
+const partRects = seqRects.filter((r) => /#DAE8FC/i.test(r));
+assert.equal(partRects.length, 2, 'must draw one participant <rect> per participant');
+const frameRects = seqRects.filter((r) => /#F5F5F5/i.test(r));
+assert.equal(frameRects.length, 1, 'must draw one frame <rect>');
+const noteRects = seqRects.filter((r) => /#FFF6D5/i.test(r));
+assert.equal(noteRects.length, 1, 'must draw one note <rect>');
+
+const seqLines = [...seqSvg.matchAll(/<line[^>]*\/>/g)].map((m) => m[0]);
+const lifelineLines = seqLines.filter((l) => /stroke-dasharray/.test(l));
+assert.ok(lifelineLines.length >= 2, 'must draw a dashed <line> per lifeline');
+
+assert.ok(/marker-end="url\(#arrow\)"/.test(seqSvg), 'a message must carry the arrow marker');
+assert.ok(/<line[^>]*marker-end="url\(#arrow\)"[^>]*\/>|<polyline[^>]*marker-end="url\(#arrow\)"[^>]*\/>/.test(seqSvg), 'the message must draw as a line/polyline with the arrow marker');
+
+// the [else] divider: a distinct dashed line (frame stroke, not a lifeline)
+// at elseY, plus its own label text.
+assert.ok(/y1="1000000"[^>]*y2="1000000"|y="1000000"/.test(seqSvg), 'an else-divider must sit at elseY');
+assert.ok(/\[else\]/.test(seqSvg) && /d</.test(seqSvg), 'the elseLabel must be drawn, prefixed [else]');
+
+assert.ok(/>A</.test(seqSvg) && />B</.test(seqSvg), 'participant labels must be drawn');
+assert.ok(/>m1</.test(seqSvg), 'message label must be drawn');
+assert.ok(/>c</.test(seqSvg), 'frame title must be drawn');
+
+// escaping: the note text 'n & <ote>' must appear escaped, never as a raw
+// '<ote>' tag-looking fragment.
+assert.ok(!/<ote>/.test(seqSvg), 'note text must be escaped, not emitted as raw markup');
+assert.ok(/n &amp; &lt;ote&gt;/.test(seqSvg), 'note text must be escaped with &amp;/&lt;/&gt;');
+
+console.log('mermaid sequence svg OK');

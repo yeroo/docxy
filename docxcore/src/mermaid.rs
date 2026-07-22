@@ -163,6 +163,9 @@ struct Subgraph {
 /// diagram, plus the node-label lines for the terminal box. Returns
 /// `(drawing_xml, text_lines)`.
 pub fn to_drawing(src: &str) -> (String, Vec<String>) {
+    if crate::mermaid_seq::is_sequence(src) {
+        return crate::mermaid_seq::to_drawing(src);
+    }
     let mut d = parse(src);
     layout(&mut d);
     let text: Vec<String> = d.nodes.iter().map(|n| n.label.clone()).collect();
@@ -172,6 +175,13 @@ pub fn to_drawing(src: &str) -> (String, Vec<String>) {
 /// The node labels of a Mermaid source, in declaration order — used to fill the
 /// terminal box when a generated diagram is reloaded from a `.docx`.
 pub fn labels(src: &str) -> Vec<String> {
+    if crate::mermaid_seq::is_sequence(src) {
+        return crate::mermaid_seq::parse(src)
+            .participants
+            .iter()
+            .map(|p| p.label.clone())
+            .collect();
+    }
     parse(src).nodes.into_iter().map(|n| n.label).collect()
 }
 
@@ -185,7 +195,7 @@ pub fn source_of(raw: &str) -> Option<String> {
     Some(unescape_source(body))
 }
 
-const MARKER: &str = "mermaid:";
+pub(crate) const MARKER: &str = "mermaid:";
 
 // ===========================================================================
 // Parsing
@@ -1172,6 +1182,17 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
         sid += 1;
     }
 
+    wrap_drawing_group(&shapes, w, h, src)
+}
+
+/// Wraps a `{shapes}` DrawingML fragment (a run of `wps:wsp`/`wps:cxnSp`
+/// elements) in the shared `mc:AlternateContent` / `wpg:wgp` group + `w:drawing`
+/// scaffold, embedding `src` (escaped, marker-prefixed) in the group's
+/// `wp:docPr@descr` so [`source_of`] can recover it losslessly. This is the
+/// single wrapper both [`emit_drawing`] (flowcharts) and
+/// `mermaid_seq::to_drawing` (sequence diagrams) call, so every Mermaid
+/// diagram type produces byte-identical scaffolding around its shapes.
+pub(crate) fn wrap_drawing_group(shapes: &str, w: i64, h: i64, src: &str) -> String {
     let descr = format!("{MARKER}{}", escape_source(src));
     format!(
         "<w:r>\
@@ -1359,7 +1380,7 @@ fn emit_edge_label(label: &str, cx: i64, cy: i64, sid: i32) -> String {
 
 /// Encode the Mermaid source for an XML attribute: no literal newlines (Word and
 /// XML attribute-value normalization would mangle them), so escape them.
-fn escape_source(src: &str) -> String {
+pub(crate) fn escape_source(src: &str) -> String {
     let mut out = String::new();
     for c in src.chars() {
         match c {
@@ -1393,12 +1414,12 @@ fn unescape_source(s: &str) -> String {
     out
 }
 
-fn xml_escape_text(s: &str) -> String {
+pub(crate) fn xml_escape_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
-fn xml_escape_attr(s: &str) -> String {
+pub(crate) fn xml_escape_attr(s: &str) -> String {
     xml_escape_text(s).replace('"', "&quot;")
 }
 
@@ -1459,6 +1480,21 @@ pub fn geometry(src: &str) -> DiagramGeometry {
     let mut d = parse(src);
     layout(&mut d);
     build_geometry(&d)
+}
+
+/// Canvas `(width, height, geometry_json)` for any Mermaid source, dispatching
+/// on kind — a `sequenceDiagram` routes to [`mermaid_seq::geometry`], anything
+/// else to the flowchart [`geometry`]. This is the single seam `render.rs`'s
+/// SmartArt arm calls, so the terminal/PDF cell sizing and the webview overlay
+/// both size themselves off the same kind-appropriate canvas.
+pub fn geometry_box(src: &str) -> (i64, i64, String) {
+    if crate::mermaid_seq::is_sequence(src) {
+        let g = crate::mermaid_seq::geometry(src);
+        (g.canvas_w, g.canvas_h, g.to_json())
+    } else {
+        let g = geometry(src);
+        (g.canvas_w, g.canvas_h, g.to_json())
+    }
 }
 
 fn build_geometry(d: &Diagram) -> DiagramGeometry {
@@ -2191,5 +2227,42 @@ mod tests {
         // and layout didn't panic on a non-node endpoint.
         assert_eq!(g.edges.len(), 1);
         assert!(g.edges[0].points.len() >= 2);
+    }
+
+    #[test]
+    fn to_drawing_dispatches_sequence() {
+        let (xml, _) = to_drawing("sequenceDiagram\nA->>B: hi");
+        assert!(xml.contains("prstDash")); // lifeline → sequence path
+        // A flowchart is unaffected.
+        let (fx, _) = to_drawing("flowchart TD\nA-->B");
+        assert!(fx.contains("<a:custGeom>")); // flowchart connector, unchanged
+    }
+
+    #[test]
+    fn geometry_box_tags_kind() {
+        let (w, h, json) = geometry_box("sequenceDiagram\nA->>B: hi");
+        assert!(w > 0 && h > 0);
+        assert!(json.contains("\"kind\":\"sequence\""));
+        let (_, _, fj) = geometry_box("flowchart TD\nA-->B");
+        assert!(fj.contains("\"nodes\":[")); // flowchart geometry
+    }
+
+    #[test]
+    fn labels_dispatches_sequence() {
+        let ls = labels(
+            "sequenceDiagram\nparticipant U as User / AI\nparticipant DL as Desktop\nU->>DL: go\nalt cond\n U->>DL: x\nelse other\n DL->>U: y\nend",
+        );
+        assert_eq!(ls, vec!["User / AI".to_string(), "Desktop".to_string()]);
+        // No flowchart pseudo-node leaking through from the `alt`/`else` lines.
+        assert!(
+            !ls.iter()
+                .any(|l| l.contains("else") || l.contains("cond") || l.contains("other"))
+        );
+    }
+
+    #[test]
+    fn labels_flowchart_unchanged() {
+        let ls = labels("flowchart TD\nA[Start]-->B[End]");
+        assert_eq!(ls, vec!["Start".to_string(), "End".to_string()]);
     }
 }
