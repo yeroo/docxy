@@ -321,10 +321,30 @@ git commit -m "backstagecore: BackstageHost trait + event-returning key/mouse"
 - Produces: `pub fn draw(f: &mut ratatui::Frame, area: ratatui::layout::Rect, bs: &mut Backstage, host: &dyn BackstageHost)`
 
 **Design notes:**
-- `area` EXCLUDES the ribbon tab-strip row (the app draws that on row 0). `draw` splits `area` into a 14-wide menu column + content pane (port `draw_backstage` main.rs 2167–2227, dropping the tab-strip render at 2175–2183 and the `dim` "(click a tab…)" hint — those stay in the app).
+- `draw` receives the **FULL frame area** (row 0 included). The APP has already drawn its ribbon tab strip onto row 0 *before* calling `draw` (that needs the app's `ribboncore` ribbon). `draw` splits `area` into `[Length(1), Min(1)]` and renders the menu + content into `rows[1]` only — it does NOT draw row 0. (Port `draw_backstage` main.rs 2167–2227 but drop lines 2175–2183: the tab-strip render + the `dim` "(click a tab…)" hint stay in the app.) Because the app's `mouse` passes absolute (full-frame) coordinates and Task 2's handler already reads `layout.{list_start,save_btn,name_top,name_x0}` in absolute coords, all layout values below are computed against the full-frame `area` (whose `y == 0`), exactly matching docxy.
 - Replace `let accent = Style::default().fg(Color::Black).bg(Color::Cyan);` with `let accent = Style::default().fg(Color::Black).bg(host.accent());` and the preview-focus `Color::Cyan` with `host.accent()`. Do this in every draw helper.
-- Before drawing Open, call `bs.refresh_preview(host, preview_inner_width)` so the cache is current, and set `bs.layout.preview_h = inner_ph`.
-- Record click rects into `bs.layout` as they are computed: `list_start` (the scroll offset used for the list — compute so `sel` stays visible: `list_start = sel.saturating_sub(inner_h - 1)` clamped ≥0, matching docxy's existing `bs_list_start` computation in its draw), `save_btn`, `name_top`, `name_x0`.
+- **Compute the layout FIRST (verbatim from docxy `main.rs` 4984–5005), store into `bs.layout`, then render** (this replaces docxy's pre-draw block; the render bodies then read `bs.layout` instead of `self.bs_*`):
+
+```rust
+let preview_w = (area.width as usize).saturating_sub(50).max(8);
+bs.layout.preview_h = (area.height as usize).saturating_sub(3).max(1);
+bs.layout.name_top = area.height.saturating_sub(3);
+bs.layout.name_x0 = 16;
+bs.layout.save_btn = ratatui::layout::Rect {
+    x: area.width.saturating_sub(10),
+    y: bs.layout.name_top,
+    width: 10,
+    height: 3,
+};
+let list_h = (area.height as usize).saturating_sub(3).max(1);
+bs.layout.list_start = bs
+    .sel
+    .saturating_sub(list_h / 2)
+    .min(bs.entries.len().saturating_sub(list_h));
+bs.refresh_preview(host, preview_w);   // fill the preview cache at the pane width
+```
+
+  Do this ONCE at the top of `draw`, before the menu/content split, so `mouse` (already shipped) reads correct rects. The list render bodies use `bs.layout.list_start` as their `skip(..)` offset (was `self.bs_list_start`); the preview scroll body uses `bs.preview_scroll` clamped as before.
 - Port `draw_bs_open` (2229–2323), `draw_bs_save_as` (2325–~2430), `draw_bs_info` (2839–~2900) — but `draw_bs_info` renders `host.info_lines()` instead of docxy's inline properties.
 - Move docxy's `fit_width` helper into `render.rs` as a private fn (find it in docxy main.rs; it truncates a string to a display width using `unicode_width`). If the exact body is unavailable, implement:
 
