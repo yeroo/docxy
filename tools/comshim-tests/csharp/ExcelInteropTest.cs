@@ -44,6 +44,7 @@ internal static class ExcelInteropTest
             if (mode == "early") RunEarly(outPath);
             else if (mode == "earlyls") RunEarlyLocalServer(outPath);
             else if (mode == "castshim") RunCastShim(outPath);
+            else if (mode == "castonly") RunCastOnly();
             else RunLate(outPath);
             Console.WriteLine("RESULT: OK (" + mode + ") -> " + outPath);
             return 0;
@@ -153,6 +154,24 @@ internal static class ExcelInteropTest
         {
             app.Quit();
         }
+    }
+
+    // Just the decisive QueryInterface: activate the shim and cast to the PIA's
+    // typed interface, then stop (no method calls). Isolates "does .NET accept our
+    // object as Excel._Application" from vtable-slot concerns.
+    private static void RunCastOnly()
+    {
+        const uint CLSCTX_LOCAL_SERVER = 0x4;
+        Guid clsid = new Guid("7B3F9E20-4C1A-4E8B-A2D6-9F5C1E0B7A31");
+        Guid iidUnknown = new Guid("00000000-0000-0000-C000-000000000046");
+        IntPtr punk;
+        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_LOCAL_SERVER, ref iidUnknown, out punk);
+        if (hr < 0) throw new COMException("CoCreateInstance(shim CLSID) failed", hr);
+        object obj = Marshal.GetObjectForIUnknown(punk);
+        Marshal.Release(punk);
+        Excel.Application app = (Excel.Application)obj; // QI {000208D5}
+        Console.WriteLine("  CAST SUCCEEDED: our object satisfies Excel._Application (QI {000208D5} OK)");
+        Marshal.ReleaseComObject(app);
     }
 
     private static void RunLate(string outPath)

@@ -28,6 +28,11 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(windows)]
 mod win {
+    // COM interface methods are PascalCase by contract (they map to Excel's
+    // typelib member names), so the generated interface traits opt out of the
+    // snake_case lint.
+    #![allow(non_snake_case)]
+
     use std::cell::RefCell;
     use std::ffi::c_void;
     use std::process::ExitCode;
@@ -45,13 +50,16 @@ mod win {
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
         CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
         DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
-        IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE,
-        REGCLS_SUSPENDED,
+        IClassFactory_Impl, IDispatch, IDispatch_Impl, IDispatch_Vtbl, ITypeInfo,
+        REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
     };
-    use windows::core::{BSTR, GUID, IUnknown, Interface, PCWSTR, Result, VARIANT, implement};
+    use windows::Win32::Foundation::E_NOTIMPL;
+    use windows::core::{
+        BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement, interface,
+    };
 
     /// Our own coclass CLSID — a brand-new GUID, NEVER Microsoft's Excel CLSID
     /// {00024500-…}. `Excel.Application` (the ProgID) points here in HKCU.
@@ -281,7 +289,7 @@ mod win {
                     return Err(CLASS_E_NOAGGREGATION.into());
                 }
                 log(&format!("ClassFactory::CreateInstance riid={:?}", *riid));
-                let app: IDispatch = Application::new().into();
+                let app: _Application = Application::new().into();
                 app.query(riid, ppvobject).ok()
             }
         }
@@ -481,13 +489,38 @@ mod win {
     // Application
     // -----------------------------------------------------------------------
 
-    #[implement(IDispatch)]
+    /// Excel's `_Application` dual interface (its real IID), deriving `IDispatch`.
+    /// The vtable is IDispatch's 7 slots then these members in Excel's exact
+    /// order. This is what makes an **early-bound** .NET client's cast to
+    /// `Excel.Application` succeed (P2). Only a few leading slots are declared
+    /// here for the mechanism-validation step; the full slot list is generated
+    /// next. Unused slots return `E_NOTIMPL`.
+    #[interface("000208D5-0000-0000-C000-000000000046")]
+    unsafe trait _Application: IDispatch {
+        unsafe fn Application(&self) -> HRESULT; // slot 7
+        unsafe fn Creator(&self) -> HRESULT; // slot 8
+        unsafe fn Parent(&self) -> HRESULT; // slot 9
+    }
+
+    #[implement(_Application)]
     struct Application;
 
     impl Application {
         fn new() -> Application {
             APPS.fetch_add(1, Ordering::SeqCst);
             Application
+        }
+    }
+
+    impl _Application_Impl for Application_Impl {
+        unsafe fn Application(&self) -> HRESULT {
+            E_NOTIMPL
+        }
+        unsafe fn Creator(&self) -> HRESULT {
+            E_NOTIMPL
+        }
+        unsafe fn Parent(&self) -> HRESULT {
+            E_NOTIMPL
         }
     }
     impl Drop for Application {
