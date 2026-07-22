@@ -5,6 +5,7 @@
 //! `folders`/`messages` (see `app.rs`) — never by querying the store mid-draw.
 
 mod attachments;
+pub mod backstage;
 pub(crate) mod calendar;
 pub mod categories;
 pub mod categorypicker;
@@ -66,6 +67,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.compose.is_some() {
         compose::draw_compose(f, &*app);
+        return;
+    }
+    // The File backstage is a full-frame overlay like compose/OOF.
+    if app.backstage.is_some() {
+        backstage::draw(f, &*app);
         return;
     }
 
@@ -191,7 +197,13 @@ fn ribbon_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
-        KeyCode::Enter => app.run_ribbon_focus(),
+        KeyCode::Enter => match app.ribbon_focus {
+            // Enter on a tab: File (no body) opens the backstage; a body tab
+            // drops into its buttons. Enter on a button runs it.
+            Focus::Tab(i) if !app.ribbon.tab_has_body(i) => app.open_backstage(),
+            Focus::Tab(_) => app.ribbon_focus = app.ribbon.enter_body(),
+            _ => app.run_ribbon_focus(),
+        },
         KeyCode::Esc => {
             app.ribbon_focus = Focus::None;
             app.ribbon_open = false;
@@ -270,6 +282,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // through. Sign-in still wins (help can't be open without a token).
     if app.help {
         help::handle_key(app, key);
+        return;
+    }
+    // The File backstage owns every key while open.
+    if app.backstage.is_some() {
+        app.backstage_key(key.code);
         return;
     }
     // F9 toggles ribbon focus: on → focus the tab strip (expanded); off →

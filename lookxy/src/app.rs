@@ -251,6 +251,8 @@ pub struct App {
     /// mouse hit-testing. Its `x` is 0 (full width), so screen columns map
     /// directly onto the ribbon's own coordinates.
     pub ribbon_rect: Rect,
+    /// The File backstage overlay, when open.
+    pub backstage: Option<crate::ui::backstage::Backstage>,
     // --- Mouse hit-test regions, recorded each frame by `ui::draw` (default
     // zero, so a click before the first draw hits nothing). ---
     /// The rail column's on-screen rect.
@@ -522,6 +524,7 @@ impl App {
             ribbon_open: false,
             ribbon_focus: crate::ui::ribbon::Focus::None,
             ribbon_rect: Rect::ZERO,
+            backstage: None,
             rail_rect: Rect::ZERO,
             folders_rect: Rect::ZERO,
             folders_row0: 0,
@@ -727,6 +730,7 @@ impl App {
             || self.event_form.is_some()
             || self.free_busy.is_some()
             || self.help
+            || self.backstage.is_some()
     }
 
     /// Opens the read-only help overlay (`F1`/`?`).
@@ -1103,6 +1107,7 @@ impl App {
             || self.compose.is_some()
             || self.oof_form.is_some()
             || self.help
+            || self.backstage.is_some()
         {
             return;
         }
@@ -1137,8 +1142,8 @@ impl App {
                     self.ribbon_open = true;
                     self.ribbon_focus = crate::ui::ribbon::Focus::Tab(i);
                 } else {
-                    // File (no body) → the backstage (wired in a later task).
-                    self.run_ribbon_act(crate::ui::ribbon::Act::Settings);
+                    // File (no body) → the backstage.
+                    self.open_backstage();
                 }
             }
             Hit::Button(act) => {
@@ -1190,9 +1195,86 @@ impl App {
             Act::Help => self.open_help(),
             Act::AutoReplies => self.open_oof_form(),
             Act::Exit => self.quit = true,
-            // Settings backstage lands in a later task; a status note for now.
-            Act::Settings => self.error_notice = Some("Settings coming soon".into()),
+            Act::Settings => self.open_backstage(),
             Act::Todo(name) => self.error_notice = Some(format!("{name} not implemented yet")),
+        }
+    }
+
+    /// Opens the File backstage overlay.
+    pub fn open_backstage(&mut self) {
+        self.backstage = Some(crate::ui::backstage::Backstage::new());
+        self.ribbon_focus = crate::ui::ribbon::Focus::None;
+        self.ribbon_open = false;
+    }
+
+    /// Closes the backstage.
+    pub fn close_backstage(&mut self) {
+        self.backstage = None;
+    }
+
+    /// Keys while the backstage is open (menu ↑/↓, Enter/→ activate, Esc close;
+    /// inside Settings, ↑/↓ pick a toggle, Enter/Space flips it, ←/Esc returns).
+    pub fn backstage_key(&mut self, key: ratatui::crossterm::event::KeyCode) {
+        use crate::ui::backstage::{ITEMS, Item, SETTINGS_ROWS};
+        use ratatui::crossterm::event::KeyCode;
+        let Some(state) = self
+            .backstage
+            .as_ref()
+            .map(|b| (b.in_settings, b.sel, b.settings_sel))
+        else {
+            return;
+        };
+        let (in_settings, sel, settings_sel) = state;
+        if in_settings {
+            match key {
+                KeyCode::Up => {
+                    self.mutate_backstage(|b| b.settings_sel = b.settings_sel.saturating_sub(1))
+                }
+                KeyCode::Down => self.mutate_backstage(|b| {
+                    b.settings_sel = (b.settings_sel + 1).min(SETTINGS_ROWS - 1)
+                }),
+                KeyCode::Esc | KeyCode::Left => self.mutate_backstage(|b| b.in_settings = false),
+                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(settings_sel),
+                _ => {}
+            }
+        } else {
+            match key {
+                KeyCode::Up => self.mutate_backstage(|b| b.sel = b.sel.saturating_sub(1)),
+                KeyCode::Down => {
+                    self.mutate_backstage(|b| b.sel = (b.sel + 1).min(ITEMS.len() - 1))
+                }
+                KeyCode::Esc => self.close_backstage(),
+                KeyCode::Enter | KeyCode::Right => match ITEMS[sel.min(ITEMS.len() - 1)] {
+                    Item::AutoReplies => {
+                        self.close_backstage();
+                        self.open_oof_form();
+                    }
+                    Item::Settings => self.mutate_backstage(|b| b.in_settings = true),
+                    Item::Exit => self.quit = true,
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn mutate_backstage(&mut self, f: impl FnOnce(&mut crate::ui::backstage::Backstage)) {
+        if let Some(b) = self.backstage.as_mut() {
+            f(b);
+        }
+    }
+
+    /// Flips a Settings toggle (0 = threaded view, 1 = reminder notifications),
+    /// persisting the choice.
+    fn toggle_setting(&mut self, row: usize) {
+        match row {
+            0 => self.toggle_threaded(),
+            1 => {
+                self.reminders_notify = !self.reminders_notify;
+                if let Some(path) = &self.config_path {
+                    let _ = crate::config::persist_reminders_notify_to(path, self.reminders_notify);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -5444,6 +5526,41 @@ pub(crate) mod tests {
         app.sync_ribbon_toggles();
         assert!(app.ribbon.toggle_on(Act::Threaded));
         assert!(!app.ribbon.toggle_on(Act::CategoryFilter));
+    }
+
+    #[test]
+    fn backstage_auto_replies_opens_oof_and_closes() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.open_backstage();
+        assert!(app.backstage.is_some());
+        // Automatic Replies is item 0 (selected by default). Enter activates it.
+        app.backstage_key(KeyCode::Enter);
+        assert!(app.oof_form.is_some());
+        assert!(app.backstage.is_none());
+    }
+
+    #[test]
+    fn backstage_settings_toggle_flips_threaded() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        app.open_backstage();
+        app.backstage_key(KeyCode::Down); // → Settings
+        app.backstage_key(KeyCode::Enter); // enter the settings toggles
+        app.backstage_key(KeyCode::Enter); // toggle row 0 (Threaded)
+        assert!(!app.threaded);
+    }
+
+    #[test]
+    fn backstage_exit_sets_quit() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.open_backstage();
+        app.backstage_key(KeyCode::Down); // Settings
+        app.backstage_key(KeyCode::Down); // Exit
+        app.backstage_key(KeyCode::Enter);
+        assert!(app.quit);
     }
 
     #[test]

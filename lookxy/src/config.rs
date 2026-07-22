@@ -248,6 +248,19 @@ pub fn persist_threaded_to(path: &Path, value: bool) -> std::io::Result<()> {
 /// called once by `App::ensure_folder_tree_initialized` after the first-run
 /// Inbox expansion.
 pub fn persist_folder_tree_initialized_to(path: &Path, value: bool) -> std::io::Result<()> {
+    persist_bool_to(path, "folder_tree_initialized", value)
+}
+
+/// Read-modify-write `path`, replacing only the `reminders_notify` key. Called
+/// by the File ▸ Settings toggle so the choice survives restarts.
+pub fn persist_reminders_notify_to(path: &Path, value: bool) -> std::io::Result<()> {
+    persist_bool_to(path, "reminders_notify", value)
+}
+
+/// Shared read-modify-write for a single boolean config key, preserving every
+/// other key already in the file (and creating it, and its parent dir, if
+/// absent).
+fn persist_bool_to(path: &Path, key: &str, value: bool) -> std::io::Result<()> {
     use mailcore::json::Value;
 
     let mut entries: Vec<(String, Value)> = match std::fs::read_to_string(path) {
@@ -257,8 +270,8 @@ pub fn persist_folder_tree_initialized_to(path: &Path, value: bool) -> std::io::
         },
         Err(_) => Vec::new(),
     };
-    entries.retain(|(k, _)| k != "folder_tree_initialized");
-    entries.push(("folder_tree_initialized".to_string(), Value::Bool(value)));
+    entries.retain(|(k, _)| k != key);
+    entries.push((key.to_string(), Value::Bool(value)));
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
