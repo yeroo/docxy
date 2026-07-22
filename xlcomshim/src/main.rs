@@ -45,7 +45,7 @@ mod win {
     use windows::Win32::Foundation::E_NOTIMPL;
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND, DISP_E_UNKNOWNNAME,
-        E_FAIL,
+        E_FAIL, E_POINTER, S_OK,
     };
     use windows::Win32::System::Com::{
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
@@ -214,6 +214,11 @@ mod win {
     // -----------------------------------------------------------------------
 
     pub fn run() -> ExitCode {
+        // A panic inside a vtable method would otherwise unwind across the COM
+        // FFI boundary (UB / RPC_E_SERVERFAULT with no diagnostic). Log it.
+        std::panic::set_hook(Box::new(|info| {
+            log(&format!("PANIC: {info}"));
+        }));
         let joined = std::env::args()
             .collect::<Vec<_>>()
             .join(" ")
@@ -420,6 +425,333 @@ mod win {
 
     unsafe fn put_obj<T: IntoDispatch>(pvarresult: *mut VARIANT, obj: T) {
         unsafe { put(pvarresult, VARIANT::from(obj.into_dispatch())) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Early-bound vtable method handlers (the real create-path members, called
+    // by the generated interface stubs). [in] VARIANT is a 24-byte by-value
+    // struct => passed by hidden pointer on x64, so we take `*const VARIANT`
+    // (which also means we borrow, never drop, the caller's VARIANT).
+    // -----------------------------------------------------------------------
+
+    unsafe fn out_iface<I: Interface>(ret: *mut *mut c_void, iface: I) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { *ret = iface.into_raw() };
+        S_OK
+    }
+    unsafe fn out_bstr(ret: *mut BSTR, s: &str) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { std::ptr::write(ret, BSTR::from(s)) };
+        S_OK
+    }
+    unsafe fn out_bool(ret: *mut i16, v: bool) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { *ret = if v { -1 } else { 0 } };
+        S_OK
+    }
+    unsafe fn out_i4(ret: *mut i32, v: i32) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { *ret = v };
+        S_OK
+    }
+    unsafe fn out_var(ret: *mut VARIANT, v: VARIANT) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { std::ptr::write(ret, v) };
+        S_OK
+    }
+    fn vi32(v: *const VARIANT) -> Option<i32> {
+        if v.is_null() {
+            return None;
+        }
+        let vt = unsafe { vt_of(v) };
+        if vt == VT_EMPTY || vt == VT_ERROR {
+            None
+        } else {
+            i32::try_from(unsafe { &*v }).ok()
+        }
+    }
+
+    // ---- Application ----
+    unsafe fn vt_app_workbooks(_t: &Application_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let w: IWorkbooks = Workbooks.into();
+        unsafe { out_iface(ret, w) }
+    }
+    unsafe fn vt_app_quit(_t: &Application_Impl) -> HRESULT {
+        log("Application::Quit (early)");
+        unsafe { PostQuitMessage(0) };
+        S_OK
+    }
+    unsafe fn vt_app_da_get(_t: &Application_Impl, ret: *mut i16) -> HRESULT {
+        unsafe { out_bool(ret, reg(|r| r.display_alerts)) }
+    }
+    unsafe fn vt_app_da_put(_t: &Application_Impl, v: i16) -> HRESULT {
+        reg(|r| r.display_alerts = v != 0);
+        S_OK
+    }
+    unsafe fn vt_app_vis_get(_t: &Application_Impl, ret: *mut i16) -> HRESULT {
+        unsafe { out_bool(ret, reg(|r| r.visible)) }
+    }
+    unsafe fn vt_app_vis_put(_t: &Application_Impl, v: i16) -> HRESULT {
+        reg(|r| r.visible = v != 0);
+        S_OK
+    }
+    unsafe fn vt_app_name(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
+        unsafe { out_bstr(ret, "Docxy") }
+    }
+    unsafe fn vt_app_version(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
+        unsafe { out_bstr(ret, "16.0") }
+    }
+
+    // ---- Workbooks ----
+    unsafe fn vt_wbs_add(_t: &Workbooks_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let book = reg(|r| {
+            r.books.push(Book::new());
+            r.active = r.books.len() - 1;
+            r.active
+        });
+        let w: IWorkbook = Workbook { book }.into();
+        unsafe { out_iface(ret, w) }
+    }
+    unsafe fn vt_wbs_count(_t: &Workbooks_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, reg(|r| r.books.len() as i32)) }
+    }
+    unsafe fn vt_wbs_item(_t: &Workbooks_Impl, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+        let idx = (vi32(index).unwrap_or(1).max(1) as usize) - 1;
+        if !reg(|r| idx < r.books.len()) {
+            return DISP_E_BADINDEX;
+        }
+        let w: IWorkbook = Workbook { book: idx }.into();
+        unsafe { out_iface(ret, w) }
+    }
+
+    // ---- Workbook ----
+    unsafe fn vt_wb_sheets(t: &Workbook_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let s: ISheets = Worksheets { book: t.book }.into();
+        unsafe { out_iface(ret, s) }
+    }
+    unsafe fn vt_wb_name(t: &Workbook_Impl, ret: *mut BSTR) -> HRESULT {
+        let name = reg(|r| r.books.get(t.book).and_then(|b| b.path.clone()))
+            .as_deref()
+            .and_then(|p| p.rsplit(['\\', '/']).next().map(str::to_string))
+            .unwrap_or_else(|| "Book1".into());
+        unsafe { out_bstr(ret, &name) }
+    }
+    unsafe fn vt_wb_saved_get(t: &Workbook_Impl, ret: *mut i16) -> HRESULT {
+        unsafe { out_bool(ret, reg(|r| r.books.get(t.book).map(|b| b.saved).unwrap_or(true))) }
+    }
+    unsafe fn vt_wb_saved_put(t: &Workbook_Impl, v: i16) -> HRESULT {
+        reg(|r| {
+            if let Some(b) = r.books.get_mut(t.book) {
+                b.saved = v != 0;
+            }
+        });
+        S_OK
+    }
+    unsafe fn vt_wb_close(_t: &Workbook_Impl) -> HRESULT {
+        S_OK
+    }
+    unsafe fn vt_wb_saveas(t: &Workbook_Impl, filename: *const VARIANT, _fmt: *const VARIANT) -> HRESULT {
+        let Some(path) = (unsafe { filename.as_ref() }).and_then(variant_to_string) else {
+            log("SaveAs(early): missing Filename");
+            return E_FAIL;
+        };
+        log(&format!("SaveAs(early) '{path}'"));
+        let book = t.book;
+        let res = reg(|r| r.books.get_mut(book).map(|b| b.save_as(&path)));
+        match res {
+            Some(Ok(())) => S_OK,
+            Some(Err(e)) => {
+                log(&format!("SaveAs(early) failed: {e}"));
+                E_FAIL
+            }
+            None => DISP_E_BADINDEX,
+        }
+    }
+
+    // ---- Sheets (collection) ----
+    unsafe fn vt_sheets_count(t: &Worksheets_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, reg(|r| r.books.get(t.book).map(|b| b.sheet_count()).unwrap_or(0)) as i32) }
+    }
+    unsafe fn vt_sheets_item(t: &Worksheets_Impl, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+        let book = t.book;
+        let sheet = match unsafe { sheet_sel_idx(book, index) } {
+            SheetSelV::Sheet(s) => s,
+            SheetSelV::Invalid => return DISP_E_BADINDEX,
+        };
+        let ws: IWorksheet = Worksheet { book, sheet }.into();
+        unsafe { out_iface(ret, ws) }
+    }
+
+    // ---- Worksheet ----
+    unsafe fn vt_ws_name_get(t: &Worksheet_Impl, ret: *mut BSTR) -> HRESULT {
+        let name = reg(|r| r.books.get(t.book).map(|b| b.sheet_name(t.sheet)).unwrap_or_default());
+        unsafe { out_bstr(ret, &name) }
+    }
+    unsafe fn vt_ws_name_put(t: &Worksheet_Impl, v: *const u16) -> HRESULT {
+        let name = unsafe { PCWSTR(v).to_string() }.unwrap_or_default();
+        let (book, sheet) = (t.book, t.sheet);
+        reg(|r| {
+            if let Some(s) = r
+                .books
+                .get_mut(book)
+                .and_then(|b| b.pkg.workbook.sheets.get_mut(sheet))
+            {
+                s.name = name;
+            }
+        });
+        S_OK
+    }
+    unsafe fn vt_ws_cells(t: &Worksheet_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let rng: IRange = Range {
+            book: t.book,
+            sheet: t.sheet,
+            r1: 0,
+            c1: 0,
+            r2: MAX_ROW,
+            c2: MAX_COL,
+        }
+        .into();
+        unsafe { out_iface(ret, rng) }
+    }
+    unsafe fn vt_ws_range(t: &Worksheet_Impl, cell1: *const VARIANT, _cell2: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+        let Some(a) = (unsafe { cell1.as_ref() }).and_then(variant_to_string) else {
+            return E_FAIL;
+        };
+        let rect = parse_range_name(a.trim())
+            .map(|(r1, c1, r2, c2)| (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
+            .or_else(|| parse_cell_name(a.trim()).map(|(r, c)| (r, c, r, c)));
+        let Some((r1, c1, r2, c2)) = rect else {
+            return E_FAIL;
+        };
+        let rng: IRange = Range {
+            book: t.book,
+            sheet: t.sheet,
+            r1,
+            c1,
+            r2,
+            c2,
+        }
+        .into();
+        unsafe { out_iface(ret, rng) }
+    }
+
+    // ---- Range ----
+    unsafe fn vt_rng_child(t: &Range_Impl, row: *const VARIANT, col: *const VARIANT, ret: *mut VARIANT) -> HRESULT {
+        let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
+        let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
+        let (r, c) = (t.r1 + rr, t.c1 + cc);
+        let sub = Range {
+            book: t.book,
+            sheet: t.sheet,
+            r1: r,
+            c1: c,
+            r2: r,
+            c2: c,
+        };
+        unsafe { out_var(ret, VARIANT::from(sub.into_dispatch())) }
+    }
+    unsafe fn vt_rng_value_get(t: &Range_Impl, ret: *mut VARIANT) -> HRESULT {
+        let (book, sheet, r1, c1) = (t.book, t.sheet, t.r1, t.c1);
+        let val = reg(|r| {
+            r.books
+                .get_mut(book)
+                .map(|b| b.value(sheet, r1, c1))
+                .unwrap_or(CellValue::Empty)
+        });
+        unsafe { out_var(ret, cellvalue_to_variant(&val)) }
+    }
+    unsafe fn vt_rng_value_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
+        let cell = (unsafe { val.as_ref() })
+            .and_then(variant_to_cell)
+            .unwrap_or_default();
+        t.write_fill(cell);
+        S_OK
+    }
+    unsafe fn vt_rng_formula_get(t: &Range_Impl, ret: *mut VARIANT) -> HRESULT {
+        let (book, sheet, r1, c1) = (t.book, t.sheet, t.r1, t.c1);
+        let f = reg(|r| r.books.get(book).and_then(|b| b.formula_src(sheet, r1, c1)));
+        let v = match f {
+            Some(src) => VARIANT::from(BSTR::from(format!("={src}").as_str())),
+            None => {
+                let val = reg(|r| {
+                    r.books
+                        .get_mut(book)
+                        .map(|b| b.value(sheet, r1, c1))
+                        .unwrap_or(CellValue::Empty)
+                });
+                cellvalue_to_variant(&val)
+            }
+        };
+        unsafe { out_var(ret, v) }
+    }
+    unsafe fn vt_rng_formula_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
+        let cell = match (unsafe { val.as_ref() }).and_then(variant_to_string) {
+            Some(s) => match s.strip_prefix('=') {
+                Some(f) if !f.is_empty() => Cell::formula(f),
+                _ => (unsafe { val.as_ref() })
+                    .and_then(variant_to_cell)
+                    .unwrap_or_default(),
+            },
+            None => Cell::default(),
+        };
+        t.write_fill(cell);
+        S_OK
+    }
+    unsafe fn vt_rng_item_put(t: &Range_Impl, row: *const VARIANT, col: *const VARIANT, val: *const VARIANT) -> HRESULT {
+        let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
+        let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
+        let (r, c) = (t.r1 + rr, t.c1 + cc);
+        let cell = (unsafe { val.as_ref() })
+            .and_then(variant_to_cell)
+            .unwrap_or_default();
+        let (book, sheet) = (t.book, t.sheet);
+        reg(|reg| {
+            if let Some(b) = reg.books.get_mut(book) {
+                b.set(sheet, r, c, cell);
+            }
+        });
+        S_OK
+    }
+
+    /// Sheet selector variant used by the early-bound Sheets.Item handler
+    /// (a name or a 1-based index). No arg is invalid here (Item always indexes).
+    enum SheetSelV {
+        Sheet(usize),
+        Invalid,
+    }
+    unsafe fn sheet_sel_idx(book: usize, index: *const VARIANT) -> SheetSelV {
+        if index.is_null() {
+            return SheetSelV::Invalid;
+        }
+        let v = unsafe { &*index };
+        if unsafe { vt_of(index) } == VT_BSTR {
+            let name = variant_to_string(v).unwrap_or_default();
+            match reg(|r| {
+                r.books
+                    .get(book)
+                    .and_then(|b| b.pkg.workbook.sheet_index(&name))
+            }) {
+                Some(i) => SheetSelV::Sheet(i),
+                None => SheetSelV::Invalid,
+            }
+        } else {
+            let i = (vi32(index).unwrap_or(1).max(1) as usize) - 1;
+            if reg(|r| r.books.get(book).map(|b| i < b.sheet_count()).unwrap_or(false)) {
+                SheetSelV::Sheet(i)
+            } else {
+                SheetSelV::Invalid
+            }
+        }
     }
 
     fn is_put(wflags: DISPATCH_FLAGS) -> bool {
