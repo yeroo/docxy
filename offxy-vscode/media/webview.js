@@ -83,12 +83,18 @@ function buildMermaidSvg(geo) {
     }
   }
 
-  // Edges next — under the nodes they connect.
+  // Edges next — under the nodes they connect. `style` (from the shared
+  // geometry — docxcore's `mermaid.rs` `EdgeStyle`) mirrors the same dotted /
+  // thick line the DrawingML `emit_connector` draws for Word, so the two
+  // renderings agree; `solid` (the default when a geometry omits `style`)
+  // keeps today's plain line untouched.
   for (const e of geo.edges || []) {
     const pts = (e.points || []).map((p) => `${p[0]},${p[1]}`).join(' ');
+    const strokeWidth = e.style === 'thick' ? MMD_STROKE * 1.5 : MMD_STROKE;
+    const dash = e.style === 'dotted' ? ' stroke-dasharray="8 6"' : '';
     parts.push(
       `<polyline points="${pts}" fill="none" stroke="#333333" ` +
-        `stroke-width="${MMD_STROKE}" marker-end="url(#arrow)"/>`
+        `stroke-width="${strokeWidth}"${dash} marker-end="url(#arrow)"/>`
     );
   }
 

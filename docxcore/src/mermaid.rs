@@ -74,6 +74,27 @@ struct Edge {
     from: usize,
     to: usize,
     label: String,
+    style: EdgeStyle,
+}
+
+/// An edge's link-line rendering, carried through the shared geometry so Word
+/// (`emit_connector`) and the webview (`buildMermaidSvg`) draw it identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeStyle {
+    Solid,
+    Dotted,
+    Thick,
+}
+
+impl EdgeStyle {
+    /// The geometry-JSON tag for this style — read back by the webview.
+    fn tag(self) -> &'static str {
+        match self {
+            EdgeStyle::Solid => "solid",
+            EdgeStyle::Dotted => "dotted",
+            EdgeStyle::Thick => "thick",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +465,7 @@ fn parse_statement(
     // node-group is one or more `&`-joined node tokens (`A & B --> C & D`).
     let mut prev_group: Vec<usize> = Vec::new();
     let mut pending_label = String::new();
+    let mut cur_style = EdgeStyle::Solid;
     for seg in segments {
         match seg {
             Seg::Node(tok) => {
@@ -469,6 +491,7 @@ fn parse_statement(
                                 from: p,
                                 to: c,
                                 label: pending_label.clone(),
+                                style: cur_style,
                             });
                         }
                     }
@@ -476,8 +499,9 @@ fn parse_statement(
                 }
                 prev_group = group;
             }
-            Seg::Arrow(label) => {
+            Seg::Arrow(label, style) => {
                 pending_label = label;
+                cur_style = style;
             }
         }
     }
@@ -519,7 +543,7 @@ fn message_colon(line: &str) -> Option<usize> {
 
 enum Seg {
     Node(String),
-    Arrow(String),
+    Arrow(String, EdgeStyle),
 }
 
 /// Split a node segment on top-level `&` (Mermaid group operator), keeping `&`
@@ -584,7 +608,14 @@ fn split_edges(line: &str) -> Vec<Seg> {
                         i += 1; // closing |
                     }
                 }
-                out.push(Seg::Arrow(label.trim().to_string()));
+                let style = if run.contains('.') {
+                    EdgeStyle::Dotted
+                } else if run.contains('=') {
+                    EdgeStyle::Thick
+                } else {
+                    EdgeStyle::Solid
+                };
+                out.push(Seg::Arrow(label.trim().to_string(), style));
                 continue;
             }
             // Not an arrow: treat as node text.
@@ -1176,6 +1207,14 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
     } else {
         emit_edge_label(&e.label, (x1 + x2) / 2, (y1 + y2) / 2, sid)
     };
+    let line_w = match e.style {
+        EdgeStyle::Thick => 19050,
+        _ => 12700,
+    };
+    let dash = match e.style {
+        EdgeStyle::Dotted => "<a:prstDash val=\"dash\"/>",
+        _ => "",
+    };
     format!(
         "<wps:wsp>\
          <wps:cNvPr id=\"{sid}\" name=\"Edge {sid}\"/>\
@@ -1187,8 +1226,8 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
          <a:rect l=\"0\" t=\"0\" r=\"{cx}\" b=\"{cy}\"/>\
          <a:pathLst><a:path w=\"{cx}\" h=\"{cy}\">{path}</a:path></a:pathLst>\
          </a:custGeom>\
-         <a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
-         <a:tailEnd type=\"triangle\"/></a:ln>\
+         <a:ln w=\"{line_w}\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
+         {dash}<a:tailEnd type=\"triangle\"/></a:ln>\
          </wps:spPr>\
          <wps:bodyPr/>\
          </wps:wsp>{label}",
@@ -1330,6 +1369,7 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
         .map(|e| EdgeGeom {
             points: edge_points(d, e),
             label: e.label.clone(),
+            style: e.style,
         })
         .collect();
     let subgraphs = d
@@ -1403,6 +1443,7 @@ pub struct NodeGeom {
 pub struct EdgeGeom {
     pub points: Vec<(i64, i64)>,
     pub label: String,
+    style: EdgeStyle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1450,7 +1491,9 @@ impl DiagramGeometry {
             }
             s.push_str("],\"label\":");
             json_str(&mut s, &e.label);
-            s.push('}');
+            s.push_str(",\"style\":\"");
+            s.push_str(e.style.tag());
+            s.push_str("\"}");
         }
         s.push_str("],\"subgraphs\":[");
         for (i, g) in self.subgraphs.iter().enumerate() {
@@ -1549,6 +1592,36 @@ mod tests {
         let d = parse("graph TD\nA -->|yes| B");
         assert_eq!(d.edges.len(), 1);
         assert_eq!(d.edges[0].label, "yes");
+    }
+
+    #[test]
+    fn edge_styles_classified() {
+        assert_eq!(
+            parse("flowchart TD\nA --> B").edges[0].style,
+            EdgeStyle::Solid
+        );
+        assert_eq!(
+            parse("flowchart TD\nA -.-> B").edges[0].style,
+            EdgeStyle::Dotted
+        );
+        assert_eq!(
+            parse("flowchart TD\nA ==> B").edges[0].style,
+            EdgeStyle::Thick
+        );
+    }
+
+    #[test]
+    fn dotted_edge_drawingml_and_geometry() {
+        let (xml, _) = to_drawing("flowchart TD\nA -.-> B");
+        assert!(xml.contains("prstDash"), "{xml}");
+        let g = geometry("flowchart TD\nA -.-> B");
+        assert!(g.to_json().contains("\"style\":\"dotted\""));
+    }
+
+    #[test]
+    fn solid_edge_unchanged() {
+        let (xml, _) = to_drawing("flowchart TD\nA --> B");
+        assert!(!xml.contains("prstDash")); // solid emits no dash
     }
 
     #[test]
