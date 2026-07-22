@@ -86,10 +86,12 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let styled = render_body(app, body_area.width as usize);
     let (lines, images, links) = body_layout(styled, focused_url.as_deref());
     app.body_links = links;
+    app.reading_body_rect = body_area;
     let vh = body_area.height as usize;
     app.reading_content_rows = lines.len();
     app.reading_viewport = vh;
     let scroll = app.reading_scroll.min(lines.len().saturating_sub(vh));
+    app.reading_scroll = scroll; // keep the stored scroll at the effective value
 
     // Text: render the visible window as one Paragraph, no re-wrap (lines
     // already fit width; blank lines hold the image bands' space).
@@ -334,9 +336,6 @@ fn body_layout(
 /// A navigable link in the rendered body: its screen row (index into the
 /// laid-out lines), start column and width (for highlighting/mouse hit-testing),
 /// and target URL.
-// `col`/`width` are consumed by the navigation-highlight and click tasks that
-// follow; allow the short-lived gap.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BodyLink {
     pub line: usize,

@@ -265,8 +265,10 @@ pub struct App {
     /// `row_index`).
     pub list_rect: Rect,
     pub list_row0: u16,
-    /// The reading pane's rect.
+    /// The reading pane's rect, and the body sub-area within it (below the
+    /// header) — the latter maps a click to a body row/link.
     pub reading_rect: Rect,
+    pub reading_body_rect: Rect,
     /// Navigable links in the currently-rendered body, recorded each frame by
     /// `ui::reading::draw`, and which one (if any) is focused (`Ctrl+↑/↓`).
     pub body_links: Vec<crate::ui::reading::BodyLink>,
@@ -537,6 +539,7 @@ impl App {
             list_rect: Rect::ZERO,
             list_row0: 0,
             reading_rect: Rect::ZERO,
+            reading_body_rect: Rect::ZERO,
             body_links: Vec::new(),
             focused_link: None,
             link_prompt: None,
@@ -1432,6 +1435,19 @@ impl App {
             }
         } else if self.reading_rect.contains(pos) {
             self.focus = Pane::Reading;
+            // A click on a linked cell opens that link's warning dialog.
+            if self.reading_body_rect.contains(pos) {
+                let row = (y - self.reading_body_rect.y) as usize + self.reading_scroll;
+                let bx = self.reading_body_rect.x;
+                if let Some(url) = self
+                    .body_links
+                    .iter()
+                    .find(|l| l.line == row && x >= bx + l.col && x < bx + l.col + l.width)
+                    .map(|l| l.url.clone())
+                {
+                    self.open_link_prompt(url);
+                }
+            }
         }
     }
 
@@ -5553,6 +5569,43 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Pane::Reading); // stays active
         assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
         assert!(!app.open_sibling_message(1)); // no-op past the end
+    }
+
+    #[test]
+    fn clicking_a_link_opens_the_warning_dialog() {
+        use crate::ui::reading::BodyLink;
+        let mut app = App::for_test_with_seeded_store();
+        app.reading_rect = Rect::new(50, 0, 40, 20);
+        app.reading_body_rect = Rect::new(51, 3, 38, 16); // inside the border, below header
+        app.reading_scroll = 0;
+        app.body_links = vec![BodyLink {
+            line: 0,
+            col: 2,
+            width: 6,
+            url: "https://acme.com".into(),
+        }];
+        // Click a cell inside the link: body_rect.x(51)+col(2) = 53 .. 59.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 55,
+            row: 3, // body_rect.y + (line 0)
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.link_prompt.as_ref().map(|p| p.url.as_str()),
+            Some("https://acme.com")
+        );
+
+        // A click off any link just focuses Reading, no dialog.
+        app.link_prompt = None;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 80,
+            row: 10,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.link_prompt.is_none());
+        assert_eq!(app.focus, Pane::Reading);
     }
 
     #[test]
