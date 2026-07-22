@@ -247,9 +247,10 @@ pub struct App {
     pub ribbon_open: bool,
     /// Keyboard focus within the ribbon (`None` = the panes have focus).
     pub ribbon_focus: crate::ui::ribbon::Focus,
-    /// Rows the ribbon occupies on screen this frame (recorded by `ui::draw`),
-    /// for mouse hit-testing.
-    pub ribbon_h: u16,
+    /// The ribbon's on-screen rect this frame (recorded by `ui::draw`), for
+    /// mouse hit-testing. Its `x` is 0 (full width), so screen columns map
+    /// directly onto the ribbon's own coordinates.
+    pub ribbon_rect: Rect,
     // --- Mouse hit-test regions, recorded each frame by `ui::draw` (default
     // zero, so a click before the first draw hits nothing). ---
     /// The rail column's on-screen rect.
@@ -520,7 +521,7 @@ impl App {
             ribbon: crate::ui::ribbon::Ribbon::new(),
             ribbon_open: false,
             ribbon_focus: crate::ui::ribbon::Focus::None,
-            ribbon_h: 1,
+            ribbon_rect: Rect::ZERO,
             rail_rect: Rect::ZERO,
             folders_rect: Rect::ZERO,
             folders_row0: 0,
@@ -1105,12 +1106,120 @@ impl App {
         {
             return;
         }
+        // A left-click in the ribbon strip drives the ribbon; wheel/other events
+        // fall through to the panes.
+        if self.ribbon_rect.contains(Position {
+            x: m.column,
+            y: m.row,
+        }) {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                self.ribbon_click(m.column, m.row);
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.on_left_click(m.column, m.row),
             MouseEventKind::ScrollDown => self.on_wheel(m.column, m.row, 1),
             MouseEventKind::ScrollUp => self.on_wheel(m.column, m.row, -1),
             _ => {}
         }
+    }
+
+    /// Route a click within the ribbon: a tab header switches/opens that tab; a
+    /// button runs its action.
+    fn ribbon_click(&mut self, x: u16, y: u16) {
+        use crate::ui::ribbon::Hit;
+        let local_y = y.saturating_sub(self.ribbon_rect.y);
+        match self.ribbon.hit(x, local_y, self.ribbon_open) {
+            Hit::Tab(i) => {
+                if self.ribbon.tab_has_body(i) {
+                    self.ribbon.set_active(i);
+                    self.ribbon_open = true;
+                    self.ribbon_focus = crate::ui::ribbon::Focus::Tab(i);
+                } else {
+                    // File (no body) → the backstage (wired in a later task).
+                    self.run_ribbon_act(crate::ui::ribbon::Act::Settings);
+                }
+            }
+            Hit::Button(act) => {
+                self.run_ribbon_act(act);
+                // Hand focus back to the panes after a button runs.
+                self.ribbon_focus = crate::ui::ribbon::Focus::None;
+                self.ribbon_open = false;
+            }
+            Hit::Outside => {}
+        }
+    }
+
+    /// Run the ribbon button currently under keyboard focus (Enter).
+    pub fn run_ribbon_focus(&mut self) {
+        if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
+            self.run_ribbon_act(act);
+            self.ribbon_focus = crate::ui::ribbon::Focus::None;
+            self.ribbon_open = false;
+        }
+    }
+
+    /// Dispatch a ribbon command to the existing `App` action it stands for.
+    pub fn run_ribbon_act(&mut self, act: crate::ui::ribbon::Act) {
+        use crate::ui::categorypicker::PickerMode;
+        use crate::ui::ribbon::Act;
+        match act {
+            Act::Compose => self.compose_new(),
+            Act::Reply => self.compose_reply(false),
+            Act::ReplyAll => self.compose_reply(true),
+            Act::Forward => self.compose_forward(),
+            Act::Delete => self.delete_selected(),
+            Act::Flag => self.toggle_flag(),
+            Act::MarkRead => self.mark_read(true),
+            Act::MarkUnread => self.mark_read(false),
+            Act::Move => self.open_move_picker(),
+            Act::Categorize => self.open_category_picker(PickerMode::Assign),
+            Act::Find => self.start_search(),
+            Act::NewEvent => self.open_new_event(),
+            Act::EditEvent => self.open_edit_event(),
+            Act::DeleteEvent => self.delete_selected_event(),
+            Act::RsvpAccept => self.start_rsvp("accepted"),
+            Act::RsvpDecline => self.start_rsvp("declined"),
+            Act::RsvpTentative => self.start_rsvp("tentativelyAccepted"),
+            Act::SendReceive => self.send_receive(),
+            Act::ExpandAll => self.expand_all_folders(),
+            Act::CollapseAll => self.collapse_all_folders(),
+            Act::Threaded => self.toggle_threaded(),
+            Act::CategoryFilter => self.open_category_picker(PickerMode::Filter),
+            Act::Help => self.open_help(),
+            Act::AutoReplies => self.open_oof_form(),
+            Act::Exit => self.quit = true,
+            // Settings backstage lands in a later task; a status note for now.
+            Act::Settings => self.error_notice = Some("Settings coming soon".into()),
+            Act::Todo(name) => self.error_notice = Some(format!("{name} not implemented yet")),
+        }
+    }
+
+    /// Expand every folder that has children (the ribbon's Folder ▸ Expand All).
+    pub fn expand_all_folders(&mut self) {
+        self.set_all_folders_expanded(true);
+    }
+
+    /// Collapse every folder (Folder ▸ Collapse All).
+    pub fn collapse_all_folders(&mut self) {
+        self.set_all_folders_expanded(false);
+    }
+
+    fn set_all_folders_expanded(&mut self, expanded: bool) {
+        let ids: Vec<String> = self.folders.iter().map(|f| f.id.clone()).collect();
+        for id in ids {
+            let _ = self.store.set_folder_expanded(&id, expanded);
+        }
+        for f in &mut self.folders {
+            f.is_expanded = expanded;
+        }
+        self.rebuild_visible_folders();
+    }
+
+    /// Send/Receive: ask the sync engine to refresh mail and calendar now.
+    pub fn send_receive(&mut self) {
+        let _ = self.sync.cmd_tx.send(SyncCommand::RefreshCalendar);
     }
 
     fn on_left_click(&mut self, x: u16, y: u16) {
@@ -5299,6 +5408,43 @@ pub(crate) mod tests {
             modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
         });
         assert!(app.reading_scroll > 0);
+    }
+
+    #[test]
+    fn ribbon_act_compose_opens_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        app.run_ribbon_act(crate::ui::ribbon::Act::Compose);
+        assert!(app.compose.is_some());
+    }
+
+    #[test]
+    fn ribbon_act_help_opens_the_help_overlay() {
+        let mut app = App::for_test_with_seeded_store();
+        app.run_ribbon_act(crate::ui::ribbon::Act::Help);
+        assert!(app.help);
+    }
+
+    #[test]
+    fn expand_all_folders_expands_every_parent() {
+        let mut app = App::for_test_with_folder_tree(); // inbox has a child (collapsed)
+        app.expand_all_folders();
+        assert!(app.visible_folders.iter().any(|v| v.row.id == "epam")); // child visible
+    }
+
+    #[test]
+    fn clicking_the_file_tab_header_dispatches_to_the_backstage_act() {
+        let mut app = App::for_test_with_seeded_store();
+        app.ribbon_rect = Rect::new(0, 0, 100, 1);
+        // File is the first tab; its header column starts at x=2.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        // File has no body → the click runs the Settings act (placeholder until
+        // the backstage lands); the ribbon didn't switch to File.
+        assert_ne!(app.ribbon.active_tab(), 0);
     }
 
     #[test]

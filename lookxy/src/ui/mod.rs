@@ -81,7 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(ribbon_h), Constraint::Min(0)])
         .split(area);
     draw_ribbon(f, app, ribbon_split[0]);
-    app.ribbon_h = ribbon_h;
+    app.ribbon_rect = ribbon_split[0];
     let area = ribbon_split[1];
 
     // The level-0 rail sits to the left of both the Mail panes and the Calendar
@@ -189,9 +189,13 @@ fn ribbon_key(app: &mut App, key: KeyEvent) {
         app.ribbon_focus = next;
         return;
     }
-    if key.code == KeyCode::Esc {
-        app.ribbon_focus = Focus::None;
-        app.ribbon_open = false;
+    match key.code {
+        KeyCode::Enter => app.run_ribbon_focus(),
+        KeyCode::Esc => {
+            app.ribbon_focus = Focus::None;
+            app.ribbon_open = false;
+        }
+        _ => {}
     }
 }
 
