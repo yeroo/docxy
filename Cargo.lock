@@ -2083,6 +2083,7 @@ dependencies = [
  "mppread",
  "projcore",
  "ratatui",
+ "ribboncore",
  "unicode-width 0.2.0",
 ]
 

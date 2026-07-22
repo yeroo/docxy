@@ -1756,14 +1756,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(app.ribbon.render_body(app.rfocus)), rows[1]);
     draw_header(f, rows[2], app);
     draw_body(f, rows[3], app);
-    if app.rfocus != ribbon::Focus::None {
-        f.render_widget(
-            Paragraph::new(app.ribbon.render_hint(app.rfocus, area.width)),
-            rows[4],
-        );
-    } else {
-        draw_status(f, rows[4], app);
-    }
+    draw_status(f, rows[4], app);
     if app.prompt.is_some() {
         draw_prompt(f, area, app);
     }

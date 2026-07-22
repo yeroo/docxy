@@ -1,14 +1,14 @@
-//! A Word/Excel-style tabbed ribbon, the same interaction model as docxy and
-//! xlsxy, retargeted to project scheduling. Tab headers show on one line; F9
-//! (or a click) engages it, Down enters the buttons, arrows move, Enter applies,
-//! Esc leaves. The File tab is bodyless — it opens the backstage.
+//! yppxy's ribbon: its command set (`Act`), tab/button data, yellow accent, and
+//! dispatch — all rendered/navigated by the shared [`ribboncore`] crate. The
+//! wrapper `Ribbon` derefs to `ribboncore::Ribbon<Act>`.
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::Color;
+use ribboncore::{Ribbon as CoreRibbon, Seg};
 use unicode_width::UnicodeWidthStr;
 
-/// A ribbon command. `Todo` entries render dimmed and report "not implemented
-/// yet" until wired up.
+pub use ribboncore::{Dir, Focus, Hit};
+
+/// A ribbon command. `Todo` entries only report "not implemented yet".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     // Task
@@ -38,412 +38,52 @@ pub enum Act {
     Todo(&'static str),
 }
 
-impl Act {
-    fn enabled(self) -> bool {
-        !matches!(self, Act::Todo(_))
-    }
-}
+type Group = ribboncore::Group<Act>;
 
-struct Button {
-    glyph: &'static str,
-    /// Display columns the glyph occupies — computed, since several glyphs
-    /// (💾 ＋ ⏱ 🔗 👤 ⛓) are two columns wide and hand-counted widths drift.
-    width: usize,
-    act: Act,
-    hint: &'static str,
-}
-
-enum Seg {
-    Btn(Button),
-    Gap(&'static str),
-}
-
-fn btn(glyph: &'static str, act: Act, hint: &'static str) -> Seg {
-    Seg::Btn(Button {
-        glyph,
-        width: glyph.width(),
-        act,
-        hint,
-    })
-}
-
-struct Group {
-    title: &'static str,
-    width: usize,
-    rows: [Vec<Seg>; 2],
-}
-
-#[derive(Clone, Copy)]
-struct Placed {
-    row: u8,
-    x: u16,
-    w: u16,
-    act: Act,
-    hint: &'static str,
-}
-
-/// Keyboard focus within the ribbon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    None,
-    Tab(usize),
-    Button(usize),
-}
-
-/// Result of a mouse click on the ribbon.
-pub enum Hit {
-    Tab(usize),
-    Button(Act),
-    Outside,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dir {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-pub struct Ribbon {
-    tabs: Vec<&'static str>,
-    active: usize,
-    tab_groups: Vec<Vec<Group>>,
-    placed: Vec<Placed>,
-    tab_cols: Vec<(u16, u16)>,
-    width: u16,
-    active_toggles: Vec<Act>,
-}
-
-/// yppxy's ribbon accent — the whole ribbon draws yellow (one colour per app in
-/// the suite: lookxy cyan, docxy light blue, xlsxy green).
+/// yppxy's ribbon accent — the whole ribbon draws yellow (lookxy cyan, docxy
+/// light blue, xlsxy green).
 const ACCENT: Color = Color::Yellow;
-const ROW0: usize = 1;
-const ROW1: usize = 2;
+
+/// A focusable button; width is the glyph's display width.
+fn btn(glyph: &'static str, act: Act, hint: &'static str) -> Seg<Act> {
+    ribboncore::btn(glyph, glyph.width(), act, hint)
+}
+
+/// yppxy's ribbon — a thin wrapper over the shared core.
+pub struct Ribbon(CoreRibbon<Act>);
 
 impl Ribbon {
     pub fn new() -> Ribbon {
-        let mut r = Ribbon {
-            tabs: vec!["File", "Task", "Schedule", "View"],
-            active: 1,
-            tab_groups: vec![Vec::new(), task_groups(), schedule_groups(), view_groups()],
-            placed: Vec::new(),
-            tab_cols: Vec::new(),
-            width: 0,
-            active_toggles: Vec::new(),
-        };
-        r.layout();
-        r
+        let tabs = vec!["File", "Task", "Schedule", "View"];
+        let tab_groups = vec![
+            Vec::new(), // File → backstage
+            task_groups(),
+            schedule_groups(),
+            view_groups(),
+        ];
+        Ribbon(CoreRibbon::new(tabs, tab_groups, 1, ACCENT))
     }
 
     /// Whether tab `i` is the bodyless File tab (opens the backstage).
     pub fn tab_is_file(&self, i: usize) -> bool {
-        self.tabs.get(i) == Some(&"File")
-    }
-
-    pub fn set_toggles(&mut self, acts: Vec<Act>) {
-        self.active_toggles = acts;
-    }
-
-    fn groups(&self) -> &[Group] {
-        &self.tab_groups[self.active]
-    }
-
-    pub fn active_tab(&self) -> usize {
-        self.active
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn tab_label(&self, i: usize) -> Option<&'static str> {
-        self.tabs.get(i).copied()
-    }
-
-    pub fn set_active(&mut self, i: usize) {
-        if i < self.tabs.len() && !self.tab_groups[i].is_empty() {
-            self.active = i;
-            self.layout();
-        }
-    }
-
-    // ---- layout ----
-
-    fn layout(&mut self) {
-        self.placed.clear();
-        let mut gx = 1u16;
-        let active = self.active;
-        for g in &self.tab_groups[active] {
-            for (ri, row) in g.rows.iter().enumerate() {
-                let mut x = gx + 1;
-                for seg in row {
-                    match seg {
-                        Seg::Gap(s) => x += s.width() as u16,
-                        Seg::Btn(b) => {
-                            self.placed.push(Placed {
-                                row: ri as u8,
-                                x,
-                                w: b.width as u16,
-                                act: b.act,
-                                hint: b.hint,
-                            });
-                            x += b.width as u16;
-                        }
-                    }
-                }
-            }
-            gx += g.width as u16 + 3;
-        }
-        self.width = gx;
-        self.tab_cols.clear();
-        let mut tx = 2u16;
-        for t in &self.tabs {
-            let w = t.chars().count() as u16;
-            self.tab_cols.push((tx, tx + w));
-            tx += w + 3;
-        }
-    }
-
-    // ---- mouse ----
-
-    /// Hit-test a click. `y` is the row within the ribbon area (0 = tab strip).
-    pub fn hit(&self, x: u16, y: u16, expanded: bool) -> Hit {
-        if y == 0 {
-            for (i, &(a, b)) in self.tab_cols.iter().enumerate() {
-                if x >= a && x < b {
-                    return Hit::Tab(i);
-                }
-            }
-            return Hit::Outside;
-        }
-        if expanded {
-            let brow = match y as usize {
-                n if n == ROW0 + 1 => Some(0u8),
-                n if n == ROW1 + 1 => Some(1u8),
-                _ => None,
-            };
-            if let Some(rr) = brow {
-                for p in &self.placed {
-                    if p.row == rr && x >= p.x && x < p.x + p.w {
-                        return Hit::Button(p.act);
-                    }
-                }
-            }
-        }
-        Hit::Outside
-    }
-
-    // ---- keyboard nav ----
-
-    pub fn enter_body(&self) -> Focus {
-        self.placed
-            .iter()
-            .position(|p| p.row == 0)
-            .map(Focus::Button)
-            .unwrap_or(Focus::Tab(self.active))
-    }
-
-    pub fn focus_act(&self, f: Focus) -> Option<(Act, &'static str)> {
-        match f {
-            Focus::Button(i) => self.placed.get(i).map(|p| (p.act, p.hint)),
-            _ => None,
-        }
-    }
-
-    pub fn nav(&self, f: Focus, dir: Dir) -> Focus {
-        match f {
-            Focus::Tab(t) => match dir {
-                Dir::Left => Focus::Tab(t.saturating_sub(1)),
-                Dir::Right => Focus::Tab((t + 1).min(self.tabs.len() - 1)),
-                Dir::Down => self.enter_body(),
-                Dir::Up => Focus::Tab(t),
-            },
-            Focus::Button(i) => {
-                let Some(cur) = self.placed.get(i) else {
-                    return Focus::Tab(self.active);
-                };
-                match dir {
-                    Dir::Left | Dir::Right => self
-                        .nearest_in_row(cur.row, cur.x, dir == Dir::Right, i)
-                        .map(Focus::Button)
-                        .unwrap_or(Focus::Button(i)),
-                    Dir::Down => self
-                        .nearest_in_row_byx(1, cur.x)
-                        .map(Focus::Button)
-                        .unwrap_or(Focus::Button(i)),
-                    Dir::Up => {
-                        if cur.row == 0 {
-                            Focus::Tab(self.active)
-                        } else {
-                            self.nearest_in_row_byx(0, cur.x)
-                                .map(Focus::Button)
-                                .unwrap_or(Focus::Button(i))
-                        }
-                    }
-                }
-            }
-            Focus::None => Focus::Tab(self.active),
-        }
-    }
-
-    fn nearest_in_row(&self, row: u8, x: u16, right: bool, skip: usize) -> Option<usize> {
-        self.placed
-            .iter()
-            .enumerate()
-            .filter(|(j, p)| *j != skip && p.row == row && if right { p.x > x } else { p.x < x })
-            .min_by_key(|(_, p)| p.x.abs_diff(x))
-            .map(|(j, _)| j)
-    }
-
-    fn nearest_in_row_byx(&self, row: u8, x: u16) -> Option<usize> {
-        self.placed
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.row == row)
-            .min_by_key(|(_, p)| p.x.abs_diff(x))
-            .map(|(j, _)| j)
-    }
-
-    // ---- rendering ----
-
-    pub fn render_tabs(&self, focus: Focus) -> Line<'static> {
-        let engaged = focus != Focus::None;
-        let focused_tab = if let Focus::Tab(t) = focus {
-            Some(t)
-        } else {
-            None
-        };
-        let mut spans = vec![Span::raw("  ")];
-        for (i, t) in self.tabs.iter().enumerate() {
-            let _ = engaged;
-            let style = if i == self.active {
-                Style::default().fg(Color::Black).bg(ACCENT) // selected: inverted accent
-            } else if Some(i) == focused_tab {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default().fg(ACCENT) // other tab names: app colour
-            };
-            spans.push(Span::styled(t.to_string(), style));
-            spans.push(Span::raw("   "));
-        }
-        spans.push(Span::styled(
-            "· F9 ribbon".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        Line::from(spans)
-    }
-
-    pub fn render_body(&self, focus: Focus) -> Vec<Line<'static>> {
-        let dim = Style::default().fg(ACCENT); // box + titles draw in the app accent
-        let widths: Vec<usize> = self.groups().iter().map(|g| g.width).collect();
-        let bar = |l: &str, m: &str, r: &str| -> Line<'static> {
-            let mut s = String::from(l);
-            for (i, w) in widths.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(m);
-                }
-                s.push_str(&"─".repeat(w + 2));
-            }
-            s.push_str(r);
-            Line::styled(s, dim)
-        };
-        let focused = if let Focus::Button(i) = focus {
-            self.placed.get(i).copied()
-        } else {
-            None
-        };
-        let row_w = |row: &[Seg]| -> usize {
-            row.iter()
-                .map(|s| match s {
-                    Seg::Gap(g) => g.width(),
-                    Seg::Btn(b) => b.width,
-                })
-                .sum()
-        };
-        let mut out = vec![bar("┌", "┬", "┐")];
-        for ri in 0..2 {
-            let mut spans = vec![Span::styled("│", dim)];
-            for g in self.groups() {
-                spans.push(Span::raw(" "));
-                self.row_spans(&g.rows[ri], ri as u8, focused, &mut spans);
-                let pad = g.width.saturating_sub(row_w(&g.rows[ri]));
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.push(Span::styled("│", dim));
-            }
-            out.push(Line::from(spans));
-        }
-        out.push(bar("├", "┼", "┤"));
-        let mut spans = vec![Span::styled("│", dim)];
-        for g in self.groups() {
-            let pad = g.width.saturating_sub(g.title.width());
-            let l = pad / 2;
-            spans.push(Span::styled(
-                format!(" {}{}{} ", " ".repeat(l), g.title, " ".repeat(pad - l)),
-                dim,
-            ));
-            spans.push(Span::styled("│", dim));
-        }
-        out.push(Line::from(spans));
-        out.push(bar("└", "┴", "┘"));
-        out
-    }
-
-    fn row_spans(
-        &self,
-        row: &[Seg],
-        rr: u8,
-        focused: Option<Placed>,
-        out: &mut Vec<Span<'static>>,
-    ) {
-        for seg in row {
-            match seg {
-                Seg::Gap(s) => out.push(Span::raw(s.to_string())),
-                Seg::Btn(b) => {
-                    let is_focus = focused
-                        .map(|p| p.row == rr && p.act == b.act && p.hint == b.hint)
-                        .unwrap_or(false);
-                    let is_on = self.active_toggles.contains(&b.act);
-                    let style = if is_focus {
-                        Style::default().fg(Color::Black).bg(ACCENT)
-                    } else if is_on {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else if b.act.enabled() {
-                        Style::default().fg(ACCENT)
-                    } else {
-                        Style::default().add_modifier(Modifier::DIM)
-                    };
-                    out.push(Span::styled(b.glyph.to_string(), style));
-                }
-            }
-        }
-    }
-
-    pub fn render_hint(&self, focus: Focus, total_width: u16) -> Line<'static> {
-        let style = Style::default().fg(Color::Black).bg(Color::Yellow);
-        let text = match focus {
-            Focus::Button(i) => {
-                let p = self.placed.get(i);
-                let enabled = p.map(|p| p.act.enabled()).unwrap_or(true);
-                let h = p.map(|p| p.hint).unwrap_or("");
-                if enabled {
-                    format!(" {h}")
-                } else {
-                    format!(" {h} — not implemented yet")
-                }
-            }
-            _ => " ←→ tabs · ↓ enter · arrows move · Enter apply · Esc leave".to_string(),
-        };
-        let w = total_width as usize;
-        let padded = if text.chars().count() >= w {
-            text.chars().take(w).collect()
-        } else {
-            format!("{text}{}", " ".repeat(w - text.chars().count()))
-        };
-        Line::styled(padded, style)
+        self.0.tab_label(i) == Some("File")
     }
 }
 
 impl Default for Ribbon {
     fn default() -> Self {
-        Ribbon::new()
+        Self::new()
+    }
+}
+impl std::ops::Deref for Ribbon {
+    type Target = CoreRibbon<Act>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Ribbon {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -584,131 +224,43 @@ fn view_groups() -> Vec<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ribboncore::Seg;
 
-    #[test]
-    fn groups_fit_their_declared_width() {
-        use unicode_width::UnicodeWidthStr;
-        let mut r = Ribbon::new();
-        for tab in 0..r.tabs.len() {
-            if r.tab_groups[tab].is_empty() {
-                continue;
-            }
-            r.set_active(tab);
-            for g in r.groups() {
-                let widest = g
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|seg| match seg {
-                                Seg::Gap(s) => s.width(),
-                                Seg::Btn(b) => b.width,
-                            })
-                            .sum::<usize>()
-                    })
-                    .max()
-                    .unwrap_or(0);
-                assert!(g.width >= widest, "group {:?} width too small", g.title);
-            }
-        }
+    fn content_w(row: &[Seg<Act>]) -> usize {
+        row.iter()
+            .map(|s| match s {
+                Seg::Gap(g) => g.width(),
+                Seg::Btn(b) => b.width,
+            })
+            .sum()
     }
 
     #[test]
-    fn task_tab_exposes_core_actions() {
-        let mut r = Ribbon::new();
-        let task = (0..r.tabs.len())
-            .find(|&i| r.tab_label(i) == Some("Task"))
-            .unwrap();
-        r.set_active(task);
-        let acts: Vec<Act> = r.placed.iter().map(|p| p.act).collect();
-        for a in [
-            Act::AddTask,
-            Act::DeleteTask,
-            Act::Indent,
-            Act::Duration,
-            Act::Save,
-        ] {
-            assert!(acts.contains(&a), "Task tab missing {a:?}");
-        }
-    }
-
-    #[test]
-    fn file_tab_is_bodyless() {
-        let r = Ribbon::new();
-        let file = (0..r.tabs.len())
-            .find(|&i| r.tab_label(i) == Some("File"))
-            .unwrap();
-        assert!(r.tab_is_file(file));
-        assert!(r.tab_groups[file].is_empty());
-    }
-
-    #[test]
-    fn down_from_tabs_enters_a_button() {
-        let r = Ribbon::new();
-        assert!(matches!(r.nav(Focus::Tab(1), Dir::Down), Focus::Button(_)));
-    }
-
-    /// Every body line must span the same number of terminal COLUMNS (display
-    /// width, not chars) on every tab — otherwise the side borders zigzag
-    /// wherever a two-column glyph (💾 ＋ ⏱ …) appears.
-    #[test]
-    fn body_rows_share_one_width() {
-        let mut r = Ribbon::new();
-        for tab in 0..r.tabs.len() {
-            if r.tab_groups[tab].is_empty() {
-                continue;
-            }
-            r.set_active(tab);
-            let lines = r.render_body(Focus::None);
-            let w = |l: &Line| l.spans.iter().map(|s| s.width()).sum::<usize>();
-            let w0 = w(&lines[0]);
-            for (i, l) in lines.iter().enumerate() {
-                assert_eq!(w(l), w0, "tab {tab} line {i} width");
-            }
-        }
-    }
-
-    /// The body is a closed box: top ┌…┐, bottom └…┘.
-    #[test]
-    fn body_box_is_closed() {
-        let r = Ribbon::new();
-        let lines = r.render_body(Focus::None);
-        assert_eq!(lines.len(), 6, "bar + 2 rows + separator + titles + bar");
-        let text = |l: &Line| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        };
-        let top = text(&lines[0]);
-        let bottom = text(lines.last().unwrap());
-        assert!(top.starts_with('┌') && top.ends_with('┐'), "top: {top}");
-        assert!(
-            bottom.starts_with('└') && bottom.ends_with('┘'),
-            "bottom: {bottom}"
-        );
-    }
-
-    /// A button's placed hit-box width equals its glyph's display width, so
-    /// clicks land on what the eye sees.
-    #[test]
-    fn placed_widths_are_display_widths() {
-        use unicode_width::UnicodeWidthStr;
-        let mut r = Ribbon::new();
-        for tab in 0..r.tabs.len() {
-            if r.tab_groups[tab].is_empty() {
-                continue;
-            }
-            r.set_active(tab);
-            for g in r.groups() {
+    fn every_group_is_wide_enough_for_its_content() {
+        for groups in [task_groups(), schedule_groups(), view_groups()] {
+            for g in &groups {
                 for row in &g.rows {
-                    for seg in row {
-                        if let Seg::Btn(b) = seg {
-                            assert_eq!(b.width, b.glyph.width(), "button {:?}", b.glyph);
-                        }
-                    }
+                    assert!(
+                        g.width >= content_w(row),
+                        "group {:?} width {} < content {}",
+                        g.title,
+                        g.width,
+                        content_w(row)
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn constructs_hits_and_navigates() {
+        let r = Ribbon::new();
+        assert!(r.tab_is_file(0));
+        assert!(!r.tab_is_file(1));
+        assert!(r.button_count() > 0);
+        assert!(matches!(r.hit(2, 0, false), Hit::Tab(0)));
+        let f = r.nav(Focus::Tab(1), Dir::Down);
+        assert!(matches!(f, Focus::Button(_)));
+        assert!(matches!(r.nav(f, Dir::Up), Focus::Tab(1)));
     }
 }
