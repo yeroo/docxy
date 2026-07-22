@@ -91,17 +91,58 @@ class XlsxFileEditor(
             engine,
             onView = { v ->
                 bar.update(v)
+                sheetTabs?.update(v)
                 markModified(v.dirty)
             },
             onMutate = { command -> runMutating(command) },
         )
         grid = g
+        val tabs = SheetTabs(
+            onCommand = { c ->
+                g.cmd(c)
+                g.requestWindow(0, 0)
+            },
+            onMutate = { c -> runMutating(c) },
+        )
+        sheetTabs = tabs
+        tabs.update(g.view)
+
+        val north = JPanel(BorderLayout())
+        north.add(bar.component, BorderLayout.NORTH)
+        north.add(GridToolbar.create(this), BorderLayout.SOUTH)
+
         panel.removeAll()
-        panel.add(bar.component, BorderLayout.NORTH)
+        panel.add(north, BorderLayout.NORTH)
         panel.add(g.scrollPane, BorderLayout.CENTER)
+        panel.add(tabs.component, BorderLayout.SOUTH)
         panel.revalidate()
         panel.repaint()
+        installContextMenu(g)
         return true
+    }
+
+    private var sheetTabs: SheetTabs? = null
+
+    /** Right-click: structural edits at the selection. */
+    private fun installContextMenu(g: GridPanel) {
+        val menu = javax.swing.JPopupMenu()
+        fun item(label: String, command: (IntArray) -> String) {
+            val mi = javax.swing.JMenuItem(label)
+            mi.addActionListener {
+                val rows = g.table.selectedRows
+                val cols = g.table.selectedColumns
+                if (rows.isEmpty() || cols.isEmpty()) return@addActionListener
+                val b = intArrayOf(rows.min(), cols.min(), rows.max(), cols.max())
+                runMutating(command(b))
+            }
+            menu.add(mi)
+        }
+        item("Insert rows above") { b -> "insrow\t${b[0]}\t${b[2] - b[0] + 1}" }
+        item("Delete rows") { b -> "delrow\t${b[0]}\t${b[2] - b[0] + 1}" }
+        menu.addSeparator()
+        item("Insert columns left") { b -> "inscol\t${b[1]}\t${b[3] - b[1] + 1}" }
+        item("Delete columns") { b -> "delcol\t${b[1]}\t${b[3] - b[1] + 1}" }
+        g.table.componentPopupMenu = menu
     }
 
     /** One mutating command = one platform undo step driving the engine's own
