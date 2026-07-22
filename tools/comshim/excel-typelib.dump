@@ -1,0 +1,1335 @@
+Typelib: C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE  types=1036
+====================================================================================================
+INTERFACE _Application  IID={000208D5-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=474  cbSizeVft=56  wTypeFlags=0x1040
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> Application*
+  slot#10   oVft=80    dispid=0x00000131 (305   ) GET    ActiveCell() -> Range*
+  slot#11   oVft=88    dispid=0x000000B7 (183   ) GET    ActiveChart() -> Chart*
+  slot#12   oVft=96    dispid=0x0000032F (815   ) GET    ActiveDialog() -> DialogSheet*
+  slot#13   oVft=104   dispid=0x000002F6 (758   ) GET    ActiveMenuBar() -> MenuBar*
+  slot#14   oVft=112   dispid=0x00000132 (306   ) GET    ActivePrinter() -> VT_BSTR
+  slot#15   oVft=120   dispid=0x00000132 (306   ) PUT    ActivePrinter([in] VT_BSTR arg0) -> VT_VOID
+  slot#16   oVft=128   dispid=0x00000133 (307   ) GET    ActiveSheet() -> VT_DISPATCH
+  slot#17   oVft=136   dispid=0x000002F7 (759   ) GET    ActiveWindow() -> Window*
+  slot#18   oVft=144   dispid=0x00000134 (308   ) GET    ActiveWorkbook() -> Workbook*
+  slot#19   oVft=152   dispid=0x00000225 (549   ) GET    AddIns() -> AddIns*
+  slot#20   oVft=160   dispid=0x0000059E (1438  ) GET    Assistant() -> Assistant*
+  slot#21   oVft=168   dispid=0x00000117 (279   ) FUNC   Calculate() -> VT_VOID
+  slot#22   oVft=176   dispid=0x000000EE (238   ) GET    Cells() -> Range*
+  slot#23   oVft=184   dispid=0x00000079 (121   ) GET    Charts() -> Sheets*
+  slot#24   oVft=192   dispid=0x000000F1 (241   ) GET    Columns() -> Range*
+  slot#25   oVft=200   dispid=0x0000059F (1439  ) GET    CommandBars() -> CommandBars*
+  slot#26   oVft=208   dispid=0x0000014C (332   ) GET    DDEAppReturnCode() -> VT_I4
+  slot#27   oVft=216   dispid=0x0000014D (333   ) FUNC   DDEExecute([in] VT_I4 Channel, [in] VT_BSTR String) -> VT_VOID
+  slot#28   oVft=224   dispid=0x0000014E (334   ) FUNC   DDEInitiate([in] VT_BSTR App, [in] VT_BSTR Topic) -> VT_I4
+  slot#29   oVft=232   dispid=0x0000014F (335   ) FUNC   DDEPoke([in] VT_I4 Channel, [in] VT_VARIANT Item, [in] VT_VARIANT Data) -> VT_VOID
+  slot#30   oVft=240   dispid=0x00000150 (336   ) FUNC   DDERequest([in] VT_I4 Channel, [in] VT_BSTR Item) -> VT_VARIANT
+  slot#31   oVft=248   dispid=0x00000151 (337   ) FUNC   DDETerminate([in] VT_I4 Channel) -> VT_VOID
+  slot#32   oVft=256   dispid=0x000002FC (764   ) GET    DialogSheets() -> Sheets*
+  slot#33   oVft=264   dispid=0x00000001 (1     ) FUNC   Evaluate([in] VT_VARIANT Name) -> VT_VARIANT
+  slot#34   oVft=272   dispid=0xFFFFFFFB (-5    ) FUNC   _Evaluate([in] VT_VARIANT Name) -> VT_VARIANT
+  slot#35   oVft=280   dispid=0x0000015E (350   ) FUNC   ExecuteExcel4Macro([in] VT_BSTR String) -> VT_VARIANT
+  slot#36   oVft=288   dispid=0x000002FE (766   ) FUNC   Intersect([in] Range* Arg1, [in] Range* Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> Range*
+  slot#37   oVft=296   dispid=0x0000024D (589   ) GET    MenuBars() -> MenuBars*
+  slot#38   oVft=304   dispid=0x00000246 (582   ) GET    Modules() -> Modules*
+  slot#39   oVft=312   dispid=0x000001BA (442   ) GET    Names() -> Names*
+  slot#40   oVft=320   dispid=0x000000C5 (197   ) GET    Range([in] VT_VARIANT Cell1, [in,opt] VT_VARIANT Cell2) -> Range*
+  slot#41   oVft=328   dispid=0x00000102 (258   ) GET    Rows() -> Range*
+  slot#42   oVft=336   dispid=0x00000103 (259   ) FUNC   Run([in,opt] VT_VARIANT Macro, [in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> VT_VARIANT
+  slot#43   oVft=344   dispid=0x00000326 (806   ) FUNC   _Run2([in,opt] VT_VARIANT Macro, [in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> VT_VARIANT
+  slot#44   oVft=352   dispid=0x00000093 (147   ) GET    Selection() -> VT_DISPATCH
+  slot#45   oVft=360   dispid=0x0000017F (383   ) FUNC   SendKeys([in] VT_VARIANT Keys, [in,opt] VT_VARIANT Wait) -> VT_VOID
+  slot#46   oVft=368   dispid=0x000001E5 (485   ) GET    Sheets() -> Sheets*
+  slot#47   oVft=376   dispid=0x00000308 (776   ) GET    ShortcutMenus([in] VT_I4 Index) -> Menu*
+  slot#48   oVft=384   dispid=0x0000030A (778   ) GET    ThisWorkbook() -> Workbook*
+  slot#49   oVft=392   dispid=0x00000228 (552   ) GET    Toolbars() -> Toolbars*
+  slot#50   oVft=400   dispid=0x0000030B (779   ) FUNC   Union([in] Range* Arg1, [in] Range* Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> Range*
+  slot#51   oVft=408   dispid=0x000001AE (430   ) GET    Windows() -> Windows*
+  slot#52   oVft=416   dispid=0x0000023C (572   ) GET    Workbooks() -> Workbooks*
+  slot#53   oVft=424   dispid=0x000005A0 (1440  ) GET    WorksheetFunction() -> WorksheetFunction*
+  slot#54   oVft=432   dispid=0x000001EE (494   ) GET    Worksheets() -> Sheets*
+  slot#55   oVft=440   dispid=0x00000245 (581   ) GET    Excel4IntlMacroSheets() -> Sheets*
+  slot#56   oVft=448   dispid=0x00000243 (579   ) GET    Excel4MacroSheets() -> Sheets*
+  slot#57   oVft=456   dispid=0x00000447 (1095  ) FUNC   ActivateMicrosoftApp([in] XlMSApplication Index) -> VT_VOID
+  slot#58   oVft=464   dispid=0x000000D8 (216   ) FUNC   AddChartAutoFormat([in] VT_VARIANT Chart, [in] VT_BSTR Name, [in,opt] VT_VARIANT Description) -> VT_VOID
+  slot#59   oVft=472   dispid=0x0000030C (780   ) FUNC   AddCustomList([in] VT_VARIANT ListArray, [in,opt] VT_VARIANT ByRow) -> VT_VOID
+  slot#60   oVft=480   dispid=0x000003A2 (930   ) GET    AlertBeforeOverwriting() -> VT_BOOL
+  slot#61   oVft=488   dispid=0x000003A2 (930   ) PUT    AlertBeforeOverwriting([in] VT_BOOL arg0) -> VT_VOID
+  slot#62   oVft=496   dispid=0x00000139 (313   ) GET    AltStartupPath() -> VT_BSTR
+  slot#63   oVft=504   dispid=0x00000139 (313   ) PUT    AltStartupPath([in] VT_BSTR arg0) -> VT_VOID
+  slot#64   oVft=512   dispid=0x000003E0 (992   ) GET    AskToUpdateLinks() -> VT_BOOL
+  slot#65   oVft=520   dispid=0x000003E0 (992   ) PUT    AskToUpdateLinks([in] VT_BOOL arg0) -> VT_VOID
+  slot#66   oVft=528   dispid=0x0000049C (1180  ) GET    EnableAnimations() -> VT_BOOL
+  slot#67   oVft=536   dispid=0x0000049C (1180  ) PUT    EnableAnimations([in] VT_BOOL arg0) -> VT_VOID
+  slot#68   oVft=544   dispid=0x00000479 (1145  ) GET    AutoCorrect() -> AutoCorrect*
+  slot#69   oVft=552   dispid=0x0000013A (314   ) GET    Build() -> VT_I4
+  slot#70   oVft=560   dispid=0x0000013B (315   ) GET    CalculateBeforeSave() -> VT_BOOL
+  slot#71   oVft=568   dispid=0x0000013B (315   ) PUT    CalculateBeforeSave([in] VT_BOOL arg0) -> VT_VOID
+  slot#72   oVft=576   dispid=0x0000013C (316   ) GET    Calculation() -> XlCalculation
+  slot#73   oVft=584   dispid=0x0000013C (316   ) PUT    Calculation([in] XlCalculation arg0) -> VT_VOID
+  slot#74   oVft=592   dispid=0x0000013D (317   ) GET    Caller([in,opt] VT_VARIANT Index) -> VT_VARIANT
+  slot#75   oVft=600   dispid=0x0000013E (318   ) GET    CanPlaySounds() -> VT_BOOL
+  slot#76   oVft=608   dispid=0x0000013F (319   ) GET    CanRecordSounds() -> VT_BOOL
+  slot#77   oVft=616   dispid=0x0000008B (139   ) GET    Caption() -> VT_BSTR
+  slot#78   oVft=624   dispid=0x0000008B (139   ) PUT    Caption([in] VT_BSTR arg0) -> VT_VOID
+  slot#79   oVft=632   dispid=0x00000140 (320   ) GET    CellDragAndDrop() -> VT_BOOL
+  slot#80   oVft=640   dispid=0x00000140 (320   ) PUT    CellDragAndDrop([in] VT_BOOL arg0) -> VT_VOID
+  slot#81   oVft=648   dispid=0x0000043E (1086  ) FUNC   CentimetersToPoints([in] VT_R8 Centimeters) -> VT_R8
+  slot#82   oVft=656   dispid=0x000001F9 (505   ) FUNC   CheckSpelling([in] VT_BSTR Word, [in,opt] VT_VARIANT CustomDictionary, [in,opt] VT_VARIANT IgnoreUppercase) -> VT_BOOL
+  slot#83   oVft=664   dispid=0x00000141 (321   ) GET    ClipboardFormats([in,opt] VT_VARIANT Index) -> VT_VARIANT
+  slot#84   oVft=672   dispid=0x00000142 (322   ) GET    DisplayClipboardWindow() -> VT_BOOL
+  slot#85   oVft=680   dispid=0x00000142 (322   ) PUT    DisplayClipboardWindow([in] VT_BOOL arg0) -> VT_VOID
+  slot#86   oVft=688   dispid=0x0000016D (365   ) GET    ColorButtons() -> VT_BOOL
+  slot#87   oVft=696   dispid=0x0000016D (365   ) PUT    ColorButtons([in] VT_BOOL arg0) -> VT_VOID
+  slot#88   oVft=704   dispid=0x00000143 (323   ) GET    CommandUnderlines() -> XlCommandUnderlines
+  slot#89   oVft=712   dispid=0x00000143 (323   ) PUT    CommandUnderlines([in] XlCommandUnderlines arg0) -> VT_VOID
+  slot#90   oVft=720   dispid=0x00000144 (324   ) GET    ConstrainNumeric() -> VT_BOOL
+  slot#91   oVft=728   dispid=0x00000144 (324   ) PUT    ConstrainNumeric([in] VT_BOOL arg0) -> VT_VOID
+  slot#92   oVft=736   dispid=0x00000145 (325   ) FUNC   ConvertFormula([in] VT_VARIANT Formula, [in] XlReferenceStyle FromReferenceStyle, [in,opt] VT_VARIANT ToReferenceStyle, [in,opt] VT_VARIANT ToAbsolute, [in,opt] VT_VARIANT RelativeTo) -> VT_VARIANT
+  slot#93   oVft=744   dispid=0x000003DF (991   ) GET    CopyObjectsWithCells() -> VT_BOOL
+  slot#94   oVft=752   dispid=0x000003DF (991   ) PUT    CopyObjectsWithCells([in] VT_BOOL arg0) -> VT_VOID
+  slot#95   oVft=760   dispid=0x00000489 (1161  ) GET    Cursor() -> XlMousePointer
+  slot#96   oVft=768   dispid=0x00000489 (1161  ) PUT    Cursor([in] XlMousePointer arg0) -> VT_VOID
+  slot#97   oVft=776   dispid=0x00000313 (787   ) GET    CustomListCount() -> VT_I4
+  slot#98   oVft=784   dispid=0x0000014A (330   ) GET    CutCopyMode() -> XlCutCopyMode
+  slot#99   oVft=792   dispid=0x0000014A (330   ) PUT    CutCopyMode([in] XlCutCopyMode arg0) -> VT_VOID
+  slot#100  oVft=800   dispid=0x0000014B (331   ) GET    DataEntryMode() -> VT_I4
+  slot#101  oVft=808   dispid=0x0000014B (331   ) PUT    DataEntryMode([in] VT_I4 arg0) -> VT_VOID
+  slot#102  oVft=816   dispid=0x000006F6 (1782  ) FUNC   Dummy1([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4) -> VT_VARIANT
+  slot#103  oVft=824   dispid=0x000006F7 (1783  ) FUNC   Dummy2([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8) -> VT_VARIANT
+  slot#104  oVft=832   dispid=0x000006F8 (1784  ) FUNC   Dummy3() -> VT_VARIANT
+  slot#105  oVft=840   dispid=0x000006F9 (1785  ) FUNC   Dummy4([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15) -> VT_VARIANT
+  slot#106  oVft=848   dispid=0x000006FA (1786  ) FUNC   Dummy5([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13) -> VT_VARIANT
+  slot#107  oVft=856   dispid=0x000006FB (1787  ) FUNC   Dummy6() -> VT_VARIANT
+  slot#108  oVft=864   dispid=0x000006FC (1788  ) FUNC   Dummy7() -> VT_VARIANT
+  slot#109  oVft=872   dispid=0x000006FD (1789  ) FUNC   Dummy8([in,opt] VT_VARIANT Arg1) -> VT_VARIANT
+  slot#110  oVft=880   dispid=0x000006FE (1790  ) FUNC   Dummy9() -> VT_VARIANT
+  slot#111  oVft=888   dispid=0x000006FF (1791  ) FUNC   Dummy10([in,opt] VT_VARIANT arg) -> VT_BOOL
+  slot#112  oVft=896   dispid=0x00000700 (1792  ) FUNC   Dummy11() -> VT_VOID
+  slot#113  oVft=904   dispid=0x00000000 (0     ) GET    _Default() -> VT_BSTR
+  slot#114  oVft=912   dispid=0x0000040E (1038  ) GET    DefaultFilePath() -> VT_BSTR
+  slot#115  oVft=920   dispid=0x0000040E (1038  ) PUT    DefaultFilePath([in] VT_BSTR arg0) -> VT_VOID
+  slot#116  oVft=928   dispid=0x000000D9 (217   ) FUNC   DeleteChartAutoFormat([in] VT_BSTR Name) -> VT_VOID
+  slot#117  oVft=936   dispid=0x0000030F (783   ) FUNC   DeleteCustomList([in] VT_I4 ListNum) -> VT_VOID
+  slot#118  oVft=944   dispid=0x000002F9 (761   ) GET    Dialogs() -> Dialogs*
+  slot#119  oVft=952   dispid=0x00000157 (343   ) GET    DisplayAlerts() -> VT_BOOL
+  slot#120  oVft=960   dispid=0x00000157 (343   ) PUT    DisplayAlerts([in] VT_BOOL arg0) -> VT_VOID
+  slot#121  oVft=968   dispid=0x00000158 (344   ) GET    DisplayFormulaBar() -> VT_BOOL
+  slot#122  oVft=976   dispid=0x00000158 (344   ) PUT    DisplayFormulaBar([in] VT_BOOL arg0) -> VT_VOID
+  slot#123  oVft=984   dispid=0x00000425 (1061  ) GET    DisplayFullScreen() -> VT_BOOL
+  slot#124  oVft=992   dispid=0x00000425 (1061  ) PUT    DisplayFullScreen([in] VT_BOOL arg0) -> VT_VOID
+  slot#125  oVft=1000  dispid=0x00000159 (345   ) GET    DisplayNoteIndicator() -> VT_BOOL
+  slot#126  oVft=1008  dispid=0x00000159 (345   ) PUT    DisplayNoteIndicator([in] VT_BOOL arg0) -> VT_VOID
+  slot#127  oVft=1016  dispid=0x000004AC (1196  ) GET    DisplayCommentIndicator() -> XlCommentDisplayMode
+  slot#128  oVft=1024  dispid=0x000004AC (1196  ) PUT    DisplayCommentIndicator([in] XlCommentDisplayMode arg0) -> VT_VOID
+  slot#129  oVft=1032  dispid=0x0000039F (927   ) GET    DisplayExcel4Menus() -> VT_BOOL
+  slot#130  oVft=1040  dispid=0x0000039F (927   ) PUT    DisplayExcel4Menus([in] VT_BOOL arg0) -> VT_VOID
+  slot#131  oVft=1048  dispid=0x0000039E (926   ) GET    DisplayRecentFiles() -> VT_BOOL
+  slot#132  oVft=1056  dispid=0x0000039E (926   ) PUT    DisplayRecentFiles([in] VT_BOOL arg0) -> VT_VOID
+  slot#133  oVft=1064  dispid=0x0000015A (346   ) GET    DisplayScrollBars() -> VT_BOOL
+  slot#134  oVft=1072  dispid=0x0000015A (346   ) PUT    DisplayScrollBars([in] VT_BOOL arg0) -> VT_VOID
+  slot#135  oVft=1080  dispid=0x0000015B (347   ) GET    DisplayStatusBar() -> VT_BOOL
+  slot#136  oVft=1088  dispid=0x0000015B (347   ) PUT    DisplayStatusBar([in] VT_BOOL arg0) -> VT_VOID
+  slot#137  oVft=1096  dispid=0x0000015D (349   ) FUNC   DoubleClick() -> VT_VOID
+  slot#138  oVft=1104  dispid=0x000003A1 (929   ) GET    EditDirectlyInCell() -> VT_BOOL
+  slot#139  oVft=1112  dispid=0x000003A1 (929   ) PUT    EditDirectlyInCell([in] VT_BOOL arg0) -> VT_VOID
+  slot#140  oVft=1120  dispid=0x0000049B (1179  ) GET    EnableAutoComplete() -> VT_BOOL
+  slot#141  oVft=1128  dispid=0x0000049B (1179  ) PUT    EnableAutoComplete([in] VT_BOOL arg0) -> VT_VOID
+  slot#142  oVft=1136  dispid=0x00000448 (1096  ) GET    EnableCancelKey() -> XlEnableCancelKey
+  slot#143  oVft=1144  dispid=0x00000448 (1096  ) PUT    EnableCancelKey([in] XlEnableCancelKey arg0) -> VT_VOID
+  slot#144  oVft=1152  dispid=0x000004AD (1197  ) GET    EnableSound() -> VT_BOOL
+  slot#145  oVft=1160  dispid=0x000004AD (1197  ) PUT    EnableSound([in] VT_BOOL arg0) -> VT_VOID
+  slot#146  oVft=1168  dispid=0x00000428 (1064  ) GET    EnableTipWizard() -> VT_BOOL
+  slot#147  oVft=1176  dispid=0x00000428 (1064  ) PUT    EnableTipWizard([in] VT_BOOL arg0) -> VT_VOID
+  slot#148  oVft=1184  dispid=0x000003A3 (931   ) GET    FileConverters([in,opt] VT_VARIANT Index1, [in,opt] VT_VARIANT Index2) -> VT_VARIANT
+  slot#149  oVft=1192  dispid=0x000004B0 (1200  ) GET    FileSearch() -> FileSearch*
+  slot#150  oVft=1200  dispid=0x000004B1 (1201  ) GET    FileFind() -> IFind*
+  slot#151  oVft=1208  dispid=0x0000042C (1068  ) FUNC   _FindFile() -> VT_VOID
+  slot#152  oVft=1216  dispid=0x0000015F (351   ) GET    FixedDecimal() -> VT_BOOL
+  slot#153  oVft=1224  dispid=0x0000015F (351   ) PUT    FixedDecimal([in] VT_BOOL arg0) -> VT_VOID
+  slot#154  oVft=1232  dispid=0x00000160 (352   ) GET    FixedDecimalPlaces() -> VT_I4
+  slot#155  oVft=1240  dispid=0x00000160 (352   ) PUT    FixedDecimalPlaces([in] VT_I4 arg0) -> VT_VOID
+  slot#156  oVft=1248  dispid=0x00000312 (786   ) FUNC   GetCustomListContents([in] VT_I4 ListNum) -> VT_VARIANT
+  slot#157  oVft=1256  dispid=0x00000311 (785   ) FUNC   GetCustomListNum([in] VT_VARIANT ListArray) -> VT_I4
+  slot#158  oVft=1264  dispid=0x00000433 (1075  ) FUNC   GetOpenFilename([in,opt] VT_VARIANT FileFilter, [in,opt] VT_VARIANT FilterIndex, [in,opt] VT_VARIANT Title, [in,opt] VT_VARIANT ButtonText, [in,opt] VT_VARIANT MultiSelect) -> VT_VARIANT
+  slot#159  oVft=1272  dispid=0x00000434 (1076  ) FUNC   GetSaveAsFilename([in,opt] VT_VARIANT InitialFilename, [in,opt] VT_VARIANT FileFilter, [in,opt] VT_VARIANT FilterIndex, [in,opt] VT_VARIANT Title, [in,opt] VT_VARIANT ButtonText) -> VT_VARIANT
+  slot#160  oVft=1280  dispid=0x000001DB (475   ) FUNC   Goto([in,opt] VT_VARIANT Reference, [in,opt] VT_VARIANT Scroll) -> VT_VOID
+  slot#161  oVft=1288  dispid=0x0000007B (123   ) GET    Height() -> VT_R8
+  slot#162  oVft=1296  dispid=0x0000007B (123   ) PUT    Height([in] VT_R8 arg0) -> VT_VOID
+  slot#163  oVft=1304  dispid=0x00000162 (354   ) FUNC   Help([in,opt] VT_VARIANT HelpFile, [in,opt] VT_VARIANT HelpContextID) -> VT_VOID
+  slot#164  oVft=1312  dispid=0x00000164 (356   ) GET    IgnoreRemoteRequests() -> VT_BOOL
+  slot#165  oVft=1320  dispid=0x00000164 (356   ) PUT    IgnoreRemoteRequests([in] VT_BOOL arg0) -> VT_VOID
+  slot#166  oVft=1328  dispid=0x0000043F (1087  ) FUNC   InchesToPoints([in] VT_R8 Inches) -> VT_R8
+  slot#167  oVft=1336  dispid=0x00000165 (357   ) FUNC   InputBox([in] VT_BSTR Prompt, [in,opt] VT_VARIANT Title, [in,opt] VT_VARIANT Default, [in,opt] VT_VARIANT Left, [in,opt] VT_VARIANT Top, [in,opt] VT_VARIANT HelpFile, [in,opt] VT_VARIANT HelpContextID, [in,opt] VT_VARIANT Type) -> VT_VARIANT
+  slot#168  oVft=1344  dispid=0x00000169 (361   ) GET    Interactive() -> VT_BOOL
+  slot#169  oVft=1352  dispid=0x00000169 (361   ) PUT    Interactive([in] VT_BOOL arg0) -> VT_VOID
+  slot#170  oVft=1360  dispid=0x0000016A (362   ) GET    International([in,opt] VT_VARIANT Index) -> VT_VARIANT
+  slot#171  oVft=1368  dispid=0x0000016B (363   ) GET    Iteration() -> VT_BOOL
+  slot#172  oVft=1376  dispid=0x0000016B (363   ) PUT    Iteration([in] VT_BOOL arg0) -> VT_VOID
+  slot#173  oVft=1384  dispid=0x0000016C (364   ) GET    LargeButtons() -> VT_BOOL
+  slot#174  oVft=1392  dispid=0x0000016C (364   ) PUT    LargeButtons([in] VT_BOOL arg0) -> VT_VOID
+  slot#175  oVft=1400  dispid=0x0000007F (127   ) GET    Left() -> VT_R8
+  slot#176  oVft=1408  dispid=0x0000007F (127   ) PUT    Left([in] VT_R8 arg0) -> VT_VOID
+  slot#177  oVft=1416  dispid=0x0000016E (366   ) GET    LibraryPath() -> VT_BSTR
+  slot#178  oVft=1424  dispid=0x0000046F (1135  ) FUNC   _MacroOptions([in,opt] VT_VARIANT Macro, [in,opt] VT_VARIANT Description, [in,opt] VT_VARIANT HasMenu, [in,opt] VT_VARIANT MenuText, [in,opt] VT_VARIANT HasShortcutKey, [in,opt] VT_VARIANT ShortcutKey, [in,opt] VT_VARIANT Category, [in,opt] VT_VARIANT StatusBar, [in,opt] VT_VARIANT HelpContextID, [in,opt] VT_VARIANT HelpFile) -> VT_VOID
+  slot#179  oVft=1432  dispid=0x000003B1 (945   ) FUNC   MailLogoff() -> VT_VOID
+  slot#180  oVft=1440  dispid=0x000003AF (943   ) FUNC   MailLogon([in,opt] VT_VARIANT Name, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT DownloadNewMail) -> VT_VOID
+  slot#181  oVft=1448  dispid=0x000003AE (942   ) GET    MailSession() -> VT_VARIANT
+  slot#182  oVft=1456  dispid=0x000003CB (971   ) GET    MailSystem() -> XlMailSystem
+  slot#183  oVft=1464  dispid=0x0000016F (367   ) GET    MathCoprocessorAvailable() -> VT_BOOL
+  slot#184  oVft=1472  dispid=0x00000170 (368   ) GET    MaxChange() -> VT_R8
+  slot#185  oVft=1480  dispid=0x00000170 (368   ) PUT    MaxChange([in] VT_R8 arg0) -> VT_VOID
+  slot#186  oVft=1488  dispid=0x00000171 (369   ) GET    MaxIterations() -> VT_I4
+  slot#187  oVft=1496  dispid=0x00000171 (369   ) PUT    MaxIterations([in] VT_I4 arg0) -> VT_VOID
+  slot#188  oVft=1504  dispid=0x00000172 (370   ) GET    MemoryFree() -> VT_I4
+  slot#189  oVft=1512  dispid=0x00000173 (371   ) GET    MemoryTotal() -> VT_I4
+  slot#190  oVft=1520  dispid=0x00000174 (372   ) GET    MemoryUsed() -> VT_I4
+  slot#191  oVft=1528  dispid=0x00000175 (373   ) GET    MouseAvailable() -> VT_BOOL
+  slot#192  oVft=1536  dispid=0x00000176 (374   ) GET    MoveAfterReturn() -> VT_BOOL
+  slot#193  oVft=1544  dispid=0x00000176 (374   ) PUT    MoveAfterReturn([in] VT_BOOL arg0) -> VT_VOID
+  slot#194  oVft=1552  dispid=0x00000478 (1144  ) GET    MoveAfterReturnDirection() -> XlDirection
+  slot#195  oVft=1560  dispid=0x00000478 (1144  ) PUT    MoveAfterReturnDirection([in] XlDirection arg0) -> VT_VOID
+  slot#196  oVft=1568  dispid=0x000004B2 (1202  ) GET    RecentFiles() -> RecentFiles*
+  slot#197  oVft=1576  dispid=0x0000006E (110   ) GET    Name() -> VT_BSTR
+  slot#198  oVft=1584  dispid=0x000003CC (972   ) FUNC   NextLetter() -> Workbook*
+  slot#199  oVft=1592  dispid=0x00000184 (388   ) GET    NetworkTemplatesPath() -> VT_BSTR
+  slot#200  oVft=1600  dispid=0x000004B3 (1203  ) GET    ODBCErrors() -> ODBCErrors*
+  slot#201  oVft=1608  dispid=0x000004B4 (1204  ) GET    ODBCTimeout() -> VT_I4
+  slot#202  oVft=1616  dispid=0x000004B4 (1204  ) PUT    ODBCTimeout([in] VT_I4 arg0) -> VT_VOID
+  slot#203  oVft=1624  dispid=0x00000271 (625   ) GET    OnCalculate() -> VT_BSTR
+  slot#204  oVft=1632  dispid=0x00000271 (625   ) PUT    OnCalculate([in] VT_BSTR arg0) -> VT_VOID
+  slot#205  oVft=1640  dispid=0x00000275 (629   ) GET    OnData() -> VT_BSTR
+  slot#206  oVft=1648  dispid=0x00000275 (629   ) PUT    OnData([in] VT_BSTR arg0) -> VT_VOID
+  slot#207  oVft=1656  dispid=0x00000274 (628   ) GET    OnDoubleClick() -> VT_BSTR
+  slot#208  oVft=1664  dispid=0x00000274 (628   ) PUT    OnDoubleClick([in] VT_BSTR arg0) -> VT_VOID
+  slot#209  oVft=1672  dispid=0x00000273 (627   ) GET    OnEntry() -> VT_BSTR
+  slot#210  oVft=1680  dispid=0x00000273 (627   ) PUT    OnEntry([in] VT_BSTR arg0) -> VT_VOID
+  slot#211  oVft=1688  dispid=0x00000272 (626   ) FUNC   OnKey([in] VT_BSTR Key, [in,opt] VT_VARIANT Procedure) -> VT_VOID
+  slot#212  oVft=1696  dispid=0x00000301 (769   ) FUNC   OnRepeat([in] VT_BSTR Text, [in] VT_BSTR Procedure) -> VT_VOID
+  slot#213  oVft=1704  dispid=0x00000407 (1031  ) GET    OnSheetActivate() -> VT_BSTR
+  slot#214  oVft=1712  dispid=0x00000407 (1031  ) PUT    OnSheetActivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#215  oVft=1720  dispid=0x00000439 (1081  ) GET    OnSheetDeactivate() -> VT_BSTR
+  slot#216  oVft=1728  dispid=0x00000439 (1081  ) PUT    OnSheetDeactivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#217  oVft=1736  dispid=0x00000270 (624   ) FUNC   OnTime([in] VT_VARIANT EarliestTime, [in] VT_BSTR Procedure, [in,opt] VT_VARIANT LatestTime, [in,opt] VT_VARIANT Schedule) -> VT_VOID
+  slot#218  oVft=1744  dispid=0x00000302 (770   ) FUNC   OnUndo([in] VT_BSTR Text, [in] VT_BSTR Procedure) -> VT_VOID
+  slot#219  oVft=1752  dispid=0x0000026F (623   ) GET    OnWindow() -> VT_BSTR
+  slot#220  oVft=1760  dispid=0x0000026F (623   ) PUT    OnWindow([in] VT_BSTR arg0) -> VT_VOID
+  slot#221  oVft=1768  dispid=0x00000177 (375   ) GET    OperatingSystem() -> VT_BSTR
+  slot#222  oVft=1776  dispid=0x00000178 (376   ) GET    OrganizationName() -> VT_BSTR
+  slot#223  oVft=1784  dispid=0x00000123 (291   ) GET    Path() -> VT_BSTR
+  slot#224  oVft=1792  dispid=0x00000179 (377   ) GET    PathSeparator() -> VT_BSTR
+  slot#225  oVft=1800  dispid=0x0000017A (378   ) GET    PreviousSelections([in,opt] VT_VARIANT Index) -> VT_VARIANT
+  slot#226  oVft=1808  dispid=0x000004B5 (1205  ) GET    PivotTableSelection() -> VT_BOOL
+  slot#227  oVft=1816  dispid=0x000004B5 (1205  ) PUT    PivotTableSelection([in] VT_BOOL arg0) -> VT_VOID
+  slot#228  oVft=1824  dispid=0x00000426 (1062  ) GET    PromptForSummaryInfo() -> VT_BOOL
+  slot#229  oVft=1832  dispid=0x00000426 (1062  ) PUT    PromptForSummaryInfo([in] VT_BOOL arg0) -> VT_VOID
+  slot#230  oVft=1840  dispid=0x0000012E (302   ) FUNC   Quit() -> VT_VOID
+  slot#231  oVft=1848  dispid=0x00000305 (773   ) FUNC   RecordMacro([in,opt] VT_VARIANT BasicCode, [in,opt] VT_VARIANT XlmCode) -> VT_VOID
+  slot#232  oVft=1856  dispid=0x0000017B (379   ) GET    RecordRelative() -> VT_BOOL
+  slot#233  oVft=1864  dispid=0x0000017C (380   ) GET    ReferenceStyle() -> XlReferenceStyle
+  slot#234  oVft=1872  dispid=0x0000017C (380   ) PUT    ReferenceStyle([in] XlReferenceStyle arg0) -> VT_VOID
+  slot#235  oVft=1880  dispid=0x00000307 (775   ) GET    RegisteredFunctions([in,opt] VT_VARIANT Index1, [in,opt] VT_VARIANT Index2) -> VT_VARIANT
+  slot#236  oVft=1888  dispid=0x0000001E (30    ) FUNC   RegisterXLL([in] VT_BSTR Filename) -> VT_BOOL
+  slot#237  oVft=1896  dispid=0x0000012D (301   ) FUNC   Repeat() -> VT_VOID
+  slot#238  oVft=1904  dispid=0x000003A0 (928   ) FUNC   ResetTipWizard() -> VT_VOID
+  slot#239  oVft=1912  dispid=0x000004B6 (1206  ) GET    RollZoom() -> VT_BOOL
+  slot#240  oVft=1920  dispid=0x000004B6 (1206  ) PUT    RollZoom([in] VT_BOOL arg0) -> VT_VOID
+  slot#241  oVft=1928  dispid=0x0000011B (283   ) FUNC   Save([in,opt] VT_VARIANT Filename) -> VT_VOID
+  slot#242  oVft=1936  dispid=0x000000D4 (212   ) FUNC   SaveWorkspace([in,opt] VT_VARIANT Filename) -> VT_VOID
+  slot#243  oVft=1944  dispid=0x0000017E (382   ) GET    ScreenUpdating() -> VT_BOOL
+  slot#244  oVft=1952  dispid=0x0000017E (382   ) PUT    ScreenUpdating([in] VT_BOOL arg0) -> VT_VOID
+  slot#245  oVft=1960  dispid=0x000000DB (219   ) FUNC   SetDefaultChart([in,opt] VT_VARIANT FormatName, [in,opt] VT_VARIANT Gallery) -> VT_VOID
+  slot#246  oVft=1968  dispid=0x000003E1 (993   ) GET    SheetsInNewWorkbook() -> VT_I4
+  slot#247  oVft=1976  dispid=0x000003E1 (993   ) PUT    SheetsInNewWorkbook([in] VT_I4 arg0) -> VT_VOID
+  slot#248  oVft=1984  dispid=0x000004B7 (1207  ) GET    ShowChartTipNames() -> VT_BOOL
+  slot#249  oVft=1992  dispid=0x000004B7 (1207  ) PUT    ShowChartTipNames([in] VT_BOOL arg0) -> VT_VOID
+  slot#250  oVft=2000  dispid=0x000004B8 (1208  ) GET    ShowChartTipValues() -> VT_BOOL
+  slot#251  oVft=2008  dispid=0x000004B8 (1208  ) PUT    ShowChartTipValues([in] VT_BOOL arg0) -> VT_VOID
+  slot#252  oVft=2016  dispid=0x0000039C (924   ) GET    StandardFont() -> VT_BSTR
+  slot#253  oVft=2024  dispid=0x0000039C (924   ) PUT    StandardFont([in] VT_BSTR arg0) -> VT_VOID
+  slot#254  oVft=2032  dispid=0x0000039D (925   ) GET    StandardFontSize() -> VT_R8
+  slot#255  oVft=2040  dispid=0x0000039D (925   ) PUT    StandardFontSize([in] VT_R8 arg0) -> VT_VOID
+  slot#256  oVft=2048  dispid=0x00000181 (385   ) GET    StartupPath() -> VT_BSTR
+  slot#257  oVft=2056  dispid=0x00000182 (386   ) GET    StatusBar() -> VT_VARIANT
+  slot#258  oVft=2064  dispid=0x00000182 (386   ) PUT    StatusBar([in] VT_VARIANT arg0) -> VT_VOID
+  slot#259  oVft=2072  dispid=0x0000017D (381   ) GET    TemplatesPath() -> VT_BSTR
+  slot#260  oVft=2080  dispid=0x00000183 (387   ) GET    ShowToolTips() -> VT_BOOL
+  slot#261  oVft=2088  dispid=0x00000183 (387   ) PUT    ShowToolTips([in] VT_BOOL arg0) -> VT_VOID
+  slot#262  oVft=2096  dispid=0x0000007E (126   ) GET    Top() -> VT_R8
+  slot#263  oVft=2104  dispid=0x0000007E (126   ) PUT    Top([in] VT_R8 arg0) -> VT_VOID
+  slot#264  oVft=2112  dispid=0x000004B9 (1209  ) GET    DefaultSaveFormat() -> XlFileFormat
+  slot#265  oVft=2120  dispid=0x000004B9 (1209  ) PUT    DefaultSaveFormat([in] XlFileFormat arg0) -> VT_VOID
+  slot#266  oVft=2128  dispid=0x00000136 (310   ) GET    TransitionMenuKey() -> VT_BSTR
+  slot#267  oVft=2136  dispid=0x00000136 (310   ) PUT    TransitionMenuKey([in] VT_BSTR arg0) -> VT_VOID
+  slot#268  oVft=2144  dispid=0x00000137 (311   ) GET    TransitionMenuKeyAction() -> VT_I4
+  slot#269  oVft=2152  dispid=0x00000137 (311   ) PUT    TransitionMenuKeyAction([in] VT_I4 arg0) -> VT_VOID
+  slot#270  oVft=2160  dispid=0x00000138 (312   ) GET    TransitionNavigKeys() -> VT_BOOL
+  slot#271  oVft=2168  dispid=0x00000138 (312   ) PUT    TransitionNavigKeys([in] VT_BOOL arg0) -> VT_VOID
+  slot#272  oVft=2176  dispid=0x0000012F (303   ) FUNC   Undo() -> VT_VOID
+  slot#273  oVft=2184  dispid=0x00000185 (389   ) GET    UsableHeight() -> VT_R8
+  slot#274  oVft=2192  dispid=0x00000186 (390   ) GET    UsableWidth() -> VT_R8
+  slot#275  oVft=2200  dispid=0x000004BA (1210  ) GET    UserControl() -> VT_BOOL
+  slot#276  oVft=2208  dispid=0x000004BA (1210  ) PUT    UserControl([in] VT_BOOL arg0) -> VT_VOID
+  slot#277  oVft=2216  dispid=0x00000187 (391   ) GET    UserName() -> VT_BSTR
+  slot#278  oVft=2224  dispid=0x00000187 (391   ) PUT    UserName([in] VT_BSTR arg0) -> VT_VOID
+  slot#279  oVft=2232  dispid=0x00000006 (6     ) GET    Value() -> VT_BSTR
+  slot#280  oVft=2240  dispid=0x000004BB (1211  ) GET    VBE() -> VBE*
+  slot#281  oVft=2248  dispid=0x00000188 (392   ) GET    Version() -> VT_BSTR
+  slot#282  oVft=2256  dispid=0x0000022E (558   ) GET    Visible() -> VT_BOOL
+  slot#283  oVft=2264  dispid=0x0000022E (558   ) PUT    Visible([in] VT_BOOL arg0) -> VT_VOID
+  slot#284  oVft=2272  dispid=0x00000314 (788   ) FUNC   Volatile([in,opt] VT_VARIANT Volatile) -> VT_VOID
+  slot#285  oVft=2280  dispid=0x00000189 (393   ) FUNC   _Wait([in] VT_VARIANT Time) -> VT_VOID
+  slot#286  oVft=2288  dispid=0x0000007A (122   ) GET    Width() -> VT_R8
+  slot#287  oVft=2296  dispid=0x0000007A (122   ) PUT    Width([in] VT_R8 arg0) -> VT_VOID
+  slot#288  oVft=2304  dispid=0x0000018B (395   ) GET    WindowsForPens() -> VT_BOOL
+  slot#289  oVft=2312  dispid=0x0000018C (396   ) GET    WindowState() -> XlWindowState
+  slot#290  oVft=2320  dispid=0x0000018C (396   ) PUT    WindowState([in] XlWindowState arg0) -> VT_VOID
+  slot#291  oVft=2328  dispid=0x00000002 (2     ) GET    UILanguage() -> VT_I4
+  slot#292  oVft=2336  dispid=0x00000002 (2     ) PUT    UILanguage([in] VT_I4 arg0) -> VT_VOID
+  slot#293  oVft=2344  dispid=0x000000E5 (229   ) GET    DefaultSheetDirection() -> VT_I4
+  slot#294  oVft=2352  dispid=0x000000E5 (229   ) PUT    DefaultSheetDirection([in] VT_I4 arg0) -> VT_VOID
+  slot#295  oVft=2360  dispid=0x000000E8 (232   ) GET    CursorMovement() -> VT_I4
+  slot#296  oVft=2368  dispid=0x000000E8 (232   ) PUT    CursorMovement([in] VT_I4 arg0) -> VT_VOID
+  slot#297  oVft=2376  dispid=0x000000E9 (233   ) GET    ControlCharacters() -> VT_BOOL
+  slot#298  oVft=2384  dispid=0x000000E9 (233   ) PUT    ControlCharacters([in] VT_BOOL arg0) -> VT_VOID
+  slot#299  oVft=2392  dispid=0x000000A9 (169   ) FUNC   _WSFunction([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> VT_VARIANT
+  slot#300  oVft=2400  dispid=0x000004BC (1212  ) GET    EnableEvents() -> VT_BOOL
+  slot#301  oVft=2408  dispid=0x000004BC (1212  ) PUT    EnableEvents([in] VT_BOOL arg0) -> VT_VOID
+  slot#302  oVft=2416  dispid=0x000004BD (1213  ) GET    DisplayInfoWindow() -> VT_BOOL
+  slot#303  oVft=2424  dispid=0x000004BD (1213  ) PUT    DisplayInfoWindow([in] VT_BOOL arg0) -> VT_VOID
+  slot#304  oVft=2432  dispid=0x000006EA (1770  ) FUNC   Wait([in] VT_VARIANT Time) -> VT_BOOL
+  slot#305  oVft=2440  dispid=0x00000701 (1793  ) GET    ExtendList() -> VT_BOOL
+  slot#306  oVft=2448  dispid=0x00000701 (1793  ) PUT    ExtendList([in] VT_BOOL arg0) -> VT_VOID
+  slot#307  oVft=2456  dispid=0x00000702 (1794  ) GET    OLEDBErrors() -> OLEDBErrors*
+  slot#308  oVft=2464  dispid=0x00000703 (1795  ) FUNC   GetPhonetic([in,opt] VT_VARIANT Text) -> VT_BSTR
+  slot#309  oVft=2472  dispid=0x00000704 (1796  ) GET    COMAddIns() -> COMAddIns*
+  slot#310  oVft=2480  dispid=0x00000705 (1797  ) GET    DefaultWebOptions() -> DefaultWebOptions*
+  slot#311  oVft=2488  dispid=0x00000706 (1798  ) GET    ProductCode() -> VT_BSTR
+  slot#312  oVft=2496  dispid=0x00000707 (1799  ) GET    UserLibraryPath() -> VT_BSTR
+  slot#313  oVft=2504  dispid=0x00000708 (1800  ) GET    AutoPercentEntry() -> VT_BOOL
+  slot#314  oVft=2512  dispid=0x00000708 (1800  ) PUT    AutoPercentEntry([in] VT_BOOL arg0) -> VT_VOID
+  slot#315  oVft=2520  dispid=0x00000709 (1801  ) GET    LanguageSettings() -> LanguageSettings*
+  slot#316  oVft=2528  dispid=0x0000070A (1802  ) GET    Dummy101() -> VT_DISPATCH
+  slot#317  oVft=2536  dispid=0x0000070B (1803  ) FUNC   Dummy12([in] PivotTable* p1, [in] PivotTable* p2) -> VT_VOID
+  slot#318  oVft=2544  dispid=0x0000070C (1804  ) GET    AnswerWizard() -> AnswerWizard*
+  slot#319  oVft=2552  dispid=0x0000070D (1805  ) FUNC   CalculateFull() -> VT_VOID
+  slot#320  oVft=2560  dispid=0x000006EB (1771  ) FUNC   FindFile() -> VT_BOOL
+  slot#321  oVft=2568  dispid=0x0000070E (1806  ) GET    CalculationVersion() -> VT_I4
+  slot#322  oVft=2576  dispid=0x0000070F (1807  ) GET    ShowWindowsInTaskbar() -> VT_BOOL
+  slot#323  oVft=2584  dispid=0x0000070F (1807  ) PUT    ShowWindowsInTaskbar([in] VT_BOOL arg0) -> VT_VOID
+  slot#324  oVft=2592  dispid=0x00000710 (1808  ) GET    FeatureInstall() -> MsoFeatureInstall
+  slot#325  oVft=2600  dispid=0x00000710 (1808  ) PUT    FeatureInstall([in] MsoFeatureInstall arg0) -> VT_VOID
+  slot#326  oVft=2608  dispid=0x0000078C (1932  ) GET    Ready() -> VT_BOOL
+  slot#327  oVft=2616  dispid=0x0000078D (1933  ) FUNC   Dummy13([in] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> VT_VARIANT
+  slot#328  oVft=2624  dispid=0x0000078E (1934  ) GET    FindFormat() -> CellFormat*
+  slot#329  oVft=2632  dispid=0x0000078E (1934  ) PUTREF FindFormat([in] CellFormat* arg0) -> VT_VOID
+  slot#330  oVft=2640  dispid=0x0000078F (1935  ) GET    ReplaceFormat() -> CellFormat*
+  slot#331  oVft=2648  dispid=0x0000078F (1935  ) PUTREF ReplaceFormat([in] CellFormat* arg0) -> VT_VOID
+  slot#332  oVft=2656  dispid=0x00000790 (1936  ) GET    UsedObjects() -> UsedObjects*
+  slot#333  oVft=2664  dispid=0x00000791 (1937  ) GET    CalculationState() -> XlCalculationState
+  slot#334  oVft=2672  dispid=0x00000792 (1938  ) GET    CalculationInterruptKey() -> XlCalculationInterruptKey
+  slot#335  oVft=2680  dispid=0x00000792 (1938  ) PUT    CalculationInterruptKey([in] XlCalculationInterruptKey arg0) -> VT_VOID
+  slot#336  oVft=2688  dispid=0x00000793 (1939  ) GET    Watches() -> Watches*
+  slot#337  oVft=2696  dispid=0x00000794 (1940  ) GET    DisplayFunctionToolTips() -> VT_BOOL
+  slot#338  oVft=2704  dispid=0x00000794 (1940  ) PUT    DisplayFunctionToolTips([in] VT_BOOL arg0) -> VT_VOID
+  slot#339  oVft=2712  dispid=0x00000795 (1941  ) GET    AutomationSecurity() -> MsoAutomationSecurity
+  slot#340  oVft=2720  dispid=0x00000795 (1941  ) PUT    AutomationSecurity([in] MsoAutomationSecurity arg0) -> VT_VOID
+  slot#341  oVft=2728  dispid=0x00000796 (1942  ) GET    FileDialog([in] MsoFileDialogType fileDialogType) -> FileDialog*
+  slot#342  oVft=2736  dispid=0x00000798 (1944  ) FUNC   Dummy14() -> VT_VOID
+  slot#343  oVft=2744  dispid=0x00000799 (1945  ) FUNC   CalculateFullRebuild() -> VT_VOID
+  slot#344  oVft=2752  dispid=0x0000079A (1946  ) GET    DisplayPasteOptions() -> VT_BOOL
+  slot#345  oVft=2760  dispid=0x0000079A (1946  ) PUT    DisplayPasteOptions([in] VT_BOOL arg0) -> VT_VOID
+  slot#346  oVft=2768  dispid=0x0000079B (1947  ) GET    DisplayInsertOptions() -> VT_BOOL
+  slot#347  oVft=2776  dispid=0x0000079B (1947  ) PUT    DisplayInsertOptions([in] VT_BOOL arg0) -> VT_VOID
+  slot#348  oVft=2784  dispid=0x0000079C (1948  ) GET    GenerateGetPivotData() -> VT_BOOL
+  slot#349  oVft=2792  dispid=0x0000079C (1948  ) PUT    GenerateGetPivotData([in] VT_BOOL arg0) -> VT_VOID
+  slot#350  oVft=2800  dispid=0x0000079D (1949  ) GET    AutoRecover() -> AutoRecover*
+  slot#351  oVft=2808  dispid=0x0000079E (1950  ) GET    Hwnd() -> VT_I4
+  slot#352  oVft=2816  dispid=0x0000079F (1951  ) GET    Hinstance() -> VT_I4
+  slot#353  oVft=2824  dispid=0x000007A0 (1952  ) FUNC   CheckAbort([in,opt] VT_VARIANT KeepAbort) -> VT_VOID
+  slot#354  oVft=2832  dispid=0x000007A2 (1954  ) GET    ErrorCheckingOptions() -> ErrorCheckingOptions*
+  slot#355  oVft=2840  dispid=0x000007A3 (1955  ) GET    AutoFormatAsYouTypeReplaceHyperlinks() -> VT_BOOL
+  slot#356  oVft=2848  dispid=0x000007A3 (1955  ) PUT    AutoFormatAsYouTypeReplaceHyperlinks([in] VT_BOOL arg0) -> VT_VOID
+  slot#357  oVft=2856  dispid=0x000007A4 (1956  ) GET    SmartTagRecognizers() -> SmartTagRecognizers*
+  slot#358  oVft=2864  dispid=0x0000061D (1565  ) GET    NewWorkbook() -> NewFile*
+  slot#359  oVft=2872  dispid=0x000007A5 (1957  ) GET    SpellingOptions() -> SpellingOptions*
+  slot#360  oVft=2880  dispid=0x000007A6 (1958  ) GET    Speech() -> Speech*
+  slot#361  oVft=2888  dispid=0x000007A7 (1959  ) GET    MapPaperSize() -> VT_BOOL
+  slot#362  oVft=2896  dispid=0x000007A7 (1959  ) PUT    MapPaperSize([in] VT_BOOL arg0) -> VT_VOID
+  slot#363  oVft=2904  dispid=0x000007A8 (1960  ) GET    ShowStartupDialog() -> VT_BOOL
+  slot#364  oVft=2912  dispid=0x000007A8 (1960  ) PUT    ShowStartupDialog([in] VT_BOOL arg0) -> VT_VOID
+  slot#365  oVft=2920  dispid=0x00000711 (1809  ) GET    DecimalSeparator() -> VT_BSTR
+  slot#366  oVft=2928  dispid=0x00000711 (1809  ) PUT    DecimalSeparator([in] VT_BSTR arg0) -> VT_VOID
+  slot#367  oVft=2936  dispid=0x00000712 (1810  ) GET    ThousandsSeparator() -> VT_BSTR
+  slot#368  oVft=2944  dispid=0x00000712 (1810  ) PUT    ThousandsSeparator([in] VT_BSTR arg0) -> VT_VOID
+  slot#369  oVft=2952  dispid=0x000007A9 (1961  ) GET    UseSystemSeparators() -> VT_BOOL
+  slot#370  oVft=2960  dispid=0x000007A9 (1961  ) PUT    UseSystemSeparators([in] VT_BOOL arg0) -> VT_VOID
+  slot#371  oVft=2968  dispid=0x000007AA (1962  ) GET    ThisCell() -> Range*
+  slot#372  oVft=2976  dispid=0x000007AB (1963  ) GET    RTD() -> RTD*
+  slot#373  oVft=2984  dispid=0x000008CB (2251  ) GET    DisplayDocumentActionTaskPane() -> VT_BOOL
+  slot#374  oVft=2992  dispid=0x000008CB (2251  ) PUT    DisplayDocumentActionTaskPane([in] VT_BOOL arg0) -> VT_VOID
+  slot#375  oVft=3000  dispid=0x000008CC (2252  ) FUNC   DisplayXMLSourcePane([in,opt] VT_VARIANT XmlMap) -> VT_VOID
+  slot#376  oVft=3008  dispid=0x000008CE (2254  ) GET    ArbitraryXMLSupportAvailable() -> VT_BOOL
+  slot#377  oVft=3016  dispid=0x000008CF (2255  ) FUNC   Support([in] VT_DISPATCH Object, [in] VT_I4 ID, [in,opt] VT_VARIANT arg) -> VT_VARIANT
+  slot#378  oVft=3024  dispid=0x00000945 (2373  ) FUNC   Dummy20([in] VT_I4 grfCompareFunctions) -> VT_VARIANT
+  slot#379  oVft=3032  dispid=0x00000947 (2375  ) GET    MeasurementUnit() -> VT_I4
+  slot#380  oVft=3040  dispid=0x00000947 (2375  ) PUT    MeasurementUnit([in] VT_I4 arg0) -> VT_VOID
+  slot#381  oVft=3048  dispid=0x00000948 (2376  ) GET    ShowSelectionFloaties() -> VT_BOOL
+  slot#382  oVft=3056  dispid=0x00000948 (2376  ) PUT    ShowSelectionFloaties([in] VT_BOOL arg0) -> VT_VOID
+  slot#383  oVft=3064  dispid=0x00000949 (2377  ) GET    ShowMenuFloaties() -> VT_BOOL
+  slot#384  oVft=3072  dispid=0x00000949 (2377  ) PUT    ShowMenuFloaties([in] VT_BOOL arg0) -> VT_VOID
+  slot#385  oVft=3080  dispid=0x0000094A (2378  ) GET    ShowDevTools() -> VT_BOOL
+  slot#386  oVft=3088  dispid=0x0000094A (2378  ) PUT    ShowDevTools([in] VT_BOOL arg0) -> VT_VOID
+  slot#387  oVft=3096  dispid=0x0000094B (2379  ) GET    EnableLivePreview() -> VT_BOOL
+  slot#388  oVft=3104  dispid=0x0000094B (2379  ) PUT    EnableLivePreview([in] VT_BOOL arg0) -> VT_VOID
+  slot#389  oVft=3112  dispid=0x0000094C (2380  ) GET    DisplayDocumentInformationPanel() -> VT_BOOL
+  slot#390  oVft=3120  dispid=0x0000094C (2380  ) PUT    DisplayDocumentInformationPanel([in] VT_BOOL arg0) -> VT_VOID
+  slot#391  oVft=3128  dispid=0x0000094D (2381  ) GET    AlwaysUseClearType() -> VT_BOOL
+  slot#392  oVft=3136  dispid=0x0000094D (2381  ) PUT    AlwaysUseClearType([in] VT_BOOL arg0) -> VT_VOID
+  slot#393  oVft=3144  dispid=0x0000094E (2382  ) GET    WarnOnFunctionNameConflict() -> VT_BOOL
+  slot#394  oVft=3152  dispid=0x0000094E (2382  ) PUT    WarnOnFunctionNameConflict([in] VT_BOOL arg0) -> VT_VOID
+  slot#395  oVft=3160  dispid=0x0000094F (2383  ) GET    FormulaBarHeight() -> VT_I4
+  slot#396  oVft=3168  dispid=0x0000094F (2383  ) PUT    FormulaBarHeight([in] VT_I4 arg0) -> VT_VOID
+  slot#397  oVft=3176  dispid=0x00000950 (2384  ) GET    DisplayFormulaAutoComplete() -> VT_BOOL
+  slot#398  oVft=3184  dispid=0x00000950 (2384  ) PUT    DisplayFormulaAutoComplete([in] VT_BOOL arg0) -> VT_VOID
+  slot#399  oVft=3192  dispid=0x00000951 (2385  ) GET    GenerateTableRefs() -> XlGenerateTableRefs
+  slot#400  oVft=3200  dispid=0x00000951 (2385  ) PUT    GenerateTableRefs([in] XlGenerateTableRefs arg0) -> VT_VOID
+  slot#401  oVft=3208  dispid=0x00000952 (2386  ) GET    Assistance() -> IAssistance*
+  slot#402  oVft=3216  dispid=0x00000953 (2387  ) FUNC   CalculateUntilAsyncQueriesDone() -> VT_VOID
+  slot#403  oVft=3224  dispid=0x00000954 (2388  ) GET    EnableLargeOperationAlert() -> VT_BOOL
+  slot#404  oVft=3232  dispid=0x00000954 (2388  ) PUT    EnableLargeOperationAlert([in] VT_BOOL arg0) -> VT_VOID
+  slot#405  oVft=3240  dispid=0x00000955 (2389  ) GET    LargeOperationCellThousandCount() -> VT_I4
+  slot#406  oVft=3248  dispid=0x00000955 (2389  ) PUT    LargeOperationCellThousandCount([in] VT_I4 arg0) -> VT_VOID
+  slot#407  oVft=3256  dispid=0x00000956 (2390  ) GET    DeferAsyncQueries() -> VT_BOOL
+  slot#408  oVft=3264  dispid=0x00000956 (2390  ) PUT    DeferAsyncQueries([in] VT_BOOL arg0) -> VT_VOID
+  slot#409  oVft=3272  dispid=0x00000957 (2391  ) GET    MultiThreadedCalculation() -> MultiThreadedCalculation*
+  slot#410  oVft=3280  dispid=0x00000958 (2392  ) FUNC   SharePointVersion([in] VT_BSTR bstrUrl) -> VT_I4
+  slot#411  oVft=3288  dispid=0x0000095A (2394  ) GET    ActiveEncryptionSession() -> VT_I4
+  slot#412  oVft=3296  dispid=0x0000095B (2395  ) GET    HighQualityModeForGraphics() -> VT_BOOL
+  slot#413  oVft=3304  dispid=0x0000095B (2395  ) PUT    HighQualityModeForGraphics([in] VT_BOOL arg0) -> VT_VOID
+  slot#414  oVft=3312  dispid=0x00000AD0 (2768  ) GET    FileExportConverters() -> FileExportConverters*
+  slot#415  oVft=3320  dispid=0x00000AD4 (2772  ) GET    SmartArtLayouts() -> SmartArtLayouts*
+  slot#416  oVft=3328  dispid=0x00000AD5 (2773  ) GET    SmartArtQuickStyles() -> SmartArtQuickStyles*
+  slot#417  oVft=3336  dispid=0x00000AD6 (2774  ) GET    SmartArtColors() -> SmartArtColors*
+  slot#418  oVft=3344  dispid=0x00000AD7 (2775  ) GET    AddIns2() -> AddIns2*
+  slot#419  oVft=3352  dispid=0x00000AD8 (2776  ) GET    PrintCommunication() -> VT_BOOL
+  slot#420  oVft=3360  dispid=0x00000AD8 (2776  ) PUT    PrintCommunication([in] VT_BOOL arg0) -> VT_VOID
+  slot#421  oVft=3368  dispid=0x00000AD2 (2770  ) FUNC   MacroOptions([in,opt] VT_VARIANT Macro, [in,opt] VT_VARIANT Description, [in,opt] VT_VARIANT HasMenu, [in,opt] VT_VARIANT MenuText, [in,opt] VT_VARIANT HasShortcutKey, [in,opt] VT_VARIANT ShortcutKey, [in,opt] VT_VARIANT Category, [in,opt] VT_VARIANT StatusBar, [in,opt] VT_VARIANT HelpContextID, [in,opt] VT_VARIANT HelpFile, [in,opt] VT_VARIANT ArgumentDescriptions) -> VT_VOID
+  slot#422  oVft=3376  dispid=0x00000ADA (2778  ) GET    UseClusterConnector() -> VT_BOOL
+  slot#423  oVft=3384  dispid=0x00000ADA (2778  ) PUT    UseClusterConnector([in] VT_BOOL arg0) -> VT_VOID
+  slot#424  oVft=3392  dispid=0x00000ADB (2779  ) GET    ClusterConnector() -> VT_BSTR
+  slot#425  oVft=3400  dispid=0x00000ADB (2779  ) PUT    ClusterConnector([in] VT_BSTR arg0) -> VT_VOID
+  slot#426  oVft=3408  dispid=0x00000ADC (2780  ) GET    Quitting() -> VT_BOOL
+  slot#427  oVft=3416  dispid=0x00000ADD (2781  ) GET    Dummy22() -> VT_BOOL
+  slot#428  oVft=3424  dispid=0x00000ADD (2781  ) PUT    Dummy22([in] VT_BOOL arg0) -> VT_VOID
+  slot#429  oVft=3432  dispid=0x00000ADE (2782  ) GET    Dummy23() -> VT_BOOL
+  slot#430  oVft=3440  dispid=0x00000ADE (2782  ) PUT    Dummy23([in] VT_BOOL arg0) -> VT_VOID
+  slot#431  oVft=3448  dispid=0x00000ADF (2783  ) GET    ProtectedViewWindows() -> ProtectedViewWindows*
+  slot#432  oVft=3456  dispid=0x00000AE0 (2784  ) GET    ActiveProtectedViewWindow() -> ProtectedViewWindow*
+  slot#433  oVft=3464  dispid=0x00000AE1 (2785  ) GET    IsSandboxed() -> VT_BOOL
+  slot#434  oVft=3472  dispid=0x00000AE2 (2786  ) GET    SaveISO8601Dates() -> VT_BOOL
+  slot#435  oVft=3480  dispid=0x00000AE2 (2786  ) PUT    SaveISO8601Dates([in] VT_BOOL arg0) -> VT_VOID
+  slot#436  oVft=3488  dispid=0x00000AE3 (2787  ) GET    HinstancePtr() -> VT_VARIANT
+  slot#437  oVft=3496  dispid=0x00000AE4 (2788  ) GET    FileValidation() -> MsoFileValidationMode
+  slot#438  oVft=3504  dispid=0x00000AE4 (2788  ) PUT    FileValidation([in] MsoFileValidationMode arg0) -> VT_VOID
+  slot#439  oVft=3512  dispid=0x00000AE5 (2789  ) GET    FileValidationPivot() -> XlFileValidationPivotMode
+  slot#440  oVft=3520  dispid=0x00000AE5 (2789  ) PUT    FileValidationPivot([in] XlFileValidationPivotMode arg0) -> VT_VOID
+  slot#441  oVft=3528  dispid=0x00000BB2 (2994  ) GET    ShowQuickAnalysis() -> VT_BOOL
+  slot#442  oVft=3536  dispid=0x00000BB2 (2994  ) PUT    ShowQuickAnalysis([in] VT_BOOL arg0) -> VT_VOID
+  slot#443  oVft=3544  dispid=0x00000BB3 (2995  ) GET    QuickAnalysis() -> QuickAnalysis*
+  slot#444  oVft=3552  dispid=0x00000BB4 (2996  ) GET    FlashFill() -> VT_BOOL
+  slot#445  oVft=3560  dispid=0x00000BB4 (2996  ) PUT    FlashFill([in] VT_BOOL arg0) -> VT_VOID
+  slot#446  oVft=3568  dispid=0x00000BB5 (2997  ) GET    EnableMacroAnimations() -> VT_BOOL
+  slot#447  oVft=3576  dispid=0x00000BB5 (2997  ) PUT    EnableMacroAnimations([in] VT_BOOL arg0) -> VT_VOID
+  slot#448  oVft=3584  dispid=0x00000BB6 (2998  ) GET    ChartDataPointTrack() -> VT_BOOL
+  slot#449  oVft=3592  dispid=0x00000BB6 (2998  ) PUT    ChartDataPointTrack([in] VT_BOOL arg0) -> VT_VOID
+  slot#450  oVft=3600  dispid=0x00000BB7 (2999  ) GET    FlashFillMode() -> VT_BOOL
+  slot#451  oVft=3608  dispid=0x00000BB7 (2999  ) PUT    FlashFillMode([in] VT_BOOL arg0) -> VT_VOID
+  slot#452  oVft=3616  dispid=0x00000BB8 (3000  ) GET    MergeInstances() -> VT_BOOL
+  slot#453  oVft=3624  dispid=0x00000BB8 (3000  ) PUT    MergeInstances([in] VT_BOOL arg0) -> VT_VOID
+  slot#454  oVft=3632  dispid=0x00000C56 (3158  ) GET    EnableCheckFileExtensions() -> VT_BOOL
+  slot#455  oVft=3640  dispid=0x00000C56 (3158  ) PUT    EnableCheckFileExtensions([in] VT_BOOL arg0) -> VT_VOID
+  slot#456  oVft=3648  dispid=0x00000CC7 (3271  ) GET    DefaultPivotTableLayoutOptions() -> DefaultPivotTableLayoutOptions*
+  slot#457  oVft=3656  dispid=0x00000CF0 (3312  ) GET    TruncateLeadingZeros() -> VT_BOOL
+  slot#458  oVft=3664  dispid=0x00000CF0 (3312  ) PUT    TruncateLeadingZeros([in] VT_BOOL arg0) -> VT_VOID
+  slot#459  oVft=3672  dispid=0x00000CF1 (3313  ) GET    TruncateLargeNumbers() -> VT_BOOL
+  slot#460  oVft=3680  dispid=0x00000CF1 (3313  ) PUT    TruncateLargeNumbers([in] VT_BOOL arg0) -> VT_VOID
+  slot#461  oVft=3688  dispid=0x00000CF2 (3314  ) GET    ConvertNumbersWithECharacter() -> VT_BOOL
+  slot#462  oVft=3696  dispid=0x00000CF2 (3314  ) PUT    ConvertNumbersWithECharacter([in] VT_BOOL arg0) -> VT_VOID
+  slot#463  oVft=3704  dispid=0x00000CF3 (3315  ) GET    CSVDisplayNumberConversionWarning() -> VT_BOOL
+  slot#464  oVft=3712  dispid=0x00000CF3 (3315  ) PUT    CSVDisplayNumberConversionWarning([in] VT_BOOL arg0) -> VT_VOID
+  slot#465  oVft=3720  dispid=0x00000CF4 (3316  ) GET    CSVKeepColumnAsTextIfMultipleEntriesAreText() -> VT_BOOL
+  slot#466  oVft=3728  dispid=0x00000CF4 (3316  ) PUT    CSVKeepColumnAsTextIfMultipleEntriesAreText([in] VT_BOOL arg0) -> VT_VOID
+  slot#467  oVft=3736  dispid=0x00000CF5 (3317  ) GET    DataPrivacyOptions() -> DataPrivacyOptions*
+  slot#468  oVft=3744  dispid=0x00000CEF (3311  ) GET    ShowConvertToDataType() -> VT_BOOL
+  slot#469  oVft=3752  dispid=0x00000CEF (3311  ) PUT    ShowConvertToDataType([in] VT_BOOL arg0) -> VT_VOID
+  slot#470  oVft=3760  dispid=0x00000D25 (3365  ) GET    SensitivityLabelPolicy() -> SensitivityLabelPolicy*
+  slot#471  oVft=3768  dispid=0x00000D49 (3401  ) GET    FormatStaleValues() -> VT_BOOL
+  slot#472  oVft=3776  dispid=0x00000D49 (3401  ) PUT    FormatStaleValues([in] VT_BOOL arg0) -> VT_VOID
+  slot#473  oVft=3784  dispid=0x00000D59 (3417  ) GET    MaxSupportedCompatibilityVersion() -> VT_I4
+====================================================================================================
+INTERFACE Sheets  IID={000208D7-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=29  cbSizeVft=56  wTypeFlags=0x10C0
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x000000B5 (181   ) FUNC   Add([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After, [in,opt] VT_VARIANT Count, [in,opt] VT_VARIANT Type) -> VT_DISPATCH
+  slot#11   oVft=88    dispid=0x00000227 (551   ) FUNC   Copy([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After) -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000076 (118   ) GET    Count() -> VT_I4
+  slot#13   oVft=104   dispid=0x00000075 (117   ) FUNC   Delete() -> VT_VOID
+  slot#14   oVft=112   dispid=0x000001D5 (469   ) FUNC   FillAcrossSheets([in] Range* Range, [in,opt] XlFillWith Type) -> VT_VOID
+  slot#15   oVft=120   dispid=0x000000AA (170   ) GET    Item([in] VT_VARIANT Index) -> VT_DISPATCH
+  slot#16   oVft=128   dispid=0x0000027D (637   ) FUNC   Move([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After) -> VT_VOID
+  slot#17   oVft=136   dispid=0xFFFFFFFC (-4    ) GET    _NewEnum() -> VT_UNKNOWN
+  slot#18   oVft=144   dispid=0x00000389 (905   ) FUNC   __PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate) -> VT_VOID
+  slot#19   oVft=152   dispid=0x00000119 (281   ) FUNC   PrintPreview([in,opt] VT_VARIANT EnableChanges) -> VT_VOID
+  slot#20   oVft=160   dispid=0x000000EB (235   ) FUNC   Select([in,opt] VT_VARIANT Replace) -> VT_VOID
+  slot#21   oVft=168   dispid=0x0000058A (1418  ) GET    HPageBreaks() -> HPageBreaks*
+  slot#22   oVft=176   dispid=0x0000058B (1419  ) GET    VPageBreaks() -> VPageBreaks*
+  slot#23   oVft=184   dispid=0x0000022E (558   ) GET    Visible() -> VT_VARIANT
+  slot#24   oVft=192   dispid=0x0000022E (558   ) PUT    Visible([in] VT_VARIANT arg0) -> VT_VOID
+  slot#25   oVft=200   dispid=0x00000000 (0     ) GET    _Default([in] VT_VARIANT Index) -> VT_DISPATCH
+  slot#26   oVft=208   dispid=0x000006EC (1772  ) FUNC   _PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName) -> VT_VOID
+  slot#27   oVft=216   dispid=0x00000939 (2361  ) FUNC   PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName, [in,opt] VT_VARIANT IgnorePrintAreas) -> VT_VOID
+  slot#28   oVft=224   dispid=0x00000BEE (3054  ) FUNC   Add2([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After, [in,opt] VT_VARIANT Count, [in,opt] VT_VARIANT NewLayout) -> VT_DISPATCH
+====================================================================================================
+INTERFACE _Worksheet  IID={000208D8-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=158  cbSizeVft=56  wTypeFlags=0x10C0
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x00000130 (304   ) FUNC   Activate() -> VT_VOID
+  slot#11   oVft=88    dispid=0x00000227 (551   ) FUNC   Copy([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After) -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000075 (117   ) FUNC   Delete() -> VT_VOID
+  slot#13   oVft=104   dispid=0x0000055D (1373  ) GET    CodeName() -> VT_BSTR
+  slot#14   oVft=112   dispid=0x80010000 (-2147418112) GET    _CodeName() -> VT_BSTR
+  slot#15   oVft=120   dispid=0x80010000 (-2147418112) PUT    _CodeName([in] VT_BSTR arg0) -> VT_VOID
+  slot#16   oVft=128   dispid=0x000001E6 (486   ) GET    Index() -> VT_I4
+  slot#17   oVft=136   dispid=0x0000027D (637   ) FUNC   Move([in,opt] VT_VARIANT Before, [in,opt] VT_VARIANT After) -> VT_VOID
+  slot#18   oVft=144   dispid=0x0000006E (110   ) GET    Name() -> VT_BSTR
+  slot#19   oVft=152   dispid=0x0000006E (110   ) PUT    Name([in] VT_BSTR arg0) -> VT_VOID
+  slot#20   oVft=160   dispid=0x000001F6 (502   ) GET    Next() -> VT_DISPATCH
+  slot#21   oVft=168   dispid=0x00000274 (628   ) GET    OnDoubleClick() -> VT_BSTR
+  slot#22   oVft=176   dispid=0x00000274 (628   ) PUT    OnDoubleClick([in] VT_BSTR arg0) -> VT_VOID
+  slot#23   oVft=184   dispid=0x00000407 (1031  ) GET    OnSheetActivate() -> VT_BSTR
+  slot#24   oVft=192   dispid=0x00000407 (1031  ) PUT    OnSheetActivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#25   oVft=200   dispid=0x00000439 (1081  ) GET    OnSheetDeactivate() -> VT_BSTR
+  slot#26   oVft=208   dispid=0x00000439 (1081  ) PUT    OnSheetDeactivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#27   oVft=216   dispid=0x000003E6 (998   ) GET    PageSetup() -> PageSetup*
+  slot#28   oVft=224   dispid=0x000001F7 (503   ) GET    Previous() -> VT_DISPATCH
+  slot#29   oVft=232   dispid=0x00000389 (905   ) FUNC   __PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate) -> VT_VOID
+  slot#30   oVft=240   dispid=0x00000119 (281   ) FUNC   PrintPreview([in,opt] VT_VARIANT EnableChanges) -> VT_VOID
+  slot#31   oVft=248   dispid=0x0000011A (282   ) FUNC   _Protect([in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT DrawingObjects, [in,opt] VT_VARIANT Contents, [in,opt] VT_VARIANT Scenarios, [in,opt] VT_VARIANT UserInterfaceOnly) -> VT_VOID
+  slot#32   oVft=256   dispid=0x00000124 (292   ) GET    ProtectContents() -> VT_BOOL
+  slot#33   oVft=264   dispid=0x00000125 (293   ) GET    ProtectDrawingObjects() -> VT_BOOL
+  slot#34   oVft=272   dispid=0x00000487 (1159  ) GET    ProtectionMode() -> VT_BOOL
+  slot#35   oVft=280   dispid=0x00000126 (294   ) GET    ProtectScenarios() -> VT_BOOL
+  slot#36   oVft=288   dispid=0x0000011C (284   ) FUNC   __SaveAs([in] VT_BSTR Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout) -> VT_VOID
+  slot#37   oVft=296   dispid=0x000000EB (235   ) FUNC   Select([in,opt] VT_VARIANT Replace) -> VT_VOID
+  slot#38   oVft=304   dispid=0x0000011D (285   ) FUNC   Unprotect([in,opt] VT_VARIANT Password) -> VT_VOID
+  slot#39   oVft=312   dispid=0x0000022E (558   ) GET    Visible() -> XlSheetVisibility
+  slot#40   oVft=320   dispid=0x0000022E (558   ) PUT    Visible([in] XlSheetVisibility arg0) -> VT_VOID
+  slot#41   oVft=328   dispid=0x00000561 (1377  ) GET    Shapes() -> Shapes*
+  slot#42   oVft=336   dispid=0x00000191 (401   ) GET    TransitionExpEval() -> VT_BOOL
+  slot#43   oVft=344   dispid=0x00000191 (401   ) PUT    TransitionExpEval([in] VT_BOOL arg0) -> VT_VOID
+  slot#44   oVft=352   dispid=0x000002F8 (760   ) FUNC   Arcs([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#45   oVft=360   dispid=0x00000318 (792   ) GET    AutoFilterMode() -> VT_BOOL
+  slot#46   oVft=368   dispid=0x00000318 (792   ) PUT    AutoFilterMode([in] VT_BOOL arg0) -> VT_VOID
+  slot#47   oVft=376   dispid=0x000004A4 (1188  ) FUNC   SetBackgroundPicture([in] VT_BSTR Filename) -> VT_VOID
+  slot#48   oVft=384   dispid=0x0000022D (557   ) FUNC   Buttons([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#49   oVft=392   dispid=0x00000117 (279   ) FUNC   Calculate() -> VT_VOID
+  slot#50   oVft=400   dispid=0x00000590 (1424  ) GET    EnableCalculation() -> VT_BOOL
+  slot#51   oVft=408   dispid=0x00000590 (1424  ) PUT    EnableCalculation([in] VT_BOOL arg0) -> VT_VOID
+  slot#52   oVft=416   dispid=0x000000EE (238   ) GET    Cells() -> Range*
+  slot#53   oVft=424   dispid=0x00000424 (1060  ) FUNC   ChartObjects([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#54   oVft=432   dispid=0x00000338 (824   ) FUNC   CheckBoxes([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#55   oVft=440   dispid=0x000001F9 (505   ) FUNC   CheckSpelling([in,opt] VT_VARIANT CustomDictionary, [in,opt] VT_VARIANT IgnoreUppercase, [in,opt] VT_VARIANT AlwaysSuggest, [in,opt] VT_VARIANT SpellLang) -> VT_VOID
+  slot#56   oVft=448   dispid=0x0000042D (1069  ) GET    CircularReference() -> Range*
+  slot#57   oVft=456   dispid=0x000003CA (970   ) FUNC   ClearArrows() -> VT_VOID
+  slot#58   oVft=464   dispid=0x000000F1 (241   ) GET    Columns() -> Range*
+  slot#59   oVft=472   dispid=0x00000315 (789   ) GET    ConsolidationFunction() -> XlConsolidationFunction
+  slot#60   oVft=480   dispid=0x00000316 (790   ) GET    ConsolidationOptions() -> VT_VARIANT
+  slot#61   oVft=488   dispid=0x00000317 (791   ) GET    ConsolidationSources() -> VT_VARIANT
+  slot#62   oVft=496   dispid=0x00000283 (643   ) GET    DisplayAutomaticPageBreaks() -> VT_BOOL
+  slot#63   oVft=504   dispid=0x00000283 (643   ) PUT    DisplayAutomaticPageBreaks([in] VT_BOOL arg0) -> VT_VOID
+  slot#64   oVft=512   dispid=0x00000304 (772   ) FUNC   Drawings([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#65   oVft=520   dispid=0x00000058 (88    ) FUNC   DrawingObjects([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#66   oVft=528   dispid=0x00000344 (836   ) FUNC   DropDowns([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#67   oVft=536   dispid=0x00000484 (1156  ) GET    EnableAutoFilter() -> VT_BOOL
+  slot#68   oVft=544   dispid=0x00000484 (1156  ) PUT    EnableAutoFilter([in] VT_BOOL arg0) -> VT_VOID
+  slot#69   oVft=552   dispid=0x00000591 (1425  ) GET    EnableSelection() -> XlEnableSelection
+  slot#70   oVft=560   dispid=0x00000591 (1425  ) PUT    EnableSelection([in] XlEnableSelection arg0) -> VT_VOID
+  slot#71   oVft=568   dispid=0x00000485 (1157  ) GET    EnableOutlining() -> VT_BOOL
+  slot#72   oVft=576   dispid=0x00000485 (1157  ) PUT    EnableOutlining([in] VT_BOOL arg0) -> VT_VOID
+  slot#73   oVft=584   dispid=0x00000486 (1158  ) GET    EnablePivotTable() -> VT_BOOL
+  slot#74   oVft=592   dispid=0x00000486 (1158  ) PUT    EnablePivotTable([in] VT_BOOL arg0) -> VT_VOID
+  slot#75   oVft=600   dispid=0x00000001 (1     ) FUNC   Evaluate([in] VT_VARIANT Name) -> VT_VARIANT
+  slot#76   oVft=608   dispid=0xFFFFFFFB (-5    ) FUNC   _Evaluate([in] VT_VARIANT Name) -> VT_VARIANT
+  slot#77   oVft=616   dispid=0x00000320 (800   ) GET    FilterMode() -> VT_BOOL
+  slot#78   oVft=624   dispid=0x00000592 (1426  ) FUNC   ResetAllPageBreaks() -> VT_VOID
+  slot#79   oVft=632   dispid=0x00000342 (834   ) FUNC   GroupBoxes([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#80   oVft=640   dispid=0x00000459 (1113  ) FUNC   GroupObjects([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#81   oVft=648   dispid=0x00000349 (841   ) FUNC   Labels([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#82   oVft=656   dispid=0x000002FF (767   ) FUNC   Lines([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#83   oVft=664   dispid=0x00000340 (832   ) FUNC   ListBoxes([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#84   oVft=672   dispid=0x000001BA (442   ) GET    Names() -> Names*
+  slot#85   oVft=680   dispid=0x0000031F (799   ) FUNC   OLEObjects([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#86   oVft=688   dispid=0x00000271 (625   ) GET    OnCalculate() -> VT_BSTR
+  slot#87   oVft=696   dispid=0x00000271 (625   ) PUT    OnCalculate([in] VT_BSTR arg0) -> VT_VOID
+  slot#88   oVft=704   dispid=0x00000275 (629   ) GET    OnData() -> VT_BSTR
+  slot#89   oVft=712   dispid=0x00000275 (629   ) PUT    OnData([in] VT_BSTR arg0) -> VT_VOID
+  slot#90   oVft=720   dispid=0x00000273 (627   ) GET    OnEntry() -> VT_BSTR
+  slot#91   oVft=728   dispid=0x00000273 (627   ) PUT    OnEntry([in] VT_BSTR arg0) -> VT_VOID
+  slot#92   oVft=736   dispid=0x0000033A (826   ) FUNC   OptionButtons([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#93   oVft=744   dispid=0x00000066 (102   ) GET    Outline() -> Outline*
+  slot#94   oVft=752   dispid=0x00000321 (801   ) FUNC   Ovals([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#95   oVft=760   dispid=0x000000D3 (211   ) FUNC   Paste([in,opt] VT_VARIANT Destination, [in,opt] VT_VARIANT Link) -> VT_VOID
+  slot#96   oVft=768   dispid=0x00000403 (1027  ) FUNC   _PasteSpecial([in,opt] VT_VARIANT Format, [in,opt] VT_VARIANT Link, [in,opt] VT_VARIANT DisplayAsIcon, [in,opt] VT_VARIANT IconFileName, [in,opt] VT_VARIANT IconIndex, [in,opt] VT_VARIANT IconLabel) -> VT_VOID
+  slot#97   oVft=776   dispid=0x00000303 (771   ) FUNC   Pictures([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#98   oVft=784   dispid=0x000002B2 (690   ) FUNC   PivotTables([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#99   oVft=792   dispid=0x000002AC (684   ) FUNC   PivotTableWizard([in,opt] VT_VARIANT SourceType, [in,opt] VT_VARIANT SourceData, [in,opt] VT_VARIANT TableDestination, [in,opt] VT_VARIANT TableName, [in,opt] VT_VARIANT RowGrand, [in,opt] VT_VARIANT ColumnGrand, [in,opt] VT_VARIANT SaveData, [in,opt] VT_VARIANT HasAutoFormat, [in,opt] VT_VARIANT AutoPage, [in,opt] VT_VARIANT Reserved, [in,opt] VT_VARIANT BackgroundQuery, [in,opt] VT_VARIANT OptimizeCache, [in,opt] VT_VARIANT PageFieldOrder, [in,opt] VT_VARIANT PageFieldWrapCount, [in,opt] VT_VARIANT ReadData, [in,opt] VT_VARIANT Connection) -> PivotTable*
+  slot#100  oVft=800   dispid=0x000000C5 (197   ) GET    Range([in] VT_VARIANT Cell1, [in,opt] VT_VARIANT Cell2) -> Range*
+  slot#101  oVft=808   dispid=0x00000306 (774   ) FUNC   Rectangles([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#102  oVft=816   dispid=0x00000102 (258   ) GET    Rows() -> Range*
+  slot#103  oVft=824   dispid=0x0000038C (908   ) FUNC   Scenarios([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#104  oVft=832   dispid=0x00000599 (1433  ) GET    ScrollArea() -> VT_BSTR
+  slot#105  oVft=840   dispid=0x00000599 (1433  ) PUT    ScrollArea([in] VT_BSTR arg0) -> VT_VOID
+  slot#106  oVft=848   dispid=0x0000033E (830   ) FUNC   ScrollBars([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#107  oVft=856   dispid=0x0000031A (794   ) FUNC   ShowAllData() -> VT_VOID
+  slot#108  oVft=864   dispid=0x00000199 (409   ) FUNC   ShowDataForm() -> VT_VOID
+  slot#109  oVft=872   dispid=0x00000346 (838   ) FUNC   Spinners([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#110  oVft=880   dispid=0x00000197 (407   ) GET    StandardHeight() -> VT_R8
+  slot#111  oVft=888   dispid=0x00000198 (408   ) GET    StandardWidth() -> VT_R8
+  slot#112  oVft=896   dispid=0x00000198 (408   ) PUT    StandardWidth([in] VT_R8 arg0) -> VT_VOID
+  slot#113  oVft=904   dispid=0x00000309 (777   ) FUNC   TextBoxes([in,opt] VT_VARIANT Index) -> VT_DISPATCH
+  slot#114  oVft=912   dispid=0x00000192 (402   ) GET    TransitionFormEntry() -> VT_BOOL
+  slot#115  oVft=920   dispid=0x00000192 (402   ) PUT    TransitionFormEntry([in] VT_BOOL arg0) -> VT_VOID
+  slot#116  oVft=928   dispid=0x0000006C (108   ) GET    Type() -> XlSheetType
+  slot#117  oVft=936   dispid=0x0000019C (412   ) GET    UsedRange() -> Range*
+  slot#118  oVft=944   dispid=0x0000058A (1418  ) GET    HPageBreaks() -> HPageBreaks*
+  slot#119  oVft=952   dispid=0x0000058B (1419  ) GET    VPageBreaks() -> VPageBreaks*
+  slot#120  oVft=960   dispid=0x0000059A (1434  ) GET    QueryTables() -> QueryTables*
+  slot#121  oVft=968   dispid=0x0000059B (1435  ) GET    DisplayPageBreaks() -> VT_BOOL
+  slot#122  oVft=976   dispid=0x0000059B (1435  ) PUT    DisplayPageBreaks([in] VT_BOOL arg0) -> VT_VOID
+  slot#123  oVft=984   dispid=0x0000023F (575   ) GET    Comments() -> Comments*
+  slot#124  oVft=992   dispid=0x00000571 (1393  ) GET    Hyperlinks() -> Hyperlinks*
+  slot#125  oVft=1000  dispid=0x0000059C (1436  ) FUNC   ClearCircles() -> VT_VOID
+  slot#126  oVft=1008  dispid=0x0000059D (1437  ) FUNC   CircleInvalid() -> VT_VOID
+  slot#127  oVft=1016  dispid=0x00000288 (648   ) GET    _DisplayRightToLeft() -> VT_I4
+  slot#128  oVft=1024  dispid=0x00000288 (648   ) PUT    _DisplayRightToLeft([in] VT_I4 arg0) -> VT_VOID
+  slot#129  oVft=1032  dispid=0x00000319 (793   ) GET    _AutoFilter() -> AutoFilter*
+  slot#130  oVft=1040  dispid=0x000006EE (1774  ) GET    DisplayRightToLeft() -> VT_BOOL
+  slot#131  oVft=1048  dispid=0x000006EE (1774  ) PUT    DisplayRightToLeft([in] VT_BOOL arg0) -> VT_VOID
+  slot#132  oVft=1056  dispid=0x00000718 (1816  ) GET    Scripts() -> Scripts*
+  slot#133  oVft=1064  dispid=0x000006EC (1772  ) FUNC   _PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName) -> VT_VOID
+  slot#134  oVft=1072  dispid=0x00000719 (1817  ) FUNC   _CheckSpelling([in,opt] VT_VARIANT CustomDictionary, [in,opt] VT_VARIANT IgnoreUppercase, [in,opt] VT_VARIANT AlwaysSuggest, [in,opt] VT_VARIANT SpellLang, [in,opt] VT_VARIANT IgnoreFinalYaa, [in,opt] VT_VARIANT SpellScript) -> VT_VOID
+  slot#135  oVft=1080  dispid=0x00000411 (1041  ) GET    Tab() -> Tab*
+  slot#136  oVft=1088  dispid=0x000007E5 (2021  ) GET    MailEnvelope() -> MsoEnvelope*
+  slot#137  oVft=1096  dispid=0x00000785 (1925  ) FUNC   _SaveAs([in] VT_BSTR Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT Local) -> VT_VOID
+  slot#138  oVft=1104  dispid=0x000007EE (2030  ) GET    CustomProperties() -> CustomProperties*
+  slot#139  oVft=1112  dispid=0x000007E0 (2016  ) GET    SmartTags() -> SmartTags*
+  slot#140  oVft=1120  dispid=0x000000B0 (176   ) GET    Protection() -> Protection*
+  slot#141  oVft=1128  dispid=0x00000788 (1928  ) FUNC   PasteSpecial([in,opt] VT_VARIANT Format, [in,opt] VT_VARIANT Link, [in,opt] VT_VARIANT DisplayAsIcon, [in,opt] VT_VARIANT IconFileName, [in,opt] VT_VARIANT IconIndex, [in,opt] VT_VARIANT IconLabel, [in,opt] VT_VARIANT NoHTMLFormatting) -> VT_VOID
+  slot#142  oVft=1136  dispid=0x000007ED (2029  ) FUNC   Protect([in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT DrawingObjects, [in,opt] VT_VARIANT Contents, [in,opt] VT_VARIANT Scenarios, [in,opt] VT_VARIANT UserInterfaceOnly, [in,opt] VT_VARIANT AllowFormattingCells, [in,opt] VT_VARIANT AllowFormattingColumns, [in,opt] VT_VARIANT AllowFormattingRows, [in,opt] VT_VARIANT AllowInsertingColumns, [in,opt] VT_VARIANT AllowInsertingRows, [in,opt] VT_VARIANT AllowInsertingHyperlinks, [in,opt] VT_VARIANT AllowDeletingColumns, [in,opt] VT_VARIANT AllowDeletingRows, [in,opt] VT_VARIANT AllowSorting, [in,opt] VT_VARIANT AllowFiltering, [in,opt] VT_VARIANT AllowUsingPivotTables) -> VT_VOID
+  slot#143  oVft=1144  dispid=0x000008D3 (2259  ) GET    ListObjects() -> ListObjects*
+  slot#144  oVft=1152  dispid=0x000008D4 (2260  ) FUNC   XmlDataQuery([in] VT_BSTR XPath, [in,opt] VT_VARIANT SelectionNamespaces, [in,opt] VT_VARIANT Map) -> Range*
+  slot#145  oVft=1160  dispid=0x000008D7 (2263  ) FUNC   XmlMapQuery([in] VT_BSTR XPath, [in,opt] VT_VARIANT SelectionNamespaces, [in,opt] VT_VARIANT Map) -> Range*
+  slot#146  oVft=1168  dispid=0x00000939 (2361  ) FUNC   PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName, [in,opt] VT_VARIANT IgnorePrintAreas) -> VT_VOID
+  slot#147  oVft=1176  dispid=0x000009CF (2511  ) GET    EnableFormatConditionsCalculation() -> VT_BOOL
+  slot#148  oVft=1184  dispid=0x000009CF (2511  ) PUT    EnableFormatConditionsCalculation([in] VT_BOOL arg0) -> VT_VOID
+  slot#149  oVft=1192  dispid=0x00000370 (880   ) GET    _Sort() -> Sort*
+  slot#150  oVft=1200  dispid=0x000009BD (2493  ) FUNC   _ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr) -> VT_VOID
+  slot#151  oVft=1208  dispid=0x00000B29 (2857  ) GET    PrintedCommentPages() -> VT_I4
+  slot#152  oVft=1216  dispid=0x00000C67 (3175  ) FUNC   ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr, [in,opt] VT_VARIANT WorkIdentity) -> VT_VOID
+  slot#153  oVft=1224  dispid=0x00000C66 (3174  ) FUNC   SaveAs([in] VT_BSTR Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT Local) -> VT_VOID
+  slot#154  oVft=1232  dispid=0x00000CD2 (3282  ) GET    CommentsThreaded() -> CommentsThreaded*
+  slot#155  oVft=1240  dispid=0x00000CD9 (3289  ) GET    AutoFilter() -> AutoFilter*
+  slot#156  oVft=1248  dispid=0x00000CD8 (3288  ) GET    Sort() -> Sort*
+  slot#157  oVft=1256  dispid=0x00000CED (3309  ) GET    NamedSheetViews() -> NamedSheetViewCollection*
+====================================================================================================
+INTERFACE _Workbook  IID={000208DA-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=287  cbSizeVft=56  wTypeFlags=0x1040
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x000005A1 (1441  ) GET    AcceptLabelsInFormulas() -> VT_BOOL
+  slot#11   oVft=88    dispid=0x000005A1 (1441  ) PUT    AcceptLabelsInFormulas([in] VT_BOOL arg0) -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000130 (304   ) FUNC   Activate() -> VT_VOID
+  slot#13   oVft=104   dispid=0x000000B7 (183   ) GET    ActiveChart() -> Chart*
+  slot#14   oVft=112   dispid=0x00000133 (307   ) GET    ActiveSheet() -> VT_DISPATCH
+  slot#15   oVft=120   dispid=0x0000023E (574   ) GET    Author() -> VT_BSTR
+  slot#16   oVft=128   dispid=0x0000023E (574   ) PUT    Author([in] VT_BSTR arg0) -> VT_VOID
+  slot#17   oVft=136   dispid=0x000005A2 (1442  ) GET    AutoUpdateFrequency() -> VT_I4
+  slot#18   oVft=144   dispid=0x000005A2 (1442  ) PUT    AutoUpdateFrequency([in] VT_I4 arg0) -> VT_VOID
+  slot#19   oVft=152   dispid=0x000005A3 (1443  ) GET    AutoUpdateSaveChanges() -> VT_BOOL
+  slot#20   oVft=160   dispid=0x000005A3 (1443  ) PUT    AutoUpdateSaveChanges([in] VT_BOOL arg0) -> VT_VOID
+  slot#21   oVft=168   dispid=0x000005A4 (1444  ) GET    ChangeHistoryDuration() -> VT_I4
+  slot#22   oVft=176   dispid=0x000005A4 (1444  ) PUT    ChangeHistoryDuration([in] VT_I4 arg0) -> VT_VOID
+  slot#23   oVft=184   dispid=0x00000498 (1176  ) GET    BuiltinDocumentProperties() -> VT_DISPATCH
+  slot#24   oVft=192   dispid=0x000003DD (989   ) FUNC   ChangeFileAccess([in] XlFileAccess Mode, [in,opt] VT_VARIANT WritePassword, [in,opt] VT_VARIANT Notify) -> VT_VOID
+  slot#25   oVft=200   dispid=0x00000322 (802   ) FUNC   ChangeLink([in] VT_BSTR Name, [in] VT_BSTR NewName, [in,opt] XlLinkType Type) -> VT_VOID
+  slot#26   oVft=208   dispid=0x00000079 (121   ) GET    Charts() -> Sheets*
+  slot#27   oVft=216   dispid=0x00000115 (277   ) FUNC   Close([in,opt] VT_VARIANT SaveChanges, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT RouteWorkbook) -> VT_VOID
+  slot#28   oVft=224   dispid=0x0000055D (1373  ) GET    CodeName() -> VT_BSTR
+  slot#29   oVft=232   dispid=0x80010000 (-2147418112) GET    _CodeName() -> VT_BSTR
+  slot#30   oVft=240   dispid=0x80010000 (-2147418112) PUT    _CodeName([in] VT_BSTR arg0) -> VT_VOID
+  slot#31   oVft=248   dispid=0x0000011E (286   ) GET    Colors([in,opt] VT_VARIANT Index) -> VT_VARIANT
+  slot#32   oVft=256   dispid=0x0000011E (286   ) PUT    Colors([in,opt] VT_VARIANT Index, [in] VT_VARIANT arg1) -> VT_VOID
+  slot#33   oVft=264   dispid=0x0000059F (1439  ) GET    CommandBars() -> CommandBars*
+  slot#34   oVft=272   dispid=0x0000023F (575   ) GET    Comments() -> VT_BSTR
+  slot#35   oVft=280   dispid=0x0000023F (575   ) PUT    Comments([in] VT_BSTR arg0) -> VT_VOID
+  slot#36   oVft=288   dispid=0x00000497 (1175  ) GET    ConflictResolution() -> XlSaveConflictResolution
+  slot#37   oVft=296   dispid=0x00000497 (1175  ) PUT    ConflictResolution([in] XlSaveConflictResolution arg0) -> VT_VOID
+  slot#38   oVft=304   dispid=0x000004A6 (1190  ) GET    Container() -> VT_DISPATCH
+  slot#39   oVft=312   dispid=0x0000011F (287   ) GET    CreateBackup() -> VT_BOOL
+  slot#40   oVft=320   dispid=0x00000499 (1177  ) GET    CustomDocumentProperties() -> VT_DISPATCH
+  slot#41   oVft=328   dispid=0x00000193 (403   ) GET    Date1904() -> VT_BOOL
+  slot#42   oVft=336   dispid=0x00000193 (403   ) PUT    Date1904([in] VT_BOOL arg0) -> VT_VOID
+  slot#43   oVft=344   dispid=0x0000018D (397   ) FUNC   DeleteNumberFormat([in] VT_BSTR NumberFormat) -> VT_VOID
+  slot#44   oVft=352   dispid=0x000002FC (764   ) GET    DialogSheets() -> Sheets*
+  slot#45   oVft=360   dispid=0x00000194 (404   ) GET    DisplayDrawingObjects() -> XlDisplayDrawingObjects
+  slot#46   oVft=368   dispid=0x00000194 (404   ) PUT    DisplayDrawingObjects([in] XlDisplayDrawingObjects arg0) -> VT_VOID
+  slot#47   oVft=376   dispid=0x00000490 (1168  ) FUNC   ExclusiveAccess() -> VT_BOOL
+  slot#48   oVft=384   dispid=0x00000120 (288   ) GET    FileFormat() -> XlFileFormat
+  slot#49   oVft=392   dispid=0x000003CD (973   ) FUNC   ForwardMailer() -> VT_VOID
+  slot#50   oVft=400   dispid=0x00000121 (289   ) GET    FullName() -> VT_BSTR
+  slot#51   oVft=408   dispid=0x000003D0 (976   ) GET    HasMailer() -> VT_BOOL
+  slot#52   oVft=416   dispid=0x000003D0 (976   ) PUT    HasMailer([in] VT_BOOL arg0) -> VT_VOID
+  slot#53   oVft=424   dispid=0x00000122 (290   ) GET    HasPassword() -> VT_BOOL
+  slot#54   oVft=432   dispid=0x000003B6 (950   ) GET    HasRoutingSlip() -> VT_BOOL
+  slot#55   oVft=440   dispid=0x000003B6 (950   ) PUT    HasRoutingSlip([in] VT_BOOL arg0) -> VT_VOID
+  slot#56   oVft=448   dispid=0x000005A5 (1445  ) GET    IsAddin() -> VT_BOOL
+  slot#57   oVft=456   dispid=0x000005A5 (1445  ) PUT    IsAddin([in] VT_BOOL arg0) -> VT_VOID
+  slot#58   oVft=464   dispid=0x00000241 (577   ) GET    Keywords() -> VT_BSTR
+  slot#59   oVft=472   dispid=0x00000241 (577   ) PUT    Keywords([in] VT_BSTR arg0) -> VT_VOID
+  slot#60   oVft=480   dispid=0x00000327 (807   ) FUNC   LinkInfo([in] VT_BSTR Name, [in] XlLinkInfo LinkInfo, [in,opt] VT_VARIANT Type, [in,opt] VT_VARIANT EditionRef) -> VT_VARIANT
+  slot#61   oVft=488   dispid=0x00000328 (808   ) FUNC   LinkSources([in,opt] VT_VARIANT Type) -> VT_VARIANT
+  slot#62   oVft=496   dispid=0x000003D3 (979   ) GET    Mailer() -> Mailer*
+  slot#63   oVft=504   dispid=0x000005A6 (1446  ) FUNC   MergeWorkbook([in] VT_VARIANT Filename) -> VT_VOID
+  slot#64   oVft=512   dispid=0x00000246 (582   ) GET    Modules() -> Sheets*
+  slot#65   oVft=520   dispid=0x00000491 (1169  ) GET    MultiUserEditing() -> VT_BOOL
+  slot#66   oVft=528   dispid=0x0000006E (110   ) GET    Name() -> VT_BSTR
+  slot#67   oVft=536   dispid=0x000001BA (442   ) GET    Names() -> Names*
+  slot#68   oVft=544   dispid=0x00000118 (280   ) FUNC   NewWindow() -> Window*
+  slot#69   oVft=552   dispid=0x0000049A (1178  ) GET    OnSave() -> VT_BSTR
+  slot#70   oVft=560   dispid=0x0000049A (1178  ) PUT    OnSave([in] VT_BSTR arg0) -> VT_VOID
+  slot#71   oVft=568   dispid=0x00000407 (1031  ) GET    OnSheetActivate() -> VT_BSTR
+  slot#72   oVft=576   dispid=0x00000407 (1031  ) PUT    OnSheetActivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#73   oVft=584   dispid=0x00000439 (1081  ) GET    OnSheetDeactivate() -> VT_BSTR
+  slot#74   oVft=592   dispid=0x00000439 (1081  ) PUT    OnSheetDeactivate([in] VT_BSTR arg0) -> VT_VOID
+  slot#75   oVft=600   dispid=0x00000323 (803   ) FUNC   OpenLinks([in] VT_BSTR Name, [in,opt] VT_VARIANT ReadOnly, [in,opt] VT_VARIANT Type) -> VT_VOID
+  slot#76   oVft=608   dispid=0x00000123 (291   ) GET    Path() -> VT_BSTR
+  slot#77   oVft=616   dispid=0x000005A7 (1447  ) GET    PersonalViewListSettings() -> VT_BOOL
+  slot#78   oVft=624   dispid=0x000005A7 (1447  ) PUT    PersonalViewListSettings([in] VT_BOOL arg0) -> VT_VOID
+  slot#79   oVft=632   dispid=0x000005A8 (1448  ) GET    PersonalViewPrintSettings() -> VT_BOOL
+  slot#80   oVft=640   dispid=0x000005A8 (1448  ) PUT    PersonalViewPrintSettings([in] VT_BOOL arg0) -> VT_VOID
+  slot#81   oVft=648   dispid=0x000005A9 (1449  ) FUNC   PivotCaches() -> PivotCaches*
+  slot#82   oVft=656   dispid=0x0000048E (1166  ) FUNC   Post([in,opt] VT_VARIANT DestName) -> VT_VOID
+  slot#83   oVft=664   dispid=0x00000195 (405   ) GET    PrecisionAsDisplayed() -> VT_BOOL
+  slot#84   oVft=672   dispid=0x00000195 (405   ) PUT    PrecisionAsDisplayed([in] VT_BOOL arg0) -> VT_VOID
+  slot#85   oVft=680   dispid=0x00000389 (905   ) FUNC   __PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate) -> VT_VOID
+  slot#86   oVft=688   dispid=0x00000119 (281   ) FUNC   PrintPreview([in,opt] VT_VARIANT EnableChanges) -> VT_VOID
+  slot#87   oVft=696   dispid=0x0000011A (282   ) FUNC   _Protect([in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT Structure, [in,opt] VT_VARIANT Windows) -> VT_VOID
+  slot#88   oVft=704   dispid=0x000005AA (1450  ) FUNC   _ProtectSharing([in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] VT_VARIANT SharingPassword) -> VT_VOID
+  slot#89   oVft=712   dispid=0x0000024C (588   ) GET    ProtectStructure() -> VT_BOOL
+  slot#90   oVft=720   dispid=0x00000127 (295   ) GET    ProtectWindows() -> VT_BOOL
+  slot#91   oVft=728   dispid=0x00000128 (296   ) GET    ReadOnly() -> VT_BOOL
+  slot#92   oVft=736   dispid=0x00000129 (297   ) GET    _ReadOnlyRecommended() -> VT_BOOL
+  slot#93   oVft=744   dispid=0x000005AC (1452  ) FUNC   RefreshAll() -> VT_VOID
+  slot#94   oVft=752   dispid=0x000003D1 (977   ) FUNC   Reply() -> VT_VOID
+  slot#95   oVft=760   dispid=0x000003D2 (978   ) FUNC   ReplyAll() -> VT_VOID
+  slot#96   oVft=768   dispid=0x000005AD (1453  ) FUNC   RemoveUser([in] VT_I4 Index) -> VT_VOID
+  slot#97   oVft=776   dispid=0x00000494 (1172  ) GET    RevisionNumber() -> VT_I4
+  slot#98   oVft=784   dispid=0x000003B2 (946   ) FUNC   Route() -> VT_VOID
+  slot#99   oVft=792   dispid=0x000003B7 (951   ) GET    Routed() -> VT_BOOL
+  slot#100  oVft=800   dispid=0x000003B5 (949   ) GET    RoutingSlip() -> RoutingSlip*
+  slot#101  oVft=808   dispid=0x0000027A (634   ) FUNC   RunAutoMacros([in] XlRunAutoMacro Which) -> VT_VOID
+  slot#102  oVft=816   dispid=0x0000011B (283   ) FUNC   Save() -> VT_VOID
+  slot#103  oVft=824   dispid=0x0000011C (284   ) FUNC   __SaveAs([in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] XlSaveAsAccessMode AccessMode, [in,opt] VT_VARIANT ConflictResolution, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout) -> VT_VOID
+  slot#104  oVft=832   dispid=0x000000AF (175   ) FUNC   SaveCopyAs([in,opt] VT_VARIANT Filename) -> VT_VOID
+  slot#105  oVft=840   dispid=0x0000012A (298   ) GET    Saved() -> VT_BOOL
+  slot#106  oVft=848   dispid=0x0000012A (298   ) PUT    Saved([in] VT_BOOL arg0) -> VT_VOID
+  slot#107  oVft=856   dispid=0x00000196 (406   ) GET    SaveLinkValues() -> VT_BOOL
+  slot#108  oVft=864   dispid=0x00000196 (406   ) PUT    SaveLinkValues([in] VT_BOOL arg0) -> VT_VOID
+  slot#109  oVft=872   dispid=0x000003B3 (947   ) FUNC   SendMail([in] VT_VARIANT Recipients, [in,opt] VT_VARIANT Subject, [in,opt] VT_VARIANT ReturnReceipt) -> VT_VOID
+  slot#110  oVft=880   dispid=0x000003D4 (980   ) FUNC   SendMailer([in,opt] VT_VARIANT FileFormat, [in,opt] XlPriority Priority) -> VT_VOID
+  slot#111  oVft=888   dispid=0x00000329 (809   ) FUNC   SetLinkOnData([in] VT_BSTR Name, [in,opt] VT_VARIANT Procedure) -> VT_VOID
+  slot#112  oVft=896   dispid=0x000001E5 (485   ) GET    Sheets() -> Sheets*
+  slot#113  oVft=904   dispid=0x00000493 (1171  ) GET    ShowConflictHistory() -> VT_BOOL
+  slot#114  oVft=912   dispid=0x00000493 (1171  ) PUT    ShowConflictHistory([in] VT_BOOL arg0) -> VT_VOID
+  slot#115  oVft=920   dispid=0x000001ED (493   ) GET    Styles() -> Styles*
+  slot#116  oVft=928   dispid=0x000003B9 (953   ) GET    Subject() -> VT_BSTR
+  slot#117  oVft=936   dispid=0x000003B9 (953   ) PUT    Subject([in] VT_BSTR arg0) -> VT_VOID
+  slot#118  oVft=944   dispid=0x000000C7 (199   ) GET    Title() -> VT_BSTR
+  slot#119  oVft=952   dispid=0x000000C7 (199   ) PUT    Title([in] VT_BSTR arg0) -> VT_VOID
+  slot#120  oVft=960   dispid=0x0000011D (285   ) FUNC   Unprotect([in,opt] VT_VARIANT Password) -> VT_VOID
+  slot#121  oVft=968   dispid=0x000005AF (1455  ) FUNC   UnprotectSharing([in,opt] VT_VARIANT SharingPassword) -> VT_VOID
+  slot#122  oVft=976   dispid=0x000003E3 (995   ) FUNC   UpdateFromFile() -> VT_VOID
+  slot#123  oVft=984   dispid=0x00000324 (804   ) FUNC   UpdateLink([in,opt] VT_VARIANT Name, [in,opt] VT_VARIANT Type) -> VT_VOID
+  slot#124  oVft=992   dispid=0x0000019B (411   ) GET    UpdateRemoteReferences() -> VT_BOOL
+  slot#125  oVft=1000  dispid=0x0000019B (411   ) PUT    UpdateRemoteReferences([in] VT_BOOL arg0) -> VT_VOID
+  slot#126  oVft=1008  dispid=0x000004BA (1210  ) GET    UserControl() -> VT_BOOL
+  slot#127  oVft=1016  dispid=0x000004BA (1210  ) PUT    UserControl([in] VT_BOOL arg0) -> VT_VOID
+  slot#128  oVft=1024  dispid=0x00000495 (1173  ) GET    UserStatus() -> VT_VARIANT
+  slot#129  oVft=1032  dispid=0x000005B0 (1456  ) GET    CustomViews() -> CustomViews*
+  slot#130  oVft=1040  dispid=0x000001AE (430   ) GET    Windows() -> Windows*
+  slot#131  oVft=1048  dispid=0x000001EE (494   ) GET    Worksheets() -> Sheets*
+  slot#132  oVft=1056  dispid=0x0000012B (299   ) GET    WriteReserved() -> VT_BOOL
+  slot#133  oVft=1064  dispid=0x0000012C (300   ) GET    WriteReservedBy() -> VT_BSTR
+  slot#134  oVft=1072  dispid=0x00000245 (581   ) GET    Excel4IntlMacroSheets() -> Sheets*
+  slot#135  oVft=1080  dispid=0x00000243 (579   ) GET    Excel4MacroSheets() -> Sheets*
+  slot#136  oVft=1088  dispid=0x000005B1 (1457  ) GET    TemplateRemoveExtData() -> VT_BOOL
+  slot#137  oVft=1096  dispid=0x000005B1 (1457  ) PUT    TemplateRemoveExtData([in] VT_BOOL arg0) -> VT_VOID
+  slot#138  oVft=1104  dispid=0x000005B2 (1458  ) FUNC   HighlightChangesOptions([in,opt] VT_VARIANT When, [in,opt] VT_VARIANT Who, [in,opt] VT_VARIANT Where) -> VT_VOID
+  slot#139  oVft=1112  dispid=0x000005B5 (1461  ) GET    HighlightChangesOnScreen() -> VT_BOOL
+  slot#140  oVft=1120  dispid=0x000005B5 (1461  ) PUT    HighlightChangesOnScreen([in] VT_BOOL arg0) -> VT_VOID
+  slot#141  oVft=1128  dispid=0x000005B6 (1462  ) GET    KeepChangeHistory() -> VT_BOOL
+  slot#142  oVft=1136  dispid=0x000005B6 (1462  ) PUT    KeepChangeHistory([in] VT_BOOL arg0) -> VT_VOID
+  slot#143  oVft=1144  dispid=0x000005B7 (1463  ) GET    ListChangesOnNewSheet() -> VT_BOOL
+  slot#144  oVft=1152  dispid=0x000005B7 (1463  ) PUT    ListChangesOnNewSheet([in] VT_BOOL arg0) -> VT_VOID
+  slot#145  oVft=1160  dispid=0x000005B8 (1464  ) FUNC   PurgeChangeHistoryNow([in] VT_I4 Days, [in,opt] VT_VARIANT SharingPassword) -> VT_VOID
+  slot#146  oVft=1168  dispid=0x000005BA (1466  ) FUNC   AcceptAllChanges([in,opt] VT_VARIANT When, [in,opt] VT_VARIANT Who, [in,opt] VT_VARIANT Where) -> VT_VOID
+  slot#147  oVft=1176  dispid=0x000005BB (1467  ) FUNC   RejectAllChanges([in,opt] VT_VARIANT When, [in,opt] VT_VARIANT Who, [in,opt] VT_VARIANT Where) -> VT_VOID
+  slot#148  oVft=1184  dispid=0x000002AC (684   ) FUNC   PivotTableWizard([in,opt] VT_VARIANT SourceType, [in,opt] VT_VARIANT SourceData, [in,opt] VT_VARIANT TableDestination, [in,opt] VT_VARIANT TableName, [in,opt] VT_VARIANT RowGrand, [in,opt] VT_VARIANT ColumnGrand, [in,opt] VT_VARIANT SaveData, [in,opt] VT_VARIANT HasAutoFormat, [in,opt] VT_VARIANT AutoPage, [in,opt] VT_VARIANT Reserved, [in,opt] VT_VARIANT BackgroundQuery, [in,opt] VT_VARIANT OptimizeCache, [in,opt] VT_VARIANT PageFieldOrder, [in,opt] VT_VARIANT PageFieldWrapCount, [in,opt] VT_VARIANT ReadData, [in,opt] VT_VARIANT Connection) -> VT_VOID
+  slot#149  oVft=1192  dispid=0x000005BC (1468  ) FUNC   ResetColors() -> VT_VOID
+  slot#150  oVft=1200  dispid=0x000005BD (1469  ) GET    VBProject() -> VBProject*
+  slot#151  oVft=1208  dispid=0x000005BE (1470  ) FUNC   FollowHyperlink([in] VT_BSTR Address, [in,opt] VT_VARIANT SubAddress, [in,opt] VT_VARIANT NewWindow, [in,opt] VT_VARIANT AddHistory, [in,opt] VT_VARIANT ExtraInfo, [in,opt] VT_VARIANT Method, [in,opt] VT_VARIANT HeaderInfo) -> VT_VOID
+  slot#152  oVft=1216  dispid=0x000005C4 (1476  ) FUNC   AddToFavorites() -> VT_VOID
+  slot#153  oVft=1224  dispid=0x000006E9 (1769  ) GET    IsInplace() -> VT_BOOL
+  slot#154  oVft=1232  dispid=0x000006EC (1772  ) FUNC   _PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName) -> VT_VOID
+  slot#155  oVft=1240  dispid=0x0000071A (1818  ) FUNC   WebPagePreview() -> VT_VOID
+  slot#156  oVft=1248  dispid=0x0000071B (1819  ) GET    PublishObjects() -> PublishObjects*
+  slot#157  oVft=1256  dispid=0x0000071C (1820  ) GET    WebOptions() -> WebOptions*
+  slot#158  oVft=1264  dispid=0x0000071D (1821  ) FUNC   ReloadAs([in] MsoEncoding Encoding) -> VT_VOID
+  slot#159  oVft=1272  dispid=0x0000071F (1823  ) GET    HTMLProject() -> HTMLProject*
+  slot#160  oVft=1280  dispid=0x00000720 (1824  ) GET    EnvelopeVisible() -> VT_BOOL
+  slot#161  oVft=1288  dispid=0x00000720 (1824  ) PUT    EnvelopeVisible([in] VT_BOOL arg0) -> VT_VOID
+  slot#162  oVft=1296  dispid=0x0000070E (1806  ) GET    CalculationVersion() -> VT_I4
+  slot#163  oVft=1304  dispid=0x000007FC (2044  ) FUNC   Dummy17([in] VT_I4 calcid) -> VT_VOID
+  slot#164  oVft=1312  dispid=0x00000722 (1826  ) FUNC   sblt([in] VT_BSTR s) -> VT_VOID
+  slot#165  oVft=1320  dispid=0x00000724 (1828  ) GET    VBASigned() -> VT_BOOL
+  slot#166  oVft=1328  dispid=0x000007FE (2046  ) GET    ShowPivotTableFieldList() -> VT_BOOL
+  slot#167  oVft=1336  dispid=0x000007FE (2046  ) PUT    ShowPivotTableFieldList([in] VT_BOOL arg0) -> VT_VOID
+  slot#168  oVft=1344  dispid=0x00000360 (864   ) GET    UpdateLinks() -> XlUpdateLinks
+  slot#169  oVft=1352  dispid=0x00000360 (864   ) PUT    UpdateLinks([in] XlUpdateLinks arg0) -> VT_VOID
+  slot#170  oVft=1360  dispid=0x000007FF (2047  ) FUNC   BreakLink([in] VT_BSTR Name, [in] XlLinkType Type) -> VT_VOID
+  slot#171  oVft=1368  dispid=0x00000800 (2048  ) FUNC   Dummy16() -> VT_VOID
+  slot#172  oVft=1376  dispid=0x00000785 (1925  ) FUNC   _SaveAs([in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] XlSaveAsAccessMode AccessMode, [in,opt] VT_VARIANT ConflictResolution, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT Local) -> VT_VOID
+  slot#173  oVft=1384  dispid=0x00000801 (2049  ) GET    EnableAutoRecover() -> VT_BOOL
+  slot#174  oVft=1392  dispid=0x00000801 (2049  ) PUT    EnableAutoRecover([in] VT_BOOL arg0) -> VT_VOID
+  slot#175  oVft=1400  dispid=0x00000802 (2050  ) GET    RemovePersonalInformation() -> VT_BOOL
+  slot#176  oVft=1408  dispid=0x00000802 (2050  ) PUT    RemovePersonalInformation([in] VT_BOOL arg0) -> VT_VOID
+  slot#177  oVft=1416  dispid=0x00000787 (1927  ) GET    FullNameURLEncoded() -> VT_BSTR
+  slot#178  oVft=1424  dispid=0x00000803 (2051  ) FUNC   CheckIn([in,opt] VT_VARIANT SaveChanges, [in,opt] VT_VARIANT Comments, [in,opt] VT_VARIANT MakePublic) -> VT_VOID
+  slot#179  oVft=1432  dispid=0x00000805 (2053  ) FUNC   CanCheckIn() -> VT_BOOL
+  slot#180  oVft=1440  dispid=0x00000806 (2054  ) FUNC   SendForReview([in,opt] VT_VARIANT Recipients, [in,opt] VT_VARIANT Subject, [in,opt] VT_VARIANT ShowMessage, [in,opt] VT_VARIANT IncludeAttachment) -> VT_VOID
+  slot#181  oVft=1448  dispid=0x00000809 (2057  ) FUNC   ReplyWithChanges([in,opt] VT_VARIANT ShowMessage) -> VT_VOID
+  slot#182  oVft=1456  dispid=0x0000080A (2058  ) FUNC   EndReview() -> VT_VOID
+  slot#183  oVft=1464  dispid=0x000001AD (429   ) GET    Password() -> VT_BSTR
+  slot#184  oVft=1472  dispid=0x000001AD (429   ) PUT    Password([in] VT_BSTR arg0) -> VT_VOID
+  slot#185  oVft=1480  dispid=0x00000468 (1128  ) GET    WritePassword() -> VT_BSTR
+  slot#186  oVft=1488  dispid=0x00000468 (1128  ) PUT    WritePassword([in] VT_BSTR arg0) -> VT_VOID
+  slot#187  oVft=1496  dispid=0x0000080B (2059  ) GET    PasswordEncryptionProvider() -> VT_BSTR
+  slot#188  oVft=1504  dispid=0x0000080C (2060  ) GET    PasswordEncryptionAlgorithm() -> VT_BSTR
+  slot#189  oVft=1512  dispid=0x0000080D (2061  ) GET    PasswordEncryptionKeyLength() -> VT_I4
+  slot#190  oVft=1520  dispid=0x0000080E (2062  ) FUNC   SetPasswordEncryptionOptions([in,opt] VT_VARIANT PasswordEncryptionProvider, [in,opt] VT_VARIANT PasswordEncryptionAlgorithm, [in,opt] VT_VARIANT PasswordEncryptionKeyLength, [in,opt] VT_VARIANT PasswordEncryptionFileProperties) -> VT_VOID
+  slot#191  oVft=1528  dispid=0x0000080F (2063  ) GET    PasswordEncryptionFileProperties() -> VT_BOOL
+  slot#192  oVft=1536  dispid=0x000007D5 (2005  ) GET    ReadOnlyRecommended() -> VT_BOOL
+  slot#193  oVft=1544  dispid=0x000007D5 (2005  ) PUT    ReadOnlyRecommended([in] VT_BOOL arg0) -> VT_VOID
+  slot#194  oVft=1552  dispid=0x000007ED (2029  ) FUNC   Protect([in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT Structure, [in,opt] VT_VARIANT Windows) -> VT_VOID
+  slot#195  oVft=1560  dispid=0x00000810 (2064  ) GET    SmartTagOptions() -> SmartTagOptions*
+  slot#196  oVft=1568  dispid=0x00000811 (2065  ) FUNC   RecheckSmartTags() -> VT_VOID
+  slot#197  oVft=1576  dispid=0x000008D8 (2264  ) GET    Permission() -> Permission*
+  slot#198  oVft=1584  dispid=0x000008D9 (2265  ) GET    SharedWorkspace() -> SharedWorkspace*
+  slot#199  oVft=1592  dispid=0x000008DA (2266  ) GET    Sync() -> Sync*
+  slot#200  oVft=1600  dispid=0x000008DB (2267  ) FUNC   SendFaxOverInternet([in,opt] VT_VARIANT Recipients, [in,opt] VT_VARIANT Subject, [in,opt] VT_VARIANT ShowMessage) -> VT_VOID
+  slot#201  oVft=1608  dispid=0x000008DC (2268  ) GET    XmlNamespaces() -> XmlNamespaces*
+  slot#202  oVft=1616  dispid=0x000008DD (2269  ) GET    XmlMaps() -> XmlMaps*
+  slot#203  oVft=1624  dispid=0x000008DE (2270  ) FUNC   XmlImport([in] VT_BSTR Url, [out] XmlMap** ImportMap, [in,opt] VT_VARIANT Overwrite, [in,opt] VT_VARIANT Destination) -> XlXmlImportResult
+  slot#204  oVft=1632  dispid=0x000008E1 (2273  ) GET    SmartDocument() -> SmartDocument*
+  slot#205  oVft=1640  dispid=0x000008E2 (2274  ) GET    DocumentLibraryVersions() -> DocumentLibraryVersions*
+  slot#206  oVft=1648  dispid=0x000008E3 (2275  ) GET    InactiveListBorderVisible() -> VT_BOOL
+  slot#207  oVft=1656  dispid=0x000008E3 (2275  ) PUT    InactiveListBorderVisible([in] VT_BOOL arg0) -> VT_VOID
+  slot#208  oVft=1664  dispid=0x000008E4 (2276  ) GET    DisplayInkComments() -> VT_BOOL
+  slot#209  oVft=1672  dispid=0x000008E4 (2276  ) PUT    DisplayInkComments([in] VT_BOOL arg0) -> VT_VOID
+  slot#210  oVft=1680  dispid=0x000008E5 (2277  ) FUNC   XmlImportXml([in] VT_BSTR Data, [out] XmlMap** ImportMap, [in,opt] VT_VARIANT Overwrite, [in,opt] VT_VARIANT Destination) -> XlXmlImportResult
+  slot#211  oVft=1688  dispid=0x000008E6 (2278  ) FUNC   SaveAsXMLData([in] VT_BSTR Filename, [in] XmlMap* Map) -> VT_VOID
+  slot#212  oVft=1696  dispid=0x000008E7 (2279  ) FUNC   ToggleFormsDesign() -> VT_VOID
+  slot#213  oVft=1704  dispid=0x000009D0 (2512  ) GET    ContentTypeProperties() -> MetaProperties*
+  slot#214  oVft=1712  dispid=0x000009D1 (2513  ) GET    Connections() -> Connections*
+  slot#215  oVft=1720  dispid=0x000009D2 (2514  ) FUNC   RemoveDocumentInformation([in] XlRemoveDocInfoType RemoveDocInfoType) -> VT_VOID
+  slot#216  oVft=1728  dispid=0x000009D4 (2516  ) GET    Signatures() -> SignatureSet*
+  slot#217  oVft=1736  dispid=0x000009D5 (2517  ) FUNC   CheckInWithVersion([in,opt] VT_VARIANT SaveChanges, [in,opt] VT_VARIANT Comments, [in,opt] VT_VARIANT MakePublic, [in,opt] VT_VARIANT VersionType) -> VT_VOID
+  slot#218  oVft=1744  dispid=0x000009D7 (2519  ) GET    ServerPolicy() -> ServerPolicy*
+  slot#219  oVft=1752  dispid=0x000009D8 (2520  ) FUNC   LockServerFile() -> VT_VOID
+  slot#220  oVft=1760  dispid=0x000009D9 (2521  ) GET    DocumentInspectors() -> DocumentInspectors*
+  slot#221  oVft=1768  dispid=0x000009DA (2522  ) FUNC   GetWorkflowTasks() -> WorkflowTasks*
+  slot#222  oVft=1776  dispid=0x000009DB (2523  ) FUNC   GetWorkflowTemplates() -> WorkflowTemplates*
+  slot#223  oVft=1784  dispid=0x00000939 (2361  ) FUNC   PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName, [in,opt] VT_VARIANT IgnorePrintAreas) -> VT_VOID
+  slot#224  oVft=1792  dispid=0x000009DC (2524  ) GET    ServerViewableItems() -> ServerViewableItems*
+  slot#225  oVft=1800  dispid=0x000009DD (2525  ) GET    TableStyles() -> TableStyles*
+  slot#226  oVft=1808  dispid=0x000009DE (2526  ) GET    DefaultTableStyle() -> VT_VARIANT
+  slot#227  oVft=1816  dispid=0x000009DE (2526  ) PUT    DefaultTableStyle([in] VT_VARIANT arg0) -> VT_VOID
+  slot#228  oVft=1824  dispid=0x000009DF (2527  ) GET    DefaultPivotTableStyle() -> VT_VARIANT
+  slot#229  oVft=1832  dispid=0x000009DF (2527  ) PUT    DefaultPivotTableStyle([in] VT_VARIANT arg0) -> VT_VOID
+  slot#230  oVft=1840  dispid=0x000009E0 (2528  ) GET    CheckCompatibility() -> VT_BOOL
+  slot#231  oVft=1848  dispid=0x000009E0 (2528  ) PUT    CheckCompatibility([in] VT_BOOL arg0) -> VT_VOID
+  slot#232  oVft=1856  dispid=0x000009E1 (2529  ) GET    HasVBProject() -> VT_BOOL
+  slot#233  oVft=1864  dispid=0x000009E2 (2530  ) GET    CustomXMLParts() -> CustomXMLParts*
+  slot#234  oVft=1872  dispid=0x000009E3 (2531  ) GET    Final() -> VT_BOOL
+  slot#235  oVft=1880  dispid=0x000009E3 (2531  ) PUT    Final([in] VT_BOOL arg0) -> VT_VOID
+  slot#236  oVft=1888  dispid=0x000009E4 (2532  ) GET    Research() -> Research*
+  slot#237  oVft=1896  dispid=0x000009E5 (2533  ) GET    Theme() -> OfficeTheme*
+  slot#238  oVft=1904  dispid=0x000009E6 (2534  ) FUNC   ApplyTheme([in] VT_BSTR Filename) -> VT_VOID
+  slot#239  oVft=1912  dispid=0x000009E7 (2535  ) GET    Excel8CompatibilityMode() -> VT_BOOL
+  slot#240  oVft=1920  dispid=0x000009E8 (2536  ) GET    ConnectionsDisabled() -> VT_BOOL
+  slot#241  oVft=1928  dispid=0x000009E9 (2537  ) FUNC   EnableConnections() -> VT_VOID
+  slot#242  oVft=1936  dispid=0x000009EA (2538  ) GET    ShowPivotChartActiveFields() -> VT_BOOL
+  slot#243  oVft=1944  dispid=0x000009EA (2538  ) PUT    ShowPivotChartActiveFields([in] VT_BOOL arg0) -> VT_VOID
+  slot#244  oVft=1952  dispid=0x000009BD (2493  ) FUNC   _ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr) -> VT_VOID
+  slot#245  oVft=1960  dispid=0x000009EB (2539  ) GET    IconSets() -> IconSets*
+  slot#246  oVft=1968  dispid=0x000009EC (2540  ) GET    EncryptionProvider() -> VT_BSTR
+  slot#247  oVft=1976  dispid=0x000009EC (2540  ) PUT    EncryptionProvider([in] VT_BSTR arg0) -> VT_VOID
+  slot#248  oVft=1984  dispid=0x000009ED (2541  ) GET    DoNotPromptForConvert() -> VT_BOOL
+  slot#249  oVft=1992  dispid=0x000009ED (2541  ) PUT    DoNotPromptForConvert([in] VT_BOOL arg0) -> VT_VOID
+  slot#250  oVft=2000  dispid=0x000009EE (2542  ) GET    ForceFullCalculation() -> VT_BOOL
+  slot#251  oVft=2008  dispid=0x000009EE (2542  ) PUT    ForceFullCalculation([in] VT_BOOL arg0) -> VT_VOID
+  slot#252  oVft=2016  dispid=0x000009EF (2543  ) FUNC   ProtectSharing([in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] VT_VARIANT SharingPassword, [in,opt] VT_VARIANT FileFormat) -> VT_VOID
+  slot#253  oVft=2024  dispid=0x00000B32 (2866  ) GET    SlicerCaches() -> SlicerCaches*
+  slot#254  oVft=2032  dispid=0x00000B33 (2867  ) GET    ActiveSlicer() -> Slicer*
+  slot#255  oVft=2040  dispid=0x00000B34 (2868  ) GET    DefaultSlicerStyle() -> VT_VARIANT
+  slot#256  oVft=2048  dispid=0x00000B34 (2868  ) PUT    DefaultSlicerStyle([in] VT_VARIANT arg0) -> VT_VOID
+  slot#257  oVft=2056  dispid=0x00000B35 (2869  ) FUNC   Dummy26() -> VT_VOID
+  slot#258  oVft=2064  dispid=0x00000B36 (2870  ) FUNC   Dummy27() -> VT_VOID
+  slot#259  oVft=2072  dispid=0x00000B37 (2871  ) GET    AccuracyVersion() -> VT_I4
+  slot#260  oVft=2080  dispid=0x00000B37 (2871  ) PUT    AccuracyVersion([in] VT_I4 arg0) -> VT_VOID
+  slot#261  oVft=2088  dispid=0x00000BF0 (3056  ) GET    CaseSensitive() -> VT_BOOL
+  slot#262  oVft=2096  dispid=0x00000BF1 (3057  ) GET    UseWholeCellCriteria() -> VT_BOOL
+  slot#263  oVft=2104  dispid=0x00000BF2 (3058  ) GET    UseWildcards() -> VT_BOOL
+  slot#264  oVft=2112  dispid=0x000002B2 (690   ) GET    PivotTables() -> VT_DISPATCH
+  slot#265  oVft=2120  dispid=0x00000BF3 (3059  ) GET    Model() -> Model*
+  slot#266  oVft=2128  dispid=0x00000BB6 (2998  ) GET    ChartDataPointTrack() -> VT_BOOL
+  slot#267  oVft=2136  dispid=0x00000BB6 (2998  ) PUT    ChartDataPointTrack([in] VT_BOOL arg0) -> VT_VOID
+  slot#268  oVft=2144  dispid=0x00000BF4 (3060  ) GET    DefaultTimelineStyle() -> VT_VARIANT
+  slot#269  oVft=2152  dispid=0x00000BF4 (3060  ) PUT    DefaultTimelineStyle([in] VT_VARIANT arg0) -> VT_VOID
+  slot#270  oVft=2160  dispid=0x00000C72 (3186  ) GET    Queries() -> Queries*
+  slot#271  oVft=2168  dispid=0x00000C5F (3167  ) FUNC   CreateForecastSheet([in] Range* Timeline, [in] Range* Values, [in,opt] VT_VARIANT ForecastStart, [in,opt] VT_VARIANT ForecastEnd, [in,opt] VT_VARIANT ConfInt, [in,opt] VT_VARIANT Seasonality, [in,opt] VT_VARIANT DataCompletion, [in,opt] VT_VARIANT Aggregation, [in,opt] VT_VARIANT ChartType, [in,opt] VT_VARIANT ShowStatsTable) -> VT_VOID
+  slot#272  oVft=2176  dispid=0x00000C65 (3173  ) GET    WorkIdentity() -> VT_BSTR
+  slot#273  oVft=2184  dispid=0x00000C65 (3173  ) PUT    WorkIdentity([in] VT_BSTR arg0) -> VT_VOID
+  slot#274  oVft=2192  dispid=0x00000C66 (3174  ) FUNC   SaveAs([in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT FileFormat, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT ReadOnlyRecommended, [in,opt] VT_VARIANT CreateBackup, [in,opt] XlSaveAsAccessMode AccessMode, [in,opt] VT_VARIANT ConflictResolution, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT TextCodepage, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT Local, [in,opt] VT_VARIANT WorkIdentity) -> VT_VOID
+  slot#275  oVft=2200  dispid=0x00000C67 (3175  ) FUNC   ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr, [in,opt] VT_VARIANT WorkIdentity) -> VT_VOID
+  slot#276  oVft=2208  dispid=0x00000D06 (3334  ) FUNC   PublishToDocs([in] VT_BSTR Title, [in] XlPublishToDocsDisclosureScope DisclosureScope, [in,opt] VT_VARIANT OverwriteUrl) -> VT_BSTR
+  slot#277  oVft=2216  dispid=0x00000D07 (3335  ) FUNC   LookUpInDocs([in,opt] VT_VARIANT Filename) -> PublishedDocs*
+  slot#278  oVft=2224  dispid=0x00000CB9 (3257  ) FUNC   PublishToPBI([in,opt] VT_VARIANT PublishType, [in,opt] VT_VARIANT nameConflict, [in,opt] VT_VARIANT bstrGroupName) -> VT_BSTR
+  slot#279  oVft=2232  dispid=0x00000CA0 (3232  ) GET    AutoSaveOn() -> VT_BOOL
+  slot#280  oVft=2240  dispid=0x00000CA0 (3232  ) PUT    AutoSaveOn([in] VT_BOOL arg0) -> VT_VOID
+  slot#281  oVft=2248  dispid=0x00000CCF (3279  ) FUNC   ConvertComments() -> VT_VOID
+  slot#282  oVft=2256  dispid=0x00000D33 (3379  ) GET    SensitivityLabel() -> ISensitivityLabel*
+  slot#283  oVft=2264  dispid=0x00000D4E (3406  ) GET    ExternalCodeServiceTimeout() -> VT_I4
+  slot#284  oVft=2272  dispid=0x00000D4E (3406  ) PUT    ExternalCodeServiceTimeout([in] VT_I4 arg0) -> VT_VOID
+  slot#285  oVft=2280  dispid=0x00000D58 (3416  ) GET    CompatibilityVersion() -> VT_I4
+  slot#286  oVft=2288  dispid=0x00000D58 (3416  ) PUT    CompatibilityVersion([in] VT_I4 arg0) -> VT_VOID
+====================================================================================================
+INTERFACE Workbooks  IID={000208DB-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=26  cbSizeVft=56  wTypeFlags=0x10C0
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x000000B5 (181   ) FUNC   Add([in,opt] VT_VARIANT Template) -> Workbook*
+  slot#11   oVft=88    dispid=0x00000115 (277   ) FUNC   Close() -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000076 (118   ) GET    Count() -> VT_I4
+  slot#13   oVft=104   dispid=0x000000AA (170   ) GET    Item([in] VT_VARIANT Index) -> Workbook*
+  slot#14   oVft=112   dispid=0xFFFFFFFC (-4    ) GET    _NewEnum() -> VT_UNKNOWN
+  slot#15   oVft=120   dispid=0x000002AA (682   ) FUNC   _Open([in] VT_BSTR Filename, [in,opt] VT_VARIANT UpdateLinks, [in,opt] VT_VARIANT ReadOnly, [in,opt] VT_VARIANT Format, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT IgnoreReadOnlyRecommended, [in,opt] VT_VARIANT Origin, [in,opt] VT_VARIANT Delimiter, [in,opt] VT_VARIANT Editable, [in,opt] VT_VARIANT Notify, [in,opt] VT_VARIANT Converter, [in,opt] VT_VARIANT AddToMru) -> Workbook*
+  slot#16   oVft=128   dispid=0x000002AB (683   ) FUNC   __OpenText([in] VT_BSTR Filename, [in,opt] VT_VARIANT Origin, [in,opt] VT_VARIANT StartRow, [in,opt] VT_VARIANT DataType, [in,opt] XlTextQualifier TextQualifier, [in,opt] VT_VARIANT ConsecutiveDelimiter, [in,opt] VT_VARIANT Tab, [in,opt] VT_VARIANT Semicolon, [in,opt] VT_VARIANT Comma, [in,opt] VT_VARIANT Space, [in,opt] VT_VARIANT Other, [in,opt] VT_VARIANT OtherChar, [in,opt] VT_VARIANT FieldInfo, [in,opt] VT_VARIANT TextVisualLayout) -> VT_VOID
+  slot#17   oVft=136   dispid=0x00000000 (0     ) GET    _Default([in] VT_VARIANT Index) -> Workbook*
+  slot#18   oVft=144   dispid=0x000006ED (1773  ) FUNC   _OpenText([in] VT_BSTR Filename, [in,opt] VT_VARIANT Origin, [in,opt] VT_VARIANT StartRow, [in,opt] VT_VARIANT DataType, [in,opt] XlTextQualifier TextQualifier, [in,opt] VT_VARIANT ConsecutiveDelimiter, [in,opt] VT_VARIANT Tab, [in,opt] VT_VARIANT Semicolon, [in,opt] VT_VARIANT Comma, [in,opt] VT_VARIANT Space, [in,opt] VT_VARIANT Other, [in,opt] VT_VARIANT OtherChar, [in,opt] VT_VARIANT FieldInfo, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT DecimalSeparator, [in,opt] VT_VARIANT ThousandsSeparator) -> VT_VOID
+  slot#19   oVft=152   dispid=0x00000783 (1923  ) FUNC   Open([in] VT_BSTR Filename, [in,opt] VT_VARIANT UpdateLinks, [in,opt] VT_VARIANT ReadOnly, [in,opt] VT_VARIANT Format, [in,opt] VT_VARIANT Password, [in,opt] VT_VARIANT WriteResPassword, [in,opt] VT_VARIANT IgnoreReadOnlyRecommended, [in,opt] VT_VARIANT Origin, [in,opt] VT_VARIANT Delimiter, [in,opt] VT_VARIANT Editable, [in,opt] VT_VARIANT Notify, [in,opt] VT_VARIANT Converter, [in,opt] VT_VARIANT AddToMru, [in,opt] VT_VARIANT Local, [in,opt] VT_VARIANT CorruptLoad) -> Workbook*
+  slot#20   oVft=160   dispid=0x00000784 (1924  ) FUNC   OpenText([in] VT_BSTR Filename, [in,opt] VT_VARIANT Origin, [in,opt] VT_VARIANT StartRow, [in,opt] VT_VARIANT DataType, [in,opt] XlTextQualifier TextQualifier, [in,opt] VT_VARIANT ConsecutiveDelimiter, [in,opt] VT_VARIANT Tab, [in,opt] VT_VARIANT Semicolon, [in,opt] VT_VARIANT Comma, [in,opt] VT_VARIANT Space, [in,opt] VT_VARIANT Other, [in,opt] VT_VARIANT OtherChar, [in,opt] VT_VARIANT FieldInfo, [in,opt] VT_VARIANT TextVisualLayout, [in,opt] VT_VARIANT DecimalSeparator, [in,opt] VT_VARIANT ThousandsSeparator, [in,opt] VT_VARIANT TrailingMinusNumbers, [in,opt] VT_VARIANT Local) -> VT_VOID
+  slot#21   oVft=168   dispid=0x00000813 (2067  ) FUNC   OpenDatabase([in] VT_BSTR Filename, [in,opt] VT_VARIANT CommandText, [in,opt] VT_VARIANT CommandType, [in,opt] VT_VARIANT BackgroundQuery, [in,opt] VT_VARIANT ImportDataAs) -> Workbook*
+  slot#22   oVft=176   dispid=0x00000815 (2069  ) FUNC   CheckOut([in] VT_BSTR Filename) -> VT_VOID
+  slot#23   oVft=184   dispid=0x00000816 (2070  ) FUNC   CanCheckOut([in] VT_BSTR Filename) -> VT_BOOL
+  slot#24   oVft=192   dispid=0x00000817 (2071  ) FUNC   _OpenXML([in] VT_BSTR Filename, [in,opt] VT_VARIANT Stylesheets) -> Workbook*
+  slot#25   oVft=200   dispid=0x000008E8 (2280  ) FUNC   OpenXML([in] VT_BSTR Filename, [in,opt] VT_VARIANT Stylesheets, [in,opt] VT_VARIANT LoadOption) -> Workbook*
+====================================================================================================
+INTERFACE Font  IID={0002084D-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=44  cbSizeVft=56  wTypeFlags=0x1000
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x000000B4 (180   ) GET    Background() -> VT_VARIANT
+  slot#11   oVft=88    dispid=0x000000B4 (180   ) PUT    Background([in] VT_VARIANT arg0) -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000060 (96    ) GET    Bold() -> VT_VARIANT
+  slot#13   oVft=104   dispid=0x00000060 (96    ) PUT    Bold([in] VT_VARIANT arg0) -> VT_VOID
+  slot#14   oVft=112   dispid=0x00000063 (99    ) GET    Color() -> VT_VARIANT
+  slot#15   oVft=120   dispid=0x00000063 (99    ) PUT    Color([in] VT_VARIANT arg0) -> VT_VOID
+  slot#16   oVft=128   dispid=0x00000061 (97    ) GET    ColorIndex() -> VT_VARIANT
+  slot#17   oVft=136   dispid=0x00000061 (97    ) PUT    ColorIndex([in] VT_VARIANT arg0) -> VT_VOID
+  slot#18   oVft=144   dispid=0x000000B1 (177   ) GET    FontStyle() -> VT_VARIANT
+  slot#19   oVft=152   dispid=0x000000B1 (177   ) PUT    FontStyle([in] VT_VARIANT arg0) -> VT_VOID
+  slot#20   oVft=160   dispid=0x00000065 (101   ) GET    Italic() -> VT_VARIANT
+  slot#21   oVft=168   dispid=0x00000065 (101   ) PUT    Italic([in] VT_VARIANT arg0) -> VT_VOID
+  slot#22   oVft=176   dispid=0x0000006E (110   ) GET    Name() -> VT_VARIANT
+  slot#23   oVft=184   dispid=0x0000006E (110   ) PUT    Name([in] VT_VARIANT arg0) -> VT_VOID
+  slot#24   oVft=192   dispid=0x000000DD (221   ) GET    OutlineFont() -> VT_VARIANT
+  slot#25   oVft=200   dispid=0x000000DD (221   ) PUT    OutlineFont([in] VT_VARIANT arg0) -> VT_VOID
+  slot#26   oVft=208   dispid=0x00000067 (103   ) GET    Shadow() -> VT_VARIANT
+  slot#27   oVft=216   dispid=0x00000067 (103   ) PUT    Shadow([in] VT_VARIANT arg0) -> VT_VOID
+  slot#28   oVft=224   dispid=0x00000068 (104   ) GET    Size() -> VT_VARIANT
+  slot#29   oVft=232   dispid=0x00000068 (104   ) PUT    Size([in] VT_VARIANT arg0) -> VT_VOID
+  slot#30   oVft=240   dispid=0x00000069 (105   ) GET    Strikethrough() -> VT_VARIANT
+  slot#31   oVft=248   dispid=0x00000069 (105   ) PUT    Strikethrough([in] VT_VARIANT arg0) -> VT_VOID
+  slot#32   oVft=256   dispid=0x000000B3 (179   ) GET    Subscript() -> VT_VARIANT
+  slot#33   oVft=264   dispid=0x000000B3 (179   ) PUT    Subscript([in] VT_VARIANT arg0) -> VT_VOID
+  slot#34   oVft=272   dispid=0x000000B2 (178   ) GET    Superscript() -> VT_VARIANT
+  slot#35   oVft=280   dispid=0x000000B2 (178   ) PUT    Superscript([in] VT_VARIANT arg0) -> VT_VOID
+  slot#36   oVft=288   dispid=0x0000006A (106   ) GET    Underline() -> VT_VARIANT
+  slot#37   oVft=296   dispid=0x0000006A (106   ) PUT    Underline([in] VT_VARIANT arg0) -> VT_VOID
+  slot#38   oVft=304   dispid=0x0000093D (2365  ) GET    ThemeColor() -> VT_VARIANT
+  slot#39   oVft=312   dispid=0x0000093D (2365  ) PUT    ThemeColor([in] VT_VARIANT arg0) -> VT_VOID
+  slot#40   oVft=320   dispid=0x0000093E (2366  ) GET    TintAndShade() -> VT_VARIANT
+  slot#41   oVft=328   dispid=0x0000093E (2366  ) PUT    TintAndShade([in] VT_VARIANT arg0) -> VT_VOID
+  slot#42   oVft=336   dispid=0x0000093F (2367  ) GET    ThemeFont() -> XlThemeFont
+  slot#43   oVft=344   dispid=0x0000093F (2367  ) PUT    ThemeFont([in] XlThemeFont arg0) -> VT_VOID
+====================================================================================================
+INTERFACE Range  IID={00020846-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=260  cbSizeVft=56  wTypeFlags=0x1000
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x00000130 (304   ) FUNC   Activate() -> VT_VARIANT
+  slot#11   oVft=88    dispid=0x00000427 (1063  ) GET    AddIndent() -> VT_VARIANT
+  slot#12   oVft=96    dispid=0x00000427 (1063  ) PUT    AddIndent([in] VT_VARIANT arg0) -> VT_VOID
+  slot#13   oVft=104   dispid=0x000000EC (236   ) GET    Address([in,opt] VT_VARIANT RowAbsolute, [in,opt] VT_VARIANT ColumnAbsolute, [in,opt] XlReferenceStyle ReferenceStyle, [in,opt] VT_VARIANT External, [in,opt] VT_VARIANT RelativeTo) -> VT_BSTR
+  slot#14   oVft=112   dispid=0x000001B5 (437   ) GET    AddressLocal([in,opt] VT_VARIANT RowAbsolute, [in,opt] VT_VARIANT ColumnAbsolute, [in,opt] XlReferenceStyle ReferenceStyle, [in,opt] VT_VARIANT External, [in,opt] VT_VARIANT RelativeTo) -> VT_BSTR
+  slot#15   oVft=120   dispid=0x0000036C (876   ) FUNC   AdvancedFilter([in] XlFilterAction Action, [in,opt] VT_VARIANT CriteriaRange, [in,opt] VT_VARIANT CopyToRange, [in,opt] VT_VARIANT Unique) -> VT_VARIANT
+  slot#16   oVft=128   dispid=0x000001B9 (441   ) FUNC   ApplyNames([in,opt] VT_VARIANT Names, [in,opt] VT_VARIANT IgnoreRelativeAbsolute, [in,opt] VT_VARIANT UseRowColumnNames, [in,opt] VT_VARIANT OmitColumn, [in,opt] VT_VARIANT OmitRow, [in,opt] XlApplyNamesOrder Order, [in,opt] VT_VARIANT AppendLast) -> VT_VARIANT
+  slot#17   oVft=136   dispid=0x000001C0 (448   ) FUNC   ApplyOutlineStyles() -> VT_VARIANT
+  slot#18   oVft=144   dispid=0x00000238 (568   ) GET    Areas() -> Areas*
+  slot#19   oVft=152   dispid=0x000004A1 (1185  ) FUNC   AutoComplete([in] VT_BSTR String) -> VT_BSTR
+  slot#20   oVft=160   dispid=0x000001C1 (449   ) FUNC   AutoFill([in] Range* Destination, [in,opt] XlAutoFillType Type) -> VT_VARIANT
+  slot#21   oVft=168   dispid=0x00000319 (793   ) FUNC   _AutoFilter([in,opt] VT_VARIANT Field, [in,opt] VT_VARIANT Criteria1, [in,opt] XlAutoFilterOperator Operator, [in,opt] VT_VARIANT Criteria2, [in,opt] VT_VARIANT VisibleDropDown) -> VT_VARIANT
+  slot#22   oVft=176   dispid=0x000000ED (237   ) FUNC   AutoFit() -> VT_VARIANT
+  slot#23   oVft=184   dispid=0x00000072 (114   ) FUNC   AutoFormat([in,opt] XlRangeAutoFormat Format, [in,opt] VT_VARIANT Number, [in,opt] VT_VARIANT Font, [in,opt] VT_VARIANT Alignment, [in,opt] VT_VARIANT Border, [in,opt] VT_VARIANT Pattern, [in,opt] VT_VARIANT Width) -> VT_VARIANT
+  slot#24   oVft=192   dispid=0x0000040C (1036  ) FUNC   AutoOutline() -> VT_VARIANT
+  slot#25   oVft=200   dispid=0x0000042B (1067  ) FUNC   _BorderAround([in,opt] VT_VARIANT LineStyle, [in,opt] XlBorderWeight Weight, [in,opt] XlColorIndex ColorIndex, [in,opt] VT_VARIANT Color) -> VT_VARIANT
+  slot#26   oVft=208   dispid=0x000001B3 (435   ) GET    Borders() -> Borders*
+  slot#27   oVft=216   dispid=0x00000117 (279   ) FUNC   Calculate() -> VT_VARIANT
+  slot#28   oVft=224   dispid=0x000000EE (238   ) GET    Cells() -> Range*
+  slot#29   oVft=232   dispid=0x0000025B (603   ) GET    Characters([in,opt] VT_VARIANT Start, [in,opt] VT_VARIANT Length) -> Characters*
+  slot#30   oVft=240   dispid=0x000001F9 (505   ) FUNC   CheckSpelling([in,opt] VT_VARIANT CustomDictionary, [in,opt] VT_VARIANT IgnoreUppercase, [in,opt] VT_VARIANT AlwaysSuggest, [in,opt] VT_VARIANT SpellLang) -> VT_VARIANT
+  slot#31   oVft=248   dispid=0x0000006F (111   ) FUNC   Clear() -> VT_VARIANT
+  slot#32   oVft=256   dispid=0x00000071 (113   ) FUNC   _ClearContents() -> VT_VARIANT
+  slot#33   oVft=264   dispid=0x00000070 (112   ) FUNC   ClearFormats() -> VT_VARIANT
+  slot#34   oVft=272   dispid=0x000000EF (239   ) FUNC   ClearNotes() -> VT_VARIANT
+  slot#35   oVft=280   dispid=0x0000040D (1037  ) FUNC   ClearOutline() -> VT_VARIANT
+  slot#36   oVft=288   dispid=0x000000F0 (240   ) GET    Column() -> VT_I4
+  slot#37   oVft=296   dispid=0x000001FE (510   ) FUNC   ColumnDifferences([in] VT_VARIANT Comparison) -> Range*
+  slot#38   oVft=304   dispid=0x000000F1 (241   ) GET    Columns() -> Range*
+  slot#39   oVft=312   dispid=0x000000F2 (242   ) GET    ColumnWidth() -> VT_VARIANT
+  slot#40   oVft=320   dispid=0x000000F2 (242   ) PUT    ColumnWidth([in] VT_VARIANT arg0) -> VT_VOID
+  slot#41   oVft=328   dispid=0x000001E2 (482   ) FUNC   Consolidate([in,opt] VT_VARIANT Sources, [in,opt] VT_VARIANT Function, [in,opt] VT_VARIANT TopRow, [in,opt] VT_VARIANT LeftColumn, [in,opt] VT_VARIANT CreateLinks) -> VT_VARIANT
+  slot#42   oVft=336   dispid=0x00000227 (551   ) FUNC   Copy([in,opt] VT_VARIANT Destination) -> VT_VARIANT
+  slot#43   oVft=344   dispid=0x00000480 (1152  ) FUNC   CopyFromRecordset([in] VT_UNKNOWN Data, [in,opt] VT_VARIANT MaxRows, [in,opt] VT_VARIANT MaxColumns) -> VT_I4
+  slot#44   oVft=352   dispid=0x000000D5 (213   ) FUNC   CopyPicture([in,opt] XlPictureAppearance Appearance, [in,opt] XlCopyPictureFormat Format) -> VT_VARIANT
+  slot#45   oVft=360   dispid=0x00000076 (118   ) GET    Count() -> VT_I4
+  slot#46   oVft=368   dispid=0x000001C9 (457   ) FUNC   CreateNames([in,opt] VT_VARIANT Top, [in,opt] VT_VARIANT Left, [in,opt] VT_VARIANT Bottom, [in,opt] VT_VARIANT Right) -> VT_VARIANT
+  slot#47   oVft=376   dispid=0x000001CA (458   ) FUNC   CreatePublisher([in,opt] VT_VARIANT Edition, [in,opt] XlPictureAppearance Appearance, [in,opt] VT_VARIANT ContainsPICT, [in,opt] VT_VARIANT ContainsBIFF, [in,opt] VT_VARIANT ContainsRTF, [in,opt] VT_VARIANT ContainsVALU) -> VT_VARIANT
+  slot#48   oVft=384   dispid=0x000001F5 (501   ) GET    CurrentArray() -> Range*
+  slot#49   oVft=392   dispid=0x000000F3 (243   ) GET    CurrentRegion() -> Range*
+  slot#50   oVft=400   dispid=0x00000235 (565   ) FUNC   Cut([in,opt] VT_VARIANT Destination) -> VT_VARIANT
+  slot#51   oVft=408   dispid=0x000001D0 (464   ) FUNC   DataSeries([in,opt] VT_VARIANT Rowcol, [in,opt] XlDataSeriesType Type, [in,opt] XlDataSeriesDate Date, [in,opt] VT_VARIANT Step, [in,opt] VT_VARIANT Stop, [in,opt] VT_VARIANT Trend) -> VT_VARIANT
+  slot#52   oVft=416   dispid=0x00000000 (0     ) GET    _Default([in,opt] VT_VARIANT RowIndex, [in,opt] VT_VARIANT ColumnIndex) -> VT_VARIANT
+  slot#53   oVft=424   dispid=0x00000000 (0     ) PUT    _Default([in,opt] VT_VARIANT RowIndex, [in,opt] VT_VARIANT ColumnIndex, [in] VT_VARIANT arg2) -> VT_VOID
+  slot#54   oVft=432   dispid=0x00000075 (117   ) FUNC   Delete([in,opt] VT_VARIANT Shift) -> VT_VARIANT
+  slot#55   oVft=440   dispid=0x0000021F (543   ) GET    Dependents() -> Range*
+  slot#56   oVft=448   dispid=0x000000F5 (245   ) FUNC   DialogBox() -> VT_VARIANT
+  slot#57   oVft=456   dispid=0x00000221 (545   ) GET    DirectDependents() -> Range*
+  slot#58   oVft=464   dispid=0x00000222 (546   ) GET    DirectPrecedents() -> Range*
+  slot#59   oVft=472   dispid=0x0000046B (1131  ) FUNC   EditionOptions([in] XlEditionType Type, [in] XlEditionOptionsOption Option, [in,opt] VT_VARIANT Name, [in,opt] VT_VARIANT Reference, [in,opt] XlPictureAppearance Appearance, [in,opt] XlPictureAppearance ChartSize, [in,opt] VT_VARIANT Format) -> VT_VARIANT
+  slot#60   oVft=480   dispid=0x000001F4 (500   ) GET    End([in] XlDirection Direction) -> Range*
+  slot#61   oVft=488   dispid=0x000000F6 (246   ) GET    EntireColumn() -> Range*
+  slot#62   oVft=496   dispid=0x000000F7 (247   ) GET    EntireRow() -> Range*
+  slot#63   oVft=504   dispid=0x000000F8 (248   ) FUNC   FillDown() -> VT_VARIANT
+  slot#64   oVft=512   dispid=0x000000F9 (249   ) FUNC   FillLeft() -> VT_VARIANT
+  slot#65   oVft=520   dispid=0x000000FA (250   ) FUNC   FillRight() -> VT_VARIANT
+  slot#66   oVft=528   dispid=0x000000FB (251   ) FUNC   FillUp() -> VT_VARIANT
+  slot#67   oVft=536   dispid=0x0000018E (398   ) FUNC   Find([in] VT_VARIANT What, [in,opt] VT_VARIANT After, [in,opt] VT_VARIANT LookIn, [in,opt] VT_VARIANT LookAt, [in,opt] VT_VARIANT SearchOrder, [in,opt] XlSearchDirection SearchDirection, [in,opt] VT_VARIANT MatchCase, [in,opt] VT_VARIANT MatchByte, [in,opt] VT_VARIANT SearchFormat) -> Range*
+  slot#68   oVft=544   dispid=0x0000018F (399   ) FUNC   FindNext([in,opt] VT_VARIANT After) -> Range*
+  slot#69   oVft=552   dispid=0x00000190 (400   ) FUNC   FindPrevious([in,opt] VT_VARIANT After) -> Range*
+  slot#70   oVft=560   dispid=0x00000092 (146   ) GET    Font() -> Font*
+  slot#71   oVft=568   dispid=0x00000105 (261   ) GET    Formula() -> VT_VARIANT
+  slot#72   oVft=576   dispid=0x00000105 (261   ) PUT    Formula([in] VT_VARIANT arg0) -> VT_VOID
+  slot#73   oVft=584   dispid=0x0000024A (586   ) GET    FormulaArray() -> VT_VARIANT
+  slot#74   oVft=592   dispid=0x0000024A (586   ) PUT    FormulaArray([in] VT_VARIANT arg0) -> VT_VOID
+  slot#75   oVft=600   dispid=0x00000564 (1380  ) GET    FormulaLabel() -> XlFormulaLabel
+  slot#76   oVft=608   dispid=0x00000564 (1380  ) PUT    FormulaLabel([in] XlFormulaLabel arg0) -> VT_VOID
+  slot#77   oVft=616   dispid=0x00000106 (262   ) GET    FormulaHidden() -> VT_VARIANT
+  slot#78   oVft=624   dispid=0x00000106 (262   ) PUT    FormulaHidden([in] VT_VARIANT arg0) -> VT_VOID
+  slot#79   oVft=632   dispid=0x00000107 (263   ) GET    FormulaLocal() -> VT_VARIANT
+  slot#80   oVft=640   dispid=0x00000107 (263   ) PUT    FormulaLocal([in] VT_VARIANT arg0) -> VT_VOID
+  slot#81   oVft=648   dispid=0x00000108 (264   ) GET    FormulaR1C1() -> VT_VARIANT
+  slot#82   oVft=656   dispid=0x00000108 (264   ) PUT    FormulaR1C1([in] VT_VARIANT arg0) -> VT_VOID
+  slot#83   oVft=664   dispid=0x00000109 (265   ) GET    FormulaR1C1Local() -> VT_VARIANT
+  slot#84   oVft=672   dispid=0x00000109 (265   ) PUT    FormulaR1C1Local([in] VT_VARIANT arg0) -> VT_VOID
+  slot#85   oVft=680   dispid=0x0000023B (571   ) FUNC   FunctionWizard() -> VT_VARIANT
+  slot#86   oVft=688   dispid=0x000001D8 (472   ) FUNC   GoalSeek([in] VT_VARIANT Goal, [in] Range* ChangingCell) -> VT_BOOL
+  slot#87   oVft=696   dispid=0x0000002E (46    ) FUNC   Group([in,opt] VT_VARIANT Start, [in,opt] VT_VARIANT End, [in,opt] VT_VARIANT By, [in,opt] VT_VARIANT Periods) -> VT_VARIANT
+  slot#88   oVft=704   dispid=0x0000010A (266   ) GET    HasArray() -> VT_VARIANT
+  slot#89   oVft=712   dispid=0x0000010B (267   ) GET    HasFormula() -> VT_VARIANT
+  slot#90   oVft=720   dispid=0x0000007B (123   ) GET    Height() -> VT_VARIANT
+  slot#91   oVft=728   dispid=0x0000010C (268   ) GET    Hidden() -> VT_VARIANT
+  slot#92   oVft=736   dispid=0x0000010C (268   ) PUT    Hidden([in] VT_VARIANT arg0) -> VT_VOID
+  slot#93   oVft=744   dispid=0x00000088 (136   ) GET    HorizontalAlignment() -> VT_VARIANT
+  slot#94   oVft=752   dispid=0x00000088 (136   ) PUT    HorizontalAlignment([in] VT_VARIANT arg0) -> VT_VOID
+  slot#95   oVft=760   dispid=0x000000C9 (201   ) GET    IndentLevel() -> VT_VARIANT
+  slot#96   oVft=768   dispid=0x000000C9 (201   ) PUT    IndentLevel([in] VT_VARIANT arg0) -> VT_VOID
+  slot#97   oVft=776   dispid=0x00000565 (1381  ) FUNC   InsertIndent([in] VT_I4 InsertAmount) -> VT_VOID
+  slot#98   oVft=784   dispid=0x000000FC (252   ) FUNC   Insert([in,opt] VT_VARIANT Shift, [in,opt] VT_VARIANT CopyOrigin) -> VT_VARIANT
+  slot#99   oVft=792   dispid=0x00000081 (129   ) GET    Interior() -> Interior*
+  slot#100  oVft=800   dispid=0x000000AA (170   ) GET    Item([in] VT_VARIANT RowIndex, [in,opt] VT_VARIANT ColumnIndex) -> VT_VARIANT
+  slot#101  oVft=808   dispid=0x000000AA (170   ) PUT    Item([in] VT_VARIANT RowIndex, [in,opt] VT_VARIANT ColumnIndex, [in] VT_VARIANT arg2) -> VT_VOID
+  slot#102  oVft=816   dispid=0x000001EF (495   ) FUNC   Justify() -> VT_VARIANT
+  slot#103  oVft=824   dispid=0x0000007F (127   ) GET    Left() -> VT_VARIANT
+  slot#104  oVft=832   dispid=0x000004A3 (1187  ) GET    ListHeaderRows() -> VT_I4
+  slot#105  oVft=840   dispid=0x000000FD (253   ) FUNC   ListNames() -> VT_VARIANT
+  slot#106  oVft=848   dispid=0x000002B3 (691   ) GET    LocationInTable() -> XlLocationInTable
+  slot#107  oVft=856   dispid=0x0000010D (269   ) GET    Locked() -> VT_VARIANT
+  slot#108  oVft=864   dispid=0x0000010D (269   ) PUT    Locked([in] VT_VARIANT arg0) -> VT_VOID
+  slot#109  oVft=872   dispid=0x00000234 (564   ) FUNC   Merge([in,opt] VT_VARIANT Across) -> VT_VOID
+  slot#110  oVft=880   dispid=0x00000568 (1384  ) FUNC   UnMerge() -> VT_VOID
+  slot#111  oVft=888   dispid=0x00000569 (1385  ) GET    MergeArea() -> Range*
+  slot#112  oVft=896   dispid=0x000000D0 (208   ) GET    MergeCells() -> VT_VARIANT
+  slot#113  oVft=904   dispid=0x000000D0 (208   ) PUT    MergeCells([in] VT_VARIANT arg0) -> VT_VOID
+  slot#114  oVft=912   dispid=0x0000006E (110   ) GET    Name() -> VT_VARIANT
+  slot#115  oVft=920   dispid=0x0000006E (110   ) PUT    Name([in] VT_VARIANT arg0) -> VT_VOID
+  slot#116  oVft=928   dispid=0x00000408 (1032  ) FUNC   NavigateArrow([in,opt] VT_VARIANT TowardPrecedent, [in,opt] VT_VARIANT ArrowNumber, [in,opt] VT_VARIANT LinkNumber) -> VT_VARIANT
+  slot#117  oVft=936   dispid=0xFFFFFFFC (-4    ) GET    _NewEnum() -> VT_UNKNOWN
+  slot#118  oVft=944   dispid=0x000001F6 (502   ) GET    Next() -> Range*
+  slot#119  oVft=952   dispid=0x00000467 (1127  ) FUNC   NoteText([in,opt] VT_VARIANT Text, [in,opt] VT_VARIANT Start, [in,opt] VT_VARIANT Length) -> VT_BSTR
+  slot#120  oVft=960   dispid=0x000000C1 (193   ) GET    NumberFormat() -> VT_VARIANT
+  slot#121  oVft=968   dispid=0x000000C1 (193   ) PUT    NumberFormat([in] VT_VARIANT arg0) -> VT_VOID
+  slot#122  oVft=976   dispid=0x00000449 (1097  ) GET    NumberFormatLocal() -> VT_VARIANT
+  slot#123  oVft=984   dispid=0x00000449 (1097  ) PUT    NumberFormatLocal([in] VT_VARIANT arg0) -> VT_VOID
+  slot#124  oVft=992   dispid=0x000000FE (254   ) GET    Offset([in,opt] VT_VARIANT RowOffset, [in,opt] VT_VARIANT ColumnOffset) -> Range*
+  slot#125  oVft=1000  dispid=0x00000086 (134   ) GET    Orientation() -> VT_VARIANT
+  slot#126  oVft=1008  dispid=0x00000086 (134   ) PUT    Orientation([in] VT_VARIANT arg0) -> VT_VOID
+  slot#127  oVft=1016  dispid=0x0000010F (271   ) GET    OutlineLevel() -> VT_VARIANT
+  slot#128  oVft=1024  dispid=0x0000010F (271   ) PUT    OutlineLevel([in] VT_VARIANT arg0) -> VT_VOID
+  slot#129  oVft=1032  dispid=0x000000FF (255   ) GET    PageBreak() -> VT_I4
+  slot#130  oVft=1040  dispid=0x000000FF (255   ) PUT    PageBreak([in] VT_I4 arg0) -> VT_VOID
+  slot#131  oVft=1048  dispid=0x000001DD (477   ) FUNC   Parse([in,opt] VT_VARIANT ParseLine, [in,opt] VT_VARIANT Destination) -> VT_VARIANT
+  slot#132  oVft=1056  dispid=0x00000403 (1027  ) FUNC   _PasteSpecial([in,opt] XlPasteType Paste, [in,opt] XlPasteSpecialOperation Operation, [in,opt] VT_VARIANT SkipBlanks, [in,opt] VT_VARIANT Transpose) -> VT_VARIANT
+  slot#133  oVft=1064  dispid=0x000002DB (731   ) GET    PivotField() -> PivotField*
+  slot#134  oVft=1072  dispid=0x000002E4 (740   ) GET    PivotItem() -> PivotItem*
+  slot#135  oVft=1080  dispid=0x000002CC (716   ) GET    PivotTable() -> PivotTable*
+  slot#136  oVft=1088  dispid=0x00000220 (544   ) GET    Precedents() -> Range*
+  slot#137  oVft=1096  dispid=0x000001F8 (504   ) GET    PrefixCharacter() -> VT_VARIANT
+  slot#138  oVft=1104  dispid=0x000001F7 (503   ) GET    Previous() -> Range*
+  slot#139  oVft=1112  dispid=0x00000389 (905   ) FUNC   __PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate) -> VT_VARIANT
+  slot#140  oVft=1120  dispid=0x00000119 (281   ) FUNC   PrintPreview([in,opt] VT_VARIANT EnableChanges) -> VT_VARIANT
+  slot#141  oVft=1128  dispid=0x0000056A (1386  ) GET    QueryTable() -> QueryTable*
+  slot#142  oVft=1136  dispid=0x000000C5 (197   ) GET    Range([in] VT_VARIANT Cell1, [in,opt] VT_VARIANT Cell2) -> Range*
+  slot#143  oVft=1144  dispid=0x00000373 (883   ) FUNC   RemoveSubtotal() -> VT_VARIANT
+  slot#144  oVft=1152  dispid=0x000000E2 (226   ) FUNC   _Replace([in] VT_VARIANT What, [in] VT_VARIANT Replacement, [in,opt] VT_VARIANT LookAt, [in,opt] VT_VARIANT SearchOrder, [in,opt] VT_VARIANT MatchCase, [in,opt] VT_VARIANT MatchByte, [in,opt] VT_VARIANT SearchFormat, [in,opt] VT_VARIANT ReplaceFormat) -> VT_BOOL
+  slot#145  oVft=1160  dispid=0x00000100 (256   ) GET    Resize([in,opt] VT_VARIANT RowSize, [in,opt] VT_VARIANT ColumnSize) -> Range*
+  slot#146  oVft=1168  dispid=0x00000101 (257   ) GET    Row() -> VT_I4
+  slot#147  oVft=1176  dispid=0x000001FF (511   ) FUNC   RowDifferences([in] VT_VARIANT Comparison) -> Range*
+  slot#148  oVft=1184  dispid=0x00000110 (272   ) GET    RowHeight() -> VT_VARIANT
+  slot#149  oVft=1192  dispid=0x00000110 (272   ) PUT    RowHeight([in] VT_VARIANT arg0) -> VT_VOID
+  slot#150  oVft=1200  dispid=0x00000102 (258   ) GET    Rows() -> Range*
+  slot#151  oVft=1208  dispid=0x00000103 (259   ) FUNC   Run([in,opt] VT_VARIANT Arg1, [in,opt] VT_VARIANT Arg2, [in,opt] VT_VARIANT Arg3, [in,opt] VT_VARIANT Arg4, [in,opt] VT_VARIANT Arg5, [in,opt] VT_VARIANT Arg6, [in,opt] VT_VARIANT Arg7, [in,opt] VT_VARIANT Arg8, [in,opt] VT_VARIANT Arg9, [in,opt] VT_VARIANT Arg10, [in,opt] VT_VARIANT Arg11, [in,opt] VT_VARIANT Arg12, [in,opt] VT_VARIANT Arg13, [in,opt] VT_VARIANT Arg14, [in,opt] VT_VARIANT Arg15, [in,opt] VT_VARIANT Arg16, [in,opt] VT_VARIANT Arg17, [in,opt] VT_VARIANT Arg18, [in,opt] VT_VARIANT Arg19, [in,opt] VT_VARIANT Arg20, [in,opt] VT_VARIANT Arg21, [in,opt] VT_VARIANT Arg22, [in,opt] VT_VARIANT Arg23, [in,opt] VT_VARIANT Arg24, [in,opt] VT_VARIANT Arg25, [in,opt] VT_VARIANT Arg26, [in,opt] VT_VARIANT Arg27, [in,opt] VT_VARIANT Arg28, [in,opt] VT_VARIANT Arg29, [in,opt] VT_VARIANT Arg30) -> VT_VARIANT
+  slot#152  oVft=1216  dispid=0x000000EB (235   ) FUNC   Select() -> VT_VARIANT
+  slot#153  oVft=1224  dispid=0x000001F0 (496   ) FUNC   Show() -> VT_VARIANT
+  slot#154  oVft=1232  dispid=0x0000036D (877   ) FUNC   ShowDependents([in,opt] VT_VARIANT Remove) -> VT_VARIANT
+  slot#155  oVft=1240  dispid=0x00000249 (585   ) GET    ShowDetail() -> VT_VARIANT
+  slot#156  oVft=1248  dispid=0x00000249 (585   ) PUT    ShowDetail([in] VT_VARIANT arg0) -> VT_VOID
+  slot#157  oVft=1256  dispid=0x0000036E (878   ) FUNC   ShowErrors() -> VT_VARIANT
+  slot#158  oVft=1264  dispid=0x0000036F (879   ) FUNC   ShowPrecedents([in,opt] VT_VARIANT Remove) -> VT_VARIANT
+  slot#159  oVft=1272  dispid=0x000000D1 (209   ) GET    ShrinkToFit() -> VT_VARIANT
+  slot#160  oVft=1280  dispid=0x000000D1 (209   ) PUT    ShrinkToFit([in] VT_VARIANT arg0) -> VT_VOID
+  slot#161  oVft=1288  dispid=0x00000370 (880   ) FUNC   _Sort([in,opt] VT_VARIANT Key1, [in,opt] XlSortOrder Order1, [in,opt] VT_VARIANT Key2, [in,opt] VT_VARIANT Type, [in,opt] XlSortOrder Order2, [in,opt] VT_VARIANT Key3, [in,opt] XlSortOrder Order3, [in,opt] XlYesNoGuess Header, [in,opt] VT_VARIANT OrderCustom, [in,opt] VT_VARIANT MatchCase, [in,opt] XlSortOrientation Orientation, [in,opt] XlSortMethod SortMethod, [in,opt] XlSortDataOption DataOption1, [in,opt] XlSortDataOption DataOption2, [in,opt] XlSortDataOption DataOption3) -> VT_VARIANT
+  slot#162  oVft=1296  dispid=0x00000371 (881   ) FUNC   SortSpecial([in,opt] XlSortMethod SortMethod, [in,opt] VT_VARIANT Key1, [in,opt] XlSortOrder Order1, [in,opt] VT_VARIANT Type, [in,opt] VT_VARIANT Key2, [in,opt] XlSortOrder Order2, [in,opt] VT_VARIANT Key3, [in,opt] XlSortOrder Order3, [in,opt] XlYesNoGuess Header, [in,opt] VT_VARIANT OrderCustom, [in,opt] VT_VARIANT MatchCase, [in,opt] XlSortOrientation Orientation, [in,opt] XlSortDataOption DataOption1, [in,opt] XlSortDataOption DataOption2, [in,opt] XlSortDataOption DataOption3) -> VT_VARIANT
+  slot#163  oVft=1304  dispid=0x00000394 (916   ) GET    SoundNote() -> SoundNote*
+  slot#164  oVft=1312  dispid=0x0000019A (410   ) FUNC   SpecialCells([in] XlCellType Type, [in,opt] VT_VARIANT Value) -> Range*
+  slot#165  oVft=1320  dispid=0x00000104 (260   ) GET    Style() -> VT_VARIANT
+  slot#166  oVft=1328  dispid=0x00000104 (260   ) PUT    Style([in] VT_VARIANT arg0) -> VT_VOID
+  slot#167  oVft=1336  dispid=0x000001E1 (481   ) FUNC   SubscribeTo([in] VT_BSTR Edition, [in,opt] XlSubscribeToFormat Format) -> VT_VARIANT
+  slot#168  oVft=1344  dispid=0x00000372 (882   ) FUNC   Subtotal([in] VT_I4 GroupBy, [in] XlConsolidationFunction Function, [in] VT_VARIANT TotalList, [in,opt] VT_VARIANT Replace, [in,opt] VT_VARIANT PageBreaks, [in,opt] XlSummaryRow SummaryBelowData) -> VT_VARIANT
+  slot#169  oVft=1352  dispid=0x00000111 (273   ) GET    Summary() -> VT_VARIANT
+  slot#170  oVft=1360  dispid=0x000001F1 (497   ) FUNC   Table([in,opt] VT_VARIANT RowInput, [in,opt] VT_VARIANT ColumnInput) -> VT_VARIANT
+  slot#171  oVft=1368  dispid=0x0000008A (138   ) GET    Text() -> VT_VARIANT
+  slot#172  oVft=1376  dispid=0x00000410 (1040  ) FUNC   TextToColumns([in,opt] VT_VARIANT Destination, [in,opt] XlTextParsingType DataType, [in,opt] XlTextQualifier TextQualifier, [in,opt] VT_VARIANT ConsecutiveDelimiter, [in,opt] VT_VARIANT Tab, [in,opt] VT_VARIANT Semicolon, [in,opt] VT_VARIANT Comma, [in,opt] VT_VARIANT Space, [in,opt] VT_VARIANT Other, [in,opt] VT_VARIANT OtherChar, [in,opt] VT_VARIANT FieldInfo, [in,opt] VT_VARIANT DecimalSeparator, [in,opt] VT_VARIANT ThousandsSeparator, [in,opt] VT_VARIANT TrailingMinusNumbers) -> VT_VARIANT
+  slot#173  oVft=1384  dispid=0x0000007E (126   ) GET    Top() -> VT_VARIANT
+  slot#174  oVft=1392  dispid=0x000000F4 (244   ) FUNC   Ungroup() -> VT_VARIANT
+  slot#175  oVft=1400  dispid=0x00000112 (274   ) GET    UseStandardHeight() -> VT_VARIANT
+  slot#176  oVft=1408  dispid=0x00000112 (274   ) PUT    UseStandardHeight([in] VT_VARIANT arg0) -> VT_VOID
+  slot#177  oVft=1416  dispid=0x00000113 (275   ) GET    UseStandardWidth() -> VT_VARIANT
+  slot#178  oVft=1424  dispid=0x00000113 (275   ) PUT    UseStandardWidth([in] VT_VARIANT arg0) -> VT_VOID
+  slot#179  oVft=1432  dispid=0x0000056B (1387  ) GET    Validation() -> Validation*
+  slot#180  oVft=1440  dispid=0x00000006 (6     ) GET    Value([in,opt] VT_VARIANT RangeValueDataType) -> VT_VARIANT
+  slot#181  oVft=1448  dispid=0x00000006 (6     ) PUT    Value([in,opt] VT_VARIANT RangeValueDataType, [in] VT_VARIANT arg1) -> VT_VOID
+  slot#182  oVft=1456  dispid=0x0000056C (1388  ) GET    Value2() -> VT_VARIANT
+  slot#183  oVft=1464  dispid=0x0000056C (1388  ) PUT    Value2([in] VT_VARIANT arg0) -> VT_VOID
+  slot#184  oVft=1472  dispid=0x00000089 (137   ) GET    VerticalAlignment() -> VT_VARIANT
+  slot#185  oVft=1480  dispid=0x00000089 (137   ) PUT    VerticalAlignment([in] VT_VARIANT arg0) -> VT_VOID
+  slot#186  oVft=1488  dispid=0x0000007A (122   ) GET    Width() -> VT_VARIANT
+  slot#187  oVft=1496  dispid=0x0000015C (348   ) GET    Worksheet() -> Worksheet*
+  slot#188  oVft=1504  dispid=0x00000114 (276   ) GET    WrapText() -> VT_VARIANT
+  slot#189  oVft=1512  dispid=0x00000114 (276   ) PUT    WrapText([in] VT_VARIANT arg0) -> VT_VOID
+  slot#190  oVft=1520  dispid=0x0000056D (1389  ) FUNC   AddComment([in,opt] VT_VARIANT Text) -> Comment*
+  slot#191  oVft=1528  dispid=0x0000038E (910   ) GET    Comment() -> Comment*
+  slot#192  oVft=1536  dispid=0x0000056E (1390  ) FUNC   ClearComments() -> VT_VOID
+  slot#193  oVft=1544  dispid=0x0000056F (1391  ) GET    Phonetic() -> Phonetic*
+  slot#194  oVft=1552  dispid=0x00000570 (1392  ) GET    FormatConditions() -> FormatConditions*
+  slot#195  oVft=1560  dispid=0x000003CF (975   ) GET    ReadingOrder() -> VT_I4
+  slot#196  oVft=1568  dispid=0x000003CF (975   ) PUT    ReadingOrder([in] VT_I4 arg0) -> VT_VOID
+  slot#197  oVft=1576  dispid=0x00000571 (1393  ) GET    Hyperlinks() -> Hyperlinks*
+  slot#198  oVft=1584  dispid=0x00000713 (1811  ) GET    Phonetics() -> Phonetics*
+  slot#199  oVft=1592  dispid=0x00000714 (1812  ) FUNC   SetPhonetic() -> VT_VOID
+  slot#200  oVft=1600  dispid=0x00000715 (1813  ) GET    ID() -> VT_BSTR
+  slot#201  oVft=1608  dispid=0x00000715 (1813  ) PUT    ID([in] VT_BSTR arg0) -> VT_VOID
+  slot#202  oVft=1616  dispid=0x000006EC (1772  ) FUNC   _PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName) -> VT_VARIANT
+  slot#203  oVft=1624  dispid=0x000007DD (2013  ) GET    PivotCell() -> PivotCell*
+  slot#204  oVft=1632  dispid=0x000007DE (2014  ) FUNC   Dirty() -> VT_VOID
+  slot#205  oVft=1640  dispid=0x000007DF (2015  ) GET    Errors() -> Errors*
+  slot#206  oVft=1648  dispid=0x000007E0 (2016  ) GET    SmartTags() -> SmartTags*
+  slot#207  oVft=1656  dispid=0x000007E1 (2017  ) FUNC   Speak([in,opt] VT_VARIANT SpeakDirection, [in,opt] VT_VARIANT SpeakFormulas) -> VT_VOID
+  slot#208  oVft=1664  dispid=0x00000788 (1928  ) FUNC   PasteSpecial([in,opt] XlPasteType Paste, [in,opt] XlPasteSpecialOperation Operation, [in,opt] VT_VARIANT SkipBlanks, [in,opt] VT_VARIANT Transpose) -> VT_VARIANT
+  slot#209  oVft=1672  dispid=0x000007E4 (2020  ) GET    AllowEdit() -> VT_BOOL
+  slot#210  oVft=1680  dispid=0x000008D1 (2257  ) GET    ListObject() -> ListObject*
+  slot#211  oVft=1688  dispid=0x000008D2 (2258  ) GET    XPath() -> XPath*
+  slot#212  oVft=1696  dispid=0x000009BB (2491  ) GET    ServerActions() -> Actions*
+  slot#213  oVft=1704  dispid=0x000009BC (2492  ) FUNC   RemoveDuplicates([in,opt] VT_VARIANT Columns, [in,opt] XlYesNoGuess Header) -> VT_VOID
+  slot#214  oVft=1712  dispid=0x00000939 (2361  ) FUNC   PrintOut([in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT Copies, [in,opt] VT_VARIANT Preview, [in,opt] VT_VARIANT ActivePrinter, [in,opt] VT_VARIANT PrintToFile, [in,opt] VT_VARIANT Collate, [in,opt] VT_VARIANT PrToFileName) -> VT_VARIANT
+  slot#215  oVft=1720  dispid=0x0000084B (2123  ) GET    MDX() -> VT_BSTR
+  slot#216  oVft=1728  dispid=0x000009BD (2493  ) FUNC   _ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr) -> VT_VOID
+  slot#217  oVft=1736  dispid=0x000009C3 (2499  ) GET    CountLarge() -> VT_VARIANT
+  slot#218  oVft=1744  dispid=0x0000093C (2364  ) FUNC   CalculateRowMajorOrder() -> VT_VARIANT
+  slot#219  oVft=1752  dispid=0x00000B25 (2853  ) GET    SparklineGroups() -> SparklineGroups*
+  slot#220  oVft=1760  dispid=0x00000B26 (2854  ) FUNC   ClearHyperlinks() -> VT_VOID
+  slot#221  oVft=1768  dispid=0x0000029A (666   ) GET    DisplayFormat() -> DisplayFormat*
+  slot#222  oVft=1776  dispid=0x00000AD3 (2771  ) FUNC   BorderAround([in,opt] VT_VARIANT LineStyle, [in,opt] XlBorderWeight Weight, [in,opt] XlColorIndex ColorIndex, [in,opt] VT_VARIANT Color, [in,opt] VT_VARIANT ThemeColor) -> VT_VARIANT
+  slot#223  oVft=1784  dispid=0x00000B27 (2855  ) FUNC   AllocateChanges() -> VT_VOID
+  slot#224  oVft=1792  dispid=0x00000B28 (2856  ) FUNC   DiscardChanges() -> VT_VOID
+  slot#225  oVft=1800  dispid=0x00000BB4 (2996  ) FUNC   FlashFill() -> VT_VOID
+  slot#226  oVft=1808  dispid=0x00000C67 (3175  ) FUNC   ExportAsFixedFormat([in] XlFixedFormatType Type, [in,opt] VT_VARIANT Filename, [in,opt] VT_VARIANT Quality, [in,opt] VT_VARIANT IncludeDocProperties, [in,opt] VT_VARIANT IgnorePrintAreas, [in,opt] VT_VARIANT From, [in,opt] VT_VARIANT To, [in,opt] VT_VARIANT OpenAfterPublish, [in,opt] VT_VARIANT FixedFormatExtClassPtr, [in,opt] VT_VARIANT WorkIdentity) -> VT_VOID
+  slot#227  oVft=1816  dispid=0x00000CFE (3326  ) GET    HasRichDataType() -> VT_VARIANT
+  slot#228  oVft=1824  dispid=0x00000CCA (3274  ) FUNC   ShowCard() -> VT_VOID
+  slot#229  oVft=1832  dispid=0x00000CD0 (3280  ) FUNC   AddCommentThreaded([in] VT_BSTR Text) -> CommentThreaded*
+  slot#230  oVft=1840  dispid=0x00000CD1 (3281  ) GET    CommentThreaded() -> CommentThreaded*
+  slot#231  oVft=1848  dispid=0x00000CD8 (3288  ) FUNC   Sort([in,opt] VT_VARIANT Key1, [in,opt] XlSortOrder Order1, [in,opt] VT_VARIANT Key2, [in,opt] VT_VARIANT Type, [in,opt] XlSortOrder Order2, [in,opt] VT_VARIANT Key3, [in,opt] XlSortOrder Order3, [in,opt] XlYesNoGuess Header, [in,opt] VT_VARIANT OrderCustom, [in,opt] VT_VARIANT MatchCase, [in,opt] XlSortOrientation Orientation, [in,opt] XlSortMethod SortMethod, [in,opt] XlSortDataOption DataOption1, [in,opt] XlSortDataOption DataOption2, [in,opt] XlSortDataOption DataOption3, [in,opt] VT_VARIANT SubField1) -> VT_VARIANT
+  slot#232  oVft=1856  dispid=0x00000CD9 (3289  ) FUNC   AutoFilter([in,opt] VT_VARIANT Field, [in,opt] VT_VARIANT Criteria1, [in,opt] XlAutoFilterOperator Operator, [in,opt] VT_VARIANT Criteria2, [in,opt] VT_VARIANT VisibleDropDown, [in,opt] VT_VARIANT SubField) -> VT_VARIANT
+  slot#233  oVft=1864  dispid=0x00000CDA (3290  ) FUNC   ConvertToLinkedDataType([in] VT_I4 ServiceID, [in] VT_BSTR LanguageCulture) -> VT_VOID
+  slot#234  oVft=1872  dispid=0x00000CDB (3291  ) GET    LinkedDataTypeState() -> VT_VARIANT
+  slot#235  oVft=1880  dispid=0x00000CDD (3293  ) FUNC   SetCellDataTypeFromCell([in] Range* SourceCell) -> VT_VOID
+  slot#236  oVft=1888  dispid=0x00000CDE (3294  ) FUNC   DataTypeToText() -> VT_VOID
+  slot#237  oVft=1896  dispid=0x00000CDF (3295  ) GET    HasSpill() -> VT_VARIANT
+  slot#238  oVft=1904  dispid=0x00000CE0 (3296  ) GET    SpillingToRange() -> Range*
+  slot#239  oVft=1912  dispid=0x00000CE1 (3297  ) GET    SpillParent() -> Range*
+  slot#240  oVft=1920  dispid=0x00000CE3 (3299  ) FUNC   RefreshLinkedDataType([in,opt] VT_VARIANT DomainID) -> VT_VOID
+  slot#241  oVft=1928  dispid=0x0000062C (1580  ) GET    Formula2() -> VT_VARIANT
+  slot#242  oVft=1936  dispid=0x0000062C (1580  ) PUT    Formula2([in] VT_VARIANT arg0) -> VT_VOID
+  slot#243  oVft=1944  dispid=0x00000CE4 (3300  ) GET    Formula2Local() -> VT_VARIANT
+  slot#244  oVft=1952  dispid=0x00000CE4 (3300  ) PUT    Formula2Local([in] VT_VARIANT arg0) -> VT_VOID
+  slot#245  oVft=1960  dispid=0x00000CE5 (3301  ) GET    Formula2R1C1() -> VT_VARIANT
+  slot#246  oVft=1968  dispid=0x00000CE5 (3301  ) PUT    Formula2R1C1([in] VT_VARIANT arg0) -> VT_VOID
+  slot#247  oVft=1976  dispid=0x00000CE6 (3302  ) GET    Formula2R1C1Local() -> VT_VARIANT
+  slot#248  oVft=1984  dispid=0x00000CE6 (3302  ) PUT    Formula2R1C1Local([in] VT_VARIANT arg0) -> VT_VOID
+  slot#249  oVft=1992  dispid=0x00000CE7 (3303  ) GET    SavedAsArray() -> VT_VARIANT
+  slot#250  oVft=2000  dispid=0x00000CE9 (3305  ) FUNC   Replace([in] VT_VARIANT What, [in] VT_VARIANT Replacement, [in,opt] VT_VARIANT LookAt, [in,opt] VT_VARIANT SearchOrder, [in,opt] VT_VARIANT MatchCase, [in,opt] VT_VARIANT MatchByte, [in,opt] VT_VARIANT SearchFormat, [in,opt] VT_VARIANT ReplaceFormat, [in,opt] VT_VARIANT FormulaVersion) -> VT_BOOL
+  slot#251  oVft=2008  dispid=0x00000D4A (3402  ) FUNC   InsertPictureInCell([in] VT_BSTR PictureURI) -> VT_VOID
+  slot#252  oVft=2016  dispid=0x00000D4D (3405  ) FUNC   PastePictureInCell() -> VT_VOID
+  slot#253  oVft=2024  dispid=0x00000D4F (3407  ) FUNC   PlacePictureOverCells([in,opt] VT_VARIANT AsReference) -> VT_VOID
+  slot#254  oVft=2032  dispid=0x00000D52 (3410  ) FUNC   UpdatePictureInCellAlternativeText([in] VT_BSTR AlternativeText) -> VT_VOID
+  slot#255  oVft=2040  dispid=0x00000D53 (3411  ) GET    CellControl() -> CellControl*
+  slot#256  oVft=2048  dispid=0x00000D55 (3413  ) FUNC   ClearContents([in,opt] VT_VARIANT RemoveControls) -> VT_VARIANT
+  slot#257  oVft=2056  dispid=0x00000D57 (3415  ) FUNC   ResetContents() -> VT_VOID
+  slot#258  oVft=2064  dispid=0x00000D56 (3414  ) FUNC   RemoveControls() -> VT_VOID
+  slot#259  oVft=2072  dispid=0x00000D5B (3419  ) FUNC   TogglePythonMarshalMode([in,opt] VT_VARIANT MarshalMode) -> VT_VOID
+====================================================================================================
+INTERFACE Interior  IID={00020870-0000-0000-C000-000000000046}  typekind=TKIND_DISPATCH  cFuncs=31  cbSizeVft=56  wTypeFlags=0x1000
+  inherits: IDispatch
+  slot#0    oVft=0     dispid=0x60000000 (1610612736) FUNC   QueryInterface([in] GUID* riid, [out] VT_VOID** ppvObj) -> VT_VOID
+  slot#1    oVft=8     dispid=0x60000001 (1610612737) FUNC   AddRef() -> VT_UI4
+  slot#2    oVft=16    dispid=0x60000002 (1610612738) FUNC   Release() -> VT_UI4
+  slot#3    oVft=24    dispid=0x60010000 (1610678272) FUNC   GetTypeInfoCount([out] VT_UINT* pctinfo) -> VT_VOID
+  slot#4    oVft=32    dispid=0x60010001 (1610678273) FUNC   GetTypeInfo([in] VT_UINT itinfo, [in] VT_UI4 lcid, [out] VT_VOID** pptinfo) -> VT_VOID
+  slot#5    oVft=40    dispid=0x60010002 (1610678274) FUNC   GetIDsOfNames([in] GUID* riid, [in] VT_16** rgszNames, [in] VT_UINT cNames, [in] VT_UI4 lcid, [out] VT_I4* rgdispid) -> VT_VOID
+  slot#6    oVft=48    dispid=0x60010003 (1610678275) FUNC   Invoke([in] VT_I4 dispidMember, [in] GUID* riid, [in] VT_UI4 lcid, [in] VT_UI2 wFlags, [in] DISPPARAMS* pdispparams, [out] VT_VARIANT* pvarResult, [out] EXCEPINFO* pexcepinfo, [out] VT_UINT* puArgErr) -> VT_VOID
+  slot#7    oVft=56    dispid=0x00000094 (148   ) GET    Application() -> Application*
+  slot#8    oVft=64    dispid=0x00000095 (149   ) GET    Creator() -> XlCreator
+  slot#9    oVft=72    dispid=0x00000096 (150   ) GET    Parent() -> VT_DISPATCH
+  slot#10   oVft=80    dispid=0x00000063 (99    ) GET    Color() -> VT_VARIANT
+  slot#11   oVft=88    dispid=0x00000063 (99    ) PUT    Color([in] VT_VARIANT arg0) -> VT_VOID
+  slot#12   oVft=96    dispid=0x00000061 (97    ) GET    ColorIndex() -> VT_VARIANT
+  slot#13   oVft=104   dispid=0x00000061 (97    ) PUT    ColorIndex([in] VT_VARIANT arg0) -> VT_VOID
+  slot#14   oVft=112   dispid=0x00000084 (132   ) GET    InvertIfNegative() -> VT_VARIANT
+  slot#15   oVft=120   dispid=0x00000084 (132   ) PUT    InvertIfNegative([in] VT_VARIANT arg0) -> VT_VOID
+  slot#16   oVft=128   dispid=0x0000005F (95    ) GET    Pattern() -> VT_VARIANT
+  slot#17   oVft=136   dispid=0x0000005F (95    ) PUT    Pattern([in] VT_VARIANT arg0) -> VT_VOID
+  slot#18   oVft=144   dispid=0x00000064 (100   ) GET    PatternColor() -> VT_VARIANT
+  slot#19   oVft=152   dispid=0x00000064 (100   ) PUT    PatternColor([in] VT_VARIANT arg0) -> VT_VOID
+  slot#20   oVft=160   dispid=0x00000062 (98    ) GET    PatternColorIndex() -> VT_VARIANT
+  slot#21   oVft=168   dispid=0x00000062 (98    ) PUT    PatternColorIndex([in] VT_VARIANT arg0) -> VT_VOID
+  slot#22   oVft=176   dispid=0x0000093D (2365  ) GET    ThemeColor() -> VT_VARIANT
+  slot#23   oVft=184   dispid=0x0000093D (2365  ) PUT    ThemeColor([in] VT_VARIANT arg0) -> VT_VOID
+  slot#24   oVft=192   dispid=0x0000093E (2366  ) GET    TintAndShade() -> VT_VARIANT
+  slot#25   oVft=200   dispid=0x0000093E (2366  ) PUT    TintAndShade([in] VT_VARIANT arg0) -> VT_VOID
+  slot#26   oVft=208   dispid=0x00000A53 (2643  ) GET    PatternThemeColor() -> VT_VARIANT
+  slot#27   oVft=216   dispid=0x00000A53 (2643  ) PUT    PatternThemeColor([in] VT_VARIANT arg0) -> VT_VOID
+  slot#28   oVft=224   dispid=0x00000A54 (2644  ) GET    PatternTintAndShade() -> VT_VARIANT
+  slot#29   oVft=232   dispid=0x00000A54 (2644  ) PUT    PatternTintAndShade([in] VT_VARIANT arg0) -> VT_VOID
+  slot#30   oVft=240   dispid=0x00000A55 (2645  ) GET    Gradient() -> VT_DISPATCH
+
