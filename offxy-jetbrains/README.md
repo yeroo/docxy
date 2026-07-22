@@ -1,12 +1,12 @@
 # Offxy for JetBrains IDEs
 
-A **native** Word `.docx` editor for IntelliJ-platform IDEs — no webview, no
-Microsoft Office, no per-platform native code. The document engine is the
-dependency-free [docxy](https://github.com/yeroo/docxy) Rust core (parse →
-render → edit → **lossless save**), compiled to WebAssembly and executed on
-the JVM by [Chicory](https://chicory.dev). The same `docxwasm.wasm` artifact
-also powers the [VS Code extension](../offxy-vscode) and shares its release
-train.
+**Native** Word `.docx` and Excel `.xlsx` editors for IntelliJ-platform IDEs
+— no webview, no Microsoft Office, no per-platform native code. The engines
+are the dependency-free [docxy](https://github.com/yeroo/docxy) Rust cores
+(parse → render → edit → **lossless save**), compiled to WebAssembly and
+executed on the JVM by [Chicory](https://chicory.dev). The same
+`docxwasm.wasm`/`gridwasm.wasm` artifacts also power the
+[VS Code extension](../offxy-vscode) and share its release train.
 
 ## How it works
 
@@ -30,15 +30,35 @@ IntelliJ editor over a live, **editable** `Document`:
   regenerates only what you changed and preserves everything else
   byte-for-byte.
 
+## The spreadsheet editor
+
+`.xlsx` opens in a **virtualized native grid** over gridwasm's windowed
+viewport protocol — the table asks the engine only for the visible window,
+so scrolling huge sheets stays flat:
+
+- **Full editing:** values and formulas (leading `=`, validated, live
+  recalculation across the window), type-through or F2/double-click in
+  place, a formula bar synced with the selection.
+- **Structure:** insert/delete rows/columns (workbook-wide reference
+  rewriting) from the context menu; sheet strip to switch/add/rename.
+- **Formatting:** bold/italic/alignment/decimals/autosum toolbar; display
+  honors the workbook's number formats and colors.
+- **Clipboard:** rectangular TSV copy/cut/paste through the OS clipboard.
+- **Undo:** every mutation is one engine transaction = one Ctrl+Z step
+  (the engine's own undo stack drives it — including agent edits).
+- **Lossless save**, same guarantee as the Word editor.
+
 ## AI assistants (agent control surface)
 
-Every open tab advertises as `docxy-jetbrains-<name>-<n>` on docxy's
-[control surface](../docs/agent-control.md) — the same loopback protocol the
-terminal apps and VS Code tabs use. Any `docxy --mcp` server sees IDE tabs
-with zero configuration:
+Every open tab advertises on the matching app's
+[control surface](../docs/agent-control.md) — `docxy-jetbrains-…` for
+documents, `xlsxy-jetbrains-…` for workbooks; the same loopback protocol the
+terminal apps and VS Code tabs use. Any `docxy --mcp`/`xlsxy --mcp` server
+sees IDE tabs with zero configuration:
 
 ```sh
-claude mcp add docxy -- docxy --mcp     # Claude Code
+claude mcp add docxy -- docxy --mcp     # Claude Code (Word)
+claude mcp add xlsxy -- xlsxy --mcp     # Claude Code (Excel)
 ```
 
 JetBrains AI Assistant / Junie: add `docxy --mcp` as an MCP server in its
@@ -75,6 +95,8 @@ Needs JDK 17+ and a Rust toolchain with the `wasm32-unknown-unknown` target
 - WMF/EMF/SVG images show as labeled placeholder boxes (PNG/JPEG/GIF/BMP
   render inline).
 - Double-width (CJK) column mapping can briefly drift until the engine
-  reconciles.
-- No `.xlsx` editor yet — designed for, planned as a second provider over
-  the `gridwasm` viewport protocol.
+  reconciles (Word editor).
+- Spreadsheet: merged cells render at their anchor without spanning; charts
+  and pivot tables render as data; no frozen panes or column-drag resize
+  yet; agent `sheet.remove` is not undoable from the IDE (unlike VS Code
+  tabs' single-slot restore).

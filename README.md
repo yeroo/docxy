@@ -262,17 +262,19 @@ in [VSCODE.md](VSCODE.md).
 
 ## Offxy in JetBrains IDEs — native, no webview
 
-The [`offxy-jetbrains`](offxy-jetbrains) plugin brings the Word editor to
-IntelliJ-platform IDEs (2024.2+) with **no webview at all**: the *same*
-`docxwasm.wasm` artifact runs on the JVM via [Chicory](https://chicory.dev)
-(a pure-Java wasm runtime — no native code, no per-platform builds), and the
-document renders in a **real IntelliJ editor** over a live, editable
-`Document`. Typing is native-editor fast on any document size — the engine
-follows your edits asynchronously and reconciles the view — while list
-markers and table borders are guarded (read-only) regions, styles are editor
-highlighters, platform find/undo/save just work, and every open tab
-advertises on the same [agent control surface](docs/agent-control.md) the
-terminal apps use, so Claude Code and Junie can read and edit it live. See
+The [`offxy-jetbrains`](offxy-jetbrains) plugin brings the Word **and Excel**
+editors to IntelliJ-platform IDEs (2024.2+) with **no webview at all**: the
+*same* `docxwasm.wasm`/`gridwasm.wasm` artifacts run on the JVM via
+[Chicory](https://chicory.dev) (a pure-Java wasm runtime — no native code,
+no per-platform builds). A `.docx` renders in a **real IntelliJ editor**
+over a live, editable `Document` — typing is native-editor fast on any
+document size, the engine follows and reconciles asynchronously, structure
+is guarded, platform find/undo/save just work. An `.xlsx` opens in a
+**virtualized native grid** over gridwasm's windowed viewport protocol —
+formulas with live recalculation, formatting, structural edits, sheets, TSV
+clipboard, one-transaction-one-undo. Every open tab advertises on the same
+[agent control surface](docs/agent-control.md) the terminal apps use, so
+Claude Code and Junie can read and edit it live. See
 [offxy-jetbrains/README.md](offxy-jetbrains/README.md).
 
 ## Install

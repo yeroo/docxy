@@ -1,6 +1,6 @@
 # Offxy JetBrains Plugin — Test Plan
 
-Covers v1 (native docx editor + agent ctl bridge). Two halves: the automated
+Covers v1 (native docx + xlsx editors, agent ctl bridges). Two halves: the automated
 suite (run per change, gates CI) and the manual plan (run before merging a
 feature branch and before attaching a zip to a release). Known limits at the
 end are expected behavior — don't file them as bugs.
@@ -145,6 +145,30 @@ hand.
 - [ ] Leave a tab open 30+ min with the ctl refresh running: no CPU churn.
 - [ ] `idea.log` (Help → Show Log): no Offxy exceptions after a full session
       of the above.
+
+### 2.9 Spreadsheet editor
+
+- [ ] `.xlsx` opens in the Offxy grid (not Excel); corpus workbooks render
+      values with number formats, alignment, bold/colors; sheets listed.
+- [ ] Scrolling a large sheet is smooth; far-away cells appear as the
+      window refreshes (no blank stalls).
+- [ ] Type into a cell (replaces), F2 edits in place showing the raw
+      formula; Enter moves down, Tab right, Esc cancels; the formula bar
+      edits the same state and commits on Enter.
+- [ ] `=SUM(...)` over edited cells recalculates dependents immediately;
+      a bad formula balloons and changes nothing.
+- [ ] Rectangular select → Ctrl+C pastes as TSV into a text editor;
+      Ctrl+V of a TSV block lands as one undo step; Delete clears.
+- [ ] Context menu insert/delete rows/columns shifts references correctly
+      (`=A1` follows its cell); one Ctrl+Z reverses each.
+- [ ] Toolbar bold/italic/align/decimals/autosum apply and undo.
+- [ ] Sheet strip: switch, `+` add, double-click rename; all undoable
+      except switch.
+- [ ] Save → reopen in terminal `xlsxy`: values, formulas, and formats
+      intact (lossless round-trip).
+- [ ] `xlsxy --mcp`: `xlsxy_list` shows `xlsxy-jetbrains-*`; `xlsxy_set`
+      repaints live and is one Ctrl+Z; terminal + IDE disambiguated by
+      `target`.
 
 ## 3. Release checklist (additions)
 
