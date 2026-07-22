@@ -35,6 +35,7 @@ enum NodeShape {
     Stadium,
     Diamond,
     Circle,
+    Hexagon,
 }
 
 impl NodeShape {
@@ -46,6 +47,7 @@ impl NodeShape {
             NodeShape::Stadium => "roundRect",
             NodeShape::Diamond => "diamond",
             NodeShape::Circle => "ellipse",
+            NodeShape::Hexagon => "hexagon",
         }
     }
 }
@@ -605,7 +607,7 @@ fn push_node(out: &mut Vec<Seg>, buf: &mut String) {
 }
 
 /// Parse `id[Label]` / `id(Label)` / `id{Label}` / `id((Label))` / `id([Label])`
-/// / bare `id`, with an optional trailing `:::className` (applies a
+/// / `id{{Label}}` / bare `id`, with an optional trailing `:::className` (applies a
 /// `classDef` inline, e.g. `A[Hot]:::warn`). Returns `(id, label, shape,
 /// class_name)`.
 fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>, Option<String>) {
@@ -628,6 +630,8 @@ fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>, Op
         (NodeShape::Circle, l)
     } else if let Some(l) = strip_pair(rest, "([", "])") {
         (NodeShape::Stadium, l)
+    } else if let Some(l) = strip_pair(rest, "{{", "}}") {
+        (NodeShape::Hexagon, l)
     } else if let Some(l) = strip_pair(rest, "{", "}") {
         (NodeShape::Diamond, l)
     } else if let Some(l) = strip_pair(rest, "(", ")") {
@@ -1512,6 +1516,26 @@ mod tests {
         assert_eq!(d.edges.len(), 2);
         assert_eq!(d.edges[0].from, 0);
         assert_eq!(d.edges[0].to, 1);
+    }
+
+    #[test]
+    fn double_brace_is_hexagon() {
+        let (_, _, shape, _) = parse_node_token("EB{{EventBridge bus}}");
+        assert_eq!(shape, Some(NodeShape::Hexagon));
+        let (_, label, _, _) = parse_node_token("EB{{EventBridge bus}}");
+        assert_eq!(label.as_deref(), Some("EventBridge bus")); // no stray brace
+    }
+
+    #[test]
+    fn single_brace_still_diamond() {
+        let (_, _, shape, _) = parse_node_token("D{Choice}");
+        assert_eq!(shape, Some(NodeShape::Diamond));
+    }
+
+    #[test]
+    fn hexagon_prst_and_geometry() {
+        let g = geometry("flowchart TD\nA{{Bus}}");
+        assert_eq!(g.nodes[0].shape, "hexagon");
     }
 
     #[test]

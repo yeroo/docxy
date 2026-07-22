@@ -102,6 +102,12 @@ function buildMermaidSvg(geo) {
     if (n.shape === 'diamond') {
       const pts = `${cx},${n.y} ${n.x + n.w},${cy} ${cx},${n.y + n.h} ${n.x},${cy}`;
       parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
+    } else if (n.shape === 'hexagon') {
+      const tip = n.w / 6;
+      const pts =
+        `${n.x + tip},${n.y} ${n.x + n.w - tip},${n.y} ${n.x + n.w},${cy} ` +
+        `${n.x + n.w - tip},${n.y + n.h} ${n.x + tip},${n.y + n.h} ${n.x},${cy}`;
+      parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
     } else if (n.shape === 'ellipse' || n.shape === 'circle') {
       parts.push(
         `<ellipse cx="${cx}" cy="${cy}" rx="${n.w / 2}" ry="${n.h / 2}" ` +
