@@ -73,11 +73,13 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
         Item::Info => draw_info(f, cols[1], host),
         other => {
+            // App-neutral: the same crate serves docxy (PDF), xlsxy (CSV) and
+            // yppxy (Gantt), so avoid naming a format or the app.
             let msg = match other {
                 Item::Save => "Save (Ctrl+S) — write changes to the current file.",
-                Item::Export => "Export — write a PDF next to the document.",
-                Item::New => "New — start a blank document.",
-                Item::Exit => "Exit — quit docxy.",
+                Item::Export => "Export — write an export next to the current file.",
+                Item::New => "New — start a blank file.",
+                Item::Exit => "Exit — quit the app.",
                 _ => "",
             };
             f.render_widget(
