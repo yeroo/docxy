@@ -1091,8 +1091,11 @@ impl App {
         {
             return;
         }
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            self.on_left_click(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.on_left_click(m.column, m.row),
+            MouseEventKind::ScrollDown => self.on_wheel(m.column, m.row, 1),
+            MouseEventKind::ScrollUp => self.on_wheel(m.column, m.row, -1),
+            _ => {}
         }
     }
 
@@ -1105,24 +1108,65 @@ impl App {
         } else if self.folders_rect.contains(pos) {
             self.focus = Pane::Folders;
             let idx = y.saturating_sub(self.folders_row0) as usize;
-            if idx < self.visible_folders.len() {
+            if let Some(v) = self.visible_folders.get(idx) {
+                let (depth, has_children) = (v.depth as u16, v.has_children);
                 self.folder_index = idx;
-                self.selected_folder = Some(self.visible_folders[idx].row.id.clone());
+                self.selected_folder = Some(v.row.id.clone());
                 self.msg_index = 0;
                 self.reload_messages();
+                // A click on the chevron cell toggles expand/collapse.
+                if has_children && x == self.folders_rect.x + 1 + 2 * depth {
+                    self.toggle_selected_folder();
+                }
             }
         } else if self.list_rect.contains(pos) {
             self.focus = Pane::List;
             let idx = y.saturating_sub(self.list_row0) as usize;
-            if self.threaded_active() {
-                if idx < self.visible_rows.len() {
+            let in_range = if self.threaded_active() {
+                idx < self.visible_rows.len()
+            } else {
+                idx < self.messages.len()
+            };
+            if in_range {
+                if self.threaded_active() {
                     self.row_index = idx;
+                } else {
+                    self.msg_index = idx;
                 }
-            } else if idx < self.messages.len() {
-                self.msg_index = idx;
+                // Click-to-select, click-again-to-open: a second click on the
+                // already-open row activates it (the terminal "double-click").
+                match self.cursor_target() {
+                    Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
+                        self.activate_selected()
+                    }
+                    _ => self.preview_selected_message(),
+                }
             }
         } else if self.reading_rect.contains(pos) {
             self.focus = Pane::Reading;
+        }
+    }
+
+    /// Wheel scroll: the reader scrolls its body; the list/folders move their
+    /// selection (previewing, for the list). `dir` is -1 (up) / +1 (down).
+    fn on_wheel(&mut self, x: u16, y: u16, dir: isize) {
+        let pos = Position { x, y };
+        if self.reading_rect.contains(pos) {
+            self.reading_scroll_by(dir * 3);
+        } else if self.list_rect.contains(pos) {
+            if self.threaded_active() {
+                self.move_thread_selection(dir);
+            } else if !self.messages.is_empty() {
+                let max = self.messages.len() as isize - 1;
+                self.msg_index = (self.msg_index as isize + dir).clamp(0, max) as usize;
+            }
+            self.preview_selected_message();
+        } else if self.folders_rect.contains(pos) && !self.visible_folders.is_empty() {
+            let max = self.visible_folders.len() as isize - 1;
+            self.folder_index = (self.folder_index as isize + dir).clamp(0, max) as usize;
+            self.selected_folder = Some(self.visible_folders[self.folder_index].row.id.clone());
+            self.msg_index = 0;
+            self.reload_messages();
         }
     }
 
@@ -1133,7 +1177,18 @@ impl App {
     /// skipped (they open in the composer via Enter, not previewed). A no-op
     /// when that message is already the one open (avoids reload churn).
     pub fn preview_selected_message(&mut self) {
-        let target = if self.threaded_active() {
+        if let Some((id, is_draft)) = self.cursor_target() {
+            if !is_draft && self.selected_msg.as_deref() != Some(id.as_str()) {
+                self.open_message(&id);
+            }
+        }
+    }
+
+    /// The `(id, is_draft)` of the message the list cursor points at (threaded:
+    /// the message row, or a collapsed header's latest; flat: `messages[msg_index]`)
+    /// — shared by preview and mouse click-to-activate.
+    fn cursor_target(&self) -> Option<(String, bool)> {
+        if self.threaded_active() {
             match self.selected_row() {
                 Some(Row::Header(t)) => self.threads[t].thread.messages.last(),
                 Some(Row::Message(t, m)) => self.threads[t].thread.messages.get(m),
@@ -1144,11 +1199,6 @@ impl App {
             self.messages
                 .get(self.msg_index)
                 .map(|m| (m.id.clone(), m.is_draft))
-        };
-        if let Some((id, is_draft)) = target {
-            if !is_draft && self.selected_msg.as_deref() != Some(id.as_str()) {
-                self.open_message(&id);
-            }
         }
     }
 
@@ -5195,6 +5245,46 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Pane::Reading); // stays active
         assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
         assert!(!app.open_sibling_message(1)); // no-op past the end
+    }
+
+    #[test]
+    fn clicking_a_message_previews_then_activates_on_second_click() {
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = false;
+        app.reload_messages();
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row: 1,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        click(&mut app); // first click on m1: preview, still unread, focus List
+        assert_eq!(app.selected_msg.as_deref(), Some("m1"));
+        assert_eq!(app.focus, Pane::List);
+        assert!(!app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
+        click(&mut app); // second click on the selected row: activate
+        assert_eq!(app.focus, Pane::Reading);
+        assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
+    }
+
+    #[test]
+    fn wheel_over_the_reader_scrolls_the_body() {
+        let mut app = App::for_test_with_seeded_store();
+        app.reading_rect = Rect::new(55, 0, 40, 20);
+        app.open_message("m1");
+        app.reading_content_rows = 100;
+        app.reading_viewport = 10; // scrollable
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 60,
+            row: 5,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.reading_scroll > 0);
     }
 
     #[test]
