@@ -141,7 +141,9 @@ const ACCENT: Color = Color::Cyan;
 /// Rows inside the expanded ribbon body (0 = first button row).
 const ROW0: usize = 1;
 const ROW1: usize = 2;
-/// Total rows a fully-expanded ribbon occupies: tab strip + 5 body lines + hint.
+/// Total rows a fully-expanded ribbon occupies: the tab strip + the 6-line
+/// bordered body (top border, two button rows, mid divider, titles, bottom
+/// border).
 pub const EXPANDED_H: u16 = 7;
 
 impl Ribbon {
@@ -458,6 +460,7 @@ impl Ribbon {
             spans.push(Span::styled("\u{2502}", accent));
         }
         out.push(Line::from(spans));
+        out.push(bar("\u{2514}", "\u{2534}", "\u{2518}")); // bottom border — close the box
         out
     }
 
@@ -489,31 +492,6 @@ impl Ribbon {
                 }
             }
         }
-    }
-
-    /// The yellow hint bar shown at the ribbon's bottom edge.
-    pub fn render_hint(&self, focus: Focus, total_width: u16) -> Line<'static> {
-        let style = Style::default().fg(Color::Black).bg(Color::Yellow);
-        let text = match focus {
-            Focus::Button(i) => {
-                let p = self.placed.get(i);
-                let enabled = p.map(|p| p.act.enabled()).unwrap_or(true);
-                let h = p.map(|p| p.hint).unwrap_or("");
-                if enabled {
-                    format!(" {h}")
-                } else {
-                    format!(" {h} \u{2014} not implemented yet")
-                }
-            }
-            _ => " F9 ribbon \u{b7} \u{2190}\u{2192} tabs \u{b7} \u{2193} enter \u{b7} arrows move \u{b7} Enter apply \u{b7} Esc leave".to_string(),
-        };
-        let w = total_width as usize;
-        let padded = if text.chars().count() >= w {
-            text.chars().take(w).collect()
-        } else {
-            format!("{text}{}", " ".repeat(w - text.chars().count()))
-        };
-        Line::styled(padded, style)
     }
 }
 

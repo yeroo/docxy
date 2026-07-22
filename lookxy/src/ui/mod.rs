@@ -234,15 +234,6 @@ fn draw_ribbon(f: &mut Frame, app: &App, area: Rect) {
                 ..area
             },
         );
-        let hint = app.ribbon.render_hint(app.ribbon_focus, area.width);
-        f.render_widget(
-            Paragraph::new(hint),
-            Rect {
-                y: area.y + 1 + body_h,
-                height: 1,
-                ..area
-            },
-        );
     }
 }
 
