@@ -62,25 +62,101 @@
       }
     ],
     "commands": [
-      { "command": "offxy.toggleBold", "title": "Bold", "category": "Docxy" },
-      { "command": "offxy.toggleItalic", "title": "Italic", "category": "Docxy" },
-      { "command": "offxy.toggleUnderline", "title": "Underline", "category": "Docxy" },
-      { "command": "offxy.toggleStrike", "title": "Strikethrough", "category": "Docxy" },
-      { "command": "offxy.heading1", "title": "Heading 1", "category": "Docxy" },
-      { "command": "offxy.heading2", "title": "Heading 2", "category": "Docxy" },
-      { "command": "offxy.heading3", "title": "Heading 3", "category": "Docxy" },
-      { "command": "offxy.normalStyle", "title": "Normal (clear heading)", "category": "Docxy" },
-      { "command": "offxy.bulletList", "title": "Bulleted List", "category": "Docxy" },
-      { "command": "offxy.numberedList", "title": "Numbered List", "category": "Docxy" },
-      { "command": "offxy.alignLeft", "title": "Align Left", "category": "Docxy" },
-      { "command": "offxy.alignCenter", "title": "Align Center", "category": "Docxy" },
-      { "command": "offxy.alignRight", "title": "Align Right", "category": "Docxy" },
-      { "command": "offxy.alignJustify", "title": "Justify", "category": "Docxy" },
-      { "command": "offxy.fontBigger", "title": "Increase Font Size", "category": "Docxy" },
-      { "command": "offxy.fontSmaller", "title": "Decrease Font Size", "category": "Docxy" },
-      { "command": "offxy.replace", "title": "Replace…", "category": "Docxy" },
-      { "command": "offxy.convertMarkdown", "title": "Convert Markdown to Word (.docx)", "category": "Docxy" },
-      { "command": "offxy.exportMarkdown", "title": "Export to Markdown (.md)", "category": "Docxy" }
+      {
+        "command": "offxy.toggleBold",
+        "title": "Bold",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.toggleItalic",
+        "title": "Italic",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.toggleUnderline",
+        "title": "Underline",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.toggleStrike",
+        "title": "Strikethrough",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.heading1",
+        "title": "Heading 1",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.heading2",
+        "title": "Heading 2",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.heading3",
+        "title": "Heading 3",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.normalStyle",
+        "title": "Normal (clear heading)",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.bulletList",
+        "title": "Bulleted List",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.numberedList",
+        "title": "Numbered List",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.alignLeft",
+        "title": "Align Left",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.alignCenter",
+        "title": "Align Center",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.alignRight",
+        "title": "Align Right",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.alignJustify",
+        "title": "Justify",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.fontBigger",
+        "title": "Increase Font Size",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.fontSmaller",
+        "title": "Decrease Font Size",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.replace",
+        "title": "Replace…",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.convertMarkdown",
+        "title": "Convert Markdown to Word (.docx)",
+        "category": "Docxy"
+      },
+      {
+        "command": "offxy.exportMarkdown",
+        "title": "Export to Markdown (.md)",
+        "category": "Docxy"
+      }
     ],
     "menus": {
       "explorer/context": [
@@ -114,20 +190,25 @@
   "scripts": {
     "vscode:prepublish": "npm run build",
     "build:wasm": "cargo build -p docxwasm -p gridwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
+    "build:mermaid": "node ./scripts/copy-mermaid.mjs",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
-    "build": "npm run build:wasm && npm run build:ext",
+    "build": "npm run build:wasm && npm run build:mermaid && npm run build:ext",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18 --watch",
     "typecheck": "tsc --noEmit",
     "test:mcp-parity": "node mcp/parity.test.mjs",
     "test:grid-layout": "node media/grid.layout.test.mjs",
     "test:md-roundtrip": "node media/markdown-roundtrip.test.mjs",
     "test:mermaid-svg": "node media/mermaid-svg.test.mjs",
+    "test:mermaid-live": "node media/mermaid-live.test.mjs",
+    "test:mermaid-render": "node media/mermaid-render.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",
     "@types/vscode": "^1.101.0",
     "esbuild": "^0.24.0",
+    "jsdom": "^29.1.1",
+    "mermaid": "^10.9.6",
     "typescript": "^5.4.0"
   }
 }

@@ -9,6 +9,12 @@ out/
 media/*.wasm
 offxy-vscode/TEST-PLAN.docx
 
+# Vendored mermaid.min.js is copied from node_modules/mermaid (npm run
+# build:mermaid, part of `npm run build`) — same build-artifact policy as the
+# wasm above, not committed. `npm install` (mermaid is a devDependency) +
+# `npm run build` regenerates it.
+media/mermaid.min.js
+
 # Mermaid sample fixtures are checked in as .md; the .docx conversions are
 # build artifacts produced by `docxy.exe --docx`, not committed.
 samples/mermaid/*.docx

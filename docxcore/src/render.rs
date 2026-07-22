@@ -330,6 +330,7 @@ pub struct MermaidBox {
     pub cols: usize,
     pub rows: usize,
     pub geometry_json: String,
+    pub source: String,
 }
 
 /// The relationship id of an embedded image from its raw run XML — DrawingML
@@ -1597,6 +1598,7 @@ fn emit_block_item(
                     cols,
                     rows,
                     geometry_json: gjson,
+                    source: src.clone(),
                 });
             } else {
                 let blocks = smartart_blocks(text);
@@ -2957,6 +2959,7 @@ fn paginate(
                     cols: mb.cols,
                     rows: mb.rows,
                     geometry_json: mb.geometry_json.clone(),
+                    source: mb.source.clone(),
                 });
             }
         }

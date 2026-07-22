@@ -1,0 +1,13 @@
+{
+  "name": "mmcompare",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Visual-comparison harness: renders real Mermaid and docxy's geometry-driven SVG side by side (Phase-2 gate for real-mermaid.js rendering in the docxy webview).",
+  "type": "module",
+  "scripts": {
+    "compare": "node render.mjs"
+  },
+  "devDependencies": {
+    "mermaid": "^10.9.6"
+  }
+}
