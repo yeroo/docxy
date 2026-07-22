@@ -19,6 +19,7 @@ mod message_list;
 pub mod oofform;
 pub mod rail;
 mod reading;
+pub mod ribbon;
 mod search;
 mod signin;
 mod status_bar;
