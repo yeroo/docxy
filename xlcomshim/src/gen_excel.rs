@@ -474,473 +474,473 @@ unsafe trait IApplication: IDispatch {
 }
 
 impl IApplication_Impl for Application_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IApplication vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IApplication vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IApplication vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IApplication vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IApplication vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IApplication vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IApplication vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IApplication vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IApplication vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IApplication vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IApplication vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IApplication vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IApplication vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IApplication vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IApplication vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IApplication vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IApplication vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IApplication vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IApplication vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IApplication vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IApplication vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IApplication vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IApplication vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IApplication vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IApplication vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IApplication vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IApplication vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IApplication vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IApplication vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IApplication vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IApplication vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IApplication vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IApplication vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IApplication vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IApplication vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IApplication vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IApplication vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IApplication vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IApplication vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IApplication vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IApplication vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IApplication vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IApplication vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IApplication vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IApplication vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s52(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_app_workbooks(self, ret) } }
-    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s100(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { log("IApplication vtable#53 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IApplication vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IApplication vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IApplication vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IApplication vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IApplication vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IApplication vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IApplication vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IApplication vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IApplication vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IApplication vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IApplication vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IApplication vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { log("IApplication vtable#66 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IApplication vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IApplication vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IApplication vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IApplication vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { log("IApplication vtable#71 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { log("IApplication vtable#72 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { log("IApplication vtable#73 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { log("IApplication vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IApplication vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IApplication vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IApplication vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IApplication vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IApplication vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IApplication vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IApplication vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IApplication vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IApplication vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IApplication vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IApplication vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IApplication vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IApplication vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IApplication vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IApplication vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IApplication vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IApplication vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IApplication vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IApplication vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IApplication vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IApplication vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IApplication vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IApplication vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IApplication vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { log("IApplication vtable#99 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { log("IApplication vtable#100 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { log("IApplication vtable#101 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { log("IApplication vtable#102 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { log("IApplication vtable#103 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { log("IApplication vtable#104 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { log("IApplication vtable#105 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { log("IApplication vtable#106 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { log("IApplication vtable#107 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { log("IApplication vtable#108 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { log("IApplication vtable#109 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { log("IApplication vtable#110 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { log("IApplication vtable#111 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { log("IApplication vtable#112 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { log("IApplication vtable#113 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { log("IApplication vtable#114 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { log("IApplication vtable#115 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { log("IApplication vtable#116 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { log("IApplication vtable#117 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { log("IApplication vtable#118 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s119(&self, _lcid: u32, ret: *mut i16) -> HRESULT { unsafe { vt_app_da_get(self, ret) } }
     unsafe fn s120(&self, _lcid: u32, v: i16) -> HRESULT { unsafe { vt_app_da_put(self, v) } }
-    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s158(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s159(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s160(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s161(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s162(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s163(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s164(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s165(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s166(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s167(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s168(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s169(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s170(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s171(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s172(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s173(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s174(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s175(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s176(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s177(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s178(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s179(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s180(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s181(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s182(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s183(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s184(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s185(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s186(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s187(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s188(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s189(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s190(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s191(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s192(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s193(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s194(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s195(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s196(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { log("IApplication vtable#121 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { log("IApplication vtable#122 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { log("IApplication vtable#123 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { log("IApplication vtable#124 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { log("IApplication vtable#125 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { log("IApplication vtable#126 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { log("IApplication vtable#127 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { log("IApplication vtable#128 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { log("IApplication vtable#129 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { log("IApplication vtable#130 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { log("IApplication vtable#131 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { log("IApplication vtable#132 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { log("IApplication vtable#133 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { log("IApplication vtable#134 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { log("IApplication vtable#135 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { log("IApplication vtable#136 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { log("IApplication vtable#137 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { log("IApplication vtable#138 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { log("IApplication vtable#139 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { log("IApplication vtable#140 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { log("IApplication vtable#141 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { log("IApplication vtable#142 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { log("IApplication vtable#143 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { log("IApplication vtable#144 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { log("IApplication vtable#145 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { log("IApplication vtable#146 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { log("IApplication vtable#147 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { log("IApplication vtable#148 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { log("IApplication vtable#149 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { log("IApplication vtable#150 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { log("IApplication vtable#151 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { log("IApplication vtable#152 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { log("IApplication vtable#153 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { log("IApplication vtable#154 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { log("IApplication vtable#155 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { log("IApplication vtable#156 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { log("IApplication vtable#157 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s158(&self) -> HRESULT { log("IApplication vtable#158 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s159(&self) -> HRESULT { log("IApplication vtable#159 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s160(&self) -> HRESULT { log("IApplication vtable#160 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s161(&self) -> HRESULT { log("IApplication vtable#161 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s162(&self) -> HRESULT { log("IApplication vtable#162 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s163(&self) -> HRESULT { log("IApplication vtable#163 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s164(&self) -> HRESULT { log("IApplication vtable#164 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s165(&self) -> HRESULT { log("IApplication vtable#165 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s166(&self) -> HRESULT { log("IApplication vtable#166 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s167(&self) -> HRESULT { log("IApplication vtable#167 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s168(&self) -> HRESULT { log("IApplication vtable#168 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s169(&self) -> HRESULT { log("IApplication vtable#169 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s170(&self) -> HRESULT { log("IApplication vtable#170 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s171(&self) -> HRESULT { log("IApplication vtable#171 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s172(&self) -> HRESULT { log("IApplication vtable#172 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s173(&self) -> HRESULT { log("IApplication vtable#173 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s174(&self) -> HRESULT { log("IApplication vtable#174 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s175(&self) -> HRESULT { log("IApplication vtable#175 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s176(&self) -> HRESULT { log("IApplication vtable#176 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s177(&self) -> HRESULT { log("IApplication vtable#177 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s178(&self) -> HRESULT { log("IApplication vtable#178 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s179(&self) -> HRESULT { log("IApplication vtable#179 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s180(&self) -> HRESULT { log("IApplication vtable#180 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s181(&self) -> HRESULT { log("IApplication vtable#181 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s182(&self) -> HRESULT { log("IApplication vtable#182 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s183(&self) -> HRESULT { log("IApplication vtable#183 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s184(&self) -> HRESULT { log("IApplication vtable#184 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s185(&self) -> HRESULT { log("IApplication vtable#185 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s186(&self) -> HRESULT { log("IApplication vtable#186 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s187(&self) -> HRESULT { log("IApplication vtable#187 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s188(&self) -> HRESULT { log("IApplication vtable#188 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s189(&self) -> HRESULT { log("IApplication vtable#189 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s190(&self) -> HRESULT { log("IApplication vtable#190 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s191(&self) -> HRESULT { log("IApplication vtable#191 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s192(&self) -> HRESULT { log("IApplication vtable#192 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s193(&self) -> HRESULT { log("IApplication vtable#193 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s194(&self) -> HRESULT { log("IApplication vtable#194 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s195(&self) -> HRESULT { log("IApplication vtable#195 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s196(&self) -> HRESULT { log("IApplication vtable#196 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s197(&self, ret: *mut BSTR) -> HRESULT { unsafe { vt_app_name(self, ret) } }
-    unsafe fn s198(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s199(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s200(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s201(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s202(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s203(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s204(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s205(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s206(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s207(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s208(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s209(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s210(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s211(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s212(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s213(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s214(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s215(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s216(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s217(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s218(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s219(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s220(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s221(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s222(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s223(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s224(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s225(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s226(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s227(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s228(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s229(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s198(&self) -> HRESULT { log("IApplication vtable#198 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s199(&self) -> HRESULT { log("IApplication vtable#199 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s200(&self) -> HRESULT { log("IApplication vtable#200 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s201(&self) -> HRESULT { log("IApplication vtable#201 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s202(&self) -> HRESULT { log("IApplication vtable#202 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s203(&self) -> HRESULT { log("IApplication vtable#203 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s204(&self) -> HRESULT { log("IApplication vtable#204 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s205(&self) -> HRESULT { log("IApplication vtable#205 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s206(&self) -> HRESULT { log("IApplication vtable#206 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s207(&self) -> HRESULT { log("IApplication vtable#207 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s208(&self) -> HRESULT { log("IApplication vtable#208 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s209(&self) -> HRESULT { log("IApplication vtable#209 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s210(&self) -> HRESULT { log("IApplication vtable#210 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s211(&self) -> HRESULT { log("IApplication vtable#211 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s212(&self) -> HRESULT { log("IApplication vtable#212 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s213(&self) -> HRESULT { log("IApplication vtable#213 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s214(&self) -> HRESULT { log("IApplication vtable#214 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s215(&self) -> HRESULT { log("IApplication vtable#215 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s216(&self) -> HRESULT { log("IApplication vtable#216 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s217(&self) -> HRESULT { log("IApplication vtable#217 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s218(&self) -> HRESULT { log("IApplication vtable#218 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s219(&self) -> HRESULT { log("IApplication vtable#219 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s220(&self) -> HRESULT { log("IApplication vtable#220 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s221(&self) -> HRESULT { log("IApplication vtable#221 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s222(&self) -> HRESULT { log("IApplication vtable#222 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s223(&self) -> HRESULT { log("IApplication vtable#223 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s224(&self) -> HRESULT { log("IApplication vtable#224 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s225(&self) -> HRESULT { log("IApplication vtable#225 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s226(&self) -> HRESULT { log("IApplication vtable#226 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s227(&self) -> HRESULT { log("IApplication vtable#227 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s228(&self) -> HRESULT { log("IApplication vtable#228 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s229(&self) -> HRESULT { log("IApplication vtable#229 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s230(&self) -> HRESULT { unsafe { vt_app_quit(self) } }
-    unsafe fn s231(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s232(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s233(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s234(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s235(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s236(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s237(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s238(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s239(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s240(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s241(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s242(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s243(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s244(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s245(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s246(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s247(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s248(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s249(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s250(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s251(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s252(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s253(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s254(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s255(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s256(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s257(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s258(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s259(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s260(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s261(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s262(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s263(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s264(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s265(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s266(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s267(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s268(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s269(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s270(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s271(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s272(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s273(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s274(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s275(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s276(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s277(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s278(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s279(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s280(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s231(&self) -> HRESULT { log("IApplication vtable#231 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s232(&self) -> HRESULT { log("IApplication vtable#232 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s233(&self) -> HRESULT { log("IApplication vtable#233 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s234(&self) -> HRESULT { log("IApplication vtable#234 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s235(&self) -> HRESULT { log("IApplication vtable#235 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s236(&self) -> HRESULT { log("IApplication vtable#236 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s237(&self) -> HRESULT { log("IApplication vtable#237 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s238(&self) -> HRESULT { log("IApplication vtable#238 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s239(&self) -> HRESULT { log("IApplication vtable#239 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s240(&self) -> HRESULT { log("IApplication vtable#240 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s241(&self) -> HRESULT { log("IApplication vtable#241 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s242(&self) -> HRESULT { log("IApplication vtable#242 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s243(&self) -> HRESULT { log("IApplication vtable#243 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s244(&self) -> HRESULT { log("IApplication vtable#244 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s245(&self) -> HRESULT { log("IApplication vtable#245 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s246(&self) -> HRESULT { log("IApplication vtable#246 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s247(&self) -> HRESULT { log("IApplication vtable#247 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s248(&self) -> HRESULT { log("IApplication vtable#248 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s249(&self) -> HRESULT { log("IApplication vtable#249 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s250(&self) -> HRESULT { log("IApplication vtable#250 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s251(&self) -> HRESULT { log("IApplication vtable#251 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s252(&self) -> HRESULT { log("IApplication vtable#252 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s253(&self) -> HRESULT { log("IApplication vtable#253 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s254(&self) -> HRESULT { log("IApplication vtable#254 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s255(&self) -> HRESULT { log("IApplication vtable#255 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s256(&self) -> HRESULT { log("IApplication vtable#256 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s257(&self) -> HRESULT { log("IApplication vtable#257 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s258(&self) -> HRESULT { log("IApplication vtable#258 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s259(&self) -> HRESULT { log("IApplication vtable#259 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s260(&self) -> HRESULT { log("IApplication vtable#260 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s261(&self) -> HRESULT { log("IApplication vtable#261 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s262(&self) -> HRESULT { log("IApplication vtable#262 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s263(&self) -> HRESULT { log("IApplication vtable#263 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s264(&self) -> HRESULT { log("IApplication vtable#264 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s265(&self) -> HRESULT { log("IApplication vtable#265 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s266(&self) -> HRESULT { log("IApplication vtable#266 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s267(&self) -> HRESULT { log("IApplication vtable#267 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s268(&self) -> HRESULT { log("IApplication vtable#268 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s269(&self) -> HRESULT { log("IApplication vtable#269 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s270(&self) -> HRESULT { log("IApplication vtable#270 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s271(&self) -> HRESULT { log("IApplication vtable#271 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s272(&self) -> HRESULT { log("IApplication vtable#272 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s273(&self) -> HRESULT { log("IApplication vtable#273 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s274(&self) -> HRESULT { log("IApplication vtable#274 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s275(&self) -> HRESULT { log("IApplication vtable#275 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s276(&self) -> HRESULT { log("IApplication vtable#276 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s277(&self) -> HRESULT { log("IApplication vtable#277 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s278(&self) -> HRESULT { log("IApplication vtable#278 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s279(&self) -> HRESULT { log("IApplication vtable#279 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s280(&self) -> HRESULT { log("IApplication vtable#280 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s281(&self, _lcid: u32, ret: *mut BSTR) -> HRESULT { unsafe { vt_app_version(self, ret) } }
     unsafe fn s282(&self, _lcid: u32, ret: *mut i16) -> HRESULT { unsafe { vt_app_vis_get(self, ret) } }
     unsafe fn s283(&self, _lcid: u32, v: i16) -> HRESULT { unsafe { vt_app_vis_put(self, v) } }
-    unsafe fn s284(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s285(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s286(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s287(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s288(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s289(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s290(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s291(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s292(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s293(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s294(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s295(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s296(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s297(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s298(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s299(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s300(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s301(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s302(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s303(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s304(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s305(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s306(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s307(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s308(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s309(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s310(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s311(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s312(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s313(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s314(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s315(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s316(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s317(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s318(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s319(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s320(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s321(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s322(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s323(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s324(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s325(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s326(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s327(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s328(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s329(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s330(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s331(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s332(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s333(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s334(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s335(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s336(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s337(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s338(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s339(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s340(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s341(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s342(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s343(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s344(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s345(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s346(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s347(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s348(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s349(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s350(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s351(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s352(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s353(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s354(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s355(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s356(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s357(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s358(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s359(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s360(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s361(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s362(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s363(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s364(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s365(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s366(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s367(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s368(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s369(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s370(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s371(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s372(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s373(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s374(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s375(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s376(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s377(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s378(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s379(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s380(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s381(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s382(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s383(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s384(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s385(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s386(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s387(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s388(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s389(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s390(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s391(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s392(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s393(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s394(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s395(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s396(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s397(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s398(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s399(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s400(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s401(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s402(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s403(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s404(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s405(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s406(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s407(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s408(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s409(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s410(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s411(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s412(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s413(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s414(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s415(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s416(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s417(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s418(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s419(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s420(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s421(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s422(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s423(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s424(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s425(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s426(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s427(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s428(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s429(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s430(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s431(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s432(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s433(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s434(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s435(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s436(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s437(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s438(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s439(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s440(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s441(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s442(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s443(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s444(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s445(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s446(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s447(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s448(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s449(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s450(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s451(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s452(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s453(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s454(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s455(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s456(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s457(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s458(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s459(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s460(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s461(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s462(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s463(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s464(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s465(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s466(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s467(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s468(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s469(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s470(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s471(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s472(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s473(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s284(&self) -> HRESULT { log("IApplication vtable#284 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s285(&self) -> HRESULT { log("IApplication vtable#285 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s286(&self) -> HRESULT { log("IApplication vtable#286 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s287(&self) -> HRESULT { log("IApplication vtable#287 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s288(&self) -> HRESULT { log("IApplication vtable#288 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s289(&self) -> HRESULT { log("IApplication vtable#289 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s290(&self) -> HRESULT { log("IApplication vtable#290 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s291(&self) -> HRESULT { log("IApplication vtable#291 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s292(&self) -> HRESULT { log("IApplication vtable#292 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s293(&self) -> HRESULT { log("IApplication vtable#293 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s294(&self) -> HRESULT { log("IApplication vtable#294 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s295(&self) -> HRESULT { log("IApplication vtable#295 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s296(&self) -> HRESULT { log("IApplication vtable#296 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s297(&self) -> HRESULT { log("IApplication vtable#297 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s298(&self) -> HRESULT { log("IApplication vtable#298 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s299(&self) -> HRESULT { log("IApplication vtable#299 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s300(&self) -> HRESULT { log("IApplication vtable#300 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s301(&self) -> HRESULT { log("IApplication vtable#301 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s302(&self) -> HRESULT { log("IApplication vtable#302 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s303(&self) -> HRESULT { log("IApplication vtable#303 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s304(&self) -> HRESULT { log("IApplication vtable#304 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s305(&self) -> HRESULT { log("IApplication vtable#305 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s306(&self) -> HRESULT { log("IApplication vtable#306 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s307(&self) -> HRESULT { log("IApplication vtable#307 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s308(&self) -> HRESULT { log("IApplication vtable#308 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s309(&self) -> HRESULT { log("IApplication vtable#309 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s310(&self) -> HRESULT { log("IApplication vtable#310 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s311(&self) -> HRESULT { log("IApplication vtable#311 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s312(&self) -> HRESULT { log("IApplication vtable#312 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s313(&self) -> HRESULT { log("IApplication vtable#313 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s314(&self) -> HRESULT { log("IApplication vtable#314 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s315(&self) -> HRESULT { log("IApplication vtable#315 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s316(&self) -> HRESULT { log("IApplication vtable#316 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s317(&self) -> HRESULT { log("IApplication vtable#317 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s318(&self) -> HRESULT { log("IApplication vtable#318 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s319(&self) -> HRESULT { log("IApplication vtable#319 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s320(&self) -> HRESULT { log("IApplication vtable#320 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s321(&self) -> HRESULT { log("IApplication vtable#321 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s322(&self) -> HRESULT { log("IApplication vtable#322 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s323(&self) -> HRESULT { log("IApplication vtable#323 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s324(&self) -> HRESULT { log("IApplication vtable#324 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s325(&self) -> HRESULT { log("IApplication vtable#325 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s326(&self) -> HRESULT { log("IApplication vtable#326 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s327(&self) -> HRESULT { log("IApplication vtable#327 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s328(&self) -> HRESULT { log("IApplication vtable#328 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s329(&self) -> HRESULT { log("IApplication vtable#329 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s330(&self) -> HRESULT { log("IApplication vtable#330 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s331(&self) -> HRESULT { log("IApplication vtable#331 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s332(&self) -> HRESULT { log("IApplication vtable#332 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s333(&self) -> HRESULT { log("IApplication vtable#333 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s334(&self) -> HRESULT { log("IApplication vtable#334 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s335(&self) -> HRESULT { log("IApplication vtable#335 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s336(&self) -> HRESULT { log("IApplication vtable#336 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s337(&self) -> HRESULT { log("IApplication vtable#337 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s338(&self) -> HRESULT { log("IApplication vtable#338 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s339(&self) -> HRESULT { log("IApplication vtable#339 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s340(&self) -> HRESULT { log("IApplication vtable#340 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s341(&self) -> HRESULT { log("IApplication vtable#341 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s342(&self) -> HRESULT { log("IApplication vtable#342 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s343(&self) -> HRESULT { log("IApplication vtable#343 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s344(&self) -> HRESULT { log("IApplication vtable#344 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s345(&self) -> HRESULT { log("IApplication vtable#345 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s346(&self) -> HRESULT { log("IApplication vtable#346 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s347(&self) -> HRESULT { log("IApplication vtable#347 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s348(&self) -> HRESULT { log("IApplication vtable#348 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s349(&self) -> HRESULT { log("IApplication vtable#349 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s350(&self) -> HRESULT { log("IApplication vtable#350 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s351(&self) -> HRESULT { log("IApplication vtable#351 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s352(&self) -> HRESULT { log("IApplication vtable#352 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s353(&self) -> HRESULT { log("IApplication vtable#353 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s354(&self) -> HRESULT { log("IApplication vtable#354 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s355(&self) -> HRESULT { log("IApplication vtable#355 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s356(&self) -> HRESULT { log("IApplication vtable#356 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s357(&self) -> HRESULT { log("IApplication vtable#357 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s358(&self) -> HRESULT { log("IApplication vtable#358 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s359(&self) -> HRESULT { log("IApplication vtable#359 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s360(&self) -> HRESULT { log("IApplication vtable#360 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s361(&self) -> HRESULT { log("IApplication vtable#361 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s362(&self) -> HRESULT { log("IApplication vtable#362 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s363(&self) -> HRESULT { log("IApplication vtable#363 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s364(&self) -> HRESULT { log("IApplication vtable#364 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s365(&self) -> HRESULT { log("IApplication vtable#365 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s366(&self) -> HRESULT { log("IApplication vtable#366 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s367(&self) -> HRESULT { log("IApplication vtable#367 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s368(&self) -> HRESULT { log("IApplication vtable#368 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s369(&self) -> HRESULT { log("IApplication vtable#369 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s370(&self) -> HRESULT { log("IApplication vtable#370 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s371(&self) -> HRESULT { log("IApplication vtable#371 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s372(&self) -> HRESULT { log("IApplication vtable#372 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s373(&self) -> HRESULT { log("IApplication vtable#373 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s374(&self) -> HRESULT { log("IApplication vtable#374 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s375(&self) -> HRESULT { log("IApplication vtable#375 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s376(&self) -> HRESULT { log("IApplication vtable#376 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s377(&self) -> HRESULT { log("IApplication vtable#377 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s378(&self) -> HRESULT { log("IApplication vtable#378 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s379(&self) -> HRESULT { log("IApplication vtable#379 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s380(&self) -> HRESULT { log("IApplication vtable#380 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s381(&self) -> HRESULT { log("IApplication vtable#381 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s382(&self) -> HRESULT { log("IApplication vtable#382 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s383(&self) -> HRESULT { log("IApplication vtable#383 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s384(&self) -> HRESULT { log("IApplication vtable#384 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s385(&self) -> HRESULT { log("IApplication vtable#385 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s386(&self) -> HRESULT { log("IApplication vtable#386 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s387(&self) -> HRESULT { log("IApplication vtable#387 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s388(&self) -> HRESULT { log("IApplication vtable#388 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s389(&self) -> HRESULT { log("IApplication vtable#389 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s390(&self) -> HRESULT { log("IApplication vtable#390 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s391(&self) -> HRESULT { log("IApplication vtable#391 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s392(&self) -> HRESULT { log("IApplication vtable#392 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s393(&self) -> HRESULT { log("IApplication vtable#393 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s394(&self) -> HRESULT { log("IApplication vtable#394 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s395(&self) -> HRESULT { log("IApplication vtable#395 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s396(&self) -> HRESULT { log("IApplication vtable#396 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s397(&self) -> HRESULT { log("IApplication vtable#397 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s398(&self) -> HRESULT { log("IApplication vtable#398 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s399(&self) -> HRESULT { log("IApplication vtable#399 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s400(&self) -> HRESULT { log("IApplication vtable#400 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s401(&self) -> HRESULT { log("IApplication vtable#401 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s402(&self) -> HRESULT { log("IApplication vtable#402 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s403(&self) -> HRESULT { log("IApplication vtable#403 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s404(&self) -> HRESULT { log("IApplication vtable#404 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s405(&self) -> HRESULT { log("IApplication vtable#405 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s406(&self) -> HRESULT { log("IApplication vtable#406 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s407(&self) -> HRESULT { log("IApplication vtable#407 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s408(&self) -> HRESULT { log("IApplication vtable#408 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s409(&self) -> HRESULT { log("IApplication vtable#409 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s410(&self) -> HRESULT { log("IApplication vtable#410 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s411(&self) -> HRESULT { log("IApplication vtable#411 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s412(&self) -> HRESULT { log("IApplication vtable#412 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s413(&self) -> HRESULT { log("IApplication vtable#413 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s414(&self) -> HRESULT { log("IApplication vtable#414 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s415(&self) -> HRESULT { log("IApplication vtable#415 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s416(&self) -> HRESULT { log("IApplication vtable#416 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s417(&self) -> HRESULT { log("IApplication vtable#417 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s418(&self) -> HRESULT { log("IApplication vtable#418 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s419(&self) -> HRESULT { log("IApplication vtable#419 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s420(&self) -> HRESULT { log("IApplication vtable#420 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s421(&self) -> HRESULT { log("IApplication vtable#421 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s422(&self) -> HRESULT { log("IApplication vtable#422 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s423(&self) -> HRESULT { log("IApplication vtable#423 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s424(&self) -> HRESULT { log("IApplication vtable#424 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s425(&self) -> HRESULT { log("IApplication vtable#425 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s426(&self) -> HRESULT { log("IApplication vtable#426 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s427(&self) -> HRESULT { log("IApplication vtable#427 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s428(&self) -> HRESULT { log("IApplication vtable#428 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s429(&self) -> HRESULT { log("IApplication vtable#429 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s430(&self) -> HRESULT { log("IApplication vtable#430 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s431(&self) -> HRESULT { log("IApplication vtable#431 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s432(&self) -> HRESULT { log("IApplication vtable#432 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s433(&self) -> HRESULT { log("IApplication vtable#433 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s434(&self) -> HRESULT { log("IApplication vtable#434 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s435(&self) -> HRESULT { log("IApplication vtable#435 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s436(&self) -> HRESULT { log("IApplication vtable#436 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s437(&self) -> HRESULT { log("IApplication vtable#437 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s438(&self) -> HRESULT { log("IApplication vtable#438 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s439(&self) -> HRESULT { log("IApplication vtable#439 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s440(&self) -> HRESULT { log("IApplication vtable#440 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s441(&self) -> HRESULT { log("IApplication vtable#441 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s442(&self) -> HRESULT { log("IApplication vtable#442 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s443(&self) -> HRESULT { log("IApplication vtable#443 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s444(&self) -> HRESULT { log("IApplication vtable#444 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s445(&self) -> HRESULT { log("IApplication vtable#445 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s446(&self) -> HRESULT { log("IApplication vtable#446 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s447(&self) -> HRESULT { log("IApplication vtable#447 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s448(&self) -> HRESULT { log("IApplication vtable#448 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s449(&self) -> HRESULT { log("IApplication vtable#449 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s450(&self) -> HRESULT { log("IApplication vtable#450 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s451(&self) -> HRESULT { log("IApplication vtable#451 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s452(&self) -> HRESULT { log("IApplication vtable#452 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s453(&self) -> HRESULT { log("IApplication vtable#453 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s454(&self) -> HRESULT { log("IApplication vtable#454 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s455(&self) -> HRESULT { log("IApplication vtable#455 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s456(&self) -> HRESULT { log("IApplication vtable#456 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s457(&self) -> HRESULT { log("IApplication vtable#457 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s458(&self) -> HRESULT { log("IApplication vtable#458 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s459(&self) -> HRESULT { log("IApplication vtable#459 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s460(&self) -> HRESULT { log("IApplication vtable#460 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s461(&self) -> HRESULT { log("IApplication vtable#461 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s462(&self) -> HRESULT { log("IApplication vtable#462 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s463(&self) -> HRESULT { log("IApplication vtable#463 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s464(&self) -> HRESULT { log("IApplication vtable#464 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s465(&self) -> HRESULT { log("IApplication vtable#465 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s466(&self) -> HRESULT { log("IApplication vtable#466 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s467(&self) -> HRESULT { log("IApplication vtable#467 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s468(&self) -> HRESULT { log("IApplication vtable#468 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s469(&self) -> HRESULT { log("IApplication vtable#469 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s470(&self) -> HRESULT { log("IApplication vtable#470 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s471(&self) -> HRESULT { log("IApplication vtable#471 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s472(&self) -> HRESULT { log("IApplication vtable#472 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s473(&self) -> HRESULT { log("IApplication vtable#473 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("000208DB-0000-0000-C000-000000000046")]
@@ -967,25 +967,25 @@ unsafe trait IWorkbooks: IDispatch {
 }
 
 impl IWorkbooks_Impl for Workbooks_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IWorkbooks vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IWorkbooks vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IWorkbooks vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s10(&self, _tmpl: *const VARIANT, _lcid: u32, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_wbs_add(self, ret) } }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IWorkbooks vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s12(&self, ret: *mut i32) -> HRESULT { unsafe { vt_wbs_count(self, ret) } }
     unsafe fn s13(&self, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_wbs_item(self, index, ret) } }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IWorkbooks vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IWorkbooks vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IWorkbooks vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s17(&self, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_wbs_item(self, index, ret) } }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IWorkbooks vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IWorkbooks vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IWorkbooks vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IWorkbooks vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IWorkbooks vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IWorkbooks vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IWorkbooks vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IWorkbooks vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("000208DA-0000-0000-C000-000000000046")]
@@ -1273,286 +1273,286 @@ unsafe trait IWorkbook: IDispatch {
 }
 
 impl IWorkbook_Impl for Workbook_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IWorkbook vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IWorkbook vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IWorkbook vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IWorkbook vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IWorkbook vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IWorkbook vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IWorkbook vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IWorkbook vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IWorkbook vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IWorkbook vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IWorkbook vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IWorkbook vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IWorkbook vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IWorkbook vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IWorkbook vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IWorkbook vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IWorkbook vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IWorkbook vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IWorkbook vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IWorkbook vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s27(&self, _sc: *const VARIANT, _fn: *const VARIANT, _rw: *const VARIANT, _lcid: u32) -> HRESULT { unsafe { vt_wb_close(self) } }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s52(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IWorkbook vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IWorkbook vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IWorkbook vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IWorkbook vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IWorkbook vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IWorkbook vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IWorkbook vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IWorkbook vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IWorkbook vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IWorkbook vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IWorkbook vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IWorkbook vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IWorkbook vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IWorkbook vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IWorkbook vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IWorkbook vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IWorkbook vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IWorkbook vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IWorkbook vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IWorkbook vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IWorkbook vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IWorkbook vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IWorkbook vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IWorkbook vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { log("IWorkbook vtable#52 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { log("IWorkbook vtable#53 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IWorkbook vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IWorkbook vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IWorkbook vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IWorkbook vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IWorkbook vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IWorkbook vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IWorkbook vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IWorkbook vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IWorkbook vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IWorkbook vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IWorkbook vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IWorkbook vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s66(&self, ret: *mut BSTR) -> HRESULT { unsafe { vt_wb_name(self, ret) } }
-    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s100(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IWorkbook vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IWorkbook vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IWorkbook vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IWorkbook vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { log("IWorkbook vtable#71 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { log("IWorkbook vtable#72 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { log("IWorkbook vtable#73 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { log("IWorkbook vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IWorkbook vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IWorkbook vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IWorkbook vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IWorkbook vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IWorkbook vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IWorkbook vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IWorkbook vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IWorkbook vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IWorkbook vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IWorkbook vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IWorkbook vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IWorkbook vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IWorkbook vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IWorkbook vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IWorkbook vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IWorkbook vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IWorkbook vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IWorkbook vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IWorkbook vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IWorkbook vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IWorkbook vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IWorkbook vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IWorkbook vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IWorkbook vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { log("IWorkbook vtable#99 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { log("IWorkbook vtable#100 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { log("IWorkbook vtable#101 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { log("IWorkbook vtable#102 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { log("IWorkbook vtable#103 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { log("IWorkbook vtable#104 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s105(&self, _lcid: u32, ret: *mut i16) -> HRESULT { unsafe { vt_wb_saved_get(self, ret) } }
     unsafe fn s106(&self, _lcid: u32, v: i16) -> HRESULT { unsafe { vt_wb_saved_put(self, v) } }
-    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { log("IWorkbook vtable#107 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { log("IWorkbook vtable#108 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { log("IWorkbook vtable#109 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { log("IWorkbook vtable#110 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { log("IWorkbook vtable#111 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s112(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_wb_sheets(self, ret) } }
-    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { log("IWorkbook vtable#113 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { log("IWorkbook vtable#114 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { log("IWorkbook vtable#115 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { log("IWorkbook vtable#116 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { log("IWorkbook vtable#117 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { log("IWorkbook vtable#118 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { log("IWorkbook vtable#119 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { log("IWorkbook vtable#120 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { log("IWorkbook vtable#121 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { log("IWorkbook vtable#122 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { log("IWorkbook vtable#123 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { log("IWorkbook vtable#124 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { log("IWorkbook vtable#125 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { log("IWorkbook vtable#126 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { log("IWorkbook vtable#127 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { log("IWorkbook vtable#128 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { log("IWorkbook vtable#129 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { log("IWorkbook vtable#130 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s131(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_wb_sheets(self, ret) } }
-    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s158(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s159(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s160(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s161(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s162(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s163(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s164(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s165(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s166(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s167(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s168(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s169(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s170(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s171(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { log("IWorkbook vtable#132 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { log("IWorkbook vtable#133 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { log("IWorkbook vtable#134 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { log("IWorkbook vtable#135 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { log("IWorkbook vtable#136 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { log("IWorkbook vtable#137 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { log("IWorkbook vtable#138 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { log("IWorkbook vtable#139 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { log("IWorkbook vtable#140 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { log("IWorkbook vtable#141 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { log("IWorkbook vtable#142 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { log("IWorkbook vtable#143 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { log("IWorkbook vtable#144 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { log("IWorkbook vtable#145 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { log("IWorkbook vtable#146 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { log("IWorkbook vtable#147 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { log("IWorkbook vtable#148 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { log("IWorkbook vtable#149 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { log("IWorkbook vtable#150 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { log("IWorkbook vtable#151 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { log("IWorkbook vtable#152 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { log("IWorkbook vtable#153 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { log("IWorkbook vtable#154 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { log("IWorkbook vtable#155 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { log("IWorkbook vtable#156 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { log("IWorkbook vtable#157 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s158(&self) -> HRESULT { log("IWorkbook vtable#158 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s159(&self) -> HRESULT { log("IWorkbook vtable#159 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s160(&self) -> HRESULT { log("IWorkbook vtable#160 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s161(&self) -> HRESULT { log("IWorkbook vtable#161 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s162(&self) -> HRESULT { log("IWorkbook vtable#162 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s163(&self) -> HRESULT { log("IWorkbook vtable#163 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s164(&self) -> HRESULT { log("IWorkbook vtable#164 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s165(&self) -> HRESULT { log("IWorkbook vtable#165 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s166(&self) -> HRESULT { log("IWorkbook vtable#166 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s167(&self) -> HRESULT { log("IWorkbook vtable#167 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s168(&self) -> HRESULT { log("IWorkbook vtable#168 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s169(&self) -> HRESULT { log("IWorkbook vtable#169 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s170(&self) -> HRESULT { log("IWorkbook vtable#170 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s171(&self) -> HRESULT { log("IWorkbook vtable#171 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s172(&self, filename: *const VARIANT, fileformat: *const VARIANT, _p3: *const VARIANT, _p4: *const VARIANT, _p5: *const VARIANT, _p6: *const VARIANT, _access: i32, _p8: *const VARIANT, _p9: *const VARIANT, _p10: *const VARIANT, _p11: *const VARIANT, _p12: *const VARIANT, _lcid: u32) -> HRESULT { unsafe { vt_wb_saveas(self, filename, fileformat) } }
-    unsafe fn s173(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s174(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s175(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s176(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s177(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s178(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s179(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s180(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s181(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s182(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s183(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s184(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s185(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s186(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s187(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s188(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s189(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s190(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s191(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s192(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s193(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s194(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s195(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s196(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s197(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s198(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s199(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s200(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s201(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s202(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s203(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s204(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s205(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s206(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s207(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s208(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s209(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s210(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s211(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s212(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s213(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s214(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s215(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s216(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s217(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s218(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s219(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s220(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s221(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s222(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s223(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s224(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s225(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s226(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s227(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s228(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s229(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s230(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s231(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s232(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s233(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s234(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s235(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s236(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s237(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s238(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s239(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s240(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s241(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s242(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s243(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s244(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s245(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s246(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s247(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s248(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s249(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s250(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s251(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s252(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s253(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s254(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s255(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s256(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s257(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s258(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s259(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s260(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s261(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s262(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s263(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s264(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s265(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s266(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s267(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s268(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s269(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s270(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s271(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s272(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s273(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s274(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s275(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s276(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s277(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s278(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s279(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s280(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s281(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s282(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s283(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s284(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s285(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s286(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s173(&self) -> HRESULT { log("IWorkbook vtable#173 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s174(&self) -> HRESULT { log("IWorkbook vtable#174 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s175(&self) -> HRESULT { log("IWorkbook vtable#175 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s176(&self) -> HRESULT { log("IWorkbook vtable#176 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s177(&self) -> HRESULT { log("IWorkbook vtable#177 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s178(&self) -> HRESULT { log("IWorkbook vtable#178 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s179(&self) -> HRESULT { log("IWorkbook vtable#179 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s180(&self) -> HRESULT { log("IWorkbook vtable#180 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s181(&self) -> HRESULT { log("IWorkbook vtable#181 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s182(&self) -> HRESULT { log("IWorkbook vtable#182 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s183(&self) -> HRESULT { log("IWorkbook vtable#183 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s184(&self) -> HRESULT { log("IWorkbook vtable#184 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s185(&self) -> HRESULT { log("IWorkbook vtable#185 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s186(&self) -> HRESULT { log("IWorkbook vtable#186 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s187(&self) -> HRESULT { log("IWorkbook vtable#187 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s188(&self) -> HRESULT { log("IWorkbook vtable#188 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s189(&self) -> HRESULT { log("IWorkbook vtable#189 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s190(&self) -> HRESULT { log("IWorkbook vtable#190 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s191(&self) -> HRESULT { log("IWorkbook vtable#191 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s192(&self) -> HRESULT { log("IWorkbook vtable#192 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s193(&self) -> HRESULT { log("IWorkbook vtable#193 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s194(&self) -> HRESULT { log("IWorkbook vtable#194 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s195(&self) -> HRESULT { log("IWorkbook vtable#195 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s196(&self) -> HRESULT { log("IWorkbook vtable#196 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s197(&self) -> HRESULT { log("IWorkbook vtable#197 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s198(&self) -> HRESULT { log("IWorkbook vtable#198 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s199(&self) -> HRESULT { log("IWorkbook vtable#199 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s200(&self) -> HRESULT { log("IWorkbook vtable#200 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s201(&self) -> HRESULT { log("IWorkbook vtable#201 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s202(&self) -> HRESULT { log("IWorkbook vtable#202 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s203(&self) -> HRESULT { log("IWorkbook vtable#203 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s204(&self) -> HRESULT { log("IWorkbook vtable#204 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s205(&self) -> HRESULT { log("IWorkbook vtable#205 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s206(&self) -> HRESULT { log("IWorkbook vtable#206 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s207(&self) -> HRESULT { log("IWorkbook vtable#207 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s208(&self) -> HRESULT { log("IWorkbook vtable#208 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s209(&self) -> HRESULT { log("IWorkbook vtable#209 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s210(&self) -> HRESULT { log("IWorkbook vtable#210 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s211(&self) -> HRESULT { log("IWorkbook vtable#211 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s212(&self) -> HRESULT { log("IWorkbook vtable#212 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s213(&self) -> HRESULT { log("IWorkbook vtable#213 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s214(&self) -> HRESULT { log("IWorkbook vtable#214 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s215(&self) -> HRESULT { log("IWorkbook vtable#215 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s216(&self) -> HRESULT { log("IWorkbook vtable#216 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s217(&self) -> HRESULT { log("IWorkbook vtable#217 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s218(&self) -> HRESULT { log("IWorkbook vtable#218 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s219(&self) -> HRESULT { log("IWorkbook vtable#219 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s220(&self) -> HRESULT { log("IWorkbook vtable#220 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s221(&self) -> HRESULT { log("IWorkbook vtable#221 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s222(&self) -> HRESULT { log("IWorkbook vtable#222 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s223(&self) -> HRESULT { log("IWorkbook vtable#223 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s224(&self) -> HRESULT { log("IWorkbook vtable#224 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s225(&self) -> HRESULT { log("IWorkbook vtable#225 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s226(&self) -> HRESULT { log("IWorkbook vtable#226 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s227(&self) -> HRESULT { log("IWorkbook vtable#227 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s228(&self) -> HRESULT { log("IWorkbook vtable#228 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s229(&self) -> HRESULT { log("IWorkbook vtable#229 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s230(&self) -> HRESULT { log("IWorkbook vtable#230 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s231(&self) -> HRESULT { log("IWorkbook vtable#231 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s232(&self) -> HRESULT { log("IWorkbook vtable#232 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s233(&self) -> HRESULT { log("IWorkbook vtable#233 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s234(&self) -> HRESULT { log("IWorkbook vtable#234 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s235(&self) -> HRESULT { log("IWorkbook vtable#235 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s236(&self) -> HRESULT { log("IWorkbook vtable#236 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s237(&self) -> HRESULT { log("IWorkbook vtable#237 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s238(&self) -> HRESULT { log("IWorkbook vtable#238 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s239(&self) -> HRESULT { log("IWorkbook vtable#239 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s240(&self) -> HRESULT { log("IWorkbook vtable#240 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s241(&self) -> HRESULT { log("IWorkbook vtable#241 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s242(&self) -> HRESULT { log("IWorkbook vtable#242 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s243(&self) -> HRESULT { log("IWorkbook vtable#243 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s244(&self) -> HRESULT { log("IWorkbook vtable#244 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s245(&self) -> HRESULT { log("IWorkbook vtable#245 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s246(&self) -> HRESULT { log("IWorkbook vtable#246 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s247(&self) -> HRESULT { log("IWorkbook vtable#247 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s248(&self) -> HRESULT { log("IWorkbook vtable#248 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s249(&self) -> HRESULT { log("IWorkbook vtable#249 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s250(&self) -> HRESULT { log("IWorkbook vtable#250 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s251(&self) -> HRESULT { log("IWorkbook vtable#251 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s252(&self) -> HRESULT { log("IWorkbook vtable#252 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s253(&self) -> HRESULT { log("IWorkbook vtable#253 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s254(&self) -> HRESULT { log("IWorkbook vtable#254 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s255(&self) -> HRESULT { log("IWorkbook vtable#255 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s256(&self) -> HRESULT { log("IWorkbook vtable#256 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s257(&self) -> HRESULT { log("IWorkbook vtable#257 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s258(&self) -> HRESULT { log("IWorkbook vtable#258 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s259(&self) -> HRESULT { log("IWorkbook vtable#259 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s260(&self) -> HRESULT { log("IWorkbook vtable#260 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s261(&self) -> HRESULT { log("IWorkbook vtable#261 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s262(&self) -> HRESULT { log("IWorkbook vtable#262 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s263(&self) -> HRESULT { log("IWorkbook vtable#263 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s264(&self) -> HRESULT { log("IWorkbook vtable#264 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s265(&self) -> HRESULT { log("IWorkbook vtable#265 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s266(&self) -> HRESULT { log("IWorkbook vtable#266 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s267(&self) -> HRESULT { log("IWorkbook vtable#267 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s268(&self) -> HRESULT { log("IWorkbook vtable#268 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s269(&self) -> HRESULT { log("IWorkbook vtable#269 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s270(&self) -> HRESULT { log("IWorkbook vtable#270 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s271(&self) -> HRESULT { log("IWorkbook vtable#271 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s272(&self) -> HRESULT { log("IWorkbook vtable#272 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s273(&self) -> HRESULT { log("IWorkbook vtable#273 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s274(&self) -> HRESULT { log("IWorkbook vtable#274 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s275(&self) -> HRESULT { log("IWorkbook vtable#275 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s276(&self) -> HRESULT { log("IWorkbook vtable#276 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s277(&self) -> HRESULT { log("IWorkbook vtable#277 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s278(&self) -> HRESULT { log("IWorkbook vtable#278 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s279(&self) -> HRESULT { log("IWorkbook vtable#279 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s280(&self) -> HRESULT { log("IWorkbook vtable#280 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s281(&self) -> HRESULT { log("IWorkbook vtable#281 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s282(&self) -> HRESULT { log("IWorkbook vtable#282 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s283(&self) -> HRESULT { log("IWorkbook vtable#283 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s284(&self) -> HRESULT { log("IWorkbook vtable#284 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s285(&self) -> HRESULT { log("IWorkbook vtable#285 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s286(&self) -> HRESULT { log("IWorkbook vtable#286 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("000208D7-0000-0000-C000-000000000046")]
@@ -1582,28 +1582,28 @@ unsafe trait ISheets: IDispatch {
 }
 
 impl ISheets_Impl for Worksheets_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("ISheets vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("ISheets vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("ISheets vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("ISheets vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("ISheets vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s12(&self, ret: *mut i32) -> HRESULT { unsafe { vt_sheets_count(self, ret) } }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("ISheets vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("ISheets vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s15(&self, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_sheets_item(self, index, ret) } }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("ISheets vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("ISheets vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("ISheets vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("ISheets vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("ISheets vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("ISheets vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("ISheets vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("ISheets vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("ISheets vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s25(&self, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_sheets_item(self, index, ret) } }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("ISheets vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("ISheets vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("ISheets vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("000208D8-0000-0000-C000-000000000046")]
@@ -1762,157 +1762,157 @@ unsafe trait IWorksheet: IDispatch {
 }
 
 impl IWorksheet_Impl for Worksheet_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IWorksheet vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IWorksheet vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IWorksheet vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IWorksheet vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IWorksheet vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IWorksheet vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IWorksheet vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IWorksheet vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IWorksheet vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IWorksheet vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IWorksheet vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s18(&self, ret: *mut BSTR) -> HRESULT { unsafe { vt_ws_name_get(self, ret) } }
     unsafe fn s19(&self, v: *const u16) -> HRESULT { unsafe { vt_ws_name_put(self, v) } }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IWorksheet vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IWorksheet vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IWorksheet vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IWorksheet vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IWorksheet vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IWorksheet vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IWorksheet vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IWorksheet vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IWorksheet vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IWorksheet vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IWorksheet vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IWorksheet vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IWorksheet vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IWorksheet vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IWorksheet vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IWorksheet vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IWorksheet vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IWorksheet vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IWorksheet vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IWorksheet vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IWorksheet vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IWorksheet vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IWorksheet vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IWorksheet vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IWorksheet vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IWorksheet vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IWorksheet vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IWorksheet vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IWorksheet vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IWorksheet vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IWorksheet vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IWorksheet vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s52(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_ws_cells(self, ret) } }
-    unsafe fn s53(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s71(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s72(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { log("IWorksheet vtable#53 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IWorksheet vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IWorksheet vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IWorksheet vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IWorksheet vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IWorksheet vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IWorksheet vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IWorksheet vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IWorksheet vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IWorksheet vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IWorksheet vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IWorksheet vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IWorksheet vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { log("IWorksheet vtable#66 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IWorksheet vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IWorksheet vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IWorksheet vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IWorksheet vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { log("IWorksheet vtable#71 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { log("IWorksheet vtable#72 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { log("IWorksheet vtable#73 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { log("IWorksheet vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IWorksheet vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IWorksheet vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IWorksheet vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IWorksheet vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IWorksheet vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IWorksheet vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IWorksheet vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IWorksheet vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IWorksheet vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IWorksheet vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IWorksheet vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IWorksheet vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IWorksheet vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IWorksheet vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IWorksheet vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IWorksheet vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IWorksheet vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IWorksheet vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IWorksheet vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IWorksheet vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IWorksheet vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IWorksheet vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IWorksheet vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IWorksheet vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { log("IWorksheet vtable#99 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s100(&self, cell1: *const VARIANT, cell2: *const VARIANT, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_ws_range(self, cell1, cell2, ret) } }
-    unsafe fn s101(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { log("IWorksheet vtable#101 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { log("IWorksheet vtable#102 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { log("IWorksheet vtable#103 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { log("IWorksheet vtable#104 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { log("IWorksheet vtable#105 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { log("IWorksheet vtable#106 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { log("IWorksheet vtable#107 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { log("IWorksheet vtable#108 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { log("IWorksheet vtable#109 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { log("IWorksheet vtable#110 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { log("IWorksheet vtable#111 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { log("IWorksheet vtable#112 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { log("IWorksheet vtable#113 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { log("IWorksheet vtable#114 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { log("IWorksheet vtable#115 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { log("IWorksheet vtable#116 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { log("IWorksheet vtable#117 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { log("IWorksheet vtable#118 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { log("IWorksheet vtable#119 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { log("IWorksheet vtable#120 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { log("IWorksheet vtable#121 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { log("IWorksheet vtable#122 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { log("IWorksheet vtable#123 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { log("IWorksheet vtable#124 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { log("IWorksheet vtable#125 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { log("IWorksheet vtable#126 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { log("IWorksheet vtable#127 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { log("IWorksheet vtable#128 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { log("IWorksheet vtable#129 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { log("IWorksheet vtable#130 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { log("IWorksheet vtable#131 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { log("IWorksheet vtable#132 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { log("IWorksheet vtable#133 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { log("IWorksheet vtable#134 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { log("IWorksheet vtable#135 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { log("IWorksheet vtable#136 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { log("IWorksheet vtable#137 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { log("IWorksheet vtable#138 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { log("IWorksheet vtable#139 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { log("IWorksheet vtable#140 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { log("IWorksheet vtable#141 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { log("IWorksheet vtable#142 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { log("IWorksheet vtable#143 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { log("IWorksheet vtable#144 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { log("IWorksheet vtable#145 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { log("IWorksheet vtable#146 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { log("IWorksheet vtable#147 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { log("IWorksheet vtable#148 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { log("IWorksheet vtable#149 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { log("IWorksheet vtable#150 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { log("IWorksheet vtable#151 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { log("IWorksheet vtable#152 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { log("IWorksheet vtable#153 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { log("IWorksheet vtable#154 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { log("IWorksheet vtable#155 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { log("IWorksheet vtable#156 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { log("IWorksheet vtable#157 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("00020846-0000-0000-C000-000000000046")]
@@ -2173,259 +2173,259 @@ unsafe trait IRange: IDispatch {
 }
 
 impl IRange_Impl for Range_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s44(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s45(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s46(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s47(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s48(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s49(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s50(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s51(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IRange vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IRange vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IRange vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IRange vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IRange vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IRange vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IRange vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IRange vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IRange vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IRange vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IRange vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IRange vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IRange vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IRange vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IRange vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IRange vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IRange vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IRange vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IRange vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IRange vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IRange vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IRange vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IRange vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IRange vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IRange vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IRange vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IRange vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IRange vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IRange vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IRange vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IRange vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IRange vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IRange vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IRange vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IRange vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IRange vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IRange vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IRange vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IRange vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IRange vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IRange vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IRange vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IRange vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IRange vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IRange vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s52(&self, row: *const VARIANT, col: *const VARIANT, ret: *mut VARIANT) -> HRESULT { unsafe { vt_rng_child(self, row, col, ret) } }
     unsafe fn s53(&self, row: *const VARIANT, col: *const VARIANT, val: *const VARIANT) -> HRESULT { unsafe { vt_rng_item_put(self, row, col, val) } }
-    unsafe fn s54(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s55(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s56(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s57(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s58(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s59(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s60(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s61(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s62(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s63(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s64(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s65(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s66(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s67(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s68(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s69(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s70(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IRange vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IRange vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IRange vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IRange vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IRange vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IRange vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IRange vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IRange vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IRange vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IRange vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IRange vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IRange vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { log("IRange vtable#66 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IRange vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IRange vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IRange vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IRange vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s71(&self, ret: *mut VARIANT) -> HRESULT { unsafe { vt_rng_formula_get(self, ret) } }
     unsafe fn s72(&self, v: *const VARIANT) -> HRESULT { unsafe { vt_rng_formula_put(self, v) } }
-    unsafe fn s73(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s74(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s75(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s76(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s77(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s78(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s79(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s80(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s81(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s82(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s83(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s84(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s85(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s86(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s87(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s88(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s89(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s90(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s91(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s92(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s93(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s94(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s95(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s96(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s97(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s98(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s99(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { log("IRange vtable#73 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { log("IRange vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IRange vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IRange vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IRange vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IRange vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IRange vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IRange vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IRange vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IRange vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IRange vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IRange vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IRange vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IRange vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IRange vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IRange vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IRange vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IRange vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IRange vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IRange vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IRange vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IRange vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IRange vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IRange vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IRange vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IRange vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { log("IRange vtable#99 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s100(&self, row: *const VARIANT, col: *const VARIANT, ret: *mut VARIANT) -> HRESULT { unsafe { vt_rng_child(self, row, col, ret) } }
     unsafe fn s101(&self, row: *const VARIANT, col: *const VARIANT, val: *const VARIANT) -> HRESULT { unsafe { vt_rng_item_put(self, row, col, val) } }
-    unsafe fn s102(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s103(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s104(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s105(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s106(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s107(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s108(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s109(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s110(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s111(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s112(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s113(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s114(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s115(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s116(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s117(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s118(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s119(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s120(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s121(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s122(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s123(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s124(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s125(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s126(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s127(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s128(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s129(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s130(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s131(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s132(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s133(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s134(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s135(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s136(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s137(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s138(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s139(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s140(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s141(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s142(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s143(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s144(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s145(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s146(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s147(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s148(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s149(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s150(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s151(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s152(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s153(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s154(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s155(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s156(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s157(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s158(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s159(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s160(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s161(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s162(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s163(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s164(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s165(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s166(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s167(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s168(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s169(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s170(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s171(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s172(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s173(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s174(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s175(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s176(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s177(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s178(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s179(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { log("IRange vtable#102 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { log("IRange vtable#103 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { log("IRange vtable#104 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { log("IRange vtable#105 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { log("IRange vtable#106 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { log("IRange vtable#107 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { log("IRange vtable#108 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { log("IRange vtable#109 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { log("IRange vtable#110 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s111(&self) -> HRESULT { log("IRange vtable#111 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s112(&self) -> HRESULT { log("IRange vtable#112 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s113(&self) -> HRESULT { log("IRange vtable#113 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s114(&self) -> HRESULT { log("IRange vtable#114 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s115(&self) -> HRESULT { log("IRange vtable#115 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s116(&self) -> HRESULT { log("IRange vtable#116 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s117(&self) -> HRESULT { log("IRange vtable#117 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s118(&self) -> HRESULT { log("IRange vtable#118 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s119(&self) -> HRESULT { log("IRange vtable#119 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s120(&self) -> HRESULT { log("IRange vtable#120 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s121(&self) -> HRESULT { log("IRange vtable#121 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s122(&self) -> HRESULT { log("IRange vtable#122 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s123(&self) -> HRESULT { log("IRange vtable#123 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s124(&self) -> HRESULT { log("IRange vtable#124 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s125(&self) -> HRESULT { log("IRange vtable#125 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s126(&self) -> HRESULT { log("IRange vtable#126 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s127(&self) -> HRESULT { log("IRange vtable#127 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s128(&self) -> HRESULT { log("IRange vtable#128 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s129(&self) -> HRESULT { log("IRange vtable#129 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s130(&self) -> HRESULT { log("IRange vtable#130 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s131(&self) -> HRESULT { log("IRange vtable#131 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s132(&self) -> HRESULT { log("IRange vtable#132 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s133(&self) -> HRESULT { log("IRange vtable#133 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s134(&self) -> HRESULT { log("IRange vtable#134 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s135(&self) -> HRESULT { log("IRange vtable#135 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s136(&self) -> HRESULT { log("IRange vtable#136 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s137(&self) -> HRESULT { log("IRange vtable#137 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s138(&self) -> HRESULT { log("IRange vtable#138 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s139(&self) -> HRESULT { log("IRange vtable#139 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s140(&self) -> HRESULT { log("IRange vtable#140 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s141(&self) -> HRESULT { log("IRange vtable#141 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s142(&self) -> HRESULT { log("IRange vtable#142 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s143(&self) -> HRESULT { log("IRange vtable#143 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s144(&self) -> HRESULT { log("IRange vtable#144 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s145(&self) -> HRESULT { log("IRange vtable#145 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s146(&self) -> HRESULT { log("IRange vtable#146 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s147(&self) -> HRESULT { log("IRange vtable#147 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s148(&self) -> HRESULT { log("IRange vtable#148 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s149(&self) -> HRESULT { log("IRange vtable#149 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s150(&self) -> HRESULT { log("IRange vtable#150 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s151(&self) -> HRESULT { log("IRange vtable#151 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s152(&self) -> HRESULT { log("IRange vtable#152 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s153(&self) -> HRESULT { log("IRange vtable#153 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s154(&self) -> HRESULT { log("IRange vtable#154 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s155(&self) -> HRESULT { log("IRange vtable#155 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s156(&self) -> HRESULT { log("IRange vtable#156 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s157(&self) -> HRESULT { log("IRange vtable#157 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s158(&self) -> HRESULT { log("IRange vtable#158 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s159(&self) -> HRESULT { log("IRange vtable#159 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s160(&self) -> HRESULT { log("IRange vtable#160 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s161(&self) -> HRESULT { log("IRange vtable#161 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s162(&self) -> HRESULT { log("IRange vtable#162 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s163(&self) -> HRESULT { log("IRange vtable#163 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s164(&self) -> HRESULT { log("IRange vtable#164 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s165(&self) -> HRESULT { log("IRange vtable#165 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s166(&self) -> HRESULT { log("IRange vtable#166 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s167(&self) -> HRESULT { log("IRange vtable#167 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s168(&self) -> HRESULT { log("IRange vtable#168 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s169(&self) -> HRESULT { log("IRange vtable#169 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s170(&self) -> HRESULT { log("IRange vtable#170 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s171(&self) -> HRESULT { log("IRange vtable#171 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s172(&self) -> HRESULT { log("IRange vtable#172 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s173(&self) -> HRESULT { log("IRange vtable#173 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s174(&self) -> HRESULT { log("IRange vtable#174 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s175(&self) -> HRESULT { log("IRange vtable#175 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s176(&self) -> HRESULT { log("IRange vtable#176 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s177(&self) -> HRESULT { log("IRange vtable#177 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s178(&self) -> HRESULT { log("IRange vtable#178 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s179(&self) -> HRESULT { log("IRange vtable#179 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s180(&self, _ty: *const VARIANT, ret: *mut VARIANT) -> HRESULT { unsafe { vt_rng_value_get(self, ret) } }
     unsafe fn s181(&self, _ty: *const VARIANT, val: *const VARIANT) -> HRESULT { unsafe { vt_rng_value_put(self, val) } }
     unsafe fn s182(&self, ret: *mut VARIANT) -> HRESULT { unsafe { vt_rng_value_get(self, ret) } }
     unsafe fn s183(&self, val: *const VARIANT) -> HRESULT { unsafe { vt_rng_value_put(self, val) } }
-    unsafe fn s184(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s185(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s186(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s187(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s188(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s189(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s190(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s191(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s192(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s193(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s194(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s195(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s196(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s197(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s198(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s199(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s200(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s201(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s202(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s203(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s204(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s205(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s206(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s207(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s208(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s209(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s210(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s211(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s212(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s213(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s214(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s215(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s216(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s217(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s218(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s219(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s220(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s221(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s222(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s223(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s224(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s225(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s226(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s227(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s228(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s229(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s230(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s231(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s232(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s233(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s234(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s235(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s236(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s237(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s238(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s239(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s240(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s241(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s242(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s243(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s244(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s245(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s246(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s247(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s248(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s249(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s250(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s251(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s252(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s253(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s254(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s255(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s256(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s257(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s258(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s259(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s184(&self) -> HRESULT { log("IRange vtable#184 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s185(&self) -> HRESULT { log("IRange vtable#185 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s186(&self) -> HRESULT { log("IRange vtable#186 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s187(&self) -> HRESULT { log("IRange vtable#187 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s188(&self) -> HRESULT { log("IRange vtable#188 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s189(&self) -> HRESULT { log("IRange vtable#189 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s190(&self) -> HRESULT { log("IRange vtable#190 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s191(&self) -> HRESULT { log("IRange vtable#191 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s192(&self) -> HRESULT { log("IRange vtable#192 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s193(&self) -> HRESULT { log("IRange vtable#193 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s194(&self) -> HRESULT { log("IRange vtable#194 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s195(&self) -> HRESULT { log("IRange vtable#195 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s196(&self) -> HRESULT { log("IRange vtable#196 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s197(&self) -> HRESULT { log("IRange vtable#197 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s198(&self) -> HRESULT { log("IRange vtable#198 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s199(&self) -> HRESULT { log("IRange vtable#199 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s200(&self) -> HRESULT { log("IRange vtable#200 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s201(&self) -> HRESULT { log("IRange vtable#201 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s202(&self) -> HRESULT { log("IRange vtable#202 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s203(&self) -> HRESULT { log("IRange vtable#203 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s204(&self) -> HRESULT { log("IRange vtable#204 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s205(&self) -> HRESULT { log("IRange vtable#205 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s206(&self) -> HRESULT { log("IRange vtable#206 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s207(&self) -> HRESULT { log("IRange vtable#207 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s208(&self) -> HRESULT { log("IRange vtable#208 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s209(&self) -> HRESULT { log("IRange vtable#209 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s210(&self) -> HRESULT { log("IRange vtable#210 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s211(&self) -> HRESULT { log("IRange vtable#211 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s212(&self) -> HRESULT { log("IRange vtable#212 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s213(&self) -> HRESULT { log("IRange vtable#213 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s214(&self) -> HRESULT { log("IRange vtable#214 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s215(&self) -> HRESULT { log("IRange vtable#215 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s216(&self) -> HRESULT { log("IRange vtable#216 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s217(&self) -> HRESULT { log("IRange vtable#217 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s218(&self) -> HRESULT { log("IRange vtable#218 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s219(&self) -> HRESULT { log("IRange vtable#219 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s220(&self) -> HRESULT { log("IRange vtable#220 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s221(&self) -> HRESULT { log("IRange vtable#221 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s222(&self) -> HRESULT { log("IRange vtable#222 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s223(&self) -> HRESULT { log("IRange vtable#223 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s224(&self) -> HRESULT { log("IRange vtable#224 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s225(&self) -> HRESULT { log("IRange vtable#225 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s226(&self) -> HRESULT { log("IRange vtable#226 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s227(&self) -> HRESULT { log("IRange vtable#227 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s228(&self) -> HRESULT { log("IRange vtable#228 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s229(&self) -> HRESULT { log("IRange vtable#229 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s230(&self) -> HRESULT { log("IRange vtable#230 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s231(&self) -> HRESULT { log("IRange vtable#231 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s232(&self) -> HRESULT { log("IRange vtable#232 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s233(&self) -> HRESULT { log("IRange vtable#233 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s234(&self) -> HRESULT { log("IRange vtable#234 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s235(&self) -> HRESULT { log("IRange vtable#235 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s236(&self) -> HRESULT { log("IRange vtable#236 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s237(&self) -> HRESULT { log("IRange vtable#237 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s238(&self) -> HRESULT { log("IRange vtable#238 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s239(&self) -> HRESULT { log("IRange vtable#239 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s240(&self) -> HRESULT { log("IRange vtable#240 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s241(&self) -> HRESULT { log("IRange vtable#241 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s242(&self) -> HRESULT { log("IRange vtable#242 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s243(&self) -> HRESULT { log("IRange vtable#243 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s244(&self) -> HRESULT { log("IRange vtable#244 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s245(&self) -> HRESULT { log("IRange vtable#245 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s246(&self) -> HRESULT { log("IRange vtable#246 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s247(&self) -> HRESULT { log("IRange vtable#247 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s248(&self) -> HRESULT { log("IRange vtable#248 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s249(&self) -> HRESULT { log("IRange vtable#249 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s250(&self) -> HRESULT { log("IRange vtable#250 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s251(&self) -> HRESULT { log("IRange vtable#251 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s252(&self) -> HRESULT { log("IRange vtable#252 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s253(&self) -> HRESULT { log("IRange vtable#253 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s254(&self) -> HRESULT { log("IRange vtable#254 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s255(&self) -> HRESULT { log("IRange vtable#255 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s256(&self) -> HRESULT { log("IRange vtable#256 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s257(&self) -> HRESULT { log("IRange vtable#257 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s258(&self) -> HRESULT { log("IRange vtable#258 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s259(&self) -> HRESULT { log("IRange vtable#259 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("0002084D-0000-0000-C000-000000000046")]
@@ -2470,43 +2470,43 @@ unsafe trait IFont: IDispatch {
 }
 
 impl IFont_Impl for Font_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s31(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s32(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s33(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s34(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s35(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s36(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s38(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s39(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s40(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s41(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s42(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s43(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IFont vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IFont vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IFont vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IFont vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IFont vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IFont vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IFont vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IFont vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IFont vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IFont vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IFont vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IFont vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IFont vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IFont vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IFont vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IFont vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IFont vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IFont vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IFont vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IFont vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IFont vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IFont vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IFont vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IFont vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IFont vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IFont vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IFont vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IFont vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IFont vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IFont vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IFont vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IFont vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IFont vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IFont vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IFont vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IFont vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IFont vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 #[interface("00020870-0000-0000-C000-000000000046")]
@@ -2538,30 +2538,30 @@ unsafe trait IInterior: IDispatch {
 }
 
 impl IInterior_Impl for Interior_Impl {
-    unsafe fn s7(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s8(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s9(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s10(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s11(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s12(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s13(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s14(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s16(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s17(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s18(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s19(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s20(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s21(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s22(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s23(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s24(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s25(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s26(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s27(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s28(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s29(&self) -> HRESULT { E_NOTIMPL }
-    unsafe fn s30(&self) -> HRESULT { E_NOTIMPL }
+    unsafe fn s7(&self) -> HRESULT { log("IInterior vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IInterior vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IInterior vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IInterior vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IInterior vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IInterior vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self) -> HRESULT { log("IInterior vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s14(&self) -> HRESULT { log("IInterior vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self) -> HRESULT { log("IInterior vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IInterior vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IInterior vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IInterior vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IInterior vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IInterior vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IInterior vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IInterior vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IInterior vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IInterior vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IInterior vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IInterior vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IInterior vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IInterior vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IInterior vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IInterior vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 

@@ -39,7 +39,7 @@ mod win {
     use windows::Win32::Foundation::E_NOTIMPL;
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX,
-        DISP_E_MEMBERNOTFOUND, DISP_E_UNKNOWNNAME, E_FAIL, E_POINTER, S_FALSE, S_OK,
+        E_FAIL, E_POINTER, S_FALSE, S_OK,
     };
     use windows::Win32::System::Com::{
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
@@ -868,15 +868,15 @@ mod win {
             }
             let name = names[0].to_string().unwrap_or_default();
             match resolver(&name) {
-                Some(d) => {
-                    ids[0] = d;
-                    Ok(())
-                }
+                Some(d) => ids[0] = d,
                 None => {
-                    log(&format!("{who}: unknown member '{name}'"));
-                    Err(DISP_E_UNKNOWNNAME.into())
+                    // Don't fail — hand back a synthetic id so the follow-up
+                    // Invoke reaches the graceful `unhandled` path (logged there).
+                    log(&format!("{who}: unmodeled member '{name}' -> graceful"));
+                    ids[0] = synth_id(&name);
                 }
             }
+            Ok(())
         }
     }
 
@@ -889,6 +889,107 @@ mod win {
                 Err(DISP_E_BADINDEX.into())
             }
         };
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful degradation — never fault on a member we don't model.
+    //
+    // Field strategy: cover broad, LOG every call, deploy on the VDI, then read
+    // the log to see what the host (Petrel) actually called. For that to survive
+    // the one-shot, an unmodeled member must NOT return an error (that throws in
+    // the client and aborts the export) — it must degrade benignly: a property
+    // put is swallowed, a get / method call yields a do-nothing object so a
+    // chain like `range.Font.Bold = True` keeps flowing. Every such call is
+    // logged with its member name for later triage.
+    // -----------------------------------------------------------------------
+
+    thread_local! {
+        // dispid_of(unmodeled name) - stable per name so the get and the
+        // subsequent put land on the same synthetic id; index into this table.
+        static SYNTH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    const SYNTH_BASE: i32 = 0x4000_0000;
+
+    fn synth_id(name: &str) -> i32 {
+        SYNTH.with(|s| {
+            let mut v = s.borrow_mut();
+            match v.iter().position(|n| n == name) {
+                Some(i) => SYNTH_BASE + i as i32,
+                None => {
+                    v.push(name.to_string());
+                    SYNTH_BASE + (v.len() as i32 - 1)
+                }
+            }
+        })
+    }
+    fn synth_name(id: i32) -> Option<String> {
+        (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
+    }
+
+    /// The default arm of every object's `Invoke` for a dispid it doesn't handle:
+    /// log the member (name when we assigned a synthetic id, else the raw dispid)
+    /// and degrade benignly — swallow puts, hand back a do-nothing object for
+    /// gets/calls.
+    unsafe fn unhandled(id: i32, wflags: DISPATCH_FLAGS, result: *mut VARIANT) -> Result<()> {
+        let member = synth_name(id).unwrap_or_else(|| format!("dispid {id}"));
+        // The caller's Invoke already logged the object + id at entry; this adds
+        // the resolved member name and the benign outcome on the next line.
+        log(&format!(
+            "  -> unmodeled '{member}' (put={}) -> benign",
+            is_put(wflags)
+        ));
+        if !is_put(wflags) {
+            unsafe { put(result, VARIANT::from(null_dispatch())) };
+        }
+        Ok(())
+    }
+
+    /// A do-nothing `IDispatch`: resolves any name, swallows any put, returns
+    /// itself for any get/call — so a client can walk unmodeled property chains
+    /// without faulting.
+    #[implement(IDispatch)]
+    struct NullObject;
+
+    fn null_dispatch() -> IDispatch {
+        NullObject.into()
+    }
+
+    impl IDispatch_Impl for NullObject_Impl {
+        no_typeinfo!();
+        fn GetIDsOfNames(
+            &self,
+            _riid: *const GUID,
+            rgsznames: *const PCWSTR,
+            cnames: u32,
+            _lcid: u32,
+            rgdispid: *mut i32,
+        ) -> Result<()> {
+            unsafe {
+                if cnames > 0 {
+                    let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
+                    let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
+                    for id in ids.iter_mut() {
+                        *id = DISPID_UNKNOWN;
+                    }
+                    ids[0] = synth_id(&names[0].to_string().unwrap_or_default());
+                }
+            }
+            Ok(())
+        }
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            _params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            log("NullObject::Invoke");
+            unsafe { unhandled(id, wflags, result) }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1032,7 +1133,7 @@ mod win {
                         log("Application::Quit");
                         PostQuitMessage(0);
                     }
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
@@ -1076,7 +1177,7 @@ mod win {
             id: i32,
             _riid: *const GUID,
             _lcid: u32,
-            _wflags: DISPATCH_FLAGS,
+            wflags: DISPATCH_FLAGS,
             params: *const DISPPARAMS,
             result: *mut VARIANT,
             _ei: *mut EXCEPINFO,
@@ -1103,7 +1204,7 @@ mod win {
                     }
                     118 => put(result, VARIANT::from(reg(|r| r.books.len() as i32))),
                     277 => {} // Close all — no-op
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
@@ -1247,7 +1348,7 @@ mod win {
                         };
                         put(result, VARIANT::from(BSTR::from(out.as_str())));
                     }
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
@@ -1291,7 +1392,7 @@ mod win {
             id: i32,
             _riid: *const GUID,
             _lcid: u32,
-            _wflags: DISPATCH_FLAGS,
+            wflags: DISPATCH_FLAGS,
             params: *const DISPPARAMS,
             result: *mut VARIANT,
             _ei: *mut EXCEPINFO,
@@ -1314,7 +1415,7 @@ mod win {
                         // set; multi-sheet add lands with the broader coverage pass).
                         put_obj(result, Worksheet { book, sheet: 0 });
                     }
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
@@ -1460,7 +1561,7 @@ mod win {
                         }
                     }
                     304 | 235 => {} // Activate / Select — no-op
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
@@ -1645,7 +1746,7 @@ mod win {
                     ),
                     111 => self.write_fill(Cell::default()),
                     235 | 564 => {} // Select / Merge — no-op in P1
-                    _ => return Err(DISP_E_MEMBERNOTFOUND.into()),
+                    _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }

@@ -152,7 +152,12 @@ foreach ($iface in $map.Keys) {
             $args = if ($sig) { ", $sig" } else { "" }
             [void]$sb.AppendLine("    unsafe fn s$n(&self$args) -> HRESULT { unsafe { $call } }")
         } else {
-            [void]$sb.AppendLine("    unsafe fn s$n(&self) -> HRESULT { E_NOTIMPL }")
+            # Unmodeled early-bound slot: log which interface+slot the host hit
+            # (map back to a member via tools/comshim/excel-vtable.txt) before the
+            # clean E_NOTIMPL. E_NOTIMPL (not S_OK) is deliberate: the uniform stub
+            # has no retval pointer to fill, so a clean "not implemented" is safer
+            # than handing the client an uninitialized return value.
+            [void]$sb.AppendLine("    unsafe fn s$n(&self) -> HRESULT { log(`"$trait vtable#$n unmodeled (early-bound)`"); E_NOTIMPL }")
         }
     }
     [void]$sb.AppendLine("}")
