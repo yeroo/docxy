@@ -91,6 +91,10 @@ class GridViewModel(json: String) {
         copied = root["copied"] as? String
     }
 
+    /** The active cell (from `cur.ref`), 0-based. */
+    val curR: Int get() = refToRc(curRef).first
+    val curC: Int get() = refToRc(curRef).second
+
     companion object {
         /** 0-based column index → A1-style letters (0 = A, 26 = AA). */
         fun columnName(c: Int): String {
@@ -101,6 +105,18 @@ class GridViewModel(json: String) {
                 n = n / 26 - 1
             }
             return sb.toString()
+        }
+
+        /** A1-style ref → 0-based (row, col); "B4" → (3, 1). */
+        fun refToRc(ref: String): Pair<Int, Int> {
+            var c = 0
+            var i = 0
+            while (i < ref.length && ref[i].isLetter()) {
+                c = c * 26 + (ref[i].uppercaseChar() - 'A' + 1)
+                i++
+            }
+            val r = ref.substring(i).toIntOrNull() ?: 1
+            return (r - 1).coerceAtLeast(0) to (c - 1).coerceAtLeast(0)
         }
     }
 }

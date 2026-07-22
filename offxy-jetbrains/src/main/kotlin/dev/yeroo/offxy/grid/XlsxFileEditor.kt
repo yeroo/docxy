@@ -31,9 +31,15 @@ import javax.swing.SwingConstants
  * grid; the ctl bridge attaches per tab.
  */
 class XlsxFileEditor(
-    @Suppress("unused") private val project: Project,
+    private val project: Project,
     private val xlsxFile: VirtualFile,
-) : UserDataHolderBase(), FileEditor {
+) : UserDataHolderBase(), FileEditor,
+    com.intellij.openapi.command.undo.DocumentReferenceProvider {
+
+    /** Routes platform undo/redo to this editor (no Document — file ref only). */
+    override fun getDocumentReferences(): Collection<com.intellij.openapi.command.undo.DocumentReference> =
+        listOf(com.intellij.openapi.command.undo.DocumentReferenceManager.getInstance().create(xlsxFile))
+
     private val engine = GridEngine()
     private val panel = JPanel(BorderLayout())
     private val changeSupport = PropertyChangeSupport(this)
@@ -67,6 +73,8 @@ class XlsxFileEditor(
             })
     }
 
+    private var formulaBar: FormulaBar? = null
+
     private fun openInPanel(bytes: ByteArray): Boolean {
         if (!engine.open(bytes)) return false
         val existing = grid
@@ -74,13 +82,57 @@ class XlsxFileEditor(
             existing.requestWindow(0, 0)
             return true
         }
-        val g = GridPanel(engine) { v -> markModified(v.dirty) }
+        val bar = FormulaBar(
+            commit = { r, c, text -> runMutating("set\t$r\t$c\t$text") },
+            focusGrid = { grid?.table?.requestFocusInWindow() },
+        )
+        formulaBar = bar
+        val g = GridPanel(
+            engine,
+            onView = { v ->
+                bar.update(v)
+                markModified(v.dirty)
+            },
+            onMutate = { command -> runMutating(command) },
+        )
         grid = g
         panel.removeAll()
+        panel.add(bar.component, BorderLayout.NORTH)
         panel.add(g.scrollPane, BorderLayout.CENTER)
         panel.revalidate()
         panel.repaint()
         return true
+    }
+
+    /** One mutating command = one platform undo step driving the engine's own
+     *  undo stack (no snapshots — every grid mutation is transactional). */
+    fun runMutating(command: String) {
+        val g = grid ?: return
+        val before = g.view.edits
+        val v = g.cmd(command)
+        v.copied?.let { tsv ->
+            com.intellij.openapi.ide.CopyPasteManager.getInstance()
+                .setContents(java.awt.datatransfer.StringSelection(tsv))
+        }
+        v.err?.let { showError(it) }
+        if (v.edits != before) {
+            com.intellij.openapi.command.CommandProcessor.getInstance().executeCommand(project, {
+                com.intellij.openapi.command.undo.UndoManager.getInstance(project)
+                    .undoableActionPerformed(GridUndo(this))
+            }, "Offxy: $command", null)
+        }
+    }
+
+    private fun showError(message: String) {
+        val table = grid?.table ?: return
+        com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+            .createHtmlTextBalloonBuilder(message, com.intellij.openapi.ui.MessageType.WARNING, null)
+            .setFadeoutTime(4000)
+            .createBalloon()
+            .show(
+                com.intellij.ui.awt.RelativePoint.getNorthWestOf(table),
+                com.intellij.openapi.ui.popup.Balloon.Position.above,
+            )
     }
 
     private fun showEmptyState() {
@@ -173,5 +225,20 @@ class XlsxFileEditor(
         isDisposed = true
         runCatching { saveNow() }
         engine.close()
+    }
+}
+
+/** Undo/redo drive the engine's own stack — the tab's single edit source. */
+private class GridUndo(
+    private val editor: XlsxFileEditor,
+) : com.intellij.openapi.command.undo.BasicUndoableAction(
+    com.intellij.openapi.command.undo.DocumentReferenceManager.getInstance().create(editor.file),
+) {
+    override fun undo() {
+        if (!editor.isDisposed) editor.grid?.cmd("undo")
+    }
+
+    override fun redo() {
+        if (!editor.isDisposed) editor.grid?.cmd("redo")
     }
 }

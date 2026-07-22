@@ -25,6 +25,7 @@ import javax.swing.table.JTableHeader
 class GridPanel(
     private val engine: GridEngine,
     private val onView: (GridViewModel) -> Unit,
+    private val onMutate: (String) -> Unit = { },
 ) {
     /** Grid extent shown beyond the used range, so there is room to grow. */
     private val marginRows = 40
@@ -42,6 +43,11 @@ class GridPanel(
         override fun getValueAt(row: Int, col: Int): Any? = view.cells[row to col]
         override fun getColumnName(col: Int): String = GridViewModel.columnName(col)
         override fun isCellEditable(row: Int, col: Int): Boolean = true
+
+        /** The commit path — the in-place editor and tests both land here. */
+        override fun setValueAt(value: Any?, row: Int, col: Int) {
+            onMutate("set\t$row\t$col\t${value ?: ""}")
+        }
     }
 
     val table: JBTable = object : JBTable(model) {
@@ -89,6 +95,95 @@ class GridPanel(
         scrollPane = JBUI.Panels.simplePanel().let { JScrollPane(table) }
         scrollPane.setRowHeaderView(rowHeader())
         scrollPane.viewport.addChangeListener { refreshWindowIfNeeded() }
+        installEditing()
+    }
+
+    // ---- editing: selection sync, in-place editor, clipboard, delete --------
+
+    private var syncing = false
+
+    private fun installEditing() {
+        // Selection follows into the engine (drives cur.ref/src for the bar).
+        val selListener = javax.swing.event.ListSelectionListener { e ->
+            if (e.valueIsAdjusting || syncing) return@ListSelectionListener
+            val r = table.selectionModel.leadSelectionIndex
+            val c = table.columnModel.selectionModel.leadSelectionIndex
+            if (r < 0 || c < 0) return@ListSelectionListener
+            val ar = table.selectionModel.anchorSelectionIndex.takeIf { it >= 0 } ?: r
+            val ac = table.columnModel.selectionModel.anchorSelectionIndex.takeIf { it >= 0 } ?: c
+            syncing = true
+            try {
+                cmd("select\t$r\t$c\t$ar\t$ac")
+            } finally {
+                syncing = false
+            }
+        }
+        table.selectionModel.addListSelectionListener(selListener)
+        table.columnModel.selectionModel.addListSelectionListener(selListener)
+
+        // In-place editor: prefilled with the RAW source (formula, not the
+        // rendered value), selected so type-through replaces.
+        val field = javax.swing.JTextField()
+        table.setDefaultEditor(Any::class.java, object : javax.swing.DefaultCellEditor(field) {
+            override fun getTableCellEditorComponent(
+                tbl: JTable, value: Any?, isSelected: Boolean, row: Int, col: Int,
+            ): Component {
+                super.getTableCellEditorComponent(tbl, "", isSelected, row, col)
+                if (view.curR != row || view.curC != col) {
+                    cmd("select\t$row\t$col")
+                }
+                field.text = view.curSrc
+                field.selectAll()
+                return field
+            }
+
+            override fun getCellEditorValue(): Any = field.text
+        })
+
+        fun selBounds(): IntArray? {
+            val rows = table.selectedRows
+            val cols = table.selectedColumns
+            if (rows.isEmpty() || cols.isEmpty()) return null
+            return intArrayOf(rows.min(), cols.min(), rows.max(), cols.max())
+        }
+
+        fun toClipboard(text: String) {
+            com.intellij.openapi.ide.CopyPasteManager.getInstance()
+                .setContents(java.awt.datatransfer.StringSelection(text))
+        }
+
+        val actionMap = table.actionMap
+        actionMap.put("copy", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent) {
+                val b = selBounds() ?: return
+                cmd("select\t${b[2]}\t${b[3]}\t${b[0]}\t${b[1]}")
+                cmd("copy").copied?.let(::toClipboard)
+            }
+        })
+        actionMap.put("cut", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent) {
+                val b = selBounds() ?: return
+                cmd("select\t${b[2]}\t${b[3]}\t${b[0]}\t${b[1]}")
+                view.copied // stale; the cut's TSV arrives with the mutation:
+                onMutate("cut")
+                view.copied?.let(::toClipboard)
+            }
+        })
+        actionMap.put("paste", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent) {
+                val b = selBounds() ?: return
+                val text = com.intellij.openapi.ide.CopyPasteManager.getInstance()
+                    .getContents<String>(java.awt.datatransfer.DataFlavor.stringFlavor) ?: return
+                onMutate("paste\t${b[0]}\t${b[1]}\t$text")
+            }
+        })
+        table.inputMap.put(javax.swing.KeyStroke.getKeyStroke("DELETE"), "offxy.clear")
+        actionMap.put("offxy.clear", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent) {
+                val b = selBounds() ?: return
+                onMutate("clear\t${b[0]}\t${b[1]}\t${b[2]}\t${b[3]}")
+            }
+        })
     }
 
     /** Sticky numbered row header. */
