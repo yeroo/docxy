@@ -731,6 +731,7 @@ impl App {
             || self.free_busy.is_some()
             || self.help
             || self.backstage.is_some()
+            || self.ribbon_focus != crate::ui::ribbon::Focus::None
     }
 
     /// Opens the read-only help overlay (`F1`/`?`).
@@ -5525,6 +5526,16 @@ pub(crate) mod tests {
         app.sync_ribbon_toggles();
         assert!(app.ribbon.toggle_on(Act::Threaded));
         assert!(!app.ribbon.toggle_on(Act::CategoryFilter));
+    }
+
+    #[test]
+    fn q_does_not_quit_while_the_ribbon_or_backstage_has_focus() {
+        let mut app = App::for_test_with_seeded_store();
+        app.ribbon_focus = crate::ui::ribbon::Focus::Tab(1);
+        assert!(app.is_capturing_text()); // guards the global q-quit
+        app.ribbon_focus = crate::ui::ribbon::Focus::None;
+        app.open_backstage();
+        assert!(app.is_capturing_text());
     }
 
     #[test]
