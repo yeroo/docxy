@@ -913,25 +913,6 @@ mod tests {
     // --- App wiring / rendering ---------------------------------------------
 
     #[test]
-    fn g_toggles_mode_and_refreshes_calendar_then_back_to_mail() {
-        use std::sync::mpsc;
-
-        let mut app = App::for_test_with_seeded_store();
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        app.sync.cmd_tx = cmd_tx;
-
-        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')));
-        assert_eq!(app.mode, Mode::Calendar);
-        assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(SyncCommand::RefreshCalendar)
-        ));
-
-        crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')));
-        assert_eq!(app.mode, Mode::Mail);
-    }
-
-    #[test]
     fn esc_also_returns_to_mail_from_calendar() {
         let mut app = App::for_test_with_seeded_store();
         app.toggle_mode();

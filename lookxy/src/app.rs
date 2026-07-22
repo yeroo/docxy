@@ -945,6 +945,7 @@ impl App {
                             self.open_draft(&id);
                         } else {
                             self.open_message(&id);
+                            self.mark_message_read(&id);
                             self.focus = Pane::Reading;
                         }
                     }
@@ -958,12 +959,69 @@ impl App {
                         self.open_draft(&id);
                     } else {
                         self.open_message(&id);
+                        self.mark_message_read(&id);
                         self.focus = Pane::Reading;
                     }
                 }
             }
             None => {}
         }
+    }
+
+    /// Marks exactly `id` read (optimistic store write + `MarkRead` command +
+    /// `reload_messages`) — the activate path's targeted mark-read, distinct
+    /// from `mark_read`, which is cursor-based and reads a whole thread when the
+    /// cursor sits on a header.
+    fn mark_message_read(&mut self, id: &str) {
+        self.store.set_read(id, true);
+        let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
+            id: id.to_string(),
+            read: true,
+        });
+        self.reload_messages();
+    }
+
+    /// Enter / activate on the current selection: `Folders` → enter the list;
+    /// `List` → open the highlighted message into the reader (marking it read)
+    /// or, in threaded mode, run the header/message activate. Drafts open in the
+    /// composer. `Rail`/`Reading` have nothing to activate.
+    pub fn activate_selected(&mut self) {
+        match self.focus {
+            Pane::Folders => self.focus = Pane::List,
+            Pane::List => {
+                if self.threaded_active() {
+                    self.activate_thread_row();
+                } else if let Some(msg) = self.messages.get(self.msg_index) {
+                    let (id, is_draft) = (msg.id.clone(), msg.is_draft);
+                    if is_draft {
+                        self.open_draft(&id);
+                    } else {
+                        self.open_message(&id);
+                        self.mark_message_read(&id);
+                        self.focus = Pane::Reading;
+                    }
+                }
+            }
+            Pane::Rail | Pane::Reading => {}
+        }
+    }
+
+    /// Right-arrow on the message list: on a collapsed thread header, expand it
+    /// and drop to its first child (staying in the list); on a message row (or
+    /// the flat list), activate it into the reader. Mirrors the folder pane's
+    /// "expand first, enter second" feel.
+    pub fn list_right(&mut self) {
+        if self.threaded_active() {
+            if let Some(Row::Header(t)) = self.selected_row() {
+                if !self.threads[t].expanded {
+                    self.threads[t].expanded = true;
+                    self.rebuild_visible_rows();
+                }
+                self.move_thread_selection(1); // to the first child
+                return;
+            }
+        }
+        self.activate_selected();
     }
 
     /// The currently-open (`selected_msg`) message's row, resolved from the

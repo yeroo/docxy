@@ -314,25 +314,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
-        KeyCode::Tab => cycle_focus(app),
-        KeyCode::BackTab => cycle_focus_back(app),
-        // Back out of the current pane toward the folder list. Guarded to
-        // non-Folders so the Folders pane keeps `←`/`h` (and Esc) for tree
-        // collapse / no-op; there's nothing further left of Folders anyway.
-        KeyCode::Left | KeyCode::Char('h') if app.focus != Pane::Folders => focus_back(app),
-        KeyCode::Esc if app.focus != Pane::Folders => focus_back(app),
-        // Folder-tree expand/collapse (Folders pane only): `→`/`l` expand,
-        // `←`/`h` collapse-or-parent, `Space` toggle. Ahead of the generic
-        // `Char(c) => on_key_char` so `l`/`h`/space aren't read as triage keys.
-        KeyCode::Right | KeyCode::Char('l') if app.focus == Pane::Folders => app.expand_selected(),
-        KeyCode::Left | KeyCode::Char('h') if app.focus == Pane::Folders => {
-            app.collapse_or_parent()
-        }
+        // Spatial navigation: Left/Right move between levels (Rail ↔ Folders ↔
+        // List ↔ Reading, with folder/thread expand-collapse folded in); Up/Down
+        // move within a level. `h`/`l` alias Left/Right only in the Folders pane
+        // (elsewhere `l` stays the category key); `j`/`k` alias Down/Up.
+        KeyCode::Left => nav_left(app),
+        KeyCode::Right => nav_right(app),
+        KeyCode::Char('h') if app.focus == Pane::Folders => nav_left(app),
+        KeyCode::Char('l') if app.focus == Pane::Folders => nav_right(app),
         KeyCode::Char(' ') if app.focus == Pane::Folders => app.toggle_selected_folder(),
-        // Reading-focused vertical keys scroll the reader instead of moving
-        // a selection (`move_selection`'s `Pane::Reading` arm is a no-op —
-        // there's nothing there to select over). These guarded arms must
-        // precede the unguarded ones below for the same keys.
+        // Reading-focused vertical keys scroll the reader instead of moving a
+        // selection. These guarded arms must precede the unguarded ones below.
         KeyCode::Char('k') | KeyCode::Up if app.focus == Pane::Reading => app.reading_scroll_by(-1),
         KeyCode::Char('j') | KeyCode::Down if app.focus == Pane::Reading => {
             app.reading_scroll_by(1)
@@ -343,14 +335,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::End if app.focus == Pane::Reading => app.reading_scroll_end(),
         KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1),
         KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1),
+        // Esc backs out one level from the list/reader (the reminder and
+        // category-filter Esc handlers ran earlier and returned).
+        KeyCode::Esc if matches!(app.focus, Pane::List | Pane::Reading) => nav_left(app),
         KeyCode::Enter => activate(app),
         KeyCode::Delete => app.delete_selected(),
-        // Checked ahead of the general `on_key_char` catch-all: `g` isn't
-        // claimed by any existing triage key (unlike the brief's own bare
-        // `f`, already taken by flag-toggle — see `App::compose_forward`'s
-        // doc comment for that precedent), so it's free for the
-        // mail↔calendar toggle.
-        KeyCode::Char('g') => app.toggle_mode(),
         KeyCode::Char(c) => app.on_key_char(c),
         _ => {}
     }
@@ -412,32 +401,49 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// `Folders` → `List` → `Reading` → `Folders`.
-fn cycle_focus(app: &mut App) {
-    app.focus = match app.focus {
-        Pane::Rail | Pane::Folders => Pane::List,
-        Pane::List => Pane::Reading,
-        Pane::Reading => Pane::Folders,
-    };
+/// Right arrow — descend a level. `Folders`: expand a collapsed parent (dropping
+/// onto its first child), else enter the message list. `List`: expand a folded
+/// thread (onto its first child), else activate the message into the reader.
+/// `Rail`/`Reading` have nothing further right (the rail is handled earlier).
+fn nav_right(app: &mut App) {
+    match app.focus {
+        Pane::Folders => {
+            let expandable = app
+                .visible_folders
+                .get(app.folder_index)
+                .map(|v| v.has_children && !v.expanded)
+                .unwrap_or(false);
+            if expandable {
+                app.expand_selected();
+                move_selection(app, 1); // drop onto the newly-revealed first child
+            } else {
+                app.focus = Pane::List;
+            }
+        }
+        Pane::List => app.list_right(),
+        Pane::Rail | Pane::Reading => {}
+    }
 }
 
-/// `Shift+Tab` — the reverse of `cycle_focus`.
-fn cycle_focus_back(app: &mut App) {
-    app.focus = match app.focus {
-        Pane::Rail | Pane::Folders => Pane::Reading,
-        Pane::List => Pane::Folders,
-        Pane::Reading => Pane::List,
-    };
-}
-
-/// Step focus one pane to the left (Reading → List → Folders), bottoming out at
-/// Folders. Bound to `←`/`h`/`Esc` in the List/Reading panes so you can back out
-/// of an opened message — the Folders pane keeps `←`/`h` for tree collapse.
-fn focus_back(app: &mut App) {
-    app.focus = match app.focus {
-        Pane::Reading => Pane::List,
-        Pane::Rail | Pane::List | Pane::Folders => Pane::Folders,
-    };
+/// Left arrow — ascend a level. `Reading` → `List` → `Folders`. In `Folders`,
+/// collapse an expanded folder (or jump to its parent); a top-level folder
+/// steps out to the `Rail`.
+fn nav_left(app: &mut App) {
+    match app.focus {
+        Pane::Reading => app.focus = Pane::List,
+        Pane::List => app.focus = Pane::Folders,
+        Pane::Folders => {
+            let sel = app.visible_folders.get(app.folder_index);
+            let expanded = sel.map(|v| v.has_children && v.expanded).unwrap_or(false);
+            let has_parent = sel.and_then(|v| v.row.parent_id.clone()).is_some();
+            if expanded || has_parent {
+                app.collapse_or_parent();
+            } else {
+                app.focus = Pane::Rail;
+            }
+        }
+        Pane::Rail => {}
+    }
 }
 
 /// Moves the focused pane's selection by `delta` (wrapping). Selecting a
@@ -464,33 +470,11 @@ fn move_selection(app: &mut App, delta: isize) {
     }
 }
 
-/// Enter: on `Folders`, move into the message list (matching how the
-/// selection already loaded that folder's messages); on `List`, activate the
-/// highlighted message — a draft (`MessageRow::is_draft`, whether it's
-/// sitting in the real Drafts folder or a not-yet-synced sentinel one, see
-/// `Store::drafts_folder_id`) opens straight into the composer
-/// (`App::open_draft`) instead of the reading pane, since there's nothing
-/// useful to read-only-render for something still being written; anything
-/// else opens normally (sets `selected_msg`) and moves focus to the reading
-/// pane. `Reading` has nothing further to activate.
+/// Enter — delegates to `App::activate_selected` (Folders → enter list; List →
+/// open the highlighted message into the reader and mark it read; drafts open
+/// in the composer).
 fn activate(app: &mut App) {
-    match app.focus {
-        Pane::Folders => app.focus = Pane::List,
-        Pane::List => {
-            if app.threaded_active() {
-                app.activate_thread_row();
-            } else if let Some(msg) = app.messages.get(app.msg_index) {
-                let id = msg.id.clone();
-                if msg.is_draft {
-                    app.open_draft(&id);
-                } else {
-                    app.open_message(&id);
-                    app.focus = Pane::Reading;
-                }
-            }
-        }
-        Pane::Rail | Pane::Reading => {}
-    }
+    app.activate_selected();
 }
 
 fn nonzero(len: usize) -> Option<usize> {
@@ -575,28 +559,37 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_reverse_cycles_panes() {
+    fn right_from_folders_enters_list_then_activates_to_reading() {
         let mut app = App::for_test_with_seeded_store();
-        app.focus = Pane::Reading;
-        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        app.focus = Pane::Folders; // Inbox is a leaf here
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right));
         assert_eq!(app.focus, Pane::List);
-        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
-        assert_eq!(app.focus, Pane::Folders);
-        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right));
         assert_eq!(app.focus, Pane::Reading);
+        assert!(app.selected_msg.is_some());
     }
 
     #[test]
-    fn left_and_esc_step_focus_back_from_reading_and_list() {
+    fn left_walks_back_out_to_the_rail() {
         let mut app = App::for_test_with_seeded_store();
         app.focus = Pane::Reading;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
         assert_eq!(app.focus, Pane::List);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert_eq!(app.focus, Pane::Folders);
-        // At Folders, `←`/`h` is reserved for tree collapse — focus stays put.
         handle_key(&mut app, KeyEvent::from(KeyCode::Left));
         assert_eq!(app.focus, Pane::Folders);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left)); // top-level folder → Rail
+        assert_eq!(app.focus, Pane::Rail);
+    }
+
+    #[test]
+    fn g_tab_and_backtab_no_longer_navigate() {
+        let mut app = App::for_test_with_seeded_store();
+        app.focus = Pane::Folders;
+        let before = (app.mode, app.focus);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab));
+        assert_eq!((app.mode, app.focus), before);
     }
 
     #[test]
@@ -637,18 +630,6 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Inbox"));
-    }
-
-    #[test]
-    fn tab_cycles_focus_through_all_three_panes() {
-        let mut app = App::for_test_with_seeded_store();
-        assert_eq!(app.focus, Pane::Folders);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Pane::List);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Pane::Reading);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Pane::Folders);
     }
 
     #[test]
