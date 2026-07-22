@@ -837,6 +837,291 @@ impl SequenceGeometry {
     }
 }
 
+// ---------------------------------------------------------------------
+// DrawingML emission (Task 3): builds the `{shapes}` fragment from the
+// geometry above, then hands it to `mermaid::wrap_drawing_group` — the same
+// `mc:AlternateContent` / `wpg:wgp` scaffold the flowchart emitter uses, so
+// every Mermaid diagram type produces a structurally identical `<w:drawing>`.
+// ---------------------------------------------------------------------
+
+/// A distinct fill for `Note over` boxes (vs. the participant-box fill),
+/// matching Mermaid's own pale-yellow note color.
+const NOTE_FILL: &str = "FFF6D5";
+const NOTE_STROKE: &str = "AAAA33";
+/// Participant header-box fill/stroke — reuses the flowchart node palette
+/// (`DAE8FC`/`6C8EBF`) so a sequence diagram's participant boxes read as the
+/// same "node" visual language as flowchart boxes.
+const PART_FILL: &str = "DAE8FC";
+const PART_STROKE: &str = "6C8EBF";
+/// `alt`/`else` frame fill/stroke: a light, low-contrast box so it reads as
+/// a background container rather than competing with participant boxes.
+const FRAME_FILL: &str = "F5F5F5";
+const FRAME_STROKE: &str = "999999";
+const LINE_STROKE: &str = "333333";
+const LINE_W: i64 = 12700; // 1pt, matching the flowchart connector width
+
+/// Convert a `sequenceDiagram` Mermaid source to a `<w:drawing>` run holding a
+/// DrawingML diagram, plus the participant-label lines used for the
+/// terminal/PDF caption fallback (in declaration order). Returns
+/// `(drawing_xml, text_lines)`.
+pub fn to_drawing(src: &str) -> (String, Vec<String>) {
+    let g = geometry(src);
+    let text: Vec<String> = g.participants.iter().map(|p| p.label.clone()).collect();
+
+    let mut shapes = String::new();
+    let mut sid = 2; // 1 is the docPr id
+
+    // Z-order (back to front): frame rects, note rects, participant boxes,
+    // lifelines, messages+labels.
+    for f in &g.frames {
+        shapes.push_str(&emit_frame(f, sid));
+        sid += 1;
+    }
+    for n in &g.notes {
+        shapes.push_str(&emit_note(n, sid));
+        sid += 1;
+    }
+    for p in &g.participants {
+        shapes.push_str(&emit_participant(p, sid));
+        sid += 1;
+    }
+    for l in &g.lifelines {
+        shapes.push_str(&emit_lifeline(l, sid));
+        sid += 1;
+    }
+    for m in &g.messages {
+        shapes.push_str(&emit_message(m, sid));
+        sid += 1;
+        if !m.text.is_empty() {
+            shapes.push_str(&emit_message_label(m, sid));
+            sid += 1;
+        }
+    }
+
+    let xml = crate::mermaid::wrap_drawing_group(&shapes, g.canvas_w, g.canvas_h, src);
+    (xml, text)
+}
+
+fn emit_participant(p: &PartBox, sid: i32) -> String {
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Participant {sid}\"/>\
+         <wps:cNvSpPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>\
+         <a:solidFill><a:srgbClr val=\"{PART_FILL}\"/></a:solidFill>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{PART_STROKE}\"/></a:solidFill></a:ln>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"ctr\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = p.x,
+        y = p.y,
+        w = p.w,
+        h = p.h,
+        t = crate::mermaid::xml_escape_text(&p.label),
+    )
+}
+
+/// A thin vertical dashed line — the lifeline dropping from a participant's
+/// header box down through every row it's active in.
+fn emit_lifeline(l: &Lifeline, sid: i32) -> String {
+    let cy = (l.y2 - l.y1).max(1);
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Lifeline {sid}\"/>\
+         <wps:cNvCnPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y1}\"/><a:ext cx=\"1\" cy=\"{cy}\"/></a:xfrm>\
+         <a:prstGeom prst=\"line\"><a:avLst/></a:prstGeom>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{LINE_STROKE}\"/></a:solidFill>\
+         <a:prstDash val=\"dash\"/></a:ln>\
+         </wps:spPr>\
+         <wps:bodyPr/>\
+         </wps:wsp>",
+        x = l.x,
+        y1 = l.y1,
+        cy = cy,
+    )
+}
+
+/// A message arrow: a straight horizontal line for a cross-lifeline message,
+/// or a small 3-point loop to the right of the lifeline for a self-message.
+fn emit_message(m: &MsgGeom, sid: i32) -> String {
+    let dash = if m.dashed {
+        "<a:prstDash val=\"dash\"/>"
+    } else {
+        ""
+    };
+    let pts: Vec<(i64, i64)> = if m.self_msg {
+        // A small rectangular loop out to x2, down, and back to the lifeline.
+        vec![(m.x1, m.y1), (m.x2, m.y1), (m.x2, m.y2), (m.x1, m.y2)]
+    } else {
+        vec![(m.x1, m.y1), (m.x2, m.y2)]
+    };
+    let ox = pts.iter().map(|p| p.0).min().unwrap_or(0);
+    let oy = pts.iter().map(|p| p.1).min().unwrap_or(0);
+    let maxx = pts.iter().map(|p| p.0).max().unwrap_or(0);
+    let maxy = pts.iter().map(|p| p.1).max().unwrap_or(0);
+    let cx = (maxx - ox).max(1);
+    let cy = (maxy - oy).max(1);
+    let mut path = String::new();
+    for (i, (px, py)) in pts.iter().enumerate() {
+        let (rx, ry) = (px - ox, py - oy);
+        if i == 0 {
+            path.push_str(&format!(
+                "<a:moveTo><a:pt x=\"{rx}\" y=\"{ry}\"/></a:moveTo>"
+            ));
+        } else {
+            path.push_str(&format!("<a:lnTo><a:pt x=\"{rx}\" y=\"{ry}\"/></a:lnTo>"));
+        }
+    }
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Message {sid}\"/>\
+         <wps:cNvCnPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{ox}\" y=\"{oy}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+         <a:custGeom>\
+         <a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>\
+         <a:rect l=\"0\" t=\"0\" r=\"{cx}\" b=\"{cy}\"/>\
+         <a:pathLst><a:path w=\"{cx}\" h=\"{cy}\">{path}</a:path></a:pathLst>\
+         </a:custGeom>\
+         <a:ln w=\"{LINE_W}\"><a:solidFill><a:srgbClr val=\"{LINE_STROKE}\"/></a:solidFill>\
+         {dash}<a:tailEnd type=\"triangle\"/></a:ln>\
+         </wps:spPr>\
+         <wps:bodyPr/>\
+         </wps:wsp>",
+    )
+}
+
+/// The message's text label, in a small borderless text box centered above
+/// the arrow's midpoint (or above the loop, for a self-message).
+fn emit_message_label(m: &MsgGeom, sid: i32) -> String {
+    let cx = (m.x1 + m.x2) / 2;
+    let cy = m.y1.min(m.y2);
+    let w = (m.text.chars().count() as i64 * (EMU_PER_INCH * 9 / 100) + (EMU_PER_INCH * 2 / 10))
+        .clamp(EMU_PER_INCH / 2, EMU_PER_INCH * 3);
+    let h = EMU_PER_INCH * 3 / 10;
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Label {sid}\"/>\
+         <wps:cNvSpPr txBox=\"1\"/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>\
+         <a:noFill/>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"b\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = cx - w / 2,
+        y = cy - h,
+        t = crate::mermaid::xml_escape_text(&m.text),
+    )
+}
+
+/// An `alt`/`else` frame: a light-fill rounded rect with a top-left title
+/// run, plus (when present) a horizontal divider line at `else_y` and an
+/// `[else]` label under it.
+fn emit_frame(f: &FrameGeom, sid: i32) -> String {
+    let mut out = format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Frame {sid}\"/>\
+         <wps:cNvSpPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"roundRect\"><a:avLst/></a:prstGeom>\
+         <a:solidFill><a:srgbClr val=\"{FRAME_FILL}\"/></a:solidFill>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{FRAME_STROKE}\"/></a:solidFill></a:ln>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"left\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"t\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = f.x,
+        y = f.y,
+        w = f.w,
+        h = f.h,
+        t = crate::mermaid::xml_escape_text(&f.label),
+    );
+    // The divider + `[else]` label derive their shape ids from the frame's
+    // own `sid` (rather than consuming extra slots from the caller's shared
+    // counter) — the same "{sid}NN" convention `mermaid::emit_edge_label`
+    // uses for edge labels, which keeps every frame self-contained.
+    if let (Some(else_y), Some(else_label)) = (f.else_y, &f.else_label) {
+        emit_frame_else(&mut out, sid, f, else_y, else_label);
+    }
+    out
+}
+
+/// Appends the `else` divider line + `[else]` label to a frame's shapes
+/// (split out of `emit_frame` to keep that function's happy path linear).
+fn emit_frame_else(out: &mut String, sid: i32, f: &FrameGeom, else_y: i64, else_label: &str) {
+    out.push_str(&format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}01\" name=\"Divider {sid}\"/>\
+         <wps:cNvCnPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"1\"/></a:xfrm>\
+         <a:prstGeom prst=\"line\"><a:avLst/></a:prstGeom>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{FRAME_STROKE}\"/></a:solidFill>\
+         <a:prstDash val=\"dash\"/></a:ln>\
+         </wps:spPr>\
+         <wps:bodyPr/>\
+         </wps:wsp>",
+        x = f.x,
+        y = else_y,
+        cx = f.w.max(1),
+    ));
+    out.push_str(&format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}02\" name=\"ElseLabel {sid}\"/>\
+         <wps:cNvSpPr txBox=\"1\"/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>\
+         <a:noFill/>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"left\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">[else] {t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"t\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = f.x,
+        y = else_y,
+        w = f.w.max(1),
+        h = EMU_PER_INCH * 3 / 10,
+        t = crate::mermaid::xml_escape_text(else_label),
+    ));
+}
+
+/// A `Note over` box: a distinctly-filled rect with its text centered.
+fn emit_note(n: &NoteGeom, sid: i32) -> String {
+    format!(
+        "<wps:wsp>\
+         <wps:cNvPr id=\"{sid}\" name=\"Note {sid}\"/>\
+         <wps:cNvSpPr/>\
+         <wps:spPr>\
+         <a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>\
+         <a:solidFill><a:srgbClr val=\"{NOTE_FILL}\"/></a:solidFill>\
+         <a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{NOTE_STROKE}\"/></a:solidFill></a:ln>\
+         </wps:spPr>\
+         <wps:txbx><w:txbxContent><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>\
+         <w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
+         <wps:bodyPr anchor=\"ctr\"><a:noAutofit/></wps:bodyPr>\
+         </wps:wsp>",
+        x = n.x,
+        y = n.y,
+        w = n.w,
+        h = n.h,
+        t = crate::mermaid::xml_escape_text(&n.text),
+    )
+}
+
 /// Minimal JSON string escaping (quotes, backslash, control chars); a
 /// local copy of `mermaid`'s `json_str` (kept local per Task 2 scope,
 /// which only touches this file).
@@ -1000,5 +1285,34 @@ mod tests {
         let n = &g.notes[0];
         assert!(n.w > 0 && n.h > 0);
         assert_eq!(n.x, g.participants[0].x);
+    }
+
+    #[test]
+    fn emits_participant_boxes_and_lifelines() {
+        let (xml, text) =
+            to_drawing("sequenceDiagram\nparticipant A as Alice\nparticipant B as Bob\nA->>B: hi");
+        assert!(xml.contains("<w:drawing>"));
+        assert!(xml.contains("Alice") && xml.contains("Bob"));
+        // A dashed lifeline (prstDash) and a message arrow (tailEnd) present.
+        assert!(xml.contains("prstDash"), "lifeline dash missing: {xml}");
+        assert!(xml.contains("tailEnd"), "arrow head missing");
+        assert_eq!(text, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn emits_alt_frame_and_note() {
+        let (xml, _) =
+            to_drawing("sequenceDiagram\nA->>B: x\nalt c\n A->>B: y\nend\nNote over A,B: n");
+        assert!(xml.contains("roundRect")); // frame (and/or note) box
+        assert!(xml.contains(">c<") || xml.contains("preserve\">c")); // alt label
+        assert!(xml.contains(">n<") || xml.contains("preserve\">n")); // note text
+    }
+
+    #[test]
+    fn sequence_source_round_trips() {
+        let src = "sequenceDiagram\nA->>B: hi";
+        let (xml, _) = to_drawing(src);
+        assert!(xml.contains("descr=\"mermaid:"));
+        assert_eq!(crate::mermaid::source_of(&xml).as_deref(), Some(src));
     }
 }

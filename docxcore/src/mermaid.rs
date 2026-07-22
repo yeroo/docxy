@@ -185,7 +185,7 @@ pub fn source_of(raw: &str) -> Option<String> {
     Some(unescape_source(body))
 }
 
-const MARKER: &str = "mermaid:";
+pub(crate) const MARKER: &str = "mermaid:";
 
 // ===========================================================================
 // Parsing
@@ -1172,6 +1172,17 @@ fn emit_drawing(d: &Diagram, src: &str) -> String {
         sid += 1;
     }
 
+    wrap_drawing_group(&shapes, w, h, src)
+}
+
+/// Wraps a `{shapes}` DrawingML fragment (a run of `wps:wsp`/`wps:cxnSp`
+/// elements) in the shared `mc:AlternateContent` / `wpg:wgp` group + `w:drawing`
+/// scaffold, embedding `src` (escaped, marker-prefixed) in the group's
+/// `wp:docPr@descr` so [`source_of`] can recover it losslessly. This is the
+/// single wrapper both [`emit_drawing`] (flowcharts) and
+/// `mermaid_seq::to_drawing` (sequence diagrams) call, so every Mermaid
+/// diagram type produces byte-identical scaffolding around its shapes.
+pub(crate) fn wrap_drawing_group(shapes: &str, w: i64, h: i64, src: &str) -> String {
     let descr = format!("{MARKER}{}", escape_source(src));
     format!(
         "<w:r>\
@@ -1359,7 +1370,7 @@ fn emit_edge_label(label: &str, cx: i64, cy: i64, sid: i32) -> String {
 
 /// Encode the Mermaid source for an XML attribute: no literal newlines (Word and
 /// XML attribute-value normalization would mangle them), so escape them.
-fn escape_source(src: &str) -> String {
+pub(crate) fn escape_source(src: &str) -> String {
     let mut out = String::new();
     for c in src.chars() {
         match c {
@@ -1393,12 +1404,12 @@ fn unescape_source(s: &str) -> String {
     out
 }
 
-fn xml_escape_text(s: &str) -> String {
+pub(crate) fn xml_escape_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
-fn xml_escape_attr(s: &str) -> String {
+pub(crate) fn xml_escape_attr(s: &str) -> String {
     xml_escape_text(s).replace('"', "&quot;")
 }
 
