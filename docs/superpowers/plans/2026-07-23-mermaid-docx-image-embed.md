@@ -103,7 +103,7 @@ fn embedded_picture_round_trips_to_markdown() {
     <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
      <pic:nvPicPr><pic:cNvPr id="1" name="mermaid.png" descr="{descr}"/><pic:cNvPicPr/></pic:nvPicPr>
      <pic:blipFill><a:blip r:embed="{rid_png}">
-       <a:extLst><a:ext uri="{{28A0092B-C50C-407E-A947-70E740481C1C}}">
+       <a:extLst><a:ext uri="{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}">
          <asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="{rid_svg}"/>
        </a:ext></a:extLst></a:blip>
       <a:stretch><a:fillRect/></a:stretch></pic:blipFill>
