@@ -231,6 +231,64 @@ impl Package {
         Some(part_name)
     }
 
+    /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
+    /// wiring up `[Content_Types].xml` (a `Default` for `<ext>`, added if not
+    /// already declared) and a `document.xml.rels` relationship of type
+    /// `.../relationships/image`. Returns the new relationship id (`rId…`), for
+    /// use in a `<a:blip r:embed="…">`. Mirrors [`Package::create_hf`]'s
+    /// add-part idiom (unused part name, `.rels` append via `next_rid`,
+    /// `[Content_Types].xml` append).
+    pub(crate) fn add_media_part(&mut self, bytes: &[u8], ext: &str) -> String {
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+        // Unused word/media/imageN.<ext> part name — N unique across ALL media
+        // parts regardless of extension, so a PNG + SVG pair minted together
+        // (the mermaid embed case) never collide on the same N.
+        let mut max_n = 0u32;
+        for (name, _) in &self.parts {
+            if let Some(rest) = name.strip_prefix("word/media/image") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    max_n = max_n.max(n);
+                }
+            }
+        }
+        let n = max_n + 1;
+        let target = format!("image{n}.{ext}");
+        let part_name = format!("word/media/{target}");
+        self.parts.push((part_name, bytes.to_vec()));
+
+        // Content-type Default for the extension, if not already declared.
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            let marker = format!("Extension=\"{ext}\"");
+            if !ct.contains(&marker) {
+                let content_type = match ext {
+                    "svg" => "image/svg+xml".to_string(),
+                    other => format!("image/{other}"),
+                };
+                let default =
+                    format!("<Default Extension=\"{ext}\" ContentType=\"{content_type}\"/>");
+                let new_ct = ct.replacen("</Types>", &format!("{default}</Types>"), 1);
+                self.set_part("[Content_Types].xml", new_ct.into_bytes());
+            }
+        }
+
+        // Image relationship in document.xml.rels.
+        let rels_name = "word/_rels/document.xml.rels";
+        let rels_xml = self
+            .part(rels_name)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let rid = next_rid(&rels_xml);
+        let rel =
+            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/image\" Target=\"media/{target}\"/>");
+        let new_rels = rels_xml.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
+        self.set_part(rels_name, new_rels.into_bytes());
+
+        rid
+    }
+
     /// Page size/margins from the captured (final) `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
         crate::model::PageGeom::from_sect_pr(&self.sect_pr)
