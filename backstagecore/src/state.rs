@@ -111,10 +111,9 @@ pub struct Backstage {
     /// In Save As: true when the file-name field is focused (accepting edits),
     /// false when the folder browser is focused.
     pub name_focus: bool,
-    // Filled by `draw` (Task 3) and read by `mouse` (Task 2); unread until
-    // those land, so silence the interim dead-code warning.
-    #[allow(dead_code)]
-    layout: BackstageLayout,
+    // Filled by `draw` (Task 3) and read by `mouse` (Task 2, `input.rs`), a
+    // sibling module — needs crate-wide visibility, not just within `state`.
+    pub(crate) layout: BackstageLayout,
 }
 
 impl Backstage {
