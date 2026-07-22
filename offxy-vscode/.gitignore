@@ -8,3 +8,7 @@ out/
 # not committed — same policy as other binaries in this repo.
 media/*.wasm
 offxy-vscode/TEST-PLAN.docx
+
+# Mermaid sample fixtures are checked in as .md; the .docx conversions are
+# build artifacts produced by `docxy.exe --docx`, not committed.
+samples/mermaid/*.docx
