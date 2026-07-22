@@ -25,6 +25,10 @@
 
 ### Task 1: `WasmBinding` extraction + `GridEngine` + tests + benchmark
 
+> **Status: DONE.** Docx suite untouched; JSON parser learned floats (colw
+> carries them). Benchmark (3MB/29-sheet corpus workbook): view-scroll p95
+> 0.5ms, set+recalc p95 591ms (pivot-web recalc; typical books are ms).
+
 **Files:**
 - Create: `engine/WasmBinding.kt`, `engine/GridEngine.kt`
 - Modify: `engine/ChicoryEngine.kt` (extend the base; public surface unchanged)
