@@ -48,6 +48,10 @@ wb.Names.Add "MyRange", ws.Range("A1:B4")
 ws.Protect "pw"
 ws.Unprotect "pw"
 
+' --- writes POSITIONED through navigation must land (not be swallowed) ---
+ws.Range("A6").Offset(1, 1).Value = "OffsetLands"   ' -> B7
+ws.Range("D10").Resize(1, 1).Value = 999            ' -> D10
+
 wb.SaveAs out, 51
 wb.Close False
 app.Quit

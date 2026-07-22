@@ -1601,6 +1601,16 @@ mod win {
             "clearcontents" => 111,
             "select" => 235,
             "mergecells" | "merge" => 564,
+            // Navigation — these commonly POSITION a subsequent write, so they
+            // must return a real sub-Range (a NullObject would silently swallow
+            // the data written through it).
+            "offset" => 254,
+            "resize" => 256,
+            "rows" => 258,
+            "columns" => 241,
+            "entirerow" => 247,
+            "entirecolumn" => 246,
+            "text" => 138,
             _ => return None,
         })
     }
@@ -1746,6 +1756,97 @@ mod win {
                     ),
                     111 => self.write_fill(Cell::default()),
                     235 | 564 => {} // Select / Merge — no-op in P1
+                    // Offset(RowOffset, ColumnOffset) — shift the whole range.
+                    254 => {
+                        let dr = arg_i32(params, 0).unwrap_or(0) as i64;
+                        let dc = arg_i32(params, 1).unwrap_or(0) as i64;
+                        let sh = |v: u32, d: i64| (v as i64 + d).max(0) as u32;
+                        put_obj(
+                            result,
+                            Range {
+                                book,
+                                sheet,
+                                r1: sh(r1, dr),
+                                c1: sh(c1, dc),
+                                r2: sh(r2, dr),
+                                c2: sh(c2, dc),
+                            },
+                        );
+                    }
+                    // Resize(RowSize, ColumnSize) — anchor at the top-left corner.
+                    256 => {
+                        let rs = arg_i32(params, 0).filter(|&x| x > 0).map(|x| x as u32);
+                        let cs = arg_i32(params, 1).filter(|&x| x > 0).map(|x| x as u32);
+                        let rs = rs.unwrap_or(r2 - r1 + 1);
+                        let cs = cs.unwrap_or(c2 - c1 + 1);
+                        put_obj(
+                            result,
+                            Range {
+                                book,
+                                sheet,
+                                r1,
+                                c1,
+                                r2: r1 + rs - 1,
+                                c2: c1 + cs - 1,
+                            },
+                        );
+                    }
+                    // Rows / Columns — return the range itself (Count/Item/writes
+                    // still work); a faithful row/column iterator is not needed for
+                    // the write path.
+                    258 | 241 => put_obj(
+                        result,
+                        Range {
+                            book,
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        },
+                    ),
+                    // EntireRow / EntireColumn — widen to the full row(s)/column(s).
+                    247 => put_obj(
+                        result,
+                        Range {
+                            book,
+                            sheet,
+                            r1,
+                            c1: 0,
+                            r2,
+                            c2: MAX_COL,
+                        },
+                    ),
+                    246 => put_obj(
+                        result,
+                        Range {
+                            book,
+                            sheet,
+                            r1: 0,
+                            c1,
+                            r2: MAX_ROW,
+                            c2,
+                        },
+                    ),
+                    // Text — the displayed value of the top-left cell, as a string.
+                    138 => {
+                        let val = reg(|r| {
+                            r.books
+                                .get_mut(book)
+                                .map(|b| b.value(sheet, r1, c1))
+                                .unwrap_or(CellValue::Empty)
+                        });
+                        let s = match &val {
+                            CellValue::Empty => String::new(),
+                            CellValue::Number(n) => format!("{n}"),
+                            CellValue::Text(t) => t.clone(),
+                            CellValue::Bool(b) => {
+                                if *b { "TRUE" } else { "FALSE" }.to_string()
+                            }
+                            CellValue::Error(e) => e.clone(),
+                        };
+                        put(result, VARIANT::from(BSTR::from(s.as_str())));
+                    }
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
