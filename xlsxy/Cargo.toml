@@ -33,6 +33,7 @@ arboard = "3"
 # wide (CJK/emoji) glyphs. Already in ratatui's tree.
 unicode-width = "0.2"
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
+backstagecore = { version = "0.1.0", path = "../backstagecore" }
 # Inline images for embedded pictures (kitty/iTerm2/Sixel, half-block fallback).
 ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
 # Only the raster formats a workbook embeds; avoids heavy AVIF/AV1 codecs.

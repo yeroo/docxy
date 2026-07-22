@@ -2053,6 +2053,7 @@ name = "xlsxy"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "backstagecore",
  "ctlcore",
  "gridcore",
  "image",
