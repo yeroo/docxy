@@ -1103,6 +1103,35 @@ impl App {
         true
     }
 
+    /// Ctrl+↓/Ctrl+↑ in the reader: focus the next/previous body link (clamped,
+    /// no wrap), scrolling it into view. From no focus, `+1` starts at the first
+    /// link and `-1` at the last. A no-op when the body has no links.
+    pub fn focus_link(&mut self, delta: isize) {
+        let n = self.body_links.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.focused_link {
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    n - 1
+                }
+            }
+            Some(i) => (i as isize + delta).clamp(0, n as isize - 1) as usize,
+        };
+        self.focused_link = Some(next);
+        // Scroll so the focused link's row is within the reading viewport.
+        let line = self.body_links[next].line;
+        let vh = self.reading_viewport.max(1);
+        if line < self.reading_scroll {
+            self.reading_scroll = line;
+        } else if line >= self.reading_scroll + vh {
+            self.reading_scroll = line + 1 - vh;
+        }
+    }
+
     /// Routes a mouse event: left-click focuses the pane under the pointer and
     /// selects the clicked row (rail → switch section; folders → select;
     /// message list → select; reading → focus). Wheel and click-to-activate are
@@ -5476,6 +5505,43 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Pane::Reading); // stays active
         assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
         assert!(!app.open_sibling_message(1)); // no-op past the end
+    }
+
+    #[test]
+    fn focus_link_steps_through_links_and_scrolls_into_view() {
+        use crate::ui::reading::BodyLink;
+        let mut app = App::for_test_with_seeded_store();
+        app.reading_viewport = 10;
+        app.focus = Pane::Reading;
+        app.body_links = vec![
+            BodyLink {
+                line: 2,
+                col: 0,
+                width: 3,
+                url: "https://a".into(),
+            },
+            BodyLink {
+                line: 30,
+                col: 0,
+                width: 3,
+                url: "https://b".into(),
+            },
+        ];
+        let visible = |a: &App, li: usize| {
+            let l = a.body_links[li].line;
+            l >= a.reading_scroll && l < a.reading_scroll + a.reading_viewport
+        };
+        app.focus_link(1);
+        assert_eq!(app.focused_link, Some(0));
+        assert!(visible(&app, 0));
+        app.focus_link(1);
+        assert_eq!(app.focused_link, Some(1));
+        assert!(visible(&app, 1));
+        app.focus_link(1); // clamped at the last
+        assert_eq!(app.focused_link, Some(1));
+        app.focus_link(-1);
+        assert_eq!(app.focused_link, Some(0));
+        assert!(visible(&app, 0));
     }
 
     #[test]

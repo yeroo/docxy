@@ -23,7 +23,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
@@ -79,8 +79,12 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(header), header_area);
 
     // Build the owned layout (render_body returns Vec<StyledLine>, owned).
+    let focused_url = app
+        .focused_link
+        .and_then(|i| app.body_links.get(i))
+        .map(|l| l.url.clone());
     let styled = render_body(app, body_area.width as usize);
-    let (lines, images, links) = body_layout(styled);
+    let (lines, images, links) = body_layout(styled, focused_url.as_deref());
     app.body_links = links;
     let vh = body_area.height as usize;
     app.reading_content_rows = lines.len();
@@ -131,6 +135,51 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             draw_image_fallback_rect(f, rect, &ib.img);
         }
     }
+
+    // Focused-link URL strip: the full URL along the reader's bottom edge,
+    // wrapped across up to 3 rows (Enter opens it — with a warning).
+    if let Some(url) = focused_url {
+        let rows = wrap_url(&url, body_area.width as usize, 3);
+        let h = (rows.len() as u16).min(body_area.height);
+        if h > 0 {
+            let strip = Rect {
+                x: body_area.x,
+                y: body_area.y + body_area.height - h,
+                width: body_area.width,
+                height: h,
+            };
+            f.render_widget(Clear, strip);
+            f.render_widget(
+                Paragraph::new(rows).style(Style::new().fg(Color::Black).bg(Color::Cyan)),
+                strip,
+            );
+        }
+    }
+}
+
+/// Wraps `url` into at most `max_rows` lines of `width` columns, char-breaking
+/// (a URL has no spaces to wrap on); an ellipsis marks truncation if it doesn't
+/// fit. The first row is prefixed with a small link glyph.
+fn wrap_url(url: &str, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let text = format!("\u{1f517} {url}"); // 🔗 url
+    let chars: Vec<char> = text.chars().collect();
+    let chunks: Vec<&[char]> = chars.chunks(width).collect();
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == max_rows - 1 && chunks.len() > max_rows {
+            // Last allowed row and there's more — end with an ellipsis.
+            let mut s: String = chunk.iter().take(width.saturating_sub(1)).collect();
+            s.push('\u{2026}');
+            rows.push(Line::from(s));
+            break;
+        }
+        rows.push(Line::from(chunk.iter().collect::<String>()));
+        if i + 1 == max_rows {
+            break;
+        }
+    }
+    rows
 }
 
 /// A stable cache key for a `data:` URI image, derived from the bytes'
@@ -258,7 +307,10 @@ fn render_body(app: &App, width: usize) -> Vec<StyledLine> {
 /// this borrows nothing from `app`, so `app.reading_*` can be assigned right
 /// after building it — and an absolute-row image box can still be cropped
 /// correctly even when its top row is scrolled above the viewport.
-fn body_layout(styled: Vec<StyledLine>) -> (Vec<Line<'static>>, Vec<ImgBox>, Vec<BodyLink>) {
+fn body_layout(
+    styled: Vec<StyledLine>,
+    focused_url: Option<&str>,
+) -> (Vec<Line<'static>>, Vec<ImgBox>, Vec<BodyLink>) {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<ImgBox> = Vec::new();
     let mut raw_links: Vec<BodyLink> = Vec::new();
@@ -273,7 +325,7 @@ fn body_layout(styled: Vec<StyledLine>) -> (Vec<Line<'static>>, Vec<ImgBox>, Vec
             }
         } else {
             collect_line_links(line, out_lines.len(), &mut raw_links);
-            out_lines.push(to_ratatui_line(line));
+            out_lines.push(to_ratatui_line(line, focused_url));
         }
     }
     (out_lines, images, dedup_continuations(raw_links))
@@ -369,21 +421,20 @@ fn draw_image_fallback_rect(f: &mut Frame, rect: Rect, img: &ImageRef) {
 /// `htmlrender::INDENT_SPACES`-wide groups of leading spaces (the same
 /// figure `htmlrender` already subtracted from its wrap width, so this
 /// plus the wrapped text still fits within what `render_body` asked for).
-fn to_ratatui_line(line: &StyledLine) -> Line<'static> {
+fn to_ratatui_line(line: &StyledLine, focused_url: Option<&str>) -> Line<'static> {
     let mut spans = Vec::with_capacity(line.spans.len() + 1);
     let indent = line.indent as usize * htmlrender::INDENT_SPACES;
     if indent > 0 {
         spans.push(Span::raw(" ".repeat(indent)));
     }
-    spans.extend(line.spans.iter().map(to_ratatui_span));
+    spans.extend(line.spans.iter().map(|s| to_ratatui_span(s, focused_url)));
     Line::from(spans)
 }
 
-/// Maps one `StyledSpan` to a ratatui `Span`: bold/italic/underline become
-/// the matching `Modifier`; a link (footnote reference or the footnote
-/// appendix line itself) renders in cyan so it stands out from plain body
-/// text.
-fn to_ratatui_span(span: &StyledSpan) -> Span<'static> {
+/// Maps one `StyledSpan` to a ratatui `Span`: bold/italic/underline become the
+/// matching `Modifier`; a link renders blue, and the currently-focused link
+/// (its URL == `focused_url`) is additionally reversed so it stands out.
+fn to_ratatui_span(span: &StyledSpan, focused_url: Option<&str>) -> Span<'static> {
     let mut style = Style::default();
     if span.bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -396,6 +447,9 @@ fn to_ratatui_span(span: &StyledSpan) -> Span<'static> {
     }
     if span.link.is_some() {
         style = style.fg(Color::Blue);
+    }
+    if focused_url.is_some() && span.link.as_deref() == focused_url {
+        style = style.add_modifier(Modifier::REVERSED);
     }
     Span::styled(span.text.clone(), style)
 }
@@ -413,7 +467,7 @@ mod tests {
             link: Some("https://x".into()),
             ..Default::default()
         };
-        assert_eq!(to_ratatui_span(&span).style.fg, Some(Color::Blue));
+        assert_eq!(to_ratatui_span(&span, None).style.fg, Some(Color::Blue));
     }
 
     #[test]

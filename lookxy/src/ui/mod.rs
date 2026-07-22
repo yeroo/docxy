@@ -28,7 +28,7 @@ mod status_bar;
 use crate::app::{App, Mode, Pane};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 
@@ -451,6 +451,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') if app.focus == Pane::Folders => nav_left(app),
         KeyCode::Char('l') if app.focus == Pane::Folders => nav_right(app),
         KeyCode::Char(' ') if app.focus == Pane::Folders => app.toggle_selected_folder(),
+        // Ctrl+↑/↓ in the reader jump between links (ahead of the plain scroll
+        // arms below, which match the same Up/Down without the modifier).
+        KeyCode::Up
+            if app.focus == Pane::Reading && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.focus_link(-1)
+        }
+        KeyCode::Down
+            if app.focus == Pane::Reading && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.focus_link(1)
+        }
         // Reading-focused vertical keys scroll the reader instead of moving a
         // selection. These guarded arms must precede the unguarded ones below.
         KeyCode::Char('k') | KeyCode::Up if app.focus == Pane::Reading => app.reading_scroll_by(-1),
