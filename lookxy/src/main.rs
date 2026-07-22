@@ -221,7 +221,11 @@ fn run(
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                // Accept auto-repeat (holding a key) as well as the initial
+                // press — otherwise holding/rapidly-tapping a key (e.g. Ctrl+↓
+                // to walk links) drops every repeat and only the first press
+                // registers. Release events are still ignored.
+                Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                     // Any key press acknowledges (and clears) a transient error
                     // notice — same lifecycle as the sync states that clear it.
                     app.error_notice = None;
