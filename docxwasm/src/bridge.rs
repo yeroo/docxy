@@ -1134,6 +1134,13 @@ impl Session {
     /// only a clone is embedded into and serialized — so the SmartArt shapes
     /// keep rendering in the editor after this call; only the returned bytes
     /// carry pictures.
+    ///
+    /// `self.pkg` is likewise only cloned, never mutated: `embed_images` adds
+    /// media parts/rels/content-types for the current diagrams, and doing that
+    /// in place on `self.pkg` would leave every previous call's media parts
+    /// stranded as orphans (the doc only references the newest rIds), growing
+    /// the saved `.docx` on every repeated save. Starting fresh from a clone
+    /// each time keeps the output limited to exactly the current diagrams.
     pub fn save_with_mermaid_images(
         &mut self,
         images_json: &str,
@@ -1141,11 +1148,12 @@ impl Session {
         svg_blob: &[u8],
     ) -> Vec<u8> {
         let images = parse_mermaid_images(images_json, png_blob, svg_blob);
+        let mut pkg = self.pkg.clone();
         let mut doc = self.editor.doc.clone();
-        docxcore::mermaid_embed::embed_images(&mut self.pkg, &mut doc, &images);
-        self.pkg.document = doc;
+        docxcore::mermaid_embed::embed_images(&mut pkg, &mut doc, &images);
+        pkg.document = doc;
         self.dirty = false;
-        save_package(&self.pkg)
+        save_package(&pkg)
     }
 
     #[cfg(test)]
@@ -1493,6 +1501,43 @@ mod tests {
         assert_eq!(
             via_empty, via_plain,
             "an empty images array must behave exactly like save()"
+        );
+    }
+
+    #[test]
+    fn save_with_images_is_idempotent_across_repeated_saves() {
+        let doc = docxcore::markdown::from_markdown("```mermaid\nflowchart TD\nA-->B\n```\n");
+        let bytes = save_package(&docxcore::package::new_markdown_package(doc));
+        let mut s = Session::open(&bytes).expect("open");
+        let json = r#"[{"source":"flowchart TD\nA-->B","pngOff":0,"pngLen":4,"svgOff":0,"svgLen":6,"wEmu":3000000,"hEmu":1500000}]"#;
+        let png = [0x89, 0x50, 0x4E, 0x47];
+        let svg = b"<svg/>";
+
+        // Simulate the webview calling save on every Ctrl+S: same inputs,
+        // called twice in a row on the same live session.
+        let first = s.save_with_mermaid_images(json, &png, svg);
+        let second = s.save_with_mermaid_images(json, &png, svg);
+
+        assert_eq!(
+            first, second,
+            "repeated save_with_mermaid_images calls with identical inputs must \
+             produce byte-identical output, not accumulate orphaned media parts"
+        );
+
+        // Belt-and-suspenders: same media-part count both times (in case byte
+        // equality were ever satisfied vacuously for an unrelated reason).
+        let count_media = |out: &[u8]| {
+            load_package(out)
+                .expect("reload")
+                .part_names()
+                .iter()
+                .filter(|n| n.starts_with("word/media/image"))
+                .count()
+        };
+        assert_eq!(
+            count_media(&first),
+            count_media(&second),
+            "second save must not carry more media parts than the first"
         );
     }
 
