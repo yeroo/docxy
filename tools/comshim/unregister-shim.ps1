@@ -20,11 +20,11 @@ if (Test-Path "$Classes\Excel.Application\CLSID") {
     $mapped = (Get-ItemProperty "$Classes\Excel.Application\CLSID" -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
     if ($mapped -eq $ShimClsid) {
         Remove-Item "$Classes\Excel.Application" -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "Removed HKCU Excel.Application shim mapping." -ForegroundColor Green
+        Write-Host "Removed HKCU Excel.Application shim mapping."
     } else {
-        Write-Host "HKCU Excel.Application maps to $mapped (not our shim) — left untouched." -ForegroundColor Yellow
+        Write-Host "HKCU Excel.Application maps to $mapped (not our shim) - left untouched."
     }
 } else {
-    Write-Host "No HKCU Excel.Application mapping present." -ForegroundColor DarkGray
+    Write-Host "No HKCU Excel.Application mapping present."
 }
-Write-Host "Installed (HKLM) Excel, if any, is unaffected." -ForegroundColor DarkGray
+Write-Host "Installed (HKLM) Excel, if any, is unaffected."

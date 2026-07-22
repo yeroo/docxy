@@ -30,7 +30,8 @@ live Excel instance via COM and fails when Excel is absent. This shim registers
 | Phase | What | State |
 |---|---|---|
 | **P0** | Prove COM launches the server + routes a late-bound call end-to-end, with logging | ✅ **done** — verified with a VBScript client (`Name`/`Version`/`Visible`/`Workbooks`/`Quit`) |
-| P1 | Full `create → write → SaveAs → quit`, backed by `gridcore`, verified against real Excel as the oracle | next |
+| **P1** | Full `create → write → SaveAs → quit`, backed by `gridcore`, verified against real Excel as the oracle | ✅ **done** — `tools/comshim-tests/verify.ps1`: the shim creates an `.xlsx` (`Workbooks.Add`, `Worksheets(1)`, `Range`/`Cells` writes, `=SUM` formula, `SaveAs 51`); **real Excel opens it with no repair** and recomputes `B4=42.5` |
+| P1.5 | In-binary `/regserver`, number formats + basic Font/Interior, array (range) writes, `.xls` | next |
 | P2 | Early-bound typelib/vtable — only if a client needs it (the log decides) | gated |
 | P3 | Petrel integration on the VDI | pending |
 | P4 | `Word.Application` over `docxcore` | later |

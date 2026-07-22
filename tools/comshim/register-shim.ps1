@@ -9,10 +9,10 @@
   written to HKLM, and a distinct shim CLSID is used (never Microsoft's Excel
   CLSID {00024500-...}).
 
-  GUARD: if Excel.Application is already mapped in HKCU to a different CLSID
-  (e.g. you registered something else), the script refuses unless -Force. It
-  never touches the machine-wide (HKLM) Excel registration, so an installed
-  Excel keeps working for other users and elevated processes.
+  GUARD: if Excel.Application is already mapped in HKCU to a different CLSID, the
+  script refuses unless -Force. It never touches the machine-wide (HKLM) Excel
+  registration, so an installed Excel keeps working for other users and elevated
+  processes.
 
 .PARAMETER Exe
   Path to xlcomshim.exe. Defaults to the release build in this repo.
@@ -30,31 +30,33 @@ $ErrorActionPreference = 'Stop'
 $ShimClsid = '{7B3F9E20-4C1A-4E8B-A2D6-9F5C1E0B7A31}'
 $Classes   = 'HKCU:\Software\Classes'
 
-$Exe = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).Path
-if (-not (Test-Path -LiteralPath $Exe)) { throw "xlcomshim.exe not found at $Exe — build it first (cargo build --release -p xlcomshim)." }
+if (-not (Test-Path -LiteralPath $Exe)) {
+    throw "xlcomshim.exe not found at $Exe. Build it first: cargo build --release -p xlcomshim"
+}
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
 
-# --- guard: don't stomp a different existing mapping ---------------------------
+# Guard: do not stomp a different existing mapping.
 $existing = $null
 if (Test-Path "$Classes\Excel.Application\CLSID") {
     $existing = (Get-ItemProperty "$Classes\Excel.Application\CLSID" -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
 }
 if ($existing -and $existing -ne $ShimClsid -and -not $Force) {
-    throw "HKCU already maps Excel.Application to $existing. Re-run with -Force to replace it (this only affects your user; HKLM/installed Excel is untouched)."
+    throw "HKCU already maps Excel.Application to $existing. Re-run with -Force to replace it (only affects your user; HKLM/installed Excel is untouched)."
 }
 
-# NB: HKLM (machine-wide) Excel is deliberately NOT read or changed. On this
+# NB: HKLM (machine-wide) Excel is deliberately NOT read or changed. For this
 # user, HKCU\Software\Classes shadows HKLM for COM lookups.
 function Set-Default($path, $value) {
     New-Item -Path $path -Force | Out-Null
     Set-ItemProperty -Path $path -Name '(default)' -Value $value
 }
 
-Set-Default "$Classes\Excel.Application"                      "Docxy Spreadsheet Application"
-Set-Default "$Classes\Excel.Application\CLSID"                $ShimClsid
-Set-Default "$Classes\CLSID\$ShimClsid"                       "Docxy spreadsheet automation server"
-Set-Default "$Classes\CLSID\$ShimClsid\LocalServer32"        ('"{0}" /automation' -f $Exe)
-Set-Default "$Classes\CLSID\$ShimClsid\ProgID"               "Excel.Application"
+Set-Default "$Classes\Excel.Application"               "Docxy Spreadsheet Application"
+Set-Default "$Classes\Excel.Application\CLSID"         $ShimClsid
+Set-Default "$Classes\CLSID\$ShimClsid"               "Docxy spreadsheet automation server"
+Set-Default "$Classes\CLSID\$ShimClsid\LocalServer32" ('"{0}" /automation' -f $Exe)
+Set-Default "$Classes\CLSID\$ShimClsid\ProgID"        "Excel.Application"
 
-Write-Host "Registered Excel.Application -> $ShimClsid -> $Exe (HKCU, per-user)." -ForegroundColor Green
-Write-Host "Test:  `$x = New-Object -ComObject Excel.Application; `$x.Version; `$x.Quit()" -ForegroundColor Cyan
-Write-Host "Undo:  tools\comshim\unregister-shim.ps1" -ForegroundColor DarkGray
+Write-Host "Registered Excel.Application -> $ShimClsid -> $Exe (HKCU, per-user)."
+Write-Host 'Test:  $x = New-Object -ComObject Excel.Application; $x.Version; $x.Quit()'
+Write-Host 'Undo:  tools\comshim\unregister-shim.ps1'
