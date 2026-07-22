@@ -15,29 +15,36 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Global",
         &[
-            ("Tab / Shift-Tab", "cycle panes forward / back"),
-            ("\u{2190} / h / Esc", "back toward the folder list"),
-            ("g", "toggle Mail / Calendar"),
+            ("\u{2190} / \u{2192}", "move out / in a level"),
+            ("\u{2191} / \u{2193} (j/k)", "move within a level"),
             ("/", "search"),
             ("F1 / ?", "this help"),
             ("q", "quit"),
         ],
     ),
     (
+        "Rail",
+        &[
+            ("\u{2191} / \u{2193}", "Mail / Calendar"),
+            ("\u{2192} / Enter", "enter the section"),
+        ],
+    ),
+    (
         "Folders",
         &[
-            ("j / k", "move"),
-            ("\u{2192} / l", "expand"),
-            ("\u{2190} / h", "collapse / parent"),
+            ("\u{2191} / \u{2193}", "move"),
+            ("\u{2192}", "expand / enter list"),
+            ("\u{2190}", "collapse / parent / rail"),
             ("Space", "toggle"),
-            ("Enter", "open folder"),
         ],
     ),
     (
         "Message list",
         &[
-            ("j / k", "move"),
-            ("Enter", "open"),
+            ("\u{2191} / \u{2193}", "move (auto-preview)"),
+            ("\u{2192}", "open thread / activate"),
+            ("\u{2190}", "back to folders"),
+            ("Enter", "activate (mark read)"),
             ("m / u", "mark read / unread"),
             ("f", "flag"),
             ("d / Del", "delete"),
@@ -55,20 +62,21 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Reading",
         &[
-            ("j / k", "scroll"),
-            ("PgUp / PgDn", "page"),
+            ("\u{2191} / \u{2193}", "scroll"),
+            ("PgUp / PgDn", "prev / next message"),
             ("Home / End", "top / bottom"),
-            ("Esc / \u{2190}", "back to list"),
+            ("\u{2190} / Esc", "back to list"),
         ],
     ),
     (
         "Calendar",
         &[
-            ("j / k", "move"),
+            ("\u{2191} / \u{2193}", "move"),
+            ("\u{2192} / Enter", "edit event"),
+            ("\u{2190} / Esc", "back to rail"),
             ("c / e / x", "new / edit / delete"),
             ("a / d / t", "RSVP"),
             ("O", "out-of-office"),
-            ("g / Esc", "back to Mail"),
         ],
     ),
     (
@@ -153,21 +161,33 @@ mod tests {
         assert!(app.is_capturing_text());
     }
 
-    #[test]
-    fn draw_lists_group_headers() {
+    fn render_help_to_string(app: &App) -> String {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut app = App::for_test_with_seeded_store();
-        app.open_help();
-        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
-        let text: String = term
-            .backend()
+        let mut term = Terminal::new(TestBackend::new(100, 50)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend()
             .buffer()
             .content()
             .iter()
             .map(|c| c.symbol())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn draw_lists_group_headers() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_help();
+        let text = render_help_to_string(&app);
         assert!(text.contains("Global"));
         assert!(text.contains("Message list"));
+    }
+
+    #[test]
+    fn help_lists_the_rail_and_arrow_model() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_help();
+        let text = render_help_to_string(&app);
+        assert!(text.contains("Rail")); // new level-0 group
+        assert!(!text.contains("Shift-Tab")); // the removed pane-cycle key is gone
     }
 }
