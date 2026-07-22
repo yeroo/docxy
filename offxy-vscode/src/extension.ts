@@ -1156,11 +1156,23 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     const scriptUri = media(this.spec.script);
     const styleUri = media(this.spec.style);
     const wasmUri = media(this.spec.wasm);
+    // Only the docx/markdown editor (webview.js) overlays Mermaid diagrams —
+    // the grid editor (grid.js) never references `mermaid`, so it skips the
+    // ~3MB script tag entirely.
+    const hasMermaid = this.spec.script === 'webview.js';
+    const mermaidUri = hasMermaid ? media('mermaid.min.js') : null;
     const nonce = makeNonce();
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} data:`,
-      `style-src ${webview.cspSource}`,
+      // 'unsafe-inline' here is Mermaid's, not ours: mermaid.render() injects
+      // a <style> element (per-diagram CSS) directly into the DOM at render
+      // time, with no nonce attached (it's the UMD bundle's own DOM call, not
+      // one of our <script>/<style> tags) — without 'unsafe-inline' the
+      // browser drops that stylesheet and every live-rendered diagram comes
+      // out unstyled (default black-on-white, no theme colors/fonts). Every
+      // other directive stays nonce/host-scoped; only style-src widens.
+      `style-src ${webview.cspSource} 'unsafe-inline'`,
       `font-src ${webview.cspSource}`,
       // wasm needs 'unsafe-eval' to compile in some webview runtimes; scope it to
       // our nonce'd script only.
@@ -1181,6 +1193,7 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
   <div id="doc" tabindex="0" aria-label="Document" spellcheck="false"></div>
   <div id="status" role="status"></div>
   <script nonce="${nonce}">window.__OFFXY__ = { wasmUri: "${wasmUri}", markdown: ${this.spec.markdown === true} };</script>
+  ${mermaidUri ? `<script nonce="${nonce}" src="${mermaidUri}"></script>` : ''}
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

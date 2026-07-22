@@ -292,6 +292,24 @@ function buildSequenceSvg(geo) {
   let lastView = { lines: [], caret: { line: 0, col: 0 }, selection: 0 };
   let metrics = { charW: 8, lineH: 18 };
 
+  // `mermaid.min.js` is loaded as a plain global UMD `<script>` tag BEFORE
+  // this one, ONLY for this editor (extension.ts's `hasMermaid` gate skips it
+  // for grid.js) — so `mermaid` is a bare global, never an import. `typeof
+  // mermaid` is safe even when the script never loaded: the grid editor, and
+  // this file running unmodified inside mermaid-svg.test.mjs's `vm` sandbox
+  // (see that test's header comment) both hit this line with no `mermaid`
+  // global defined, and `typeof` never throws on an undeclared identifier.
+  const MERMAID = typeof mermaid !== 'undefined' ? mermaid : null;
+  if (MERMAID) {
+    MERMAID.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: 'default',
+      flowchart: { useMaxWidth: false },
+      sequence: { useMaxWidth: false },
+    });
+  }
+
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
@@ -342,6 +360,7 @@ function buildSequenceSvg(geo) {
   function openBytes(u8) {
     if (handle) ex.docx_close(handle);
     mediaCache.clear();
+    mmdCache.clear();
     if (u8.length === 0) {
       handle = 0;
       showEmptyState();
@@ -421,32 +440,128 @@ function buildSequenceSvg(geo) {
   }
 
   let mmdEls = [];
-  /** Overlay each mermaid diagram's real geometry as inline SVG, positioned
-   *  over its reserved grid box with the same col/row -> px math paintImages()
-   *  uses (PAD_L/PAD_T + metrics). A diagram with zero laid-out nodes (the
-   *  geometry builder found nothing to draw) is left to the label-box text
-   *  fallback already painted underneath by render_with_images's `text_box` —
-   *  that's why this only ever adds elements, never draws in place of the
-   *  text; the text is the fallback, this is the enhancement on top of it. */
+  // Rendered-svg cache, keyed by the diagram's raw mermaid `source` text — a
+  // paint that doesn't change a diagram's text (e.g. typing in an unrelated
+  // paragraph) reuses the already-rendered svg instead of re-invoking
+  // MERMAID.render() (an async DOM-touching call) on every keystroke.
+  const mmdCache = new Map();
+  // Bumped on every paintMermaid() call; a render Promise from a paint that's
+  // since been superseded checks this before touching the DOM, so a burst of
+  // edits can't let an old render land after a newer one already painted.
+  let mmdVersion = 0;
+  // MERMAID.render(id, ...) needs a fresh id each call (v10 briefly inserts a
+  // measuring element under it) — a running counter, not the box index, so
+  // two diagrams sharing an index across repaints (or the same box rendering
+  // twice — cache miss then a later source edit) never collide.
+  let mmdRenderSeq = 0;
+
+  /** Parse a rendered mermaid `<svg ...>` string's natural pixel size from its
+   *  width/height attributes, falling back to its viewBox — v10's `render()`
+   *  always emits one or the other. Returns {w:0,h:0} if neither parses
+   *  (defensive; not expected in practice), letting the caller fall back to
+   *  the reserved cell width instead of collapsing to nothing. */
+  function svgNaturalSize(svg) {
+    const attr = (name) => {
+      const m = new RegExp(`${name}="([\\d.]+)(?:px)?"`).exec(svg);
+      return m ? parseFloat(m[1]) : null;
+    };
+    let w = attr('width');
+    let h = attr('height');
+    if (w == null || h == null) {
+      const vb = /viewBox="[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)"/.exec(svg);
+      if (vb) {
+        if (w == null) w = parseFloat(vb[1]);
+        if (h == null) h = parseFloat(vb[2]);
+      }
+    }
+    return { w: w || 0, h: h || 0 };
+  }
+
+  /** Fill `el` with a REAL rendered-mermaid `svg` string, sized to the
+   *  diagram's own natural aspect ratio and capped to `contentW` — real
+   *  Mermaid output is laid out for its own content, not the `cols x rows`
+   *  text-box cell the wasm side reserved for it, so (per the brief) this is
+   *  deliberately NOT clamped into that cell box; a diagram taller than its
+   *  cell is allowed to be tall, scrolling internally past a generous cap
+   *  instead of being squashed or spilling unbounded over following lines. */
+  function paintMermaidSvgInto(el, svg, contentW) {
+    el.innerHTML = svg;
+    const { w, h } = svgNaturalSize(svg);
+    const displayW = w > 0 ? Math.min(w, contentW) : contentW;
+    const scale = w > 0 ? displayW / w : 1;
+    el.style.width = displayW + 'px';
+    el.style.height = h > 0 ? h * scale + 'px' : '';
+    el.style.maxHeight = '80vh';
+    el.style.overflow = 'auto';
+  }
+
+  /** Fill `el` with today's geometry-SVG fallback, sized to the reserved
+   *  `cols x rows` cell — used when real Mermaid is unavailable/erroring, has
+   *  no `source` for this box, or while its render is still in flight. A
+   *  diagram with zero laid-out nodes (the geometry builder found nothing to
+   *  draw) leaves `el` empty, deferring entirely to the label-box text
+   *  fallback already painted underneath by render_with_images's `text_box`. */
+  function fallbackInto(el, mb) {
+    el.style.maxHeight = '';
+    el.style.overflow = '';
+    if (mb.geo && mb.geo.nodes && mb.geo.nodes.length > 0) {
+      el.innerHTML = buildMermaidSvg(mb.geo);
+      el.style.width = mb.cols * metrics.charW + 'px';
+      el.style.height = mb.rows * metrics.lineH + 'px';
+    } else {
+      el.innerHTML = '';
+      el.style.width = '0px';
+      el.style.height = '0px';
+    }
+  }
+
+  /** Overlay each mermaid diagram over its reserved grid box (same col/row ->
+   *  px math paintImages() uses: PAD_L/PAD_T + metrics). Prefers a REAL
+   *  mermaid.js render of `mb.source` (Task 3 of the mermaid-live-render
+   *  plan); falls back to `buildMermaidSvg(mb.geo)` — today's geometry-mirror
+   *  SVG — whenever mermaid isn't available, the box has no `source`, or the
+   *  real render rejects. Render is async (`MERMAID.render` returns a
+   *  Promise), so a box's element is appended up front holding the fallback
+   *  as an interim, then swapped in place for the real svg on resolve — see
+   *  mmdVersion/mmdCache above for the staleness guard and the render cache. */
   function paintMermaid() {
     for (const el of mmdEls) el.remove();
     mmdEls = [];
+    const myVersion = ++mmdVersion;
     for (const mb of lastView.mermaid || []) {
-      if (!mb.geo || !mb.geo.nodes || mb.geo.nodes.length === 0) continue;
       const left = PAD_L + mb.col * metrics.charW;
       const top = PAD_T + mb.row * metrics.lineH;
-      const w = mb.cols * metrics.charW;
-      const h = mb.rows * metrics.lineH;
+      const contentW = Math.max(200, docEl.clientWidth - left - PAD_L);
       const el = document.createElement('div');
       el.className = 'docimg'; // reuses the image overlay's position:absolute
                                 // + pointer-events:none rule — no new CSS needed.
-      el.innerHTML = buildMermaidSvg(mb.geo);
       el.style.left = left + 'px';
       el.style.top = top + 'px';
-      el.style.width = w + 'px';
-      el.style.height = h + 'px';
       docEl.appendChild(el);
       mmdEls.push(el);
+
+      if (!MERMAID || !mb.source) {
+        fallbackInto(el, mb);
+        continue;
+      }
+      const cached = mmdCache.get(mb.source);
+      if (cached) {
+        paintMermaidSvgInto(el, cached, contentW);
+        continue;
+      }
+      fallbackInto(el, mb); // interim, while the real render is in flight
+      const id = 'mmd-' + ++mmdRenderSeq;
+      MERMAID.render(id, mb.source)
+        .then(({ svg }) => {
+          if (myVersion !== mmdVersion) return; // a newer paint superseded this one
+          mmdCache.set(mb.source, svg);
+          paintMermaidSvgInto(el, svg, contentW);
+        })
+        .catch(() => {
+          // el already holds fallbackInto()'s interim result above — a
+          // broken/unsupported diagram source just keeps showing that
+          // (or nothing, if there was no geometry either), never blank/crash.
+        });
     }
   }
 
