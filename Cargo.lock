@@ -2090,6 +2090,7 @@ dependencies = [
 name = "yppxy"
 version = "0.1.0"
 dependencies = [
+ "backstagecore",
  "ctlcore",
  "mppread",
  "projcore",

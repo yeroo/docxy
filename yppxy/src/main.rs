@@ -23,7 +23,10 @@ mod mcp;
 mod ribbon;
 mod skill;
 
-use backstage::{Backstage, Item, Pane};
+use backstage::Backstage;
+// Brings `extensions()`/`default_save_name()`/`accent()` etc. into scope
+// for the `impl backstage::BackstageHost for App` call site below.
+use backstage::BackstageHost as _;
 use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
@@ -408,7 +411,11 @@ struct App {
     rfocus: ribbon::Focus,
     backstage: Option<Backstage>,
     light: bool,
-    start: bool,
+    /// When launched with no file, a welcome/start screen overlays everything
+    /// until the user picks New/Open/Quit.
+    start_screen: bool,
+    /// The shared centered start card (item list, selection, click rects).
+    start: backstage::Start,
     // undo/redo, find, vim
     undo: Vec<Project>,
     redo: Vec<Project>,
@@ -418,19 +425,16 @@ struct App {
     leveled: bool,
     level: Option<Leveled>,
     // geometry recorded during draw for mouse hit-testing
-    list_y0: u16,       // absolute y of the first task row
-    list_left_w: u16,   // width of the task pane (left of the gantt)
-    gantt_x0: u16,      // absolute x where the gantt inner area begins
-    bs_menu: Rect,      // backstage menu items (one per row)
-    bs_list: Rect,      // backstage browser file list (row 0 = header)
-    bs_list_top: usize, // first entry index visible in bs_list
+    list_y0: u16,     // absolute y of the first task row
+    list_left_w: u16, // width of the task pane (left of the gantt)
+    gantt_x0: u16,    // absolute x where the gantt inner area begins
 }
 
 const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, titles, border)
 
 impl App {
     fn new(proj: Project, path: Option<String>, vim: bool) -> App {
-        let start = path.is_none();
+        let start_screen = path.is_none();
         let mut app = App {
             proj,
             path,
@@ -447,13 +451,28 @@ impl App {
             rfocus: ribbon::Focus::None,
             backstage: None,
             light: load_theme_pref(),
-            start,
+            start_screen,
+            start: backstage::Start::new(
+                "yppxy",
+                vec![
+                    backstage::StartItem {
+                        label: "New schedule".to_string(),
+                        desc: Some("Start a fresh blank schedule".to_string()),
+                    },
+                    backstage::StartItem {
+                        label: "Open a project…".to_string(),
+                        desc: Some("Browse for .xml · .yppx · .mpp".to_string()),
+                    },
+                    backstage::StartItem {
+                        label: "Quit".to_string(),
+                        desc: Some("Exit yppxy".to_string()),
+                    },
+                ],
+                Color::Yellow,
+            ),
             list_y0: 0,
             list_left_w: 0,
             gantt_x0: 0,
-            bs_menu: Rect::default(),
-            bs_list: Rect::default(),
-            bs_list_top: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             find_query: String::new(),
@@ -508,8 +527,19 @@ impl App {
             .filter(|d| !d.as_os_str().is_empty())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.backstage = Some(Backstage::open(dir));
+        self.backstage = Some(Backstage::open(dir, self.extensions()));
         self.rfocus = ribbon::Focus::None;
+    }
+
+    /// Act on a chosen welcome-screen item. Returns true to quit.
+    fn start_choose(&mut self, idx: usize) -> bool {
+        self.start_screen = false;
+        match idx {
+            0 => self.new_schedule(),
+            1 => self.open_backstage(),
+            _ => return true, // Quit
+        }
+        false
     }
 
     fn toggle_milestone(&mut self) {
@@ -996,7 +1026,7 @@ impl App {
                 self.top = 0;
                 self.hscroll = 0;
                 self.backstage = None;
-                self.start = false;
+                self.start_screen = false;
                 self.reschedule();
                 let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
                 self.status = if is_mpp && !self.proj.tasks.is_empty() {
@@ -1014,93 +1044,99 @@ impl App {
         }
     }
 
-    /// Refresh the backstage preview for the highlighted browser file.
-    fn bs_update_preview(&mut self) {
-        let Some(path) = self.backstage.as_ref().and_then(|b| b.selected_file()) else {
-            if let Some(b) = self.backstage.as_mut() {
-                b.preview.clear();
-                b.preview_path = None;
-            }
-            return;
-        };
-        let already = self
-            .backstage
-            .as_ref()
-            .map(|b| b.preview_path.as_deref() == Some(path.as_path()))
-            .unwrap_or(false);
-        if already {
-            return;
-        }
-        let lines = match load(&path.to_string_lossy()) {
-            Ok(p) => {
-                let s = schedule(&p);
-                project_preview(&p, &s)
-            }
-            Err(e) => vec![format!("(cannot preview: {e})")],
-        };
-        if let Some(b) = self.backstage.as_mut() {
-            b.preview = lines;
-            b.preview_path = Some(path);
-            b.preview_scroll = 0;
-        }
+    /// Start a fresh blank schedule (one task), discarding any current file
+    /// binding. Shared by the File ▸ New backstage item and the welcome
+    /// screen's "New schedule" choice.
+    fn new_schedule(&mut self) {
+        self.proj = new_project();
+        self.path = None;
+        self.dirty = false;
+        self.sel = 0;
+        self.top = 0;
+        self.hscroll = 0;
+        self.reschedule();
+        self.status = "New schedule".into();
     }
 
-    /// Activate the highlighted backstage menu item.
-    fn bs_activate_item(&mut self) {
-        let Some(item) = self.backstage.as_ref().map(|b| b.item) else {
-            return;
-        };
-        match item {
-            Item::New => {
-                self.proj = new_project();
-                self.path = None;
-                self.dirty = false;
-                self.sel = 0;
-                self.top = 0;
-                self.hscroll = 0;
+    /// Act on a [`backstage::BackstageEvent`] returned by the backstage's own
+    /// `key`/`mouse` handlers. Shared by `backstage_key` and `bs_mouse`.
+    fn apply_backstage_event(&mut self, ev: backstage::BackstageEvent) {
+        use backstage::BackstageEvent;
+        match ev {
+            BackstageEvent::None => {}
+            BackstageEvent::Close => self.backstage = None,
+            BackstageEvent::New => {
+                self.new_schedule();
                 self.backstage = None;
-                self.reschedule();
-                self.status = "New schedule".into();
             }
-            Item::Open => {
-                if let Some(b) = self.backstage.as_mut() {
-                    b.pane = Pane::Browser;
-                }
-                self.bs_update_preview();
-            }
-            Item::Info => {
-                let lines = project_preview(&self.proj, &self.sched);
-                if let Some(b) = self.backstage.as_mut() {
-                    b.preview = lines;
-                    b.preview_path = None;
-                    b.pane = Pane::Preview;
-                }
-            }
-            Item::Save => {
+            BackstageEvent::Open(p) => self.open_file(&p.to_string_lossy()),
+            BackstageEvent::Save => {
                 self.backstage = None;
                 self.save();
             }
-            Item::SaveAs => {
-                let cur = self
-                    .path
-                    .as_deref()
-                    .and_then(|p| {
-                        std::path::Path::new(p)
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_default();
-                if let Some(b) = self.backstage.as_mut() {
-                    b.name_input = cur;
-                    b.pane = Pane::SaveAs;
-                }
-            }
-            Item::Export => {
+            BackstageEvent::SaveAs { dir, name } => self.commit_save_as(dir, name),
+            BackstageEvent::Export => {
                 self.backstage = None;
                 self.export_md();
             }
-            Item::Exit => self.quit = true,
+            BackstageEvent::Exit => self.quit = true,
         }
+    }
+
+    /// Route a key to the backstage.
+    fn backstage_key(&mut self, key: KeyEvent) {
+        let mut bs = self.backstage.take();
+        let ev = bs
+            .as_mut()
+            .map(|b| b.key(key, self))
+            .unwrap_or(backstage::BackstageEvent::None);
+        self.backstage = bs;
+        self.apply_backstage_event(ev);
+    }
+
+    /// Route a left-click inside the File backstage. Row 0 is the ribbon tab
+    /// strip (drawn over the backstage) and is handled here directly; every
+    /// other row is delegated to `backstage::Backstage::mouse`.
+    fn bs_mouse(&mut self, x: u16, y: u16) {
+        if y == 0 {
+            match self.ribbon.hit(x, 0, false) {
+                ribbon::Hit::Tab(i) if !self.ribbon.tab_is_file(i) => {
+                    self.backstage = None;
+                    self.ribbon.set_active(i);
+                    self.rfocus = ribbon::Focus::Tab(i);
+                }
+                _ => self.backstage = None,
+            }
+            return;
+        }
+        let mut bs = self.backstage.take();
+        let ev = bs
+            .as_mut()
+            .map(|b| b.mouse(x, y, self))
+            .unwrap_or(backstage::BackstageEvent::None);
+        self.backstage = bs;
+        self.apply_backstage_event(ev);
+    }
+
+    /// Write the project to `dir/name` (defaulting to `.yppx` when the typed
+    /// name carries no known project extension), then make it the current
+    /// file and close the backstage.
+    fn commit_save_as(&mut self, dir: std::path::PathBuf, name: String) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "Save As — type a file name first.".to_string();
+            return;
+        }
+        let lower = name.to_ascii_lowercase();
+        let known = [".yppx", ".xml", ".mpp"];
+        let fname = if known.iter().any(|e| lower.ends_with(e)) {
+            name.to_string()
+        } else {
+            format!("{name}.yppx")
+        };
+        self.path = Some(dir.join(&fname).to_string_lossy().into_owned());
+        self.backstage = None;
+        self.save();
     }
 }
 
@@ -1146,6 +1182,46 @@ fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
         out.push(format!("  … {} more", proj.tasks.len() - 16));
     }
     out
+}
+
+/// Format-specific content the shared File backstage needs from yppxy: only
+/// project files are listed/opened, the Save As default is the current
+/// file's name, the preview/Info panes render a project summary, and the
+/// accent matches yppxy's ribbon (yellow).
+impl backstage::BackstageHost for App {
+    fn extensions(&self) -> &'static [&'static str] {
+        &["xml", "yppx", "mpp"]
+    }
+
+    fn default_save_name(&self) -> String {
+        self.path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled.yppx".to_string())
+    }
+
+    /// Render a quick summary of the highlighted project.
+    fn preview_lines(&self, path: &std::path::Path, _width: usize) -> Vec<String> {
+        match load(&path.to_string_lossy()) {
+            Ok(p) => {
+                let s = schedule(&p);
+                project_preview(&p, &s)
+            }
+            Err(e) => vec![format!("(cannot preview: {e})")],
+        }
+    }
+
+    fn info_lines(&self) -> Vec<Line<'static>> {
+        project_preview(&self.proj, &self.sched)
+            .into_iter()
+            .map(Line::from)
+            .collect()
+    }
+
+    fn accent(&self) -> Color {
+        Color::Yellow
+    }
 }
 
 fn empty_schedule() -> Schedule {
@@ -1276,11 +1352,37 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
-    if app.start {
-        return; // the start screen is keyboard-driven
+    // The welcome screen owns the whole terminal; handle its clicks here so
+    // nothing leaks to the hidden schedule behind it. Hovering highlights an
+    // item, clicking activates it.
+    if app.start_screen {
+        let ev = app.start.mouse(m.column, m.row);
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let backstage::StartEvent::Choose(i) = ev {
+                if app.start_choose(i) {
+                    app.quit = true;
+                }
+            }
+        }
+        return;
     }
+    // The File backstage is a full-screen surface: it owns the mouse while
+    // open, so clicks/scroll never leak through to the schedule underneath.
     if app.backstage.is_some() {
-        bs_mouse(app, m); // don't let clicks/scroll leak to the editor behind
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => app.bs_mouse(m.column, m.row),
+            MouseEventKind::ScrollDown => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.scroll_preview(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(b) = app.backstage.as_mut() {
+                    b.scroll_preview(-3);
+                }
+            }
+            _ => {}
+        }
         return;
     }
     let (x, y) = (m.column, m.row);
@@ -1331,69 +1433,6 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Mouse inside the File backstage: click a menu item to run it, click a
-/// browser row to highlight it (click it again to open), wheel to move the
-/// browser selection.
-fn bs_mouse(app: &mut App, m: MouseEvent) {
-    let (x, y) = (m.column, m.row);
-    let inside = |r: Rect| -> bool {
-        r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-    };
-    match m.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if inside(app.bs_menu) {
-                let idx = (y - app.bs_menu.y) as usize;
-                if let Some(&it) = backstage::ITEMS.get(idx) {
-                    if let Some(b) = app.backstage.as_mut() {
-                        b.item = it;
-                        b.pane = Pane::Menu;
-                    }
-                    app.bs_activate_item(); // same as highlighting it and pressing Enter
-                }
-                return;
-            }
-            if inside(app.bs_list) && y > app.bs_list.y {
-                // Row 0 is the "Open — <dir>" header; entries start below it.
-                let idx = app.bs_list_top + (y - app.bs_list.y - 1) as usize;
-                let Some((valid, same)) = app.backstage.as_ref().map(|b| {
-                    (
-                        idx < b.entries.len(),
-                        idx == b.sel && b.pane == Pane::Browser,
-                    )
-                }) else {
-                    return;
-                };
-                if !valid {
-                    return;
-                }
-                if let Some(b) = app.backstage.as_mut() {
-                    b.pane = Pane::Browser;
-                    b.sel = idx;
-                }
-                if same {
-                    // Second click on the highlighted row activates it.
-                    let opened = app.backstage.as_mut().and_then(|b| b.enter());
-                    match opened {
-                        Some(path) => app.open_file(&path.to_string_lossy()),
-                        None => app.bs_update_preview(),
-                    }
-                } else {
-                    app.bs_update_preview();
-                }
-            }
-        }
-        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(app.bs_list) => {
-            let down = matches!(m.kind, MouseEventKind::ScrollDown);
-            if let Some(b) = app.backstage.as_mut() {
-                b.pane = Pane::Browser;
-                b.move_sel(down);
-            }
-            app.bs_update_preview();
-        }
-        _ => {}
-    }
-}
-
 fn on_key(app: &mut App, k: KeyEvent) {
     // Prompt mode swallows keys until Enter/Esc.
     if let Some(mut prompt) = app.prompt.take() {
@@ -1431,12 +1470,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 
     // Modal surfaces take keys before the editor.
-    if app.start {
+    if app.start_screen {
         start_key(app, k);
         return;
     }
     if app.backstage.is_some() {
-        backstage_key(app, k);
+        app.backstage_key(k);
         return;
     }
     if app.rfocus != ribbon::Focus::None {
@@ -1565,14 +1604,17 @@ fn on_key(app: &mut App, k: KeyEvent) {
 
 // ---- start screen, ribbon, backstage key handling ---------------------------
 
+/// Route a key on the welcome screen. Up/Down/Tab move the highlight, a
+/// number key or Enter picks it, Esc/`q` quits.
 fn start_key(app: &mut App, k: KeyEvent) {
-    match k.code {
-        KeyCode::Char('o') | KeyCode::Char('O') => {
-            app.start = false;
-            app.open_backstage();
+    match app.start.key(k) {
+        backstage::StartEvent::Choose(i) => {
+            if app.start_choose(i) {
+                app.quit = true;
+            }
         }
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => app.quit = true,
-        _ => app.start = false, // Enter / N / any other key: start editing
+        backstage::StartEvent::Quit => app.quit = true,
+        backstage::StartEvent::None => {}
     }
 }
 
@@ -1616,116 +1658,41 @@ fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
     app.rfocus = nf;
 }
 
-fn backstage_key(app: &mut App, k: KeyEvent) {
-    // Read pane/item without holding a borrow across app-method calls.
-    let Some((pane, item)) = app.backstage.as_ref().map(|b| (b.pane, b.item)) else {
-        return;
-    };
-    match pane {
-        Pane::SaveAs => match k.code {
-            KeyCode::Esc => set_pane(app, Pane::Menu),
-            KeyCode::Enter => {
-                let name = app
-                    .backstage
-                    .as_ref()
-                    .map(|b| b.name_input.trim().to_string())
-                    .unwrap_or_default();
-                if !name.is_empty() {
-                    let dir = app.backstage.as_ref().map(|b| b.dir.clone());
-                    if let Some(dir) = dir {
-                        app.path = Some(dir.join(&name).to_string_lossy().into_owned());
-                        app.backstage = None;
-                        app.save();
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(b) = app.backstage.as_mut() {
-                    b.name_input.pop();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(b) = app.backstage.as_mut() {
-                    b.name_input.push(c);
-                }
-            }
-            _ => {}
-        },
-        Pane::Browser => match k.code {
-            KeyCode::Esc | KeyCode::Left => set_pane(app, Pane::Menu),
-            KeyCode::Up => {
-                if let Some(b) = app.backstage.as_mut() {
-                    b.move_sel(false);
-                }
-                app.bs_update_preview();
-            }
-            KeyCode::Down => {
-                if let Some(b) = app.backstage.as_mut() {
-                    b.move_sel(true);
-                }
-                app.bs_update_preview();
-            }
-            KeyCode::Backspace => {
-                if let Some(b) = app.backstage.as_mut() {
-                    b.go_up();
-                }
-                app.bs_update_preview();
-            }
-            KeyCode::Enter => {
-                let opened = app.backstage.as_mut().and_then(|b| b.enter());
-                match opened {
-                    Some(path) => app.open_file(&path.to_string_lossy()),
-                    None => app.bs_update_preview(),
-                }
-            }
-            _ => {}
-        },
-        Pane::Menu | Pane::Preview => match k.code {
-            KeyCode::Esc => app.backstage = None, // back to the schedule
-            KeyCode::Up => {
-                if let Some(b) = app.backstage.as_mut() {
-                    let i = backstage::ITEMS
-                        .iter()
-                        .position(|&x| x == b.item)
-                        .unwrap_or(0);
-                    b.item = backstage::ITEMS[i.saturating_sub(1)];
-                }
-            }
-            KeyCode::Down => {
-                if let Some(b) = app.backstage.as_mut() {
-                    let i = backstage::ITEMS
-                        .iter()
-                        .position(|&x| x == b.item)
-                        .unwrap_or(0);
-                    b.item = backstage::ITEMS[(i + 1).min(backstage::ITEMS.len() - 1)];
-                }
-            }
-            KeyCode::Right if item == Item::Open => {
-                set_pane(app, Pane::Browser);
-                app.bs_update_preview();
-            }
-            KeyCode::Enter => app.bs_activate_item(),
-            _ => {}
-        },
-    }
-}
-
-fn set_pane(app: &mut App, pane: Pane) {
-    if let Some(b) = app.backstage.as_mut() {
-        b.pane = pane;
-    }
-}
-
 // ---- drawing ----------------------------------------------------------------
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    if app.start {
-        draw_start(f, area);
+    // The welcome screen overlays everything when launched with no file.
+    if app.start_screen {
+        f.render_widget(Clear, area);
+        app.start.draw(f, area);
         return;
     }
+    // The File backstage takes over the whole screen.
     if app.backstage.is_some() {
-        draw_backstage(f, area, app);
+        // `backstagecore::draw` clears the full frame and renders the menu +
+        // content below row 0 — draw it first, then paint the ribbon tab
+        // strip (File highlighted) over row 0 last so it isn't wiped out.
+        let mut bs = app.backstage.take();
+        if let Some(b) = bs.as_mut() {
+            backstage::draw(f, area, b, app);
+        }
+        app.backstage = bs;
+        // Keep the ribbon tab headers visible: clicking another tab leaves
+        // the backstage, and clicking File closes it back to the schedule —
+        // so the panel can be dismissed entirely with the mouse.
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let mut tabline = app.ribbon.render_tabs_as(0); // 0 = File
+        tabline
+            .spans
+            .push(Span::styled("   (click a tab or Esc to leave)", dim));
+        let row0 = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(tabline), row0);
         if app.prompt.is_some() {
             draw_prompt(f, area, app);
         }
@@ -1760,190 +1727,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.prompt.is_some() {
         draw_prompt(f, area, app);
     }
-}
-
-fn draw_start(f: &mut Frame, area: Rect) {
-    f.render_widget(Clear, area);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled("   yppxy", bold)),
-        Line::from(Span::styled(
-            "   terminal project scheduler — Critical Path Method + live Gantt",
-            dim,
-        )),
-        Line::from(""),
-        Line::from("   [N] or Enter    New schedule"),
-        Line::from("   [O]             Open a project  (.xml · .yppx · .mpp)"),
-        Line::from("   [Q] or Esc      Quit"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "   Tip: press F9 for the ribbon, Alt+F for the File menu.",
-            dim,
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Welcome ")),
-        area,
-    );
-}
-
-fn draw_backstage(f: &mut Frame, area: Rect, app: &mut App) {
-    // Geometry for mouse hit-testing: reset each frame, filled in below.
-    app.bs_menu = Rect::default();
-    app.bs_list = Rect::default();
-    app.bs_list_top = 0;
-    let Some(bs) = app.backstage.as_ref() else {
-        return;
-    };
-    f.render_widget(Clear, area);
-    let outer = Block::default().borders(Borders::ALL).title(" File ");
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Min(20)])
-        .split(inner);
-
-    // Left: the vertical menu.
-    let mut menu: Vec<Line> = Vec::new();
-    for &it in backstage::ITEMS.iter() {
-        let selected = it == bs.item;
-        let style = if selected {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        menu.push(Line::from(Span::styled(format!(" {} ", it.label()), style)));
-    }
-    f.render_widget(Paragraph::new(menu), cols[0]);
-    let menu_rect = Rect {
-        height: cols[0].height.min(backstage::ITEMS.len() as u16),
-        ..cols[0]
-    };
-
-    // Right: content depends on the pane / item.
-    let body = cols[1];
-    let mut browser_geom: Option<(Rect, usize)> = None;
-    match bs.pane {
-        Pane::Browser => browser_geom = Some(draw_bs_browser(f, body, bs)),
-        Pane::SaveAs => {
-            let dir = bs.dir.to_string_lossy();
-            let lines = vec![
-                Line::from(Span::styled(
-                    "Save As",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(format!("Folder: {dir}")),
-                Line::from(vec![
-                    Span::raw("Name:   "),
-                    Span::raw(bs.name_input.clone()),
-                    Span::styled("▏", Style::default().fg(Color::Gray)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Use .yppx (native) or .xml (MSPDI). Enter saves · Esc back",
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
-            ];
-            f.render_widget(Paragraph::new(lines), body);
-        }
-        Pane::Menu | Pane::Preview => {
-            if bs.item == Item::Open {
-                browser_geom = Some(draw_bs_browser(f, body, bs));
-            } else if bs.item == Item::Info || bs.pane == Pane::Preview {
-                let lines: Vec<Line> = bs.preview.iter().map(|s| Line::from(s.clone())).collect();
-                f.render_widget(Paragraph::new(lines), body);
-            } else {
-                let hint = match bs.item {
-                    Item::New => "Start a fresh schedule.",
-                    Item::Save => "Save to the current file.",
-                    Item::SaveAs => "Save under a new name.",
-                    Item::Export => "Export a Markdown/Mermaid Gantt chart.",
-                    Item::Exit => "Leave yppxy.",
-                    _ => "",
-                };
-                f.render_widget(
-                    Paragraph::new(vec![
-                        Line::from(Span::styled(
-                            bs.item.label(),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(""),
-                        Line::from(hint),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Enter to apply · Esc to close",
-                            Style::default().add_modifier(Modifier::DIM),
-                        )),
-                    ]),
-                    body,
-                );
-            }
-        }
-    }
-    app.bs_menu = menu_rect;
-    if let Some((list, top)) = browser_geom {
-        app.bs_list = list;
-        app.bs_list_top = top;
-    }
-}
-
-/// Returns the file-list rect and the index of its first visible entry, for
-/// mouse hit-testing.
-fn draw_bs_browser(f: &mut Frame, area: Rect, bs: &Backstage) -> (Rect, usize) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let focused = bs.pane == Pane::Browser;
-
-    // File list.
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        format!("Open — {}", bs.dir.to_string_lossy()),
-        Style::default().add_modifier(Modifier::DIM),
-    ))];
-    let h = cols[0].height.saturating_sub(1) as usize;
-    let start = bs.sel.saturating_sub(h.saturating_sub(1));
-    for (i, e) in bs.entries.iter().enumerate().skip(start).take(h) {
-        let icon = if e.is_parent {
-            "⬑ "
-        } else if e.is_dir {
-            "▸ "
-        } else {
-            "  "
-        };
-        let size = e.size_str();
-        let label = format!("{icon}{}", e.name);
-        let text = if size.is_empty() {
-            label
-        } else {
-            format!("{label:<28} {size:>8}")
-        };
-        let mut line = Line::from(text);
-        if i == bs.sel && focused {
-            line.style = Style::default().add_modifier(Modifier::REVERSED);
-        } else if e.locked {
-            line.style = Style::default().add_modifier(Modifier::DIM);
-        }
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), cols[0]);
-
-    // Preview of the highlighted project.
-    let mut prev: Vec<Line> = vec![Line::from(Span::styled(
-        "Preview",
-        Style::default().add_modifier(Modifier::DIM),
-    ))];
-    prev.extend(bs.preview.iter().map(|s| Line::from(s.clone())));
-    f.render_widget(
-        Paragraph::new(prev).block(Block::default().borders(Borders::LEFT)),
-        cols[1],
-    );
-    (cols[0], start)
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -2451,15 +2234,15 @@ mod tests {
     fn backstage_and_start_render() {
         // start screen
         let mut app = App::new(new_project(), None, false);
-        assert!(app.start);
+        assert!(app.start_screen);
         let s = buffer_text(&mut app, 100, 22);
-        assert!(s.contains("Welcome") && s.contains("New schedule"));
+        assert!(s.contains("yppxy") && s.contains("New schedule"));
 
         // backstage
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.open_backstage();
         let s = buffer_text(&mut app, 100, 22);
-        assert!(s.contains("File") && s.contains("Open") && s.contains("Export Gantt"));
+        assert!(s.contains("File") && s.contains("Open") && s.contains("Export"));
     }
 
     #[test]
