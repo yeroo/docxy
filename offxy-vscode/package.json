@@ -200,6 +200,7 @@
     "test:md-roundtrip": "node media/markdown-roundtrip.test.mjs",
     "test:mermaid-svg": "node media/mermaid-svg.test.mjs",
     "test:mermaid-live": "node media/mermaid-live.test.mjs",
+    "test:mermaid-render": "node media/mermaid-render.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

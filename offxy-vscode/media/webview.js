@@ -493,6 +493,21 @@ function buildSequenceSvg(geo) {
     el.style.height = h > 0 ? h * scale + 'px' : '';
     el.style.maxHeight = '80vh';
     el.style.overflow = 'auto';
+    // Mermaid v10 (initialized with useMaxWidth:false, see MERMAID.initialize
+    // above) emits the <svg> itself with literal px width/height attributes
+    // sized to its own natural layout — the container div's CSS width/height
+    // (just set above) has no effect on those attributes, so a diagram wider
+    // than contentW would overflow the container with BOTH a horizontal AND a
+    // vertical scrollbar instead of fitting to width. Rescale the actual
+    // injected <svg> node (not just its container) whenever it's wider than
+    // contentW; a diagram that already fits keeps its natural size untouched.
+    if (w > contentW) {
+      const s = el.querySelector('svg');
+      if (s) {
+        s.setAttribute('width', String(displayW));
+        s.setAttribute('height', String(Math.round(h * scale)));
+      }
+    }
   }
 
   /** Fill `el` with today's geometry-SVG fallback, sized to the reserved
@@ -513,6 +528,21 @@ function buildSequenceSvg(geo) {
       el.style.width = '0px';
       el.style.height = '0px';
     }
+  }
+
+  /** `MERMAID.render(id, source)` (v10) creates its own temporary sandbox
+   *  element — `<div id="d"+id>` — appended straight to `document.body` while
+   *  it measures text, and on a REJECTED render (unsupported/garbage source)
+   *  leaves that div (holding mermaid's own "error" svg) attached permanently
+   *  instead of cleaning it up itself. Called after EVERY render attempt,
+   *  resolved or rejected, so neither path leaks a body child. Also tries the
+   *  id with no `d` prefix, defensively, in case a mermaid version/config ever
+   *  names the sandbox element differently. */
+  function removeMermaidStray(id) {
+    const withPrefix = document.getElementById('d' + id);
+    if (withPrefix) withPrefix.remove();
+    const bare = document.getElementById(id);
+    if (bare) bare.remove();
   }
 
   /** Overlay each mermaid diagram over its reserved grid box (same col/row ->
@@ -544,23 +574,38 @@ function buildSequenceSvg(geo) {
         fallbackInto(el, mb);
         continue;
       }
-      const cached = mmdCache.get(mb.source);
-      if (cached) {
-        paintMermaidSvgInto(el, cached, contentW);
+      // `mmdCache.has()` — not just a truthy check on the value — because a
+      // previously-FAILED source is cached too, as the `null` sentinel (see
+      // the `.catch()` below): a plain `if (cached)` would read that `null`
+      // as "not cached" and re-invoke MERMAID.render() on the same known-bad
+      // source on every single paint (every keystroke), leaking another
+      // stray document.body div each time.
+      if (mmdCache.has(mb.source)) {
+        const cached = mmdCache.get(mb.source);
+        if (cached === null) {
+          fallbackInto(el, mb); // known-bad source: skip re-render entirely
+        } else {
+          paintMermaidSvgInto(el, cached, contentW);
+        }
         continue;
       }
       fallbackInto(el, mb); // interim, while the real render is in flight
       const id = 'mmd-' + ++mmdRenderSeq;
       MERMAID.render(id, mb.source)
         .then(({ svg }) => {
+          removeMermaidStray(id);
           if (myVersion !== mmdVersion) return; // a newer paint superseded this one
           mmdCache.set(mb.source, svg);
           paintMermaidSvgInto(el, svg, contentW);
         })
         .catch(() => {
-          // el already holds fallbackInto()'s interim result above — a
-          // broken/unsupported diagram source just keeps showing that
-          // (or nothing, if there was no geometry either), never blank/crash.
+          removeMermaidStray(id);
+          // Cache the failure (the `null` sentinel, distinct from a real svg
+          // string) so this source is never handed to MERMAID.render() again
+          // — el already holds fallbackInto()'s interim result above, and
+          // future paints of the same source take the `cached === null`
+          // branch straight to that same fallback.
+          mmdCache.set(mb.source, null);
         });
     }
   }
@@ -1021,7 +1066,25 @@ function buildSequenceSvg(geo) {
     window.addEventListener('resize', onResize);
     vscode.postMessage({ type: 'ready' });
   }
-  boot().catch((err) => {
-    docEl.textContent = 'Docxy failed to start: ' + (err && err.message ? err.message : err);
-  });
+  // ---- test-only hooks (Node/jsdom, e.g. mermaid-render.test.mjs) ----------
+  // A real VS Code webview never sets `window.__OFFXY_TEST__`, so this whole
+  // branch is dead there — it exists purely so a jsdom test can drive
+  // `paintMermaid()`/`paintMermaidSvgInto()` directly and inspect their
+  // DOM-leak / failure-cache / sizing behavior, without this file needing an
+  // export statement (mirrors how `buildMermaidSvg` above is reached, just
+  // for state that — unlike that function — lives inside this IIFE's
+  // closure). Skipping `boot()` in that mode too: it fetches a real wasm
+  // binary and would only reject noisily against a test that never supplies
+  // `window.__OFFXY__.wasmUri`, with no bearing on what's under test.
+  if (typeof window !== 'undefined' && window.__OFFXY_TEST__) {
+    window.__OFFXY_TEST__.paintMermaid = paintMermaid;
+    window.__OFFXY_TEST__.paintMermaidSvgInto = paintMermaidSvgInto;
+    window.__OFFXY_TEST__.mmdCache = mmdCache;
+    window.__OFFXY_TEST__.setLastView = (v) => { lastView = v; };
+    window.__OFFXY_TEST__.setMetrics = (m) => { metrics = m; };
+  } else {
+    boot().catch((err) => {
+      docEl.textContent = 'Docxy failed to start: ' + (err && err.message ? err.message : err);
+    });
+  }
 })();
