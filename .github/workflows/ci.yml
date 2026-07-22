@@ -94,7 +94,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       - name: Build and test the plugin
         working-directory: offxy-jetbrains
         # buildWasm (a Gradle task) runs the cargo wasm build; `build` runs
