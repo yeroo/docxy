@@ -42,6 +42,18 @@ const MMD_FONT_TITLE = 115000; // subgraph title size
 const MMD_FONT_EDGE = 110000; // edge label size
 const MMD_ARROW = 140000; // arrowhead marker box side, in EMU (userSpaceOnUse)
 
+// Sequence-diagram palette — mirrors docxcore's `mermaid_seq.rs` constants
+// (`PART_FILL`/`PART_STROKE`, `FRAME_FILL`/`FRAME_STROKE`,
+// `NOTE_FILL`/`NOTE_STROKE`, `LINE_STROKE`) exactly, so the webview overlay
+// and the Word DrawingML shapes it mirrors read as the same picture.
+const SEQ_PART_FILL = '#DAE8FC';
+const SEQ_PART_STROKE = '#6C8EBF';
+const SEQ_FRAME_FILL = '#F5F5F5';
+const SEQ_FRAME_STROKE = '#999999';
+const SEQ_NOTE_FILL = '#FFF6D5';
+const SEQ_NOTE_STROKE = '#AAAA33';
+const SEQ_LINE_STROKE = '#333333';
+
 function escMermaidText(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -56,6 +68,7 @@ function escMermaidText(s) {
  *  then edge labels (drawn last so they sit legibly on top of any edge line
  *  crossing under them). */
 function buildMermaidSvg(geo) {
+  if (geo.kind === 'sequence') return buildSequenceSvg(geo);
   const canvasW = geo.canvasW || 0;
   const canvasH = geo.canvasH || 0;
   const parts = [];
@@ -148,6 +161,120 @@ function buildMermaidSvg(geo) {
       `<text x="${mid[0]}" y="${mid[1]}" text-anchor="middle" dominant-baseline="middle" ` +
         `font-size="${MMD_FONT_EDGE}" fill="#333333">${escMermaidText(e.label)}</text>`
     );
+  }
+
+  parts.push('</svg>');
+  return parts.join('');
+}
+
+/** geo: `SequenceGeometry` JSON (`kind:"sequence"`, canvasW/canvasH,
+ *  participants[], lifelines[], messages[], frames[], notes[]) -> a
+ *  self-contained `<svg>...</svg>` string. Draws the SAME geometry
+ *  docxcore's `mermaid_seq.rs` turns into DrawingML shapes for Word — same
+ *  colors, same z-order (back to front, mirroring `to_drawing`): alt/else
+ *  frame bands + titles + else-dividers, then notes, then participant
+ *  header boxes, then lifelines, then messages + their labels. */
+function buildSequenceSvg(geo) {
+  const canvasW = geo.canvasW || 0;
+  const canvasH = geo.canvasH || 0;
+  const parts = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${canvasW} ${canvasH}" ` +
+      `width="100%" height="100%" preserveAspectRatio="xMidYMid meet">`
+  );
+  parts.push(
+    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" ' +
+      `markerWidth="${MMD_ARROW}" markerHeight="${MMD_ARROW}" markerUnits="userSpaceOnUse" ` +
+      'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#333333"/></marker></defs>'
+  );
+
+  // Frames first — the alt/else band sits behind everything else, with its
+  // title top-left and (when present) a dashed divider + "[else] ..." label
+  // at elseY.
+  for (const f of geo.frames || []) {
+    parts.push(
+      `<rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" ` +
+        `rx="${Math.min(f.w, f.h) * 0.03}" fill="${SEQ_FRAME_FILL}" ` +
+        `stroke="${SEQ_FRAME_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    if (f.label) {
+      parts.push(
+        `<text x="${f.x + MMD_FONT_TITLE * 0.3}" y="${f.y + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">${escMermaidText(f.label)}</text>`
+      );
+    }
+    if (f.elseY != null) {
+      parts.push(
+        `<line x1="${f.x}" y1="${f.elseY}" x2="${f.x + f.w}" y2="${f.elseY}" ` +
+          `stroke="${SEQ_FRAME_STROKE}" stroke-width="${MMD_STROKE}" stroke-dasharray="6 6"/>`
+      );
+      parts.push(
+        `<text x="${f.x + MMD_FONT_TITLE * 0.3}" y="${f.elseY + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">[else] ${escMermaidText(f.elseLabel)}</text>`
+      );
+    }
+  }
+
+  // Notes next — a distinctly-filled box, centered text.
+  for (const n of geo.notes || []) {
+    parts.push(
+      `<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" ` +
+        `fill="${SEQ_NOTE_FILL}" stroke="${SEQ_NOTE_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    parts.push(
+      `<text x="${n.x + n.w / 2}" y="${n.y + n.h / 2}" text-anchor="middle" ` +
+        `dominant-baseline="middle" font-size="${MMD_FONT_NODE}" fill="#333333">` +
+        `${escMermaidText(n.text)}</text>`
+    );
+  }
+
+  // Participant header boxes on top of the frame/note bands.
+  for (const p of geo.participants || []) {
+    parts.push(
+      `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" ` +
+        `fill="${SEQ_PART_FILL}" stroke="${SEQ_PART_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    parts.push(
+      `<text x="${p.x + p.w / 2}" y="${p.y + p.h / 2}" text-anchor="middle" ` +
+        `dominant-baseline="middle" font-size="${MMD_FONT_NODE}" fill="#000000">` +
+        `${escMermaidText(p.label)}</text>`
+    );
+  }
+
+  // Lifelines drop from each participant box; dashed, like Word's.
+  for (const l of geo.lifelines || []) {
+    parts.push(
+      `<line x1="${l.x}" y1="${l.y1}" x2="${l.x}" y2="${l.y2}" ` +
+        `stroke="${SEQ_LINE_STROKE}" stroke-width="${MMD_STROKE}" stroke-dasharray="6 6"/>`
+    );
+  }
+
+  // Messages last, on top: a straight arrow between lifelines, or — for a
+  // self-message — a small rectangular loop out and back to the same
+  // lifeline (mirrors `mermaid_seq.rs`'s `emit_message`). Its label sits
+  // just above the line/loop.
+  for (const m of geo.messages || []) {
+    const dash = m.dashed ? ' stroke-dasharray="6 6"' : '';
+    if (m.self) {
+      const pts = `${m.x1},${m.y1} ${m.x2},${m.y1} ${m.x2},${m.y2} ${m.x1},${m.y2}`;
+      parts.push(
+        `<polyline points="${pts}" fill="none" stroke="${SEQ_LINE_STROKE}" ` +
+          `stroke-width="${MMD_STROKE}"${dash} marker-end="url(#arrow)"/>`
+      );
+    } else {
+      parts.push(
+        `<line x1="${m.x1}" y1="${m.y1}" x2="${m.x2}" y2="${m.y2}" ` +
+          `stroke="${SEQ_LINE_STROKE}" stroke-width="${MMD_STROKE}"${dash} marker-end="url(#arrow)"/>`
+      );
+    }
+    if (m.text) {
+      const cx = (m.x1 + m.x2) / 2;
+      const cy = Math.min(m.y1, m.y2);
+      parts.push(
+        `<text x="${cx}" y="${cy - MMD_FONT_EDGE * 0.4}" text-anchor="middle" ` +
+          `font-size="${MMD_FONT_EDGE}" fill="#333333">${escMermaidText(m.text)}</text>`
+      );
+    }
   }
 
   parts.push('</svg>');
