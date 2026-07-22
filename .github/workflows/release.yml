@@ -30,7 +30,7 @@ jobs:
             ext: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux clipboard deps (arboard)
         if: runner.os == 'Linux'
@@ -102,7 +102,7 @@ jobs:
       contents: write # attach the .vsix to the release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -139,7 +139,7 @@ jobs:
       contents: write # attach the plugin zip to the release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -189,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') && !github.event.repository.fork
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux clipboard deps (arboard)
         run: |
