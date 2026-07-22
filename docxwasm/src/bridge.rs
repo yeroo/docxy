@@ -227,9 +227,11 @@ impl Session {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"row\":{},\"col\":{},\"cols\":{},\"rows\":{},\"geo\":{}}}",
+                "{{\"row\":{},\"col\":{},\"cols\":{},\"rows\":{},\"geo\":{},\"source\":",
                 mb.row, mb.col, mb.cols, mb.rows, mb.geometry_json
             ));
+            json::push_str(&mut out, &mb.source);
+            out.push('}');
         }
         out.push(']');
         // Editable column ranges per visual line ([c0, c1) — c1 is one past the
@@ -1473,6 +1475,23 @@ mod tests {
         let v = s.view_json(None);
         assert!(v.contains("\"mermaid\":["), "{v}");
         assert!(v.contains("\"kind\":\"sequence\""), "{v}");
+    }
+
+    #[test]
+    fn view_json_mermaid_carries_source() {
+        // Same markdown → docx path as `view_json_emits_mermaid_geometry`: the
+        // mermaid entry must also carry the raw source text (JSON-escaped) so
+        // the webview can hand it to mermaid.js for live rendering.
+        let bytes = markdown_to_docx("```mermaid\nflowchart TD\nA[Start]-->B[End]\n```\n");
+        let mut s = Session::open(&bytes).expect("open");
+        let v = s.view_json(None);
+        assert!(v.contains("\"mermaid\":["), "{v}");
+        assert!(v.contains("\"source\":\"flowchart TD"), "{v}");
+
+        // sequence source too
+        let bytes2 = markdown_to_docx("```mermaid\nsequenceDiagram\nA->>B: hi\n```\n");
+        let mut s2 = Session::open(&bytes2).expect("open");
+        assert!(s2.view_json(None).contains("\"source\":\"sequenceDiagram"));
     }
 
     #[test]
