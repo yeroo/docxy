@@ -122,8 +122,8 @@ struct Word {
 /// `width` columns wide (see the module doc comment for the wrapping
 /// caveat). Handles `<p> <br> <b>/<strong> <i>/<em> <u> <a href>
 /// <blockquote> <ul>/<ol>/<li> <table>/<tr>/<td>`; anything else is
-/// transparent. `<a href>` text becomes `text[n]`, with a `[n] url`
-/// footnote appendix appended after a blank line.
+/// transparent. `<a href>` text renders inline carrying its href on each
+/// span's `link` (no footnote markers or appendix).
 pub fn render_html(html: &str, width: usize) -> Vec<StyledLine> {
     let width = width.max(1);
     let mut tok = Tokenizer::new(html);

@@ -267,6 +267,10 @@ pub struct App {
     pub list_row0: u16,
     /// The reading pane's rect.
     pub reading_rect: Rect,
+    /// Navigable links in the currently-rendered body, recorded each frame by
+    /// `ui::reading::draw`, and which one (if any) is focused (`Ctrl+↑/↓`).
+    pub body_links: Vec<crate::ui::reading::BodyLink>,
+    pub focused_link: Option<usize>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_home`/`reading_scroll_end` against
@@ -531,6 +535,8 @@ impl App {
             list_rect: Rect::ZERO,
             list_row0: 0,
             reading_rect: Rect::ZERO,
+            body_links: Vec::new(),
+            focused_link: None,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -1525,6 +1531,10 @@ impl App {
     pub fn open_message(&mut self, id: &str) {
         self.selected_msg = Some(id.to_string());
         self.reading_scroll = 0;
+        // Links belong to the previous body; cleared until the next draw
+        // repopulates them for this message.
+        self.body_links.clear();
+        self.focused_link = None;
         // A new message is open — any previously cached/requested inline
         // images belonged to whatever was open before. Clear these BEFORE
         // reload_body(): a cache-hit body triggers request_inline_images()

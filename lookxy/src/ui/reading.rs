@@ -80,7 +80,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Build the owned layout (render_body returns Vec<StyledLine>, owned).
     let styled = render_body(app, body_area.width as usize);
-    let (lines, images) = body_layout(styled);
+    let (lines, images, links) = body_layout(styled);
+    app.body_links = links;
     let vh = body_area.height as usize;
     app.reading_content_rows = lines.len();
     app.reading_viewport = vh;
@@ -257,9 +258,10 @@ fn render_body(app: &App, width: usize) -> Vec<StyledLine> {
 /// this borrows nothing from `app`, so `app.reading_*` can be assigned right
 /// after building it — and an absolute-row image box can still be cropped
 /// correctly even when its top row is scrolled above the viewport.
-fn body_layout(styled: Vec<StyledLine>) -> (Vec<Line<'static>>, Vec<ImgBox>) {
+fn body_layout(styled: Vec<StyledLine>) -> (Vec<Line<'static>>, Vec<ImgBox>, Vec<BodyLink>) {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<ImgBox> = Vec::new();
+    let mut raw_links: Vec<BodyLink> = Vec::new();
     for line in &styled {
         if let Some(img) = &line.image {
             images.push(ImgBox {
@@ -270,10 +272,77 @@ fn body_layout(styled: Vec<StyledLine>) -> (Vec<Line<'static>>, Vec<ImgBox>) {
                 out_lines.push(Line::from(""));
             }
         } else {
+            collect_line_links(line, out_lines.len(), &mut raw_links);
             out_lines.push(to_ratatui_line(line));
         }
     }
-    (out_lines, images)
+    (out_lines, images, dedup_continuations(raw_links))
+}
+
+/// A navigable link in the rendered body: its screen row (index into the
+/// laid-out lines), start column and width (for highlighting/mouse hit-testing),
+/// and target URL.
+// `col`/`width` are consumed by the navigation-highlight and click tasks that
+// follow; allow the short-lived gap.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct BodyLink {
+    pub line: usize,
+    pub col: u16,
+    pub width: u16,
+    pub url: String,
+}
+
+/// Collects one `BodyLink` per contiguous same-link run on `line`, at output
+/// `row`. Column tracking mirrors `to_ratatui_line` (leading indent spaces,
+/// then span texts in order).
+fn collect_line_links(line: &StyledLine, row: usize, out: &mut Vec<BodyLink>) {
+    let mut col = (line.indent as usize * htmlrender::INDENT_SPACES) as u16;
+    let mut run: Option<BodyLink> = None;
+    for span in &line.spans {
+        let slen = span.text.chars().count() as u16;
+        match &span.link {
+            Some(url) => match &mut run {
+                Some(r) if r.url == *url => r.width += slen,
+                _ => {
+                    if let Some(r) = run.take() {
+                        out.push(r);
+                    }
+                    run = Some(BodyLink {
+                        line: row,
+                        col,
+                        width: slen,
+                        url: url.clone(),
+                    });
+                }
+            },
+            None => {
+                if let Some(r) = run.take() {
+                    out.push(r);
+                }
+            }
+        }
+        col += slen;
+    }
+    if let Some(r) = run.take() {
+        out.push(r);
+    }
+}
+
+/// Collapses a wrapped anchor — the same URL continuing on the next line — into
+/// a single navigable target at its first line, so a long hard-wrapped URL is
+/// one Ctrl-arrow stop rather than many.
+fn dedup_continuations(raw: Vec<BodyLink>) -> Vec<BodyLink> {
+    let mut out: Vec<BodyLink> = Vec::new();
+    for link in raw {
+        if let Some(last) = out.last() {
+            if last.url == link.url && last.line + 1 == link.line {
+                continue;
+            }
+        }
+        out.push(link);
+    }
+    out
 }
 
 /// Renders the bordered fallback box for one inline image band, captioned
@@ -326,7 +395,7 @@ fn to_ratatui_span(span: &StyledSpan) -> Span<'static> {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     if span.link.is_some() {
-        style = style.fg(Color::Cyan);
+        style = style.fg(Color::Blue);
     }
     Span::styled(span.text.clone(), style)
 }
@@ -336,6 +405,40 @@ mod tests {
     use super::*;
     use mailcore::graph::model::Body;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn linked_spans_render_blue() {
+        let span = StyledSpan {
+            text: "click".into(),
+            link: Some("https://x".into()),
+            ..Default::default()
+        };
+        assert_eq!(to_ratatui_span(&span).style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn drawing_a_two_link_body_populates_body_links() {
+        let mut app = App::for_test_with_seeded_store();
+        app.store
+            .put_body(
+                "m1",
+                &Body {
+                    content_type: "html".into(),
+                    content:
+                        r#"<p><a href="https://a">one</a> and <a href="https://b">two</a></p>"#
+                            .into(),
+                },
+            )
+            .expect("seed body");
+        app.open_message("m1");
+        assert!(app.body_links.is_empty()); // cleared until drawn
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+        assert_eq!(app.body_links.len(), 2);
+        assert_eq!(app.body_links[0].url, "https://a");
+        assert_eq!(app.body_links[1].url, "https://b");
+        assert_eq!(app.focused_link, None);
+    }
 
     #[test]
     fn renders_an_image_fallback_box_for_an_inline_cid_image() {
