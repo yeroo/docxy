@@ -82,8 +82,8 @@ fn embed_in_inlines(pkg: &mut Package, inlines: &mut [Inline], images: &[Mermaid
 
 /// The `<w:r><w:drawing>…</w:drawing></w:r>` XML for a picture run: a PNG blip
 /// (`r:embed="{rid_png}"`) with an `asvg:svgBlip` fallback
-/// (`r:embed="{rid_svg}"`) via the standard Office 2016 SVG extension
-/// (`{28A0092B-C50C-407E-A947-70E740481C1C}`), sized `w`x`h` EMU. Wrapped in a
+/// (`r:embed="{rid_svg}"`) via the standard Office 2016 SVG blip extension
+/// (`{96DAC541-7B7A-43D3-8B79-37D633B846F1}`), sized `w`x`h` EMU. Wrapped in a
 /// `<w:r>` because [`Inline::SmartArt::raw`] holds the *whole run* XML (see
 /// [`crate::load::parse_paragraph`]'s `w:r` case and
 /// [`crate::serialize`]'s verbatim `s.push_str(raw)`), not just the drawing —
@@ -107,7 +107,7 @@ fn picture_drawing_xml(rid_png: &str, rid_svg: &str, w: i64, h: i64, source: &st
          <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
          <pic:nvPicPr><pic:cNvPr id=\"1\" name=\"mermaid.png\" descr=\"{descr}\"/><pic:cNvPicPr/></pic:nvPicPr>\
          <pic:blipFill><a:blip r:embed=\"{rid_png}\">\
-         <a:extLst><a:ext uri=\"{{28A0092B-C50C-407E-A947-70E740481C1C}}\">\
+         <a:extLst><a:ext uri=\"{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}\">\
          <asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{rid_svg}\"/>\
          </a:ext></a:extLst></a:blip>\
          <a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
@@ -154,6 +154,15 @@ mod tests {
         assert!(raw.contains("<pic:pic"), "{raw}");
         assert!(raw.contains("a:blip") && raw.contains("r:embed="), "{raw}");
         assert!(raw.contains("svgBlip"), "svg blip missing: {raw}");
+        // Pin the SVG-blip extension GUID: Word only honors `asvg:svgBlip`
+        // under the correct `{96DAC541-7B7A-43D3-8B79-37D633B846F1}` extension
+        // URI — the similar-looking `useLocalDpi` GUID
+        // (`{28A0092B-C50C-407E-A947-70E740481C1C}`) is silently ignored, which
+        // degrades the embed to PNG-only and defeats the crisp-SVG purpose.
+        assert!(
+            raw.contains("{96DAC541-7B7A-43D3-8B79-37D633B846F1}"),
+            "wrong (or missing) SVG-blip extension GUID: {raw}"
+        );
         assert!(
             raw.contains("cx=\"3000000\"") && raw.contains("cy=\"1500000\""),
             "{raw}"

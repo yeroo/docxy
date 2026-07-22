@@ -274,8 +274,20 @@ impl Package {
             }
         }
 
-        // Image relationship in document.xml.rels.
+        // Image relationship in document.xml.rels. If the part is missing
+        // entirely (unusual, but not guaranteed present), create a minimal
+        // valid one first — otherwise the `replacen` below is a no-op against
+        // an empty string, `set_part` fails to find the part to update, and
+        // the returned rId would be a dangling `r:embed` reference.
+        const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
         let rels_name = "word/_rels/document.xml.rels";
+        if self.part(rels_name).is_none() {
+            let empty = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+                 <Relationships xmlns=\"{RELS_NS}\"></Relationships>"
+            );
+            self.parts.push((rels_name.to_string(), empty.into_bytes()));
+        }
         let rels_xml = self
             .part(rels_name)
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -1408,6 +1420,82 @@ mod tests {
         // And a full round-trip is stable (the preserved wrapper stays put).
         let pkg2 = load_package(&saved).expect("reload");
         assert_eq!(pkg1.document, pkg2.document);
+    }
+
+    #[test]
+    fn add_media_part_avoids_collisions_with_existing_media_and_rids() {
+        let mut pkg = new_package(Document { body: vec![] });
+
+        // Pre-existing media part (image1.png) that must not be overwritten.
+        pkg.parts.push((
+            "word/media/image1.png".to_string(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        ));
+
+        // A document.xml.rels that already carries a relationship using
+        // "rId5" — the new rId must not collide with (or reuse) it.
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/preexisting.png"/></Relationships>"#;
+        pkg.set_part("word/_rels/document.xml.rels", rels.as_bytes().to_vec());
+
+        let existing_rids = ["rId1", "rId5"]; // rId1: new_package's styles rel
+
+        let rid = pkg.add_media_part(&[1, 2, 3], "png");
+
+        // (a) a fresh rId, not reusing any existing one.
+        assert!(
+            !existing_rids.contains(&rid.as_str()),
+            "add_media_part must mint a fresh rId, got reused {rid}"
+        );
+
+        // (b) image1.png untouched; the new part landed at image2.png.
+        assert_eq!(
+            pkg.part("word/media/image1.png"),
+            Some([0xDE, 0xAD, 0xBE, 0xEF].as_slice()),
+            "add_media_part must not overwrite pre-existing media"
+        );
+        assert_eq!(
+            pkg.part("word/media/image2.png"),
+            Some([1u8, 2, 3].as_slice()),
+            "add_media_part must add the new part under the next free name"
+        );
+
+        // (c) the rels part now carries BOTH the old rId5 relationship and
+        // the newly minted one — not one replacing the other.
+        let rels_after =
+            String::from_utf8_lossy(pkg.part("word/_rels/document.xml.rels").unwrap()).into_owned();
+        assert!(
+            rels_after.contains("Id=\"rId5\"") && rels_after.contains("media/preexisting.png"),
+            "pre-existing relationship lost: {rels_after}"
+        );
+        assert!(
+            rels_after.contains(&format!("Id=\"{rid}\""))
+                && rels_after.contains("media/image2.png"),
+            "new relationship missing: {rels_after}"
+        );
+    }
+
+    #[test]
+    fn add_media_part_creates_rels_part_when_absent() {
+        // A package with no word/_rels/document.xml.rels at all (defensive
+        // gap: add_media_part must not silently produce a dangling rId).
+        let mut pkg = new_package(Document { body: vec![] });
+        assert!(pkg.set_part("word/_rels/document.xml.rels", Vec::new())); // sanity: part exists pre-removal
+        pkg.parts
+            .retain(|(n, _)| n != "word/_rels/document.xml.rels");
+        assert!(pkg.part("word/_rels/document.xml.rels").is_none());
+
+        let rid = pkg.add_media_part(&[9, 9, 9], "png");
+
+        let rels = pkg
+            .part("word/_rels/document.xml.rels")
+            .expect("add_media_part must create the rels part if missing");
+        let rels_xml = String::from_utf8_lossy(rels).into_owned();
+        assert!(
+            rels_xml.contains(&format!("Id=\"{rid}\"")) && rels_xml.contains("media/image1.png"),
+            "new relationship missing from freshly-created rels part: {rels_xml}"
+        );
+        assert!(pkg.part("word/media/image1.png").is_some());
     }
 
     #[test]
