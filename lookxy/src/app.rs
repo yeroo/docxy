@@ -271,6 +271,8 @@ pub struct App {
     /// `ui::reading::draw`, and which one (if any) is focused (`Ctrl+↑/↓`).
     pub body_links: Vec<crate::ui::reading::BodyLink>,
     pub focused_link: Option<usize>,
+    /// The "open link?" warning dialog, when open.
+    pub link_prompt: Option<crate::ui::linkprompt::LinkPrompt>,
     /// The reading pane's vertical scroll offset, in body rows — reset to `0`
     /// whenever a different message is opened (`open_message`). Clamped by
     /// `reading_scroll_by`/`reading_scroll_home`/`reading_scroll_end` against
@@ -537,6 +539,7 @@ impl App {
             reading_rect: Rect::ZERO,
             body_links: Vec::new(),
             focused_link: None,
+            link_prompt: None,
             reading_scroll: 0,
             reading_viewport: 0,
             reading_content_rows: 0,
@@ -738,6 +741,7 @@ impl App {
             || self.help
             || self.backstage.is_some()
             || self.ribbon_focus != crate::ui::ribbon::Focus::None
+            || self.link_prompt.is_some()
     }
 
     /// Opens the read-only help overlay (`F1`/`?`).
@@ -1132,6 +1136,49 @@ impl App {
         }
     }
 
+    /// Enter on a focused link: raise the open-link warning dialog for its URL.
+    pub fn open_focused_link(&mut self) {
+        if let Some(url) = self
+            .focused_link
+            .and_then(|i| self.body_links.get(i))
+            .map(|l| l.url.clone())
+        {
+            self.open_link_prompt(url);
+        }
+    }
+
+    /// Raise the warning dialog for `url` (used by both Enter-on-focused-link
+    /// and a mouse click on a link).
+    pub fn open_link_prompt(&mut self, url: String) {
+        self.link_prompt = Some(crate::ui::linkprompt::LinkPrompt { url, parsed: false });
+    }
+
+    /// Keys while the open-link dialog is up: `Esc` cancels, `p`/`Tab` toggles
+    /// the raw/parsed view, `Enter` opens (if it's a web URL) or blocks it.
+    pub fn link_prompt_key(&mut self, code: ratatui::crossterm::event::KeyCode) {
+        use ratatui::crossterm::event::KeyCode;
+        match code {
+            KeyCode::Esc => self.link_prompt = None,
+            KeyCode::Char('p') | KeyCode::Tab => {
+                if let Some(p) = self.link_prompt.as_mut() {
+                    p.parsed = !p.parsed;
+                }
+            }
+            KeyCode::Enter => self.confirm_link(),
+            _ => {}
+        }
+    }
+
+    fn confirm_link(&mut self) {
+        if let Some(p) = self.link_prompt.take() {
+            if crate::ui::linkprompt::safe_url(&p.url) {
+                self.open_url_with_os_handler(&p.url);
+            } else {
+                self.error_notice = Some(format!("blocked non-web link: {}", p.url));
+            }
+        }
+    }
+
     /// Routes a mouse event: left-click focuses the pane under the pointer and
     /// selects the clicked row (rail → switch section; folders → select;
     /// message list → select; reading → focus). Wheel and click-to-activate are
@@ -1144,6 +1191,7 @@ impl App {
             || self.oof_form.is_some()
             || self.help
             || self.backstage.is_some()
+            || self.link_prompt.is_some()
         {
             return;
         }
@@ -5505,6 +5553,49 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Pane::Reading); // stays active
         assert!(app.messages.iter().find(|m| m.id == "m1").unwrap().is_read);
         assert!(!app.open_sibling_message(1)); // no-op past the end
+    }
+
+    #[test]
+    fn enter_on_a_focused_link_warns_then_opens_a_safe_url() {
+        use crate::ui::reading::BodyLink;
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.body_links = vec![BodyLink {
+            line: 0,
+            col: 0,
+            width: 3,
+            url: "https://acme.com/x".into(),
+        }];
+        app.focused_link = Some(0);
+        app.open_focused_link();
+        assert_eq!(app.link_prompt.as_ref().unwrap().url, "https://acme.com/x");
+        assert!(!app.link_prompt.as_ref().unwrap().parsed);
+        app.link_prompt_key(KeyCode::Char('p')); // toggle parsed view
+        assert!(app.link_prompt.as_ref().unwrap().parsed);
+        let before = app.browser_open_invocations.get();
+        app.link_prompt_key(KeyCode::Enter); // confirm → opens + closes
+        assert!(app.link_prompt.is_none());
+        assert_eq!(app.browser_open_invocations.get(), before + 1);
+    }
+
+    #[test]
+    fn a_non_web_link_is_blocked_not_opened() {
+        use crate::ui::reading::BodyLink;
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.body_links = vec![BodyLink {
+            line: 0,
+            col: 0,
+            width: 3,
+            url: "javascript:alert(1)".into(),
+        }];
+        app.focused_link = Some(0);
+        app.open_focused_link();
+        let before = app.browser_open_invocations.get();
+        app.link_prompt_key(KeyCode::Enter);
+        assert!(app.link_prompt.is_none());
+        assert_eq!(app.browser_open_invocations.get(), before); // not opened
+        assert!(app.error_notice.as_deref().unwrap().contains("blocked"));
     }
 
     #[test]

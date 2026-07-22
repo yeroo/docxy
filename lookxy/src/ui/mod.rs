@@ -16,6 +16,7 @@ mod folders;
 pub mod foldertree;
 pub mod freebusy;
 pub mod help;
+pub mod linkprompt;
 mod message_list;
 pub mod oofform;
 pub mod rail;
@@ -171,6 +172,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // The RSVP prompt can be opened from the mail reader (`D`/`T` on an
     // invite); the Calendar branch already draws it via `draw_calendar`.
     calendar::draw_rsvp_prompt(f, &*app);
+    linkprompt::draw(f, &*app);
     help::draw(f, &*app);
     signin::draw(f, &*app);
 }
@@ -287,6 +289,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // The File backstage owns every key while open.
     if app.backstage.is_some() {
         app.backstage_key(key.code);
+        return;
+    }
+    // The open-link warning dialog owns every key while open.
+    if app.link_prompt.is_some() {
+        app.link_prompt_key(key.code);
         return;
     }
     // F9 toggles ribbon focus: on → focus the tab strip (expanded); off →
@@ -482,6 +489,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // Esc backs out one level from the list/reader (the reminder and
         // category-filter Esc handlers ran earlier and returned).
         KeyCode::Esc if matches!(app.focus, Pane::List | Pane::Reading) => nav_left(app),
+        // Enter on a focused link opens the warning dialog (Reading has nothing
+        // else to activate).
+        KeyCode::Enter if app.focus == Pane::Reading && app.focused_link.is_some() => {
+            app.open_focused_link()
+        }
         KeyCode::Enter => activate(app),
         KeyCode::Delete => app.delete_selected(),
         KeyCode::Char(c) => app.on_key_char(c),
