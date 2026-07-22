@@ -22,6 +22,7 @@ workspace = true
 [dependencies]
 # Path + version so `lookxy` can be published once `mailcore` is on crates.io.
 mailcore = { version = "0.1.0", path = "../mailcore" }
+ribboncore = { version = "0.1.0", path = "../ribboncore" }
 # Shared rich-text editing model (the compose view's body editor buffer).
 editcore = { version = "0.1.0", path = "../editcore" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the

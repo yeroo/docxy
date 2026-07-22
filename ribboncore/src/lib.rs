@@ -234,6 +234,10 @@ impl<A: Copy + PartialEq> Ribbon<A> {
     pub fn has_act(&self, act: A) -> bool {
         self.placed.iter().any(|p| p.act == act)
     }
+    /// Whether `act` is currently drawn as an active toggle (see `set_toggles`).
+    pub fn toggle_on(&self, act: A) -> bool {
+        self.active_toggles.contains(&act)
+    }
     pub fn focus_hint(&self, f: Focus) -> Option<&'static str> {
         match f {
             Focus::Button(i) => self.placed.get(i).map(|p| p.hint),
@@ -493,7 +497,11 @@ mod tests {
                 title: "G1",
                 width: 7,
                 rows: [
-                    vec![btn("Aaa", 3, Act::A, "a"), gap(" "), btn("Bbb", 3, Act::B, "b")],
+                    vec![
+                        btn("Aaa", 3, Act::A, "a"),
+                        gap(" "),
+                        btn("Bbb", 3, Act::B, "b"),
+                    ],
                     vec![btn("Ccc", 3, Act::C, "c")],
                 ],
             }],
