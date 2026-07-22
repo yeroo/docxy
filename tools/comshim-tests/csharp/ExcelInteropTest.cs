@@ -44,6 +44,7 @@ internal static class ExcelInteropTest
             if (mode == "early") RunEarly(outPath);
             else if (mode == "earlyls") RunEarlyLocalServer(outPath);
             else if (mode == "castshim") RunCastShim(outPath);
+            else if (mode == "castinproc") RunCastInproc(outPath);
             else if (mode == "castonly") RunCastOnly();
             else RunLate(outPath);
             Console.WriteLine("RESULT: OK (" + mode + ") -> " + outPath);
@@ -147,6 +148,46 @@ internal static class ExcelInteropTest
             Excel.Workbook wb = app.Workbooks.Add();
             Excel.Worksheet ws = (Excel.Worksheet)wb.Worksheets[1];
             ws.Name = "CSharpCast";
+            ((Excel.Range)ws.Range["A1"]).Value2 = "Item";
+            ((Excel.Range)ws.Cells[2, 1]).Value2 = 10;
+            ((Excel.Range)ws.Cells[3, 1]).Value2 = 32.5;
+            ((Excel.Range)ws.Range["A4"]).Formula = "=SUM(A2:A3)";
+            Console.WriteLine("  ws.Name = " + ws.Name);
+            Console.WriteLine("  A4 = " + ((Excel.Range)ws.Range["A4"]).Value2 + " (expect 42.5)");
+            wb.SaveAs(outPath, Excel.XlFileFormat.xlOpenXMLWorkbook);
+            wb.Close(false);
+        }
+        finally
+        {
+            app.Quit();
+        }
+    }
+
+    // IN-PROCESS activation (CLSCTX_INPROC_SERVER): COM loads xlcomshim.dll into
+    // THIS process and the RCW calls our vtable DIRECTLY -- no proxy, no
+    // marshalling, no type library. This is the no-Office (VDI) path, and it also
+    // drives our early-bound Range/Worksheet members (out-of-proc the RCW fell
+    // back to IDispatch for those). Full create -> write -> formula -> SaveAs.
+    private static void RunCastInproc(string outPath)
+    {
+        const uint CLSCTX_INPROC_SERVER = 0x1;
+        Guid clsid = new Guid("7B3F9E20-4C1A-4E8B-A2D6-9F5C1E0B7A31"); // shim coclass
+        Guid iidUnknown = new Guid("00000000-0000-0000-C000-000000000046");
+        IntPtr punk;
+        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref iidUnknown, out punk);
+        if (hr < 0) throw new COMException("CoCreateInstance(INPROC_SERVER) failed", hr);
+        object obj = Marshal.GetObjectForIUnknown(punk);
+        Marshal.Release(punk);
+        Console.WriteLine("  loaded shim in-process; casting to Excel._Application...");
+
+        Excel.Application app = (Excel.Application)obj; // vtable QI, in-proc
+        try
+        {
+            Console.WriteLine("  cast OK. Name = " + app.Name + " | Version = " + app.Version);
+            app.DisplayAlerts = false;
+            Excel.Workbook wb = app.Workbooks.Add();
+            Excel.Worksheet ws = (Excel.Worksheet)wb.Worksheets[1];
+            ws.Name = "CSharpInproc";
             ((Excel.Range)ws.Range["A1"]).Value2 = "Item";
             ((Excel.Range)ws.Cells[2, 1]).Value2 = 10;
             ((Excel.Range)ws.Cells[3, 1]).Value2 = 32.5;

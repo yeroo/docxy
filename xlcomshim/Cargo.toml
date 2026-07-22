@@ -9,6 +9,14 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+# The COM objects live in the library, built two ways: an rlib the bin links
+# (the LocalServer32 .exe) and a cdylib (the InprocServer32 .dll) exporting
+# DllGetClassObject/DllCanUnloadNow. One implementation, both activation styles.
+[lib]
+name = "xlcomshim"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
 [[bin]]
 name = "xlcomshim"
 path = "src/main.rs"
