@@ -83,12 +83,18 @@ function buildMermaidSvg(geo) {
     }
   }
 
-  // Edges next — under the nodes they connect.
+  // Edges next — under the nodes they connect. `style` (from the shared
+  // geometry — docxcore's `mermaid.rs` `EdgeStyle`) mirrors the same dotted /
+  // thick line the DrawingML `emit_connector` draws for Word, so the two
+  // renderings agree; `solid` (the default when a geometry omits `style`)
+  // keeps today's plain line untouched.
   for (const e of geo.edges || []) {
     const pts = (e.points || []).map((p) => `${p[0]},${p[1]}`).join(' ');
+    const strokeWidth = e.style === 'thick' ? MMD_STROKE * 1.5 : MMD_STROKE;
+    const dash = e.style === 'dotted' ? ' stroke-dasharray="8 6"' : '';
     parts.push(
       `<polyline points="${pts}" fill="none" stroke="#333333" ` +
-        `stroke-width="${MMD_STROKE}" marker-end="url(#arrow)"/>`
+        `stroke-width="${strokeWidth}"${dash} marker-end="url(#arrow)"/>`
     );
   }
 
@@ -101,6 +107,12 @@ function buildMermaidSvg(geo) {
     const cy = n.y + n.h / 2;
     if (n.shape === 'diamond') {
       const pts = `${cx},${n.y} ${n.x + n.w},${cy} ${cx},${n.y + n.h} ${n.x},${cy}`;
+      parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
+    } else if (n.shape === 'hexagon') {
+      const tip = n.w / 6;
+      const pts =
+        `${n.x + tip},${n.y} ${n.x + n.w - tip},${n.y} ${n.x + n.w},${cy} ` +
+        `${n.x + n.w - tip},${n.y + n.h} ${n.x + tip},${n.y + n.h} ${n.x},${cy}`;
       parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
     } else if (n.shape === 'ellipse' || n.shape === 'circle') {
       parts.push(

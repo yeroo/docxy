@@ -35,6 +35,7 @@ enum NodeShape {
     Stadium,
     Diamond,
     Circle,
+    Hexagon,
 }
 
 impl NodeShape {
@@ -46,6 +47,7 @@ impl NodeShape {
             NodeShape::Stadium => "roundRect",
             NodeShape::Diamond => "diamond",
             NodeShape::Circle => "ellipse",
+            NodeShape::Hexagon => "hexagon",
         }
     }
 }
@@ -72,6 +74,49 @@ struct Edge {
     from: usize,
     to: usize,
     label: String,
+    style: EdgeStyle,
+    // When an endpoint names a subgraph id rather than a node, `from`/`to`
+    // holds the `NO_NODE` placeholder and the matching `*_subgraph` field
+    // carries the real subgraph index — the edge anchors on the container
+    // box instead of a phantom node. `None` (the common case) means a real
+    // node index.
+    from_subgraph: Option<usize>,
+    to_subgraph: Option<usize>,
+}
+
+/// Placeholder `Edge.from`/`Edge.to` value when an endpoint is a subgraph id
+/// rather than a node — never a valid index into `Diagram.nodes`. Any code
+/// indexing `d.nodes[e.from]`/`d.nodes[e.to]` MUST first check
+/// `from_subgraph`/`to_subgraph` (or go through `endpoint_rect`), or it will
+/// panic on this value.
+const NO_NODE: usize = usize::MAX;
+
+/// One end of an edge: either a real node, or a subgraph id (anchors on the
+/// container box — see `endpoint_rect`).
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+    Node(usize),
+    Subgraph(usize),
+}
+
+/// An edge's link-line rendering, carried through the shared geometry so Word
+/// (`emit_connector`) and the webview (`buildMermaidSvg`) draw it identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeStyle {
+    Solid,
+    Dotted,
+    Thick,
+}
+
+impl EdgeStyle {
+    /// The geometry-JSON tag for this style — read back by the webview.
+    fn tag(self) -> &'static str {
+        match self {
+            EdgeStyle::Solid => "solid",
+            EdgeStyle::Dotted => "dotted",
+            EdgeStyle::Thick => "thick",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +135,15 @@ struct Diagram {
 
 #[derive(Debug, Clone)]
 struct Subgraph {
+    // The subgraph's Mermaid id — the token before `[` in `subgraph
+    // SharedVPC[Shared VPC]`, or the title text itself for a bare `subgraph
+    // Title` (Mermaid treats the title as the id then). Fed into `parse`'s
+    // `subgraph_ids` map at construction time, which is what actually
+    // resolves an edge endpoint naming this subgraph — so nothing reads this
+    // field back off the struct afterward (dead-code-clean, but part of the
+    // documented interface and handy for debugging/future lookups).
+    #[allow(dead_code)]
+    id: String,
     title: String,
     // Node indices assigned to this subgraph (its innermost containing block).
     members: Vec<usize>,
@@ -213,6 +267,12 @@ fn parse(src: &str) -> Diagram {
     let mut pending: Vec<(String, PendingStyle)> = Vec::new();
     let mut subgraphs: Vec<Subgraph> = Vec::new();
     let mut sg_stack: Vec<usize> = Vec::new();
+    // Maps a subgraph's Mermaid id to its index, so an edge like `B --> S`
+    // anchors on the container box instead of minting a phantom node named
+    // `S`. Only subgraphs opened *before* the referencing edge are resolvable
+    // this way (the common case); a forward reference falls back to a node.
+    let mut subgraph_ids: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // `sg_stack`/`subgraphs` are threaded through as explicit parameters (like
     // `nodes` already is) rather than captured by the closure — capturing them
@@ -302,8 +362,13 @@ fn parse(src: &str) -> Diagram {
         // `subgraph [id[Title]]` → open a (possibly nested) container.
         if let Some(rest) = line.strip_prefix("subgraph") {
             let title = parse_subgraph_title(rest);
+            let id = parse_subgraph_id(rest, &title);
             let idx = subgraphs.len();
+            if !id.is_empty() {
+                subgraph_ids.insert(id.clone(), idx);
+            }
             subgraphs.push(Subgraph {
+                id,
                 title,
                 members: Vec::new(),
                 parent: sg_stack.last().copied(),
@@ -363,6 +428,7 @@ fn parse(src: &str) -> Diagram {
             &mut pending,
             &sg_stack,
             &mut subgraphs,
+            &subgraph_ids,
             &mut get,
         );
     }
@@ -410,7 +476,26 @@ fn parse_subgraph_title(rest: &str) -> String {
     rest.to_string()
 }
 
+/// The id of a `subgraph` line (same `rest` as `parse_subgraph_title`, plus
+/// its already-computed `title`): the token before `[` in `subgraph
+/// SharedVPC[Shared VPC]`, or the title text itself for a bare `subgraph
+/// Title` — Mermaid uses the title as the id in that case. A bare `subgraph`
+/// with no title at all yields an empty id (never resolvable from an edge).
+fn parse_subgraph_id(rest: &str, title: &str) -> String {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return String::new();
+    }
+    if let Some(open) = rest.find('[') {
+        if rest.ends_with(']') {
+            return sanitize_id(&rest[..open]);
+        }
+    }
+    title.to_string()
+}
+
 /// Parse one statement: `A[x] --> B(y) -->|lbl| C`, or a lone `A[x]`.
+#[allow(clippy::too_many_arguments)]
 fn parse_statement(
     line: &str,
     nodes: &mut Vec<Node>,
@@ -418,6 +503,7 @@ fn parse_statement(
     pending: &mut Vec<(String, PendingStyle)>,
     sg_stack: &[usize],
     subgraphs: &mut Vec<Subgraph>,
+    subgraph_ids: &std::collections::HashMap<String, usize>,
     get: &mut impl FnMut(
         &str,
         Option<&str>,
@@ -438,35 +524,70 @@ fn parse_statement(
     let edges_before = edges.len();
     let line = graph_part;
     let segments = split_edges(line);
-    // segments alternate: node, (edge-label, node), (edge-label, node), …
-    let mut prev: Option<usize> = None;
+    // segments alternate: node-group, (edge-label, node-group), …, where a
+    // node-group is one or more `&`-joined node tokens (`A & B --> C & D`).
+    // A group element resolves to a real node OR a subgraph id (`Endpoint`) —
+    // an edge referencing a subgraph id anchors on the container box rather
+    // than minting a phantom node (see `subgraph_ids`).
+    let mut prev_group: Vec<Endpoint> = Vec::new();
     let mut pending_label = String::new();
-    let mut first = true;
+    let mut cur_style = EdgeStyle::Solid;
     for seg in segments {
         match seg {
             Seg::Node(tok) => {
-                let (id, label, shape, class_name) = parse_node_token(&tok);
-                if id.is_empty() {
+                let mut group: Vec<Endpoint> = Vec::new();
+                for member in split_ampersand(&tok) {
+                    let (id, label, shape, class_name) = parse_node_token(&member);
+                    if id.is_empty() {
+                        continue;
+                    }
+                    // A bare id matching an already-declared subgraph resolves
+                    // to that container instead of a node — this is the only
+                    // place a phantom node would otherwise get minted for a
+                    // subgraph-id edge endpoint. Forward references (edge
+                    // before its subgraph) aren't in `subgraph_ids` yet and
+                    // fall back to a node, as documented.
+                    if let Some(&sg_idx) = subgraph_ids.get(&id) {
+                        group.push(Endpoint::Subgraph(sg_idx));
+                        continue;
+                    }
+                    let idx = get(&id, label.as_deref(), shape, nodes, sg_stack, subgraphs);
+                    if let Some(name) = class_name {
+                        pending.push((id.clone(), PendingStyle::Class(name)));
+                    }
+                    group.push(Endpoint::Node(idx));
+                }
+                if group.is_empty() {
                     continue;
                 }
-                let idx = get(&id, label.as_deref(), shape, nodes, sg_stack, subgraphs);
-                if let Some(name) = class_name {
-                    pending.push((id.clone(), PendingStyle::Class(name)));
+                if !prev_group.is_empty() {
+                    for &p in &prev_group {
+                        for &c in &group {
+                            let (from, from_subgraph) = match p {
+                                Endpoint::Node(idx) => (idx, None),
+                                Endpoint::Subgraph(idx) => (NO_NODE, Some(idx)),
+                            };
+                            let (to, to_subgraph) = match c {
+                                Endpoint::Node(idx) => (idx, None),
+                                Endpoint::Subgraph(idx) => (NO_NODE, Some(idx)),
+                            };
+                            edges.push(Edge {
+                                from,
+                                to,
+                                label: pending_label.clone(),
+                                style: cur_style,
+                                from_subgraph,
+                                to_subgraph,
+                            });
+                        }
+                    }
+                    pending_label.clear();
                 }
-                if let Some(p) = prev {
-                    edges.push(Edge {
-                        from: p,
-                        to: idx,
-                        label: std::mem::take(&mut pending_label),
-                    });
-                }
-                prev = Some(idx);
-                first = false;
+                prev_group = group;
             }
-            Seg::Arrow(label) => {
+            Seg::Arrow(label, style) => {
                 pending_label = label;
-                // A leading arrow with no left node: ignore.
-                let _ = first;
+                cur_style = style;
             }
         }
     }
@@ -508,7 +629,34 @@ fn message_colon(line: &str) -> Option<usize> {
 
 enum Seg {
     Node(String),
-    Arrow(String),
+    Arrow(String, EdgeStyle),
+}
+
+/// Split a node segment on top-level `&` (Mermaid group operator), keeping `&`
+/// inside a `[...]`/`(...)`/`{...}` label intact. Empty pieces are dropped.
+fn split_ampersand(tok: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    for c in tok.chars() {
+        match c {
+            '[' | '(' | '{' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ']' | ')' | '}' => {
+                depth -= 1;
+                buf.push(c);
+            }
+            '&' if depth == 0 => out.push(std::mem::take(&mut buf)),
+            _ => buf.push(c),
+        }
+    }
+    out.push(buf);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Split a line into alternating node / arrow segments. Arrows are runs built
@@ -546,7 +694,14 @@ fn split_edges(line: &str) -> Vec<Seg> {
                         i += 1; // closing |
                     }
                 }
-                out.push(Seg::Arrow(label.trim().to_string()));
+                let style = if run.contains('.') {
+                    EdgeStyle::Dotted
+                } else if run.contains('=') {
+                    EdgeStyle::Thick
+                } else {
+                    EdgeStyle::Solid
+                };
+                out.push(Seg::Arrow(label.trim().to_string(), style));
                 continue;
             }
             // Not an arrow: treat as node text.
@@ -569,7 +724,7 @@ fn push_node(out: &mut Vec<Seg>, buf: &mut String) {
 }
 
 /// Parse `id[Label]` / `id(Label)` / `id{Label}` / `id((Label))` / `id([Label])`
-/// / bare `id`, with an optional trailing `:::className` (applies a
+/// / `id{{Label}}` / bare `id`, with an optional trailing `:::className` (applies a
 /// `classDef` inline, e.g. `A[Hot]:::warn`). Returns `(id, label, shape,
 /// class_name)`.
 fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>, Option<String>) {
@@ -592,6 +747,8 @@ fn parse_node_token(tok: &str) -> (String, Option<String>, Option<NodeShape>, Op
         (NodeShape::Circle, l)
     } else if let Some(l) = strip_pair(rest, "([", "])") {
         (NodeShape::Stadium, l)
+    } else if let Some(l) = strip_pair(rest, "{{", "}}") {
+        (NodeShape::Hexagon, l)
     } else if let Some(l) = strip_pair(rest, "{", "}") {
         (NodeShape::Diamond, l)
     } else if let Some(l) = strip_pair(rest, "(", ")") {
@@ -902,6 +1059,10 @@ fn order_ranks(by_rank: &mut [Vec<usize>], d: &Diagram) {
                     let neighbors: Vec<usize> = d
                         .edges
                         .iter()
+                        // Skip subgraph-endpoint edges: not a rank/ordering
+                        // constraint, and `from`/`to` may be `NO_NODE`, which
+                        // must never index `pos` (sized to `d.nodes.len()`).
+                        .filter(|e| e.from_subgraph.is_none() && e.to_subgraph.is_none())
                         .filter_map(|e| {
                             if down && e.to == n {
                                 Some(e.from)
@@ -935,6 +1096,12 @@ fn assign_ranks(d: &mut Diagram) {
     for _ in 0..n {
         let mut changed = false;
         for e in &d.edges {
+            // A subgraph-endpoint edge is a visual connector, not a rank
+            // constraint: `from`/`to` may be the `NO_NODE` placeholder, which
+            // must never index `d.nodes`.
+            if e.from_subgraph.is_some() || e.to_subgraph.is_some() {
+                continue;
+            }
             if e.from == e.to {
                 continue;
             }
@@ -1105,7 +1272,8 @@ fn emit_node(node: &Node, sid: i32) -> String {
 }
 
 fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
-    let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
+    let from = endpoint_rect(d, e.from, e.from_subgraph);
+    let to = endpoint_rect(d, e.to, e.to_subgraph);
     // Anchor points based on flow direction.
     let (x1, y1, x2, y2) = anchors(d.dir, from, to);
     // The single source of truth for the elbow shape: the same 4-point
@@ -1136,6 +1304,14 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
     } else {
         emit_edge_label(&e.label, (x1 + x2) / 2, (y1 + y2) / 2, sid)
     };
+    let line_w = match e.style {
+        EdgeStyle::Thick => 19050,
+        _ => 12700,
+    };
+    let dash = match e.style {
+        EdgeStyle::Dotted => "<a:prstDash val=\"dash\"/>",
+        _ => "",
+    };
     format!(
         "<wps:wsp>\
          <wps:cNvPr id=\"{sid}\" name=\"Edge {sid}\"/>\
@@ -1147,8 +1323,8 @@ fn emit_connector(d: &Diagram, e: &Edge, sid: i32) -> String {
          <a:rect l=\"0\" t=\"0\" r=\"{cx}\" b=\"{cy}\"/>\
          <a:pathLst><a:path w=\"{cx}\" h=\"{cy}\">{path}</a:path></a:pathLst>\
          </a:custGeom>\
-         <a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
-         <a:tailEnd type=\"triangle\"/></a:ln>\
+         <a:ln w=\"{line_w}\"><a:solidFill><a:srgbClr val=\"333333\"/></a:solidFill>\
+         {dash}<a:tailEnd type=\"triangle\"/></a:ln>\
          </wps:spPr>\
          <wps:bodyPr/>\
          </wps:wsp>{label}",
@@ -1246,11 +1422,35 @@ fn xml_unescape(s: &str) -> String {
 // Shared geometry (DrawingML emitter + webview renderer)
 // ===========================================================================
 
-/// The (start, end) anchor points of an edge, by flow direction.
-fn anchors(dir: Dir, from: &Node, to: &Node) -> (i64, i64, i64, i64) {
+/// The rect `(x, y, w, h)` an edge endpoint anchors on: a node's own rect, or
+/// — when the endpoint names a subgraph id instead — the container's
+/// post-layout box. This is the only place `e.from`/`e.to`/`e.from_subgraph`/
+/// `e.to_subgraph` should be turned into geometry: it never indexes
+/// `d.nodes` with the `NO_NODE` placeholder because a `Some(sg_idx)` always
+/// takes the subgraph branch first.
+fn endpoint_rect(d: &Diagram, idx: usize, sg: Option<usize>) -> (i64, i64, i64, i64) {
+    match sg {
+        Some(si) => {
+            let g = &d.subgraphs[si];
+            (g.x, g.y, g.w, g.h)
+        }
+        None => {
+            let n = &d.nodes[idx];
+            (n.x, n.y, n.w, n.h)
+        }
+    }
+}
+
+/// The (start, end) anchor points of an edge, by flow direction. `from`/`to`
+/// are endpoint rects (`(x, y, w, h)`) from `endpoint_rect` — a node's rect or
+/// a subgraph's box; the bottom/top/left/right-center formulae are identical
+/// either way.
+fn anchors(dir: Dir, from: (i64, i64, i64, i64), to: (i64, i64, i64, i64)) -> (i64, i64, i64, i64) {
+    let (fx, fy, fw, fh) = from;
+    let (tx, ty, tw, th) = to;
     match dir {
-        Dir::TopDown => (from.x + from.w / 2, from.y + from.h, to.x + to.w / 2, to.y),
-        Dir::LeftRight => (from.x + from.w, from.y + from.h / 2, to.x, to.y + to.h / 2),
+        Dir::TopDown => (fx + fw / 2, fy + fh, tx + tw / 2, ty),
+        Dir::LeftRight => (fx + fw, fy + fh / 2, tx, ty + th / 2),
     }
 }
 
@@ -1290,6 +1490,7 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
         .map(|e| EdgeGeom {
             points: edge_points(d, e),
             label: e.label.clone(),
+            style: e.style,
         })
         .collect();
     let subgraphs = d
@@ -1321,7 +1522,8 @@ fn build_geometry(d: &Diagram) -> DiagramGeometry {
 /// truth for the edge's shape — `emit_connector` draws these exact points as a
 /// custom-geometry path, so Word and the webview renderer agree.
 fn edge_points(d: &Diagram, e: &Edge) -> Vec<(i64, i64)> {
-    let (from, to) = (&d.nodes[e.from], &d.nodes[e.to]);
+    let from = endpoint_rect(d, e.from, e.from_subgraph);
+    let to = endpoint_rect(d, e.to, e.to_subgraph);
     let (x1, y1, x2, y2) = anchors(d.dir, from, to);
     match d.dir {
         Dir::TopDown => {
@@ -1363,6 +1565,7 @@ pub struct NodeGeom {
 pub struct EdgeGeom {
     pub points: Vec<(i64, i64)>,
     pub label: String,
+    style: EdgeStyle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1410,7 +1613,9 @@ impl DiagramGeometry {
             }
             s.push_str("],\"label\":");
             json_str(&mut s, &e.label);
-            s.push('}');
+            s.push_str(",\"style\":\"");
+            s.push_str(e.style.tag());
+            s.push_str("\"}");
         }
         s.push_str("],\"subgraphs\":[");
         for (i, g) in self.subgraphs.iter().enumerate() {
@@ -1451,7 +1656,15 @@ fn json_str(out: &mut String, s: &str) {
 fn crossing_count(d: &Diagram, order: &std::collections::HashMap<usize, usize>) -> usize {
     let mut cross = 0;
     for (i, e1) in d.edges.iter().enumerate() {
+        // A subgraph-endpoint edge isn't a rank/ordering constraint and its
+        // `from`/`to` may be `NO_NODE`, which isn't a key in `order`.
+        if e1.from_subgraph.is_some() || e1.to_subgraph.is_some() {
+            continue;
+        }
         for e2 in &d.edges[i + 1..] {
+            if e2.from_subgraph.is_some() || e2.to_subgraph.is_some() {
+                continue;
+            }
             let (a1, b1) = (order[&e1.from], order[&e1.to]);
             let (a2, b2) = (order[&e2.from], order[&e2.to]);
             if (a1 < a2 && b1 > b2) || (a1 > a2 && b1 < b2) {
@@ -1479,6 +1692,26 @@ mod tests {
     }
 
     #[test]
+    fn double_brace_is_hexagon() {
+        let (_, _, shape, _) = parse_node_token("EB{{EventBridge bus}}");
+        assert_eq!(shape, Some(NodeShape::Hexagon));
+        let (_, label, _, _) = parse_node_token("EB{{EventBridge bus}}");
+        assert_eq!(label.as_deref(), Some("EventBridge bus")); // no stray brace
+    }
+
+    #[test]
+    fn single_brace_still_diamond() {
+        let (_, _, shape, _) = parse_node_token("D{Choice}");
+        assert_eq!(shape, Some(NodeShape::Diamond));
+    }
+
+    #[test]
+    fn hexagon_prst_and_geometry() {
+        let g = geometry("flowchart TD\nA{{Bus}}");
+        assert_eq!(g.nodes[0].shape, "hexagon");
+    }
+
+    #[test]
     fn direction_lr_detected() {
         let d = parse("graph LR\nA-->B");
         assert_eq!(d.dir, Dir::LeftRight);
@@ -1489,6 +1722,76 @@ mod tests {
         let d = parse("graph TD\nA -->|yes| B");
         assert_eq!(d.edges.len(), 1);
         assert_eq!(d.edges[0].label, "yes");
+    }
+
+    #[test]
+    fn edge_styles_classified() {
+        assert_eq!(
+            parse("flowchart TD\nA --> B").edges[0].style,
+            EdgeStyle::Solid
+        );
+        assert_eq!(
+            parse("flowchart TD\nA -.-> B").edges[0].style,
+            EdgeStyle::Dotted
+        );
+        assert_eq!(
+            parse("flowchart TD\nA ==> B").edges[0].style,
+            EdgeStyle::Thick
+        );
+    }
+
+    #[test]
+    fn dotted_edge_drawingml_and_geometry() {
+        let (xml, _) = to_drawing("flowchart TD\nA -.-> B");
+        assert!(xml.contains("prstDash"), "{xml}");
+        let g = geometry("flowchart TD\nA -.-> B");
+        assert!(g.to_json().contains("\"style\":\"dotted\""));
+    }
+
+    #[test]
+    fn solid_edge_unchanged() {
+        let (xml, _) = to_drawing("flowchart TD\nA --> B");
+        assert!(!xml.contains("prstDash")); // solid emits no dash
+    }
+
+    #[test]
+    fn ampersand_fan_out_targets() {
+        let d = parse("flowchart TD\nA -->|x| B & C & D");
+        // 3 edges A→B, A→C, A→D, all labelled x.
+        assert_eq!(d.edges.len(), 3);
+        let labels: Vec<&str> = d.edges.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.iter().all(|l| *l == "x"));
+        // No phantom node whose label contains '&'.
+        assert!(d.nodes.iter().all(|n| !n.label.contains('&')));
+        assert_eq!(d.nodes.len(), 4); // A,B,C,D
+    }
+
+    #[test]
+    fn ampersand_fan_out_sources_and_product() {
+        let d = parse("flowchart TD\nA & B --> C");
+        assert_eq!(d.edges.len(), 2); // A→C, B→C
+        let d2 = parse("flowchart TD\nA & B --> C & D");
+        assert_eq!(d2.edges.len(), 4); // cross-product
+        let d3 = parse("flowchart TD\nA --> B & C --> D");
+        // A→B, A→C, then B→D, C→D
+        assert_eq!(d3.edges.len(), 4);
+    }
+
+    #[test]
+    fn ampersand_in_label_is_not_a_separator() {
+        let d = parse("flowchart TD\nX[a & b] --> Y");
+        assert_eq!(d.nodes.len(), 2);
+        assert!(d.nodes.iter().any(|n| n.label == "a & b"));
+        assert_eq!(d.edges.len(), 1);
+    }
+
+    #[test]
+    fn context_map_fan_out_expands() {
+        // The Aliaksei context map fan-outs must become many edges, not phantom nodes.
+        let src = "graph LR\n  IA[Identity]\n  IA -->|claims| DL & POOL & OE & CAT";
+        let d = parse(src);
+        assert_eq!(d.edges.len(), 4);
+        assert!(d.nodes.iter().all(|n| !n.label.contains('&')));
     }
 
     #[test]
@@ -1852,5 +2155,41 @@ mod tests {
             !xml.contains("cx=\"0\" cy=\"0\""),
             "no zero-area container should be emitted: {xml}"
         );
+    }
+
+    #[test]
+    fn subgraph_id_extracted_from_bracket_and_bare_title() {
+        // `subgraph SharedVPC[Shared VPC]` → id is the token before `[`.
+        let d1 = parse("flowchart TD\nsubgraph SharedVPC[Shared VPC]\nA\nend");
+        assert_eq!(d1.subgraphs[0].id, "SharedVPC");
+        assert_eq!(d1.subgraphs[0].title, "Shared VPC");
+        // A bare `subgraph Title` (no `[...]`) → id is the title itself,
+        // same as Mermaid's own behavior.
+        let d2 = parse("flowchart TD\nsubgraph Group One\nA\nend");
+        assert_eq!(d2.subgraphs[0].id, "Group One");
+    }
+
+    #[test]
+    fn edge_to_subgraph_id_no_phantom() {
+        let src = "flowchart TB\nsubgraph S[Shared]\n  A\nend\nB --> S";
+        let d = parse(src);
+        // No phantom node named S; the edge targets subgraph 0.
+        assert!(
+            d.nodes
+                .iter()
+                .all(|n| n.label != "S" && n.label != "Shared" || n.subgraph.is_some())
+        ); // only member nodes, none named S
+        assert_eq!(d.edges.len(), 1);
+        assert_eq!(d.edges[0].to_subgraph, Some(0));
+    }
+
+    #[test]
+    fn edge_to_subgraph_excluded_from_ranking_and_anchors_box() {
+        let src = "flowchart TB\nsubgraph S[Shared]\n  A\nend\nB --> S";
+        let g = geometry(src);
+        // Geometry still produces an edge with real points (anchored on the box),
+        // and layout didn't panic on a non-node endpoint.
+        assert_eq!(g.edges.len(), 1);
+        assert!(g.edges[0].points.len() >= 2);
     }
 }
