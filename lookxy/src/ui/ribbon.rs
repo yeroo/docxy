@@ -6,8 +6,8 @@
 //! Collapsed to its tab strip by default; clicking a header or pressing F9
 //! expands it. Buttons are mouse-clickable and keyboard-navigable (F9 focuses
 //! the tabs, Down enters the buttons, arrows move, Up returns to the tabs).
-//! Every glyph is single-width so the layout is exact. The focused/hovered
-//! button's description shows in a black-on-yellow hint bar at the bottom edge.
+//! Every glyph is single-width so the layout is exact. The whole ribbon draws
+//! in the app accent colour (see `ACCENT`).
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
