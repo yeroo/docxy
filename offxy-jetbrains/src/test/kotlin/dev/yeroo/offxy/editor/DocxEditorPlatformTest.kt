@@ -11,6 +11,15 @@ import dev.yeroo.offxy.engine.ChicoryEngine
 /** Platform-level test: the provider claims .docx, the editor shows the
  *  rendered document, and guarded decoration columns reject edits. */
 class DocxEditorPlatformTest : BasePlatformTestCase() {
+    fun testDocxFileTypeClaimsTheExtension() {
+        // Without this mapping the platform treats docx as its Native type and
+        // double-click launches Word instead of consulting editor providers.
+        val type = com.intellij.openapi.fileTypes.FileTypeManager.getInstance()
+            .getFileTypeByFileName("report.docx")
+        assertEquals("Offxy Word Document", type.name)
+        assertTrue(type.isBinary)
+    }
+
     fun testProviderAcceptsAndRendersDocx() {
         val bytes = ChicoryEngine.fromMarkdown("# Heading\n\nBody text here.\n\n- bullet item\n")
         val file = BinaryLightVirtualFile("t.docx", bytes)

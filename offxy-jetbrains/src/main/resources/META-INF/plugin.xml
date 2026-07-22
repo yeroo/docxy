@@ -14,6 +14,13 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <!-- Claim docx away from the platform's Native ("open in associated
+             application") type, so double-click opens an editor tab instead
+             of launching Word. -->
+        <fileType name="Offxy Word Document"
+                  implementationClass="dev.yeroo.offxy.editor.DocxFileType"
+                  fieldName="INSTANCE"
+                  extensions="docx"/>
         <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
     </extensions>
 
