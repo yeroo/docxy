@@ -93,10 +93,13 @@ fn header_line(t: &mailcore::thread::Thread, expanded: bool, width: usize) -> Li
         t.subject
     );
     let truncated = truncate_width(&text, width);
-    let mut style = Style::default();
-    if t.unread_count > 0 {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    // Unread conversations stand out bold; fully-read ones recede (dim), the
+    // standard mail read/unread contrast.
+    let style = if t.unread_count > 0 {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
     Line::from(Span::styled(truncated, style))
 }
 
@@ -123,10 +126,11 @@ fn child_line(
     );
     let (dots, dot_cols) = category_dots(m, master);
     let truncated = truncate_width(&text, width.saturating_sub(dot_cols));
-    let mut style = Style::default();
-    if !m.is_read {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    let style = if m.is_read {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
     let mut spans = dots;
     spans.push(Span::styled(truncated, style));
     Line::from(spans)
@@ -204,10 +208,11 @@ fn line(m: &MessageRow, width: usize, master: &[MasterCategory]) -> Line<'static
     let (dots, dot_cols) = category_dots(m, master);
     let truncated = truncate_width(&text, width.saturating_sub(dot_cols));
 
-    let mut style = Style::default();
-    if !m.is_read {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    let style = if m.is_read {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
     let mut spans = dots;
     spans.push(Span::styled(truncated, style));
     Line::from(spans)
@@ -292,6 +297,42 @@ mod tests {
     use crate::app::tests::seed_second_in_c1;
     use mailcore::graph::model::MailFolder;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn row(is_read: bool) -> MessageRow {
+        MessageRow {
+            id: "m".into(),
+            folder_id: "inbox".into(),
+            conversation_id: "c".into(),
+            subject: "Hi".into(),
+            from_name: "Al".into(),
+            from_addr: "a@x".into(),
+            to_recipients: String::new(),
+            cc_recipients: String::new(),
+            received_at: "2026-07-20T10:00:00Z".into(),
+            sent_at: String::new(),
+            is_read,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            bcc_recipients: String::new(),
+            is_meeting_request: false,
+            categories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unread_rows_are_bold_and_read_rows_dim() {
+        let unread = line(&row(false), 80, &[]);
+        let read = line(&row(true), 80, &[]);
+        let unread_style = unread.spans.last().unwrap().style;
+        let read_style = read.spans.last().unwrap().style;
+        assert!(unread_style.add_modifier.contains(Modifier::BOLD));
+        assert!(!unread_style.add_modifier.contains(Modifier::DIM));
+        assert!(read_style.add_modifier.contains(Modifier::DIM));
+        assert!(!read_style.add_modifier.contains(Modifier::BOLD));
+    }
 
     #[test]
     fn message_row_shows_a_category_dot() {
