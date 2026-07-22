@@ -135,6 +135,9 @@ pub struct Ribbon {
     active_toggles: Vec<Act>,
 }
 
+/// xlsxy's ribbon accent — the whole ribbon draws green (one colour per app in
+/// the suite: lookxy cyan, docxy light blue, yppxy yellow).
+const ACCENT: Color = Color::Green;
 const ROW0: usize = 1;
 const ROW1: usize = 2;
 
@@ -337,16 +340,13 @@ impl Ribbon {
         };
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
-            let style = if !engaged {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::DIM) // idle: app accent (xlsxy)
-            } else if i == self.active {
-                Style::default().fg(Color::Black).bg(Color::White)
+            let _ = engaged;
+            let style = if i == self.active {
+                Style::default().fg(Color::Black).bg(ACCENT) // selected: inverted accent
             } else if Some(i) == focused_tab {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                Style::default().fg(ACCENT) // other tab names: app colour
             };
             spans.push(Span::styled(t.to_string(), style));
             spans.push(Span::raw("   "));
@@ -359,7 +359,7 @@ impl Ribbon {
     }
 
     pub fn render_body(&self, focus: Focus) -> Vec<Line<'static>> {
-        let dim = Style::default().add_modifier(Modifier::DIM);
+        let dim = Style::default().fg(ACCENT); // box + titles draw in the app accent
         let widths: Vec<usize> = self.groups().iter().map(|g| g.width).collect();
         let bar = |l: &str, m: &str, r: &str| -> Line<'static> {
             let mut s = String::from(l);
@@ -402,12 +402,10 @@ impl Ribbon {
         for g in self.groups() {
             let pad = g.width.saturating_sub(g.title.width());
             let l = pad / 2;
-            spans.push(Span::raw(format!(
-                " {}{}{} ",
-                " ".repeat(l),
-                g.title,
-                " ".repeat(pad - l)
-            )));
+            spans.push(Span::styled(
+                format!(" {}{}{} ", " ".repeat(l), g.title, " ".repeat(pad - l)),
+                dim,
+            ));
             spans.push(Span::styled("│", dim));
         }
         out.push(Line::from(spans));
@@ -431,11 +429,11 @@ impl Ribbon {
                         .unwrap_or(false);
                     let is_on = self.active_toggles.contains(&b.act);
                     let style = if is_focus {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default().fg(Color::Black).bg(ACCENT)
                     } else if is_on {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else if b.act.enabled() {
-                        Style::default()
+                        Style::default().fg(ACCENT)
                     } else {
                         Style::default().add_modifier(Modifier::DIM)
                     };

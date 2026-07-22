@@ -133,9 +133,10 @@ pub struct Ribbon {
     active_toggles: Vec<Act>,
 }
 
-/// The app's ribbon accent — lookxy's tab names are blue (docxy light blue,
-/// xlsxy green, yppxy yellow — one colour per app in the suite).
-const ACCENT: Color = Color::Blue;
+/// The app's ribbon accent — lookxy is cyan (docxy light blue, xlsxy green,
+/// yppxy yellow — one colour per app in the suite). The whole ribbon (tab
+/// names, box, group titles, button glyphs) draws in this colour.
+const ACCENT: Color = Color::Cyan;
 
 /// Rows inside the expanded ribbon body (0 = first button row).
 const ROW0: usize = 1;
@@ -362,9 +363,9 @@ impl Ribbon {
     // ---- rendering ----
 
     /// Render the collapsed ribbon: the tab strip (one line). The active tab is
-    /// only highlighted while the ribbon is engaged; idle, the tabs are plain.
+    /// app-accent tab names; the active tab is inverted (black on accent), the
+    /// keyboard cursor (when the ribbon is engaged) is reversed.
     pub fn render_tabs(&self, focus: Focus) -> Line<'static> {
-        let engaged = focus != Focus::None;
         let focused_tab = if let Focus::Tab(t) = focus {
             Some(t)
         } else {
@@ -372,14 +373,13 @@ impl Ribbon {
         };
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
-            let style = if !engaged {
-                Style::default().fg(ACCENT) // idle: app-coloured tab names
-            } else if i == self.active {
-                Style::default().fg(Color::Black).bg(Color::White)
+            let style = if i == self.active {
+                // Selected tab: inverted — black on the app accent.
+                Style::default().fg(Color::Black).bg(ACCENT)
             } else if Some(i) == focused_tab {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::default().add_modifier(Modifier::REVERSED) // keyboard cursor
             } else {
-                Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
+                Style::default().fg(ACCENT) // other tab names: app colour
             };
             spans.push(Span::styled(t.to_string(), style));
             spans.push(Span::raw("   "));
@@ -394,9 +394,9 @@ impl Ribbon {
         let mut spans = vec![Span::raw("  ")];
         for (i, t) in self.tabs.iter().enumerate() {
             let style = if i == active_tab {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default().fg(Color::Black).bg(ACCENT)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                Style::default().fg(ACCENT)
             };
             spans.push(Span::styled(t.to_string(), style));
             spans.push(Span::raw("   "));
@@ -407,7 +407,8 @@ impl Ribbon {
     /// Render the expanded ribbon body (box + buttons + group titles). Does not
     /// include the tab strip (line 0) or the hint bar.
     pub fn render_body(&self, focus: Focus) -> Vec<Line<'static>> {
-        let dim = Style::default().add_modifier(Modifier::DIM);
+        // The whole ribbon body draws in the app accent (box, titles, glyphs).
+        let accent = Style::default().fg(ACCENT);
         let widths: Vec<usize> = self.groups().iter().map(|g| g.width).collect();
         let bar = |l: &str, m: &str, r: &str| -> Line<'static> {
             let mut s = String::from(l);
@@ -418,7 +419,7 @@ impl Ribbon {
                 s.push_str(&"\u{2500}".repeat(w + 2));
             }
             s.push_str(r);
-            Line::styled(s, dim)
+            Line::styled(s, accent)
         };
         let focused = if let Focus::Button(i) = focus {
             self.placed.get(i).copied()
@@ -435,28 +436,26 @@ impl Ribbon {
         };
         let mut out = vec![bar("\u{250c}", "\u{252c}", "\u{2510}")];
         for ri in 0..2 {
-            let mut spans = vec![Span::styled("\u{2502}", dim)];
+            let mut spans = vec![Span::styled("\u{2502}", accent)];
             for g in self.groups() {
                 spans.push(Span::raw(" "));
                 self.row_spans(&g.rows[ri], ri as u8, focused, &mut spans);
                 let pad = g.width.saturating_sub(row_w(&g.rows[ri]));
                 spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.push(Span::styled("\u{2502}", dim));
+                spans.push(Span::styled("\u{2502}", accent));
             }
             out.push(Line::from(spans));
         }
         out.push(bar("\u{251c}", "\u{253c}", "\u{2524}"));
-        let mut spans = vec![Span::styled("\u{2502}", dim)];
+        let mut spans = vec![Span::styled("\u{2502}", accent)];
         for g in self.groups() {
             let pad = g.width.saturating_sub(g.title.chars().count());
             let l = pad / 2;
-            spans.push(Span::raw(format!(
-                " {}{}{} ",
-                " ".repeat(l),
-                g.title,
-                " ".repeat(pad - l)
-            )));
-            spans.push(Span::styled("\u{2502}", dim));
+            spans.push(Span::styled(
+                format!(" {}{}{} ", " ".repeat(l), g.title, " ".repeat(pad - l)),
+                accent,
+            ));
+            spans.push(Span::styled("\u{2502}", accent));
         }
         out.push(Line::from(spans));
         out
@@ -478,11 +477,11 @@ impl Ribbon {
                         .unwrap_or(false);
                     let is_on = self.active_toggles.contains(&b.act);
                     let style = if is_focus {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default().fg(Color::Black).bg(ACCENT)
                     } else if is_on {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else if b.act.enabled() {
-                        Style::default()
+                        Style::default().fg(ACCENT)
                     } else {
                         Style::default().add_modifier(Modifier::DIM)
                     };
