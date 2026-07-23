@@ -26,7 +26,7 @@ ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # Path + version so `xlsxy` can be published once `gridcore` is on crates.io.
 gridcore = { version = "0.1.0", path = "../gridcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
-ratatui = "0.29"
+ratatui = "0.30"
 # OS clipboard bridge (copy/paste across applications), same as docxy.
 arboard = "3"
 # Display-column widths for correct grid alignment + mouse hit-testing with
