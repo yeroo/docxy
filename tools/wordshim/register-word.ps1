@@ -52,6 +52,21 @@ if ($wLs -and $wLs -notmatch 'wordcomshim' -and -not $Force) {
 }
 Set-Default "$Classes\CLSID\$WordClsid\LocalServer32" ('"{0}" /automation' -f $Exe)
 
+# Type library: required only for EARLY-BOUND OUT-OF-PROCESS marshalling on a
+# machine with no Word (the oleaut universal marshaller reads it to build vtable
+# proxies for the shim's dual interfaces). Registered per-user if the tool + .tlb
+# are present. Late-bound and in-process paths don't need it. The .tlb is built on
+# a machine WITH Word (mkwordtypelib reads Word's typelib) and shipped as an
+# artifact.
+$mk  = Join-Path (Split-Path $Exe) 'mkwordtypelib.exe'
+$tlb = Join-Path $PSScriptRoot 'docxy-word.tlb'
+if ((Test-Path -LiteralPath $mk) -and (Test-Path -LiteralPath $tlb)) {
+    & $mk register $tlb | Out-Null
+    Write-Host "Registered type library (per-user) from $tlb"
+} else {
+    Write-Host "NOTE: type library NOT registered (need mkwordtypelib.exe next to the exe and docxy-word.tlb here)."
+}
+
 Write-Host "Registered Word.Application (ProgID + coclass) -> $Exe (HKCU, per-user)."
 Write-Host 'Test:  $w = New-Object -ComObject Word.Application; $w.Version; $w.Quit()'
 Write-Host 'Undo:  tools\wordshim\unregister-word.ps1'

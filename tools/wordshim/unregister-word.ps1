@@ -15,6 +15,13 @@ $Classes   = 'HKCU:\Software\Classes'
 
 Remove-Item "$Classes\CLSID\$ShimClsid" -Recurse -Force -ErrorAction SilentlyContinue
 
+# Unregister our per-user type library (no-op if never registered).
+$mk  = Join-Path $PSScriptRoot '..\..\target\release\mkwordtypelib.exe'
+$tlb = Join-Path $PSScriptRoot 'docxy-word.tlb'
+if ((Test-Path -LiteralPath $mk) -and (Test-Path -LiteralPath $tlb)) {
+    try { & $mk unregister $tlb | Out-Null } catch { }
+}
+
 $wLs = (Get-ItemProperty "$Classes\CLSID\$WordClsid\LocalServer32" -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
 if ($wLs -and $wLs -match 'wordcomshim') {
     Remove-Item "$Classes\CLSID\$WordClsid" -Recurse -Force -ErrorAction SilentlyContinue

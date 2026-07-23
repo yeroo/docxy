@@ -35,3 +35,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# The oracle differential test (tests/typelib_faithful.rs) introspects both Word's
+# registered typelib and our generated one via the same COM APIs.
+[target.'cfg(windows)'.dev-dependencies]
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
