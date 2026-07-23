@@ -16,8 +16,9 @@ use mailcore::graph::model::{
 };
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
 use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
-use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Color;
 
 /// Which pane currently has keyboard focus. Tab cycles `Folders` → `List` →
 /// `Reading` → `Folders` (see `ui::handle_key`).
@@ -39,6 +40,16 @@ pub enum Pane {
 pub enum Mode {
     Mail,
     Calendar,
+}
+
+/// What confirming the shared exit dialog (`exit_confirm`) should do. lookxy
+/// has no document/unsaved state to warn about (it's a mail client, not an
+/// editor), so there's exactly one action — but it still goes through
+/// `backstagecore::Confirm<A>` like docxy/xlsxy/yppxy's exit prompts, for a
+/// consistent Yes/No modal across all four apps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitAction {
+    Exit,
 }
 
 /// All in-memory TUI state: the local store, the sync channels, the cached
@@ -95,6 +106,13 @@ pub struct App {
     pub body_loading: bool,
     pub status: SyncState,
     pub quit: bool,
+    /// The shared Yes/No exit confirmation modal (`backstagecore::Confirm`),
+    /// open while asking whether to quit — the global quit key(s) (`q`/Ctrl-C,
+    /// see `main::is_global_quit`) and the mail File backstage's Exit item
+    /// both open this instead of setting `quit` directly (see `request_exit`).
+    /// `Some` owns the whole screen ahead of every other modal/pane — see
+    /// `ui::draw` and `main::run`.
+    pub exit_confirm: Option<backstagecore::Confirm<ExitAction>>,
     /// The open move-folder popup (`v`), if any — see `open_move_picker`.
     pub move_picker: Option<MovePicker>,
     /// The in-progress/submitted search prompt (`/`), if any — see
@@ -495,6 +513,7 @@ impl App {
             body_loading: false,
             status: SyncState::Idle,
             quit: false,
+            exit_confirm: None,
             move_picker: None,
             search: None,
             attachments: None,
@@ -751,6 +770,52 @@ impl App {
             || self.backstage.is_some()
             || self.ribbon_focus != crate::ui::ribbon::Focus::None
             || self.link_prompt.is_some()
+    }
+
+    /// Opens the shared Yes/No exit confirmation modal (used by the global
+    /// quit key(s) — `q`/Ctrl-C, see `main::is_global_quit` — and the mail
+    /// File backstage's Exit item). Closes the backstage first, if it was the
+    /// one asking, so the confirm modal isn't drawn on top of it. lookxy has
+    /// no unsaved-document state to warn about, so the prompt is just "Exit
+    /// lookxy?" — unlike docxy/xlsxy/yppxy's dirty-aware variant.
+    pub fn request_exit(&mut self) {
+        self.backstage = None;
+        self.exit_confirm = Some(backstagecore::Confirm::new(
+            "Exit lookxy?",
+            ExitAction::Exit,
+            Color::Cyan,
+        ));
+    }
+
+    /// Acts on the shared exit dialog's outcome: `Confirmed` quits, `Cancelled`
+    /// closes the modal without quitting, `Pending` is a no-op.
+    fn apply_exit_confirm(&mut self, outcome: backstagecore::ConfirmOutcome<ExitAction>) {
+        match outcome {
+            backstagecore::ConfirmOutcome::Pending => {}
+            backstagecore::ConfirmOutcome::Cancelled => self.exit_confirm = None,
+            backstagecore::ConfirmOutcome::Confirmed(ExitAction::Exit) => {
+                self.exit_confirm = None;
+                self.quit = true;
+            }
+        }
+    }
+
+    /// Routes a key to the exit confirm modal, if open — a no-op otherwise.
+    pub fn exit_confirm_key(&mut self, key: KeyEvent) {
+        let Some(c) = self.exit_confirm.as_mut() else {
+            return;
+        };
+        let outcome = c.key(key);
+        self.apply_exit_confirm(outcome);
+    }
+
+    /// Routes a click to the exit confirm modal, if open — a no-op otherwise.
+    pub fn exit_confirm_mouse(&mut self, x: u16, y: u16) {
+        let Some(c) = self.exit_confirm.as_mut() else {
+            return;
+        };
+        let outcome = c.mouse(x, y);
+        self.apply_exit_confirm(outcome);
     }
 
     /// Opens the read-only help overlay (`F1`/`?`).
@@ -1195,6 +1260,16 @@ impl App {
     /// or before the first draw records the pane rects (they start zero, and a
     /// zero rect `contains` nothing).
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        // A modal exit confirmation owns the whole screen while open — ahead
+        // of the backstage or any other popup, so it can appear over either
+        // (the File backstage's own Exit item is one of the things that opens
+        // it — see `request_exit`).
+        if self.exit_confirm.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                self.exit_confirm_mouse(m.column, m.row);
+            }
+            return;
+        }
         // The backstage handles its own clicks (menu / tabs / toggles).
         if self.backstage.is_some() {
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
@@ -1397,7 +1472,7 @@ impl App {
                 self.open_oof_form();
             }
             Item::Settings => self.mutate_backstage(|b| b.in_settings = true),
-            Item::Exit => self.quit = true,
+            Item::Exit => self.request_exit(),
         }
     }
 
@@ -5830,7 +5905,11 @@ pub(crate) mod tests {
             row: 3,
             modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
         });
-        assert!(app.quit);
+        // Exit doesn't quit outright anymore — it opens the shared Yes/No
+        // confirmation (and closes the backstage it was raised from).
+        assert!(app.exit_confirm.is_some());
+        assert!(app.backstage.is_none());
+        assert!(!app.quit);
     }
 
     #[test]
@@ -5894,14 +5973,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn backstage_exit_sets_quit() {
+    fn backstage_exit_opens_the_confirm_dialog_then_quits_on_yes() {
         use ratatui::crossterm::event::KeyCode;
         let mut app = App::for_test_with_seeded_store();
         app.open_backstage();
         app.backstage_key(KeyCode::Down); // Settings
         app.backstage_key(KeyCode::Down); // Exit
         app.backstage_key(KeyCode::Enter);
+        // Enter on Exit raises the shared confirm modal — nothing quits yet.
+        assert!(app.exit_confirm.is_some());
+        assert!(app.backstage.is_none());
+        assert!(!app.quit);
+        assert_eq!(app.exit_confirm.as_ref().unwrap().prompt(), "Exit lookxy?");
+        assert!(
+            app.exit_confirm.as_ref().unwrap().yes_selected(),
+            "Yes is the default"
+        );
+
+        app.exit_confirm_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.quit);
+        assert!(app.exit_confirm.is_none());
+    }
+
+    #[test]
+    fn backstage_exit_confirmation_can_be_cancelled() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = App::for_test_with_seeded_store();
+        app.open_backstage();
+        app.backstage_key(KeyCode::Down); // Settings
+        app.backstage_key(KeyCode::Down); // Exit
+        app.backstage_key(KeyCode::Enter);
+        assert!(app.exit_confirm.is_some());
+
+        app.exit_confirm_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.exit_confirm.is_none());
+        assert!(!app.quit);
     }
 
     #[test]

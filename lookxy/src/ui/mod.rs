@@ -44,6 +44,17 @@ use ratatui::style::{Color, Style};
 /// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
 /// which are drawn on top of them, in that order).
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // The shared exit confirmation owns the whole screen ahead of literally
+    // everything else — including the reminder banner and the other
+    // full-frame overlays below — since it can be raised from any of them
+    // (the mail File backstage's Exit item, or the global quit key(s) at any
+    // time; see `App::request_exit`).
+    if let Some(c) = app.exit_confirm.as_mut() {
+        let area = f.area();
+        f.render_widget(ratatui::widgets::Clear, area);
+        c.draw(f, area);
+        return;
+    }
     // Reminder banner: a 1-row strip at the top when reminders are queued; the
     // Mail panes and the calendar lay out against the remaining `area`. The
     // full-frame modal editors (compose/OOF) ignore it — a reminder that fires
@@ -815,6 +826,19 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Inbox"));
+    }
+
+    #[test]
+    fn exit_confirmation_draws_full_screen_over_everything_else() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::for_test_with_seeded_store();
+        app.request_exit();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Exit lookxy?"));
+        // The three-pane layout underneath is not drawn at all while it's open.
+        assert!(!text.contains("Inbox"));
     }
 
     #[test]
