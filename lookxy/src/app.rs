@@ -42,14 +42,18 @@ pub enum Mode {
     Calendar,
 }
 
-/// What confirming the shared exit dialog (`exit_confirm`) should do. lookxy
-/// has no document/unsaved state to warn about (it's a mail client, not an
-/// editor), so there's exactly one action — but it still goes through
-/// `backstagecore::Confirm<A>` like docxy/xlsxy/yppxy's exit prompts, for a
-/// consistent Yes/No modal across all four apps.
+/// What confirming the single shared `backstagecore::Confirm<ConfirmAction>`
+/// modal (`App::confirm`) should do: quit (raised by `request_exit`), or one
+/// of the destructive mail/calendar actions (whole-thread delete/move, event
+/// delete) raised by `delete_selected`/`confirm_move`/`delete_selected_event`.
+/// One modal, one action enum, for a consistent Yes/No dialog across every
+/// confirmation in the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExitAction {
+pub enum ConfirmAction {
     Exit,
+    DeleteThread(Vec<String>),
+    MoveThread(Vec<String>, String), // (message ids, destination folder id)
+    DeleteEvent(String),
 }
 
 /// All in-memory TUI state: the local store, the sync channels, the cached
@@ -106,13 +110,6 @@ pub struct App {
     pub body_loading: bool,
     pub status: SyncState,
     pub quit: bool,
-    /// The shared Yes/No exit confirmation modal (`backstagecore::Confirm`),
-    /// open while asking whether to quit — the global quit key(s) (`q`/Ctrl-C,
-    /// see `main::is_global_quit`) and the mail File backstage's Exit item
-    /// both open this instead of setting `quit` directly (see `request_exit`).
-    /// `Some` owns the whole screen ahead of every other modal/pane — see
-    /// `ui::draw` and `main::run`.
-    pub exit_confirm: Option<backstagecore::Confirm<ExitAction>>,
     /// The open move-folder popup (`v`), if any — see `open_move_picker`.
     pub move_picker: Option<MovePicker>,
     /// The in-progress/submitted search prompt (`/`), if any — see
@@ -213,9 +210,15 @@ pub struct App {
     /// so typing into the comment can never end up attached to a different
     /// event than the one the key was pressed on.
     pub rsvp_prompt: Option<RsvpPrompt>,
-    /// A pending destructive-action confirmation, if any (whole-thread delete
-    /// or move). `Some` blocks other keys until answered — see `ui::handle_key`.
-    pub confirm: Option<ConfirmModal>,
+    /// The single shared Yes/No confirmation modal (`backstagecore::Confirm`),
+    /// covering every confirm dialog in the app: the exit prompt (opened by
+    /// the global quit key(s) — `q`/Ctrl-C, see `main::is_global_quit` — and
+    /// the mail File backstage's Exit item, via `request_exit`) as well as
+    /// the destructive mail/calendar confirmations (whole-thread delete or
+    /// move, event delete). `Some` owns the whole screen ahead of every other
+    /// modal/pane — see `ui::draw`, `main::run`, and `confirm_key`/
+    /// `confirm_mouse`.
+    pub confirm: Option<backstagecore::Confirm<ConfirmAction>>,
     /// The open file-picker popup (opened to choose a file to attach to the
     /// message being composed), if any — see `ui::filepicker`. `Some` takes
     /// keys ahead of the compose view it's drawn over (see `ui::handle_key`).
@@ -445,18 +448,6 @@ pub struct ThreadView {
     pub expanded: bool,
 }
 
-/// A pending destructive confirmation (whole-conversation delete/move).
-pub struct ConfirmModal {
-    pub prompt: String,
-    pub action: ConfirmAction,
-}
-
-pub enum ConfirmAction {
-    DeleteThread(Vec<String>),
-    MoveThread(Vec<String>, String), // (message ids, destination folder id)
-    DeleteEvent(String),
-}
-
 /// One visible line in the threaded list: a collapsible conversation header,
 /// or (only under an expanded header) one of its messages. A single-message
 /// conversation is represented directly as a `Message` row with no header.
@@ -513,7 +504,6 @@ impl App {
             body_loading: false,
             status: SyncState::Idle,
             quit: false,
-            exit_confirm: None,
             move_picker: None,
             search: None,
             attachments: None,
@@ -772,50 +762,79 @@ impl App {
             || self.link_prompt.is_some()
     }
 
-    /// Opens the shared Yes/No exit confirmation modal (used by the global
-    /// quit key(s) — `q`/Ctrl-C, see `main::is_global_quit` — and the mail
-    /// File backstage's Exit item). Closes the backstage first, if it was the
-    /// one asking, so the confirm modal isn't drawn on top of it. lookxy has
-    /// no unsaved-document state to warn about, so the prompt is just "Exit
-    /// lookxy?" — unlike docxy/xlsxy/yppxy's dirty-aware variant.
+    /// Opens the shared Yes/No confirmation modal with the exit prompt (used
+    /// by the global quit key(s) — `q`/Ctrl-C, see `main::is_global_quit` —
+    /// and the mail File backstage's Exit item). Closes the backstage first,
+    /// if it was the one asking, so the confirm modal isn't drawn on top of
+    /// it. lookxy has no unsaved-document state to warn about, so the prompt
+    /// is just "Exit lookxy?" — unlike docxy/xlsxy/yppxy's dirty-aware variant.
     pub fn request_exit(&mut self) {
         self.backstage = None;
-        self.exit_confirm = Some(backstagecore::Confirm::new(
+        self.confirm = Some(backstagecore::Confirm::new(
             "Exit lookxy?",
-            ExitAction::Exit,
+            ConfirmAction::Exit,
             Color::Cyan,
         ));
     }
 
-    /// Acts on the shared exit dialog's outcome: `Confirmed` quits, `Cancelled`
-    /// closes the modal without quitting, `Pending` is a no-op.
-    fn apply_exit_confirm(&mut self, outcome: backstagecore::ConfirmOutcome<ExitAction>) {
+    /// Acts on the shared confirm modal's outcome: `Confirmed` runs the
+    /// carried action (quit, or the same delete/move/event-delete code the
+    /// old per-action `confirm_yes` ran), `Cancelled` closes the modal without
+    /// acting, `Pending` is a no-op. Always clears `self.confirm` on a
+    /// `Confirmed`/`Cancelled` outcome.
+    fn apply_confirm(&mut self, outcome: backstagecore::ConfirmOutcome<ConfirmAction>) {
         match outcome {
             backstagecore::ConfirmOutcome::Pending => {}
-            backstagecore::ConfirmOutcome::Cancelled => self.exit_confirm = None,
-            backstagecore::ConfirmOutcome::Confirmed(ExitAction::Exit) => {
-                self.exit_confirm = None;
-                self.quit = true;
+            backstagecore::ConfirmOutcome::Cancelled => self.confirm = None,
+            backstagecore::ConfirmOutcome::Confirmed(action) => {
+                self.confirm = None;
+                match action {
+                    ConfirmAction::Exit => self.quit = true,
+                    ConfirmAction::DeleteThread(ids) => {
+                        for id in ids {
+                            let _ = self.store.delete_message(&id);
+                            let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+                        }
+                        self.reload_messages();
+                    }
+                    ConfirmAction::MoveThread(ids, dest) => {
+                        for id in ids {
+                            if self.store.move_message(&id, &dest).is_ok() {
+                                let _ = self.sync.cmd_tx.send(SyncCommand::Move {
+                                    id,
+                                    dest: dest.clone(),
+                                });
+                            }
+                        }
+                        self.reload_messages();
+                    }
+                    ConfirmAction::DeleteEvent(id) => {
+                        let _ = self.store.delete_event(&id);
+                        let _ = self.sync.cmd_tx.send(SyncCommand::DeleteEvent { id });
+                        self.reload_agenda();
+                        self.reload_messages();
+                    }
+                }
             }
         }
     }
 
-    /// Routes a key to the exit confirm modal, if open — a no-op otherwise.
-    pub fn exit_confirm_key(&mut self, key: KeyEvent) {
-        let Some(c) = self.exit_confirm.as_mut() else {
+    /// Routes a key to the confirm modal, if open — a no-op otherwise.
+    pub fn confirm_key(&mut self, key: KeyEvent) {
+        let Some(c) = self.confirm.as_mut() else {
             return;
         };
         let outcome = c.key(key);
-        self.apply_exit_confirm(outcome);
+        self.apply_confirm(outcome);
     }
 
-    /// Routes a click to the exit confirm modal, if open — a no-op otherwise.
-    pub fn exit_confirm_mouse(&mut self, x: u16, y: u16) {
-        let Some(c) = self.exit_confirm.as_mut() else {
+    /// Routes a click to the confirm modal, if open — a no-op otherwise.
+    pub fn confirm_mouse(&mut self, x: u16, y: u16) {
+        let Some(c) = self.confirm.as_mut() else {
             return;
         };
         let outcome = c.mouse(x, y);
-        self.apply_exit_confirm(outcome);
+        self.apply_confirm(outcome);
     }
 
     /// Opens the read-only help overlay (`F1`/`?`).
@@ -1260,13 +1279,13 @@ impl App {
     /// or before the first draw records the pane rects (they start zero, and a
     /// zero rect `contains` nothing).
     pub fn on_mouse(&mut self, m: MouseEvent) {
-        // A modal exit confirmation owns the whole screen while open — ahead
+        // The shared confirm modal owns the whole screen while open — ahead
         // of the backstage or any other popup, so it can appear over either
         // (the File backstage's own Exit item is one of the things that opens
         // it — see `request_exit`).
-        if self.exit_confirm.is_some() {
+        if self.confirm.is_some() {
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                self.exit_confirm_mouse(m.column, m.row);
+                self.confirm_mouse(m.column, m.row);
             }
             return;
         }
@@ -2343,7 +2362,7 @@ impl App {
     /// (`series_master_id.is_some()`): recurring events stay read + RSVP only
     /// (see the calendar-edit design spec). A no-op if nothing is
     /// selected/highlighted or the resolved id isn't in the currently-loaded
-    /// `agenda` window. The actual delete happens on `confirm_yes` (see its
+    /// `agenda` window. The actual delete happens on `apply_confirm` (see its
     /// `ConfirmAction::DeleteEvent` arm), not here.
     pub fn delete_selected_event(&mut self) {
         let Some(id) = self
@@ -2361,10 +2380,11 @@ impl App {
             return;
         }
         let prompt = format!("Delete event '{}'?", row.subject);
-        self.confirm = Some(ConfirmModal {
+        self.confirm = Some(backstagecore::Confirm::new(
             prompt,
-            action: ConfirmAction::DeleteEvent(id),
-        });
+            ConfirmAction::DeleteEvent(id),
+            Color::Cyan,
+        ));
     }
 
     /// Ctrl-Enter in the event form: parse + validate the times, build the
@@ -2726,16 +2746,17 @@ impl App {
     /// bounds-safe pattern `reload_messages` already uses when a folder
     /// switch shrinks the list. In threaded mode, a multi-message conversation
     /// selected via its header opens the confirm modal instead of deleting
-    /// outright (see `confirm_yes`); a threaded singleton/message row deletes
+    /// outright (see `apply_confirm`); a threaded singleton/message row deletes
     /// directly, same as the flat path.
     pub fn delete_selected(&mut self) {
         if let Some(ids) = self.threaded_target_ids() {
             if ids.len() > 1 {
                 let prompt = format!("Delete {}?", self.describe_thread_scope(&ids));
-                self.confirm = Some(ConfirmModal {
+                self.confirm = Some(backstagecore::Confirm::new(
                     prompt,
-                    action: ConfirmAction::DeleteThread(ids),
-                });
+                    ConfirmAction::DeleteThread(ids),
+                    Color::Cyan,
+                ));
                 return;
             }
             // A singleton / single message row: delete directly.
@@ -2752,43 +2773,6 @@ impl App {
         let _ = self.store.delete_message(&id);
         self.reload_messages();
         let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
-    }
-
-    /// Esc on the confirm modal: dismiss it, doing nothing.
-    pub fn cancel_confirm(&mut self) {
-        self.confirm = None;
-    }
-
-    /// Enter on the confirm modal: carry out the pending action (per-message
-    /// optimistic store write + `SyncCommand`), then close it and reload.
-    pub fn confirm_yes(&mut self) {
-        let Some(modal) = self.confirm.take() else {
-            return;
-        };
-        match modal.action {
-            ConfirmAction::DeleteThread(ids) => {
-                for id in ids {
-                    let _ = self.store.delete_message(&id);
-                    let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
-                }
-            }
-            ConfirmAction::MoveThread(ids, dest) => {
-                for id in ids {
-                    if self.store.move_message(&id, &dest).is_ok() {
-                        let _ = self.sync.cmd_tx.send(SyncCommand::Move {
-                            id,
-                            dest: dest.clone(),
-                        });
-                    }
-                }
-            }
-            ConfirmAction::DeleteEvent(id) => {
-                let _ = self.store.delete_event(&id);
-                let _ = self.sync.cmd_tx.send(SyncCommand::DeleteEvent { id });
-                self.reload_agenda();
-            }
-        }
-        self.reload_messages();
     }
 
     /// Opens the move-folder popup over the highlighted message. A no-op if
@@ -2866,10 +2850,11 @@ impl App {
         // thread than the one the user opened the picker on.
         if let Some(ids) = picker.thread_ids {
             let scope = self.describe_thread_scope(&ids);
-            self.confirm = Some(ConfirmModal {
-                prompt: format!("Move {scope} to this folder?"),
-                action: ConfirmAction::MoveThread(ids, dest),
-            });
+            self.confirm = Some(backstagecore::Confirm::new(
+                format!("Move {scope} to this folder?"),
+                ConfirmAction::MoveThread(ids, dest),
+                Color::Cyan,
+            ));
             return;
         }
         if self.store.move_message(&picker.message_id, &dest).is_ok() {
@@ -5907,7 +5892,7 @@ pub(crate) mod tests {
         });
         // Exit doesn't quit outright anymore — it opens the shared Yes/No
         // confirmation (and closes the backstage it was raised from).
-        assert!(app.exit_confirm.is_some());
+        assert!(app.confirm.is_some());
         assert!(app.backstage.is_none());
         assert!(!app.quit);
     }
@@ -5981,18 +5966,18 @@ pub(crate) mod tests {
         app.backstage_key(KeyCode::Down); // Exit
         app.backstage_key(KeyCode::Enter);
         // Enter on Exit raises the shared confirm modal — nothing quits yet.
-        assert!(app.exit_confirm.is_some());
+        assert!(app.confirm.is_some());
         assert!(app.backstage.is_none());
         assert!(!app.quit);
-        assert_eq!(app.exit_confirm.as_ref().unwrap().prompt(), "Exit lookxy?");
+        assert_eq!(app.confirm.as_ref().unwrap().prompt(), "Exit lookxy?");
         assert!(
-            app.exit_confirm.as_ref().unwrap().yes_selected(),
+            app.confirm.as_ref().unwrap().yes_selected(),
             "Yes is the default"
         );
 
-        app.exit_confirm_key(KeyEvent::from(KeyCode::Enter));
+        app.confirm_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.quit);
-        assert!(app.exit_confirm.is_none());
+        assert!(app.confirm.is_none());
     }
 
     #[test]
@@ -6003,10 +5988,10 @@ pub(crate) mod tests {
         app.backstage_key(KeyCode::Down); // Settings
         app.backstage_key(KeyCode::Down); // Exit
         app.backstage_key(KeyCode::Enter);
-        assert!(app.exit_confirm.is_some());
+        assert!(app.confirm.is_some());
 
-        app.exit_confirm_key(KeyEvent::from(KeyCode::Esc));
-        assert!(app.exit_confirm.is_none());
+        app.confirm_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.confirm.is_none());
         assert!(!app.quit);
     }
 
@@ -6745,7 +6730,8 @@ pub(crate) mod tests {
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
 
         // Confirming deletes all messages and enqueues one Delete per message.
-        app.confirm_yes();
+        use ratatui::crossterm::event::KeyCode;
+        app.confirm_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.confirm.is_none());
         let mut count = 0;
         while let Ok(SyncCommand::Delete { .. }) = app.test_cmd_rx.as_ref().unwrap().try_recv() {
@@ -6757,6 +6743,7 @@ pub(crate) mod tests {
     #[test]
     fn canceling_the_confirm_deletes_nothing() {
         use crate::app::Row;
+        use ratatui::crossterm::event::KeyCode;
         let mut app = App::for_test_with_seeded_store();
         app.threaded = true;
         seed_second_in_c1(&app);
@@ -6768,7 +6755,7 @@ pub(crate) mod tests {
             .unwrap();
         app.row_index = pos;
         app.delete_selected();
-        app.cancel_confirm();
+        app.confirm_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.confirm.is_none());
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
     }
@@ -6820,7 +6807,8 @@ pub(crate) mod tests {
         assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
 
         // Confirming moves every message and enqueues one Move per message.
-        app.confirm_yes();
+        use ratatui::crossterm::event::KeyCode;
+        app.confirm_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.confirm.is_none());
         let mut count = 0;
         while let Ok(SyncCommand::Move { dest, .. }) = app.test_cmd_rx.as_ref().unwrap().try_recv()
@@ -7135,7 +7123,8 @@ pub(crate) mod tests {
         assert!(app.confirm.is_some()); // confirm modal opened, nothing deleted yet
         assert!(app.store.event_for_send("e1").unwrap().is_some());
 
-        app.confirm_yes(); // execute
+        use ratatui::crossterm::event::KeyCode;
+        app.confirm_key(KeyEvent::from(KeyCode::Enter)); // execute
         assert!(app.confirm.is_none());
         assert!(app.store.event_for_send("e1").unwrap().is_none()); // removed locally
         let cmd = app.test_cmd_rx.as_ref().unwrap().try_recv();
