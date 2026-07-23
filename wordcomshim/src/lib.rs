@@ -25,7 +25,8 @@ mod win {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     use docxcore::model::{
-        Align, Block, Cell, Document, Inline, Paragraph, ParProps, Row, Run, RunProps, Table, VMerge,
+        Align, Block, BreakKind, Cell, Document, Inline, Paragraph, ParProps, Row, Run, RunProps,
+        Table, VMerge,
     };
     use docxcore::package::{Package, load_package, new_package, save_package};
 
@@ -240,6 +241,18 @@ mod win {
         fn type_paragraph(&mut self) {
             let p = self.new_para();
             self.pkg.document.body.push(Block::Paragraph(p));
+            self.saved = false;
+        }
+
+        /// Insert a page/column/line break inline at the end.
+        fn insert_break(&mut self, kind: BreakKind) {
+            if !matches!(self.pkg.document.body.last(), Some(Block::Paragraph(_))) {
+                let p = self.new_para();
+                self.pkg.document.body.push(Block::Paragraph(p));
+            }
+            if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                p.content.push(Inline::Break(kind));
+            }
             self.saved = false;
         }
 
@@ -1411,6 +1424,7 @@ mod win {
             "underline" => 13,
             "paragraphformat" => 14,
             "style" => 16,
+            "insertbreak" => 17,
             _ => return None,
         })
     }
@@ -1475,6 +1489,20 @@ mod win {
                     12 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
                     13 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
                     14 => put_disp(result, ParaFmt { doc, all: false }),
+                    // InsertBreak([Type]) — wdPageBreak(7)/Column(8)/Line(6);
+                    // section breaks (0..3) fall back to a page break.
+                    17 => {
+                        let kind = match arg_i32(params, 0) {
+                            Some(8) => BreakKind::Column,
+                            Some(6) => BreakKind::Line,
+                            _ => BreakKind::Page,
+                        };
+                        reg(|r| {
+                            if let Some(d) = r.docs.get_mut(doc) {
+                                d.insert_break(kind)
+                            }
+                        });
+                    }
                     // Style — a style name ("Heading 1") or a wdStyle int.
                     16 => {
                         if is_put(wflags) {
