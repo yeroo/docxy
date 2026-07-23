@@ -1444,10 +1444,63 @@ mod win {
             "name" => 110,
             "cells" => 238,
             "range" => 197,
+            "columns" => 241,
+            "rows" => 258,
+            "usedrange" => 954,
             "activate" => 304,
             "select" => 235,
             _ => return None,
         })
+    }
+
+    /// A column letter ("A", "AB") -> 0-based index, via the cell-name parser.
+    fn col_index(letters: &str) -> Option<u32> {
+        parse_cell_name(&format!("{}1", letters.trim())).map(|(_, c)| c)
+    }
+
+    /// The `Columns`/`Rows` argument -> an inclusive 0-based span. Accepts a
+    /// letter/number range ("A:B", "1:3"), a single letter/number, or nothing
+    /// (the whole extent).
+    unsafe fn columns_arg(params: *const DISPPARAMS) -> (u32, u32) {
+        unsafe {
+            match arg(params, 0) {
+                None => (0, MAX_COL),
+                Some(v) if vt_of(v) == VT_BSTR => {
+                    let s = variant_to_string(v).unwrap_or_default();
+                    if let Some((a, b)) = s.split_once(':') {
+                        if let (Some(ca), Some(cb)) = (col_index(a), col_index(b)) {
+                            return (ca.min(cb), ca.max(cb));
+                        }
+                    }
+                    col_index(&s).map(|c| (c, c)).unwrap_or((0, MAX_COL))
+                }
+                Some(_) => {
+                    let n = (arg_i32(params, 0).unwrap_or(1).max(1) as u32) - 1;
+                    (n, n)
+                }
+            }
+        }
+    }
+    unsafe fn rows_arg(params: *const DISPPARAMS) -> (u32, u32) {
+        unsafe {
+            let parse1 = |s: &str| s.trim().parse::<u32>().ok().map(|n| n.saturating_sub(1));
+            match arg(params, 0) {
+                None => (0, MAX_ROW),
+                Some(v) if vt_of(v) == VT_BSTR => {
+                    let s = variant_to_string(v).unwrap_or_default();
+                    if let Some((a, b)) = s.split_once(':') {
+                        if let (Some(ra), Some(rb)) = (parse1(a), parse1(b)) {
+                            return (ra.min(rb), ra.max(rb));
+                        }
+                    }
+                    parse1(&s).map(|r| (r, r)).unwrap_or((0, MAX_ROW))
+                }
+                Some(_) => {
+                    let n = (arg_i32(params, 0).unwrap_or(1).max(1) as u32) - 1;
+                    (n, n)
+                }
+            }
+        }
     }
 
     impl IDispatch_Impl for Worksheet_Impl {
@@ -1567,12 +1620,79 @@ mod win {
                             }
                         }
                     }
+                    // Columns / Columns("A:B") / Columns(n) — span whole columns.
+                    241 => {
+                        let (c1, c2) = columns_arg(params);
+                        put_obj(
+                            result,
+                            Range {
+                                book,
+                                sheet,
+                                r1: 0,
+                                c1,
+                                r2: MAX_ROW,
+                                c2,
+                            },
+                        );
+                    }
+                    // Rows / Rows("1:3") / Rows(n) — span whole rows.
+                    258 => {
+                        let (r1, r2) = rows_arg(params);
+                        put_obj(
+                            result,
+                            Range {
+                                book,
+                                sheet,
+                                r1,
+                                c1: 0,
+                                r2,
+                                c2: MAX_COL,
+                            },
+                        );
+                    }
+                    // UsedRange — the populated bounding box (blank sheet -> A1).
+                    954 => {
+                        let (r1, c1, r2, c2) = reg(|r| {
+                            r.books
+                                .get(book)
+                                .and_then(|b| b.pkg.workbook.sheets.get(sheet))
+                                .map(used_bounds)
+                                .unwrap_or((0, 0, 0, 0))
+                        });
+                        put_obj(
+                            result,
+                            Range {
+                                book,
+                                sheet,
+                                r1,
+                                c1,
+                                r2,
+                                c2,
+                            },
+                        );
+                    }
                     304 | 235 => {} // Activate / Select — no-op
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
             }
         }
+    }
+
+    /// The bounding box of a sheet's populated cells (0,0,0,0 when empty).
+    fn used_bounds(s: &gridcore::sheet::Sheet) -> (u32, u32, u32, u32) {
+        let mut it = s.cells.keys();
+        let Some(&(r0, c0)) = it.next() else {
+            return (0, 0, 0, 0);
+        };
+        let (mut r1, mut c1, mut r2, mut c2) = (r0, c0, r0, c0);
+        for &(r, c) in s.cells.keys() {
+            r1 = r1.min(r);
+            c1 = c1.min(c);
+            r2 = r2.max(r);
+            c2 = c2.max(c);
+        }
+        (r1, c1, r2, c2)
     }
 
     // -----------------------------------------------------------------------
@@ -1600,6 +1720,8 @@ mod win {
             "numberformat" | "numberformatlocal" => 193,
             "horizontalalignment" => 136,
             "columnwidth" => 242,
+            "borders" => 435,
+            "borderaround" => 2771,
             "cells" => 238,
             "font" => 146,
             "interior" => 129,
@@ -1793,6 +1915,20 @@ mod win {
                             apply_style(book, sheet, (r1, c1, r2, c2), move |xf| xf.align = a);
                         }
                     }
+                    // Borders -> collection object; BorderAround -> draw box now.
+                    435 => {
+                        let b: IDispatch = Borders {
+                            book,
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        }
+                        .into();
+                        put(result, VARIANT::from(b));
+                    }
+                    2771 => apply_style(book, sheet, (r1, c1, r2, c2), |xf| xf.border = true),
                     146 => put_obj(
                         result,
                         Font {
@@ -2068,6 +2204,8 @@ mod win {
             "italic" => 2,
             "color" => 3,
             "colorindex" => 4,
+            "size" => 5,
+            "name" => 6,
             _ => return None,
         })
     }
@@ -2145,6 +2283,32 @@ mod win {
                             }
                         }
                     }
+                    5 => {
+                        if put_flag {
+                            if let Some(sz) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
+                                apply_style(book, sheet, rect, move |xf| xf.font_size = Some(sz));
+                            }
+                        } else {
+                            put(
+                                result,
+                                VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).font_size.unwrap_or(11.0)),
+                            );
+                        }
+                    }
+                    6 => {
+                        if put_flag {
+                            if let Some(nm) = arg_string(params, 0) {
+                                apply_style(book, sheet, rect, move |xf| {
+                                    xf.font_name = Some(nm.clone())
+                                });
+                            }
+                        } else {
+                            let n = cell_xf(book, sheet, rect.0, rect.1)
+                                .font_name
+                                .unwrap_or_else(|| "Calibri".into());
+                            put(result, VARIANT::from(BSTR::from(n.as_str())));
+                        }
+                    }
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
@@ -2199,6 +2363,86 @@ mod win {
                             if let Some(rgb) = arg_i32(params, 0).and_then(color_index) {
                                 apply_style(book, sheet, rect, move |xf| xf.fill = Some(rgb));
                             }
+                        }
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Borders — `range.Borders`, `range.Borders(edge)`. We model a single thin
+    // box border per cell, so setting a LineStyle/Weight on the collection or any
+    // edge draws the box. (gridcore's style model doesn't carry per-edge styles.)
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Borders {
+        book: usize,
+        sheet: usize,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+    }
+
+    fn borders_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "item" | "_default" => 0,
+            "linestyle" => 1,
+            "weight" => 2,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Borders_Impl {
+        no_typeinfo!();
+        fn GetIDsOfNames(
+            &self,
+            _riid: *const GUID,
+            rgsznames: *const PCWSTR,
+            cnames: u32,
+            _lcid: u32,
+            rgdispid: *mut i32,
+        ) -> Result<()> {
+            unsafe { resolve_names("Borders", rgsznames, cnames, rgdispid, borders_id) }
+        }
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            _params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (book, sheet) = (self.book, self.sheet);
+            let rect = (self.r1, self.c1, self.r2, self.c2);
+            unsafe {
+                log(&format!("Borders[{book}/{sheet}]::Invoke id={id}"));
+                match id {
+                    // Borders(edge) -> another Borders over the same range; setting
+                    // a LineStyle on it still draws our box.
+                    0 => {
+                        let b: IDispatch = Borders {
+                            book,
+                            sheet,
+                            r1: rect.0,
+                            c1: rect.1,
+                            r2: rect.2,
+                            c2: rect.3,
+                        }
+                        .into();
+                        put(result, VARIANT::from(b));
+                    }
+                    // LineStyle / Weight put -> draw the box border.
+                    1 | 2 => {
+                        if is_put(wflags) {
+                            apply_style(book, sheet, rect, |xf| xf.border = true);
                         }
                     }
                     _ => return unhandled(id, wflags, result),

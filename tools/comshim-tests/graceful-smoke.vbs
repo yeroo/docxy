@@ -32,16 +32,17 @@ ws.Cells(3, 1).Value = "Gadgets"
 ws.Cells(3, 2).Value = 32.5
 ws.Range("B4").Formula = "=SUM(B2:B3)"
 
-' --- unmodeled Range formatting (swallowed, output still valid) ---
+' --- Range formatting: applied to the workbook style table ---
 ws.Range("A1:B1").Font.Bold = True
-ws.Range("A1:B1").Font.Size = 12
-ws.Range("A1:B1").Font.Name = "Calibri"
+ws.Range("A1:B1").Font.Size = 14
+ws.Range("A1:B1").Font.Name = "Arial"
 ws.Range("A1:B1").Interior.Color = 15773696
 ws.Range("A1:B1").HorizontalAlignment = -4108
-ws.Columns("A:B").AutoFit
+ws.Columns("A:B").AutoFit                 ' unmodeled AutoFit -> swallowed
 ws.Range("A1").ColumnWidth = 24
+ws.Columns("C:C").ColumnWidth = 30        ' whole-column via Worksheet.Columns
 ws.Range("B2:B4").NumberFormat = "#,##0.00"
-ws.Range("A1").Borders.LineStyle = 1
+ws.Range("A1:B4").Borders.LineStyle = 1   ' box border around the table
 
 ' --- unmodeled collection walks / method calls (do-nothing object) ---
 ws.PageSetup.Orientation = 2

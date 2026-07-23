@@ -557,6 +557,8 @@ fn parse_styles(xml: &str) -> Styles {
         bold: bool,
         italic: bool,
         color: Option<(u8, u8, u8)>,
+        size: Option<f64>,
+        name: Option<String>,
     }
     let mut numfmts: BTreeMap<u32, NumFmt> = BTreeMap::new();
     let mut codes: BTreeMap<u32, String> = BTreeMap::new();
@@ -632,6 +634,19 @@ fn parse_styles(xml: &str) -> Styles {
                         }
                     }
                 }
+                "sz" => {
+                    if let Some(f) = &mut cur_font {
+                        f.size = p.attr("val").parse().ok();
+                    }
+                }
+                "name" if in_fonts => {
+                    if let Some(f) = &mut cur_font {
+                        let n = decode(p.attr("val"));
+                        if !n.is_empty() {
+                            f.name = Some(n);
+                        }
+                    }
+                }
                 "fills" => in_fills = true,
                 "fill" if in_fills => cur_fill = Some(None),
                 // dxf solid fills carry the colour in `<bgColor>` (or `<fgColor>`).
@@ -675,6 +690,9 @@ fn parse_styles(xml: &str) -> Styles {
                         color: font.color,
                         fill: fills.get(fill_id).copied().flatten(),
                         align: crate::sheet::Align::General,
+                        font_size: font.size,
+                        font_name: font.name.clone(),
+                        border: false,
                     });
                 }
                 "alignment" if in_cellxfs => {
@@ -774,11 +792,27 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     }
     let font_base = read_count(orig, "<fonts");
     let fill_base = read_count(orig, "<fills");
+    let border_base = read_count(orig, "<borders");
     let mut next_numfmt = max_numfmt_id(orig) + 1;
 
-    let (mut new_fonts, mut new_fills, mut new_numfmts, mut new_xfs) =
-        (String::new(), String::new(), String::new(), String::new());
-    let (mut fonts_added, mut fills_added, mut numfmts_added) = (0u32, 0u32, 0u32);
+    let (mut new_fonts, mut new_fills, mut new_borders, mut new_numfmts, mut new_xfs) = (
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    );
+    let (mut fonts_added, mut fills_added, mut borders_added, mut numfmts_added) =
+        (0u32, 0u32, 0u32, 0u32);
+
+    // Excel accepts an integer point size without a trailing ".0".
+    let fmt_size = |s: f64| {
+        if s.fract() == 0.0 {
+            format!("{}", s as i64)
+        } else {
+            format!("{s}")
+        }
+    };
 
     for xf in authored {
         // Font (always minted so the id is exact).
@@ -792,7 +826,11 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         if let Some((r, g, b)) = xf.color {
             font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
         }
-        font.push_str("<sz val=\"11\"/><name val=\"Calibri\"/></font>");
+        font.push_str(&format!(
+            "<sz val=\"{}\"/><name val=\"{}\"/></font>",
+            fmt_size(xf.font_size.unwrap_or(11.0)),
+            esc_attr(xf.font_name.as_deref().unwrap_or("Calibri"))
+        ));
         let font_id = font_base + fonts_added;
         new_fonts.push_str(&font);
         fonts_added += 1;
@@ -804,6 +842,18 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
             ));
             let id = fill_base + fills_added;
             fills_added += 1;
+            (id, true)
+        } else {
+            (0, false)
+        };
+
+        // Border (a thin box around the cell) when set.
+        let (border_id, apply_border) = if xf.border {
+            new_borders.push_str(
+                "<border><left style=\"thin\"/><right style=\"thin\"/><top style=\"thin\"/><bottom style=\"thin\"/><diagonal/></border>",
+            );
+            let id = border_base + borders_added;
+            borders_added += 1;
             (id, true)
         } else {
             (0, false)
@@ -824,13 +874,16 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         };
 
         let mut x = format!(
-            "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"0\" xfId=\"0\" applyFont=\"1\""
+            "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"{border_id}\" xfId=\"0\" applyFont=\"1\""
         );
         if apply_num {
             x.push_str(" applyNumberFormat=\"1\"");
         }
         if apply_fill {
             x.push_str(" applyFill=\"1\"");
+        }
+        if apply_border {
+            x.push_str(" applyBorder=\"1\"");
         }
         match xf.align.attr() {
             Some(a) => x.push_str(&format!(
@@ -857,6 +910,10 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     if fills_added > 0 {
         xml = bump_count(&xml, "<fills", fills_added);
         xml = xml.replacen("</fills>", &format!("{new_fills}</fills>"), 1);
+    }
+    if borders_added > 0 {
+        xml = bump_count(&xml, "<borders", borders_added);
+        xml = xml.replacen("</borders>", &format!("{new_borders}</borders>"), 1);
     }
     xml = bump_count(&xml, "<cellXfs", authored.len() as u32);
     xml = xml.replacen("</cellXfs>", &format!("{new_xfs}</cellXfs>"), 1);
@@ -2887,6 +2944,7 @@ mod tests {
             align: Align::Right,
             code: Some("0.00%".to_string()),
             numfmt: crate::sheet::NumFmt::Percent { decimals: 2 },
+            ..Xf::default()
         });
         pkg.workbook.sheets[0].set_cell(
             0,
