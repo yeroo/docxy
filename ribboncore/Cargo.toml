@@ -14,4 +14,4 @@ categories = ["command-line-utilities"]
 workspace = true
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"

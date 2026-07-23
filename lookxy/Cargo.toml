@@ -32,7 +32,7 @@ editcore = { version = "0.1.0", path = "../editcore" }
 # live mailbox from a sibling agwinterm pane.
 ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
-ratatui = "0.29"
+ratatui = "0.30"
 # Display-column widths for correct alignment + truncation with wide glyphs.
 unicode-width = "0.2"
 # Terminal graphics protocol detection + encoding for painting decoded inline
