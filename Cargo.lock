@@ -217,6 +217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "comshimcore"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1520,6 +1528,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
+name = "wordcomshim"
+version = "0.1.0"
+dependencies = [
+ "comshimcore",
+ "docxcore",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "x11rb"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1540,6 +1558,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 name = "xlcomshim"
 version = "0.1.0"
 dependencies = [
+ "comshimcore",
  "gridcore",
  "windows",
  "windows-core",
