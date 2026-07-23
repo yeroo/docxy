@@ -33,7 +33,9 @@ mod win {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     use gridcore::engine::Engine;
-    use gridcore::sheet::{Cell, CellValue, cell_name, parse_cell_name, parse_range_name};
+    use gridcore::sheet::{
+        Align, Cell, CellValue, Styles, Xf, cell_name, parse_cell_name, parse_range_name,
+    };
     use gridcore::xlsx::{SheetPackage, new_xlsx, save_xlsx};
 
     use windows::Win32::Foundation::E_NOTIMPL;
@@ -394,6 +396,11 @@ mod win {
                 }
             })
         }
+    }
+
+    /// Argument `i` as a bool, `default` when omitted/uncoercible.
+    unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
+        unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
     }
 
     fn variant_to_string(v: &VARIANT) -> Option<String> {
@@ -1591,6 +1598,7 @@ mod win {
             "formula" => 261,
             "formular1c1" => 264,
             "numberformat" | "numberformatlocal" => 193,
+            "horizontalalignment" => 136,
             "cells" => 238,
             "font" => 146,
             "interior" => 129,
@@ -1731,19 +1739,56 @@ mod win {
                             c2,
                         },
                     ),
-                    // NumberFormat — accepted, not yet applied (formatting pass).
+                    // NumberFormat / NumberFormatLocal — store the format code on
+                    // the cells' xf so SaveAs writes a real numFmt.
                     193 => {
                         if is_put(wflags) {
-                            log(&format!(
-                                "NumberFormat put (ignored in P1): {:?}",
-                                arg_string(params, 0)
-                            ));
+                            if let Some(fmt) = arg_string(params, 0) {
+                                apply_style(book, sheet, (r1, c1, r2, c2), move |xf| {
+                                    xf.code = Some(fmt.clone())
+                                });
+                            }
                         } else {
-                            put(result, VARIANT::from("General"));
+                            let code = cell_xf(book, sheet, r1, c1)
+                                .code
+                                .unwrap_or_else(|| "General".into());
+                            put(result, VARIANT::from(BSTR::from(code.as_str())));
                         }
                     }
-                    146 => put_obj(result, Font),
-                    129 => put_obj(result, Interior),
+                    // HorizontalAlignment (xlLeft/-4131, xlCenter/-4108, xlRight/-4152).
+                    136 => {
+                        if is_put(wflags) {
+                            let a = match arg_i32(params, 0) {
+                                Some(-4131) => Align::Left,
+                                Some(-4108) => Align::Center,
+                                Some(-4152) => Align::Right,
+                                _ => Align::General,
+                            };
+                            apply_style(book, sheet, (r1, c1, r2, c2), move |xf| xf.align = a);
+                        }
+                    }
+                    146 => put_obj(
+                        result,
+                        Font {
+                            book,
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        },
+                    ),
+                    129 => put_obj(
+                        result,
+                        Interior {
+                            book,
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        },
+                    ),
                     236 => put(
                         result,
                         VARIANT::from(BSTR::from(cell_name(r1, c1).as_str())),
@@ -1878,69 +1923,262 @@ mod win {
     }
 
     // -----------------------------------------------------------------------
-    // Font / Interior — accept-and-ignore in P1 (so `.Font.Bold = True` etc.
-    // don't fault; real formatting lands with the broader coverage pass).
+    // Cell formatting — applied to the workbook's style table so it survives
+    // SaveAs. gridcore serialises authored xfs (bold/italic/font color/fill/
+    // numFmt/alignment) into styles.xml, so real Excel shows the formatting.
     // -----------------------------------------------------------------------
 
-    #[implement(IFont)]
-    struct Font;
+    /// Intern `xf` in the style table (dedup), returning its `s=` index.
+    fn xf_index(styles: &mut Styles, xf: Xf) -> u32 {
+        match styles.xfs.iter().position(|x| *x == xf) {
+            Some(i) => i as u32,
+            None => {
+                styles.xfs.push(xf);
+                styles.xfs.len() as u32 - 1
+            }
+        }
+    }
 
-    #[implement(IInterior)]
-    struct Interior;
+    /// Apply a formatting delta to every cell of a rect: read the cell's current
+    /// Xf, mutate it, intern the result, and repoint the cell at it (creating a
+    /// blank cell when needed — Excel formats empty cells too).
+    fn apply_style(book: usize, sheet: usize, rect: (u32, u32, u32, u32), modify: impl Fn(&mut Xf)) {
+        let (r1, c1, r2, c2) = rect;
+        let cells = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
+        if cells > 1_000_000 {
+            log(&format!("apply_style: refusing huge range ({cells} cells)"));
+            return;
+        }
+        reg(|reg| {
+            let Some(b) = reg.books.get_mut(book) else {
+                return;
+            };
+            let wb = &mut b.pkg.workbook;
+            if sheet >= wb.sheets.len() {
+                return;
+            }
+            for row in r1..=r2 {
+                for col in c1..=c2 {
+                    let cur = wb.sheets[sheet]
+                        .cells
+                        .get(&(row, col))
+                        .map(|c| c.style)
+                        .unwrap_or(0);
+                    let mut xf = wb.styles.xfs.get(cur as usize).cloned().unwrap_or_default();
+                    modify(&mut xf);
+                    let idx = xf_index(&mut wb.styles, xf);
+                    wb.sheets[sheet].cells.entry((row, col)).or_default().style = idx;
+                }
+            }
+            b.saved = false;
+        });
+    }
 
-    fn ignore_id(name: &str) -> Option<i32> {
-        // Any member resolves to a throwaway id; Invoke accepts puts and returns
-        // benign gets.
-        Some(match name.to_ascii_lowercase().as_str() {
-            "bold" => 96,
-            "italic" => 101,
-            "size" => 104,
-            "name" => 110,
-            "color" => 99,
-            "colorindex" => 97,
-            "underline" => 106,
-            "pattern" => 95,
-            _ => 1,
+    /// The resolved Xf of a single cell (its `s=` xf, or the default).
+    fn cell_xf(book: usize, sheet: usize, r: u32, c: u32) -> Xf {
+        reg(|reg| {
+            reg.books.get(book).and_then(|b| {
+                let wb = &b.pkg.workbook;
+                let idx = wb.sheets.get(sheet)?.cells.get(&(r, c)).map(|c| c.style).unwrap_or(0);
+                wb.styles.xfs.get(idx as usize).cloned()
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    /// Excel's Color is a packed BGR long: R + G*256 + B*65536.
+    fn excel_color(c: i32) -> (u8, u8, u8) {
+        let c = c as u32;
+        ((c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8)
+    }
+    fn rgb_to_excel(rgb: (u8, u8, u8)) -> i32 {
+        (rgb.0 as i32) | ((rgb.1 as i32) << 8) | ((rgb.2 as i32) << 16)
+    }
+    /// A slice of Excel's ColorIndex palette — enough for the common header colors.
+    fn color_index(i: i32) -> Option<(u8, u8, u8)> {
+        Some(match i {
+            1 => (0, 0, 0),
+            2 => (255, 255, 255),
+            3 => (255, 0, 0),
+            4 => (0, 255, 0),
+            5 => (0, 0, 255),
+            6 => (255, 255, 0),
+            7 => (255, 0, 255),
+            8 => (0, 255, 255),
+            _ => return None,
         })
     }
 
-    macro_rules! ignore_dispatch {
-        ($t:ty, $who:literal) => {
-            impl IDispatch_Impl for $t {
-                no_typeinfo!();
-                fn GetIDsOfNames(
-                    &self,
-                    _riid: *const GUID,
-                    rgsznames: *const PCWSTR,
-                    cnames: u32,
-                    _lcid: u32,
-                    rgdispid: *mut i32,
-                ) -> Result<()> {
-                    unsafe { resolve_names($who, rgsznames, cnames, rgdispid, ignore_id) }
-                }
-                fn Invoke(
-                    &self,
-                    id: i32,
-                    _riid: *const GUID,
-                    _lcid: u32,
-                    wflags: DISPATCH_FLAGS,
-                    _params: *const DISPPARAMS,
-                    result: *mut VARIANT,
-                    _ei: *mut EXCEPINFO,
-                    _ae: *mut u32,
-                ) -> Result<()> {
-                    unsafe {
-                        if !is_put(wflags) {
-                            put(result, VARIANT::from(false));
-                        }
-                        let _ = id;
-                        Ok(())
-                    }
-                }
-            }
-        };
+    // -----------------------------------------------------------------------
+    // Font / Interior — real formatting objects over gridcore styles. Each
+    // carries the target range so `range.Font.Bold = True` / `.Interior.Color =`
+    // land in styles.xml. Members we can't represent (Size/Name/Underline/
+    // Pattern) fall through to the graceful `unhandled` path.
+    // -----------------------------------------------------------------------
+
+    #[implement(IFont)]
+    struct Font {
+        book: usize,
+        sheet: usize,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
     }
 
-    ignore_dispatch!(Font_Impl, "Font");
-    ignore_dispatch!(Interior_Impl, "Interior");
+    #[implement(IInterior)]
+    struct Interior {
+        book: usize,
+        sheet: usize,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+    }
+
+    fn font_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "bold" => 1,
+            "italic" => 2,
+            "color" => 3,
+            "colorindex" => 4,
+            _ => return None,
+        })
+    }
+    fn interior_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "color" => 1,
+            "colorindex" => 2,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Font_Impl {
+        no_typeinfo!();
+        fn GetIDsOfNames(
+            &self,
+            _riid: *const GUID,
+            rgsznames: *const PCWSTR,
+            cnames: u32,
+            _lcid: u32,
+            rgdispid: *mut i32,
+        ) -> Result<()> {
+            unsafe { resolve_names("Font", rgsznames, cnames, rgdispid, font_id) }
+        }
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (book, sheet) = (self.book, self.sheet);
+            let rect = (self.r1, self.c1, self.r2, self.c2);
+            unsafe {
+                log(&format!(
+                    "Font[{book}/{sheet}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
+                let put_flag = is_put(wflags);
+                match id {
+                    1 => {
+                        if put_flag {
+                            let on = arg_bool(params, 0, true);
+                            apply_style(book, sheet, rect, move |xf| xf.bold = on);
+                        } else {
+                            put(result, VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).bold));
+                        }
+                    }
+                    2 => {
+                        if put_flag {
+                            let on = arg_bool(params, 0, true);
+                            apply_style(book, sheet, rect, move |xf| xf.italic = on);
+                        } else {
+                            put(result, VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).italic));
+                        }
+                    }
+                    3 => {
+                        if put_flag {
+                            if let Some(c) = arg_i32(params, 0) {
+                                let rgb = excel_color(c);
+                                apply_style(book, sheet, rect, move |xf| xf.color = Some(rgb));
+                            }
+                        } else {
+                            let c = cell_xf(book, sheet, rect.0, rect.1).color.map(rgb_to_excel);
+                            put(result, VARIANT::from(c.unwrap_or(0)));
+                        }
+                    }
+                    4 => {
+                        if put_flag {
+                            if let Some(rgb) = arg_i32(params, 0).and_then(color_index) {
+                                apply_style(book, sheet, rect, move |xf| xf.color = Some(rgb));
+                            }
+                        }
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    impl IDispatch_Impl for Interior_Impl {
+        no_typeinfo!();
+        fn GetIDsOfNames(
+            &self,
+            _riid: *const GUID,
+            rgsznames: *const PCWSTR,
+            cnames: u32,
+            _lcid: u32,
+            rgdispid: *mut i32,
+        ) -> Result<()> {
+            unsafe { resolve_names("Interior", rgsznames, cnames, rgdispid, interior_id) }
+        }
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (book, sheet) = (self.book, self.sheet);
+            let rect = (self.r1, self.c1, self.r2, self.c2);
+            unsafe {
+                log(&format!(
+                    "Interior[{book}/{sheet}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
+                match id {
+                    1 => {
+                        if is_put(wflags) {
+                            if let Some(c) = arg_i32(params, 0) {
+                                let rgb = excel_color(c);
+                                apply_style(book, sheet, rect, move |xf| xf.fill = Some(rgb));
+                            }
+                        } else {
+                            let c = cell_xf(book, sheet, rect.0, rect.1).fill.map(rgb_to_excel);
+                            put(result, VARIANT::from(c.unwrap_or(0)));
+                        }
+                    }
+                    2 => {
+                        if is_put(wflags) {
+                            if let Some(rgb) = arg_i32(params, 0).and_then(color_index) {
+                                apply_style(book, sheet, rect, move |xf| xf.fill = Some(rgb));
+                            }
+                        }
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
 }
