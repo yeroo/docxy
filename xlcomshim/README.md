@@ -58,9 +58,12 @@ swallowed, a get/call returns a do-nothing object so chains like
 | Word | ⬜ `Word.Application` over `docxcore` — later |
 
 Known limits: graceful degradation covers the late-bound path; an unmodeled
-*early-bound* member returns a clean `E_NOTIMPL`. Whole-column formatting and
-`Font.Size`/`Name` aren't represented (gridcore's style model). `Range` currently
-falls back to `IDispatch` for its leaf ops (a separate `IRange` vtable IID).
+*early-bound* member returns a clean `E_NOTIMPL`. Whole-column font/fill
+formatting isn't represented (the per-cell style model). `Range` dispatches
+through `IDispatch` by design — it is a **dispinterface** in Excel's object model,
+so even real Excel serves Range only via `IDispatch` (`(Excel.IRange)range`, the
+vtable IID, throws `InvalidCastException` against Excel itself). Our Range path
+matches Excel exactly; there is no vtable Range to implement.
 
 ## Try it
 

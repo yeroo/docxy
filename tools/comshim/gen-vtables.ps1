@@ -107,30 +107,14 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine('// are layered on in main.rs. include!d inside `mod win`.')
 [void]$sb.AppendLine()
 
-foreach ($iface in $map.Keys) {
-    $trait  = $map[$iface].trait
-    $struct = $map[$iface].struct
-    # locate the interface header
-    $start = ($lines | Select-String -SimpleMatch "INTERFACE $iface " | Select-Object -First 1).LineNumber
-    if (-not $start) { throw "interface $iface not found in dump" }
-    $header = $lines[$start - 1]
-    if ($header -notmatch 'IID=\{([0-9A-Fa-f-]+)\}') { throw "no IID for $iface" }
-    $iid = $Matches[1]
+# Extra IIDs the same struct+layout should ALSO be reachable under. Kept as a
+# mechanism, but currently empty: the one candidate (Range's vtable interface
+# IRange {..846-0001}) turned out to be a phantom — even REAL Excel's Range does
+# not implement it (it is a pure dispinterface, served via IDispatch), so there
+# is nothing to alias. Keyed by dump interface -> list of @{ trait; iid }.
+$aliases = @{}
 
-    # collect slot numbers >= 7 until the next INTERFACE/separator
-    $slots = @()
-    for ($i = $start; $i -lt $lines.Count; $i++) {
-        $ln = $lines[$i]
-        if ($ln -match '^INTERFACE ' -or $ln -match '^={5,}') { break }
-        if ($ln -match '^\s*slot#(\d+)\s') {
-            $n = [int]$Matches[1]
-            if ($n -ge 7) { $slots += $n }
-        }
-    }
-
-    $ov = $overrides[$iface]
-    if (-not $ov) { $ov = @{} }
-
+function Emit-Iface($sb, $trait, $iid, $struct, $slots, $ov) {
     [void]$sb.AppendLine("#[interface(`"$iid`")]")
     [void]$sb.AppendLine("unsafe trait $trait`: IDispatch {")
     foreach ($n in $slots) {
@@ -162,7 +146,39 @@ foreach ($iface in $map.Keys) {
     }
     [void]$sb.AppendLine("}")
     [void]$sb.AppendLine()
+}
+
+foreach ($iface in $map.Keys) {
+    $trait  = $map[$iface].trait
+    $struct = $map[$iface].struct
+    # locate the interface header
+    $start = ($lines | Select-String -SimpleMatch "INTERFACE $iface " | Select-Object -First 1).LineNumber
+    if (-not $start) { throw "interface $iface not found in dump" }
+    $header = $lines[$start - 1]
+    if ($header -notmatch 'IID=\{([0-9A-Fa-f-]+)\}') { throw "no IID for $iface" }
+    $iid = $Matches[1]
+
+    # collect slot numbers >= 7 until the next INTERFACE/separator
+    $slots = @()
+    for ($i = $start; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]
+        if ($ln -match '^INTERFACE ' -or $ln -match '^={5,}') { break }
+        if ($ln -match '^\s*slot#(\d+)\s') {
+            $n = [int]$Matches[1]
+            if ($n -ge 7) { $slots += $n }
+        }
+    }
+
+    $ov = $overrides[$iface]
+    if (-not $ov) { $ov = @{} }
+
+    Emit-Iface $sb $trait $iid $struct $slots $ov
     Write-Host ("{0} -> {1} on {2}: {3} slots (7..{4}), {5} real" -f $iface, $trait, $struct, $slots.Count, ($slots[-1]), $ov.Count)
+
+    foreach ($alias in $aliases[$iface]) {
+        Emit-Iface $sb $alias.trait $alias.iid $struct $slots $ov
+        Write-Host ("  alias {0} ({1}) on {2}" -f $alias.trait, $alias.iid, $struct)
+    }
 }
 
 Set-Content -LiteralPath $Out -Value $sb.ToString() -Encoding UTF8

@@ -1699,6 +1699,12 @@ mod win {
     // Range
     // -----------------------------------------------------------------------
 
+    // Range is a DISPINTERFACE ({..846-0000}), not a vtable dual: even REAL Excel
+    // serves Range only through IDispatch — `(Excel.IRange)range` (the vtable IID
+    // {..846-0001}) throws InvalidCastException against Excel itself. So our
+    // IDispatch::Invoke path below is not a fallback, it is THE early-bound path,
+    // matching Excel exactly. (Our IRange trait is generated only so an early-bound
+    // client's `(Excel.Range)` cast resolves; the actual member calls dispatch.)
     #[implement(IRange)]
     struct Range {
         book: usize,
