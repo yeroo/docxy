@@ -1,0 +1,25 @@
+[package]
+name = "comshimcore"
+description = "Shared COM automation-server scaffolding for the Office shims (xlcomshim, wordcomshim): the class factory, LocalServer32/InprocServer32 plumbing, VARIANT helpers, graceful degradation, logging, and the type-library author/register tool. App-specific object graphs live in each shim."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Windows-only; an empty crate elsewhere so the workspace still builds on Linux CI.
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_WindowsAndMessaging",
+] }

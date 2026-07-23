@@ -27,6 +27,7 @@ workspace = true
 # Windows-only: the whole server compiles to a stub on other targets, so the
 # workspace still builds on Linux/macOS CI.
 [target.'cfg(windows)'.dependencies]
+comshimcore = { path = "../comshimcore" }
 gridcore = { path = "../gridcore" }
 # The #[implement] macro expands to `::windows_core::…` paths, so windows-core
 # must be a named dependency.

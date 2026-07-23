@@ -30,7 +30,10 @@ mod win {
     use std::cell::RefCell;
     use std::ffi::c_void;
     use std::process::ExitCode;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    // Shared COM scaffolding: VARIANT helpers, logging, graceful degradation,
+    // resolve_names, the server + DLL plumbing, the Application counter, VT tags,
+    // and the no_typeinfo! macro.
+    use comshimcore::*;
 
     use gridcore::engine::Engine;
     use gridcore::sheet::{
@@ -38,23 +41,13 @@ mod win {
     };
     use gridcore::xlsx::{SheetPackage, new_xlsx, save_xlsx};
 
-    use windows::Win32::Foundation::E_NOTIMPL;
-    use windows::Win32::Foundation::{
-        BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX,
-        E_FAIL, E_POINTER, S_FALSE, S_OK,
-    };
+    use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
     use windows::Win32::System::Com::{
-        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
-        CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
-        DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
-        IClassFactory_Impl, IDispatch, IDispatch_Impl, IDispatch_Vtbl, ITypeInfo,
-        REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
+        DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
     use windows::core::{
-        BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement, interface,
+        BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
     };
 
     /// Our own coclass CLSID — a brand-new GUID, NEVER Microsoft's Excel CLSID
@@ -67,21 +60,53 @@ mod win {
     /// switch shadows it into HKCU. We never write this key into HKLM.
     const EXCEL_CLSID: GUID = GUID::from_u128(0x00024500_0000_0000_c000_000000000046);
 
-    const DISPID_UNKNOWN: i32 = -1;
+    // -----------------------------------------------------------------------
+    // Server / DLL plumbing — the generic runtime lives in comshimcore; the shim
+    // supplies only its CLSIDs and the root Application constructor.
+    // -----------------------------------------------------------------------
+
+    fn make_app() -> IDispatch {
+        let a: IApplication = Application::new().into();
+        a.cast().expect("Application derives IDispatch")
+    }
+
+    pub fn run() -> ExitCode {
+        init("xlcomshim");
+        if !should_serve() {
+            eprintln!(
+                "xlcomshim — Excel-compatible COM automation server (LocalServer32).\n\
+                 Register with tools/comshim/register-shim.ps1; COM launches it with -Embedding."
+            );
+            return ExitCode::SUCCESS;
+        }
+        match run_local_server(SHIM_CLSID, EXCEL_CLSID, make_app) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                log(&format!("server error: {e:?}"));
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn DllGetClassObject(
+        rclsid: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> HRESULT {
+        unsafe { dll_get_class_object(SHIM_CLSID, EXCEL_CLSID, make_app, rclsid, riid, ppv) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn DllCanUnloadNow() -> HRESULT {
+        dll_can_unload_now()
+    }
 
     // Excel's sheet extents, used when `Worksheet.Cells` (no index) yields a
     // Range covering the whole sheet.
     const MAX_ROW: u32 = 1_048_575;
     const MAX_COL: u32 = 16_383;
 
-    // ---- VARIANT type tags (a VARIANT begins with its 16-bit VARTYPE) --------
-    const VT_EMPTY: u16 = 0;
-    const VT_BSTR: u16 = 8;
-    const VT_ERROR: u16 = 10;
-    const VT_BOOL: u16 = 11;
-
-    /// Live `Application` objects; the server exits its loop when the count hits 0.
-    static APPS: AtomicI32 = AtomicI32::new(0);
 
     // -----------------------------------------------------------------------
     // Shared workbook state (thread-local: the server is single-apartment STA,
@@ -187,237 +212,39 @@ mod win {
         REG.with(|r| f(&mut r.borrow_mut()))
     }
 
-    // -----------------------------------------------------------------------
-    // Logging (the field diagnostic)
-    // -----------------------------------------------------------------------
 
-    pub(crate) fn log(msg: &str) {
-        use std::io::Write;
-        let Ok(dir) = std::env::var("TEMP").or_else(|_| std::env::var("TMP")) else {
-            return;
+
+    /// Each child object now implements its own dual interface (not bare
+    /// `IDispatch`), so to hand it back as a VT_DISPATCH VARIANT we convert to
+    /// that interface then QI down to `IDispatch`.
+    trait IntoDispatch {
+        fn into_dispatch(self) -> IDispatch;
+    }
+    macro_rules! into_dispatch {
+        ($struct:ty, $iface:ty) => {
+            impl IntoDispatch for $struct {
+                fn into_dispatch(self) -> IDispatch {
+                    let i: $iface = self.into();
+                    i.cast().expect("interface derives IDispatch")
+                }
+            }
         };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{dir}\\xlcomshim.log"))
-        {
-            let _ = writeln!(f, "[{}] {msg}", std::process::id());
-        }
     }
+    into_dispatch!(Workbooks, IWorkbooks);
+    into_dispatch!(Workbook, IWorkbook);
+    into_dispatch!(Worksheets, ISheets);
+    into_dispatch!(Worksheet, IWorksheet);
+    into_dispatch!(Range, IRange);
+    into_dispatch!(Font, IFont);
+    into_dispatch!(Interior, IInterior);
 
-    // -----------------------------------------------------------------------
-    // Server lifecycle
-    // -----------------------------------------------------------------------
-
-    /// Install a panic hook (once) that logs instead of letting a panic unwind
-    /// across the COM FFI boundary (UB / RPC_E_SERVERFAULT with no diagnostic).
-    fn install_panic_hook() {
-        static HOOK: std::sync::Once = std::sync::Once::new();
-        HOOK.call_once(|| {
-            std::panic::set_hook(Box::new(|info| {
-                log(&format!("PANIC: {info}"));
-            }));
-        });
-    }
-
-    pub fn run() -> ExitCode {
-        install_panic_hook();
-        let joined = std::env::args()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        if joined.contains("-embedding")
-            || joined.contains("/automation")
-            || joined.contains("--serve")
-        {
-            match run_server() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    log(&format!("server error: {e:?}"));
-                    ExitCode::FAILURE
-                }
-            }
-        } else {
-            eprintln!(
-                "xlcomshim — Excel-compatible COM automation server (LocalServer32).\n\
-                 Register with tools/comshim/register-shim.ps1; COM launches it with -Embedding."
-            );
-            ExitCode::SUCCESS
-        }
-    }
-
-    fn run_server() -> Result<()> {
-        unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-            log("server starting; registering class object");
-            let factory: IClassFactory = ExcelClassFactory.into();
-            // Register the same factory for both our shim CLSID (ProgID path) and
-            // Excel's real CLSID (early-bound activation path).
-            let mut cookies = Vec::new();
-            for clsid in [SHIM_CLSID, EXCEL_CLSID] {
-                cookies.push(CoRegisterClassObject(
-                    &clsid,
-                    &factory,
-                    CLSCTX_LOCAL_SERVER,
-                    REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
-                )?);
-            }
-            CoResumeClassObjects()?;
-            log("class objects registered; entering message loop");
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            log("message loop exited; revoking + uninitializing");
-            for c in cookies {
-                let _ = CoRevokeClassObject(c);
-            }
-            CoUninitialize();
-        }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Class factory
-    // -----------------------------------------------------------------------
-
-    #[implement(IClassFactory)]
-    struct ExcelClassFactory;
-
-    impl IClassFactory_Impl for ExcelClassFactory_Impl {
-        fn CreateInstance(
-            &self,
-            punkouter: Option<&IUnknown>,
-            riid: *const GUID,
-            ppvobject: *mut *mut c_void,
-        ) -> Result<()> {
-            unsafe {
-                if punkouter.is_some() {
-                    return Err(CLASS_E_NOAGGREGATION.into());
-                }
-                log(&format!("ClassFactory::CreateInstance riid={:?}", *riid));
-                let app: IApplication = Application::new().into();
-                app.query(riid, ppvobject).ok()
-            }
-        }
-
-        fn LockServer(&self, _flock: BOOL) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // In-process server exports (InprocServer32). When the shim is registered
-    // as an in-proc DLL, COM loads it into the client's own process and calls
-    // our vtable DIRECTLY — no proxy, no marshalling, NO type library required.
-    // This is the path that works on a machine with no Office at all (the VDI):
-    // the out-of-proc LocalServer needs a registered typelib to marshal our
-    // dual interfaces, but in-proc needs nothing. Same COM objects either way.
-    // -----------------------------------------------------------------------
-
-    /// COM entry point: hand back a class object (our `IClassFactory`) for a
-    /// CLSID this DLL implements. `regsvr32`/CoGetClassObject/CoCreateInstance
-    /// (CLSCTX_INPROC_SERVER) all route here.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn DllGetClassObject(
-        rclsid: *const GUID,
-        riid: *const GUID,
-        ppv: *mut *mut c_void,
-    ) -> HRESULT {
-        unsafe {
-            if rclsid.is_null() || riid.is_null() || ppv.is_null() {
-                return E_POINTER;
-            }
-            *ppv = std::ptr::null_mut();
-            let clsid = *rclsid;
-            if clsid != SHIM_CLSID && clsid != EXCEL_CLSID {
-                log(&format!("DllGetClassObject: unknown clsid {clsid:?}"));
-                return CLASS_E_CLASSNOTAVAILABLE;
-            }
-            // A panic hook, installed lazily, keeps any vtable-method panic from
-            // unwinding across the FFI boundary into the host process.
-            install_panic_hook();
-            log(&format!("DllGetClassObject clsid={clsid:?}"));
-            let factory: IClassFactory = ExcelClassFactory.into();
-            factory.query(riid, ppv)
-        }
-    }
-
-    /// COM asks whether the DLL can be unloaded. We keep it resident while any
-    /// `Application` is alive (STA client, single-threaded export — simplest and
-    /// safe).
-    #[unsafe(no_mangle)]
-    pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-        if APPS.load(Ordering::SeqCst) > 0 {
-            S_FALSE
-        } else {
-            S_OK
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // VARIANT helpers
-    // -----------------------------------------------------------------------
-
-    /// The VARTYPE tag (masking BYREF/ARRAY flags). A VARIANT starts with its
-    /// 16-bit `vt` field, so this read is layout-stable.
-    unsafe fn vt_of(v: *const VARIANT) -> u16 {
-        unsafe { *(v as *const u16) & 0x0fff }
-    }
-
-    /// Positional argument `i` (0 = first), accounting for `rgvarg` being stored
-    /// in reverse order. `None` if omitted (fewer args passed).
-    unsafe fn arg<'a>(p: *const DISPPARAMS, i: u32) -> Option<&'a VARIANT> {
-        unsafe {
-            if p.is_null() {
-                return None;
-            }
-            let dp = &*p;
-            if i >= dp.cArgs {
-                return None;
-            }
-            Some(&*dp.rgvarg.add((dp.cArgs - 1 - i) as usize))
-        }
-    }
-
-    unsafe fn arg_string(p: *const DISPPARAMS, i: u32) -> Option<String> {
-        unsafe { arg(p, i).and_then(variant_to_string) }
-    }
-
-    unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
-        unsafe {
-            arg(p, i).and_then(|v| {
-                let vt = vt_of(v);
-                if vt == VT_EMPTY || vt == VT_ERROR {
-                    None
-                } else {
-                    i32::try_from(v).ok()
-                }
-            })
-        }
-    }
-
-    /// Argument `i` as a bool, `default` when omitted/uncoercible.
-    unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
-        unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
-    }
-
-    fn variant_to_string(v: &VARIANT) -> Option<String> {
-        let vt = unsafe { vt_of(v) };
-        if vt == VT_EMPTY || vt == VT_ERROR {
-            return None;
-        }
-        if let Ok(b) = BSTR::try_from(v) {
-            return Some(b.to_string());
-        }
-        let s = v.to_string();
-        (!s.is_empty()).then_some(s)
+    unsafe fn put_obj<T: IntoDispatch>(pvarresult: *mut VARIANT, obj: T) {
+        unsafe { put(pvarresult, VARIANT::from(obj.into_dispatch())) };
     }
 
     /// Interpret a VARIANT the way Excel interprets a value assigned to a cell:
-    /// a string starting with `=` is a formula, other strings are text, bools are
-    /// booleans, everything numeric is a number. `None` = empty/omitted (clear).
+    /// `=…` is a formula, other strings are text, bools are booleans, numbers are
+    /// numbers. `None` = empty/omitted (clear). App-specific (over gridcore).
     fn variant_to_cell(v: &VARIANT) -> Option<Cell> {
         let vt = unsafe { vt_of(v) };
         match vt {
@@ -448,40 +275,6 @@ mod win {
             CellValue::Bool(b) => VARIANT::from(*b),
             CellValue::Error(e) => VARIANT::from(BSTR::from(e.as_str())),
         }
-    }
-
-    unsafe fn put(pvarresult: *mut VARIANT, value: VARIANT) {
-        if !pvarresult.is_null() {
-            unsafe { std::ptr::write(pvarresult, value) };
-        }
-    }
-
-    /// Each child object now implements its own dual interface (not bare
-    /// `IDispatch`), so to hand it back as a VT_DISPATCH VARIANT we convert to
-    /// that interface then QI down to `IDispatch`.
-    trait IntoDispatch {
-        fn into_dispatch(self) -> IDispatch;
-    }
-    macro_rules! into_dispatch {
-        ($struct:ty, $iface:ty) => {
-            impl IntoDispatch for $struct {
-                fn into_dispatch(self) -> IDispatch {
-                    let i: $iface = self.into();
-                    i.cast().expect("interface derives IDispatch")
-                }
-            }
-        };
-    }
-    into_dispatch!(Workbooks, IWorkbooks);
-    into_dispatch!(Workbook, IWorkbook);
-    into_dispatch!(Worksheets, ISheets);
-    into_dispatch!(Worksheet, IWorksheet);
-    into_dispatch!(Range, IRange);
-    into_dispatch!(Font, IFont);
-    into_dispatch!(Interior, IInterior);
-
-    unsafe fn put_obj<T: IntoDispatch>(pvarresult: *mut VARIANT, obj: T) {
-        unsafe { put(pvarresult, VARIANT::from(obj.into_dispatch())) };
     }
 
     // -----------------------------------------------------------------------
@@ -811,10 +604,6 @@ mod win {
         }
     }
 
-    fn is_put(wflags: DISPATCH_FLAGS) -> bool {
-        (wflags.0 & (DISPATCH_PROPERTYPUT.0 | DISPATCH_PROPERTYPUTREF.0)) != 0
-    }
-
     /// Excel's `Worksheets`/`Sheets` are *parameterized* properties: called with
     /// no argument they return the collection; called with an index or a name
     /// (as VBScript does for `wb.Worksheets(1)`) they return that sheet.
@@ -855,149 +644,7 @@ mod win {
         }
     }
 
-    /// Shared `GetIDsOfNames`: resolve the first name via `resolver`, mark the
-    /// rest (argument names) unknown.
-    unsafe fn resolve_names(
-        who: &str,
-        rgsznames: *const PCWSTR,
-        cnames: u32,
-        rgdispid: *mut i32,
-        resolver: impl Fn(&str) -> Option<i32>,
-    ) -> Result<()> {
-        unsafe {
-            if cnames == 0 {
-                return Ok(());
-            }
-            let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
-            let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
-            for id in ids.iter_mut() {
-                *id = DISPID_UNKNOWN;
-            }
-            let name = names[0].to_string().unwrap_or_default();
-            match resolver(&name) {
-                Some(d) => ids[0] = d,
-                None => {
-                    // Don't fail — hand back a synthetic id so the follow-up
-                    // Invoke reaches the graceful `unhandled` path (logged there).
-                    log(&format!("{who}: unmodeled member '{name}' -> graceful"));
-                    ids[0] = synth_id(&name);
-                }
-            }
-            Ok(())
-        }
-    }
 
-    macro_rules! no_typeinfo {
-        () => {
-            fn GetTypeInfoCount(&self) -> Result<u32> {
-                Ok(0)
-            }
-            fn GetTypeInfo(&self, _i: u32, _l: u32) -> Result<ITypeInfo> {
-                Err(DISP_E_BADINDEX.into())
-            }
-        };
-    }
-
-    // -----------------------------------------------------------------------
-    // Graceful degradation — never fault on a member we don't model.
-    //
-    // Field strategy: cover broad, LOG every call, deploy on the VDI, then read
-    // the log to see what the host (Petrel) actually called. For that to survive
-    // the one-shot, an unmodeled member must NOT return an error (that throws in
-    // the client and aborts the export) — it must degrade benignly: a property
-    // put is swallowed, a get / method call yields a do-nothing object so a
-    // chain like `range.Font.Bold = True` keeps flowing. Every such call is
-    // logged with its member name for later triage.
-    // -----------------------------------------------------------------------
-
-    thread_local! {
-        // dispid_of(unmodeled name) - stable per name so the get and the
-        // subsequent put land on the same synthetic id; index into this table.
-        static SYNTH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
-    const SYNTH_BASE: i32 = 0x4000_0000;
-
-    fn synth_id(name: &str) -> i32 {
-        SYNTH.with(|s| {
-            let mut v = s.borrow_mut();
-            match v.iter().position(|n| n == name) {
-                Some(i) => SYNTH_BASE + i as i32,
-                None => {
-                    v.push(name.to_string());
-                    SYNTH_BASE + (v.len() as i32 - 1)
-                }
-            }
-        })
-    }
-    fn synth_name(id: i32) -> Option<String> {
-        (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
-    }
-
-    /// The default arm of every object's `Invoke` for a dispid it doesn't handle:
-    /// log the member (name when we assigned a synthetic id, else the raw dispid)
-    /// and degrade benignly — swallow puts, hand back a do-nothing object for
-    /// gets/calls.
-    unsafe fn unhandled(id: i32, wflags: DISPATCH_FLAGS, result: *mut VARIANT) -> Result<()> {
-        let member = synth_name(id).unwrap_or_else(|| format!("dispid {id}"));
-        // The caller's Invoke already logged the object + id at entry; this adds
-        // the resolved member name and the benign outcome on the next line.
-        log(&format!(
-            "  -> unmodeled '{member}' (put={}) -> benign",
-            is_put(wflags)
-        ));
-        if !is_put(wflags) {
-            unsafe { put(result, VARIANT::from(null_dispatch())) };
-        }
-        Ok(())
-    }
-
-    /// A do-nothing `IDispatch`: resolves any name, swallows any put, returns
-    /// itself for any get/call — so a client can walk unmodeled property chains
-    /// without faulting.
-    #[implement(IDispatch)]
-    struct NullObject;
-
-    fn null_dispatch() -> IDispatch {
-        NullObject.into()
-    }
-
-    impl IDispatch_Impl for NullObject_Impl {
-        no_typeinfo!();
-        fn GetIDsOfNames(
-            &self,
-            _riid: *const GUID,
-            rgsznames: *const PCWSTR,
-            cnames: u32,
-            _lcid: u32,
-            rgdispid: *mut i32,
-        ) -> Result<()> {
-            unsafe {
-                if cnames > 0 {
-                    let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
-                    let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
-                    for id in ids.iter_mut() {
-                        *id = DISPID_UNKNOWN;
-                    }
-                    ids[0] = synth_id(&names[0].to_string().unwrap_or_default());
-                }
-            }
-            Ok(())
-        }
-        fn Invoke(
-            &self,
-            id: i32,
-            _riid: *const GUID,
-            _lcid: u32,
-            wflags: DISPATCH_FLAGS,
-            _params: *const DISPPARAMS,
-            result: *mut VARIANT,
-            _ei: *mut EXCEPINFO,
-            _ae: *mut u32,
-        ) -> Result<()> {
-            log("NullObject::Invoke");
-            unsafe { unhandled(id, wflags, result) }
-        }
-    }
 
     // -----------------------------------------------------------------------
     // Application
@@ -1016,13 +663,13 @@ mod win {
 
     impl Application {
         fn new() -> Application {
-            APPS.fetch_add(1, Ordering::SeqCst);
+            app_created();
             Application
         }
     }
     impl Drop for Application {
         fn drop(&mut self) {
-            if APPS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if app_dropped_is_last() {
                 unsafe { PostQuitMessage(0) };
             }
         }

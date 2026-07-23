@@ -22,7 +22,12 @@ mod win {
     use std::cell::RefCell;
     use std::ffi::c_void;
     use std::process::ExitCode;
-    use std::sync::atomic::{AtomicI32, Ordering};
+
+    // Shared COM scaffolding: VARIANT helpers (vt_of/arg/put/is_put/…), logging,
+    // graceful degradation (unhandled/null_dispatch/synth_*), resolve_names, the
+    // server + DLL plumbing, the Application counter, and the no_typeinfo! /
+    // dispatch_names! macros.
+    use comshimcore::*;
 
     use docxcore::model::{
         Align, Block, BreakKind, Cell, Document, Inline, Paragraph, ParProps, Row, Run, RunProps,
@@ -41,24 +46,14 @@ mod win {
 <w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
 </w:tblBorders></w:tblPr>";
 
-    use windows::Win32::Foundation::{
-        BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, E_FAIL, E_NOTIMPL,
-        E_POINTER, S_FALSE, S_OK,
-    };
+    use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
     use windows::Win32::System::Com::{
-        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
-        CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
-        DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
-        IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE,
-        REGCLS_SUSPENDED,
+        DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
     use windows::core::{
-        BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement, interface,
+        BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
     };
-    use windows::Win32::System::Com::IDispatch_Vtbl;
 
     /// Our own coclass CLSID — a brand-new GUID, never Microsoft's Word CLSID.
     const SHIM_CLSID: GUID = GUID::from_u128(0x9c2f4a10_7d33_4b6e_b1a4_2e7c8d5f0a92);
@@ -67,14 +62,50 @@ mod win {
     /// when the HKCU shadow points here. Never written to HKLM.
     const WORD_CLSID: GUID = GUID::from_u128(0x000209ff_0000_0000_c000_000000000046);
 
-    const DISPID_UNKNOWN: i32 = -1;
+    // -----------------------------------------------------------------------
+    // Server / DLL plumbing — the generic runtime lives in comshimcore; the shim
+    // supplies only its CLSIDs and the root Application constructor.
+    // -----------------------------------------------------------------------
 
-    // ---- VARIANT type tags -------------------------------------------------
-    const VT_EMPTY: u16 = 0;
-    const VT_BSTR: u16 = 8;
-    const VT_ERROR: u16 = 10;
+    /// Mint the root Application as an IDispatch; the factory QIs whatever
+    /// interface the client asked for.
+    fn make_app() -> IDispatch {
+        let a: IWordApp = Application::new().into();
+        a.cast().expect("Application derives IDispatch")
+    }
 
-    static APPS: AtomicI32 = AtomicI32::new(0);
+    pub fn run() -> ExitCode {
+        init("wordcomshim");
+        if !should_serve() {
+            eprintln!(
+                "wordcomshim — Word-compatible COM automation server (LocalServer32).\n\
+                 Register with tools/wordshim/register-word.ps1; COM launches it with -Embedding."
+            );
+            return ExitCode::SUCCESS;
+        }
+        match run_local_server(SHIM_CLSID, WORD_CLSID, make_app) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                log(&format!("server error: {e:?}"));
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// In-process server exports (InprocServer32), forwarding to comshimcore.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn DllGetClassObject(
+        rclsid: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> HRESULT {
+        unsafe { dll_get_class_object(SHIM_CLSID, WORD_CLSID, make_app, rclsid, riid, ppv) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn DllCanUnloadNow() -> HRESULT {
+        dll_can_unload_now()
+    }
 
     // -----------------------------------------------------------------------
     // Document state (thread-local; STA single-thread, no locking).
@@ -432,198 +463,6 @@ mod win {
         REG.with(|r| f(&mut r.borrow_mut()))
     }
 
-    // -----------------------------------------------------------------------
-    // Logging (the field diagnostic)
-    // -----------------------------------------------------------------------
-
-    pub(crate) fn log(msg: &str) {
-        use std::io::Write;
-        let Ok(dir) = std::env::var("TEMP").or_else(|_| std::env::var("TMP")) else {
-            return;
-        };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{dir}\\wordcomshim.log"))
-        {
-            let _ = writeln!(f, "[{}] {msg}", std::process::id());
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Server lifecycle
-    // -----------------------------------------------------------------------
-
-    fn install_panic_hook() {
-        static HOOK: std::sync::Once = std::sync::Once::new();
-        HOOK.call_once(|| {
-            std::panic::set_hook(Box::new(|info| log(&format!("PANIC: {info}"))));
-        });
-    }
-
-    pub fn run() -> ExitCode {
-        install_panic_hook();
-        let joined = std::env::args().collect::<Vec<_>>().join(" ").to_lowercase();
-        if joined.contains("-embedding") || joined.contains("/automation") || joined.contains("--serve")
-        {
-            match run_server() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    log(&format!("server error: {e:?}"));
-                    ExitCode::FAILURE
-                }
-            }
-        } else {
-            eprintln!(
-                "wordcomshim — Word-compatible COM automation server (LocalServer32).\n\
-                 Register with tools/wordshim/register-word.ps1; COM launches it with -Embedding."
-            );
-            ExitCode::SUCCESS
-        }
-    }
-
-    fn run_server() -> Result<()> {
-        unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-            log("server starting; registering class object");
-            let factory: IClassFactory = WordClassFactory.into();
-            let mut cookies = Vec::new();
-            for clsid in [SHIM_CLSID, WORD_CLSID] {
-                cookies.push(CoRegisterClassObject(
-                    &clsid,
-                    &factory,
-                    CLSCTX_LOCAL_SERVER,
-                    REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
-                )?);
-            }
-            CoResumeClassObjects()?;
-            log("class objects registered; entering message loop");
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            log("message loop exited; revoking + uninitializing");
-            for c in cookies {
-                let _ = CoRevokeClassObject(c);
-            }
-            CoUninitialize();
-        }
-        Ok(())
-    }
-
-    #[implement(IClassFactory)]
-    struct WordClassFactory;
-
-    impl IClassFactory_Impl for WordClassFactory_Impl {
-        fn CreateInstance(
-            &self,
-            punkouter: Option<&IUnknown>,
-            riid: *const GUID,
-            ppvobject: *mut *mut c_void,
-        ) -> Result<()> {
-            unsafe {
-                if punkouter.is_some() {
-                    return Err(CLASS_E_NOAGGREGATION.into());
-                }
-                log(&format!("ClassFactory::CreateInstance riid={:?}", *riid));
-                let app: IWordApp = Application::new().into();
-                app.query(riid, ppvobject).ok()
-            }
-        }
-        fn LockServer(&self, _flock: BOOL) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    /// COM entry point for the in-process server (InprocServer32) — no
-    /// marshalling, no typelib, the RCW calls our vtable directly.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn DllGetClassObject(
-        rclsid: *const GUID,
-        riid: *const GUID,
-        ppv: *mut *mut c_void,
-    ) -> HRESULT {
-        unsafe {
-            if rclsid.is_null() || riid.is_null() || ppv.is_null() {
-                return E_POINTER;
-            }
-            *ppv = std::ptr::null_mut();
-            let clsid = *rclsid;
-            if clsid != SHIM_CLSID && clsid != WORD_CLSID {
-                return CLASS_E_CLASSNOTAVAILABLE;
-            }
-            install_panic_hook();
-            log(&format!("DllGetClassObject clsid={clsid:?}"));
-            let factory: IClassFactory = WordClassFactory.into();
-            factory.query(riid, ppv)
-        }
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-        if APPS.load(Ordering::SeqCst) > 0 {
-            S_FALSE
-        } else {
-            S_OK
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // VARIANT helpers
-    // -----------------------------------------------------------------------
-
-    unsafe fn vt_of(v: *const VARIANT) -> u16 {
-        unsafe { *(v as *const u16) & 0x0fff }
-    }
-
-    unsafe fn arg<'a>(p: *const DISPPARAMS, i: u32) -> Option<&'a VARIANT> {
-        unsafe {
-            if p.is_null() {
-                return None;
-            }
-            let dp = &*p;
-            if i >= dp.cArgs {
-                return None;
-            }
-            Some(&*dp.rgvarg.add((dp.cArgs - 1 - i) as usize))
-        }
-    }
-
-    unsafe fn arg_string(p: *const DISPPARAMS, i: u32) -> Option<String> {
-        unsafe { arg(p, i).and_then(variant_to_string) }
-    }
-
-    unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
-        unsafe {
-            arg(p, i).and_then(|v| {
-                let vt = vt_of(v);
-                if vt == VT_EMPTY || vt == VT_ERROR {
-                    None
-                } else {
-                    i32::try_from(v).ok()
-                }
-            })
-        }
-    }
-
-    fn variant_to_string(v: &VARIANT) -> Option<String> {
-        let vt = unsafe { vt_of(v) };
-        if vt == VT_EMPTY || vt == VT_ERROR {
-            return None;
-        }
-        if let Ok(b) = BSTR::try_from(v) {
-            return Some(b.to_string());
-        }
-        let s = v.to_string();
-        (!s.is_empty()).then_some(s)
-    }
-
-    unsafe fn put(pvarresult: *mut VARIANT, value: VARIANT) {
-        if !pvarresult.is_null() {
-            unsafe { std::ptr::write(pvarresult, value) };
-        }
-    }
 
     unsafe fn put_disp<T: IntoDisp>(pvarresult: *mut VARIANT, obj: T) {
         unsafe { put(pvarresult, VARIANT::from(obj.into_disp())) };
@@ -654,146 +493,6 @@ mod win {
                     self.into()
                 }
             })+
-        };
-    }
-
-    fn is_put(wflags: DISPATCH_FLAGS) -> bool {
-        (wflags.0 & (DISPATCH_PROPERTYPUT.0 | DISPATCH_PROPERTYPUTREF.0)) != 0
-    }
-
-    // -----------------------------------------------------------------------
-    // Graceful degradation — never fault on an unmodeled member.
-    // -----------------------------------------------------------------------
-
-    thread_local! {
-        static SYNTH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
-    const SYNTH_BASE: i32 = 0x4000_0000;
-
-    fn synth_id(name: &str) -> i32 {
-        SYNTH.with(|s| {
-            let mut v = s.borrow_mut();
-            match v.iter().position(|n| n == name) {
-                Some(i) => SYNTH_BASE + i as i32,
-                None => {
-                    v.push(name.to_string());
-                    SYNTH_BASE + (v.len() as i32 - 1)
-                }
-            }
-        })
-    }
-    fn synth_name(id: i32) -> Option<String> {
-        (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
-    }
-
-    unsafe fn unhandled(id: i32, wflags: DISPATCH_FLAGS, result: *mut VARIANT) -> Result<()> {
-        let member = synth_name(id).unwrap_or_else(|| format!("dispid {id}"));
-        log(&format!(
-            "  -> unmodeled '{member}' (put={}) -> benign",
-            is_put(wflags)
-        ));
-        if !is_put(wflags) {
-            unsafe { put(result, VARIANT::from(null_dispatch())) };
-        }
-        Ok(())
-    }
-
-    #[implement(IDispatch)]
-    struct NullObject;
-
-    fn null_dispatch() -> IDispatch {
-        NullObject.into()
-    }
-
-    macro_rules! no_typeinfo {
-        () => {
-            fn GetTypeInfoCount(&self) -> Result<u32> {
-                Ok(0)
-            }
-            fn GetTypeInfo(&self, _i: u32, _l: u32) -> Result<ITypeInfo> {
-                Err(DISP_E_BADINDEX.into())
-            }
-        };
-    }
-
-    unsafe fn resolve_names(
-        who: &str,
-        rgsznames: *const PCWSTR,
-        cnames: u32,
-        rgdispid: *mut i32,
-        resolver: impl Fn(&str) -> Option<i32>,
-    ) -> Result<()> {
-        unsafe {
-            if cnames == 0 {
-                return Ok(());
-            }
-            let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
-            let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
-            for id in ids.iter_mut() {
-                *id = DISPID_UNKNOWN;
-            }
-            let name = names[0].to_string().unwrap_or_default();
-            match resolver(&name) {
-                Some(d) => ids[0] = d,
-                None => {
-                    log(&format!("{who}: unmodeled member '{name}' -> graceful"));
-                    ids[0] = synth_id(&name);
-                }
-            }
-            Ok(())
-        }
-    }
-
-    impl IDispatch_Impl for NullObject_Impl {
-        no_typeinfo!();
-        fn GetIDsOfNames(
-            &self,
-            _riid: *const GUID,
-            rgsznames: *const PCWSTR,
-            cnames: u32,
-            _lcid: u32,
-            rgdispid: *mut i32,
-        ) -> Result<()> {
-            unsafe {
-                if cnames > 0 {
-                    let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
-                    let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
-                    for id in ids.iter_mut() {
-                        *id = DISPID_UNKNOWN;
-                    }
-                    ids[0] = synth_id(&names[0].to_string().unwrap_or_default());
-                }
-            }
-            Ok(())
-        }
-        fn Invoke(
-            &self,
-            id: i32,
-            _riid: *const GUID,
-            _lcid: u32,
-            wflags: DISPATCH_FLAGS,
-            _params: *const DISPPARAMS,
-            result: *mut VARIANT,
-            _ei: *mut EXCEPINFO,
-            _ae: *mut u32,
-        ) -> Result<()> {
-            unsafe { unhandled(id, wflags, result) }
-        }
-    }
-
-    /// Boilerplate `GetIDsOfNames` for an object using `resolver`.
-    macro_rules! dispatch_names {
-        ($who:literal, $resolver:path) => {
-            fn GetIDsOfNames(
-                &self,
-                _riid: *const GUID,
-                rgsznames: *const PCWSTR,
-                cnames: u32,
-                _lcid: u32,
-                rgdispid: *mut i32,
-            ) -> Result<()> {
-                unsafe { resolve_names($who, rgsznames, cnames, rgdispid, $resolver) }
-            }
         };
     }
 
@@ -1166,13 +865,13 @@ mod win {
 
     impl Application {
         fn new() -> Application {
-            APPS.fetch_add(1, Ordering::SeqCst);
+            app_created();
             Application
         }
     }
     impl Drop for Application {
         fn drop(&mut self) {
-            if APPS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if app_dropped_is_last() {
                 unsafe { PostQuitMessage(0) };
             }
         }
@@ -1678,10 +1377,6 @@ mod win {
             unsafe { put(result, VARIANT::from(v)) };
         }
         Ok(())
-    }
-
-    unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
-        unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
     }
 
     /// Word's WdColor is a packed BGR long (RGB(r,g,b) = r + g*256 + b*65536);
