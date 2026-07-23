@@ -70,6 +70,7 @@ mod win {
 
     // ---- VARIANT type tags -------------------------------------------------
     const VT_EMPTY: u16 = 0;
+    const VT_BSTR: u16 = 8;
     const VT_ERROR: u16 = 10;
 
     static APPS: AtomicI32 = AtomicI32::new(0);
@@ -87,6 +88,10 @@ mod win {
         cur: RunProps,
         /// Current paragraph alignment for new paragraphs.
         cur_align: Align,
+        /// Current paragraph style id (`w:pStyle`) + heading level, from
+        /// `Selection.Style`. Applied to new paragraphs.
+        cur_style: Option<String>,
+        cur_heading: Option<u8>,
     }
 
     impl DocState {
@@ -97,6 +102,8 @@ mod win {
                 saved: false,
                 cur: RunProps::default(),
                 cur_align: Align::Left,
+                cur_style: None,
+                cur_heading: None,
             }
         }
 
@@ -110,6 +117,8 @@ mod win {
                 saved: true,
                 cur: RunProps::default(),
                 cur_align: Align::Left,
+                cur_style: None,
+                cur_heading: None,
             })
         }
 
@@ -117,9 +126,51 @@ mod win {
             Paragraph {
                 props: ParProps {
                     align: self.cur_align,
+                    style_id: self.cur_style.clone(),
+                    heading_level: self.cur_heading,
                     ..ParProps::default()
                 },
                 content: vec![],
+            }
+        }
+
+        /// Set the current paragraph style from a name ("Heading 1", "Normal") —
+        /// applies the style id + a heading direct format so it renders even when
+        /// the document's styles.xml doesn't define the built-in style.
+        fn set_style(&mut self, style: &str) {
+            let low = style.trim().to_ascii_lowercase();
+            let hn = low
+                .strip_prefix("heading")
+                .map(str::trim)
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|n| (1..=9).contains(n));
+            if let Some(n) = hn {
+                self.cur_style = Some(format!("Heading{n}"));
+                self.cur_heading = Some(n);
+                self.cur.bold = true;
+                self.cur.size_half_pts = Some(match n {
+                    1 => 32,
+                    2 => 28,
+                    3 => 26,
+                    _ => 24,
+                });
+            } else if low == "normal" || low.is_empty() {
+                self.cur_style = None;
+                self.cur_heading = None;
+                self.cur.bold = false;
+                self.cur.size_half_pts = None;
+            } else {
+                self.cur_style = Some(style.replace(' ', ""));
+                self.cur_heading = None;
+            }
+        }
+
+        /// `Selection.Style = wdStyleHeadingN` (-2..-10) / wdStyleNormal (-1).
+        fn set_style_wd(&mut self, wd: i32) {
+            match wd {
+                -10..=-2 => self.set_style(&format!("Heading {}", -wd - 1)),
+                -1 => self.set_style("Normal"),
+                _ => {}
             }
         }
         fn cur_run(&self, text: &str) -> Inline {
@@ -161,12 +212,15 @@ mod win {
         /// character format.
         fn set_text(&mut self, s: &str) {
             let (align, props) = (self.cur_align, self.cur.clone());
+            let (style, heading) = (self.cur_style.clone(), self.cur_heading);
             self.pkg.document.body = split_paragraphs(s)
                 .into_iter()
                 .map(|seg| {
                     Block::Paragraph(Paragraph {
                         props: ParProps {
                             align,
+                            style_id: style.clone(),
+                            heading_level: heading,
                             ..ParProps::default()
                         },
                         content: if seg.is_empty() {
@@ -1321,6 +1375,7 @@ mod win {
             "italic" => 12,
             "underline" => 13,
             "paragraphformat" => 14,
+            "style" => 16,
             _ => return None,
         })
     }
@@ -1385,6 +1440,27 @@ mod win {
                     12 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
                     13 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
                     14 => put_disp(result, ParaFmt { doc, all: false }),
+                    // Style — a style name ("Heading 1") or a wdStyle int.
+                    16 => {
+                        if is_put(wflags) {
+                            if let Some(v) = arg(params, 0) {
+                                if vt_of(v) == VT_BSTR {
+                                    let s = variant_to_string(v).unwrap_or_default();
+                                    reg(|r| {
+                                        if let Some(d) = r.docs.get_mut(doc) {
+                                            d.set_style(&s)
+                                        }
+                                    });
+                                } else if let Ok(n) = i32::try_from(v) {
+                                    reg(|r| {
+                                        if let Some(d) = r.docs.get_mut(doc) {
+                                            d.set_style_wd(n)
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
