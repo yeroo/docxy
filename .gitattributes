@@ -4,3 +4,5 @@
 *.docx binary
 *.pdf binary
 *.wmf binary
+tools/comshim/docxy-excel.tlb binary
+tools/wordshim/docxy-word.tlb binary

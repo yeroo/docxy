@@ -635,6 +635,12 @@ pub struct Xf {
     /// Solid fill (background) color as (r, g, b), when set.
     pub fill: Option<(u8, u8, u8)>,
     pub align: Align,
+    /// Font size in points (`None` = the default 11).
+    pub font_size: Option<f64>,
+    /// Font family name (`None` = the default Calibri).
+    pub font_name: Option<String>,
+    /// A thin box border around each cell, when set.
+    pub border: bool,
 }
 
 /// A differential format (`<dxf>`) referenced by a conditional-formatting rule.

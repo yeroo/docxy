@@ -1,0 +1,54 @@
+[package]
+name = "xlcomshim"
+description = "Xlcomshim — a Windows COM LocalServer32 that impersonates Excel.Application so apps automating Office (e.g. via COM) can create .xlsx without Microsoft Office installed, backed by the gridcore engine."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# The COM objects live in the library, built two ways: an rlib the bin links
+# (the LocalServer32 .exe) and a cdylib (the InprocServer32 .dll) exporting
+# DllGetClassObject/DllCanUnloadNow. One implementation, both activation styles.
+[lib]
+name = "xlcomshim"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xlcomshim"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# Windows-only: the whole server compiles to a stub on other targets, so the
+# workspace still builds on Linux/macOS CI.
+[target.'cfg(windows)'.dependencies]
+comshimcore = { path = "../comshimcore" }
+gridcore = { path = "../gridcore" }
+# The #[implement] macro expands to `::windows_core::…` paths, so windows-core
+# must be a named dependency.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The oracle differential test (tests/typelib_faithful.rs) introspects both
+# Excel's registered typelib and our generated one via the same COM APIs.
+[target.'cfg(windows)'.dev-dependencies]
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
