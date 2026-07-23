@@ -1599,6 +1599,7 @@ mod win {
             "formular1c1" => 264,
             "numberformat" | "numberformatlocal" => 193,
             "horizontalalignment" => 136,
+            "columnwidth" => 242,
             "cells" => 238,
             "font" => 146,
             "interior" => 129,
@@ -1753,6 +1754,31 @@ mod win {
                                 .code
                                 .unwrap_or_else(|| "General".into());
                             put(result, VARIANT::from(BSTR::from(code.as_str())));
+                        }
+                    }
+                    // ColumnWidth (character units) — set on each column's <col>.
+                    242 => {
+                        if is_put(wflags) {
+                            if let Some(w) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
+                                reg(|reg| {
+                                    if let Some(b) = reg.books.get_mut(book) {
+                                        if let Some(s) = b.pkg.workbook.sheets.get_mut(sheet) {
+                                            for col in c1..=c2 {
+                                                s.set_col_width(col, w);
+                                            }
+                                        }
+                                        b.saved = false;
+                                    }
+                                });
+                            }
+                        } else {
+                            let w = reg(|r| {
+                                r.books
+                                    .get(book)
+                                    .and_then(|b| b.pkg.workbook.sheets.get(sheet).map(|s| s.col_width(c1)))
+                            })
+                            .unwrap_or(8.43);
+                            put(result, VARIANT::from(w));
                         }
                     }
                     // HorizontalAlignment (xlLeft/-4131, xlCenter/-4108, xlRight/-4152).

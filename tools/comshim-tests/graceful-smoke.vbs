@@ -39,6 +39,7 @@ ws.Range("A1:B1").Font.Name = "Calibri"
 ws.Range("A1:B1").Interior.Color = 15773696
 ws.Range("A1:B1").HorizontalAlignment = -4108
 ws.Columns("A:B").AutoFit
+ws.Range("A1").ColumnWidth = 24
 ws.Range("B2:B4").NumberFormat = "#,##0.00"
 ws.Range("A1").Borders.LineStyle = 1
 

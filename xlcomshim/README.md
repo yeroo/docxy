@@ -1,67 +1,110 @@
 # xlcomshim — an Excel-compatible COM automation server
 
-A Windows **COM LocalServer32** that impersonates `Excel.Application`, so
-software that automates Office over COM (create a workbook, write cells, save an
+A Windows COM server that impersonates `Excel.Application`, so software that
+automates Office over COM (create a workbook, write cells, format them, save an
 `.xlsx`) keeps working on machines that **do not have Microsoft Excel installed**.
 Document output is produced by the dependency-free [`gridcore`](../gridcore)
 engine — the same one behind `xlsxy`.
 
 The driving use case is **SLB Petrel**, whose "export to Excel" path drives a
 live Excel instance via COM and fails when Excel is absent. This shim registers
-`Excel.Application` in the user's registry and answers that COM traffic itself.
+`Excel.Application` and answers that COM traffic itself, backed by gridcore.
 
 ## How it works
 
-- Registered (per-user, `HKCU\Software\Classes`) so the `Excel.Application`
-  ProgID resolves to **our own coclass GUID** — never Microsoft's Excel CLSID.
-- COM launches the EXE as a `LocalServer32` (`-Embedding`). It registers a class
-  factory and serves an `IDispatch` object graph
-  (`Application → Workbooks → Workbook → Worksheets → Worksheet → Range`) whose
-  member ids are **Excel's real DISPIDs** (verified against the installed Excel
-  type library). Out-of-process means COM marshals across the 32/64-bit boundary
-  for free, so one 64-bit server drives 32-bit clients too.
-- Every activation, name lookup, and dispatch is written to
-  `%TEMP%\xlcomshim.log` — this is the **field diagnostic**: run a real client
-  (e.g. Petrel) against the shim and the log shows exactly which members it
-  called and whether it bound late (`IDispatch`) or early (vtable/typelib).
+It registers (per-user, `HKCU\Software\Classes`, never `HKLM`) under **our own
+coclass GUID** — never Microsoft's Excel CLSID — and serves the full object graph
+`Application → Workbooks → Workbook → Worksheets → Worksheet → Range` (plus
+`Font`/`Interior`) with **Excel's real IIDs and DISPIDs**, verified against the
+installed Excel type library.
+
+It answers **both** binding styles a .NET client (like Petrel) can use:
+
+- **Late-bound** (`IDispatch::Invoke`) — `CreateObject`, VBScript, C# `dynamic`.
+- **Early-bound** (typed vtable) — the Office PIA. Our objects implement Excel's
+  dual interfaces in exact vtable order (generated from the typelib), so a
+  `(Excel.Application)` cast and typed member calls succeed. The subtlety that
+  makes this work is the hidden **`[lcid]`** argument the CLR injects for many
+  members — our vtable signatures include it at the exact position the PIA's
+  `[LCIDConversion]` metadata dictates.
+
+Two activation paths, so it works however the host activates COM:
+
+- **In-process** (`InprocServer32`, `xlcomshim.dll`) — COM loads the DLL into the
+  client's process and calls our vtable directly. **No marshalling, no type
+  library.** `CLSCTX_SERVER` prefers in-proc, so this is the common path.
+- **Out-of-process** (`LocalServer32`, `xlcomshim.exe`) — COM launches the EXE
+  and marshals across the boundary. On a no-Office machine that needs a type
+  library for the universal marshaller to build vtable proxies, so we ship and
+  register our own (`docxy-excel.tlb`, authored from Excel's typelib and proven
+  ABI-identical by `tests/typelib_faithful.rs`).
+
+**Never faults on an unmodeled member.** The strategy is cover-broad, log every
+call, deploy, read the log. So an unknown late-bound member does not error (which
+would abort the host's export) — it logs and degrades: a property put is
+swallowed, a get/call returns a do-nothing object so chains like
+`range.Font.Bold = True` keep flowing. Every call is written to
+`%TEMP%\xlcomshim.log` — the field diagnostic.
 
 ## Status
 
-| Phase | What | State |
-|---|---|---|
-| **P0** | Prove COM launches the server + routes a late-bound call end-to-end, with logging | ✅ **done** — verified with a VBScript client (`Name`/`Version`/`Visible`/`Workbooks`/`Quit`) |
-| **P1** | Full `create → write → SaveAs → quit`, backed by `gridcore`, verified against real Excel as the oracle | ✅ **done** — `tools/comshim-tests/verify.ps1`: the shim creates an `.xlsx` (`Workbooks.Add`, `Worksheets(1)`, `Range`/`Cells` writes, `=SUM` formula, `SaveAs 51`); **real Excel opens it with no repair** and recomputes `B4=42.5` |
-| P1.5 | In-binary `/regserver`, number formats + basic Font/Interior, array (range) writes, `.xls` | next |
-| P2 | Early-bound typelib/vtable — only if a client needs it (the log decides) | gated |
-| P3 | Petrel integration on the VDI | pending |
-| P4 | `Word.Application` over `docxcore` | later |
+| Area | State |
+|---|---|
+| **Activation** | ✅ late-bound (IDispatch) **and** early-bound (typed vtable), both in-process (DLL) and out-of-process (EXE) |
+| **Create path** | ✅ `Workbooks.Add` → `Worksheets(n)` → `Range`/`Cells`/`Offset`/`Resize` writes → `=SUM` formulas → `SaveAs`; real Excel opens the result with no repair |
+| **Formatting** | ✅ Font bold/italic/color, Interior fill, NumberFormat, HorizontalAlignment — written into `styles.xml`, rendered by real Excel |
+| **Robustness** | ✅ unmodeled members degrade gracefully + are logged; unmodeled early-bound slots log their interface+slot before a clean `E_NOTIMPL` |
+| **Type library** | ✅ authored `docxy-excel.tlb` for the no-Office out-of-process path; oracle differential test proves it matches Excel (939 methods, 2067 params) |
+| Word | ⬜ `Word.Application` over `docxcore` — later |
 
-## Try it (P0)
+Known limits: graceful degradation covers the late-bound path; an unmodeled
+*early-bound* member returns a clean `E_NOTIMPL`. Whole-column formatting and
+`Font.Size`/`Name` aren't represented (gridcore's style model). `Range` currently
+falls back to `IDispatch` for its leaf ops (a separate `IRange` vtable IID).
+
+## Try it
 
 Real Excel, if installed, is **not** touched — registration is per-user and
 fully reversible.
 
 ```powershell
-cargo build --release -p xlcomshim
-tools\comshim\register-shim.ps1 -Force        # map Excel.Application -> the shim (HKCU)
+cargo build --release -p xlcomshim         # builds xlcomshim.exe, xlcomshim.dll, mktypelib.exe
 
-cscript //nologo - <<'VBS'
-Set x = CreateObject("Excel.Application")
-WScript.Echo "Version=" & x.Version
-x.Quit
-VBS
+# --- out-of-process (also registers the typelib) ---
+tools\comshim\register-shim.ps1 -Force
+cscript //nologo tools\comshim-tests\graceful-smoke.vbs %TEMP%\out.xlsx
+tools\comshim\unregister-shim.ps1
 
-tools\comshim\unregister-shim.ps1             # restore (real Excel visible again)
-type %TEMP%\xlcomshim.log                      # the dispatch trace
+# --- in-process (no typelib needed; the likely Petrel path) ---
+tools\comshim\register-inproc.ps1 -Force
+#   ... run an early-bound client; it loads xlcomshim.dll in-process ...
+tools\comshim\unregister-inproc.ps1
+
+type %TEMP%\xlcomshim.log                    # the dispatch trace / field diagnostic
 ```
+
+### Deploying where Office is absent (the VDI)
+
+`mktypelib` authors the `.tlb` by reading Excel's own typelib, so it can only be
+**generated** on a machine with Excel — the produced `tools/comshim/docxy-excel.tlb`
+is committed as a shipped artifact. Ship the release output
+(`xlcomshim.exe`, `xlcomshim.dll`, `mktypelib.exe`), the `tools/comshim` scripts,
+and that `.tlb`; on the target, `register-shim.ps1` / `register-inproc.ps1` do the
+rest (they only *register*, which needs no Excel).
+
+## Tests
+
+- `tools/comshim-tests/verify.ps1` — create via the shim, then real Excel opens
+  it and recomputes the `=SUM` (the oracle).
+- `tools/comshim-tests/graceful-smoke.vbs` — hammers unmodeled members +
+  navigation writes + formatting; must not fault and must produce a valid file.
+- `tools/comshim-tests/csharp/` — the .NET PIA harness (`castshim` early-bound
+  out-of-process, `castinproc` in-process, `late` late-bound).
+- `cargo test -p xlcomshim` — the typelib oracle differential test.
 
 ## Safety / registration
 
-`register-shim.ps1` writes only `HKCU\Software\Classes` (never `HKLM`), uses a
-distinct shim CLSID, and refuses to overwrite a different existing mapping unless
-`-Force`. An elevated/service client bypasses `HKCU`, so an opt-in machine-wide
-mode will come with P1's in-binary `/regserver`.
-
-Reference: the full Excel object-model spec (IIDs, DISPIDs, vtable order, enum
-values) was extracted from the live Excel type library; the DISPIDs seeded here
-come from that dump.
+All registration is per-user (`HKCU\Software\Classes`), uses a distinct shim
+CLSID, is guarded (refuses to overwrite a different existing mapping without
+`-Force`), and is fully reversible. `HKLM` and an installed Excel are never
+touched.
