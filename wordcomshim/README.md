@@ -29,9 +29,10 @@ object — so nothing faults, and every call is logged to `%TEMP%\wordcomshim.lo
 | Area | State |
 |---|---|
 | Late-bound create path | ✅ `Documents.Add` → `Selection`/`Range` text → `SaveAs2`; **real Word opens the result** and reads every paragraph back |
-| Both activation paths | ✅ LocalServer32 (.exe) and InprocServer32 (.dll) |
+| Early-bound (typed vtable) | ✅ a .NET PIA client casts to `Word._Application` and drives the create path through the vtable; **real Word opens it**. Interfaces: `_Application`/`Documents`/`_Document`/`Selection`/`Range` as duals (no `[lcid]` params, unlike Excel) |
+| Both activation paths | ✅ LocalServer32 (.exe, out-of-process) and InprocServer32 (.dll, in-process — the no-Word path, verified early-bound) |
 | Graceful degradation | ✅ unmodeled members logged + benign |
-| Early-bound (typed vtable + typelib) | ⬜ next — mirror xlcomshim's dual-interface + `mktypelib` approach against Word's typelib |
+| Type library (out-of-proc, no Word) | ⬜ next — author + register a Word `.tlb` (mirror xlcomshim's `mktypelib`) + oracle test |
 | Formatting (Font/ParagraphFormat) | ⬜ later — over docxcore run/paragraph props |
 
 ## Try it

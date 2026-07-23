@@ -20,9 +20,12 @@ internal static class WordInteropTest
     {
         string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "castshim";
         string outPath = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "cs-word.docx");
+        // castinproc loads the DLL into THIS process (no marshalling, no typelib —
+        // the no-Word path); castshim forces out-of-process.
+        uint clsctx = mode == "castinproc" ? 0x1u : 0x4u;
         try
         {
-            RunCastShim(outPath);
+            RunCastShim(outPath, clsctx);
             Console.WriteLine("RESULT: OK (" + mode + ") -> " + outPath);
             return 0;
         }
@@ -33,13 +36,12 @@ internal static class WordInteropTest
         }
     }
 
-    private static void RunCastShim(string outPath)
+    private static void RunCastShim(string outPath, uint clsctx)
     {
-        const uint CLSCTX_LOCAL_SERVER = 0x4;
         Guid clsid = new Guid("9C2F4A10-7D33-4B6E-B1A4-2E7C8D5F0A92"); // our shim coclass
         Guid iidUnknown = new Guid("00000000-0000-0000-C000-000000000046");
         IntPtr punk;
-        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_LOCAL_SERVER, ref iidUnknown, out punk);
+        int hr = CoCreateInstance(ref clsid, IntPtr.Zero, clsctx, ref iidUnknown, out punk);
         if (hr < 0) throw new COMException("CoCreateInstance(shim CLSID) failed", hr);
         object obj = Marshal.GetObjectForIUnknown(punk);
         Marshal.Release(punk);
