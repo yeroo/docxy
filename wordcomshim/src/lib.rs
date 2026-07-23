@@ -92,6 +92,9 @@ mod win {
         /// `Selection.Style`. Applied to new paragraphs.
         cur_style: Option<String>,
         cur_heading: Option<u8>,
+        /// Current list numbering id (from `Range.ListFormat.Apply…`), applied to
+        /// new paragraphs until `RemoveNumbers`.
+        cur_list: Option<i32>,
     }
 
     impl DocState {
@@ -104,6 +107,7 @@ mod win {
                 cur_align: Align::Left,
                 cur_style: None,
                 cur_heading: None,
+                cur_list: None,
             }
         }
 
@@ -119,6 +123,7 @@ mod win {
                 cur_align: Align::Left,
                 cur_style: None,
                 cur_heading: None,
+                cur_list: None,
             })
         }
 
@@ -128,15 +133,18 @@ mod win {
                     align: self.cur_align,
                     style_id: self.cur_style.clone(),
                     heading_level: self.cur_heading,
+                    num_id: self.cur_list,
+                    ilvl: 0,
                     ..ParProps::default()
                 },
                 content: vec![],
             }
         }
 
-        /// Set the current paragraph style from a name ("Heading 1", "Normal") —
-        /// applies the style id + a heading direct format so it renders even when
-        /// the document's styles.xml doesn't define the built-in style.
+        /// Set the current paragraph style from a name ("Heading 1", "Normal").
+        /// For a heading we DEFINE the built-in style in styles.xml (via
+        /// `ensure_styles`), so Word shows it semantically as "Heading N" with
+        /// real heading formatting — not just direct formatting.
         fn set_style(&mut self, style: &str) {
             let low = style.trim().to_ascii_lowercase();
             let hn = low
@@ -145,24 +153,51 @@ mod win {
                 .and_then(|s| s.parse::<u8>().ok())
                 .filter(|n| (1..=9).contains(n));
             if let Some(n) = hn {
-                self.cur_style = Some(format!("Heading{n}"));
+                let id = format!("Heading{}", n.min(6));
+                self.pkg.ensure_styles(&[id.as_str()]);
+                self.cur_style = Some(id);
                 self.cur_heading = Some(n);
-                self.cur.bold = true;
-                self.cur.size_half_pts = Some(match n {
-                    1 => 32,
-                    2 => 28,
-                    3 => 26,
-                    _ => 24,
-                });
+                self.cur.bold = false;
+                self.cur.size_half_pts = None;
             } else if low == "normal" || low.is_empty() {
                 self.cur_style = None;
                 self.cur_heading = None;
                 self.cur.bold = false;
                 self.cur.size_half_pts = None;
             } else {
-                self.cur_style = Some(style.replace(' ', ""));
+                let id = style.replace(' ', "");
+                self.pkg.ensure_styles(&[id.as_str()]);
+                self.cur_style = Some(id);
                 self.cur_heading = None;
             }
+            // Word applies the style to the CURRENT paragraph; if it is still
+            // empty (freshly started), retag it so `Style=x : TypeText` styles
+            // this paragraph, not just the next one.
+            let (style_id, heading) = (self.cur_style.clone(), self.cur_heading);
+            if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                if p.content.is_empty() {
+                    p.props.style_id = style_id;
+                    p.props.heading_level = heading;
+                }
+            }
+        }
+
+        /// Apply (Some) or clear (None) a bullet/numbered list to new paragraphs,
+        /// also marking the current (last) paragraph — the "apply list then type
+        /// items" idiom.
+        fn apply_list(&mut self, bullet: Option<bool>) {
+            match bullet {
+                Some(b) => {
+                    let id = self.pkg.ensure_list(b);
+                    self.cur_list = Some(id);
+                    if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                        p.props.num_id = Some(id);
+                        p.props.ilvl = 0;
+                    }
+                }
+                None => self.cur_list = None,
+            }
+            self.saved = false;
         }
 
         /// `Selection.Style = wdStyleHeadingN` (-2..-10) / wdStyleNormal (-1).
@@ -1488,6 +1523,7 @@ mod win {
             "italic" => 12,
             "underline" => 13,
             "paragraphformat" => 14,
+            "listformat" => 20,
             _ => return None,
         })
     }
@@ -1543,6 +1579,7 @@ mod win {
                     12 => return bool_prop(doc, true, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
                     13 => return bool_prop(doc, true, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
                     14 => put_disp(result, ParaFmt { doc, all: true }),
+                    20 => put_disp(result, ListFormat { doc }),
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
@@ -1780,7 +1817,52 @@ mod win {
         row: usize,
         col: usize,
     }
-    into_disp_idispatch!(Tables, WordTable, WordCell, CellRange);
+    into_disp_idispatch!(Tables, WordTable, WordCell, CellRange, ListFormat);
+
+    #[implement(IDispatch)]
+    struct ListFormat {
+        doc: usize,
+    }
+    fn listformat_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "applybulletdefault" => 1,
+            "applynumberdefault" => 2,
+            "removenumbers" => 3,
+            _ => return None,
+        })
+    }
+    impl IDispatch_Impl for ListFormat_Impl {
+        no_typeinfo!();
+        dispatch_names!("ListFormat", listformat_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            _params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let doc = self.doc;
+            unsafe {
+                log(&format!("ListFormat[{doc}]::Invoke id={id}"));
+                let bullet = match id {
+                    1 => Some(true),
+                    2 => Some(false),
+                    3 => None,
+                    _ => return unhandled(id, wflags, result),
+                };
+                reg(|r| {
+                    if let Some(d) = r.docs.get_mut(doc) {
+                        d.apply_list(bullet)
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
 
     fn tables_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
