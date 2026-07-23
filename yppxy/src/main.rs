@@ -1589,13 +1589,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 
     match k.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => {
-            if app.dirty {
-                app.status = "Unsaved changes — Ctrl+S to save, or Ctrl+Q to quit anyway".into();
-            } else {
-                app.quit = true;
-            }
-        }
+        // Any quit key opens the shared confirm (which warns about unsaved
+        // changes) — consistent with Ctrl+Q and the other apps.
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.request_exit(),
         KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             if app.sel + 1 < app.proj.tasks.len() {
