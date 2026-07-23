@@ -12,6 +12,9 @@
 /sample-output.pdf
 /cli-output.pdf
 /sample-resaved.docx
+# Assembled COM-shim deployment package (built by tools/package-shims.ps1 from
+# release binaries + the committed .tlb/scripts; regenerate, don't commit).
+/dist/
 # mmcompare: real-mermaid.js-vs-ours visual comparison harness (dev tool,
 # scripts/mmcompare) — rendered PNGs/HTMLs and its own node_modules.
 /scripts/mmcompare/out/
