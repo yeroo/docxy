@@ -791,6 +791,16 @@ struct DvPicker {
     sel: usize,
 }
 
+/// What a confirmed (Yes) modal should do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ConfirmAction {
+    Exit,
+    DeleteSheet,
+}
+
+// The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
+// across all apps); xlsxy only supplies the action carried on Yes.
+
 struct App {
     pkg: SheetPackage,
     engine: Engine,
@@ -808,8 +818,9 @@ struct App {
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
-    confirm_quit: bool,
-    confirm_delete_sheet: bool,
+    /// A modal Yes/No confirmation (e.g. Exit, delete sheet). The shared widget
+    /// records its own selection/action.
+    confirm: Option<backstage::Confirm<ConfirmAction>>,
     /// An external hyperlink awaiting the user's confirmation to open.
     pending_link: Option<String>,
     prompt: Option<Prompt>,
@@ -890,8 +901,7 @@ impl App {
             clip: None,
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
-            confirm_quit: false,
-            confirm_delete_sheet: false,
+            confirm: None,
             pending_link: None,
             prompt: None,
             pivot_edit: None,
@@ -2665,16 +2675,77 @@ impl App {
                 false
             }
             BackstageEvent::Exit => {
-                if self.modified {
-                    self.confirm_quit = true;
-                    self.backstage = None;
-                    false
-                } else {
-                    self.backstage = None;
-                    true
+                self.request_exit();
+                false
+            }
+        }
+    }
+
+    /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
+    fn request_exit(&mut self) {
+        self.backstage = None;
+        let prompt = if self.modified {
+            "Exit xlsxy? Unsaved changes will be lost."
+        } else {
+            "Exit xlsxy?"
+        };
+        self.confirm = Some(backstage::Confirm::new(
+            prompt,
+            ConfirmAction::Exit,
+            Color::Green,
+        ));
+    }
+
+    /// Open the "delete this sheet?" confirmation modal (Shift-Del).
+    fn request_delete_sheet(&mut self) {
+        let name = self.pkg.workbook.sheets[self.sheet].name.clone();
+        self.confirm = Some(
+            backstage::Confirm::new(
+                format!("Delete sheet '{name}'?"),
+                ConfirmAction::DeleteSheet,
+                Color::Green,
+            )
+            .default_no(),
+        );
+    }
+
+    /// Act on the shared dialog's outcome. Returns true if the app should quit.
+    fn apply_confirm(&mut self, outcome: backstage::ConfirmOutcome<ConfirmAction>) -> bool {
+        match outcome {
+            backstage::ConfirmOutcome::Pending => false,
+            backstage::ConfirmOutcome::Cancelled => {
+                self.confirm = None;
+                false
+            }
+            backstage::ConfirmOutcome::Confirmed(action) => {
+                self.confirm = None;
+                match action {
+                    ConfirmAction::Exit => true,
+                    ConfirmAction::DeleteSheet => {
+                        self.delete_current_sheet();
+                        false
+                    }
                 }
             }
         }
+    }
+
+    /// Route a key to the Yes/No modal. Returns true if the app should quit.
+    fn confirm_key(&mut self, key: KeyEvent) -> bool {
+        let Some(c) = self.confirm.as_mut() else {
+            return false;
+        };
+        let outcome = c.key(key);
+        self.apply_confirm(outcome)
+    }
+
+    /// Route a click to the Yes/No modal. Returns true if the app should quit.
+    fn confirm_mouse(&mut self, x: u16, y: u16) -> bool {
+        let Some(c) = self.confirm.as_mut() else {
+            return false;
+        };
+        let outcome = c.mouse(x, y);
+        self.apply_confirm(outcome)
     }
 
     /// Route a key to the backstage. Returns true when the app should exit.
@@ -2734,7 +2805,10 @@ impl App {
     fn start_screen_key(&mut self, key: KeyEvent) -> bool {
         match self.start.key(key) {
             backstage::StartEvent::Choose(i) => self.start_choose(i),
-            backstage::StartEvent::Quit => true,
+            backstage::StartEvent::Quit => {
+                self.request_exit();
+                false
+            }
             backstage::StartEvent::None => false,
         }
     }
@@ -2751,7 +2825,7 @@ impl App {
                     bs.pane = backstage::Pane::Browser;
                 }
             }
-            _ => return true, // Quit
+            _ => self.request_exit(), // Quit — always confirm first
         }
         false
     }
@@ -3178,13 +3252,7 @@ impl App {
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('r') if ctrl => self.redo(),
             KeyCode::Char('s') if ctrl => self.save(),
-            KeyCode::Char('q') if ctrl => {
-                if self.modified {
-                    self.confirm_quit = true;
-                } else {
-                    return true;
-                }
-            }
+            KeyCode::Char('q') if ctrl => self.request_exit(),
             KeyCode::Esc => self.vim_exit_visual(),
             _ => {}
         }
@@ -3543,6 +3611,13 @@ const HDR_CUR: Style = Style::new()
 fn draw(app: &mut App, f: &mut Frame) {
     let area = f.area();
     if area.height < 8 || area.width < 12 {
+        return;
+    }
+    // A confirmation modal owns the whole screen — no content behind it (it
+    // can be raised from the welcome screen too, so check it first).
+    if let Some(c) = app.confirm.as_mut() {
+        f.render_widget(Clear, area);
+        c.draw(f, area);
         return;
     }
     // Full-screen surfaces paint over everything else.
@@ -3950,13 +4025,6 @@ fn draw(app: &mut App, f: &mut Frame) {
     } else if app.pivot_edit.is_some() {
         "Pivot: ←/→ pane · ↑/↓ select · Shift-↑/↓ reorder · r/c/v add · d remove · a aggregation · Esc close"
             .to_string()
-    } else if app.confirm_quit {
-        "Unsaved changes — press Ctrl-Q again to quit without saving, Esc to stay".to_string()
-    } else if app.confirm_delete_sheet {
-        format!(
-            "Delete sheet '{}'? Shift-Del again to confirm, any key to cancel",
-            app.pkg.workbook.sheets[app.sheet].name
-        )
     } else if let Some(s) = &app.status {
         s.clone()
     } else if app.edit.is_some() {
@@ -4598,22 +4666,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // A modal confirmation owns all keys while open — even over the welcome
+    // screen or the backstage (Ctrl+Q / Esc-quit can fire from either).
+    if app.confirm.is_some() {
+        return app.confirm_key(key);
+    }
     // Full-screen surfaces own the keyboard entirely.
     if app.start_screen {
         return app.start_screen_key(key);
     }
     if app.backstage.is_some() {
         return app.backstage_key(key);
-    }
-
-    if app.confirm_quit {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') if ctrl => return true,
-            _ => {
-                app.confirm_quit = false;
-                return false;
-            }
-        }
     }
 
     if let Some(url) = app.pending_link.take() {
@@ -4623,16 +4686,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.status = Some(format!("Opening {url}"));
             }
             _ => app.status = Some("Link cancelled".to_string()),
-        }
-        return false;
-    }
-
-    if app.confirm_delete_sheet {
-        app.confirm_delete_sheet = false;
-        if key.code == KeyCode::Delete && shift {
-            app.delete_current_sheet();
-        } else {
-            app.status = Some("Sheet deletion cancelled".to_string());
         }
         return false;
     }
@@ -4833,11 +4886,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- navigation / commands --------------------------------------------------
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') if ctrl => {
-            if app.modified {
-                app.confirm_quit = true;
-                return false;
-            }
-            return true;
+            app.request_exit();
+            return false;
         }
         KeyCode::Char('s') | KeyCode::Char('S') if ctrl => app.save(),
         KeyCode::Char('z') | KeyCode::Char('Z') if ctrl => app.undo(),
@@ -4880,7 +4930,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::F(6) if shift => app.col_op(false),
         KeyCode::F(6) => app.col_op(true),
         KeyCode::Delete if shift => {
-            app.confirm_delete_sheet = true;
+            app.request_delete_sheet();
             return false;
         }
         KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
@@ -4983,6 +5033,14 @@ fn char_index(s: &str, char_pos: usize) -> usize {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // A modal confirmation owns the mouse while open — even over the welcome
+    // screen or the backstage.
+    if app.confirm.is_some() {
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            return app.confirm_mouse(m.column, m.row);
+        }
+        return false;
+    }
     // The welcome screen owns the whole terminal; handle its clicks here so
     // nothing leaks to the hidden workbook behind it. Hovering highlights an
     // item, clicking activates it.
@@ -5514,26 +5572,44 @@ mod tests {
     }
 
     #[test]
-    fn backstage_mouse_exit_item_quits() {
+    fn backstage_mouse_exit_item_opens_confirm_then_quits() {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         app.backstage = Some(backstage::Backstage::open(
             std::env::temp_dir(),
             app.extensions(),
         ));
-        // "Exit" is the last item; on an unmodified workbook it exits the app.
+        // "Exit" is the last item; clicking it opens the shared confirm modal
+        // instead of quitting outright, even on an unmodified workbook.
         let exit_row = 1 + backstage::ITEMS
             .iter()
             .position(|i| *i == backstage::Item::Exit)
             .unwrap() as u16;
-        assert!(app.bs_mouse(3, exit_row));
+        assert!(!app.bs_mouse(3, exit_row));
+        assert!(app.backstage.is_none());
+        assert!(app.confirm.is_some());
+        assert!(!app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        // Confirming (press 'y') quits.
+        assert!(app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
     }
 
     #[test]
     fn single_click_exit_opens_confirm_and_new_stays_guarded() {
-        // Exit is guarded by xlsxy's own modified-check, not a confirm modal
-        // click, but New is guarded by the shared backstagecore mouse handler:
-        // a first click only selects it, a second (confirming) click fires it.
+        // Exit is index 7 in the menu, drawn at screen row 1 + idx. One click
+        // goes straight to the shared confirm modal — no second click.
+        let exit_row = 1 + backstage::ITEMS
+            .iter()
+            .position(|i| *i == backstage::Item::Exit)
+            .unwrap() as u16;
+        let mut app = App::new(new_xlsx(), "doc.xlsx");
+        app.os_clip = None;
+        app.open_backstage();
+        app.bs_mouse(3, exit_row);
+        assert!(app.backstage.is_none(), "Exit closes the backstage");
+        assert!(app.confirm.is_some(), "Exit raises the confirm dialog");
+
+        // New is guarded by the shared backstagecore mouse handler: a first
+        // click only selects it, a second (confirming) click fires it.
         let new_row = 1 + backstage::ITEMS
             .iter()
             .position(|i| *i == backstage::Item::New)
@@ -5548,6 +5624,63 @@ mod tests {
         app.bs_mouse(3, new_row);
         assert!(app.backstage.is_none());
         assert_eq!(app.path, "untitled.xlsx");
+    }
+
+    #[test]
+    fn ctrl_q_opens_the_exit_confirmation() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.modified = true;
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        // Ctrl+Q does not quit outright — it opens the Yes/No modal.
+        assert!(!handle_key(&mut app, ctrl_q));
+        assert!(app.confirm.is_some());
+        // the prompt warns about unsaved changes
+        assert!(app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        // confirming with 'y' quits
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('y'))));
+    }
+
+    #[test]
+    fn ctrl_q_confirmation_can_be_cancelled() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        // Even with no changes, Ctrl+Q asks first.
+        assert!(!handle_key(&mut app, ctrl_q));
+        assert!(app.confirm.is_some());
+        assert!(!app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        // No / Esc dismisses without quitting.
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Esc)));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn shift_delete_opens_delete_sheet_confirmation() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.add_sheet("Sheet2");
+        let n_sheets = app.pkg.workbook.sheets.len();
+        assert!(!handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT)
+        ));
+        assert!(app.confirm.is_some());
+        assert!(
+            !app.confirm.as_ref().unwrap().yes_selected(),
+            "No is the default for a destructive prompt"
+        );
+        // Cancelling leaves every sheet in place.
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Esc)));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pkg.workbook.sheets.len(), n_sheets);
+        // Confirming with 'y' deletes the current sheet.
+        assert!(!handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT)
+        ));
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('y'))));
+        assert_eq!(app.pkg.workbook.sheets.len(), n_sheets - 1);
     }
 
     #[test]
@@ -5689,10 +5822,12 @@ mod tests {
         app.start_screen = true;
         assert!(!app.start_choose(1));
         assert!(app.backstage.is_some());
-        // Quit returns true (exit).
+        // Quit opens the shared confirm modal instead of exiting outright.
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.start_screen = true;
-        assert!(app.start_choose(2));
+        assert!(!app.start_choose(2));
+        assert!(app.confirm.is_some());
+        assert!(app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
     }
 
     #[test]
@@ -5708,8 +5843,11 @@ mod tests {
         assert_eq!(app.start.sel(), 0);
         assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Down)));
         assert_eq!(app.start.sel(), 1);
-        // A digit selects and activates: '3' → Quit.
-        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('3'))));
+        // A digit selects and activates: '3' → Quit, which opens the shared
+        // confirm modal instead of exiting outright.
+        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('3'))));
+        assert!(app.confirm.is_some());
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('y'))));
     }
 
     #[test]
