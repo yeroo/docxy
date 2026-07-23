@@ -16,7 +16,7 @@ internal static class WordTlb
     private static readonly Guid WordLib = new Guid("00020905-0000-0000-C000-000000000046");
 
     private static readonly string[] Wanted =
-        { "_Application", "Documents", "_Document", "Selection", "Range", "Paragraphs" };
+        { "_Application", "Documents", "_Document", "Selection", "Range", "_Font", "_ParagraphFormat" };
 
     private static int Main(string[] args)
     {

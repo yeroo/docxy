@@ -54,8 +54,16 @@ internal static class WordInteropTest
             Word.Documents docs = app.Documents;
             Word.Document doc = docs.Add();
             Word.Selection sel = app.Selection;
+            // Early-bound formatting: sel.Font is returned by the vtable, then
+            // used (late-bound) to set Bold/Size before typing.
+            sel.Font.Bold = 1;
+            sel.Font.Size = 16f;
+            sel.ParagraphFormat.Alignment = Word.WdParagraphAlignment.wdAlignParagraphCenter;
             sel.TypeText("Early-bound Word shim");
             sel.TypeParagraph();
+            sel.Font.Bold = 0;
+            sel.Font.Size = 11f;
+            sel.ParagraphFormat.Alignment = Word.WdParagraphAlignment.wdAlignParagraphLeft;
             sel.TypeText("Second paragraph.");
             object fn = outPath;
             object missing = Type.Missing;

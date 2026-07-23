@@ -21,6 +21,8 @@ $map = [ordered]@{
     '_Document'    = @{ trait = 'IWordDoc';   struct = 'DocumentObj' }
     'Selection'    = @{ trait = 'ISelection'; struct = 'Selection' }
     'Range'        = @{ trait = 'IWordRange'; struct = 'Range' }
+    '_Font'            = @{ trait = 'IFont';    struct = 'WordFont' }
+    '_ParagraphFormat' = @{ trait = 'IParaFmt'; struct = 'ParaFmt' }
 }
 
 $V = '*const VARIANT'
@@ -61,16 +63,44 @@ $overrides = @{
     'Selection' = @{
         7   = @{ sig = "ret: *mut BSTR";        call = 'vt_sel_text_get(self, ret)' }
         8   = @{ sig = "v: *const u16";         call = 'vt_sel_text_put(self, v)' }
+        15  = @{ sig = "ret: *mut *mut c_void"; call = 'vt_sel_font(self, ret)' }
+        37  = @{ sig = "ret: *mut *mut c_void"; call = 'vt_sel_paraformat(self, ret)' }
         57  = @{ sig = "ret: *mut *mut c_void"; call = 'vt_sel_range(self, ret)' }
         81  = @{ sig = "text: *const u16";      call = 'vt_sel_insertafter(self, text)' }
         134 = @{ sig = "text: *const u16";      call = 'vt_sel_typetext(self, text)' }
         137 = @{ sig = "";                      call = 'vt_sel_typepara(self)' }
     }
     'Range' = @{
-        7   = @{ sig = "ret: *mut BSTR";   call = 'vt_rng_text_get(self, ret)' }
-        8   = @{ sig = "v: *const u16";    call = 'vt_rng_text_put(self, v)' }
-        99  = @{ sig = "text: *const u16"; call = 'vt_rng_insertafter(self, text)' }
-        124 = @{ sig = "";                 call = 'vt_rng_insertpara(self)' }
+        7   = @{ sig = "ret: *mut BSTR";        call = 'vt_rng_text_get(self, ret)' }
+        8   = @{ sig = "v: *const u16";         call = 'vt_rng_text_put(self, v)' }
+        15  = @{ sig = "ret: *mut *mut c_void"; call = 'vt_rng_font(self, ret)' }
+        37  = @{ sig = "ret: *mut *mut c_void"; call = 'vt_rng_paraformat(self, ret)' }
+        44  = @{ sig = "ret: *mut i32";         call = 'vt_rng_bold_get(self, ret)' }
+        45  = @{ sig = "v: i32";                call = 'vt_rng_bold_put(self, v)' }
+        46  = @{ sig = "ret: *mut i32";         call = 'vt_rng_italic_get(self, ret)' }
+        47  = @{ sig = "v: i32";                call = 'vt_rng_italic_put(self, v)' }
+        48  = @{ sig = "ret: *mut i32";         call = 'vt_rng_underline_get(self, ret)' }
+        49  = @{ sig = "v: i32";                call = 'vt_rng_underline_put(self, v)' }
+        99  = @{ sig = "text: *const u16";      call = 'vt_rng_insertafter(self, text)' }
+        124 = @{ sig = "";                      call = 'vt_rng_insertpara(self)' }
+    }
+    '_Font' = @{
+        11 = @{ sig = "ret: *mut i32"; call = 'vt_font_bold_get(self, ret)' }
+        12 = @{ sig = "v: i32";        call = 'vt_font_bold_put(self, v)' }
+        13 = @{ sig = "ret: *mut i32"; call = 'vt_font_italic_get(self, ret)' }
+        14 = @{ sig = "v: i32";        call = 'vt_font_italic_put(self, v)' }
+        31 = @{ sig = "ret: *mut i32"; call = 'vt_font_underline_get(self, ret)' }
+        32 = @{ sig = "v: i32";        call = 'vt_font_underline_put(self, v)' }
+        33 = @{ sig = "ret: *mut f32"; call = 'vt_font_size_get(self, ret)' }
+        34 = @{ sig = "v: f32";        call = 'vt_font_size_put(self, v)' }
+        35 = @{ sig = "ret: *mut BSTR"; call = 'vt_font_name_get(self, ret)' }
+        36 = @{ sig = "v: *const u16"; call = 'vt_font_name_put(self, v)' }
+        72 = @{ sig = "ret: *mut i32"; call = 'vt_font_color_get(self, ret)' }
+        73 = @{ sig = "v: i32";        call = 'vt_font_color_put(self, v)' }
+    }
+    '_ParagraphFormat' = @{
+        13 = @{ sig = "ret: *mut i32"; call = 'vt_para_align_get(self, ret)' }
+        14 = @{ sig = "v: i32";        call = 'vt_para_align_put(self, v)' }
     }
 }
 

@@ -1453,7 +1453,7 @@ unsafe trait ISelection: IDispatch {
     unsafe fn s12(&self) -> HRESULT;
     unsafe fn s13(&self) -> HRESULT;
     unsafe fn s14(&self) -> HRESULT;
-    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s15(&self, ret: *mut *mut c_void) -> HRESULT;
     unsafe fn s16(&self) -> HRESULT;
     unsafe fn s17(&self) -> HRESULT;
     unsafe fn s18(&self) -> HRESULT;
@@ -1475,7 +1475,7 @@ unsafe trait ISelection: IDispatch {
     unsafe fn s34(&self) -> HRESULT;
     unsafe fn s35(&self) -> HRESULT;
     unsafe fn s36(&self) -> HRESULT;
-    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s37(&self, ret: *mut *mut c_void) -> HRESULT;
     unsafe fn s38(&self) -> HRESULT;
     unsafe fn s39(&self) -> HRESULT;
     unsafe fn s40(&self) -> HRESULT;
@@ -1669,7 +1669,7 @@ impl ISelection_Impl for Selection_Impl {
     unsafe fn s12(&self) -> HRESULT { log("ISelection vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s13(&self) -> HRESULT { log("ISelection vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s14(&self) -> HRESULT { log("ISelection vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { log("ISelection vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_sel_font(self, ret) } }
     unsafe fn s16(&self) -> HRESULT { log("ISelection vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s17(&self) -> HRESULT { log("ISelection vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s18(&self) -> HRESULT { log("ISelection vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
@@ -1691,7 +1691,7 @@ impl ISelection_Impl for Selection_Impl {
     unsafe fn s34(&self) -> HRESULT { log("ISelection vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s35(&self) -> HRESULT { log("ISelection vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s36(&self) -> HRESULT { log("ISelection vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { log("ISelection vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_sel_paraformat(self, ret) } }
     unsafe fn s38(&self) -> HRESULT { log("ISelection vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s39(&self) -> HRESULT { log("ISelection vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s40(&self) -> HRESULT { log("ISelection vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
@@ -1886,7 +1886,7 @@ unsafe trait IWordRange: IDispatch {
     unsafe fn s12(&self) -> HRESULT;
     unsafe fn s13(&self) -> HRESULT;
     unsafe fn s14(&self) -> HRESULT;
-    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s15(&self, ret: *mut *mut c_void) -> HRESULT;
     unsafe fn s16(&self) -> HRESULT;
     unsafe fn s17(&self) -> HRESULT;
     unsafe fn s18(&self) -> HRESULT;
@@ -1908,19 +1908,19 @@ unsafe trait IWordRange: IDispatch {
     unsafe fn s34(&self) -> HRESULT;
     unsafe fn s35(&self) -> HRESULT;
     unsafe fn s36(&self) -> HRESULT;
-    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s37(&self, ret: *mut *mut c_void) -> HRESULT;
     unsafe fn s38(&self) -> HRESULT;
     unsafe fn s39(&self) -> HRESULT;
     unsafe fn s40(&self) -> HRESULT;
     unsafe fn s41(&self) -> HRESULT;
     unsafe fn s42(&self) -> HRESULT;
     unsafe fn s43(&self) -> HRESULT;
-    unsafe fn s44(&self) -> HRESULT;
-    unsafe fn s45(&self) -> HRESULT;
-    unsafe fn s46(&self) -> HRESULT;
-    unsafe fn s47(&self) -> HRESULT;
-    unsafe fn s48(&self) -> HRESULT;
-    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s44(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s45(&self, v: i32) -> HRESULT;
+    unsafe fn s46(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s47(&self, v: i32) -> HRESULT;
+    unsafe fn s48(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s49(&self, v: i32) -> HRESULT;
     unsafe fn s50(&self) -> HRESULT;
     unsafe fn s51(&self) -> HRESULT;
     unsafe fn s52(&self) -> HRESULT;
@@ -2109,7 +2109,7 @@ impl IWordRange_Impl for Range_Impl {
     unsafe fn s12(&self) -> HRESULT { log("IWordRange vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s13(&self) -> HRESULT { log("IWordRange vtable#13 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s14(&self) -> HRESULT { log("IWordRange vtable#14 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s15(&self) -> HRESULT { log("IWordRange vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s15(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_rng_font(self, ret) } }
     unsafe fn s16(&self) -> HRESULT { log("IWordRange vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s17(&self) -> HRESULT { log("IWordRange vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s18(&self) -> HRESULT { log("IWordRange vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
@@ -2131,19 +2131,19 @@ impl IWordRange_Impl for Range_Impl {
     unsafe fn s34(&self) -> HRESULT { log("IWordRange vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s35(&self) -> HRESULT { log("IWordRange vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s36(&self) -> HRESULT { log("IWordRange vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s37(&self) -> HRESULT { log("IWordRange vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self, ret: *mut *mut c_void) -> HRESULT { unsafe { vt_rng_paraformat(self, ret) } }
     unsafe fn s38(&self) -> HRESULT { log("IWordRange vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s39(&self) -> HRESULT { log("IWordRange vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s40(&self) -> HRESULT { log("IWordRange vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s41(&self) -> HRESULT { log("IWordRange vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s42(&self) -> HRESULT { log("IWordRange vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s43(&self) -> HRESULT { log("IWordRange vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s44(&self) -> HRESULT { log("IWordRange vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s45(&self) -> HRESULT { log("IWordRange vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s46(&self) -> HRESULT { log("IWordRange vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s47(&self) -> HRESULT { log("IWordRange vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s48(&self) -> HRESULT { log("IWordRange vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
-    unsafe fn s49(&self) -> HRESULT { log("IWordRange vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self, ret: *mut i32) -> HRESULT { unsafe { vt_rng_bold_get(self, ret) } }
+    unsafe fn s45(&self, v: i32) -> HRESULT { unsafe { vt_rng_bold_put(self, v) } }
+    unsafe fn s46(&self, ret: *mut i32) -> HRESULT { unsafe { vt_rng_italic_get(self, ret) } }
+    unsafe fn s47(&self, v: i32) -> HRESULT { unsafe { vt_rng_italic_put(self, v) } }
+    unsafe fn s48(&self, ret: *mut i32) -> HRESULT { unsafe { vt_rng_underline_get(self, ret) } }
+    unsafe fn s49(&self, v: i32) -> HRESULT { unsafe { vt_rng_underline_put(self, v) } }
     unsafe fn s50(&self) -> HRESULT { log("IWordRange vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s51(&self) -> HRESULT { log("IWordRange vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s52(&self) -> HRESULT { log("IWordRange vtable#52 unmodeled (early-bound)"); E_NOTIMPL }
@@ -2321,6 +2321,412 @@ impl IWordRange_Impl for Range_Impl {
     unsafe fn s224(&self) -> HRESULT { log("IWordRange vtable#224 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s225(&self) -> HRESULT { log("IWordRange vtable#225 unmodeled (early-bound)"); E_NOTIMPL }
     unsafe fn s226(&self) -> HRESULT { log("IWordRange vtable#226 unmodeled (early-bound)"); E_NOTIMPL }
+}
+
+#[interface("00020952-0000-0000-c000-000000000046")]
+unsafe trait IFont: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s12(&self, v: i32) -> HRESULT;
+    unsafe fn s13(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s14(&self, v: i32) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s32(&self, v: i32) -> HRESULT;
+    unsafe fn s33(&self, ret: *mut f32) -> HRESULT;
+    unsafe fn s34(&self, v: f32) -> HRESULT;
+    unsafe fn s35(&self, ret: *mut BSTR) -> HRESULT;
+    unsafe fn s36(&self, v: *const u16) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+    unsafe fn s44(&self) -> HRESULT;
+    unsafe fn s45(&self) -> HRESULT;
+    unsafe fn s46(&self) -> HRESULT;
+    unsafe fn s47(&self) -> HRESULT;
+    unsafe fn s48(&self) -> HRESULT;
+    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s50(&self) -> HRESULT;
+    unsafe fn s51(&self) -> HRESULT;
+    unsafe fn s52(&self) -> HRESULT;
+    unsafe fn s53(&self) -> HRESULT;
+    unsafe fn s54(&self) -> HRESULT;
+    unsafe fn s55(&self) -> HRESULT;
+    unsafe fn s56(&self) -> HRESULT;
+    unsafe fn s57(&self) -> HRESULT;
+    unsafe fn s58(&self) -> HRESULT;
+    unsafe fn s59(&self) -> HRESULT;
+    unsafe fn s60(&self) -> HRESULT;
+    unsafe fn s61(&self) -> HRESULT;
+    unsafe fn s62(&self) -> HRESULT;
+    unsafe fn s63(&self) -> HRESULT;
+    unsafe fn s64(&self) -> HRESULT;
+    unsafe fn s65(&self) -> HRESULT;
+    unsafe fn s66(&self) -> HRESULT;
+    unsafe fn s67(&self) -> HRESULT;
+    unsafe fn s68(&self) -> HRESULT;
+    unsafe fn s69(&self) -> HRESULT;
+    unsafe fn s70(&self) -> HRESULT;
+    unsafe fn s71(&self) -> HRESULT;
+    unsafe fn s72(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s73(&self, v: i32) -> HRESULT;
+    unsafe fn s74(&self) -> HRESULT;
+    unsafe fn s75(&self) -> HRESULT;
+    unsafe fn s76(&self) -> HRESULT;
+    unsafe fn s77(&self) -> HRESULT;
+    unsafe fn s78(&self) -> HRESULT;
+    unsafe fn s79(&self) -> HRESULT;
+    unsafe fn s80(&self) -> HRESULT;
+    unsafe fn s81(&self) -> HRESULT;
+    unsafe fn s82(&self) -> HRESULT;
+    unsafe fn s83(&self) -> HRESULT;
+    unsafe fn s84(&self) -> HRESULT;
+    unsafe fn s85(&self) -> HRESULT;
+    unsafe fn s86(&self) -> HRESULT;
+    unsafe fn s87(&self) -> HRESULT;
+    unsafe fn s88(&self) -> HRESULT;
+    unsafe fn s89(&self) -> HRESULT;
+    unsafe fn s90(&self) -> HRESULT;
+    unsafe fn s91(&self) -> HRESULT;
+    unsafe fn s92(&self) -> HRESULT;
+    unsafe fn s93(&self) -> HRESULT;
+    unsafe fn s94(&self) -> HRESULT;
+    unsafe fn s95(&self) -> HRESULT;
+    unsafe fn s96(&self) -> HRESULT;
+    unsafe fn s97(&self) -> HRESULT;
+    unsafe fn s98(&self) -> HRESULT;
+    unsafe fn s99(&self) -> HRESULT;
+    unsafe fn s100(&self) -> HRESULT;
+    unsafe fn s101(&self) -> HRESULT;
+    unsafe fn s102(&self) -> HRESULT;
+    unsafe fn s103(&self) -> HRESULT;
+    unsafe fn s104(&self) -> HRESULT;
+    unsafe fn s105(&self) -> HRESULT;
+    unsafe fn s106(&self) -> HRESULT;
+    unsafe fn s107(&self) -> HRESULT;
+    unsafe fn s108(&self) -> HRESULT;
+    unsafe fn s109(&self) -> HRESULT;
+    unsafe fn s110(&self) -> HRESULT;
+}
+
+impl IFont_Impl for WordFont_Impl {
+    unsafe fn s7(&self) -> HRESULT { log("IFont vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IFont vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IFont vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IFont vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self, ret: *mut i32) -> HRESULT { unsafe { vt_font_bold_get(self, ret) } }
+    unsafe fn s12(&self, v: i32) -> HRESULT { unsafe { vt_font_bold_put(self, v) } }
+    unsafe fn s13(&self, ret: *mut i32) -> HRESULT { unsafe { vt_font_italic_get(self, ret) } }
+    unsafe fn s14(&self, v: i32) -> HRESULT { unsafe { vt_font_italic_put(self, v) } }
+    unsafe fn s15(&self) -> HRESULT { log("IFont vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IFont vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IFont vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IFont vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IFont vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IFont vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IFont vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IFont vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IFont vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IFont vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IFont vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IFont vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IFont vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IFont vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IFont vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IFont vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self, ret: *mut i32) -> HRESULT { unsafe { vt_font_underline_get(self, ret) } }
+    unsafe fn s32(&self, v: i32) -> HRESULT { unsafe { vt_font_underline_put(self, v) } }
+    unsafe fn s33(&self, ret: *mut f32) -> HRESULT { unsafe { vt_font_size_get(self, ret) } }
+    unsafe fn s34(&self, v: f32) -> HRESULT { unsafe { vt_font_size_put(self, v) } }
+    unsafe fn s35(&self, ret: *mut BSTR) -> HRESULT { unsafe { vt_font_name_get(self, ret) } }
+    unsafe fn s36(&self, v: *const u16) -> HRESULT { unsafe { vt_font_name_put(self, v) } }
+    unsafe fn s37(&self) -> HRESULT { log("IFont vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IFont vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IFont vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IFont vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IFont vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IFont vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IFont vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IFont vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IFont vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IFont vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IFont vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IFont vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IFont vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IFont vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IFont vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { log("IFont vtable#52 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { log("IFont vtable#53 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IFont vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IFont vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IFont vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IFont vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IFont vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IFont vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IFont vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IFont vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IFont vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IFont vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IFont vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IFont vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { log("IFont vtable#66 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IFont vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IFont vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IFont vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IFont vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { log("IFont vtable#71 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s72(&self, ret: *mut i32) -> HRESULT { unsafe { vt_font_color_get(self, ret) } }
+    unsafe fn s73(&self, v: i32) -> HRESULT { unsafe { vt_font_color_put(self, v) } }
+    unsafe fn s74(&self) -> HRESULT { log("IFont vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IFont vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IFont vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IFont vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IFont vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IFont vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IFont vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IFont vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IFont vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IFont vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IFont vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IFont vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IFont vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IFont vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IFont vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IFont vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IFont vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IFont vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IFont vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IFont vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IFont vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IFont vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IFont vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IFont vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IFont vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s99(&self) -> HRESULT { log("IFont vtable#99 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s100(&self) -> HRESULT { log("IFont vtable#100 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s101(&self) -> HRESULT { log("IFont vtable#101 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s102(&self) -> HRESULT { log("IFont vtable#102 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s103(&self) -> HRESULT { log("IFont vtable#103 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s104(&self) -> HRESULT { log("IFont vtable#104 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s105(&self) -> HRESULT { log("IFont vtable#105 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s106(&self) -> HRESULT { log("IFont vtable#106 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s107(&self) -> HRESULT { log("IFont vtable#107 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s108(&self) -> HRESULT { log("IFont vtable#108 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s109(&self) -> HRESULT { log("IFont vtable#109 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s110(&self) -> HRESULT { log("IFont vtable#110 unmodeled (early-bound)"); E_NOTIMPL }
+}
+
+#[interface("00020953-0000-0000-c000-000000000046")]
+unsafe trait IParaFmt: IDispatch {
+    unsafe fn s7(&self) -> HRESULT;
+    unsafe fn s8(&self) -> HRESULT;
+    unsafe fn s9(&self) -> HRESULT;
+    unsafe fn s10(&self) -> HRESULT;
+    unsafe fn s11(&self) -> HRESULT;
+    unsafe fn s12(&self) -> HRESULT;
+    unsafe fn s13(&self, ret: *mut i32) -> HRESULT;
+    unsafe fn s14(&self, v: i32) -> HRESULT;
+    unsafe fn s15(&self) -> HRESULT;
+    unsafe fn s16(&self) -> HRESULT;
+    unsafe fn s17(&self) -> HRESULT;
+    unsafe fn s18(&self) -> HRESULT;
+    unsafe fn s19(&self) -> HRESULT;
+    unsafe fn s20(&self) -> HRESULT;
+    unsafe fn s21(&self) -> HRESULT;
+    unsafe fn s22(&self) -> HRESULT;
+    unsafe fn s23(&self) -> HRESULT;
+    unsafe fn s24(&self) -> HRESULT;
+    unsafe fn s25(&self) -> HRESULT;
+    unsafe fn s26(&self) -> HRESULT;
+    unsafe fn s27(&self) -> HRESULT;
+    unsafe fn s28(&self) -> HRESULT;
+    unsafe fn s29(&self) -> HRESULT;
+    unsafe fn s30(&self) -> HRESULT;
+    unsafe fn s31(&self) -> HRESULT;
+    unsafe fn s32(&self) -> HRESULT;
+    unsafe fn s33(&self) -> HRESULT;
+    unsafe fn s34(&self) -> HRESULT;
+    unsafe fn s35(&self) -> HRESULT;
+    unsafe fn s36(&self) -> HRESULT;
+    unsafe fn s37(&self) -> HRESULT;
+    unsafe fn s38(&self) -> HRESULT;
+    unsafe fn s39(&self) -> HRESULT;
+    unsafe fn s40(&self) -> HRESULT;
+    unsafe fn s41(&self) -> HRESULT;
+    unsafe fn s42(&self) -> HRESULT;
+    unsafe fn s43(&self) -> HRESULT;
+    unsafe fn s44(&self) -> HRESULT;
+    unsafe fn s45(&self) -> HRESULT;
+    unsafe fn s46(&self) -> HRESULT;
+    unsafe fn s47(&self) -> HRESULT;
+    unsafe fn s48(&self) -> HRESULT;
+    unsafe fn s49(&self) -> HRESULT;
+    unsafe fn s50(&self) -> HRESULT;
+    unsafe fn s51(&self) -> HRESULT;
+    unsafe fn s52(&self) -> HRESULT;
+    unsafe fn s53(&self) -> HRESULT;
+    unsafe fn s54(&self) -> HRESULT;
+    unsafe fn s55(&self) -> HRESULT;
+    unsafe fn s56(&self) -> HRESULT;
+    unsafe fn s57(&self) -> HRESULT;
+    unsafe fn s58(&self) -> HRESULT;
+    unsafe fn s59(&self) -> HRESULT;
+    unsafe fn s60(&self) -> HRESULT;
+    unsafe fn s61(&self) -> HRESULT;
+    unsafe fn s62(&self) -> HRESULT;
+    unsafe fn s63(&self) -> HRESULT;
+    unsafe fn s64(&self) -> HRESULT;
+    unsafe fn s65(&self) -> HRESULT;
+    unsafe fn s66(&self) -> HRESULT;
+    unsafe fn s67(&self) -> HRESULT;
+    unsafe fn s68(&self) -> HRESULT;
+    unsafe fn s69(&self) -> HRESULT;
+    unsafe fn s70(&self) -> HRESULT;
+    unsafe fn s71(&self) -> HRESULT;
+    unsafe fn s72(&self) -> HRESULT;
+    unsafe fn s73(&self) -> HRESULT;
+    unsafe fn s74(&self) -> HRESULT;
+    unsafe fn s75(&self) -> HRESULT;
+    unsafe fn s76(&self) -> HRESULT;
+    unsafe fn s77(&self) -> HRESULT;
+    unsafe fn s78(&self) -> HRESULT;
+    unsafe fn s79(&self) -> HRESULT;
+    unsafe fn s80(&self) -> HRESULT;
+    unsafe fn s81(&self) -> HRESULT;
+    unsafe fn s82(&self) -> HRESULT;
+    unsafe fn s83(&self) -> HRESULT;
+    unsafe fn s84(&self) -> HRESULT;
+    unsafe fn s85(&self) -> HRESULT;
+    unsafe fn s86(&self) -> HRESULT;
+    unsafe fn s87(&self) -> HRESULT;
+    unsafe fn s88(&self) -> HRESULT;
+    unsafe fn s89(&self) -> HRESULT;
+    unsafe fn s90(&self) -> HRESULT;
+    unsafe fn s91(&self) -> HRESULT;
+    unsafe fn s92(&self) -> HRESULT;
+    unsafe fn s93(&self) -> HRESULT;
+    unsafe fn s94(&self) -> HRESULT;
+    unsafe fn s95(&self) -> HRESULT;
+    unsafe fn s96(&self) -> HRESULT;
+    unsafe fn s97(&self) -> HRESULT;
+    unsafe fn s98(&self) -> HRESULT;
+}
+
+impl IParaFmt_Impl for ParaFmt_Impl {
+    unsafe fn s7(&self) -> HRESULT { log("IParaFmt vtable#7 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s8(&self) -> HRESULT { log("IParaFmt vtable#8 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s9(&self) -> HRESULT { log("IParaFmt vtable#9 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s10(&self) -> HRESULT { log("IParaFmt vtable#10 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s11(&self) -> HRESULT { log("IParaFmt vtable#11 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s12(&self) -> HRESULT { log("IParaFmt vtable#12 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s13(&self, ret: *mut i32) -> HRESULT { unsafe { vt_para_align_get(self, ret) } }
+    unsafe fn s14(&self, v: i32) -> HRESULT { unsafe { vt_para_align_put(self, v) } }
+    unsafe fn s15(&self) -> HRESULT { log("IParaFmt vtable#15 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s16(&self) -> HRESULT { log("IParaFmt vtable#16 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s17(&self) -> HRESULT { log("IParaFmt vtable#17 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s18(&self) -> HRESULT { log("IParaFmt vtable#18 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s19(&self) -> HRESULT { log("IParaFmt vtable#19 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s20(&self) -> HRESULT { log("IParaFmt vtable#20 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s21(&self) -> HRESULT { log("IParaFmt vtable#21 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s22(&self) -> HRESULT { log("IParaFmt vtable#22 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s23(&self) -> HRESULT { log("IParaFmt vtable#23 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s24(&self) -> HRESULT { log("IParaFmt vtable#24 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s25(&self) -> HRESULT { log("IParaFmt vtable#25 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s26(&self) -> HRESULT { log("IParaFmt vtable#26 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s27(&self) -> HRESULT { log("IParaFmt vtable#27 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s28(&self) -> HRESULT { log("IParaFmt vtable#28 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s29(&self) -> HRESULT { log("IParaFmt vtable#29 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s30(&self) -> HRESULT { log("IParaFmt vtable#30 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s31(&self) -> HRESULT { log("IParaFmt vtable#31 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s32(&self) -> HRESULT { log("IParaFmt vtable#32 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s33(&self) -> HRESULT { log("IParaFmt vtable#33 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s34(&self) -> HRESULT { log("IParaFmt vtable#34 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s35(&self) -> HRESULT { log("IParaFmt vtable#35 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s36(&self) -> HRESULT { log("IParaFmt vtable#36 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s37(&self) -> HRESULT { log("IParaFmt vtable#37 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s38(&self) -> HRESULT { log("IParaFmt vtable#38 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s39(&self) -> HRESULT { log("IParaFmt vtable#39 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s40(&self) -> HRESULT { log("IParaFmt vtable#40 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s41(&self) -> HRESULT { log("IParaFmt vtable#41 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s42(&self) -> HRESULT { log("IParaFmt vtable#42 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s43(&self) -> HRESULT { log("IParaFmt vtable#43 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s44(&self) -> HRESULT { log("IParaFmt vtable#44 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s45(&self) -> HRESULT { log("IParaFmt vtable#45 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s46(&self) -> HRESULT { log("IParaFmt vtable#46 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s47(&self) -> HRESULT { log("IParaFmt vtable#47 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s48(&self) -> HRESULT { log("IParaFmt vtable#48 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s49(&self) -> HRESULT { log("IParaFmt vtable#49 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s50(&self) -> HRESULT { log("IParaFmt vtable#50 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s51(&self) -> HRESULT { log("IParaFmt vtable#51 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s52(&self) -> HRESULT { log("IParaFmt vtable#52 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s53(&self) -> HRESULT { log("IParaFmt vtable#53 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s54(&self) -> HRESULT { log("IParaFmt vtable#54 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s55(&self) -> HRESULT { log("IParaFmt vtable#55 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s56(&self) -> HRESULT { log("IParaFmt vtable#56 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s57(&self) -> HRESULT { log("IParaFmt vtable#57 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s58(&self) -> HRESULT { log("IParaFmt vtable#58 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s59(&self) -> HRESULT { log("IParaFmt vtable#59 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s60(&self) -> HRESULT { log("IParaFmt vtable#60 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s61(&self) -> HRESULT { log("IParaFmt vtable#61 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s62(&self) -> HRESULT { log("IParaFmt vtable#62 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s63(&self) -> HRESULT { log("IParaFmt vtable#63 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s64(&self) -> HRESULT { log("IParaFmt vtable#64 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s65(&self) -> HRESULT { log("IParaFmt vtable#65 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s66(&self) -> HRESULT { log("IParaFmt vtable#66 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s67(&self) -> HRESULT { log("IParaFmt vtable#67 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s68(&self) -> HRESULT { log("IParaFmt vtable#68 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s69(&self) -> HRESULT { log("IParaFmt vtable#69 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s70(&self) -> HRESULT { log("IParaFmt vtable#70 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s71(&self) -> HRESULT { log("IParaFmt vtable#71 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s72(&self) -> HRESULT { log("IParaFmt vtable#72 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s73(&self) -> HRESULT { log("IParaFmt vtable#73 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s74(&self) -> HRESULT { log("IParaFmt vtable#74 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s75(&self) -> HRESULT { log("IParaFmt vtable#75 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s76(&self) -> HRESULT { log("IParaFmt vtable#76 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s77(&self) -> HRESULT { log("IParaFmt vtable#77 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s78(&self) -> HRESULT { log("IParaFmt vtable#78 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s79(&self) -> HRESULT { log("IParaFmt vtable#79 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s80(&self) -> HRESULT { log("IParaFmt vtable#80 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s81(&self) -> HRESULT { log("IParaFmt vtable#81 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s82(&self) -> HRESULT { log("IParaFmt vtable#82 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s83(&self) -> HRESULT { log("IParaFmt vtable#83 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s84(&self) -> HRESULT { log("IParaFmt vtable#84 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s85(&self) -> HRESULT { log("IParaFmt vtable#85 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s86(&self) -> HRESULT { log("IParaFmt vtable#86 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s87(&self) -> HRESULT { log("IParaFmt vtable#87 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s88(&self) -> HRESULT { log("IParaFmt vtable#88 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s89(&self) -> HRESULT { log("IParaFmt vtable#89 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s90(&self) -> HRESULT { log("IParaFmt vtable#90 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s91(&self) -> HRESULT { log("IParaFmt vtable#91 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s92(&self) -> HRESULT { log("IParaFmt vtable#92 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s93(&self) -> HRESULT { log("IParaFmt vtable#93 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s94(&self) -> HRESULT { log("IParaFmt vtable#94 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s95(&self) -> HRESULT { log("IParaFmt vtable#95 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s96(&self) -> HRESULT { log("IParaFmt vtable#96 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s97(&self) -> HRESULT { log("IParaFmt vtable#97 unmodeled (early-bound)"); E_NOTIMPL }
+    unsafe fn s98(&self) -> HRESULT { log("IParaFmt vtable#98 unmodeled (early-bound)"); E_NOTIMPL }
 }
 
 

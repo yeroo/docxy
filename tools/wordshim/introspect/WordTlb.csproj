@@ -6,4 +6,9 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>WordTlb</AssemblyName>
   </PropertyGroup>
+  <!-- WordPia.cs is compiled separately with the Framework csc (it loads the
+       Framework PIA); keep it out of this net10 build. -->
+  <ItemGroup>
+    <Compile Remove="WordPia.cs" />
+  </ItemGroup>
 </Project>

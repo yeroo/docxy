@@ -439,16 +439,6 @@ mod win {
             }
         };
     }
-    /// For an object whose primary interface already IS IDispatch (Font etc.).
-    macro_rules! into_disp_idispatch {
-        ($struct:ty) => {
-            impl IntoDisp for $struct {
-                fn into_disp(self) -> IDispatch {
-                    self.into()
-                }
-            }
-        };
-    }
 
     fn is_put(wflags: DISPATCH_FLAGS) -> bool {
         (wflags.0 & (DISPATCH_PROPERTYPUT.0 | DISPATCH_PROPERTYPUTREF.0)) != 0
@@ -804,6 +794,147 @@ mod win {
         reg(|r| {
             if let Some(d) = r.docs.get_mut(doc) {
                 d.type_paragraph()
+            }
+        });
+        S_OK
+    }
+
+    // Early-bound formatting: Font/ParagraphFormat objects (IDispatch, used
+    // late-bound by the client after the vtable returns them) + Range's direct
+    // Bold/Italic/Underline (I4 in Word: -1/0).
+    unsafe fn vt_sel_font(t: &Selection_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let f: IFont = WordFont { doc: t.doc, all: false }.into();
+        unsafe { out_iface(ret, f) }
+    }
+    unsafe fn vt_sel_paraformat(t: &Selection_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let f: IParaFmt = ParaFmt { doc: t.doc, all: false }.into();
+        unsafe { out_iface(ret, f) }
+    }
+    unsafe fn vt_rng_font(t: &Range_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let f: IFont = WordFont { doc: t.doc, all: true }.into();
+        unsafe { out_iface(ret, f) }
+    }
+    unsafe fn vt_rng_paraformat(t: &Range_Impl, ret: *mut *mut c_void) -> HRESULT {
+        let f: IParaFmt = ParaFmt { doc: t.doc, all: true }.into();
+        unsafe { out_iface(ret, f) }
+    }
+    unsafe fn vt_rng_bold_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) { -1 } else { 0 }) }
+    }
+    unsafe fn vt_rng_bold_put(t: &Range_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, true, |p| p.bold = v != 0);
+        S_OK
+    }
+    unsafe fn vt_rng_italic_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) { -1 } else { 0 }) }
+    }
+    unsafe fn vt_rng_italic_put(t: &Range_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, true, |p| p.italic = v != 0);
+        S_OK
+    }
+    unsafe fn vt_rng_underline_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, i32::from(reg(|r| r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)))) }
+    }
+    unsafe fn vt_rng_underline_put(t: &Range_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, true, |p| p.underline = v != 0);
+        S_OK
+    }
+
+    unsafe fn out_r4(ret: *mut f32, v: f32) -> HRESULT {
+        if ret.is_null() {
+            return E_POINTER;
+        }
+        unsafe { *ret = v };
+        S_OK
+    }
+    fn align_to_wd(a: Align) -> i32 {
+        match a {
+            Align::Left => 0,
+            Align::Center => 1,
+            Align::Right => 2,
+            Align::Justify => 3,
+        }
+    }
+    fn wd_to_align(v: i32) -> Align {
+        match v {
+            1 => Align::Center,
+            2 => Align::Right,
+            3 => Align::Justify,
+            _ => Align::Left,
+        }
+    }
+
+    // _Font (dual): the create-path character-format members.
+    unsafe fn vt_font_bold_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) { -1 } else { 0 }) }
+    }
+    unsafe fn vt_font_bold_put(t: &WordFont_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, t.all, |p| p.bold = v != 0);
+        S_OK
+    }
+    unsafe fn vt_font_italic_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) { -1 } else { 0 }) }
+    }
+    unsafe fn vt_font_italic_put(t: &WordFont_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, t.all, |p| p.italic = v != 0);
+        S_OK
+    }
+    unsafe fn vt_font_underline_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, i32::from(reg(|r| r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)))) }
+    }
+    unsafe fn vt_font_underline_put(t: &WordFont_Impl, v: i32) -> HRESULT {
+        set_font(t.doc, t.all, |p| p.underline = v != 0);
+        S_OK
+    }
+    unsafe fn vt_font_size_get(t: &WordFont_Impl, ret: *mut f32) -> HRESULT {
+        let pt = reg(|r| r.docs.get(t.doc).and_then(|d| d.cur.size_half_pts))
+            .map(|h| h as f32 / 2.0)
+            .unwrap_or(11.0);
+        unsafe { out_r4(ret, pt) }
+    }
+    unsafe fn vt_font_size_put(t: &WordFont_Impl, v: f32) -> HRESULT {
+        let hp = (v * 2.0).round() as u32;
+        set_font(t.doc, t.all, |p| p.size_half_pts = Some(hp));
+        S_OK
+    }
+    unsafe fn vt_font_name_get(t: &WordFont_Impl, ret: *mut BSTR) -> HRESULT {
+        let n = reg(|r| r.docs.get(t.doc).and_then(|d| d.cur.font.clone()))
+            .unwrap_or_else(|| "Calibri".into());
+        unsafe { out_bstr(ret, &n) }
+    }
+    unsafe fn vt_font_name_put(t: &WordFont_Impl, v: *const u16) -> HRESULT {
+        let n = unsafe { pcwstr(v) };
+        set_font(t.doc, t.all, |p| p.font = Some(n.clone()));
+        S_OK
+    }
+    unsafe fn vt_font_color_get(_t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
+        unsafe { out_i4(ret, 0) } // wdColorAutomatic-ish
+    }
+    unsafe fn vt_font_color_put(t: &WordFont_Impl, v: i32) -> HRESULT {
+        if let Some(hex) = word_color_hex(v) {
+            set_font(t.doc, t.all, |p| p.color = Some(hex.clone()));
+        }
+        S_OK
+    }
+
+    // _ParagraphFormat (dual): Alignment.
+    unsafe fn vt_para_align_get(t: &ParaFmt_Impl, ret: *mut i32) -> HRESULT {
+        let a = reg(|r| r.docs.get(t.doc).map(|d| d.cur_align).unwrap_or(Align::Left));
+        unsafe { out_i4(ret, align_to_wd(a)) }
+    }
+    unsafe fn vt_para_align_put(t: &ParaFmt_Impl, v: i32) -> HRESULT {
+        let (a, doc, all) = (wd_to_align(v), t.doc, t.all);
+        reg(|r| {
+            if let Some(d) = r.docs.get_mut(doc) {
+                d.cur_align = a;
+                if all {
+                    for b in &mut d.pkg.document.body {
+                        if let Block::Paragraph(p) = b {
+                            p.props.align = a;
+                        }
+                    }
+                }
+                d.saved = false;
             }
         });
         S_OK
@@ -1232,18 +1363,22 @@ mod win {
     // `all=true` (from Range) applies to the existing text.
     // -----------------------------------------------------------------------
 
-    #[implement(IDispatch)]
+    // Word's Font / ParagraphFormat are DUAL interfaces (_Font {00020952},
+    // _ParagraphFormat {00020953}), so an early-bound client casts to them — we
+    // implement the duals (keeping IDispatch for late-bound), same as the other
+    // objects. The create-path members forward to vt_font_*/vt_para_* below.
+    #[implement(IFont)]
     struct WordFont {
         doc: usize,
         all: bool,
     }
-    #[implement(IDispatch)]
+    #[implement(IParaFmt)]
     struct ParaFmt {
         doc: usize,
         all: bool,
     }
-    into_disp_idispatch!(WordFont);
-    into_disp_idispatch!(ParaFmt);
+    into_disp!(WordFont, IFont);
+    into_disp!(ParaFmt, IParaFmt);
 
     /// Apply a RunProps change to the current format (`all=false`) or to every run
     /// in the document (`all=true`).
