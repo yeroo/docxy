@@ -408,6 +408,29 @@ function buildSequenceSvg(geo) {
   function saveBytes() {
     return readResult(ex.docx_save(handle));
   }
+  /** Like `saveBytes()`, but routes through `docx_save_with_mermaid_images` —
+   *  three independent host-written buffers (the JSON descriptor string plus
+   *  the two concatenated image blobs), matching `docxwasm/src/lib.rs`'s
+   *  three-ptr/len-pair C-ABI export. Each buffer is written/freed
+   *  separately; wasm memory may grow between allocations (`writeBytes`
+   *  already accounts for that per-call by re-fetching its view after
+   *  `docx_alloc`, see its own comment above). */
+  function saveBytesWithMermaidImages(json, pngBlob, svgBlob) {
+    const jsonBytes = enc.encode(json);
+    const jsonPtr = writeBytes(jsonBytes);
+    const pngPtr = writeBytes(pngBlob);
+    const svgPtr = writeBytes(svgBlob);
+    const r = ex.docx_save_with_mermaid_images(
+      handle,
+      jsonPtr, jsonBytes.length,
+      pngPtr, pngBlob.length,
+      svgPtr, svgBlob.length
+    );
+    ex.docx_free(jsonPtr, jsonBytes.length);
+    ex.docx_free(pngPtr, pngBlob.length);
+    ex.docx_free(svgPtr, svgBlob.length);
+    return readResult(r);
+  }
   function mediaBytes(rid) {
     const u8 = enc.encode(rid);
     const p = writeBytes(u8);
@@ -545,6 +568,33 @@ function buildSequenceSvg(geo) {
     if (bare) bare.remove();
   }
 
+  /** Get `source`'s rendered mermaid svg, from the cache if present, else
+   *  invoke `MERMAID.render()` and populate the cache — the single render
+   *  path `paintMermaid()` (the interactive live-preview repaint) and
+   *  `buildMermaidImageSave()` (the Task-3 save-time rasterization below)
+   *  both go through, so a diagram rendered once for the preview is never
+   *  re-rendered again just to embed it on save. Resolves to the cached/
+   *  fresh svg string, or `null` for a known- or newly-failed source (the
+   *  same `null` sentinel `mmdCache` already uses) — never rejects, so a
+   *  caller can `await` it unconditionally. No-op / immediately `null` when
+   *  mermaid.js itself isn't loaded (`MERMAID` is null). */
+  function ensureMermaidRendered(source) {
+    if (mmdCache.has(source)) return Promise.resolve(mmdCache.get(source));
+    if (!MERMAID) return Promise.resolve(null);
+    const id = 'mmd-' + ++mmdRenderSeq;
+    return MERMAID.render(id, source)
+      .then(({ svg }) => {
+        removeMermaidStray(id);
+        mmdCache.set(source, svg);
+        return svg;
+      })
+      .catch(() => {
+        removeMermaidStray(id);
+        mmdCache.set(source, null);
+        return null;
+      });
+  }
+
   /** Overlay each mermaid diagram over its reserved grid box (same col/row ->
    *  px math paintImages() uses: PAD_L/PAD_T + metrics). Prefers a REAL
    *  mermaid.js render of `mb.source` (Task 3 of the mermaid-live-render
@@ -590,24 +640,184 @@ function buildSequenceSvg(geo) {
         continue;
       }
       fallbackInto(el, mb); // interim, while the real render is in flight
-      const id = 'mmd-' + ++mmdRenderSeq;
-      MERMAID.render(id, mb.source)
-        .then(({ svg }) => {
-          removeMermaidStray(id);
-          if (myVersion !== mmdVersion) return; // a newer paint superseded this one
-          mmdCache.set(mb.source, svg);
-          paintMermaidSvgInto(el, svg, contentW);
-        })
-        .catch(() => {
-          removeMermaidStray(id);
-          // Cache the failure (the `null` sentinel, distinct from a real svg
-          // string) so this source is never handed to MERMAID.render() again
-          // — el already holds fallbackInto()'s interim result above, and
-          // future paints of the same source take the `cached === null`
-          // branch straight to that same fallback.
-          mmdCache.set(mb.source, null);
-        });
+      ensureMermaidRendered(mb.source).then((svg) => {
+        if (myVersion !== mmdVersion) return; // a newer paint superseded this one
+        // `svg === null` means a freshly-failed render (the same `null`
+        // cache sentinel as the already-cached branch above) — `el` already
+        // holds fallbackInto()'s interim result, so there's nothing more to
+        // do; a real svg swaps it in.
+        if (svg != null) paintMermaidSvgInto(el, svg, contentW);
+      });
     }
+  }
+
+  // ---- mermaid PNG rasterization + embedded save (Task 3 of the mermaid
+  // .docx image-embed plan) --------------------------------------------------
+  // On save, each live-rendered mermaid SVG (the same one `paintMermaid()`
+  // shows on screen, via `ensureMermaidRendered`'s shared cache) is rasterized
+  // to a PNG here and handed to `docx_save_with_mermaid_images` so the saved
+  // `.docx` carries a real Word picture instead of the editable-shape
+  // fallback — see `docxcore::mermaid_embed` (Task 1) and
+  // `Session::save_with_mermaid_images` (Task 2). The on-screen document
+  // itself is untouched by this: the engine embeds into a clone of the
+  // package at save time, so the webview keeps rendering/editing the
+  // `SmartArt` shapes exactly as before.
+  const MMD_PNG_SCALE = 2; // rasterize at ~2x natural px so Word shows a crisp (not blurry) image
+
+  /** EMU (English Metric Units, 914400/inch — the DrawingML unit `wEmu`/
+   *  `hEmu` are in) from a CSS/device pixel size, assuming the standard 96px
+   *  = 1in mapping the rest of this file's DrawingML-emitting code (`MMD_*`
+   *  constants, `buildMermaidSvg`) already uses. */
+  function pxToEmu(px) {
+    return Math.round((px / 96) * 914400);
+  }
+
+  /** `svgString` -> base64 `data:image/svg+xml` URI (the UTF-8 bytes,
+   *  base64-encoded — reuses the same `enc`/`bytesToBase64` helpers the
+   *  media-loading path above already relies on, so this needs no new
+   *  encoding logic). */
+  function svgDataUri(svgString) {
+    return 'data:image/svg+xml;base64,' + bytesToBase64(enc.encode(svgString));
+  }
+
+  /** Rasterize a rendered mermaid `svgString` to PNG bytes. `wPx`/`hPx` are
+   *  the diagram's own NATURAL pixel size (from `svgNaturalSize()`, not the
+   *  reserved `cols x rows` grid cell) — the canvas backing store is sized to
+   *  `wPx*scale x hPx*scale` (`MMD_PNG_SCALE`), so Word/a high-DPI screen
+   *  shows a crisp image rather than a 1:1 (blurry, on most displays)
+   *  rasterization. Draws through a real `<canvas>` + `Image` (loaded from a
+   *  base64 SVG data URI, decoded by the browser's own SVG renderer — this
+   *  file writes no SVG-to-raster logic itself) and reads the resulting PNG
+   *  blob back as bytes via `canvas.toBlob` + `Blob.arrayBuffer`. */
+  async function svgToPng(svgString, wPx, hPx) {
+    const img = new Image();
+    const loaded = new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('svgToPng: the rendered SVG failed to load as an <img>'));
+    });
+    img.src = svgDataUri(svgString);
+    await loaded;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(wPx * MMD_PNG_SCALE));
+    canvas.height = Math.max(1, Math.round(hPx * MMD_PNG_SCALE));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise((resolve, reject) => {
+      canvas.toBlob((b) => {
+        if (b) resolve(b);
+        else reject(new Error('svgToPng: canvas.toBlob produced no PNG blob'));
+      }, 'image/png');
+    });
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+
+  /** Concatenate several `Uint8Array`s into one fresh buffer of `totalLen`
+   *  bytes (the caller already knows the total from summing each part's
+   *  `.length`, so this just writes them in order — the flat `png_blob`/
+   *  `svg_blob` wire shape `save_with_mermaid_images` expects). */
+  function concatBytes(parts, totalLen) {
+    const out = new Uint8Array(totalLen);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+    return out;
+  }
+
+  /** Build the `save_with_mermaid_images` call's three inputs from
+   *  `lastView.mermaid`: for every entry with a `source`, get (or render on
+   *  demand via `ensureMermaidRendered`) its mermaid SVG, rasterize a PNG,
+   *  and collect `{source, png, svg, wEmu, hEmu}`. A diagram whose render
+   *  fails (or that has no `source` at all) is simply OMITTED from the
+   *  descriptor — `docxcore::mermaid_embed::embed_images` leaves any
+   *  SmartArt with no matching entry untouched, so that one diagram falls
+   *  back to today's editable shapes while every other diagram still embeds.
+   *
+   *  Returns `null` when there is nothing to embed (no mermaid diagrams at
+   *  all, or every one of them failed to render/rasterize) — the caller
+   *  falls back to the plain `save()` path in that case, exactly as if this
+   *  document had no mermaid diagrams. Otherwise resolves to
+   *  `{json, pngBlob, svgBlob}`, ready for `saveBytesWithMermaidImages`. */
+  async function buildMermaidImageSave() {
+    const list = lastView.mermaid || [];
+    if (list.length === 0) return null;
+
+    const entries = [];
+    for (const mb of list) {
+      if (!mb.source) continue;
+      let svg;
+      try {
+        svg = await ensureMermaidRendered(mb.source);
+      } catch {
+        svg = null; // ensureMermaidRendered itself never rejects, but stay defensive
+      }
+      if (svg == null) continue; // known- or newly-failed render: omit, fallback shapes stay
+
+      const { w, h } = svgNaturalSize(svg);
+      const wPx = w > 0 ? w : mb.cols * metrics.charW;
+      const hPx = h > 0 ? h : mb.rows * metrics.lineH;
+
+      let png;
+      try {
+        png = await svgToPng(svg, wPx, hPx);
+      } catch {
+        continue; // rasterization failed for this one diagram only; others still embed
+      }
+
+      entries.push({
+        source: mb.source,
+        png,
+        svg: enc.encode(svg),
+        wEmu: pxToEmu(wPx),
+        hEmu: pxToEmu(hPx),
+      });
+    }
+    if (entries.length === 0) return null;
+
+    let pngOff = 0;
+    let svgOff = 0;
+    const descriptor = [];
+    const pngParts = [];
+    const svgParts = [];
+    for (const e of entries) {
+      descriptor.push({
+        source: e.source,
+        pngOff, pngLen: e.png.length,
+        svgOff, svgLen: e.svg.length,
+        wEmu: e.wEmu, hEmu: e.hEmu,
+      });
+      pngParts.push(e.png);
+      svgParts.push(e.svg);
+      pngOff += e.png.length;
+      svgOff += e.svg.length;
+    }
+    return {
+      json: JSON.stringify(descriptor),
+      pngBlob: concatBytes(pngParts, pngOff),
+      svgBlob: concatBytes(svgParts, svgOff),
+    };
+  }
+
+  /** The save entry point the `getBytes` host message now calls: routes
+   *  through `save_with_mermaid_images` when the document has at least one
+   *  mermaid diagram that actually rendered/rasterized; otherwise (no
+   *  diagrams, or every one failed) falls back to the plain, unchanged
+   *  `saveBytes()`/`docx_save` path. Any unexpected failure while building
+   *  the image map (a bug in this new code, not a per-diagram render
+   *  failure — those are already handled inside `buildMermaidImageSave`)
+   *  also falls back to the plain save rather than losing the document. */
+  async function buildSaveBytes() {
+    let built = null;
+    try {
+      built = await buildMermaidImageSave();
+    } catch {
+      built = null;
+    }
+    if (built) return saveBytesWithMermaidImages(built.json, built.pngBlob, built.svgBlob);
+    return saveBytes();
   }
 
   let imgEls = [];
@@ -930,10 +1140,16 @@ function buildSequenceSvg(geo) {
         userCmd(msg.op);
         break;
       case 'getBytes':
-        vscode.postMessage({
-          type: 'bytes',
-          requestId: msg.requestId,
-          data: bytesToBase64(saveBytes()),
+        // `buildSaveBytes()` is async (PNG rasterization awaits an <img> load
+        // + a canvas.toBlob callback) — fire-and-forget here is fine, the
+        // host's `requestBytes()` (extension.ts) already awaits the matching
+        // `requestId` via a Promise, not a synchronous reply.
+        buildSaveBytes().then((bytes) => {
+          vscode.postMessage({
+            type: 'bytes',
+            requestId: msg.requestId,
+            data: bytesToBase64(bytes),
+          });
         });
         break;
       case 'ctl': {
@@ -1082,6 +1298,14 @@ function buildSequenceSvg(geo) {
     window.__OFFXY_TEST__.mmdCache = mmdCache;
     window.__OFFXY_TEST__.setLastView = (v) => { lastView = v; };
     window.__OFFXY_TEST__.setMetrics = (m) => { metrics = m; };
+    // Task 3 of the mermaid-docx-image plan (PNG rasterization + embedded
+    // save) — exposed the same way as the hooks above, for
+    // mermaid-embed.test.mjs.
+    window.__OFFXY_TEST__.svgToPng = svgToPng;
+    window.__OFFXY_TEST__.pxToEmu = pxToEmu;
+    window.__OFFXY_TEST__.concatBytes = concatBytes;
+    window.__OFFXY_TEST__.buildMermaidImageSave = buildMermaidImageSave;
+    window.__OFFXY_TEST__.ensureMermaidRendered = ensureMermaidRendered;
   } else {
     boot().catch((err) => {
       docEl.textContent = 'Docxy failed to start: ' + (err && err.message ? err.message : err);

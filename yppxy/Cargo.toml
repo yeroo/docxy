@@ -31,3 +31,5 @@ mppread = { version = "0.1.0", path = "../mppread" }
 ratatui = "0.29"
 # Display-column widths for correct alignment + truncation with wide glyphs.
 unicode-width = "0.2"
+ribboncore = { version = "0.1.0", path = "../ribboncore" }
+backstagecore = { version = "0.1.0", path = "../backstagecore" }
