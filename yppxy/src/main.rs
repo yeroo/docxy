@@ -388,6 +388,15 @@ enum PromptKind {
     Assign,
 }
 
+/// What a confirmed (Yes) modal should do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ConfirmAction {
+    Exit,
+}
+
+// The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
+// across all apps); yppxy only supplies the action carried on Yes.
+
 struct Prompt {
     kind: PromptKind,
     label: String,
@@ -406,6 +415,9 @@ struct App {
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
+    /// The shared Yes/No exit confirmation modal, open while asking whether
+    /// to quit (Ctrl+Q / File ▸ Exit).
+    confirm: Option<backstage::Confirm<ConfirmAction>>,
     // ribbon + backstage + chrome
     ribbon: Ribbon,
     rfocus: ribbon::Focus,
@@ -447,6 +459,7 @@ impl App {
             prompt: None,
             status: String::new(),
             quit: false,
+            confirm: None,
             ribbon: Ribbon::new(),
             rfocus: ribbon::Focus::None,
             backstage: None,
@@ -540,6 +553,53 @@ impl App {
             _ => return true, // Quit
         }
         false
+    }
+
+    /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
+    fn request_exit(&mut self) {
+        self.backstage = None;
+        let prompt = if self.dirty {
+            "Exit yppxy? Unsaved changes will be lost."
+        } else {
+            "Exit yppxy?"
+        };
+        self.confirm = Some(backstage::Confirm::new(
+            prompt,
+            ConfirmAction::Exit,
+            Color::Yellow,
+        ));
+    }
+
+    /// Act on the shared dialog's outcome.
+    fn apply_confirm(&mut self, outcome: backstage::ConfirmOutcome<ConfirmAction>) {
+        match outcome {
+            backstage::ConfirmOutcome::Pending => {}
+            backstage::ConfirmOutcome::Cancelled => self.confirm = None,
+            backstage::ConfirmOutcome::Confirmed(action) => {
+                self.confirm = None;
+                match action {
+                    ConfirmAction::Exit => self.quit = true,
+                }
+            }
+        }
+    }
+
+    /// Route a key to the Yes/No modal.
+    fn confirm_key(&mut self, key: KeyEvent) {
+        let Some(c) = self.confirm.as_mut() else {
+            return;
+        };
+        let outcome = c.key(key);
+        self.apply_confirm(outcome);
+    }
+
+    /// Route a click to the Yes/No modal.
+    fn confirm_mouse(&mut self, x: u16, y: u16) {
+        let Some(c) = self.confirm.as_mut() else {
+            return;
+        };
+        let outcome = c.mouse(x, y);
+        self.apply_confirm(outcome);
     }
 
     fn toggle_milestone(&mut self) {
@@ -1079,7 +1139,7 @@ impl App {
                 self.backstage = None;
                 self.export_md();
             }
-            BackstageEvent::Exit => self.quit = true,
+            BackstageEvent::Exit => self.request_exit(),
         }
     }
 
@@ -1352,6 +1412,14 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
+    // A modal confirmation (Exit) owns the whole screen while open — before
+    // the welcome screen or backstage, so it can appear over either.
+    if app.confirm.is_some() {
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            app.confirm_mouse(m.column, m.row);
+        }
+        return;
+    }
     // The welcome screen owns the whole terminal; handle its clicks here so
     // nothing leaks to the hidden schedule behind it. Hovering highlights an
     // item, clicking activates it.
@@ -1469,6 +1537,13 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
+    // A modal confirmation (Exit) owns all keys while open — before the
+    // welcome screen or backstage, so it can appear over either.
+    if app.confirm.is_some() {
+        app.confirm_key(k);
+        return;
+    }
+
     // Modal surfaces take keys before the editor.
     if app.start_screen {
         start_key(app, k);
@@ -1507,20 +1582,16 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     buf: String::new(),
                 });
             }
-            KeyCode::Char('q') => app.quit = true, // Ctrl+Q: quit even if dirty
+            KeyCode::Char('q') => app.request_exit(), // Ctrl+Q: confirm even if dirty
             _ => {}
         }
         return;
     }
 
     match k.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => {
-            if app.dirty {
-                app.status = "Unsaved changes — Ctrl+S to save, or Ctrl+Q to quit anyway".into();
-            } else {
-                app.quit = true;
-            }
-        }
+        // Any quit key opens the shared confirm (which warns about unsaved
+        // changes) — consistent with Ctrl+Q and the other apps.
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.request_exit(),
         KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             if app.sel + 1 < app.proj.tasks.len() {
@@ -1662,6 +1733,12 @@ fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    // A confirmation modal owns the whole screen — no content behind it.
+    if let Some(c) = app.confirm.as_mut() {
+        f.render_widget(Clear, area);
+        c.draw(f, area);
+        return;
+    }
     // The welcome screen overlays everything when launched with no file.
     if app.start_screen {
         f.render_widget(Clear, area);
@@ -2438,5 +2515,42 @@ mod tests {
         app.sel = 0;
         app.delete_task();
         assert!(app.proj.tasks.iter().all(|t| t.predecessors.is_empty()));
+    }
+
+    #[test]
+    fn ctrl_q_opens_the_exit_confirmation() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        assert!(app.dirty);
+        // Ctrl+Q does not quit outright — it opens the Yes/No modal.
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        );
+        assert!(app.confirm.is_some());
+        assert!(!app.quit);
+        // the prompt warns about unsaved changes
+        assert!(app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        // confirming with 'y' quits
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_q_confirmation_can_be_cancelled() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        // even with no changes, Ctrl+Q asks first
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        );
+        assert!(app.confirm.is_some());
+        // No / Esc dismisses without quitting
+        on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert!(!app.quit);
     }
 }

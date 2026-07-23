@@ -201,7 +201,9 @@ fn run_tui(app: &mut App, ctl_rx: Option<Receiver<ctlcore::Request>>) -> io::Res
 
 /// The event loop: render the three-pane layout, poll for input without
 /// blocking forever (so `SyncEvent`s get drained every tick), route
-/// non-global keys to `ui::handle_key`, and quit on `q`/Ctrl-C. The sync
+/// non-global keys to `ui::handle_key`, and open the shared confirm modal
+/// with the exit prompt (`App::request_exit`) on `q`/Ctrl-C — the actual quit
+/// only happens once that dialog is answered Yes (see `App::confirm_key`). The sync
 /// engine's own periodic tick (set from `Config::refresh_secs` at spawn
 /// time, in `main`) is what keeps folders/messages current on its own — this
 /// loop doesn't need to nudge it itself. It also drains any pending agent
@@ -229,8 +231,14 @@ fn run(
                     // Any key press acknowledges (and clears) a transient error
                     // notice — same lifecycle as the sync states that clear it.
                     app.error_notice = None;
-                    if is_global_quit(app, &k) {
-                        app.quit = true;
+                    // The shared confirm modal owns every key while open —
+                    // checked before `is_global_quit` so a `q`/`y`/`n` press
+                    // answers the dialog instead of being treated as a fresh
+                    // quit request.
+                    if app.confirm.is_some() {
+                        app.confirm_key(k);
+                    } else if is_global_quit(app, &k) {
+                        app.request_exit();
                     } else {
                         ui::handle_key(app, k);
                     }
@@ -247,8 +255,9 @@ fn run(
     }
 }
 
-/// Whether `k` should quit the whole app. Ctrl-C always quits. `q` quits
-/// only when no text-input context is capturing keystrokes (`App::
+/// Whether `k` should open the shared exit confirmation (`App::request_exit`,
+/// checked by `run` ahead of this). Ctrl-C always qualifies. `q` only
+/// qualifies when no text-input context is capturing keystrokes (`App::
 /// is_capturing_text`) — otherwise `q` is a character the user is typing into
 /// the search prompt (searching for "quarterly"/"query" must not quit), so it
 /// falls through to `ui::handle_key` instead.
@@ -300,6 +309,22 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEvent;
 
+    /// Test-only mirror of `run`'s key dispatch: the shared confirm modal
+    /// wins first (so a key while it's open answers the dialog rather than
+    /// being treated as a fresh quit request), then `is_global_quit` decides
+    /// whether to raise it, else the key falls through to `ui::handle_key` —
+    /// the exact routing `run`'s event loop does, minus the terminal/polling
+    /// it isn't practical to drive in a unit test.
+    fn dispatch(app: &mut App, k: KeyEvent) {
+        if app.confirm.is_some() {
+            app.confirm_key(k);
+        } else if is_global_quit(app, &k) {
+            app.request_exit();
+        } else {
+            ui::handle_key(app, k);
+        }
+    }
+
     #[test]
     fn q_in_the_search_prompt_types_into_the_query_rather_than_quitting() {
         let mut app = App::for_test_with_seeded_store();
@@ -314,10 +339,18 @@ mod tests {
     }
 
     #[test]
-    fn q_still_quits_when_no_text_input_is_active() {
-        let app = App::for_test_with_seeded_store();
+    fn q_opens_the_exit_confirmation_when_no_text_input_is_active() {
+        let mut app = App::for_test_with_seeded_store();
         let k = KeyEvent::from(KeyCode::Char('q'));
         assert!(is_global_quit(&app, &k));
+        // `q` no longer quits outright — it raises the shared Yes/No modal.
+        dispatch(&mut app, k);
+        assert!(app.confirm.is_some());
+        assert!(!app.quit);
+        assert_eq!(app.confirm.as_ref().unwrap().prompt(), "Exit lookxy?");
+        // Confirming (Enter, Yes preselected) is what actually quits.
+        dispatch(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(app.quit);
     }
 
     #[test]
@@ -344,6 +377,37 @@ mod tests {
         app.start_search();
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(is_global_quit(&app, &k));
+        // Ctrl-C doesn't quit outright either — same shared confirmation,
+        // just reached through a different global key.
+        dispatch(&mut app, k);
+        assert!(app.confirm.is_some());
+        assert!(!app.quit);
+        dispatch(&mut app, KeyEvent::from(KeyCode::Char('y')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn exit_confirmation_esc_cancels_without_quitting() {
+        let mut app = App::for_test_with_seeded_store();
+        dispatch(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.confirm.is_some());
+
+        dispatch(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn q_while_the_exit_confirmation_is_open_goes_to_the_modal_not_a_fresh_quit() {
+        let mut app = App::for_test_with_seeded_store();
+        dispatch(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.confirm.is_some());
+        // The dialog doesn't bind plain `q` to anything, so this is a no-op —
+        // but the point is it must be routed to the modal (`confirm_key`)
+        // rather than re-evaluated by `is_global_quit`/`request_exit`.
+        dispatch(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.confirm.is_some());
+        assert!(!app.quit);
     }
 
     fn strs(args: &[&str]) -> Vec<String> {

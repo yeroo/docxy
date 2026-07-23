@@ -44,6 +44,21 @@ use ratatui::style::{Color, Style};
 /// three panes (unlike the move-folder/confirm/attachments/sign-in popups,
 /// which are drawn on top of them, in that order).
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // The shared confirm modal owns the whole screen ahead of literally
+    // everything else — including the reminder banner and the other
+    // full-frame overlays below — since it can be raised from any of them:
+    // the exit prompt (the mail File backstage's Exit item, or the global
+    // quit key(s) at any time; see `App::request_exit`) as well as the
+    // destructive mail/calendar confirmations (whole-thread delete/move,
+    // event delete) — raised from either the Mail three-pane view or the
+    // Calendar agenda, so checking this ahead of the mode split covers both
+    // without needing a separate draw call in each branch.
+    if let Some(c) = app.confirm.as_mut() {
+        let area = f.area();
+        f.render_widget(ratatui::widgets::Clear, area);
+        c.draw(f, area);
+        return;
+    }
     // Reminder banner: a 1-row strip at the top when reminders are queued; the
     // Mail panes and the calendar lay out against the remaining `area`. The
     // full-frame modal editors (compose/OOF) ignore it — a reminder that fires
@@ -116,11 +131,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // own doc comment describes.
         eventform::draw(f, &*app);
         freebusy::draw(f, &*app);
-        // The delete-confirm modal (`x`) is also an overlay on top of the
-        // calendar — without this, `app.confirm` could be set (by
-        // `App::delete_selected_event`) with nothing on screen to show it,
-        // even though `handle_key` now routes Enter/Esc to it correctly.
-        message_list::draw_confirm(f, &*app);
         help::draw(f, &*app);
         return;
     }
@@ -165,7 +175,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // mailbox behind it at all (first run, no token), and it should win
     // over any other popup that somehow got left open.
     message_list::draw_move_picker(f, &*app);
-    message_list::draw_confirm(f, &*app);
     attachments::draw(f, &*app);
     categorypicker::draw(f, &*app);
     filepicker::draw(f, &*app);
@@ -372,15 +381,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // Checked ahead of the Calendar-mode short-circuit below: the confirm
     // modal (opened by `x` in Calendar mode, or a whole-thread delete/move in
-    // Mail mode) must win over both modes' own key handling, or its Enter/Esc
-    // leak through to whatever's underneath instead of confirming/cancelling
-    // — see `draw`'s matching `draw_confirm` call in the Calendar branch.
+    // Mail mode, or the exit prompt from anywhere) must win over both modes'
+    // own key handling, or its keys leak through to whatever's underneath
+    // instead of confirming/cancelling — see `draw`'s matching full-screen
+    // check, which draws it over both the Mail panes and the Calendar agenda.
     if app.confirm.is_some() {
-        match key.code {
-            KeyCode::Enter => app.confirm_yes(),
-            KeyCode::Esc => app.cancel_confirm(),
-            _ => {}
-        }
+        app.confirm_key(key);
         return;
     }
     // Open the help overlay — after the modal routers (so a modal keeps its
@@ -815,6 +821,19 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Inbox"));
+    }
+
+    #[test]
+    fn exit_confirmation_draws_full_screen_over_everything_else() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::for_test_with_seeded_store();
+        app.request_exit();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Exit lookxy?"));
+        // The three-pane layout underneath is not drawn at all while it's open.
+        assert!(!text.contains("Inbox"));
     }
 
     #[test]
@@ -1469,17 +1488,18 @@ mod tests {
     }
 
     /// Regression test for the other half of the same merge-blocker: `draw`
-    /// took the Calendar-mode branch and returned before it would call
-    /// `message_list::draw_confirm`, so the modal — even once `handle_key`
-    /// routed to it correctly — never actually rendered over the calendar.
+    /// took the Calendar-mode branch and returned before it would render the
+    /// confirm modal, so it — even once `handle_key` routed to it correctly
+    /// — never actually rendered over the calendar.
     #[test]
     fn confirm_modal_renders_over_the_calendar() {
         let mut app = App::for_test_with_seeded_store();
         app.mode = Mode::Calendar;
-        app.confirm = Some(crate::app::ConfirmModal {
-            prompt: "Delete event 'Standup'?".into(),
-            action: crate::app::ConfirmAction::DeleteEvent("e1".into()),
-        });
+        app.confirm = Some(backstagecore::Confirm::new(
+            "Delete event 'Standup'?",
+            crate::app::ConfirmAction::DeleteEvent("e1".into()),
+            ratatui::style::Color::Cyan,
+        ));
 
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();

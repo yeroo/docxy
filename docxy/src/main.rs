@@ -52,7 +52,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::{
@@ -436,13 +436,8 @@ enum ConfirmAction {
     OverwritePdf(std::path::PathBuf),
 }
 
-/// A modal Yes/No dialog.
-struct Confirm {
-    prompt: String,
-    /// The selected button: true = Yes, false = No.
-    yes: bool,
-    action: ConfirmAction,
-}
+// The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
+// across all apps); docxy only supplies the action carried on Yes.
 
 /// One way to paste the clipboard, offered by the Paste Special dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -788,10 +783,9 @@ struct App {
     doc_hscroll: u16,
     /// The full-screen File backstage, when open.
     backstage: Option<backstage::Backstage>,
-    /// A modal Yes/No confirmation (e.g. Exit). The two button rects are stored
-    /// each frame by draw() for mouse hit-testing.
-    confirm: Option<Confirm>,
-    confirm_btns: [Rect; 2],
+    /// A modal Yes/No confirmation (e.g. Exit). The shared widget records its
+    /// own button rects for mouse hit-testing.
+    confirm: Option<backstage::Confirm<ConfirmAction>>,
     /// The modal Paste Special dialog, plus the option-row and button rects that
     /// draw() records each frame for mouse hit-testing.
     paste_special: Option<PasteSpecial>,
@@ -974,7 +968,6 @@ impl App {
             ribbon_h: 0,
             backstage: None,
             confirm: None,
-            confirm_btns: [Rect::default(); 2],
             paste_special: None,
             ps_rows: Vec::new(),
             ps_btns: [Rect::default(); 2],
@@ -1531,61 +1524,47 @@ impl App {
     }
 
     /// Apply the modal's choice. Returns true if the app should quit.
-    fn apply_confirm(&mut self) -> bool {
+    /// Act on the shared dialog's outcome. Returns true if the app should quit.
+    fn apply_confirm(&mut self, outcome: backstage::ConfirmOutcome<ConfirmAction>) -> bool {
         self.dirty = true;
-        if let Some(c) = self.confirm.take() {
-            if c.yes {
-                match c.action {
+        match outcome {
+            backstage::ConfirmOutcome::Pending => false,
+            backstage::ConfirmOutcome::Cancelled => {
+                self.confirm = None;
+                false
+            }
+            backstage::ConfirmOutcome::Confirmed(action) => {
+                self.confirm = None;
+                match action {
                     ConfirmAction::Exit => {
                         self.quit_requested = true;
-                        return true;
+                        true
                     }
-                    ConfirmAction::OverwritePdf(out) => self.write_pdf(out),
+                    ConfirmAction::OverwritePdf(out) => {
+                        self.write_pdf(out);
+                        false
+                    }
                 }
             }
         }
-        false
     }
 
-    /// Keys for a Yes/No modal: ←/→/Tab move, y/n choose, Enter confirms,
-    /// Esc cancels.
+    /// Route a key to the Yes/No modal. Returns true if the app should quit.
     fn confirm_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                if let Some(c) = self.confirm.as_mut() {
-                    c.yes = !c.yes;
-                }
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(c) = self.confirm.as_mut() {
-                    c.yes = true;
-                }
-                return self.apply_confirm();
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.confirm = None;
-            }
-            KeyCode::Enter => return self.apply_confirm(),
-            _ => {}
-        }
-        self.dirty = true;
-        false
+        let Some(c) = self.confirm.as_mut() else {
+            return false;
+        };
+        let outcome = c.key(key);
+        self.apply_confirm(outcome)
     }
 
-    /// Click on a modal's Yes/No button. Returns true if the app should quit.
+    /// Route a click to the Yes/No modal. Returns true if the app should quit.
     fn confirm_mouse(&mut self, x: u16, y: u16) -> bool {
-        let p = Position { x, y };
-        if self.confirm_btns[0].contains(p) {
-            if let Some(c) = self.confirm.as_mut() {
-                c.yes = true;
-            }
-            return self.apply_confirm();
-        }
-        if self.confirm_btns[1].contains(p) {
-            self.confirm = None;
-            self.dirty = true;
-        }
-        false
+        let Some(c) = self.confirm.as_mut() else {
+            return false;
+        };
+        let outcome = c.mouse(x, y);
+        self.apply_confirm(outcome)
     }
 
     /// Replace the open document with one loaded from `path` (Markdown or `.docx`).
@@ -1649,11 +1628,14 @@ impl App {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| out.display().to_string());
-            self.confirm = Some(Confirm {
-                prompt: format!("{name} already exists. Overwrite it?"),
-                yes: false,
-                action: ConfirmAction::OverwritePdf(out),
-            });
+            self.confirm = Some(
+                backstage::Confirm::new(
+                    format!("{name} already exists. Overwrite it?"),
+                    ConfirmAction::OverwritePdf(out),
+                    Color::LightBlue,
+                )
+                .default_no(),
+            );
             self.dirty = true;
             return;
         }
@@ -2114,70 +2096,6 @@ impl App {
         );
     }
 
-    /// A centered modal Yes/No box. Stores the button rects for hit-testing.
-    fn draw_confirm(&mut self, f: &mut Frame, area: Rect, prompt: &str, yes: bool) {
-        let w = ((prompt.chars().count() as u16) + 6)
-            .clamp(28, area.width.saturating_sub(4).max(28))
-            .min(area.width);
-        let h = 7u16.min(area.height);
-        let rect = Rect {
-            x: area.x + area.width.saturating_sub(w) / 2,
-            y: area.y + area.height.saturating_sub(h) / 2,
-            width: w,
-            height: h,
-        };
-        f.render_widget(Clear, rect);
-        let block = RBlock::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Confirm ");
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-
-        // prompt, centered above the buttons
-        let prompt_area = Rect {
-            height: inner.height.saturating_sub(2),
-            ..inner
-        };
-        f.render_widget(
-            Paragraph::new(prompt)
-                .wrap(Wrap { trim: true })
-                .alignment(Alignment::Center),
-            prompt_area,
-        );
-
-        // [ Yes ] [ No ] buttons, centered on the bottom row
-        let yes_lbl = "  Yes  ";
-        let no_lbl = "  No  ";
-        let (yw, nw) = (yes_lbl.len() as u16, no_lbl.len() as u16);
-        let total = yw + 2 + nw;
-        let bx = inner.x + inner.width.saturating_sub(total) / 2;
-        let by = inner.y + inner.height.saturating_sub(1);
-        let yes_rect = Rect {
-            x: bx,
-            y: by,
-            width: yw,
-            height: 1,
-        };
-        let no_rect = Rect {
-            x: bx + yw + 2,
-            y: by,
-            width: nw,
-            height: 1,
-        };
-        let sel = Style::default().fg(Color::Black).bg(Color::Cyan);
-        let unsel = Style::default().add_modifier(Modifier::REVERSED);
-        f.render_widget(
-            Paragraph::new(yes_lbl).style(if yes { sel } else { unsel }),
-            yes_rect,
-        );
-        f.render_widget(
-            Paragraph::new(no_lbl).style(if yes { unsel } else { sel }),
-            no_rect,
-        );
-        self.confirm_btns = [yes_rect, no_rect];
-    }
-
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
@@ -2632,15 +2550,16 @@ impl App {
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
     fn request_exit(&mut self) {
         self.backstage = None;
-        self.confirm = Some(Confirm {
-            prompt: if self.modified {
-                "Exit docxy? Unsaved changes will be lost.".to_string()
-            } else {
-                "Exit docxy?".to_string()
-            },
-            yes: true,
-            action: ConfirmAction::Exit,
-        });
+        let prompt = if self.modified {
+            "Exit docxy? Unsaved changes will be lost."
+        } else {
+            "Exit docxy?"
+        };
+        self.confirm = Some(backstage::Confirm::new(
+            prompt,
+            ConfirmAction::Exit,
+            Color::LightBlue,
+        ));
         self.dirty = true;
     }
 
@@ -4290,10 +4209,10 @@ impl App {
             return;
         }
         // A confirmation modal owns the whole screen — no content behind it.
-        if let Some(c) = &self.confirm {
-            let (prompt, yes) = (c.prompt.clone(), c.yes);
-            f.render_widget(Clear, f.area());
-            self.draw_confirm(f, f.area(), &prompt, yes);
+        if let Some(c) = self.confirm.as_mut() {
+            let area = f.area();
+            f.render_widget(Clear, area);
+            c.draw(f, area);
             return;
         }
         // The File backstage takes over the whole screen.
@@ -6624,15 +6543,14 @@ mod tests {
         app.status = None;
         app.export_pdf();
         let c = app.confirm.as_ref().expect("overwrite prompt shown");
-        assert!(!c.yes, "default is No for a destructive overwrite");
-        assert_eq!(c.action, ConfirmAction::OverwritePdf(pdf.clone()));
+        assert!(
+            !c.yes_selected(),
+            "default is No for a destructive overwrite"
+        );
         assert!(app.status.is_none(), "nothing written until confirmed");
 
-        // Confirming overwrites the file.
-        if let Some(c) = app.confirm.as_mut() {
-            c.yes = true;
-        }
-        app.apply_confirm();
+        // Confirming (press 'y') overwrites the file.
+        app.on_key(key(KeyCode::Char('y')));
         assert!(app.confirm.is_none());
         assert!(app.status.as_deref().unwrap().starts_with("exported"));
 
@@ -6653,7 +6571,10 @@ mod tests {
         assert!(!app.quit_requested);
         assert!(app.backstage.is_none());
         assert!(app.confirm.is_some());
-        assert!(app.confirm.as_ref().unwrap().yes, "Yes is the default");
+        assert!(
+            app.confirm.as_ref().unwrap().yes_selected(),
+            "Yes is the default"
+        );
         // Esc dismisses without quitting regardless of the selection.
         app.on_key(key(KeyCode::Esc));
         assert!(app.confirm.is_none());
@@ -7407,7 +7328,7 @@ mod tests {
         assert!(!app.on_key(ctrl(KeyCode::Char('q'))));
         assert!(app.confirm.is_some());
         // the prompt warns about unsaved changes
-        assert!(app.confirm.as_ref().unwrap().prompt.contains("Unsaved"));
+        assert!(app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
         // confirming with 'y' quits
         assert!(app.on_key(key(KeyCode::Char('y'))));
         assert!(app.quit_requested);
