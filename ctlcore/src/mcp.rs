@@ -143,21 +143,71 @@ pub fn prop(ty: &str, desc: &str) -> Json {
     ])
 }
 
-/// An MCP tool definition with an object input schema.
-pub fn tool(name: &str, description: &str, props: Vec<(&str, Json)>, required: &[&str]) -> Json {
-    let schema = Json::obj(vec![
+/// A bare (description-less) object schema fragment: `{"type":"object",
+/// "properties":…,"required":…}` — factored out of [`tool`] so a nested
+/// array-of-objects `items` shape (e.g. `sheet.pivot`'s `values:
+/// [{col,agg}]`) can reuse it without a name/description wrapper.
+fn object_schema(props: Vec<(&str, Json)>, required: &[&str]) -> Json {
+    Json::obj(vec![
         ("type", Json::Str("object".into())),
         ("properties", Json::obj(props)),
         (
             "required",
             Json::Arr(required.iter().map(|s| Json::Str((*s).into())).collect()),
         ),
-    ]);
+    ])
+}
+
+/// An MCP tool definition with an object input schema.
+pub fn tool(name: &str, description: &str, props: Vec<(&str, Json)>, required: &[&str]) -> Json {
     Json::obj(vec![
         ("name", Json::Str(name.into())),
         ("description", Json::Str(description.into())),
-        ("inputSchema", schema),
+        ("inputSchema", object_schema(props, required)),
     ])
+}
+
+/// A JSON-schema property for an array-typed arg: `{"type":"array",
+/// "items":items,"description":desc}` — [`prop`]'s scalar `{type,
+/// description}` shape can't express a nested `items` schema, which a few
+/// wave-1 args need (`range.set`'s `rows`, `sheet.pivot`'s `rows`/`cols`/
+/// `values`). Compose `items` from [`item_ty`]/[`item_array`]/[`item_obj`].
+pub fn prop_array(items: Json, desc: &str) -> Json {
+    Json::obj(vec![
+        ("type", Json::Str("array".into())),
+        ("items", items),
+        ("description", Json::Str(desc.into())),
+    ])
+}
+
+/// A bare `{"type": ty}` items schema — e.g. `item_ty("string")` for
+/// `sheet.pivot`'s `rows`/`cols` (arrays of header-name strings).
+pub fn item_ty(ty: &str) -> Json {
+    Json::obj(vec![("type", Json::Str(ty.into()))])
+}
+
+/// A bare array items schema wrapping a nested `items` schema — e.g.
+/// `range.set`'s `rows: [[string]]` (each row an array of cell-text
+/// strings): `item_array(item_ty("string"))`.
+pub fn item_array(items: Json) -> Json {
+    Json::obj(vec![("type", Json::Str("array".into())), ("items", items)])
+}
+
+/// A bare object items schema — e.g. `sheet.pivot`'s `values: [{col,agg}]`.
+pub fn item_obj(props: Vec<(&str, Json)>, required: &[&str]) -> Json {
+    object_schema(props, required)
+}
+
+/// A JSON-schema property for an object-typed arg: `{"type":"object",
+/// "properties":…,"required":…,"description":desc}` — [`item_obj`]'s bare
+/// object schema plus a top-level `description`, for a nested-object
+/// argument that itself needs documenting, e.g. `cell.format`'s `patch`.
+pub fn prop_obj(props: Vec<(&str, Json)>, required: &[&str], desc: &str) -> Json {
+    let Json::Obj(mut pairs) = object_schema(props, required) else {
+        unreachable!("object_schema always returns Json::Obj")
+    };
+    pairs.push(("description".to_string(), Json::Str(desc.into())));
+    Json::Obj(pairs)
 }
 
 #[cfg(test)]
@@ -284,5 +334,57 @@ mod tests {
             r.get("error").unwrap().get("code").unwrap().as_i64(),
             Some(-32601)
         );
+    }
+
+    #[test]
+    fn prop_array_wraps_items_with_type_and_description() {
+        let p = prop_array(item_ty("string"), "Some strings.");
+        assert_eq!(p.get_str("type"), Some("array"));
+        assert_eq!(p.get_str("description"), Some("Some strings."));
+        assert_eq!(p.get("items").unwrap().get_str("type"), Some("string"));
+    }
+
+    #[test]
+    fn item_ty_is_a_bare_type_only_fragment() {
+        let it = item_ty("integer");
+        assert_eq!(it.get_str("type"), Some("integer"));
+        assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn item_array_wraps_a_nested_items_schema() {
+        let it = item_array(item_ty("string"));
+        assert_eq!(it.get_str("type"), Some("array"));
+        assert_eq!(it.get("items").unwrap().get_str("type"), Some("string"));
+        assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn item_obj_builds_a_bare_object_schema_with_required() {
+        let it = item_obj(
+            vec![
+                ("col", prop("string", "col desc")),
+                ("agg", prop("string", "agg desc")),
+            ],
+            &["col", "agg"],
+        );
+        assert_eq!(it.get_str("type"), Some("object"));
+        assert!(it.get("properties").unwrap().get("col").is_some());
+        assert!(it.get("properties").unwrap().get("agg").is_some());
+        assert_eq!(it.get("required").unwrap().to_string(), "[\"col\",\"agg\"]");
+        assert!(it.get("description").is_none());
+    }
+
+    #[test]
+    fn prop_obj_is_item_obj_plus_a_top_level_description() {
+        let p = prop_obj(
+            vec![("bold", prop("boolean", "bold desc"))],
+            &[],
+            "patch desc",
+        );
+        assert_eq!(p.get_str("type"), Some("object"));
+        assert!(p.get("properties").unwrap().get("bold").is_some());
+        assert_eq!(p.get("required").unwrap().to_string(), "[]");
+        assert_eq!(p.get_str("description"), Some("patch desc"));
     }
 }

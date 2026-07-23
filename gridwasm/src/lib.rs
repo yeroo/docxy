@@ -151,6 +151,25 @@ pub extern "C" fn grid_new() -> *mut u8 {
     ret_bytes(&bridge::new_workbook())
 }
 
+// ---- agent control surface -------------------------------------------------
+
+/// Route one agent control request (JSON `{"verb":…,"args":{…}}`, see
+/// [`bridge::Session::ctl`]) against the session for `handle` and return the
+/// JSON reply. For an unknown handle this returns the same failure envelope
+/// `ctl` uses for any other error, so the caller never has to special-case
+/// handle lookup.
+///
+/// # Safety
+/// `ptr`/`len` must describe a live host allocation of the request JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grid_ctl(handle: u32, ptr: *const u8, len: usize) -> *mut u8 {
+    let req = String::from_utf8_lossy(unsafe { input(ptr, len) }).into_owned();
+    SESSIONS.with(|s| match s.borrow_mut().get_mut(&handle) {
+        Some(session) => ret_bytes(session.ctl(&req).as_bytes()),
+        None => ret_bytes(br#"{"ok":false,"error":"unknown session handle"}"#),
+    })
+}
+
 /// Run `f` against the session for `handle`, returning its bytes as a
 /// length-prefixed result buffer (empty payload if the handle is unknown).
 fn with_session(handle: u32, f: impl FnOnce(&mut Session) -> Vec<u8>) -> *mut u8 {
@@ -176,5 +195,55 @@ mod tests {
             assert_eq!(data, b"hello");
             grid_free(ptr, 4 + len);
         }
+    }
+
+    /// Copy `bytes` into a fresh wasm allocation and return its pointer (the
+    /// host-write step every export's SAFETY contract assumes).
+    fn write_into_wasm(bytes: &[u8]) -> *mut u8 {
+        let ptr = grid_alloc(bytes.len());
+        // SAFETY: `ptr` is a fresh allocation exactly `bytes.len()` long.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        ptr
+    }
+
+    /// Read back a length-prefixed result buffer as a `String` and free it.
+    fn read_result(ptr: *mut u8) -> String {
+        // SAFETY: `ptr` is a live length-prefixed buffer from this module.
+        unsafe {
+            let len = u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]) as usize;
+            let data = std::slice::from_raw_parts(ptr.add(4), len);
+            let s = String::from_utf8_lossy(data).into_owned();
+            grid_free(ptr, 4 + len);
+            s
+        }
+    }
+
+    #[test]
+    fn grid_ctl_marshals_a_request_and_reply() {
+        let bytes = bridge::new_workbook();
+        let doc_ptr = write_into_wasm(&bytes);
+        // SAFETY: `doc_ptr`/`bytes.len()` is the allocation just written.
+        let handle = unsafe { grid_open(doc_ptr, bytes.len()) };
+        unsafe { grid_free(doc_ptr, bytes.len()) };
+        assert_ne!(handle, 0, "expected a live session handle");
+
+        let req = br#"{"verb":"cell.set","args":{"ref":"A1","text":"hi"}}"#;
+        let req_ptr = write_into_wasm(req);
+        // SAFETY: `req_ptr`/`req.len()` is the allocation just written.
+        let out = read_result(unsafe { grid_ctl(handle, req_ptr, req.len()) });
+        unsafe { grid_free(req_ptr, req.len()) };
+        assert!(
+            out.contains("\"ok\":true") && out.contains("\"text\":\"hi\""),
+            "{out}"
+        );
+
+        grid_close(handle);
+    }
+
+    #[test]
+    fn grid_ctl_reports_unknown_handle_instead_of_panicking() {
+        // SAFETY: null/0 is the documented empty-input case for `input()`.
+        let out = read_result(unsafe { grid_ctl(999_999, std::ptr::null(), 0) });
+        assert!(out.contains("\"ok\":false"), "{out}");
     }
 }

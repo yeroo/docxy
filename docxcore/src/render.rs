@@ -201,6 +201,12 @@ pub struct LineMap {
     /// the page's edge and reopens it with the top border on the next page (as
     /// Word does). `None` for non-table or borderless lines.
     pub table_edge: Option<Rc<(String, String)>>,
+    /// True for every visual line of a list-item paragraph (`w:numPr`/
+    /// `para.props.num_id.is_some()`), including wrapped continuation lines.
+    /// Consumed by the webview to scope Markdown-mode's checkbox glyph
+    /// (`[ ] `/`[x] ` → ☐/☑) to actual list items instead of any line whose
+    /// text happens to start with that literal prefix.
+    pub list: bool,
 }
 
 impl LineMap {
@@ -211,6 +217,7 @@ impl LineMap {
             image: false,
             overflow: false,
             table_edge: None,
+            list: false,
         }
     }
     /// The segment containing the caret (path + offset), if any.
@@ -313,6 +320,19 @@ pub struct ImageBox {
     pub label: String,
 }
 
+/// A mermaid diagram's placement on the character grid. The webview overlays an
+/// SVG (built from `geometry_json`) at this cell rectangle; the terminal/PDF keep
+/// the text caption box. `geometry_json` is `mermaid::DiagramGeometry::to_json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MermaidBox {
+    pub row: usize,
+    pub col: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub geometry_json: String,
+    pub source: String,
+}
+
 /// The relationship id of an embedded image from its raw run XML — DrawingML
 /// `<a:blip r:embed="..">` or VML `<v:imagedata r:id="..">`.
 fn embed_rid(raw: &str) -> Option<String> {
@@ -326,7 +346,7 @@ pub fn render(doc: &Document, opts: &RenderOptions) -> Vec<Line> {
 
 /// Render a document into styled lines plus a caret map per line.
 pub fn render_mapped(doc: &Document, opts: &RenderOptions) -> (Vec<Line>, Vec<LineMap>) {
-    let (lines, maps, _imgs) = render_with_images(doc, opts);
+    let (lines, maps, _imgs, _mmd) = render_with_images(doc, opts);
     (lines, maps)
 }
 
@@ -335,24 +355,28 @@ pub fn render_mapped(doc: &Document, opts: &RenderOptions) -> (Vec<Line>, Vec<Li
 pub fn render_with_images(
     doc: &Document,
     opts: &RenderOptions,
-) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>) {
+) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>, Vec<MermaidBox>) {
     if !opts.page_view {
         let w = opts.width.max(8);
         let mut images = Vec::new();
+        let mut mermaid = Vec::new();
         let mut out: Vec<(Line, LineMap)> = Vec::new();
         // Continuous view has no page margins, so the header/footer would otherwise
         // be invisible. Show them once as a non-editable banner (header on top,
         // footer at the bottom) so their content isn't lost. Their caret maps are
         // dropped so clicks don't collide with the body's paragraph paths.
-        let banner = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<(Line, LineMap)> {
-            render_blocks(blocks, &[], w, opts, imgs)
+        let banner = |blocks: &[Block],
+                      imgs: &mut Vec<ImageBox>,
+                      mmds: &mut Vec<MermaidBox>|
+         -> Vec<(Line, LineMap)> {
+            render_blocks(blocks, &[], w, opts, imgs, mmds)
                 .into_iter()
                 .map(|(l, _)| (l, LineMap::default()))
                 .collect()
         };
         let head = banner_blocks(&opts.headers);
         if !head.is_empty() {
-            out.extend(banner(head, &mut images));
+            out.extend(banner(head, &mut images, &mut mermaid));
             out.push((
                 Line {
                     spans: vec![Line::dim_span("─".repeat(w))],
@@ -362,11 +386,16 @@ pub fn render_with_images(
         }
         let body_off = out.len();
         let mut body_imgs = Vec::new();
-        let body = render_blocks(&doc.body, &[], w, opts, &mut body_imgs);
+        let mut body_mmd = Vec::new();
+        let body = render_blocks(&doc.body, &[], w, opts, &mut body_imgs, &mut body_mmd);
         for ib in &mut body_imgs {
             ib.row += body_off;
         }
+        for mb in &mut body_mmd {
+            mb.row += body_off;
+        }
         images.append(&mut body_imgs);
+        mermaid.append(&mut body_mmd);
         out.extend(body);
         let foot = banner_blocks(&opts.footers);
         if !foot.is_empty() {
@@ -378,16 +407,21 @@ pub fn render_with_images(
             ));
             let off = out.len();
             let mut foot_imgs = Vec::new();
-            for (l, _) in render_blocks(foot, &[], w, opts, &mut foot_imgs) {
+            let mut foot_mmd = Vec::new();
+            for (l, _) in render_blocks(foot, &[], w, opts, &mut foot_imgs, &mut foot_mmd) {
                 out.push((l, LineMap::default()));
             }
             for ib in &mut foot_imgs {
                 ib.row += off;
             }
+            for mb in &mut foot_mmd {
+                mb.row += off;
+            }
             images.append(&mut foot_imgs);
+            mermaid.append(&mut foot_mmd);
         }
         let (lines, maps) = out.into_iter().unzip();
-        return (lines, maps, images);
+        return (lines, maps, images, mermaid);
     }
 
     // Print layout: split the body into sections (each `section_break` paragraph
@@ -397,6 +431,7 @@ pub fn render_with_images(
     let pl = page_lines(opts);
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut images: Vec<ImageBox> = Vec::new();
+    let mut mermaid: Vec<MermaidBox> = Vec::new();
     for (start, end, geom, col_tw) in sections(doc, opts.page) {
         let m = page_metrics(opts.width, geom);
         let content_width = m.content_cols;
@@ -417,6 +452,7 @@ pub fn render_with_images(
         };
 
         let mut sec_imgs = Vec::new();
+        let mut sec_mmd = Vec::new();
         let pairs = if ncols > 1 {
             // Newspaper columns: render the section once per distinct column width,
             // then flow the lines into the (possibly unequal) columns. Pixel-image
@@ -436,6 +472,7 @@ pub fn render_with_images(
                         w.max(1),
                         &sec_opts,
                         &mut Vec::new(),
+                        &mut Vec::new(),
                     );
                     rebase(&mut p);
                     distinct.push((w, p));
@@ -453,20 +490,25 @@ pub fn render_with_images(
                 content_width,
                 &sec_opts,
                 &mut sec_imgs,
+                &mut sec_mmd,
             );
             rebase(&mut p);
             p
         };
-        let pages = paginate(pairs, opts, geom, &mut sec_imgs, &pl);
+        let pages = paginate(pairs, opts, geom, &mut sec_imgs, &mut sec_mmd, &pl);
         let base = out.len();
         for ib in &mut sec_imgs {
             ib.row += base;
         }
+        for mb in &mut sec_mmd {
+            mb.row += base;
+        }
         out.extend(pages);
         images.extend(sec_imgs);
+        mermaid.extend(sec_mmd);
     }
     let (lines, maps) = out.into_iter().unzip();
-    (lines, maps, images)
+    (lines, maps, images, mermaid)
 }
 
 /// A copy of `opts` with path-keyed inputs (selection, list markers) rebased to a
@@ -576,28 +618,31 @@ fn banner_blocks(parts: &PageParts) -> &[Block] {
 /// Render the header/footer variants to (non-editable) lines for the margins.
 fn page_lines(opts: &RenderOptions) -> PageLines {
     let mut imgs = Vec::new();
-    let to_lines = |blocks: &[Block], imgs: &mut Vec<ImageBox>| -> Vec<Line> {
-        render_blocks(
-            blocks,
-            &[],
-            page_metrics(opts.width, opts.page).content_cols,
-            opts,
-            imgs,
-        )
-        .into_iter()
-        .map(|(l, _)| l)
-        .collect()
-    };
+    let mut mmds = Vec::new();
+    let to_lines =
+        |blocks: &[Block], imgs: &mut Vec<ImageBox>, mmds: &mut Vec<MermaidBox>| -> Vec<Line> {
+            render_blocks(
+                blocks,
+                &[],
+                page_metrics(opts.width, opts.page).content_cols,
+                opts,
+                imgs,
+                mmds,
+            )
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect()
+        };
     PageLines {
         h: [
-            to_lines(&opts.headers.default, &mut imgs),
-            to_lines(&opts.headers.first, &mut imgs),
-            to_lines(&opts.headers.even, &mut imgs),
+            to_lines(&opts.headers.default, &mut imgs, &mut mmds),
+            to_lines(&opts.headers.first, &mut imgs, &mut mmds),
+            to_lines(&opts.headers.even, &mut imgs, &mut mmds),
         ],
         f: [
-            to_lines(&opts.footers.default, &mut imgs),
-            to_lines(&opts.footers.first, &mut imgs),
-            to_lines(&opts.footers.even, &mut imgs),
+            to_lines(&opts.footers.default, &mut imgs, &mut mmds),
+            to_lines(&opts.footers.first, &mut imgs, &mut mmds),
+            to_lines(&opts.footers.even, &mut imgs, &mut mmds),
         ],
         title_page: opts.title_page,
         even_odd: opts.even_odd,
@@ -610,6 +655,7 @@ fn render_blocks(
     width: usize,
     opts: &RenderOptions,
     images: &mut Vec<ImageBox>,
+    mermaid: &mut Vec<MermaidBox>,
 ) -> Vec<(Line, LineMap)> {
     // Frame-positioned (floating) images are page-anchored and independent of the
     // text flow, so gather *all* of them in this block list and project them onto
@@ -627,11 +673,17 @@ fn render_blocks(
     let absorb = |out: &mut Vec<(Line, LineMap)>,
                   sub: Vec<(Line, LineMap)>,
                   sub_imgs: Vec<ImageBox>,
-                  images: &mut Vec<ImageBox>| {
+                  images: &mut Vec<ImageBox>,
+                  sub_mmd: Vec<MermaidBox>,
+                  mermaid: &mut Vec<MermaidBox>| {
         let base_row = out.len();
         for mut ib in sub_imgs {
             ib.row += base_row;
             images.push(ib);
+        }
+        for mut mb in sub_mmd {
+            mb.row += base_row;
+            mermaid.push(mb);
         }
         out.extend(sub);
     };
@@ -642,7 +694,7 @@ fn render_blocks(
                     let region: Vec<&Block> = blocks[f..=l].iter().collect();
                     let mut sub_imgs = Vec::new();
                     let sub = render_floating_canvas(&region, width, opts, &mut sub_imgs);
-                    absorb(&mut out, sub, sub_imgs, images);
+                    absorb(&mut out, sub, sub_imgs, images, Vec::new(), mermaid);
                 }
                 continue; // the figure region is drawn as one canvas
             }
@@ -666,16 +718,18 @@ fn render_blocks(
                 let suppress_bottom =
                     me.bottom.is_some() && eff(blocks.get(bi + 1)).bottom == me.bottom;
                 let mut sub_imgs = Vec::new();
+                let mut sub_mmd = Vec::new();
                 let sub = render_paragraph(
                     p,
                     &path,
                     width,
                     opts,
                     &mut sub_imgs,
+                    &mut sub_mmd,
                     suppress_top,
                     suppress_bottom,
                 );
-                absorb(&mut out, sub, sub_imgs, images);
+                absorb(&mut out, sub, sub_imgs, images, sub_mmd, mermaid);
             }
             Block::Table(t) => out.extend(render_table(t, &path, width, opts)),
             // Content-control wrapper boundaries carry no visible payload; only
@@ -1312,12 +1366,14 @@ fn glyph_extent(glyphs: &[Glyph]) -> (usize, Vec<usize>) {
     (start.unwrap_or(0), cols)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_paragraph(
     para: &Paragraph,
     path: &[usize],
     width: usize,
     opts: &RenderOptions,
     images: &mut Vec<ImageBox>,
+    mermaid: &mut Vec<MermaidBox>,
     // Adjacent paragraphs sharing a border draw one rule for the run (Word's
     // behavior): drop the top rule when the paragraph above already carries it,
     // and the bottom rule when the one below does.
@@ -1394,6 +1450,7 @@ fn render_paragraph(
                 width,
                 opts,
                 images,
+                mermaid,
                 &mut out,
             );
             continue;
@@ -1477,7 +1534,13 @@ fn render_paragraph(
                     reserve = reserve.max(img.rows.saturating_sub(1));
                 }
             }
-            out.push((line, LineMap::one(lseg)));
+            out.push((
+                line,
+                LineMap {
+                    list: is_list,
+                    ..LineMap::one(lseg)
+                },
+            ));
             for _ in 0..reserve {
                 out.push((Line { spans: Vec::new() }, LineMap::default()));
             }
@@ -1505,6 +1568,7 @@ fn render_paragraph(
 /// Render a block-level inline (multi-line equation, chart, SmartArt, text box, or
 /// block image) at its place in the paragraph flow, appending to `out`. `idx` is the
 /// item's index in the host paragraph's content.
+#[allow(clippy::too_many_arguments)]
 fn emit_block_item(
     item: &Inline,
     idx: usize,
@@ -1512,14 +1576,34 @@ fn emit_block_item(
     width: usize,
     opts: &RenderOptions,
     images: &mut Vec<ImageBox>,
+    mermaid: &mut Vec<MermaidBox>,
     out: &mut Vec<(Line, LineMap)>,
 ) {
     match item {
         // A SmartArt diagram: the shapes can't be drawn in a terminal, so show the
-        // diagram's node text in a labeled (non-editable) box.
-        Inline::SmartArt { text, .. } => {
-            let blocks = smartart_blocks(text);
-            out.extend(text_box(&blocks, None, width, opts, images));
+        // diagram's node text in a labeled (non-editable) box. When the diagram was
+        // generated from a mermaid fence, also record a cell-anchored box so the
+        // webview can overlay the real geometry as SVG (the caption box still
+        // renders underneath for the terminal/PDF/no-webview fallback).
+        Inline::SmartArt { text, raw } => {
+            if let Some(src) = crate::mermaid::source_of(raw) {
+                let (cw, ch, gjson) = crate::mermaid::geometry_box(&src);
+                let (cols, rows) = mermaid_box_cells(cw, ch, width);
+                let row = out.len();
+                let blocks = smartart_blocks(text);
+                out.extend(text_box(&blocks, None, width, opts, images, mermaid));
+                mermaid.push(MermaidBox {
+                    row,
+                    col: 0,
+                    cols,
+                    rows,
+                    geometry_json: gjson,
+                    source: src.clone(),
+                });
+            } else {
+                let blocks = smartart_blocks(text);
+                out.extend(text_box(&blocks, None, width, opts, images, mermaid));
+            }
         }
         // A multi-line equation (a matrix laid out as rows) on its own lines.
         Inline::Equation { text, .. } if text.contains('\n') => {
@@ -1536,14 +1620,14 @@ fn emit_block_item(
         Inline::Chart { chart, .. } => {
             let lines = crate::chart::render_chart(chart, width.saturating_sub(6).max(16));
             let blocks = chart_blocks(&lines);
-            out.extend(text_box(&blocks, None, width, opts, images));
+            out.extend(text_box(&blocks, None, width, opts, images, mermaid));
         }
         // A text box: its content is editable, addressed by the host paragraph's
         // path plus this inline index, so the box's text is selectable.
         Inline::TextBox { blocks, .. } => {
             let mut base = path.to_vec();
             base.push(idx);
-            out.extend(text_box(blocks, Some(&base), width, opts, images));
+            out.extend(text_box(blocks, Some(&base), width, opts, images, mermaid));
         }
         // A larger (block) image: a sized placeholder box; real pixels are overlaid
         // by the app.
@@ -1715,10 +1799,11 @@ fn text_box(
     width: usize,
     opts: &RenderOptions,
     images: &mut Vec<ImageBox>,
+    mermaid: &mut Vec<MermaidBox>,
 ) -> Vec<(Line, LineMap)> {
     const FRAME: usize = 2; // the leading "│ "
     let inner = width.saturating_sub(4).max(8);
-    let content = render_blocks(blocks, base.unwrap_or(&[]), inner, opts, images);
+    let content = render_blocks(blocks, base.unwrap_or(&[]), inner, opts, images, mermaid);
     let mut out = Vec::new();
     out.push((
         Line {
@@ -1760,6 +1845,21 @@ fn image_box_cells(pw: usize, ph: usize, width: usize) -> (usize, usize) {
     let max_cols = width.saturating_sub(2).max(10);
     let cols = (pw / 8).clamp(10, max_cols);
     let rows = (ph / 16).clamp(3, 24);
+    (cols, rows)
+}
+
+/// Size a mermaid diagram's grid box (interior `cols`×`rows`, in cells) from its
+/// canvas size in EMUs. Same ~8×16px/cell assumption as `image_box_cells`
+/// (canvas pixels are recovered via 96dpi: `px = emu * 96 / EMU_PER_INCH`).
+/// `cols` is clamped to `width` with a floor of 8; `rows` has a floor of 4 (the
+/// webview's SVG overlay scales to fill whatever box this reserves).
+fn mermaid_box_cells(emu_w: i64, emu_h: i64, width: usize) -> (usize, usize) {
+    const EMU_PER_INCH: i64 = 914_400;
+    let px_w = (emu_w.max(0) * 96 / EMU_PER_INCH).max(0) as usize;
+    let px_h = (emu_h.max(0) * 96 / EMU_PER_INCH).max(0) as usize;
+    let max_cols = width.max(8);
+    let cols = (px_w / 8).clamp(8, max_cols);
+    let rows = (px_h / 16).max(4);
     (cols, rows)
 }
 
@@ -1935,8 +2035,16 @@ fn render_floating_canvas(
             continue;
         }
         if let Block::Paragraph(p) = b {
-            for (line, _) in render_paragraph(p, &[0], text_w, opts, &mut Vec::new(), false, false)
-            {
+            for (line, _) in render_paragraph(
+                p,
+                &[0],
+                text_w,
+                opts,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                false,
+                false,
+            ) {
                 let s = line.plain();
                 // Skip leading blank lines so the heading hugs the top.
                 if !s.trim().is_empty() || !text_lines.is_empty() {
@@ -2169,9 +2277,17 @@ fn render_table(
                 cell_path.push(r);
                 cell_path.push(ci);
                 // Images inside table cells aren't overlaid (v1): discard their boxes.
+                // Mermaid diagrams inside table cells are likewise not anchored.
                 origins.insert(
                     (r, c),
-                    render_blocks(&cell.blocks, &cell_path, cw, opts, &mut Vec::new()),
+                    render_blocks(
+                        &cell.blocks,
+                        &cell_path,
+                        cw,
+                        opts,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    ),
                 );
             }
             c += span;
@@ -2595,6 +2711,7 @@ fn paginate(
     opts: &RenderOptions,
     geom: PageGeom,
     images: &mut Vec<ImageBox>,
+    mermaid: &mut Vec<MermaidBox>,
     pl: &PageLines,
 ) -> Vec<(Line, LineMap)> {
     let m = page_metrics(opts.width, geom);
@@ -2828,6 +2945,26 @@ fn paginate(
         }
     }
     *images = placed_imgs;
+
+    // Remap mermaid boxes the same way, anchored by their top row (unlike images
+    // they never split across a page boundary — the caption box they sit beside
+    // is small enough to keep together, or is simply cut by the normal page fill).
+    let mut placed_mmd: Vec<MermaidBox> = Vec::new();
+    for mb in mermaid.iter() {
+        if let Some(&nr) = new_row.get(mb.row) {
+            if nr != usize::MAX {
+                placed_mmd.push(MermaidBox {
+                    row: nr,
+                    col: mb.col + col_off,
+                    cols: mb.cols,
+                    rows: mb.rows,
+                    geometry_json: mb.geometry_json.clone(),
+                    source: mb.source.clone(),
+                });
+            }
+        }
+    }
+    *mermaid = placed_mmd;
     out
 }
 
@@ -3120,7 +3257,7 @@ mod tests {
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
         // The picture is reported as an image region (with a fallback caption) but,
         // having no document-defined outline, draws no border in the text itself.
-        let (lines, _m, imgs) = render_with_images(&d, &opts(60));
+        let (lines, _m, imgs, _mmd) = render_with_images(&d, &opts(60));
         let joined: String = lines
             .iter()
             .map(|l| l.plain())
@@ -3138,7 +3275,7 @@ mod tests {
         let d2 = doc(vec![para(vec![Inline::Raw(
             "<w:bookmarkStart/>".to_string(),
         )])]);
-        let (_l, _m, imgs2) = render_with_images(&d2, &opts(60));
+        let (_l, _m, imgs2, _mmd) = render_with_images(&d2, &opts(60));
         assert!(imgs2.is_empty());
     }
 
@@ -3148,7 +3285,7 @@ mod tests {
         let raw = "<w:r><w:pict><v:shape style=\"width:240pt;height:120pt\" stroked=\"t\">\
                    <v:imagedata r:id=\"r\"/></v:shape></w:pict></w:r>";
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let (lines, _m, imgs) = render_with_images(&d, &opts(60));
+        let (lines, _m, imgs, _mmd) = render_with_images(&d, &opts(60));
         let joined: String = lines
             .iter()
             .map(|l| l.plain())
@@ -3176,7 +3313,7 @@ mod tests {
                 run(", then x.", RunProps::default()),
             ],
         });
-        let (lines, _m, imgs) = render_with_images(&doc(vec![p]), &opts(60));
+        let (lines, _m, imgs, _mmd) = render_with_images(&doc(vec![p]), &opts(60));
         assert_eq!(imgs.len(), 1, "one inline image");
         let ib = &imgs[0];
         assert_eq!(ib.rid, "rEq");
@@ -3222,7 +3359,7 @@ mod tests {
             framed_para(1081, 2521, vml_img(72, 72)), // ~9% across
             framed_para(8000, 2521, vml_img(72, 72)), // ~65% across, same y
         ]);
-        let (_l, _m, imgs) = render_with_images(&d, &opts(100));
+        let (_l, _m, imgs, _mmd) = render_with_images(&d, &opts(100));
         assert_eq!(imgs.len(), 2, "expected two image regions: {imgs:?}");
         assert_eq!(imgs[0].row, imgs[1].row, "same y should share a row");
         assert_ne!(
@@ -3239,7 +3376,7 @@ mod tests {
             framed_para(1081, 2521, vml_img(72, 72)),
             framed_para(8000, 2521, vml_img(72, 72)),
         ]);
-        let (_l, _m, imgs) = render_with_images(&d, &opts(100));
+        let (_l, _m, imgs, _mmd) = render_with_images(&d, &opts(100));
         assert_eq!(imgs.len(), 2, "expected one placement per image");
         assert!(
             imgs.iter().all(|i| i.rid == "r"),
@@ -3257,7 +3394,7 @@ mod tests {
         let raw = "<w:r><w:drawing><wp:inline><wp:extent cx=\"1905000\" cy=\"952500\"/>\
             <a:blip r:embed=\"rId9\"/></wp:inline></w:drawing></w:r>";
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let (_l, _m, imgs) = render_with_images(&d, &opts(60));
+        let (_l, _m, imgs, _mmd) = render_with_images(&d, &opts(60));
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].rid, "rId9");
     }
@@ -3272,7 +3409,7 @@ mod tests {
             para(vec![run("Graphics", RunProps::default())]),
             framed_para(1081, 9361, vml_img(72, 72)), // a lower image
         ]);
-        let (lines, _m, imgs) = render_with_images(&d, &opts(100));
+        let (lines, _m, imgs, _mmd) = render_with_images(&d, &opts(100));
         let texts: Vec<String> = lines.iter().map(|l| l.plain()).collect();
         let heading = texts
             .iter()
@@ -3308,7 +3445,7 @@ mod tests {
             },
             content: vec![Inline::Raw(vml_img(72, 72))],
         });
-        let (_l, _m, imgs) = render_with_images(&doc(vec![left, right]), &opts(100));
+        let (_l, _m, imgs, _mmd) = render_with_images(&doc(vec![left, right]), &opts(100));
         // The right-aligned image should project to a far-right column.
         let max_c = imgs.iter().map(|i| i.col).max().unwrap_or(0);
         assert!(
@@ -3327,7 +3464,7 @@ mod tests {
             blocks: vec![para(vec![run("boxed text", RunProps::default())])],
         };
         let d = doc(vec![para(vec![tb])]);
-        let (lines, maps, _i) = render_with_images(&d, &opts(40));
+        let (lines, maps, _i, _mmd) = render_with_images(&d, &opts(40));
         let joined: String = lines
             .iter()
             .map(|l| l.plain())
@@ -3356,7 +3493,7 @@ mod tests {
         let raw = "<w:r><w:pict><v:shape id=\"i\" type=\"#t75\" style=\"width:192pt;height:2in\">\
             <v:imagedata r:id=\"rId7\" o:title=\"\"/></v:shape></w:pict></w:r>";
         let d = doc(vec![para(vec![Inline::Raw(raw.to_string())])]);
-        let (_l, _m, imgs) = render_with_images(&d, &opts(60));
+        let (_l, _m, imgs, _mmd) = render_with_images(&d, &opts(60));
         // No explicit stroke → borderless, but reported with rid and caption.
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].rid, "rId7");
@@ -3704,7 +3841,7 @@ mod tests {
         let mut o = opts(50);
         o.page_view = true;
         o.selection = vec![(vec![1], 0, 7)]; // all of paragraph index 1
-        let (lines, _maps, _imgs) = render_with_images(&doc(vec![first, second]), &o);
+        let (lines, _maps, _imgs, _mmd) = render_with_images(&doc(vec![first, second]), &o);
         let hit = lines
             .iter()
             .find(|l| l.plain().contains("pick me"))
@@ -4497,7 +4634,7 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(image_pairs(n), &o, geom, &mut imgs, &pl);
+        paginate(image_pairs(n), &o, geom, &mut imgs, &mut Vec::new(), &pl);
 
         assert!(imgs.len() >= 2, "tall image should be cut across pages");
         assert!(imgs.iter().all(|i| i.rid == "r" && i.full_rows == n));
@@ -4544,7 +4681,7 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(pairs, &o, geom, &mut imgs, &pl);
+        paginate(pairs, &o, geom, &mut imgs, &mut Vec::new(), &pl);
 
         // Kept whole (one slice) rather than cut at the page boundary.
         assert_eq!(imgs.len(), 1, "image should not be split: {imgs:?}");

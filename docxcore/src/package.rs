@@ -231,6 +231,76 @@ impl Package {
         Some(part_name)
     }
 
+    /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
+    /// wiring up `[Content_Types].xml` (a `Default` for `<ext>`, added if not
+    /// already declared) and a `document.xml.rels` relationship of type
+    /// `.../relationships/image`. Returns the new relationship id (`rId…`), for
+    /// use in a `<a:blip r:embed="…">`. Mirrors [`Package::create_hf`]'s
+    /// add-part idiom (unused part name, `.rels` append via `next_rid`,
+    /// `[Content_Types].xml` append).
+    pub(crate) fn add_media_part(&mut self, bytes: &[u8], ext: &str) -> String {
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+        // Unused word/media/imageN.<ext> part name — N unique across ALL media
+        // parts regardless of extension, so a PNG + SVG pair minted together
+        // (the mermaid embed case) never collide on the same N.
+        let mut max_n = 0u32;
+        for (name, _) in &self.parts {
+            if let Some(rest) = name.strip_prefix("word/media/image") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    max_n = max_n.max(n);
+                }
+            }
+        }
+        let n = max_n + 1;
+        let target = format!("image{n}.{ext}");
+        let part_name = format!("word/media/{target}");
+        self.parts.push((part_name, bytes.to_vec()));
+
+        // Content-type Default for the extension, if not already declared.
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            let marker = format!("Extension=\"{ext}\"");
+            if !ct.contains(&marker) {
+                let content_type = match ext {
+                    "svg" => "image/svg+xml".to_string(),
+                    other => format!("image/{other}"),
+                };
+                let default =
+                    format!("<Default Extension=\"{ext}\" ContentType=\"{content_type}\"/>");
+                let new_ct = ct.replacen("</Types>", &format!("{default}</Types>"), 1);
+                self.set_part("[Content_Types].xml", new_ct.into_bytes());
+            }
+        }
+
+        // Image relationship in document.xml.rels. If the part is missing
+        // entirely (unusual, but not guaranteed present), create a minimal
+        // valid one first — otherwise the `replacen` below is a no-op against
+        // an empty string, `set_part` fails to find the part to update, and
+        // the returned rId would be a dangling `r:embed` reference.
+        const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let rels_name = "word/_rels/document.xml.rels";
+        if self.part(rels_name).is_none() {
+            let empty = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+                 <Relationships xmlns=\"{RELS_NS}\"></Relationships>"
+            );
+            self.parts.push((rels_name.to_string(), empty.into_bytes()));
+        }
+        let rels_xml = self
+            .part(rels_name)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let rid = next_rid(&rels_xml);
+        let rel =
+            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/image\" Target=\"media/{target}\"/>");
+        let new_rels = rels_xml.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
+        self.set_part(rels_name, new_rels.into_bytes());
+
+        rid
+    }
+
     /// Page size/margins from the captured (final) `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
         crate::model::PageGeom::from_sect_pr(&self.sect_pr)
@@ -319,20 +389,21 @@ impl Package {
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
     /// its `numId`, creating the part + relationship + content-type if absent. Used
     /// by the Bullets/Numbering ribbon commands so applied lists render and save.
+    ///
+    /// Defines all 9 indent levels (`ilvl` 0..9, [`markdown_list_levels`]) — the
+    /// same set [`new_markdown_package`] defines for a fresh markdown package —
+    /// not just `ilvl=0`. A nested Markdown list (`- a\n  - b`) spliced into an
+    /// *existing* package via this call references `ilvl=1`, `2`, etc.; with only
+    /// `ilvl=0` defined, [`crate::numbering::Numbering::marker`] falls back to a
+    /// stray decimal marker (or Word shows no marker at all) for any nested item.
     pub fn ensure_list(&mut self, bullet: bool) -> i32 {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         // Reserved high ids, unlikely to collide with a document's own lists.
-        let (num_id, abs_id, fmt, text) = if bullet {
-            (9990, 9990, "bullet", "•")
-        } else {
-            (9991, 9991, "decimal", "%1.")
-        };
-        let abstract_xml = format!(
-            "<w:abstractNum w:abstractNumId=\"{abs_id}\"><w:lvl w:ilvl=\"0\">\
-             <w:start w:val=\"1\"/><w:numFmt w:val=\"{fmt}\"/><w:lvlText w:val=\"{text}\"/>\
-             <w:lvlJc w:val=\"left\"/></w:lvl></w:abstractNum>"
-        );
+        let (num_id, abs_id) = if bullet { (9990, 9990) } else { (9991, 9991) };
+        let levels = markdown_list_levels(bullet);
+        let abstract_xml =
+            format!("<w:abstractNum w:abstractNumId=\"{abs_id}\">{levels}</w:abstractNum>");
         let num_xml =
             format!("<w:num w:numId=\"{num_id}\"><w:abstractNumId w:val=\"{abs_id}\"/></w:num>");
         let name = "word/numbering.xml";
@@ -391,6 +462,132 @@ impl Package {
         }
         num_id
     }
+
+    /// Ensure `styles.xml` defines each style id in `ids` that Markdown-sourced
+    /// content might reference (`HeadingN` for `N` in `1..=6`, `Quote`,
+    /// `SourceCode`, `Code` — the exact set [`markdown_styles_xml`] defines for
+    /// a fresh markdown package; any other id is silently ignored). Strictly
+    /// additive, mirroring [`Package::ensure_list`]'s idiom: a style id already
+    /// defined in the package — e.g. a third-party document's own `Heading1` —
+    /// is left byte-untouched; only ids genuinely ABSENT from `styles.xml` get
+    /// a definition appended. Creates the part from scratch in the (practically
+    /// unreachable, since `new_package`/`load_package` always carry one)
+    /// case a package has no `styles.xml` at all.
+    ///
+    /// Without this, a `<w:pStyle w:val="HeadingN"/>` (or `Quote`/`SourceCode`)
+    /// referencing a style the target package never defined renders as plain
+    /// Normal text in Word — the same problem [`markdown_styles_xml`]'s doc
+    /// comment describes for a *fresh* markdown package, here fixed for
+    /// splicing into an *existing* one.
+    pub fn ensure_styles(&mut self, ids: &[&str]) {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let name = "word/styles.xml";
+        let existing = self
+            .part(name)
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let mut additions = String::new();
+        for &id in ids {
+            let marker = format!("w:styleId=\"{id}\"");
+            let already_present = existing.as_deref().is_some_and(|xml| xml.contains(&marker))
+                || additions.contains(&marker);
+            if already_present {
+                continue;
+            }
+            if let Some(def) = markdown_style_def(id) {
+                additions.push_str(&def);
+            }
+        }
+        if additions.is_empty() {
+            return; // every requested id was already defined (or unknown)
+        }
+        match existing {
+            Some(xml) => {
+                let xml = xml.replacen("</w:styles>", &format!("{additions}</w:styles>"), 1);
+                self.set_part(name, xml.into_bytes());
+            }
+            None => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                     <w:styles xmlns:w=\"{W_NS}\">{additions}</w:styles>"
+                );
+                self.parts.push((name.to_string(), body.into_bytes()));
+            }
+        }
+    }
+}
+
+/// The `<w:style>` XML definition for one of the styles Markdown maps onto
+/// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`), or `None`
+/// for any other id. Shared by [`markdown_styles_xml`] (which defines the full
+/// set for a fresh markdown package) and [`Package::ensure_styles`] (which
+/// defines only the ids actually referenced, for an existing package), so the
+/// two can never drift apart.
+fn markdown_style_def(id: &str) -> Option<String> {
+    if let Some(n) = id
+        .strip_prefix("Heading")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if !(1..=6).contains(&n) {
+            return None;
+        }
+        // Heading sizes in half-points (H1..H6), decreasing.
+        let sizes = [36u32, 32, 28, 26, 24, 22];
+        let sz = sizes[n - 1];
+        let idx = n - 1;
+        return Some(format!(
+            "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\">\
+             <w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:next w:val=\"Normal\"/>\
+             <w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"60\"/>\
+             <w:outlineLvl w:val=\"{idx}\"/></w:pPr>\
+             <w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>"
+        ));
+    }
+    match id {
+        "Quote" => Some(
+            "<w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/>\
+             <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
+             <w:pPr><w:ind w:left=\"720\"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        "SourceCode" => Some(
+            "<w:style w:type=\"paragraph\" w:styleId=\"SourceCode\">\
+             <w:name w:val=\"Source Code\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:next w:val=\"Normal\"/>\
+             <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        "Code" => Some(
+            "<w:style w:type=\"character\" w:styleId=\"Code\"><w:name w:val=\"Code\"/>\
+             <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// The concatenated `<w:lvl>` XML for all 9 indent levels (`ilvl` 0..9) of a
+/// bullet or decimal list — the depth Markdown lists can nest to. Shared by
+/// [`new_markdown_package`] (defines the full set for a fresh markdown
+/// package) and [`Package::ensure_list`] (defines the same set when splicing
+/// into an existing package), so the two list definitions can never drift
+/// apart — mirrors [`markdown_style_def`]'s role for styles.
+fn markdown_list_levels(bullet: bool) -> String {
+    let mut out = String::new();
+    for lvl in 0..9 {
+        if bullet {
+            out.push_str(&format!(
+                "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
+            ));
+        } else {
+            out.push_str(&format!(
+                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>\
+                 <w:lvlText w:val=\"%{}.\"/></w:lvl>",
+                lvl + 1
+            ));
+        }
+    }
+    out
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
@@ -519,17 +716,8 @@ pub fn new_markdown_package(document: Document) -> Package {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     let mut pkg = new_package(document);
 
-    let mut bullets = String::new();
-    let mut decimals = String::new();
-    for lvl in 0..9 {
-        bullets.push_str(&format!(
-            "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
-        ));
-        decimals.push_str(&format!(
-            "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%{}.\"/></w:lvl>",
-            lvl + 1
-        ));
-    }
+    let bullets = markdown_list_levels(true);
+    let decimals = markdown_list_levels(false);
     let numbering = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:numbering xmlns:w=\"{W}\">\
@@ -580,20 +768,17 @@ pub fn new_markdown_package(document: Document) -> Package {
 /// style. Word recognizes the headings by their `styleId`/`name`.
 fn markdown_styles_xml() -> String {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    // Heading sizes in half-points (H1..H6), decreasing.
-    let sizes = [36u32, 32, 28, 26, 24, 22];
+    // Heads/Quote/SourceCode/Code definitions come from `markdown_style_def`,
+    // the single source of truth also used by `Package::ensure_styles` — so a
+    // fresh markdown package and a splice into an existing one can never
+    // define these styles differently.
     let mut heads = String::new();
-    for (idx, sz) in sizes.iter().enumerate() {
-        let n = idx + 1;
-        heads.push_str(&format!(
-            "<w:style w:type=\"paragraph\" w:styleId=\"Heading{n}\">\
-             <w:name w:val=\"heading {n}\"/><w:basedOn w:val=\"Normal\"/>\
-             <w:next w:val=\"Normal\"/>\
-             <w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"60\"/>\
-             <w:outlineLvl w:val=\"{idx}\"/></w:pPr>\
-             <w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>"
-        ));
+    for n in 1..=6 {
+        heads.push_str(&markdown_style_def(&format!("Heading{n}")).unwrap());
     }
+    let quote = markdown_style_def("Quote").unwrap();
+    let source_code = markdown_style_def("SourceCode").unwrap();
+    let code = markdown_style_def("Code").unwrap();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:styles xmlns:w=\"{W}\">\
@@ -606,15 +791,9 @@ fn markdown_styles_xml() -> String {
          <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
          <w:rPr><w:b/><w:sz w:val=\"56\"/></w:rPr></w:style>\
          {heads}\
-         <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/>\
-         <w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
-         <w:pPr><w:ind w:left=\"720\"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>\
-         <w:style w:type=\"paragraph\" w:styleId=\"SourceCode\">\
-         <w:name w:val=\"Source Code\"/><w:basedOn w:val=\"Normal\"/>\
-         <w:next w:val=\"Normal\"/>\
-         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
-         <w:style w:type=\"character\" w:styleId=\"Code\"><w:name w:val=\"Code\"/>\
-         <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>\
+         {quote}\
+         {source_code}\
+         {code}\
          </w:styles>"
     )
 }
@@ -1008,6 +1187,123 @@ mod tests {
     }
 
     #[test]
+    fn ensure_styles_adds_absent_ids_and_leaves_existing_ones_byte_untouched() {
+        let mut pkg = new_package(Document { body: vec![] });
+        // A third-party Heading1, visibly different from ours (custom name +
+        // color), already defined.
+        let custom_styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style></w:styles>"#;
+        pkg.set_part("word/styles.xml", custom_styles.as_bytes().to_vec());
+
+        pkg.ensure_styles(&["Heading1", "Quote"]);
+
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        // The third-party Heading1 definition is byte-for-byte untouched —
+        // not merged, not replaced, not duplicated.
+        assert!(
+            styles.contains(
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="ThirdPartyHeading"/><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style>"#
+            ),
+            "{styles}"
+        );
+        assert_eq!(
+            styles.matches("w:styleId=\"Heading1\"").count(),
+            1,
+            "ensure_styles must not append a second, competing Heading1: {styles}"
+        );
+        // Quote, genuinely absent, was appended.
+        assert!(styles.contains("w:styleId=\"Quote\""), "{styles}");
+    }
+
+    #[test]
+    fn ensure_styles_is_idempotent_and_ignores_unknown_ids() {
+        let mut pkg = new_package(Document { body: vec![] });
+        pkg.ensure_styles(&["SourceCode", "NotARealStyle"]);
+        pkg.ensure_styles(&["SourceCode"]); // second call: already defined
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert_eq!(
+            styles.matches("w:styleId=\"SourceCode\"").count(),
+            1,
+            "a repeat call must not duplicate the definition: {styles}"
+        );
+        assert!(
+            !styles.contains("NotARealStyle"),
+            "an id outside the Markdown-mapped set must be silently ignored: {styles}"
+        );
+    }
+
+    #[test]
+    fn ensure_list_defines_all_nine_levels_so_nested_items_get_real_markers() {
+        use crate::markdown::from_markdown;
+        use crate::model::Paragraph;
+        use crate::numbering::{compute_markers, parse_numbering_xml};
+
+        // Splice a nested bullet list into a plain, non-markdown-created package
+        // — exactly what `docxy::control::prepare_markdown_blocks` does.
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        let parsed = from_markdown("- a\n  - b");
+        let bullet_id = pkg.ensure_list(true);
+
+        // The numbering part must define ilvl=1 (and beyond), not just ilvl=0 —
+        // Word/`compute_markers` fall back to a plain decimal for an undefined
+        // level, which is the bug this fix closes.
+        let numbering =
+            String::from_utf8_lossy(pkg.part("word/numbering.xml").unwrap()).into_owned();
+        assert!(
+            numbering.contains("w:ilvl=\"1\""),
+            "ensure_list must define ilvl=1 for nested lists: {numbering}"
+        );
+        for lvl in 0..9 {
+            assert!(
+                numbering.contains(&format!("w:ilvl=\"{lvl}\"")),
+                "missing level {lvl}: {numbering}"
+            );
+        }
+
+        // Remap the parsed blocks' bare markdown numId (1) onto the reserved
+        // ensure_list id, same as `prepare_markdown_blocks` does, then verify
+        // the TUI marker path renders a real bullet — not a stray "1." — for
+        // the nested (ilvl=1) item.
+        let mut body = parsed.body;
+        for b in body.iter_mut() {
+            if let Block::Paragraph(p) = b {
+                if p.props.num_id == Some(1) {
+                    p.props.num_id = Some(bullet_id);
+                }
+            }
+        }
+        let nested_ilvl = body
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) if p.props.num_id == Some(bullet_id) && p.props.ilvl > 0 => {
+                    Some(p.props.ilvl)
+                }
+                _ => None,
+            })
+            .expect("markdown source has a nested (ilvl>0) item");
+        assert_eq!(nested_ilvl, 1);
+
+        let doc = Document { body };
+        let num = parse_numbering_xml(&numbering);
+        let markers = compute_markers(&doc, &num);
+        let nested_marker = doc
+            .body
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| match b {
+                Block::Paragraph(p) if p.props.ilvl == 1 => markers.get(&vec![i]).cloned(),
+                _ => None,
+            })
+            .expect("nested item must get a marker");
+        assert_eq!(
+            nested_marker, "◦",
+            "nested bullet must render its own marker char, not a decimal fallback"
+        );
+    }
+
+    #[test]
     fn markdown_styles_survive_docx_round_trip() {
         use crate::markdown::{from_markdown, to_markdown};
         // Inline code, blockquote, and a fenced code block.
@@ -1124,6 +1420,82 @@ mod tests {
         // And a full round-trip is stable (the preserved wrapper stays put).
         let pkg2 = load_package(&saved).expect("reload");
         assert_eq!(pkg1.document, pkg2.document);
+    }
+
+    #[test]
+    fn add_media_part_avoids_collisions_with_existing_media_and_rids() {
+        let mut pkg = new_package(Document { body: vec![] });
+
+        // Pre-existing media part (image1.png) that must not be overwritten.
+        pkg.parts.push((
+            "word/media/image1.png".to_string(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        ));
+
+        // A document.xml.rels that already carries a relationship using
+        // "rId5" — the new rId must not collide with (or reuse) it.
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/preexisting.png"/></Relationships>"#;
+        pkg.set_part("word/_rels/document.xml.rels", rels.as_bytes().to_vec());
+
+        let existing_rids = ["rId1", "rId5"]; // rId1: new_package's styles rel
+
+        let rid = pkg.add_media_part(&[1, 2, 3], "png");
+
+        // (a) a fresh rId, not reusing any existing one.
+        assert!(
+            !existing_rids.contains(&rid.as_str()),
+            "add_media_part must mint a fresh rId, got reused {rid}"
+        );
+
+        // (b) image1.png untouched; the new part landed at image2.png.
+        assert_eq!(
+            pkg.part("word/media/image1.png"),
+            Some([0xDE, 0xAD, 0xBE, 0xEF].as_slice()),
+            "add_media_part must not overwrite pre-existing media"
+        );
+        assert_eq!(
+            pkg.part("word/media/image2.png"),
+            Some([1u8, 2, 3].as_slice()),
+            "add_media_part must add the new part under the next free name"
+        );
+
+        // (c) the rels part now carries BOTH the old rId5 relationship and
+        // the newly minted one — not one replacing the other.
+        let rels_after =
+            String::from_utf8_lossy(pkg.part("word/_rels/document.xml.rels").unwrap()).into_owned();
+        assert!(
+            rels_after.contains("Id=\"rId5\"") && rels_after.contains("media/preexisting.png"),
+            "pre-existing relationship lost: {rels_after}"
+        );
+        assert!(
+            rels_after.contains(&format!("Id=\"{rid}\""))
+                && rels_after.contains("media/image2.png"),
+            "new relationship missing: {rels_after}"
+        );
+    }
+
+    #[test]
+    fn add_media_part_creates_rels_part_when_absent() {
+        // A package with no word/_rels/document.xml.rels at all (defensive
+        // gap: add_media_part must not silently produce a dangling rId).
+        let mut pkg = new_package(Document { body: vec![] });
+        assert!(pkg.set_part("word/_rels/document.xml.rels", Vec::new())); // sanity: part exists pre-removal
+        pkg.parts
+            .retain(|(n, _)| n != "word/_rels/document.xml.rels");
+        assert!(pkg.part("word/_rels/document.xml.rels").is_none());
+
+        let rid = pkg.add_media_part(&[9, 9, 9], "png");
+
+        let rels = pkg
+            .part("word/_rels/document.xml.rels")
+            .expect("add_media_part must create the rels part if missing");
+        let rels_xml = String::from_utf8_lossy(rels).into_owned();
+        assert!(
+            rels_xml.contains(&format!("Id=\"{rid}\"")) && rels_xml.contains("media/image1.png"),
+            "new relationship missing from freshly-created rels part: {rels_xml}"
+        );
+        assert!(pkg.part("word/media/image1.png").is_some());
     }
 
     #[test]

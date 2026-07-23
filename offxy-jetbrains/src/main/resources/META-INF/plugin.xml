@@ -1,0 +1,74 @@
+<idea-plugin>
+    <id>dev.yeroo.offxy</id>
+    <name>Offxy</name>
+    <vendor url="https://github.com/yeroo/docxy">yeroo</vendor>
+    <description><![CDATA[
+        <p><b>Native Word (.docx) and Excel (.xlsx) editors</b> for JetBrains
+        IDEs &mdash; no webview, no Microsoft Office, no native binaries. The
+        engines are the dependency-free
+        <a href="https://github.com/yeroo/docxy">docxy</a> Rust cores
+        (parse &rarr; render &rarr; edit &rarr; <b>lossless save</b>),
+        compiled to WebAssembly and executed on the JVM by Chicory.</p>
+        <p><b>Word:</b> documents render in a real IDE editor over a live,
+        editable buffer &mdash; native typing speed on any document size,
+        styles/tables/lists/images, guarded document structure, platform
+        find and undo, a formatting toolbar, TOC navigation, and
+        Markdown &harr; docx conversion.</p>
+        <p><b>Excel:</b> a virtualized grid over a windowed viewport
+        protocol &mdash; formulas with live recalculation, a formula bar,
+        number formats, insert/delete rows and columns with reference
+        rewriting, sheets, TSV clipboard, and one-transaction-one-undo.</p>
+        <p><b>AI-assistant ready:</b> every open tab advertises on the
+        <a href="https://github.com/yeroo/docxy/blob/main/docs/agent-control.md">agent
+        control surface</a>, so Claude Code, Junie, or any MCP client can
+        read and edit live documents &mdash; each agent edit is one Ctrl+Z
+        away.</p>
+        <p>Saving preserves everything the editors don't model,
+        byte-for-byte &mdash; your document's structure survives the
+        round-trip.</p>
+    ]]></description>
+    <change-notes><![CDATA[
+        <p>0.1.0 &mdash; initial release: native docx editor (editable
+        IDE buffer over the docxy engine), native xlsx grid editor
+        (formulas, formatting, structural edits), agent control surface
+        for AI assistants.</p>
+    ]]></change-notes>
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Claim docx away from the platform's Native ("open in associated
+             application") type, so double-click opens an editor tab instead
+             of launching Word. -->
+        <fileType name="Offxy Word Document"
+                  implementationClass="dev.yeroo.offxy.editor.DocxFileType"
+                  fieldName="INSTANCE"
+                  extensions="docx"/>
+        <fileEditorProvider implementation="dev.yeroo.offxy.editor.DocxEditorProvider"/>
+        <fileType name="Offxy Excel Workbook"
+                  implementationClass="dev.yeroo.offxy.grid.XlsxFileType"
+                  fieldName="INSTANCE"
+                  extensions="xlsx"/>
+        <fileEditorProvider implementation="dev.yeroo.offxy.grid.XlsxEditorProvider"/>
+    </extensions>
+
+    <actions>
+        <action id="offxy.convertMarkdown"
+                class="dev.yeroo.offxy.actions.ConvertMarkdownAction"
+                text="Convert Markdown to Word (.docx)"
+                description="Convert the selected Markdown file to a Word document">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+        <action id="offxy.exportMarkdown"
+                class="dev.yeroo.offxy.actions.ExportMarkdownAction"
+                text="Offxy: Export to Markdown"
+                description="Export the open Word document to a Markdown file">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="offxy.replace"
+                class="dev.yeroo.offxy.actions.ReplaceAction"
+                text="Offxy: Replace…"
+                description="Replace all occurrences in the open Word document">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

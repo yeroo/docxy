@@ -11,6 +11,276 @@
 //   docx_save(handle)->resultPtr
 // A "result" buffer is [u32 little-endian length][payload bytes].
 
+// ---- mermaid geometry -> inline SVG (Task 7 of the mermaid-flowchart-quality
+// plan) --------------------------------------------------------------------
+// Draws the SAME `DiagramGeometry` (docxcore's `mermaid.rs`) that the Word
+// exporter turns into DrawingML shapes, as an SVG overlay here — so a
+// flowchart looks the same in both places. `geo`'s coordinates are EMU
+// (English Metric Units, 914400 per inch — the OOXML DrawingML unit); the
+// SVG's viewBox uses them directly as user units, and the caller's overlay
+// element (sized in real pixels from the character-grid metrics) scales the
+// whole picture down to screen size. Because the user-unit scale is EMU
+// (values in the hundreds of thousands to millions), every absolute length
+// drawn inside the SVG — stroke width, font size, arrowhead size — must ALSO
+// be chosen in EMU, not small CSS-pixel defaults: a "2px" stroke or "14px"
+// font would shrink to an invisible sub-pixel sliver once the viewBox is
+// scaled down to a roughly one-inch-tall grid cell.
+//
+// `buildMermaidSvg` is pure (no DOM access) and declared at the TOP LEVEL of
+// this script, outside the webview IIFE below — mirroring how
+// `grid.layout.test.mjs` runs `grid.js` unmodified inside a Node `vm` sandbox
+// to reach its behavior (this project has no module system for these webview
+// scripts; they load as plain `<script src=...>` tags, see extension.ts). A
+// top-level `function` declaration in non-strict script code becomes a
+// property of the global object it runs against — `window.buildMermaidSvg` in
+// a real browser tab, or a property of the sandbox object `vm.runInContext`
+// ran the script against in `media/mermaid-svg.test.mjs` — so the test can
+// call it directly without this file needing an export statement.
+const MMD_STROKE = 12700; // 1pt in EMU: node border / edge line width
+const MMD_FONT_NODE = 130000; // ~10.2pt in EMU: node label size
+const MMD_FONT_TITLE = 115000; // subgraph title size
+const MMD_FONT_EDGE = 110000; // edge label size
+const MMD_ARROW = 140000; // arrowhead marker box side, in EMU (userSpaceOnUse)
+
+// Sequence-diagram palette — mirrors docxcore's `mermaid_seq.rs` constants
+// (`PART_FILL`/`PART_STROKE`, `FRAME_FILL`/`FRAME_STROKE`,
+// `NOTE_FILL`/`NOTE_STROKE`, `LINE_STROKE`) exactly, so the webview overlay
+// and the Word DrawingML shapes it mirrors read as the same picture.
+const SEQ_PART_FILL = '#DAE8FC';
+const SEQ_PART_STROKE = '#6C8EBF';
+const SEQ_FRAME_FILL = '#F5F5F5';
+const SEQ_FRAME_STROKE = '#999999';
+const SEQ_NOTE_FILL = '#FFF6D5';
+const SEQ_NOTE_STROKE = '#AAAA33';
+const SEQ_LINE_STROKE = '#333333';
+
+function escMermaidText(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** geo: `DiagramGeometry` JSON (canvasW/canvasH, nodes[], edges[], subgraphs[])
+ *  -> a self-contained `<svg>...</svg>` string. Z-order (back to front, per the
+ *  brief): subgraph bands + titles, then edges, then nodes + their labels,
+ *  then edge labels (drawn last so they sit legibly on top of any edge line
+ *  crossing under them). */
+function buildMermaidSvg(geo) {
+  if (geo.kind === 'sequence') return buildSequenceSvg(geo);
+  const canvasW = geo.canvasW || 0;
+  const canvasH = geo.canvasH || 0;
+  const parts = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${canvasW} ${canvasH}" ` +
+      `width="100%" height="100%" preserveAspectRatio="xMidYMid meet">`
+  );
+  parts.push(
+    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" ' +
+      `markerWidth="${MMD_ARROW}" markerHeight="${MMD_ARROW}" markerUnits="userSpaceOnUse" ` +
+      'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#333333"/></marker></defs>'
+  );
+
+  // Subgraph bands first — background, behind edges and nodes.
+  for (const sg of geo.subgraphs || []) {
+    parts.push(
+      `<rect x="${sg.x}" y="${sg.y}" width="${sg.w}" height="${sg.h}" ` +
+        `rx="${Math.min(sg.w, sg.h) * 0.02}" fill="#F5F5F5" stroke="#999999" stroke-width="${MMD_STROKE}"/>`
+    );
+    if (sg.title) {
+      parts.push(
+        `<text x="${sg.x + MMD_FONT_TITLE * 0.3}" y="${sg.y + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">${escMermaidText(sg.title)}</text>`
+      );
+    }
+  }
+
+  // Edges next — under the nodes they connect. `style` (from the shared
+  // geometry — docxcore's `mermaid.rs` `EdgeStyle`) mirrors the same dotted /
+  // thick line the DrawingML `emit_connector` draws for Word, so the two
+  // renderings agree; `solid` (the default when a geometry omits `style`)
+  // keeps today's plain line untouched.
+  for (const e of geo.edges || []) {
+    const pts = (e.points || []).map((p) => `${p[0]},${p[1]}`).join(' ');
+    const strokeWidth = e.style === 'thick' ? MMD_STROKE * 1.5 : MMD_STROKE;
+    const dash = e.style === 'dotted' ? ' stroke-dasharray="8 6"' : '';
+    parts.push(
+      `<polyline points="${pts}" fill="none" stroke="#333333" ` +
+        `stroke-width="${strokeWidth}"${dash} marker-end="url(#arrow)"/>`
+    );
+  }
+
+  // Nodes on top of edges, each with a centered label.
+  for (const n of geo.nodes || []) {
+    const fill = '#' + (n.fill || 'FFFFFF');
+    const stroke = '#' + (n.stroke || '000000');
+    const textColor = '#' + (n.textColor || '000000');
+    const cx = n.x + n.w / 2;
+    const cy = n.y + n.h / 2;
+    if (n.shape === 'diamond') {
+      const pts = `${cx},${n.y} ${n.x + n.w},${cy} ${cx},${n.y + n.h} ${n.x},${cy}`;
+      parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
+    } else if (n.shape === 'hexagon') {
+      const tip = n.w / 6;
+      const pts =
+        `${n.x + tip},${n.y} ${n.x + n.w - tip},${n.y} ${n.x + n.w},${cy} ` +
+        `${n.x + n.w - tip},${n.y + n.h} ${n.x + tip},${n.y + n.h} ${n.x},${cy}`;
+      parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`);
+    } else if (n.shape === 'ellipse' || n.shape === 'circle') {
+      parts.push(
+        `<ellipse cx="${cx}" cy="${cy}" rx="${n.w / 2}" ry="${n.h / 2}" ` +
+          `fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`
+      );
+    } else {
+      // rect / roundRect (any other/unknown shape tag falls back to a plain rect).
+      const rx = n.shape === 'roundRect' ? Math.min(n.w, n.h) * 0.15 : 0;
+      parts.push(
+        `<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="${rx}" ` +
+          `fill="${fill}" stroke="${stroke}" stroke-width="${MMD_STROKE}"/>`
+      );
+    }
+    parts.push(
+      `<text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="middle" ` +
+        `font-size="${MMD_FONT_NODE}" fill="${textColor}">${escMermaidText(n.label)}</text>`
+    );
+  }
+
+  // Edge labels last, on top of everything, with a white backing rect so an
+  // edge line crossing under a label doesn't visually cut through the text.
+  for (const e of geo.edges || []) {
+    if (!e.label) continue;
+    const pts = e.points || [];
+    const mid = pts[Math.floor(pts.length / 2)] || pts[0] || [0, 0];
+    const w = String(e.label).length * MMD_FONT_EDGE * 0.62 + MMD_FONT_EDGE;
+    const h = MMD_FONT_EDGE * 1.6;
+    parts.push(
+      `<rect x="${mid[0] - w / 2}" y="${mid[1] - h / 2}" width="${w}" height="${h}" fill="#FFFFFF"/>`
+    );
+    parts.push(
+      `<text x="${mid[0]}" y="${mid[1]}" text-anchor="middle" dominant-baseline="middle" ` +
+        `font-size="${MMD_FONT_EDGE}" fill="#333333">${escMermaidText(e.label)}</text>`
+    );
+  }
+
+  parts.push('</svg>');
+  return parts.join('');
+}
+
+/** geo: `SequenceGeometry` JSON (`kind:"sequence"`, canvasW/canvasH,
+ *  participants[], lifelines[], messages[], frames[], notes[]) -> a
+ *  self-contained `<svg>...</svg>` string. Draws the SAME geometry
+ *  docxcore's `mermaid_seq.rs` turns into DrawingML shapes for Word — same
+ *  colors, same z-order (back to front, mirroring `to_drawing`): alt/else
+ *  frame bands + titles + else-dividers, then notes, then participant
+ *  header boxes, then lifelines, then messages + their labels. */
+function buildSequenceSvg(geo) {
+  const canvasW = geo.canvasW || 0;
+  const canvasH = geo.canvasH || 0;
+  const parts = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${canvasW} ${canvasH}" ` +
+      `width="100%" height="100%" preserveAspectRatio="xMidYMid meet">`
+  );
+  parts.push(
+    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" ' +
+      `markerWidth="${MMD_ARROW}" markerHeight="${MMD_ARROW}" markerUnits="userSpaceOnUse" ` +
+      'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#333333"/></marker></defs>'
+  );
+
+  // Frames first — the alt/else band sits behind everything else, with its
+  // title top-left and (when present) a dashed divider + "[else] ..." label
+  // at elseY.
+  for (const f of geo.frames || []) {
+    parts.push(
+      `<rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" ` +
+        `rx="${Math.min(f.w, f.h) * 0.03}" fill="${SEQ_FRAME_FILL}" ` +
+        `stroke="${SEQ_FRAME_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    if (f.label) {
+      parts.push(
+        `<text x="${f.x + MMD_FONT_TITLE * 0.3}" y="${f.y + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">${escMermaidText(f.label)}</text>`
+      );
+    }
+    if (f.elseY != null) {
+      parts.push(
+        `<line x1="${f.x}" y1="${f.elseY}" x2="${f.x + f.w}" y2="${f.elseY}" ` +
+          `stroke="${SEQ_FRAME_STROKE}" stroke-width="${MMD_STROKE}" stroke-dasharray="6 6"/>`
+      );
+      parts.push(
+        `<text x="${f.x + MMD_FONT_TITLE * 0.3}" y="${f.elseY + MMD_FONT_TITLE * 1.3}" ` +
+          `font-size="${MMD_FONT_TITLE}" fill="#333333">[else] ${escMermaidText(f.elseLabel)}</text>`
+      );
+    }
+  }
+
+  // Notes next — a distinctly-filled box, centered text.
+  for (const n of geo.notes || []) {
+    parts.push(
+      `<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" ` +
+        `fill="${SEQ_NOTE_FILL}" stroke="${SEQ_NOTE_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    parts.push(
+      `<text x="${n.x + n.w / 2}" y="${n.y + n.h / 2}" text-anchor="middle" ` +
+        `dominant-baseline="middle" font-size="${MMD_FONT_NODE}" fill="#333333">` +
+        `${escMermaidText(n.text)}</text>`
+    );
+  }
+
+  // Participant header boxes on top of the frame/note bands.
+  for (const p of geo.participants || []) {
+    parts.push(
+      `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" ` +
+        `fill="${SEQ_PART_FILL}" stroke="${SEQ_PART_STROKE}" stroke-width="${MMD_STROKE}"/>`
+    );
+    parts.push(
+      `<text x="${p.x + p.w / 2}" y="${p.y + p.h / 2}" text-anchor="middle" ` +
+        `dominant-baseline="middle" font-size="${MMD_FONT_NODE}" fill="#000000">` +
+        `${escMermaidText(p.label)}</text>`
+    );
+  }
+
+  // Lifelines drop from each participant box; dashed, like Word's.
+  for (const l of geo.lifelines || []) {
+    parts.push(
+      `<line x1="${l.x}" y1="${l.y1}" x2="${l.x}" y2="${l.y2}" ` +
+        `stroke="${SEQ_LINE_STROKE}" stroke-width="${MMD_STROKE}" stroke-dasharray="6 6"/>`
+    );
+  }
+
+  // Messages last, on top: a straight arrow between lifelines, or — for a
+  // self-message — a small rectangular loop out and back to the same
+  // lifeline (mirrors `mermaid_seq.rs`'s `emit_message`). Its label sits
+  // just above the line/loop.
+  for (const m of geo.messages || []) {
+    const dash = m.dashed ? ' stroke-dasharray="6 6"' : '';
+    if (m.self) {
+      const pts = `${m.x1},${m.y1} ${m.x2},${m.y1} ${m.x2},${m.y2} ${m.x1},${m.y2}`;
+      parts.push(
+        `<polyline points="${pts}" fill="none" stroke="${SEQ_LINE_STROKE}" ` +
+          `stroke-width="${MMD_STROKE}"${dash} marker-end="url(#arrow)"/>`
+      );
+    } else {
+      parts.push(
+        `<line x1="${m.x1}" y1="${m.y1}" x2="${m.x2}" y2="${m.y2}" ` +
+          `stroke="${SEQ_LINE_STROKE}" stroke-width="${MMD_STROKE}"${dash} marker-end="url(#arrow)"/>`
+      );
+    }
+    if (m.text) {
+      const cx = (m.x1 + m.x2) / 2;
+      const cy = Math.min(m.y1, m.y2);
+      parts.push(
+        `<text x="${cx}" y="${cy - MMD_FONT_EDGE * 0.4}" text-anchor="middle" ` +
+          `font-size="${MMD_FONT_EDGE}" fill="#333333">${escMermaidText(m.text)}</text>`
+      );
+    }
+  }
+
+  parts.push('</svg>');
+  return parts.join('');
+}
+
 (function () {
   const vscode = acquireVsCodeApi();
   const docEl = document.getElementById('doc');
@@ -22,8 +292,48 @@
   let lastView = { lines: [], caret: { line: 0, col: 0 }, selection: 0 };
   let metrics = { charW: 8, lineH: 18 };
 
+  // `mermaid.min.js` is loaded as a plain global UMD `<script>` tag BEFORE
+  // this one, ONLY for this editor (extension.ts's `hasMermaid` gate skips it
+  // for grid.js) — so `mermaid` is a bare global, never an import. `typeof
+  // mermaid` is safe even when the script never loaded: the grid editor, and
+  // this file running unmodified inside mermaid-svg.test.mjs's `vm` sandbox
+  // (see that test's header comment) both hit this line with no `mermaid`
+  // global defined, and `typeof` never throws on an undeclared identifier.
+  const MERMAID = typeof mermaid !== 'undefined' ? mermaid : null;
+  if (MERMAID) {
+    MERMAID.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: 'default',
+      flowchart: { useMaxWidth: false },
+      sequence: { useMaxWidth: false },
+    });
+  }
+
   const enc = new TextEncoder();
   const dec = new TextDecoder();
+
+  // The markdown editor (`.md` files) reuses this same webview; the provider
+  // flags it via `window.__OFFXY__.markdown` so the UI can constrain itself to
+  // what Markdown can actually represent (toolbar + op guard) and re-skin literal
+  // task-list text for display (checkboxes) — see buildToolbar(), userCmd(), and
+  // mdCheckbox() below.
+  const MD_MODE = !!(window.__OFFXY__ && window.__OFFXY__.markdown);
+
+  // Ops Markdown's own syntax has no way to represent, so a save silently drops
+  // them. ONE source of truth, gating BOTH the toolbar (buildToolbar filters its
+  // button list against this) and every path that can still invoke an op with
+  // the toolbar hidden — keybindings (onKeydown) and the command-palette
+  // `command` message (both route through userCmd(), the single choke point
+  // guarded below). `align\tjustify` has no toolbar button at all (only a
+  // command-palette entry, offxy.alignJustify) but is just as unrepresentable
+  // in Markdown as left/center/right, so it's included here even though it was
+  // never in the toolbar's button list.
+  const MD_HIDDEN_OPS = new Set([
+    'underline',
+    'align\tleft', 'align\tcenter', 'align\tright', 'align\tjustify',
+    'fontsize\t-2', 'fontsize\t2',
+  ]);
 
   // ---- wasm marshalling ----------------------------------------------------
   const mem = () => new Uint8Array(ex.memory.buffer);
@@ -50,6 +360,7 @@
   function openBytes(u8) {
     if (handle) ex.docx_close(handle);
     mediaCache.clear();
+    mmdCache.clear();
     if (u8.length === 0) {
       handle = 0;
       showEmptyState();
@@ -97,6 +408,29 @@
   function saveBytes() {
     return readResult(ex.docx_save(handle));
   }
+  /** Like `saveBytes()`, but routes through `docx_save_with_mermaid_images` —
+   *  three independent host-written buffers (the JSON descriptor string plus
+   *  the two concatenated image blobs), matching `docxwasm/src/lib.rs`'s
+   *  three-ptr/len-pair C-ABI export. Each buffer is written/freed
+   *  separately; wasm memory may grow between allocations (`writeBytes`
+   *  already accounts for that per-call by re-fetching its view after
+   *  `docx_alloc`, see its own comment above). */
+  function saveBytesWithMermaidImages(json, pngBlob, svgBlob) {
+    const jsonBytes = enc.encode(json);
+    const jsonPtr = writeBytes(jsonBytes);
+    const pngPtr = writeBytes(pngBlob);
+    const svgPtr = writeBytes(svgBlob);
+    const r = ex.docx_save_with_mermaid_images(
+      handle,
+      jsonPtr, jsonBytes.length,
+      pngPtr, pngBlob.length,
+      svgPtr, svgBlob.length
+    );
+    ex.docx_free(jsonPtr, jsonBytes.length);
+    ex.docx_free(pngPtr, pngBlob.length);
+    ex.docx_free(svgPtr, svgBlob.length);
+    return readResult(r);
+  }
   function mediaBytes(rid) {
     const u8 = enc.encode(rid);
     const p = writeBytes(u8);
@@ -126,6 +460,364 @@
     const uri = mime ? `data:${mime};base64,${bytesToBase64(bytes)}` : null;
     mediaCache.set(rid, uri);
     return uri;
+  }
+
+  let mmdEls = [];
+  // Rendered-svg cache, keyed by the diagram's raw mermaid `source` text — a
+  // paint that doesn't change a diagram's text (e.g. typing in an unrelated
+  // paragraph) reuses the already-rendered svg instead of re-invoking
+  // MERMAID.render() (an async DOM-touching call) on every keystroke.
+  const mmdCache = new Map();
+  // Bumped on every paintMermaid() call; a render Promise from a paint that's
+  // since been superseded checks this before touching the DOM, so a burst of
+  // edits can't let an old render land after a newer one already painted.
+  let mmdVersion = 0;
+  // MERMAID.render(id, ...) needs a fresh id each call (v10 briefly inserts a
+  // measuring element under it) — a running counter, not the box index, so
+  // two diagrams sharing an index across repaints (or the same box rendering
+  // twice — cache miss then a later source edit) never collide.
+  let mmdRenderSeq = 0;
+
+  /** Parse a rendered mermaid `<svg ...>` string's natural pixel size from its
+   *  width/height attributes, falling back to its viewBox — v10's `render()`
+   *  always emits one or the other. Returns {w:0,h:0} if neither parses
+   *  (defensive; not expected in practice), letting the caller fall back to
+   *  the reserved cell width instead of collapsing to nothing. */
+  function svgNaturalSize(svg) {
+    const attr = (name) => {
+      const m = new RegExp(`${name}="([\\d.]+)(?:px)?"`).exec(svg);
+      return m ? parseFloat(m[1]) : null;
+    };
+    let w = attr('width');
+    let h = attr('height');
+    if (w == null || h == null) {
+      const vb = /viewBox="[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)"/.exec(svg);
+      if (vb) {
+        if (w == null) w = parseFloat(vb[1]);
+        if (h == null) h = parseFloat(vb[2]);
+      }
+    }
+    return { w: w || 0, h: h || 0 };
+  }
+
+  /** Fill `el` with a REAL rendered-mermaid `svg` string, sized to the
+   *  diagram's own natural aspect ratio and capped to `contentW` — real
+   *  Mermaid output is laid out for its own content, not the `cols x rows`
+   *  text-box cell the wasm side reserved for it, so (per the brief) this is
+   *  deliberately NOT clamped into that cell box; a diagram taller than its
+   *  cell is allowed to be tall, scrolling internally past a generous cap
+   *  instead of being squashed or spilling unbounded over following lines. */
+  function paintMermaidSvgInto(el, svg, contentW) {
+    el.innerHTML = svg;
+    const { w, h } = svgNaturalSize(svg);
+    const displayW = w > 0 ? Math.min(w, contentW) : contentW;
+    const scale = w > 0 ? displayW / w : 1;
+    el.style.width = displayW + 'px';
+    el.style.height = h > 0 ? h * scale + 'px' : '';
+    el.style.maxHeight = '80vh';
+    el.style.overflow = 'auto';
+    // Mermaid v10 (initialized with useMaxWidth:false, see MERMAID.initialize
+    // above) emits the <svg> itself with literal px width/height attributes
+    // sized to its own natural layout — the container div's CSS width/height
+    // (just set above) has no effect on those attributes, so a diagram wider
+    // than contentW would overflow the container with BOTH a horizontal AND a
+    // vertical scrollbar instead of fitting to width. Rescale the actual
+    // injected <svg> node (not just its container) whenever it's wider than
+    // contentW; a diagram that already fits keeps its natural size untouched.
+    if (w > contentW) {
+      const s = el.querySelector('svg');
+      if (s) {
+        s.setAttribute('width', String(displayW));
+        s.setAttribute('height', String(Math.round(h * scale)));
+      }
+    }
+  }
+
+  /** Fill `el` with today's geometry-SVG fallback, sized to the reserved
+   *  `cols x rows` cell — used when real Mermaid is unavailable/erroring, has
+   *  no `source` for this box, or while its render is still in flight. A
+   *  diagram with zero laid-out nodes (the geometry builder found nothing to
+   *  draw) leaves `el` empty, deferring entirely to the label-box text
+   *  fallback already painted underneath by render_with_images's `text_box`. */
+  function fallbackInto(el, mb) {
+    el.style.maxHeight = '';
+    el.style.overflow = '';
+    if (mb.geo && mb.geo.nodes && mb.geo.nodes.length > 0) {
+      el.innerHTML = buildMermaidSvg(mb.geo);
+      el.style.width = mb.cols * metrics.charW + 'px';
+      el.style.height = mb.rows * metrics.lineH + 'px';
+    } else {
+      el.innerHTML = '';
+      el.style.width = '0px';
+      el.style.height = '0px';
+    }
+  }
+
+  /** `MERMAID.render(id, source)` (v10) creates its own temporary sandbox
+   *  element — `<div id="d"+id>` — appended straight to `document.body` while
+   *  it measures text, and on a REJECTED render (unsupported/garbage source)
+   *  leaves that div (holding mermaid's own "error" svg) attached permanently
+   *  instead of cleaning it up itself. Called after EVERY render attempt,
+   *  resolved or rejected, so neither path leaks a body child. Also tries the
+   *  id with no `d` prefix, defensively, in case a mermaid version/config ever
+   *  names the sandbox element differently. */
+  function removeMermaidStray(id) {
+    const withPrefix = document.getElementById('d' + id);
+    if (withPrefix) withPrefix.remove();
+    const bare = document.getElementById(id);
+    if (bare) bare.remove();
+  }
+
+  /** Get `source`'s rendered mermaid svg, from the cache if present, else
+   *  invoke `MERMAID.render()` and populate the cache — the single render
+   *  path `paintMermaid()` (the interactive live-preview repaint) and
+   *  `buildMermaidImageSave()` (the Task-3 save-time rasterization below)
+   *  both go through, so a diagram rendered once for the preview is never
+   *  re-rendered again just to embed it on save. Resolves to the cached/
+   *  fresh svg string, or `null` for a known- or newly-failed source (the
+   *  same `null` sentinel `mmdCache` already uses) — never rejects, so a
+   *  caller can `await` it unconditionally. No-op / immediately `null` when
+   *  mermaid.js itself isn't loaded (`MERMAID` is null). */
+  function ensureMermaidRendered(source) {
+    if (mmdCache.has(source)) return Promise.resolve(mmdCache.get(source));
+    if (!MERMAID) return Promise.resolve(null);
+    const id = 'mmd-' + ++mmdRenderSeq;
+    return MERMAID.render(id, source)
+      .then(({ svg }) => {
+        removeMermaidStray(id);
+        mmdCache.set(source, svg);
+        return svg;
+      })
+      .catch(() => {
+        removeMermaidStray(id);
+        mmdCache.set(source, null);
+        return null;
+      });
+  }
+
+  /** Overlay each mermaid diagram over its reserved grid box (same col/row ->
+   *  px math paintImages() uses: PAD_L/PAD_T + metrics). Prefers a REAL
+   *  mermaid.js render of `mb.source` (Task 3 of the mermaid-live-render
+   *  plan); falls back to `buildMermaidSvg(mb.geo)` — today's geometry-mirror
+   *  SVG — whenever mermaid isn't available, the box has no `source`, or the
+   *  real render rejects. Render is async (`MERMAID.render` returns a
+   *  Promise), so a box's element is appended up front holding the fallback
+   *  as an interim, then swapped in place for the real svg on resolve — see
+   *  mmdVersion/mmdCache above for the staleness guard and the render cache. */
+  function paintMermaid() {
+    for (const el of mmdEls) el.remove();
+    mmdEls = [];
+    const myVersion = ++mmdVersion;
+    for (const mb of lastView.mermaid || []) {
+      const left = PAD_L + mb.col * metrics.charW;
+      const top = PAD_T + mb.row * metrics.lineH;
+      const contentW = Math.max(200, docEl.clientWidth - left - PAD_L);
+      const el = document.createElement('div');
+      el.className = 'docimg'; // reuses the image overlay's position:absolute
+                                // + pointer-events:none rule — no new CSS needed.
+      el.style.left = left + 'px';
+      el.style.top = top + 'px';
+      docEl.appendChild(el);
+      mmdEls.push(el);
+
+      if (!MERMAID || !mb.source) {
+        fallbackInto(el, mb);
+        continue;
+      }
+      // `mmdCache.has()` — not just a truthy check on the value — because a
+      // previously-FAILED source is cached too, as the `null` sentinel (see
+      // the `.catch()` below): a plain `if (cached)` would read that `null`
+      // as "not cached" and re-invoke MERMAID.render() on the same known-bad
+      // source on every single paint (every keystroke), leaking another
+      // stray document.body div each time.
+      if (mmdCache.has(mb.source)) {
+        const cached = mmdCache.get(mb.source);
+        if (cached === null) {
+          fallbackInto(el, mb); // known-bad source: skip re-render entirely
+        } else {
+          paintMermaidSvgInto(el, cached, contentW);
+        }
+        continue;
+      }
+      fallbackInto(el, mb); // interim, while the real render is in flight
+      ensureMermaidRendered(mb.source).then((svg) => {
+        if (myVersion !== mmdVersion) return; // a newer paint superseded this one
+        // `svg === null` means a freshly-failed render (the same `null`
+        // cache sentinel as the already-cached branch above) — `el` already
+        // holds fallbackInto()'s interim result, so there's nothing more to
+        // do; a real svg swaps it in.
+        if (svg != null) paintMermaidSvgInto(el, svg, contentW);
+      });
+    }
+  }
+
+  // ---- mermaid PNG rasterization + embedded save (Task 3 of the mermaid
+  // .docx image-embed plan) --------------------------------------------------
+  // On save, each live-rendered mermaid SVG (the same one `paintMermaid()`
+  // shows on screen, via `ensureMermaidRendered`'s shared cache) is rasterized
+  // to a PNG here and handed to `docx_save_with_mermaid_images` so the saved
+  // `.docx` carries a real Word picture instead of the editable-shape
+  // fallback — see `docxcore::mermaid_embed` (Task 1) and
+  // `Session::save_with_mermaid_images` (Task 2). The on-screen document
+  // itself is untouched by this: the engine embeds into a clone of the
+  // package at save time, so the webview keeps rendering/editing the
+  // `SmartArt` shapes exactly as before.
+  const MMD_PNG_SCALE = 2; // rasterize at ~2x natural px so Word shows a crisp (not blurry) image
+
+  /** EMU (English Metric Units, 914400/inch — the DrawingML unit `wEmu`/
+   *  `hEmu` are in) from a CSS/device pixel size, assuming the standard 96px
+   *  = 1in mapping the rest of this file's DrawingML-emitting code (`MMD_*`
+   *  constants, `buildMermaidSvg`) already uses. */
+  function pxToEmu(px) {
+    return Math.round((px / 96) * 914400);
+  }
+
+  /** `svgString` -> base64 `data:image/svg+xml` URI (the UTF-8 bytes,
+   *  base64-encoded — reuses the same `enc`/`bytesToBase64` helpers the
+   *  media-loading path above already relies on, so this needs no new
+   *  encoding logic). */
+  function svgDataUri(svgString) {
+    return 'data:image/svg+xml;base64,' + bytesToBase64(enc.encode(svgString));
+  }
+
+  /** Rasterize a rendered mermaid `svgString` to PNG bytes. `wPx`/`hPx` are
+   *  the diagram's own NATURAL pixel size (from `svgNaturalSize()`, not the
+   *  reserved `cols x rows` grid cell) — the canvas backing store is sized to
+   *  `wPx*scale x hPx*scale` (`MMD_PNG_SCALE`), so Word/a high-DPI screen
+   *  shows a crisp image rather than a 1:1 (blurry, on most displays)
+   *  rasterization. Draws through a real `<canvas>` + `Image` (loaded from a
+   *  base64 SVG data URI, decoded by the browser's own SVG renderer — this
+   *  file writes no SVG-to-raster logic itself) and reads the resulting PNG
+   *  blob back as bytes via `canvas.toBlob` + `Blob.arrayBuffer`. */
+  async function svgToPng(svgString, wPx, hPx) {
+    const img = new Image();
+    const loaded = new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('svgToPng: the rendered SVG failed to load as an <img>'));
+    });
+    img.src = svgDataUri(svgString);
+    await loaded;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(wPx * MMD_PNG_SCALE));
+    canvas.height = Math.max(1, Math.round(hPx * MMD_PNG_SCALE));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise((resolve, reject) => {
+      canvas.toBlob((b) => {
+        if (b) resolve(b);
+        else reject(new Error('svgToPng: canvas.toBlob produced no PNG blob'));
+      }, 'image/png');
+    });
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+
+  /** Concatenate several `Uint8Array`s into one fresh buffer of `totalLen`
+   *  bytes (the caller already knows the total from summing each part's
+   *  `.length`, so this just writes them in order — the flat `png_blob`/
+   *  `svg_blob` wire shape `save_with_mermaid_images` expects). */
+  function concatBytes(parts, totalLen) {
+    const out = new Uint8Array(totalLen);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+    return out;
+  }
+
+  /** Build the `save_with_mermaid_images` call's three inputs from
+   *  `lastView.mermaid`: for every entry with a `source`, get (or render on
+   *  demand via `ensureMermaidRendered`) its mermaid SVG, rasterize a PNG,
+   *  and collect `{source, png, svg, wEmu, hEmu}`. A diagram whose render
+   *  fails (or that has no `source` at all) is simply OMITTED from the
+   *  descriptor — `docxcore::mermaid_embed::embed_images` leaves any
+   *  SmartArt with no matching entry untouched, so that one diagram falls
+   *  back to today's editable shapes while every other diagram still embeds.
+   *
+   *  Returns `null` when there is nothing to embed (no mermaid diagrams at
+   *  all, or every one of them failed to render/rasterize) — the caller
+   *  falls back to the plain `save()` path in that case, exactly as if this
+   *  document had no mermaid diagrams. Otherwise resolves to
+   *  `{json, pngBlob, svgBlob}`, ready for `saveBytesWithMermaidImages`. */
+  async function buildMermaidImageSave() {
+    const list = lastView.mermaid || [];
+    if (list.length === 0) return null;
+
+    const entries = [];
+    for (const mb of list) {
+      if (!mb.source) continue;
+      let svg;
+      try {
+        svg = await ensureMermaidRendered(mb.source);
+      } catch {
+        svg = null; // ensureMermaidRendered itself never rejects, but stay defensive
+      }
+      if (svg == null) continue; // known- or newly-failed render: omit, fallback shapes stay
+
+      const { w, h } = svgNaturalSize(svg);
+      const wPx = w > 0 ? w : mb.cols * metrics.charW;
+      const hPx = h > 0 ? h : mb.rows * metrics.lineH;
+
+      let png;
+      try {
+        png = await svgToPng(svg, wPx, hPx);
+      } catch {
+        continue; // rasterization failed for this one diagram only; others still embed
+      }
+
+      entries.push({
+        source: mb.source,
+        png,
+        svg: enc.encode(svg),
+        wEmu: pxToEmu(wPx),
+        hEmu: pxToEmu(hPx),
+      });
+    }
+    if (entries.length === 0) return null;
+
+    let pngOff = 0;
+    let svgOff = 0;
+    const descriptor = [];
+    const pngParts = [];
+    const svgParts = [];
+    for (const e of entries) {
+      descriptor.push({
+        source: e.source,
+        pngOff, pngLen: e.png.length,
+        svgOff, svgLen: e.svg.length,
+        wEmu: e.wEmu, hEmu: e.hEmu,
+      });
+      pngParts.push(e.png);
+      svgParts.push(e.svg);
+      pngOff += e.png.length;
+      svgOff += e.svg.length;
+    }
+    return {
+      json: JSON.stringify(descriptor),
+      pngBlob: concatBytes(pngParts, pngOff),
+      svgBlob: concatBytes(svgParts, svgOff),
+    };
+  }
+
+  /** The save entry point the `getBytes` host message now calls: routes
+   *  through `save_with_mermaid_images` when the document has at least one
+   *  mermaid diagram that actually rendered/rasterized; otherwise (no
+   *  diagrams, or every one failed) falls back to the plain, unchanged
+   *  `saveBytes()`/`docx_save` path. Any unexpected failure while building
+   *  the image map (a bug in this new code, not a per-diagram render
+   *  failure — those are already handled inside `buildMermaidImageSave`)
+   *  also falls back to the plain save rather than losing the document. */
+  async function buildSaveBytes() {
+    let built = null;
+    try {
+      built = await buildMermaidImageSave();
+    } catch {
+      built = null;
+    }
+    if (built) return saveBytesWithMermaidImages(built.json, built.pngBlob, built.svgBlob);
+    return saveBytes();
   }
 
   let imgEls = [];
@@ -161,36 +853,107 @@
   // ---- painting ------------------------------------------------------------
   const ANSI = (name) => `var(--vscode-terminal-ansi${name})`;
 
+  // Markdown mode, DISPLAY ONLY: a task-list item's model/save text is the
+  // literal `[ ] `/`[x] `/`[X] ` that Markdown's own task-list syntax uses (see
+  // docxcore's markdown.rs — round-tripped verbatim, never escaped). This only
+  // reskins that literal 4-character prefix into a checkbox glyph in the DOM;
+  // it never calls `cmd`/`userCmd`, so the wasm model — and therefore
+  // `docx_save`/`docx_to_md` — still sees `[ ] `/`[x] ` untouched.
+  //
+  // The grid is a strict character grid: caret placement (`col * charW`) and
+  // click/drag hit-testing (`x / charW`) both work in MODEL columns. A naive
+  // text substitution (`"[ ] "` → `"☐ "`) would shrink 4 model columns down to
+  // 2 rendered characters, shifting every caret/click column after it on the
+  // line by ~2 — wrong pointer feedback, even though the model/save stay
+  // correct. `checkboxGlyph()` instead reports the glyph AND the leftover text
+  // separately, and the caller renders the glyph in its own `width:4ch` inline
+  // box (see `paint()` below) — pinning the glyph to exactly the 4 display
+  // columns the 4 model characters `[ ] `/`[x] ` occupy, so every column after
+  // it lines up with the model exactly as it did before the reskin.
+  const MD_CHECKBOX_RE = /^\[( |[xX])\] /;
+  function checkboxGlyph(text) {
+    const m = MD_CHECKBOX_RE.exec(text);
+    if (!m) return null;
+    return { glyph: m[1] === ' ' ? '☐' : '☑', rest: text.slice(4) };
+  }
+
+  /** Style one rendered span element from its wasm view-JSON span object
+   *  (bold/italic/underline/strike/dim/selected/color/link). Shared by the
+   *  plain-span path and the checkbox glyph's two-piece split below, so a
+   *  formatted task-list run (rare, but not impossible) keeps its formatting
+   *  on both the glyph box and the remainder text. */
+  function styleSpan(el, sp) {
+    if (sp.b) el.classList.add('b');
+    if (sp.i) el.classList.add('i');
+    if (sp.u) el.classList.add('u');
+    if (sp.s) el.classList.add('st');
+    if (sp.d) el.classList.add('dim');
+    if (sp.h) el.classList.add('sel');
+    if (sp.c) el.style.color = ANSI(sp.c);
+    if (sp.lnk) {
+      el.classList.add('link');
+      el.dataset.href = sp.lnk;
+    }
+  }
+
   function paint() {
     const frag = document.createDocumentFragment();
     for (const line of lastView.lines) {
       const div = document.createElement('div');
       div.className = 'line';
-      if (line.length === 0) {
+      const spans = line.sp;
+      if (spans.length === 0) {
         div.appendChild(document.createTextNode('​')); // keep empty lines tall
       }
-      for (const sp of line) {
+      // docxcore's render_paragraph always pushes the list marker (bullet glyph
+      // or the equivalent blank-space prefix on a wrapped continuation line) as
+      // its own span BEFORE the paragraph's own content spans, whenever the
+      // paragraph carries a numId — so on a real list-item line (`line.list`,
+      // from the wasm view's per-line flag) the checkbox-eligible text is always
+      // spans[1], never spans[0] (the marker) or anything later in the line.
+      // Scoping to that one index — and only when the line is actually a list
+      // item — is what keeps a coincidental "[ ] " elsewhere in a paragraph (or
+      // in a non-list paragraph entirely) from being misread as a task item.
+      // This "spans[1] is the content" assumption holds for every UI-driven edit
+      // (alignment ops are unreachable in markdown mode, see userCmd()'s guard),
+      // but the agent control surface (`doc.format`/`doc.set-style` with an
+      // align patch) can still reach the model directly and insert a lead span
+      // ahead of the marker — in that case the index no longer lines up with
+      // the checkbox text, and it just renders as the literal `[ ] ` string
+      // instead of the glyph (never corrupting anything, only degrading the
+      // cosmetic reskin back to plain text).
+      const checkboxIdx = MD_MODE && line.list ? 1 : -1;
+      spans.forEach((sp, si) => {
+        const cb = si === checkboxIdx ? checkboxGlyph(sp.t) : null;
+        if (cb) {
+          // Fixed-width box: exactly 4 display columns for the 4 model columns
+          // `[ ] `/`[x] ` occupied, regardless of the glyph's own font width.
+          const marker = document.createElement('span');
+          marker.textContent = cb.glyph;
+          marker.style.display = 'inline-block';
+          marker.style.width = '4ch';
+          marker.style.textAlign = 'left';
+          styleSpan(marker, sp);
+          div.appendChild(marker);
+          const rest = document.createElement('span');
+          rest.textContent = cb.rest;
+          styleSpan(rest, sp);
+          div.appendChild(rest);
+          return;
+        }
         const el = document.createElement('span');
         el.textContent = sp.t;
-        if (sp.b) el.classList.add('b');
-        if (sp.i) el.classList.add('i');
-        if (sp.u) el.classList.add('u');
-        if (sp.s) el.classList.add('st');
-        if (sp.d) el.classList.add('dim');
-        if (sp.h) el.classList.add('sel');
-        if (sp.c) el.style.color = ANSI(sp.c);
-        if (sp.lnk) {
-          el.classList.add('link');
-          el.dataset.href = sp.lnk;
-        }
+        styleSpan(el, sp);
         div.appendChild(el);
-      }
+      });
       frag.appendChild(div);
     }
     docEl.replaceChildren(frag);
     imgEls = []; // replaceChildren removed the old overlays
+    mmdEls = [];
     placeCaret();
     paintImages();
+    paintMermaid();
     updateStatus();
   }
 
@@ -252,8 +1015,20 @@
   ]);
 
   /** Run a user-initiated command and, if it mutates, tell the host so VS Code
-   *  lights the dirty dot and can drive undo/redo. */
+   *  lights the dirty dot and can drive undo/redo.
+   *
+   *  This is the ONE choke point every user-facing entry to a formatting op
+   *  passes through — toolbar buttons (buildToolbar()'s click handler),
+   *  keybindings (onKeydown, e.g. Ctrl+U), and the command-palette `command`
+   *  host message (the `case 'command': userCmd(msg.op)` below) — so the
+   *  Markdown-mode guard here covers all three with no per-surface duplication.
+   *  In markdown mode, an op Markdown can't represent (MD_HIDDEN_OPS — the same
+   *  set buildToolbar() filters the toolbar against) is silently dropped instead
+   *  of reaching the wasm model, so it can never create formatting that would
+   *  vanish unannounced on the next save. Gated on MD_MODE only, so plain .docx
+   *  editing is entirely unaffected. */
   function userCmd(str) {
+    if (MD_MODE && MD_HIDDEN_OPS.has(str)) return;
     cmd(str);
     const op = str.split('\t', 1)[0];
     if (MUTATING.has(op)) {
@@ -365,12 +1140,44 @@
         userCmd(msg.op);
         break;
       case 'getBytes':
-        vscode.postMessage({
-          type: 'bytes',
-          requestId: msg.requestId,
-          data: bytesToBase64(saveBytes()),
+        // `buildSaveBytes()` is async (PNG rasterization awaits an <img> load
+        // + a canvas.toBlob callback) — fire-and-forget here is fine, the
+        // host's `requestBytes()` (extension.ts) already awaits the matching
+        // `requestId` via a Promise, not a synchronous reply.
+        buildSaveBytes().then((bytes) => {
+          vscode.postMessage({
+            type: 'bytes',
+            requestId: msg.requestId,
+            data: bytesToBase64(bytes),
+          });
         });
         break;
+      case 'ctl': {
+        // One agent control verb (docs/agent-control.md), routed through the
+        // same docx_ctl marshalling callBytes() already uses for docx_cmd.
+        // Always post a ctlResult, even on an unexpected throw (a wasm trap,
+        // say) — the host's pending promise for this requestId has no other
+        // way to settle, and silence here would hang the agent's TCP request.
+        let raw;
+        try {
+          raw = dec.decode(callBytes(ex.docx_ctl, enc.encode(msg.payload)));
+        } catch (err) {
+          raw = JSON.stringify({
+            ok: false,
+            error: 'docx_ctl threw: ' + (err && err.message ? err.message : String(err)),
+          });
+        }
+        vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
+        // The host already knows (from its mutating-verb set) whether this
+        // call *could* have changed the document; only repaint if it also
+        // actually succeeded.
+        if (msg.repaint) {
+          let ok = false;
+          try { ok = JSON.parse(raw).ok === true; } catch { /* leave ok false */ }
+          if (ok) render();
+        }
+        break;
+      }
       case 'clipboardText':
         if (pastePending.delete(msg.requestId) && msg.text) {
           userCmd('paste\t' + msg.text);
@@ -400,7 +1207,7 @@
     const bar = document.createElement('div');
     bar.id = 'toolbar';
     const SEP = '|';
-    const buttons = [
+    let buttons = [
       ['B', 'bold', 'Bold', 'tb-b'],
       ['I', 'italic', 'Italic', 'tb-i'],
       ['U', 'underline', 'Underline', 'tb-u'],
@@ -420,6 +1227,25 @@
       ['A−', 'fontsize\t-2', 'Smaller'],
       ['A+', 'fontsize\t2', 'Larger'],
     ];
+    // Markdown mode can't represent underline, alignment, or font size — the
+    // model round-trips through Markdown text, which has no syntax for them.
+    // Bold/italic/strike, headings, and list ops all survive the md<->docx
+    // conversion, so those stay. (userCmd() below enforces the same set as a
+    // no-op guard, so these ops are unreachable even via keybinding/palette —
+    // hiding the button here is about decluttering, not the only defense.)
+    if (MD_MODE) {
+      buttons = buttons.filter((b) => !(b[1] && MD_HIDDEN_OPS.has(b[1])));
+      // Drop separators left leading or doubled-up by the op filter (checked
+      // against the last *kept* button, not the pre-filter array — two whole
+      // groups, align and font size, are adjacent survivors here, so a
+      // position-indexed check would miss the resulting double separator).
+      buttons = buttons.reduce((acc, b) => {
+        if (b[0] === SEP && (acc.length === 0 || acc[acc.length - 1][0] === SEP)) return acc;
+        acc.push(b);
+        return acc;
+      }, []);
+      if (buttons.length && buttons[buttons.length - 1][0] === SEP) buttons.pop();
+    }
     for (const [label, op, title, cls] of buttons) {
       if (label === SEP) {
         const s = document.createElement('span');
@@ -456,7 +1282,33 @@
     window.addEventListener('resize', onResize);
     vscode.postMessage({ type: 'ready' });
   }
-  boot().catch((err) => {
-    docEl.textContent = 'Docxy failed to start: ' + (err && err.message ? err.message : err);
-  });
+  // ---- test-only hooks (Node/jsdom, e.g. mermaid-render.test.mjs) ----------
+  // A real VS Code webview never sets `window.__OFFXY_TEST__`, so this whole
+  // branch is dead there — it exists purely so a jsdom test can drive
+  // `paintMermaid()`/`paintMermaidSvgInto()` directly and inspect their
+  // DOM-leak / failure-cache / sizing behavior, without this file needing an
+  // export statement (mirrors how `buildMermaidSvg` above is reached, just
+  // for state that — unlike that function — lives inside this IIFE's
+  // closure). Skipping `boot()` in that mode too: it fetches a real wasm
+  // binary and would only reject noisily against a test that never supplies
+  // `window.__OFFXY__.wasmUri`, with no bearing on what's under test.
+  if (typeof window !== 'undefined' && window.__OFFXY_TEST__) {
+    window.__OFFXY_TEST__.paintMermaid = paintMermaid;
+    window.__OFFXY_TEST__.paintMermaidSvgInto = paintMermaidSvgInto;
+    window.__OFFXY_TEST__.mmdCache = mmdCache;
+    window.__OFFXY_TEST__.setLastView = (v) => { lastView = v; };
+    window.__OFFXY_TEST__.setMetrics = (m) => { metrics = m; };
+    // Task 3 of the mermaid-docx-image plan (PNG rasterization + embedded
+    // save) — exposed the same way as the hooks above, for
+    // mermaid-embed.test.mjs.
+    window.__OFFXY_TEST__.svgToPng = svgToPng;
+    window.__OFFXY_TEST__.pxToEmu = pxToEmu;
+    window.__OFFXY_TEST__.concatBytes = concatBytes;
+    window.__OFFXY_TEST__.buildMermaidImageSave = buildMermaidImageSave;
+    window.__OFFXY_TEST__.ensureMermaidRendered = ensureMermaidRendered;
+  } else {
+    boot().catch((err) => {
+      docEl.textContent = 'Docxy failed to start: ' + (err && err.message ? err.message : err);
+    });
+  }
 })();

@@ -26,7 +26,7 @@ mod skill;
 use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
-use gridcore::edit::parse_input;
+use gridcore::edit::{input_text_of, parse_input, replace_all_in_sheet};
 use gridcore::engine::Engine;
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
@@ -300,28 +300,7 @@ fn csv_to_pkg(text: &str, sheet_name: &str) -> SheetPackage {
     if !sheet_name.is_empty() {
         sh.name = sheet_name.chars().take(31).collect();
     }
-    for (c, name) in frame.names.iter().enumerate() {
-        sh.set_cell(0, c as u32, Cell::text(name));
-    }
-    for (c, col) in frame.cols.iter().enumerate() {
-        for (r, v) in col.iter().enumerate() {
-            let value = match v {
-                gridcore::formula::Value::Empty => continue,
-                gridcore::formula::Value::Num(n) => CellValue::Number(*n),
-                gridcore::formula::Value::Str(s) => CellValue::Text(s.clone()),
-                gridcore::formula::Value::Bool(b) => CellValue::Bool(*b),
-                gridcore::formula::Value::Err(e) => CellValue::Error(e.code().to_string()),
-            };
-            sh.set_cell(
-                r as u32 + 1,
-                c as u32,
-                Cell {
-                    value,
-                    ..Cell::default()
-                },
-            );
-        }
-    }
+    frame.write_to_sheet(sh);
     pkg
 }
 
@@ -498,22 +477,6 @@ fn parse_a1(s: &str) -> Option<(u32, u32)> {
         return None;
     }
     Some((row - 1, col))
-}
-
-/// The text a cell would show in the formula bar (`=formula`, or the value as
-/// re-entered) — the surface Find/Replace operates on.
-fn input_text_of(cell: &Cell) -> String {
-    if let Some(f) = &cell.formula {
-        format!("={f}")
-    } else {
-        match &cell.value {
-            CellValue::Empty => String::new(),
-            CellValue::Number(n) => gridcore::sheet::fmt_general(*n),
-            CellValue::Text(s) => s.clone(),
-            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            CellValue::Error(e) => e.clone(),
-        }
-    }
 }
 
 /// The author name stamped on new comments — the OS user, else "xlsxy".
@@ -2995,21 +2958,7 @@ impl App {
             self.status = Some("Nothing to find".to_string());
             return;
         }
-        let sheet = self.sheet();
-        let changes: Vec<(u32, u32, Cell)> = sheet
-            .cells
-            .iter()
-            .filter_map(|(&(r, c), cell)| {
-                let text = input_text_of(cell);
-                if text.contains(find) {
-                    let mut newcell = parse_input(&text.replace(find, with));
-                    newcell.style = cell.style;
-                    Some((r, c, newcell))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let changes = replace_all_in_sheet(self.sheet(), find, with);
         let n = changes.len();
         if n == 0 {
             self.status = Some(format!("Not found: {find}"));

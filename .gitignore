@@ -12,3 +12,7 @@
 /sample-output.pdf
 /cli-output.pdf
 /sample-resaved.docx
+# mmcompare: real-mermaid.js-vs-ours visual comparison harness (dev tool,
+# scripts/mmcompare) — rendered PNGs/HTMLs and its own node_modules.
+/scripts/mmcompare/out/
+/scripts/mmcompare/node_modules/

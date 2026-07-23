@@ -13,7 +13,11 @@
   const $ = (id) => document.getElementById(id);
 
   const ROW_H = 22;     // must match grid.css .cell height
-  const HDR_W = 44;     // row-number gutter width
+  const HDR_W = 44;     // row-number gutter width; must match grid.css #cells left
+  const COLHDR_H = 22;  // column-header band height; must match grid.css #colhdr
+                        // height AND #cells top. Numerically equal to ROW_H today,
+                        // but it is a different CSS fact — keep them separate so a
+                        // taller header band can't silently misalign hit-testing.
   const COL_PX = 7.5;   // Excel column-width unit -> px (approximate MDW)
   const OVERSCAN = 5;   // extra rows/cols fetched around the visible window
 
@@ -22,6 +26,7 @@
   let view = null;      // last viewport JSON
   let colX = [0];       // prefix x of each col up to the fetched window's right edge
   let defW = 64;        // default column width in px
+  let lastGridKey = ''; // memo: the geometry the backdrop gridlines were built for
 
   const enc = new TextEncoder();
   const dec = new TextDecoder();
@@ -107,11 +112,66 @@
     const originX = left * defW; // sheet-x of the fetched window's left edge
     const rows = Math.max(view.dims.rows + 50, top + nrows);
     const cols = Math.max(view.dims.cols + 10, left + ncols);
-    $('spacer').style.height = rows * ROW_H + 'px';
-    $('spacer').style.width = cols * defW + 'px';
+    // Scroll extent includes the #cells gutter offset so the last row/column
+    // can scroll fully clear of the sticky headers.
+    $('spacer').style.height = rows * ROW_H + COLHDR_H + 'px';
+    $('spacer').style.width = cols * defW + HDR_W + 'px';
+
+    // Grid backdrop: a border-only tile for every cell in the fetched window,
+    // so the sheet is gridded like Excel across the whole viewport rather than
+    // only where data happens to sit. It's purely geometric (window + column
+    // widths), independent of data/selection, and lives in its own #gridlines
+    // layer beneath #cells — so it rebuilds only when the window scrolls or a
+    // column resizes, NOT on every select/edit repaint (a drag-select would
+    // otherwise churn hundreds of tiles per mousemove). Data cells paint on
+    // top in #cells with the same colX/ROW_H math, so borders line up exactly
+    // even for variable column widths. Bounded by the window, not the sheet.
+    const gridKey = top + ':' + left + ':' + nrows + ':' + ncols + ':' + colX.join(',');
+    if (gridKey !== lastGridKey) {
+      lastGridKey = gridKey;
+      const gf = document.createDocumentFragment();
+      for (let r = top; r < top + nrows; r++) {
+        for (let c = left; c < left + ncols; c++) {
+          const g = document.createElement('div');
+          g.className = 'cell';
+          g.style.top = r * ROW_H + 'px';
+          g.style.left = originX + colX[c - left] + 'px';
+          g.style.width = colWidthPx(c) + 'px';
+          gf.appendChild(g);
+        }
+      }
+      $('gridlines').replaceChildren(gf);
+    }
+
+    const frag = document.createDocumentFragment();
+    // Selection tint + active-cell box go FIRST so they paint UNDER the data
+    // layer: the translucent tint shows through the (transparent) data cells
+    // for a selected-but-not-active cell, while the active-cell box carries an
+    // OPAQUE background that punches the active cell out of the tint — so the
+    // active cell shows the normal cell background and stands out, exactly as
+    // Excel highlights the active cell within a selection (by background, not a
+    // heavier border). Data cells (text, fills) then paint on top and stay
+    // legible over both.
+    const sel = view.sel;
+    const selEl = document.createElement('div');
+    selEl.id = 'selbox';
+    selEl.style.top = sel.r * ROW_H + 'px';
+    selEl.style.left = originX + (colX[sel.c - left] ?? 0) + 'px';
+    selEl.style.height = (sel.r2 - sel.r + 1) * ROW_H + 'px';
+    let wsum = 0;
+    for (let c = sel.c; c <= sel.c2; c++) wsum += colWidthPx(c);
+    selEl.style.width = wsum + 'px';
+    frag.appendChild(selEl);
+    const curEl = document.createElement('div');
+    curEl.id = 'curbox';
+    const curR = rowOfRef(), curC = refCol();
+    curEl.style.top = curR * ROW_H + 'px';
+    curEl.style.left = originX + (colX[curC - left] ?? 0) + 'px';
+    curEl.style.height = ROW_H + 'px';
+    curEl.style.width = colWidthPx(curC) + 'px';
+    frag.appendChild(curEl);
 
     // cells
-    const frag = document.createDocumentFragment();
     for (const cl of view.cells) {
       const el = document.createElement('div');
       el.className = 'cell';
@@ -127,26 +187,6 @@
       el.style.width = colWidthPx(cl.c) + 'px';
       frag.appendChild(el);
     }
-    // selection + active cell boxes
-    const sel = view.sel;
-    const selEl = document.createElement('div');
-    selEl.id = 'selbox';
-    selEl.style.top = sel.r * ROW_H + 'px';
-    selEl.style.left = originX + (colX[sel.c - left] ?? 0) + 'px';
-    selEl.style.height = (sel.r2 - sel.r + 1) * ROW_H + 'px';
-    let wsum = 0;
-    for (let c = sel.c; c <= sel.c2; c++) wsum += colWidthPx(c);
-    selEl.style.width = wsum + 'px';
-    frag.appendChild(selEl);
-    // active-cell outline: a tighter box than the (possibly multi-cell) selEl.
-    const curEl = document.createElement('div');
-    curEl.id = 'curbox';
-    const curR = rowOfRef(), curC = refCol();
-    curEl.style.top = curR * ROW_H + 'px';
-    curEl.style.left = originX + (colX[curC - left] ?? 0) + 'px';
-    curEl.style.height = ROW_H + 'px';
-    curEl.style.width = colWidthPx(curC) + 'px';
-    frag.appendChild(curEl);
     $('cells').replaceChildren(frag);
     // A repaint can land mid-edit (e.g. any select/scroll that fires while the
     // in-cell editor is open). replaceChildren() above would otherwise
@@ -161,6 +201,14 @@
     paintTabs();
     $('cellref').textContent = view.cur.ref;
     if (document.activeElement !== $('fsrc')) $('fsrc').value = view.cur.src;
+    // Toolbar pressed state: mirror the active cell's format (view.cur, set
+    // by the wasm bridge's view_json). Align lights at most one of the three
+    // buttons; 'g' (General) lights none.
+    btnBold?.classList.toggle('on', !!view.cur.bold);
+    btnItalic?.classList.toggle('on', !!view.cur.italic);
+    btnAlignL?.classList.toggle('on', view.cur.align === 'l');
+    btnAlignC?.classList.toggle('on', view.cur.align === 'c');
+    btnAlignR?.classList.toggle('on', view.cur.align === 'r');
     // one-shot error from the wasm side (e.g. an invalid formula on `set`):
     // surface it as a tooltip on the cell reference box and a brief red flash
     // on the formula bar's border.
@@ -288,8 +336,11 @@
   function cellFromEvent(e) {
     const wrap = $('gridwrap');
     const rect = wrap.getBoundingClientRect();
-    const x = e.clientX - rect.left + wrap.scrollLeft;
-    const y = e.clientY - rect.top + wrap.scrollTop;
+    // The cell layer sits one header gutter inside #gridwrap (see grid.css
+    // #cells: top = COLHDR_H, left = HDR_W), so sheet coordinates start that
+    // far into the wrap's content box.
+    const x = e.clientX - rect.left - HDR_W + wrap.scrollLeft;
+    const y = e.clientY - rect.top - COLHDR_H + wrap.scrollTop;
     return { r: Math.max(0, Math.floor(y / ROW_H)), c: colAtX(x) };
   }
   let dragging = false;
@@ -344,10 +395,20 @@
     const wrap = $('gridwrap');
     const r = rowOfRef(), c = refCol();
     const y = r * ROW_H, x = c * defW;
+    // Near edges: a cell at sheet-y `y` sits at content-y `y + COLHDR_H` (the
+    // #cells gutter offset), and the sticky headers cover the first
+    // COLHDR_H/HDR_W of the viewport — the two cancel, so the classic
+    // `y < scrollTop` check still means "hidden under the header band".
+    // Far edges: the gutter does NOT cancel, so the visible span for cells
+    // is clientHeight - COLHDR_H tall (and clientWidth - HDR_W wide).
     if (y < wrap.scrollTop) wrap.scrollTop = y;
-    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = y + ROW_H - wrap.clientHeight;
+    if (y + ROW_H > wrap.scrollTop + wrap.clientHeight - COLHDR_H) {
+      wrap.scrollTop = y + ROW_H + COLHDR_H - wrap.clientHeight;
+    }
     if (x < wrap.scrollLeft) wrap.scrollLeft = x;
-    if (x + defW > wrap.scrollLeft + wrap.clientWidth) wrap.scrollLeft = x + defW - wrap.clientWidth;
+    if (x + defW > wrap.scrollLeft + wrap.clientWidth - HDR_W) {
+      wrap.scrollLeft = x + defW + HDR_W - wrap.clientWidth;
+    }
   }
 
   function onKeydown(e) {
@@ -396,12 +457,22 @@
   }
 
   // ---- editing ---------------------------------------------------------------
-  const MUTATING = /^(set|clear|cut|paste|insrow|delrow|inscol|delcol|sheet\t(add|rename))/;
-  /** Run a user-initiated command and, if it mutates the workbook, tell the
-   *  host so VS Code lights the dirty dot and can drive undo/redo. */
+  /** Run a user-initiated command and, if it ACTUALLY mutated the workbook,
+   *  tell the host so VS Code lights the dirty dot and can drive undo/redo.
+   *  "Actually mutated" is read from the wasm session's own `edits` counter
+   *  (view_json's `edits` field, bumped once per real undo group pushed —
+   *  see gridwasm's `Session::edits`) rather than pattern-matching the verb
+   *  name: a verb-name regex can't tell a dispatched-but-no-op command (e.g.
+   *  `autosum` with nothing to sum, `cut`/`clear` over an already-blank
+   *  selection) from one that really changed the workbook, and posting
+   *  `edit` for a no-op desyncs the host's undo stack — its next Ctrl+Z pops
+   *  an unrelated prior edit instead of doing nothing. Comparing the counter
+   *  before/after is exact for every verb, including future ones, with no
+   *  regex to keep in sync. */
   function userCmd(str) {
+    const editsBefore = view ? view.edits : 0;
     cmd(str);
-    if (MUTATING.test(str)) vscode.postMessage({ type: 'edit' });
+    if (view && view.edits > editsBefore) vscode.postMessage({ type: 'edit' });
   }
 
   let editEl = null;
@@ -481,7 +552,7 @@
   // chrome's elements are all `position: absolute`, so within body's stacking
   // context they'd paint over a plain (non-positioned) `.empty-state` box
   // regardless of DOM order.
-  const CHROME_IDS = ['fbar', 'corner', 'colhdr', 'rowhdr', 'gridwrap', 'tabs'];
+  const CHROME_IDS = ['toolbar', 'fbar', 'corner', 'colhdr', 'rowhdr', 'gridwrap', 'tabs'];
   function setChromeVisible(visible) {
     for (const id of CHROME_IDS) {
       const el = $(id);
@@ -550,6 +621,36 @@
         vscode.postMessage({ type: 'bytes', requestId: msg.requestId, data: bytesToBase64(bytes) });
         break;
       }
+      case 'ctl': {
+        // One agent control verb (docs/agent-control.md), routed through the
+        // same grid_ctl marshalling cmd() already uses for grid_cmd.
+        // Always post a ctlResult, even on an unexpected throw (a wasm trap,
+        // say) — the host's pending promise for this requestId has no other
+        // way to settle, and silence here would hang the agent's TCP request.
+        let raw;
+        try {
+          const u8 = enc.encode(msg.payload);
+          const p = writeBytes(u8);
+          const r = ex.grid_ctl(handle, p, u8.length);
+          ex.grid_free(p, u8.length);
+          raw = dec.decode(readResult(r));
+        } catch (err) {
+          raw = JSON.stringify({
+            ok: false,
+            error: 'grid_ctl threw: ' + (err && err.message ? err.message : String(err)),
+          });
+        }
+        vscode.postMessage({ type: 'ctlResult', requestId: msg.requestId, payload: raw });
+        // The host already knows (from its mutating-verb set) whether this
+        // call *could* have changed the workbook; only repaint if it also
+        // actually succeeded.
+        if (msg.repaint) {
+          let ok = false;
+          try { ok = JSON.parse(raw).ok === true; } catch { /* leave ok false */ }
+          if (ok) requestView();
+        }
+        break;
+      }
       case 'clipboardText':
         if (pastePending.delete(msg.requestId) && msg.text) {
           userCmd(`paste\t${rowOfRef()}\t${refCol()}\t${msg.text}`);
@@ -576,10 +677,81 @@
 
   // ---- boot ----------------------------------------------------------------
   document.body.innerHTML = `
+    <div id="toolbar"></div>
     <div id="fbar"><span id="cellref">A1</span><input id="fsrc" spellcheck="false" /></div>
     <div id="corner"></div><div id="colhdr"></div><div id="rowhdr"></div>
-    <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="cells"></div></div>
+    <div id="gridwrap" tabindex="0"><div id="spacer"></div><div id="gridlines"></div><div id="cells"></div></div>
     <div id="tabs"></div>`;
+
+  // ---- Excel-2003-style toolbar --------------------------------------------
+  // Button groups, thin dividers between: clipboard, autosum, bold/italic,
+  // font/fill color, align, number format. Mirrors webview.js's
+  // buildToolbar() (docxy) — same box-model/interaction pattern, adapted to
+  // this grid's `fmt`/`decimals`/`autosum` verbs. Undo/redo are deliberately
+  // NOT here: Ctrl+Z/Y already route to VS Code's own undo stack, and a
+  // toolbar undo button would desync it.
+  let btnBold, btnItalic, btnAlignL, btnAlignC, btnAlignR;
+  function buildToolbar() {
+    const bar = $('toolbar');
+    function addSep() {
+      const s = document.createElement('span');
+      s.className = 'tb-sep';
+      bar.appendChild(s);
+    }
+    // Keep the grid's selection: don't let the button steal focus on
+    // mousedown, and return focus to #gridwrap after the click so keyboard
+    // navigation keeps working immediately.
+    function addButton(label, title, onClick, cls) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.title = title;
+      if (cls) b.classList.add(cls);
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', () => {
+        onClick();
+        $('gridwrap').focus();
+      });
+      bar.appendChild(b);
+      return b;
+    }
+    // A native color picker: a hidden <input type=color> triggered by its
+    // visible swatch button. `input`/`change` both fire `fmt\t<key>\t#hex`
+    // (input fires live as the OS picker drags a color; change fires once
+    // committed) — harmless to send twice, the second just repeats the patch.
+    function addColorButton(label, title, fmtKey) {
+      const input = document.createElement('input');
+      input.type = 'color';
+      input.value = '#000000';
+      bar.appendChild(input);
+      const send = () => userCmd(`fmt\t${fmtKey}\t${input.value}`);
+      input.addEventListener('input', send);
+      input.addEventListener('change', send);
+      addButton(label, title, () => input.click());
+    }
+
+    addButton('Cut', 'Cut', () => userCmd('cut'));
+    addButton('Copy', 'Copy', () => userCmd('copy'));
+    addButton('Paste', 'Paste', () => requestPaste());
+    addSep();
+    addButton('Σ', 'AutoSum', () => userCmd('autosum'));
+    addSep();
+    btnBold = addButton('B', 'Bold', () => userCmd('fmt\tbold\ttoggle'), 'tb-b');
+    btnItalic = addButton('I', 'Italic', () => userCmd('fmt\titalic\ttoggle'), 'tb-i');
+    addSep();
+    addColorButton('A', 'Font color', 'fontColor');
+    addColorButton('▨', 'Fill color', 'fillColor');
+    addSep();
+    btnAlignL = addButton('⯇', 'Align left', () => userCmd('fmt\talign\tleft'));
+    btnAlignC = addButton('≡', 'Center', () => userCmd('fmt\talign\tcenter'));
+    btnAlignR = addButton('⯈', 'Align right', () => userCmd('fmt\talign\tright'));
+    addSep();
+    addButton('$', 'Currency', () => userCmd('fmt\tnumFmt\t$#,##0.00'));
+    addButton('%', 'Percent', () => userCmd('fmt\tnumFmt\t0%'));
+    addButton(',', 'Comma', () => userCmd('fmt\tnumFmt\t#,##0.00'));
+    addButton('◂.0', 'Decrease decimal', () => userCmd('decimals\t-1'));
+    addButton('.0▸', 'Increase decimal', () => userCmd('decimals\t1'));
+  }
 
   /** Right-click context menu for a row/col header: insert/delete at `at`. */
   function headerMenu(e, kind, at) {
@@ -608,6 +780,7 @@
     const resp = await fetch(window.__OFFXY__.wasmUri);
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
     ex = instance.exports;
+    buildToolbar();
     const wrap = $('gridwrap');
     wrap.addEventListener('scroll', onScroll);
     wrap.addEventListener('mousedown', onMousedown);

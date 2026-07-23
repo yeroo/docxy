@@ -346,7 +346,19 @@ fn code_span(text: &str) -> String {
 fn escape_inline(text: &str) -> String {
     let mut s = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(c, '\\' | '*' | '`' | '[' | ']' | '~' | '|') {
+        // `[`/`]` are only special in link/image syntax, which `to_markdown`
+        // emits through its own link path — not via this function. Escaping
+        // bare brackets mangles task-list items (`- [ ]` -> `- \[ \]`) and other
+        // literal bracket text, so they are left alone.
+        // Accepted tradeoff: literal prose containing `[text](url)` (typed as
+        // plain text, not created via the link path) re-parses as a real link
+        // on the next round-trip. Deliberate, not an oversight — task-list
+        // `[ ]`/`[x] ` never forms link syntax (no following `(url)`), and this
+        // function never sees text the link path itself emitted (that path
+        // brackets its own text independently), so the ambiguity is confined to
+        // hand-typed bracket-paren prose, which is rare and recoverable (the
+        // "link" just points nowhere useful, it doesn't lose or corrupt text).
+        if matches!(c, '\\' | '*' | '`' | '~' | '|') {
             s.push('\\');
         }
         s.push(c);
@@ -478,16 +490,32 @@ pub fn from_markdown(src: &str) -> Document {
             body.push(parse_table(&rows));
             continue;
         }
-        // List (consecutive items, possibly nested by indentation).
+        // List (consecutive items; each item may span soft-wrapped/continued
+        // lines that are not themselves new list markers or new blocks).
         if list_item(line).is_some() {
             while i < lines.len() {
-                match list_item(lines[i]) {
-                    Some((ilvl, ordered, content)) => {
-                        body.push(list_para(ilvl, ordered, content));
-                        i += 1;
+                let Some((ilvl, ordered, first)) = list_item(lines[i]) else {
+                    break;
+                };
+                i += 1;
+                let mut text = first.to_string();
+                // Fold in continuation lines belonging to THIS item.
+                while i < lines.len() {
+                    let l = lines[i];
+                    let t = l.trim();
+                    if t.is_empty()
+                        || list_item(l).is_some()
+                        || starts_block(l, lines.get(i + 1).copied())
+                    {
+                        break;
                     }
-                    None => break,
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(t);
+                    i += 1;
                 }
+                body.push(list_para(ilvl, ordered, &text));
             }
             continue;
         }
@@ -1084,6 +1112,56 @@ mod tests {
     }
 
     #[test]
+    fn list_item_continuation_lines_merge_into_the_item() {
+        // The second line is an indented soft-wrap of the first item, not a new block.
+        let src = "- first line\n  still the first item\n- second item\n";
+        let doc = from_markdown(src);
+        // Exactly two list paragraphs, and the first carries both lines' text.
+        let paras: Vec<&Paragraph> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.props.num_id.is_some())
+            .collect();
+        assert_eq!(paras.len(), 2, "two list items, not three blocks");
+        assert_eq!(paras[0].plain_text(), "first line still the first item");
+        // And it round-trips without inserting a blank line inside the list.
+        let out = to_markdown(&doc);
+        assert!(
+            !out.contains("- first line\n\n"),
+            "no spurious blank inside the list: {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_marker_continuation_has_no_leading_space() {
+        // An empty first line (`"- "`, nothing after the marker) followed by a
+        // continuation: the fold loop must guard the space the same way the
+        // plain-paragraph gather does (`if !text.is_empty()`), or the item's
+        // text picks up a spurious leading space before "cont".
+        let src = "- \n  cont\n";
+        let doc = from_markdown(src);
+        let paras: Vec<&Paragraph> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.props.num_id.is_some())
+            .collect();
+        assert_eq!(paras.len(), 1, "one list item");
+        assert_eq!(
+            paras[0].plain_text(),
+            "cont",
+            "no leading space before cont"
+        );
+    }
+
+    #[test]
     fn ordered_list_marker_kept_on_output() {
         // Simulate compute_markers output for two ordered items.
         let doc = from_markdown("1. first\n2. second");
@@ -1365,6 +1443,117 @@ mod tests {
             p.content
                 .iter()
                 .any(|i| matches!(i, Inline::Run(r) if r.props.bold && r.props.italic))
+        );
+    }
+
+    #[test]
+    fn task_list_round_trips_as_literal_text() {
+        let src = "- [ ] todo\n- [x] done\n";
+        let out = to_markdown(&from_markdown(src));
+        assert!(
+            out.contains("- [ ] todo"),
+            "unchecked task survives: {out:?}"
+        );
+        assert!(out.contains("- [x] done"), "checked task survives: {out:?}");
+        assert!(!out.contains("\\["), "brackets are not escaped: {out:?}");
+    }
+
+    /// Run one lap of the editor's real save path: parse Markdown, splice into
+    /// a `.docx` package (this is what assigns/reserves numbering ids), save
+    /// to bytes, reload (so numbering.xml is parsed back the way a real open
+    /// would see it), then serialize back to Markdown using the *marker-aware*
+    /// `to_markdown_with` + `compute_markers` — the same pair the editor's
+    /// save path uses (see `docxwasm/src/bridge.rs` and `docxy/src/main.rs`).
+    fn editor_round_trip(md: &str) -> String {
+        let doc = from_markdown(md);
+        let pkg = crate::package::new_markdown_package(doc);
+        let bytes = crate::package::save_package(&pkg);
+        let reloaded = crate::package::load_package(&bytes).expect("reload");
+        let numbering = reloaded
+            .part("word/numbering.xml")
+            .map(|b| {
+                crate::numbering::parse_numbering_xml(
+                    std::str::from_utf8(b).expect("numbering.xml is utf8"),
+                )
+            })
+            .unwrap_or_default();
+        let markers = crate::numbering::compute_markers(&reloaded.document, &numbering);
+        to_markdown_with(&reloaded.document, &markers)
+    }
+
+    #[test]
+    fn markdown_round_trip_is_idempotent_over_the_corpus() {
+        // Written in docxy's own canonical output style (one line per paragraph,
+        // two-space list nesting) so the FIRST pass is already a fixed point.
+        // Exercised through the editor's real save path (marker-aware), not the
+        // bare `to_markdown`, so ordered-list markers are preserved as they are
+        // in an actual `.md` file save.
+        let corpus = "\
+# Heading 1
+
+## Heading 2
+
+A paragraph with **bold**, *italic*, ~~strike~~, `code`, and a [link](https://x).
+
+- bullet one
+- bullet two
+  continued on a soft-wrapped line
+  - nested bullet
+- [ ] todo
+- [x] done
+
+1. first
+2. second
+
+> a quote
+
+```
+code block
+```
+
+| a | b |
+| --- | --- |
+| 1 | 2 |
+
+---
+";
+        let once = editor_round_trip(corpus);
+        let twice = editor_round_trip(&once);
+        assert_eq!(once, twice, "second pass must equal the first (idempotent)");
+        // Spot-check the constructs survive the FIRST pass.
+        for needle in [
+            "# Heading 1",
+            "**bold**",
+            "~~strike~~",
+            "`code`",
+            "[link](https://x)",
+            "continued on a soft-wrapped line",
+            "nested bullet",
+            "- [ ] todo",
+            "- [x] done",
+            "1. first",
+            "> a quote",
+            "| a | b |",
+            "---",
+        ] {
+            assert!(once.contains(needle), "corpus lost {needle:?}:\n{once}");
+        }
+    }
+
+    #[test]
+    fn escape_inline_still_escapes_real_metacharacters_but_not_brackets() {
+        // `*` `` ` `` `~` `|` `\` still escape; `[` `]` do not.
+        let e = escape_inline("a*b`c~d|e[f]g\\h");
+        assert!(
+            e.contains("\\*")
+                && e.contains("\\`")
+                && e.contains("\\~")
+                && e.contains("\\|")
+                && e.contains("\\\\")
+        );
+        assert!(
+            !e.contains("\\[") && !e.contains("\\]"),
+            "brackets not escaped: {e:?}"
         );
     }
 }

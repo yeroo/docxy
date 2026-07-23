@@ -563,6 +563,77 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
     Vec::new()
 }
 
+/// Resolve one section header/footer's block content: scan `pkg.sect_pr()`
+/// for the `w:{kind}` reference of type `wtype` (`default`/`first`/`even`),
+/// follow it through `rels` to the target part, and parse that part's
+/// content. Returns an empty `Vec` — never an error — when the document
+/// doesn't declare one (no reference, no relationship, or a missing part),
+/// so callers can render "no header/footer" as a zero-content result.
+///
+/// `kind` is `"headerReference"`/`"footerReference"` (the section-property
+/// element name). Shared by every control surface that needs a section
+/// header/footer's live content: docxy's terminal app (all three variants,
+/// for its own editing UI) and docxwasm's `docx_ctl` (the `doc.header`/
+/// `doc.footer` verbs, default variant only per their documented contract).
+pub fn resolve_header_footer(
+    pkg: &crate::package::Package,
+    rels: &Relationships,
+    kind: &str,
+    wtype: &str,
+) -> Vec<Block> {
+    let Some(rid) = header_footer_ref_rid(pkg.sect_pr(), kind, wtype) else {
+        return Vec::new();
+    };
+    let Some(target) = rels.target(&rid) else {
+        return Vec::new();
+    };
+    let name = match target.strip_prefix('/') {
+        Some(r) => r.to_string(),
+        None => format!("word/{}", target.trim_start_matches("./")),
+    };
+    let Some(bytes) = pkg.part(&name) else {
+        return Vec::new();
+    };
+    parse_header_footer(std::str::from_utf8(bytes).unwrap_or(""), rels)
+}
+
+/// The relationship id of a section header/footer reference of the given
+/// type (`default`/`first`/`even`) inside a captured `w:sectPr` XML string
+/// ([`crate::package::Package::sect_pr`]). Public so a caller that only needs
+/// the part name (not its parsed content — e.g. resolving an editable header
+/// part to save into) can use it directly, as [`resolve_header_footer`] does.
+pub fn header_footer_ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<String> {
+    let needle = format!("<w:{kind}");
+    let want = format!("w:type=\"{wtype}\"");
+    let mut i = 0;
+    while let Some(p) = sect[i..].find(&needle) {
+        let start = i + p;
+        let end = sect[start..]
+            .find('>')
+            .map(|e| start + e)
+            .unwrap_or(sect.len());
+        let el = &sect[start..end];
+        if el.contains(&want) {
+            return xml_attr_value(el, "r:id");
+        }
+        i = (end + 1).min(sect.len());
+    }
+    None
+}
+
+/// Read the value of attribute `key="…"` from a raw XML element slice (a
+/// small scoped scan, not a full attribute parser — sufficient for locating
+/// one known attribute on one already-located element, as used by
+/// [`header_footer_ref_rid`] and callers that check on/off flags like
+/// `w:val="false"`).
+pub fn xml_attr_value(el: &str, key: &str) -> Option<String> {
+    let k = format!("{key}=\"");
+    let s = el.find(&k)? + k.len();
+    let rest = &el[s..];
+    let e = rest.find('"')?;
+    Some(rest[..e].to_string())
+}
+
 /// Parse a block-level `<w:sdt>` (content control: cover pages, TOC, …) while
 /// **preserving its wrapper**. The `<w:sdtPr>`/`<w:sdtEndPr>` are captured
 /// verbatim and re-emitted, together with the `<w:sdt>`/`<w:sdtContent>` tags
@@ -1398,6 +1469,100 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    /// The populated-content case for [`parse_header_footer`], the shape
+    /// `docxy`'s `doc.header`/`doc.footer` control verbs marshal directly
+    /// into JSON (`{blocks:[{index,kind,text}]}`).
+    #[test]
+    fn parse_header_footer_returns_its_block_content() {
+        let xml = r#"<?xml version="1.0"?><w:hdr xmlns:w="x">
+            <w:p><w:r><w:t>Company Confidential</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Page footer line two</w:t></w:r></w:p>
+        </w:hdr>"#;
+        let blocks = parse_header_footer(xml, &Relationships::default());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].plain_text(), "Company Confidential");
+        assert_eq!(blocks[1].plain_text(), "Page footer line two");
+        assert!(matches!(&blocks[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn parse_header_footer_is_empty_without_the_wrapper_tag() {
+        assert!(
+            parse_header_footer(
+                "<w:p><w:r><w:t>x</w:t></w:r></w:p>",
+                &Relationships::default()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn xml_attr_value_reads_a_quoted_attribute() {
+        assert_eq!(
+            xml_attr_value(
+                "<w:headerReference w:type=\"default\" r:id=\"rId2\"/",
+                "r:id"
+            ),
+            Some("rId2".to_string())
+        );
+        assert_eq!(xml_attr_value("<w:p/", "r:id"), None);
+    }
+
+    #[test]
+    fn header_footer_ref_rid_finds_the_matching_type_only() {
+        let sect = r#"<w:sectPr><w:headerReference w:type="even" r:id="rId3"/><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>"#;
+        assert_eq!(
+            header_footer_ref_rid(sect, "headerReference", "default"),
+            Some("rId2".to_string())
+        );
+        assert_eq!(
+            header_footer_ref_rid(sect, "headerReference", "first"),
+            None
+        );
+        assert_eq!(
+            header_footer_ref_rid(sect, "footerReference", "default"),
+            None
+        );
+    }
+
+    /// Full [`resolve_header_footer`] resolution through a real [`crate::package::Package`]:
+    /// sectPr -> document.xml.rels -> word/header1.xml, the shape docxy's and
+    /// docxwasm's `doc.header`/`doc.footer` verbs both depend on.
+    #[test]
+    fn resolve_header_footer_follows_sectpr_through_rels_to_the_part() {
+        use crate::package::load_package;
+        use crate::zipwrite::write_zip;
+
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>body text</w:t></w:r></w:p>
+            <w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>
+        </w:body></w:document>"#;
+        let doc_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>"#;
+        let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:w="x"><w:p><w:r><w:t>Confidential</w:t></w:r></w:p></w:hdr>"#;
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let root_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), ct.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("word/document.xml".into(), document_xml.into()),
+            ("word/_rels/document.xml.rels".into(), doc_rels.into()),
+            ("word/styles.xml".into(), "<w:styles/>".into()),
+            ("word/header1.xml".into(), header_xml.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        let rels = parse_rels_xml(
+            std::str::from_utf8(pkg.part("word/_rels/document.xml.rels").unwrap()).unwrap(),
+        );
+        let blocks = resolve_header_footer(&pkg, &rels, "headerReference", "default");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].plain_text(), "Confidential");
+
+        // No footer reference at all -> empty, not an error.
+        assert!(resolve_header_footer(&pkg, &rels, "footerReference", "default").is_empty());
+        // A variant that isn't declared (only "default" is) -> empty.
+        assert!(resolve_header_footer(&pkg, &rels, "headerReference", "first").is_empty());
     }
 
     #[test]

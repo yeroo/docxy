@@ -21,6 +21,7 @@
 // Re-exported here so `docxcore::zip::ZipArchive` etc. keep working.
 pub use opccore::{inflate, xml, zip, zipwrite};
 
+pub mod agent;
 pub mod chart;
 pub mod comments;
 pub mod editor;
@@ -32,6 +33,8 @@ pub mod load;
 pub mod markdown;
 pub mod mathbox;
 pub mod mermaid;
+pub mod mermaid_embed;
+pub mod mermaid_seq;
 pub mod model;
 pub mod notes;
 pub mod numbering;
