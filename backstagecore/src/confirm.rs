@@ -43,6 +43,12 @@ impl<A: Clone> Confirm<A> {
         }
     }
 
+    /// Preselect No instead of Yes (for destructive prompts like "Overwrite?").
+    pub fn default_no(mut self) -> Confirm<A> {
+        self.yes = false;
+        self
+    }
+
     /// Whether Yes is currently selected (for tests / cursor placement).
     pub fn yes_selected(&self) -> bool {
         self.yes
