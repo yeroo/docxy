@@ -12,6 +12,7 @@
     * pywin32 EnsureDispatch    — Python, early-bound via makepy over our typelib
     * PowerShell 5.1 COM        — desktop CLR reflection-based late binding
     * PowerShell 7 (pwsh) COM   — .NET Core COM interop
+    * R / RDCOMClient           — R's own C++ IDispatch client
 
   The shims must be installed and the typelibs registered first (dist\install.ps1).
   Each per-client test validates the produced OOXML directly (no Office needed) and
@@ -70,6 +71,27 @@ foreach ($sh in @('powershell', 'pwsh')) {
     Record "$sh COM" 'Excel' ($LASTEXITCODE -eq 0)
     & $sh -NoProfile -ExecutionPolicy Bypass -File $wdPosh | Out-Null
     Record "$sh COM" 'Word' ($LASTEXITCODE -eq 0)
+}
+
+# --- R / RDCOMClient ---
+$rscript = Get-Command Rscript -ErrorAction SilentlyContinue
+if (-not $rscript) {
+    $rroot = Get-ChildItem 'C:\Program Files\R' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($rroot) {
+        $cand = Join-Path $rroot.FullName 'bin\x64\Rscript.exe'
+        if (Test-Path $cand) { $rscript = $cand } else { $rscript = Join-Path $rroot.FullName 'bin\Rscript.exe' }
+    }
+}
+$rexe = if ($rscript -is [string]) { $rscript } elseif ($rscript) { $rscript.Source } else { $null }
+if ($rexe -and (Test-Path $rexe)) {
+    & $rexe (Join-Path $tools 'comshim-tests\r\rdcom_conformance.R')  | Out-Null
+    Record 'R (RDCOMClient)' 'Excel' ($LASTEXITCODE -eq 0)
+    & $rexe (Join-Path $tools 'wordshim-tests\r\rdcom_conformance.R') | Out-Null
+    Record 'R (RDCOMClient)' 'Word' ($LASTEXITCODE -eq 0)
+} else {
+    Record 'R (RDCOMClient)' 'Excel' $null
+    Record 'R (RDCOMClient)' 'Word' $null
 }
 
 # --- report ---
