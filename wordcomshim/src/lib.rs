@@ -1,0 +1,933 @@
+//! wordcomshim — a COM server that impersonates `Word.Application`, so software
+//! that automates Office over COM (create a document, type text, save a `.docx`)
+//! keeps working on machines with no Microsoft Word installed. Document output is
+//! produced by the dependency-free [`docxcore`] engine — the same one behind
+//! `docxy`.
+//!
+//! This is the late-bound (`IDispatch`) create path:
+//! `Application → Documents.Add → Document → Selection/Range`, text via
+//! `Selection.TypeText`/`TypeParagraph` and `Range.Text`/`InsertAfter`, then
+//! `Document.SaveAs2(path)` writing a real `.docx`. Every activation and dispatch
+//! is logged to `%TEMP%\wordcomshim.log` — the field diagnostic. Unmodeled
+//! members degrade gracefully (never fault). Registration is per-user via
+//! `tools/wordshim/register-word.ps1`.
+
+#[cfg(windows)]
+pub use win::run;
+
+#[cfg(windows)]
+mod win {
+    #![allow(non_snake_case)]
+
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::process::ExitCode;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    use docxcore::model::{Block, Document, Inline, Paragraph, ParProps, Run, RunProps};
+    use docxcore::package::{Package, load_package, new_package, save_package};
+
+    use windows::Win32::Foundation::{
+        BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, E_POINTER, S_FALSE,
+        S_OK,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
+        CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
+        DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
+        IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE,
+        REGCLS_SUSPENDED,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
+    };
+    use windows::core::{
+        BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement,
+    };
+
+    /// Our own coclass CLSID — a brand-new GUID, never Microsoft's Word CLSID.
+    const SHIM_CLSID: GUID = GUID::from_u128(0x9c2f4a10_7d33_4b6e_b1a4_2e7c8d5f0a92);
+    /// Microsoft Word's real coclass CLSID {000209FF-…}. We register a class
+    /// object for it too so an early-bound `new Word.Application()` reaches us
+    /// when the HKCU shadow points here. Never written to HKLM.
+    const WORD_CLSID: GUID = GUID::from_u128(0x000209ff_0000_0000_c000_000000000046);
+
+    const DISPID_UNKNOWN: i32 = -1;
+
+    // ---- VARIANT type tags -------------------------------------------------
+    const VT_EMPTY: u16 = 0;
+    const VT_ERROR: u16 = 10;
+
+    static APPS: AtomicI32 = AtomicI32::new(0);
+
+    // -----------------------------------------------------------------------
+    // Document state (thread-local; STA single-thread, no locking).
+    // -----------------------------------------------------------------------
+
+    struct DocState {
+        pkg: Package,
+        path: Option<String>,
+        saved: bool,
+    }
+
+    impl DocState {
+        fn new() -> DocState {
+            DocState {
+                pkg: new_package(Document::default()),
+                path: None,
+                saved: false,
+            }
+        }
+
+        fn open(path: &str) -> std::io::Result<DocState> {
+            let bytes = std::fs::read(path)?;
+            let pkg = load_package(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            Ok(DocState {
+                pkg,
+                path: Some(path.to_string()),
+                saved: true,
+            })
+        }
+
+        /// Type text at the end, honoring embedded paragraph marks (\r / \n).
+        fn type_text(&mut self, s: &str) {
+            let body = &mut self.pkg.document.body;
+            if !matches!(body.last(), Some(Block::Paragraph(_))) {
+                body.push(Block::Paragraph(Paragraph::default()));
+            }
+            for (i, seg) in split_paragraphs(s).into_iter().enumerate() {
+                if i > 0 {
+                    body.push(Block::Paragraph(Paragraph::default()));
+                }
+                if !seg.is_empty() {
+                    if let Some(Block::Paragraph(p)) = body.last_mut() {
+                        p.content.push(text_inline(&seg));
+                    }
+                }
+            }
+            self.saved = false;
+        }
+
+        fn type_paragraph(&mut self) {
+            self.pkg
+                .document
+                .body
+                .push(Block::Paragraph(Paragraph::default()));
+            self.saved = false;
+        }
+
+        /// Replace the whole body with paragraphs split from `s`.
+        fn set_text(&mut self, s: &str) {
+            self.pkg.document.body = split_paragraphs(s)
+                .into_iter()
+                .map(|seg| {
+                    Block::Paragraph(Paragraph {
+                        props: ParProps::default(),
+                        content: if seg.is_empty() {
+                            vec![]
+                        } else {
+                            vec![text_inline(&seg)]
+                        },
+                    })
+                })
+                .collect();
+            self.saved = false;
+        }
+
+        /// The document's text, paragraphs joined by Word's paragraph mark (\r).
+        fn text(&self) -> String {
+            self.pkg
+                .document
+                .body
+                .iter()
+                .map(|b| b.plain_text())
+                .collect::<Vec<_>>()
+                .join("\r")
+        }
+
+        fn save_as(&mut self, path: &str) -> std::io::Result<()> {
+            let bytes = save_package(&self.pkg);
+            std::fs::write(path, bytes)?;
+            self.path = Some(path.to_string());
+            self.saved = true;
+            Ok(())
+        }
+
+        fn name(&self) -> String {
+            self.path
+                .as_deref()
+                .and_then(|p| p.rsplit(['\\', '/']).next())
+                .unwrap_or("Document1")
+                .to_string()
+        }
+    }
+
+    fn text_inline(s: &str) -> Inline {
+        Inline::Run(Run {
+            text: s.to_string(),
+            props: RunProps::default(),
+        })
+    }
+
+    /// Split on paragraph marks (\r\n, \r, \n), keeping empties so blank lines
+    /// become empty paragraphs.
+    fn split_paragraphs(s: &str) -> Vec<String> {
+        s.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .split('\n')
+            .map(|x| x.to_string())
+            .collect()
+    }
+
+    struct Registry {
+        docs: Vec<DocState>,
+        active: usize,
+        visible: bool,
+    }
+
+    thread_local! {
+        static REG: RefCell<Registry> = const { RefCell::new(Registry {
+            docs: Vec::new(),
+            active: 0,
+            visible: false,
+        }) };
+    }
+
+    fn reg<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+        REG.with(|r| f(&mut r.borrow_mut()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Logging (the field diagnostic)
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn log(msg: &str) {
+        use std::io::Write;
+        let Ok(dir) = std::env::var("TEMP").or_else(|_| std::env::var("TMP")) else {
+            return;
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{dir}\\wordcomshim.log"))
+        {
+            let _ = writeln!(f, "[{}] {msg}", std::process::id());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Server lifecycle
+    // -----------------------------------------------------------------------
+
+    fn install_panic_hook() {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            std::panic::set_hook(Box::new(|info| log(&format!("PANIC: {info}"))));
+        });
+    }
+
+    pub fn run() -> ExitCode {
+        install_panic_hook();
+        let joined = std::env::args().collect::<Vec<_>>().join(" ").to_lowercase();
+        if joined.contains("-embedding") || joined.contains("/automation") || joined.contains("--serve")
+        {
+            match run_server() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    log(&format!("server error: {e:?}"));
+                    ExitCode::FAILURE
+                }
+            }
+        } else {
+            eprintln!(
+                "wordcomshim — Word-compatible COM automation server (LocalServer32).\n\
+                 Register with tools/wordshim/register-word.ps1; COM launches it with -Embedding."
+            );
+            ExitCode::SUCCESS
+        }
+    }
+
+    fn run_server() -> Result<()> {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            log("server starting; registering class object");
+            let factory: IClassFactory = WordClassFactory.into();
+            let mut cookies = Vec::new();
+            for clsid in [SHIM_CLSID, WORD_CLSID] {
+                cookies.push(CoRegisterClassObject(
+                    &clsid,
+                    &factory,
+                    CLSCTX_LOCAL_SERVER,
+                    REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
+                )?);
+            }
+            CoResumeClassObjects()?;
+            log("class objects registered; entering message loop");
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            log("message loop exited; revoking + uninitializing");
+            for c in cookies {
+                let _ = CoRevokeClassObject(c);
+            }
+            CoUninitialize();
+        }
+        Ok(())
+    }
+
+    #[implement(IClassFactory)]
+    struct WordClassFactory;
+
+    impl IClassFactory_Impl for WordClassFactory_Impl {
+        fn CreateInstance(
+            &self,
+            punkouter: Option<&IUnknown>,
+            riid: *const GUID,
+            ppvobject: *mut *mut c_void,
+        ) -> Result<()> {
+            unsafe {
+                if punkouter.is_some() {
+                    return Err(CLASS_E_NOAGGREGATION.into());
+                }
+                log(&format!("ClassFactory::CreateInstance riid={:?}", *riid));
+                let app: IDispatch = Application::new().into();
+                app.query(riid, ppvobject).ok()
+            }
+        }
+        fn LockServer(&self, _flock: BOOL) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// COM entry point for the in-process server (InprocServer32) — no
+    /// marshalling, no typelib, the RCW calls our vtable directly.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn DllGetClassObject(
+        rclsid: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            if rclsid.is_null() || riid.is_null() || ppv.is_null() {
+                return E_POINTER;
+            }
+            *ppv = std::ptr::null_mut();
+            let clsid = *rclsid;
+            if clsid != SHIM_CLSID && clsid != WORD_CLSID {
+                return CLASS_E_CLASSNOTAVAILABLE;
+            }
+            install_panic_hook();
+            log(&format!("DllGetClassObject clsid={clsid:?}"));
+            let factory: IClassFactory = WordClassFactory.into();
+            factory.query(riid, ppv)
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn DllCanUnloadNow() -> HRESULT {
+        if APPS.load(Ordering::SeqCst) > 0 {
+            S_FALSE
+        } else {
+            S_OK
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // VARIANT helpers
+    // -----------------------------------------------------------------------
+
+    unsafe fn vt_of(v: *const VARIANT) -> u16 {
+        unsafe { *(v as *const u16) & 0x0fff }
+    }
+
+    unsafe fn arg<'a>(p: *const DISPPARAMS, i: u32) -> Option<&'a VARIANT> {
+        unsafe {
+            if p.is_null() {
+                return None;
+            }
+            let dp = &*p;
+            if i >= dp.cArgs {
+                return None;
+            }
+            Some(&*dp.rgvarg.add((dp.cArgs - 1 - i) as usize))
+        }
+    }
+
+    unsafe fn arg_string(p: *const DISPPARAMS, i: u32) -> Option<String> {
+        unsafe { arg(p, i).and_then(variant_to_string) }
+    }
+
+    unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
+        unsafe {
+            arg(p, i).and_then(|v| {
+                let vt = vt_of(v);
+                if vt == VT_EMPTY || vt == VT_ERROR {
+                    None
+                } else {
+                    i32::try_from(v).ok()
+                }
+            })
+        }
+    }
+
+    fn variant_to_string(v: &VARIANT) -> Option<String> {
+        let vt = unsafe { vt_of(v) };
+        if vt == VT_EMPTY || vt == VT_ERROR {
+            return None;
+        }
+        if let Ok(b) = BSTR::try_from(v) {
+            return Some(b.to_string());
+        }
+        let s = v.to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
+    unsafe fn put(pvarresult: *mut VARIANT, value: VARIANT) {
+        if !pvarresult.is_null() {
+            unsafe { std::ptr::write(pvarresult, value) };
+        }
+    }
+
+    unsafe fn put_disp<T: Into<IDispatch>>(pvarresult: *mut VARIANT, obj: T) {
+        unsafe { put(pvarresult, VARIANT::from(obj.into())) };
+    }
+
+    fn is_put(wflags: DISPATCH_FLAGS) -> bool {
+        (wflags.0 & (DISPATCH_PROPERTYPUT.0 | DISPATCH_PROPERTYPUTREF.0)) != 0
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful degradation — never fault on an unmodeled member.
+    // -----------------------------------------------------------------------
+
+    thread_local! {
+        static SYNTH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    const SYNTH_BASE: i32 = 0x4000_0000;
+
+    fn synth_id(name: &str) -> i32 {
+        SYNTH.with(|s| {
+            let mut v = s.borrow_mut();
+            match v.iter().position(|n| n == name) {
+                Some(i) => SYNTH_BASE + i as i32,
+                None => {
+                    v.push(name.to_string());
+                    SYNTH_BASE + (v.len() as i32 - 1)
+                }
+            }
+        })
+    }
+    fn synth_name(id: i32) -> Option<String> {
+        (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
+    }
+
+    unsafe fn unhandled(id: i32, wflags: DISPATCH_FLAGS, result: *mut VARIANT) -> Result<()> {
+        let member = synth_name(id).unwrap_or_else(|| format!("dispid {id}"));
+        log(&format!(
+            "  -> unmodeled '{member}' (put={}) -> benign",
+            is_put(wflags)
+        ));
+        if !is_put(wflags) {
+            unsafe { put(result, VARIANT::from(null_dispatch())) };
+        }
+        Ok(())
+    }
+
+    #[implement(IDispatch)]
+    struct NullObject;
+
+    fn null_dispatch() -> IDispatch {
+        NullObject.into()
+    }
+
+    macro_rules! no_typeinfo {
+        () => {
+            fn GetTypeInfoCount(&self) -> Result<u32> {
+                Ok(0)
+            }
+            fn GetTypeInfo(&self, _i: u32, _l: u32) -> Result<ITypeInfo> {
+                Err(DISP_E_BADINDEX.into())
+            }
+        };
+    }
+
+    unsafe fn resolve_names(
+        who: &str,
+        rgsznames: *const PCWSTR,
+        cnames: u32,
+        rgdispid: *mut i32,
+        resolver: impl Fn(&str) -> Option<i32>,
+    ) -> Result<()> {
+        unsafe {
+            if cnames == 0 {
+                return Ok(());
+            }
+            let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
+            let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
+            for id in ids.iter_mut() {
+                *id = DISPID_UNKNOWN;
+            }
+            let name = names[0].to_string().unwrap_or_default();
+            match resolver(&name) {
+                Some(d) => ids[0] = d,
+                None => {
+                    log(&format!("{who}: unmodeled member '{name}' -> graceful"));
+                    ids[0] = synth_id(&name);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl IDispatch_Impl for NullObject_Impl {
+        no_typeinfo!();
+        fn GetIDsOfNames(
+            &self,
+            _riid: *const GUID,
+            rgsznames: *const PCWSTR,
+            cnames: u32,
+            _lcid: u32,
+            rgdispid: *mut i32,
+        ) -> Result<()> {
+            unsafe {
+                if cnames > 0 {
+                    let names = std::slice::from_raw_parts(rgsznames, cnames as usize);
+                    let ids = std::slice::from_raw_parts_mut(rgdispid, cnames as usize);
+                    for id in ids.iter_mut() {
+                        *id = DISPID_UNKNOWN;
+                    }
+                    ids[0] = synth_id(&names[0].to_string().unwrap_or_default());
+                }
+            }
+            Ok(())
+        }
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            _params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            unsafe { unhandled(id, wflags, result) }
+        }
+    }
+
+    /// Boilerplate `GetIDsOfNames` for an object using `resolver`.
+    macro_rules! dispatch_names {
+        ($who:literal, $resolver:path) => {
+            fn GetIDsOfNames(
+                &self,
+                _riid: *const GUID,
+                rgsznames: *const PCWSTR,
+                cnames: u32,
+                _lcid: u32,
+                rgdispid: *mut i32,
+            ) -> Result<()> {
+                unsafe { resolve_names($who, rgsznames, cnames, rgdispid, $resolver) }
+            }
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Application
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Application;
+
+    impl Application {
+        fn new() -> Application {
+            APPS.fetch_add(1, Ordering::SeqCst);
+            Application
+        }
+    }
+    impl Drop for Application {
+        fn drop(&mut self) {
+            if APPS.fetch_sub(1, Ordering::SeqCst) == 1 {
+                unsafe { PostQuitMessage(0) };
+            }
+        }
+    }
+
+    fn app_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "name" => 1,
+            "version" => 2,
+            "visible" => 3,
+            "documents" => 4,
+            "activedocument" => 5,
+            "selection" => 6,
+            "quit" => 7,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Application_Impl {
+        no_typeinfo!();
+        dispatch_names!("Application", app_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            unsafe {
+                log(&format!("Application::Invoke id={id} put={}", is_put(wflags)));
+                match id {
+                    1 => put(result, VARIANT::from("Microsoft Word")),
+                    2 => put(result, VARIANT::from("16.0")),
+                    3 => {
+                        if is_put(wflags) {
+                            reg(|r| {
+                                r.visible = arg(params, 0)
+                                    .and_then(|v| bool::try_from(v).ok())
+                                    .unwrap_or(false)
+                            });
+                        } else {
+                            put(result, VARIANT::from(reg(|r| r.visible)));
+                        }
+                    }
+                    4 => put_disp(result, Documents),
+                    5 => {
+                        let doc = reg(|r| r.active);
+                        put_disp(result, DocumentObj { doc });
+                    }
+                    6 => {
+                        let doc = reg(|r| r.active);
+                        put_disp(result, Selection { doc });
+                    }
+                    7 => {
+                        log("Application::Quit");
+                        PostQuitMessage(0);
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Documents
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Documents;
+
+    fn documents_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "add" => 1,
+            "open" => 2,
+            "item" | "_default" => 3,
+            "count" => 4,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Documents_Impl {
+        no_typeinfo!();
+        dispatch_names!("Documents", documents_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            unsafe {
+                log(&format!("Documents::Invoke id={id}"));
+                match id {
+                    1 => {
+                        let doc = reg(|r| {
+                            r.docs.push(DocState::new());
+                            r.active = r.docs.len() - 1;
+                            r.active
+                        });
+                        put_disp(result, DocumentObj { doc });
+                    }
+                    2 => {
+                        let Some(path) = arg_string(params, 0) else {
+                            return Err(DISP_E_BADINDEX.into());
+                        };
+                        match DocState::open(&path) {
+                            Ok(d) => {
+                                let doc = reg(|r| {
+                                    r.docs.push(d);
+                                    r.active = r.docs.len() - 1;
+                                    r.active
+                                });
+                                put_disp(result, DocumentObj { doc });
+                            }
+                            Err(e) => {
+                                log(&format!("Documents.Open failed: {e}"));
+                                return Err(windows::Win32::Foundation::E_FAIL.into());
+                            }
+                        }
+                    }
+                    3 => {
+                        let idx = (arg_i32(params, 0).unwrap_or(1).max(1) as usize) - 1;
+                        if !reg(|r| idx < r.docs.len()) {
+                            return Err(DISP_E_BADINDEX.into());
+                        }
+                        put_disp(result, DocumentObj { doc: idx });
+                    }
+                    4 => put(result, VARIANT::from(reg(|r| r.docs.len() as i32))),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Document
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct DocumentObj {
+        doc: usize,
+    }
+
+    fn document_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "content" | "range" => 1,
+            "saveas" | "saveas2" | "saveas2000" => 2,
+            "save" => 3,
+            "close" => 4,
+            "name" => 5,
+            "fullname" => 6,
+            "path" => 7,
+            "activate" | "select" => 8,
+            "paragraphs" => 9,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for DocumentObj_Impl {
+        no_typeinfo!();
+        dispatch_names!("Document", document_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let doc = self.doc;
+            unsafe {
+                log(&format!("Document[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                match id {
+                    1 => put_disp(result, Range { doc }),
+                    2 => {
+                        let Some(path) = arg_string(params, 0) else {
+                            return Err(windows::Win32::Foundation::E_FAIL.into());
+                        };
+                        log(&format!("Document.SaveAs '{path}'"));
+                        let res = reg(|r| r.docs.get_mut(doc).map(|d| d.save_as(&path)));
+                        match res {
+                            Some(Ok(())) => {}
+                            _ => return Err(windows::Win32::Foundation::E_FAIL.into()),
+                        }
+                    }
+                    3 => {
+                        let res = reg(|r| {
+                            r.docs.get_mut(doc).map(|d| {
+                                d.path
+                                    .clone()
+                                    .map(|p| d.save_as(&p))
+                                    .unwrap_or(Ok(()))
+                            })
+                        });
+                        if !matches!(res, Some(Ok(()))) {
+                            log("Document.Save: no path (needs SaveAs)");
+                        }
+                    }
+                    4 => {} // Close — keep the slot so indices stay stable
+                    5 => put(result, VARIANT::from(BSTR::from(reg(|r| {
+                        r.docs.get(doc).map(|d| d.name()).unwrap_or_default()
+                    }).as_str()))),
+                    6 | 7 => put(result, VARIANT::from(BSTR::from(reg(|r| {
+                        r.docs.get(doc).and_then(|d| d.path.clone()).unwrap_or_default()
+                    }).as_str()))),
+                    8 => {} // Activate / Select — no-op
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Selection (bound to a document; a cursor at the end of the body)
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Selection {
+        doc: usize,
+    }
+
+    fn selection_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "typetext" => 1,
+            "typeparagraph" => 2,
+            "text" => 3,
+            "insertafter" => 4,
+            "insertbefore" => 5,
+            "range" => 6,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Selection_Impl {
+        no_typeinfo!();
+        dispatch_names!("Selection", selection_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let doc = self.doc;
+            unsafe {
+                log(&format!("Selection[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                match id {
+                    1 => {
+                        if let Some(s) = arg_string(params, 0) {
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.type_text(&s)
+                                }
+                            });
+                        }
+                    }
+                    2 => reg(|r| {
+                        if let Some(d) = r.docs.get_mut(doc) {
+                            d.type_paragraph()
+                        }
+                    }),
+                    3 => {
+                        if is_put(wflags) {
+                            let s = arg_string(params, 0).unwrap_or_default();
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.set_text(&s)
+                                }
+                            });
+                        } else {
+                            let t = reg(|r| r.docs.get(doc).map(|d| d.text()).unwrap_or_default());
+                            put(result, VARIANT::from(BSTR::from(t.as_str())));
+                        }
+                    }
+                    4 | 5 => {
+                        if let Some(s) = arg_string(params, 0) {
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.type_text(&s)
+                                }
+                            });
+                        }
+                    }
+                    6 => put_disp(result, Range { doc }),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Range (whole document, for the create path)
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Range {
+        doc: usize,
+    }
+
+    fn range_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "text" => 1,
+            "insertafter" => 2,
+            "insertbefore" => 3,
+            "insertparagraphafter" | "insertparagraph" => 4,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for Range_Impl {
+        no_typeinfo!();
+        dispatch_names!("Range", range_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let doc = self.doc;
+            unsafe {
+                log(&format!("Range[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                match id {
+                    1 => {
+                        if is_put(wflags) {
+                            let s = arg_string(params, 0).unwrap_or_default();
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.set_text(&s)
+                                }
+                            });
+                        } else {
+                            let t = reg(|r| r.docs.get(doc).map(|d| d.text()).unwrap_or_default());
+                            put(result, VARIANT::from(BSTR::from(t.as_str())));
+                        }
+                    }
+                    2 | 3 => {
+                        if let Some(s) = arg_string(params, 0) {
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.type_text(&s)
+                                }
+                            });
+                        }
+                    }
+                    4 => reg(|r| {
+                        if let Some(d) = r.docs.get_mut(doc) {
+                            d.type_paragraph()
+                        }
+                    }),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+}
