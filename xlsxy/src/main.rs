@@ -2805,10 +2805,9 @@ impl App {
     fn start_screen_key(&mut self, key: KeyEvent) -> bool {
         match self.start.key(key) {
             backstage::StartEvent::Choose(i) => self.start_choose(i),
-            backstage::StartEvent::Quit => {
-                self.request_exit();
-                false
-            }
+            // The welcome screen has no open workbook to lose, so Quit exits
+            // directly (matching docxy) — the in-app exit is what confirms.
+            backstage::StartEvent::Quit => true,
             backstage::StartEvent::None => false,
         }
     }
@@ -2825,7 +2824,7 @@ impl App {
                     bs.pane = backstage::Pane::Browser;
                 }
             }
-            _ => self.request_exit(), // Quit — always confirm first
+            _ => return true, // Quit — nothing open to lose, exit directly
         }
         false
     }
@@ -5822,12 +5821,11 @@ mod tests {
         app.start_screen = true;
         assert!(!app.start_choose(1));
         assert!(app.backstage.is_some());
-        // Quit opens the shared confirm modal instead of exiting outright.
+        // The welcome-screen Quit exits directly (nothing open to lose).
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.start_screen = true;
-        assert!(!app.start_choose(2));
-        assert!(app.confirm.is_some());
-        assert!(app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.start_choose(2), "welcome-screen Quit exits directly");
+        assert!(app.confirm.is_none());
     }
 
     #[test]
@@ -5843,11 +5841,8 @@ mod tests {
         assert_eq!(app.start.sel(), 0);
         assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Down)));
         assert_eq!(app.start.sel(), 1);
-        // A digit selects and activates: '3' → Quit, which opens the shared
-        // confirm modal instead of exiting outright.
-        assert!(!handle_key(&mut app, KeyEvent::from(KeyCode::Char('3'))));
-        assert!(app.confirm.is_some());
-        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('y'))));
+        // A digit selects and activates: '3' → Quit exits directly.
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('3'))));
     }
 
     #[test]
