@@ -33,6 +33,7 @@ pub mod load;
 pub mod markdown;
 pub mod mathbox;
 pub mod mermaid;
+pub mod mermaid_embed;
 pub mod mermaid_seq;
 pub mod model;
 pub mod notes;

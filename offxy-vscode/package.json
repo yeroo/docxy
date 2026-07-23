@@ -201,6 +201,7 @@
     "test:mermaid-svg": "node media/mermaid-svg.test.mjs",
     "test:mermaid-live": "node media/mermaid-live.test.mjs",
     "test:mermaid-render": "node media/mermaid-render.test.mjs",
+    "test:mermaid-embed": "node media/mermaid-embed.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

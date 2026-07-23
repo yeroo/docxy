@@ -10,6 +10,10 @@ fn main() {
         .read_to_string(&mut src)
         .expect("read");
     let (w, h, json) = docxcore::mermaid::geometry_box(&src);
-    eprintln!("canvas {w} x {h} EMU  ({:.1} x {:.1} in)", w as f64 / 914400.0, h as f64 / 914400.0);
+    eprintln!(
+        "canvas {w} x {h} EMU  ({:.1} x {:.1} in)",
+        w as f64 / 914400.0,
+        h as f64 / 914400.0
+    );
     println!("{json}");
 }
