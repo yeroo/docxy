@@ -24,7 +24,7 @@ mod win {
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    use docxcore::model::{Block, Document, Inline, Paragraph, ParProps, Run, RunProps};
+    use docxcore::model::{Align, Block, Document, Inline, Paragraph, ParProps, Run, RunProps};
     use docxcore::package::{Package, load_package, new_package, save_package};
 
     use windows::Win32::Foundation::{
@@ -69,6 +69,11 @@ mod win {
         pkg: Package,
         path: Option<String>,
         saved: bool,
+        /// Current character format — new text (`TypeText`) is emitted with this,
+        /// so the Word idiom `sel.Font.Bold = True : sel.TypeText "x"` works.
+        cur: RunProps,
+        /// Current paragraph alignment for new paragraphs.
+        cur_align: Align,
     }
 
     impl DocState {
@@ -77,6 +82,8 @@ mod win {
                 pkg: new_package(Document::default()),
                 path: None,
                 saved: false,
+                cur: RunProps::default(),
+                cur_align: Align::Left,
             }
         }
 
@@ -88,22 +95,43 @@ mod win {
                 pkg,
                 path: Some(path.to_string()),
                 saved: true,
+                cur: RunProps::default(),
+                cur_align: Align::Left,
             })
         }
 
-        /// Type text at the end, honoring embedded paragraph marks (\r / \n).
+        fn new_para(&self) -> Paragraph {
+            Paragraph {
+                props: ParProps {
+                    align: self.cur_align,
+                    ..ParProps::default()
+                },
+                content: vec![],
+            }
+        }
+        fn cur_run(&self, text: &str) -> Inline {
+            Inline::Run(Run {
+                text: text.to_string(),
+                props: self.cur.clone(),
+            })
+        }
+
+        /// Type text at the end, honoring embedded paragraph marks (\r / \n), in
+        /// the current character format.
         fn type_text(&mut self, s: &str) {
-            let body = &mut self.pkg.document.body;
-            if !matches!(body.last(), Some(Block::Paragraph(_))) {
-                body.push(Block::Paragraph(Paragraph::default()));
+            if !matches!(self.pkg.document.body.last(), Some(Block::Paragraph(_))) {
+                let p = self.new_para();
+                self.pkg.document.body.push(Block::Paragraph(p));
             }
             for (i, seg) in split_paragraphs(s).into_iter().enumerate() {
                 if i > 0 {
-                    body.push(Block::Paragraph(Paragraph::default()));
+                    let p = self.new_para();
+                    self.pkg.document.body.push(Block::Paragraph(p));
                 }
                 if !seg.is_empty() {
-                    if let Some(Block::Paragraph(p)) = body.last_mut() {
-                        p.content.push(text_inline(&seg));
+                    let run = self.cur_run(&seg);
+                    if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                        p.content.push(run);
                     }
                 }
             }
@@ -111,24 +139,30 @@ mod win {
         }
 
         fn type_paragraph(&mut self) {
-            self.pkg
-                .document
-                .body
-                .push(Block::Paragraph(Paragraph::default()));
+            let p = self.new_para();
+            self.pkg.document.body.push(Block::Paragraph(p));
             self.saved = false;
         }
 
-        /// Replace the whole body with paragraphs split from `s`.
+        /// Replace the whole body with paragraphs split from `s`, in the current
+        /// character format.
         fn set_text(&mut self, s: &str) {
+            let (align, props) = (self.cur_align, self.cur.clone());
             self.pkg.document.body = split_paragraphs(s)
                 .into_iter()
                 .map(|seg| {
                     Block::Paragraph(Paragraph {
-                        props: ParProps::default(),
+                        props: ParProps {
+                            align,
+                            ..ParProps::default()
+                        },
                         content: if seg.is_empty() {
                             vec![]
                         } else {
-                            vec![text_inline(&seg)]
+                            vec![Inline::Run(Run {
+                                text: seg,
+                                props: props.clone(),
+                            })]
                         },
                     })
                 })
@@ -162,13 +196,6 @@ mod win {
                 .unwrap_or("Document1")
                 .to_string()
         }
-    }
-
-    fn text_inline(s: &str) -> Inline {
-        Inline::Run(Run {
-            text: s.to_string(),
-            props: RunProps::default(),
-        })
     }
 
     /// Split on paragraph marks (\r\n, \r, \n), keeping empties so blank lines
@@ -408,6 +435,16 @@ mod win {
                 fn into_disp(self) -> IDispatch {
                     let i: $iface = self.into();
                     i.cast().expect("interface derives IDispatch")
+                }
+            }
+        };
+    }
+    /// For an object whose primary interface already IS IDispatch (Font etc.).
+    macro_rules! into_disp_idispatch {
+        ($struct:ty) => {
+            impl IntoDisp for $struct {
+                fn into_disp(self) -> IDispatch {
+                    self.into()
                 }
             }
         };
@@ -1031,6 +1068,11 @@ mod win {
             "insertafter" => 4,
             "insertbefore" => 5,
             "range" => 6,
+            "font" => 10,
+            "bold" => 11,
+            "italic" => 12,
+            "underline" => 13,
+            "paragraphformat" => 14,
             _ => return None,
         })
     }
@@ -1090,6 +1132,11 @@ mod win {
                         }
                     }
                     6 => put_disp(result, Range { doc }),
+                    10 => put_disp(result, WordFont { doc, all: false }),
+                    11 => return bool_prop(doc, false, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    12 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    13 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    14 => put_disp(result, ParaFmt { doc, all: false }),
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
@@ -1112,6 +1159,11 @@ mod win {
             "insertafter" => 2,
             "insertbefore" => 3,
             "insertparagraphafter" | "insertparagraph" => 4,
+            "font" => 10,
+            "bold" => 11,
+            "italic" => 12,
+            "underline" => 13,
+            "paragraphformat" => 14,
             _ => return None,
         })
     }
@@ -1161,6 +1213,210 @@ mod win {
                             d.type_paragraph()
                         }
                     }),
+                    // Range.Font/Bold/etc. format the EXISTING text (all runs).
+                    10 => put_disp(result, WordFont { doc, all: true }),
+                    11 => return bool_prop(doc, true, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    12 => return bool_prop(doc, true, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    13 => return bool_prop(doc, true, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    14 => put_disp(result, ParaFmt { doc, all: true }),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Font / ParagraphFormat — real formatting over docxcore RunProps/ParProps.
+    // `all=false` (from Selection) sets the current format that new text inherits;
+    // `all=true` (from Range) applies to the existing text.
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct WordFont {
+        doc: usize,
+        all: bool,
+    }
+    #[implement(IDispatch)]
+    struct ParaFmt {
+        doc: usize,
+        all: bool,
+    }
+    into_disp_idispatch!(WordFont);
+    into_disp_idispatch!(ParaFmt);
+
+    /// Apply a RunProps change to the current format (`all=false`) or to every run
+    /// in the document (`all=true`).
+    fn set_font(doc: usize, all: bool, f: impl Fn(&mut RunProps)) {
+        reg(|r| {
+            if let Some(d) = r.docs.get_mut(doc) {
+                if all {
+                    for b in &mut d.pkg.document.body {
+                        if let Block::Paragraph(p) = b {
+                            for inl in &mut p.content {
+                                if let Inline::Run(run) = inl {
+                                    f(&mut run.props);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    f(&mut d.cur);
+                }
+                d.saved = false;
+            }
+        });
+    }
+
+    unsafe fn bool_prop(
+        doc: usize,
+        all: bool,
+        wflags: DISPATCH_FLAGS,
+        params: *const DISPPARAMS,
+        result: *mut VARIANT,
+        set: impl Fn(&mut RunProps, bool),
+        get: impl Fn(&RunProps) -> bool,
+    ) -> Result<()> {
+        if is_put(wflags) {
+            let on = unsafe { arg_bool(params, 0, true) };
+            set_font(doc, all, |p| set(p, on));
+        } else {
+            let v = reg(|r| r.docs.get(doc).map(|d| get(&d.cur)).unwrap_or(false));
+            unsafe { put(result, VARIANT::from(v)) };
+        }
+        Ok(())
+    }
+
+    unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
+        unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
+    }
+
+    /// Word's WdColor is a packed BGR long (RGB(r,g,b) = r + g*256 + b*65536);
+    /// docxcore wants an uppercase RRGGBB hex. Negative = automatic -> None.
+    fn word_color_hex(c: i32) -> Option<String> {
+        if c < 0 {
+            return None;
+        }
+        let c = c as u32;
+        Some(format!(
+            "{:02X}{:02X}{:02X}",
+            c & 0xFF,
+            (c >> 8) & 0xFF,
+            (c >> 16) & 0xFF
+        ))
+    }
+
+    fn font_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "bold" => 1,
+            "italic" => 2,
+            "underline" => 3,
+            "size" => 4,
+            "name" => 5,
+            "color" => 6,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for WordFont_Impl {
+        no_typeinfo!();
+        dispatch_names!("Font", font_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (doc, all) = (self.doc, self.all);
+            unsafe {
+                log(&format!("Font[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                match id {
+                    1 => return bool_prop(doc, all, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    2 => return bool_prop(doc, all, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    3 => return bool_prop(doc, all, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    4 => {
+                        if is_put(wflags) {
+                            if let Some(pt) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
+                                let hp = (pt * 2.0).round() as u32;
+                                set_font(doc, all, |p| p.size_half_pts = Some(hp));
+                            }
+                        }
+                    }
+                    5 => {
+                        if is_put(wflags) {
+                            if let Some(nm) = arg_string(params, 0) {
+                                set_font(doc, all, |p| p.font = Some(nm.clone()));
+                            }
+                        }
+                    }
+                    6 => {
+                        if is_put(wflags) {
+                            if let Some(hex) = arg_i32(params, 0).and_then(word_color_hex) {
+                                set_font(doc, all, |p| p.color = Some(hex.clone()));
+                            }
+                        }
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn paraformat_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "alignment" => 1,
+            _ => return None,
+        })
+    }
+
+    impl IDispatch_Impl for ParaFmt_Impl {
+        no_typeinfo!();
+        dispatch_names!("ParagraphFormat", paraformat_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (doc, all) = (self.doc, self.all);
+            unsafe {
+                log(&format!("ParagraphFormat[{doc}]::Invoke id={id}"));
+                match id {
+                    // Alignment: WdParagraphAlignment 0=Left 1=Center 2=Right 3=Justify.
+                    1 => {
+                        if is_put(wflags) {
+                            let a = match arg_i32(params, 0) {
+                                Some(1) => Align::Center,
+                                Some(2) => Align::Right,
+                                Some(3) => Align::Justify,
+                                _ => Align::Left,
+                            };
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.cur_align = a;
+                                    if all {
+                                        for b in &mut d.pkg.document.body {
+                                            if let Block::Paragraph(p) = b {
+                                                p.props.align = a;
+                                            }
+                                        }
+                                    }
+                                    d.saved = false;
+                                }
+                            });
+                        }
+                    }
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
