@@ -29,6 +29,7 @@ fn main() -> windows::core::Result<()> {
             ("Font", 0x0002084d_0000_0000_c000_000000000046),
             ("Interior", 0x00020870_0000_0000_c000_000000000046),
         ],
+        disp_wanted: xlcomshim::DISP_IFACES,
         default_file: "docxy-excel.tlb",
     })
 }

@@ -34,6 +34,13 @@ pub struct Spec {
     pub version: (u16, u16),
     /// The dual interfaces to copy, as (name, IID-as-u128).
     pub wanted: &'static [(&'static str, u128)],
+    /// The dispinterfaces to author for the IDispatch/scripting path, as
+    /// (name, Office-source-IID, our-docxy-IID). Copied preserving real memids +
+    /// invkinds (property vs method) so typeinfo-driven late-bound clients
+    /// (pywin32, VB6) introspect each object correctly. Given OUR own IIDs so
+    /// they never collide with the dual `wanted` interfaces (which keep Office's
+    /// IIDs for vtable marshalling). Empty to author none.
+    pub disp_wanted: &'static [(&'static str, u128, u128)],
     /// Default output file name (next to the exe) when no path is given.
     pub default_file: &'static str,
 }
@@ -87,9 +94,102 @@ pub unsafe fn author(spec: &Spec, out: &str) -> Result<()> {
                 Err(e) => eprintln!("{name}: copy failed ({e:?}); skipping"),
             }
         }
+        // Dispinterfaces for the IDispatch/scripting path (real memids+invkinds).
+        let (mut disp_done, mut disp_total) = (0usize, 0usize);
+        for (name, src_iid, docxy_iid) in spec.disp_wanted {
+            let src_iid = GUID::from_u128(*src_iid);
+            let docxy_iid = GUID::from_u128(*docxy_iid);
+            let sti = match src.GetTypeInfoOfGuid(&src_iid) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{name} (disp): source {src_iid:?} not found ({e:?}); skipping");
+                    continue;
+                }
+            };
+            match copy_dispinterface(&dst, &sti, name, &docxy_iid) {
+                Ok(n) => {
+                    disp_total += n;
+                    disp_done += 1;
+                    println!("{name} (disp): copied {n} members");
+                }
+                Err(e) => eprintln!("{name} (disp): copy failed ({e:?}); skipping"),
+            }
+        }
+
         dst.SaveAllChanges()?;
-        println!("wrote {out} ({done} vtable interfaces, {total} funcs)");
+        println!(
+            "wrote {out} ({done} vtable interfaces / {total} funcs, {disp_done} dispinterfaces / {disp_total} members)"
+        );
         Ok(())
+    }
+}
+
+/// Author a TKIND_DISPINTERFACE copying `sti`'s members, PRESERVING each real
+/// memid and invkind (property-get / property-put / method) so an IDispatch
+/// client that introspects typeinfo sees properties as properties and methods as
+/// methods. Types are flattened to intrinsics (no cross-typelib refs), which is
+/// fine for the dispatch path: the client calls by dispid and re-introspects each
+/// returned object via ITS own GetTypeInfo.
+unsafe fn copy_dispinterface(
+    dst: &ICreateTypeLib2,
+    sti: &ITypeInfo,
+    name: &str,
+    iid: &GUID,
+) -> Result<usize> {
+    unsafe {
+        let attr = sti.GetTypeAttr()?;
+        let cfuncs = (*attr).cFuncs as u32;
+        sti.ReleaseTypeAttr(attr);
+        let cti: ICreateTypeInfo = dst.CreateTypeInfo(&HSTRING::from(name), TKIND_DISPATCH)?;
+        cti.SetGuid(iid)?;
+        cti.SetTypeFlags((TYPEFLAG_FDISPATCHABLE.0 | TYPEFLAG_FDUAL.0) as u32)
+            .or_else(|_| cti.SetTypeFlags(TYPEFLAG_FDISPATCHABLE.0 as u32))?;
+
+        let mut added = 0u32;
+        for f in 0..cfuncs {
+            let fd = sti.GetFuncDesc(f)?;
+            // Skip the inherited IUnknown/IDispatch members (memids 0x6000_0000..)
+            // — a dispinterface lists only its own dispatch members.
+            if ((*fd).memid as u32 & 0xFFFF_0000) == 0x6000_0000 {
+                sti.ReleaseFuncDesc(fd);
+                continue;
+            }
+            flatten_elem(sti, &mut (*fd).elemdescFunc.tdesc);
+            let cparams = (*fd).cParams as usize;
+            for p in 0..cparams {
+                let ed = (*fd).lprgelemdescParam.add(p);
+                flatten_elem(sti, &mut (*ed).tdesc);
+            }
+            // Present as a dispatch member; keep the real memid + invkind.
+            (*fd).funckind = FUNC_DISPATCH;
+            (*fd).oVft = 0;
+            if let Err(e) = cti.AddFuncDesc(added, fd) {
+                // Non-fatal: a member LayOut rejects (e.g. a get/put pair the
+                // flattening perturbs) is skipped, not fatal to the whole iface.
+                eprintln!("  {name} (disp) member#{f} memid={:#x}: {e:?}; skip", (*fd).memid);
+                sti.ReleaseFuncDesc(fd);
+                continue;
+            }
+            // Copy the member + parameter NAMES — without them a client can't map
+            // `obj.Workbooks` to a dispid from the typeinfo, and makepy chokes on
+            // the missing name. GetNames returns [funcname, param0, param1, ...].
+            let mut names: [BSTR; 64] = std::array::from_fn(|_| BSTR::new());
+            let mut cnames = 0u32;
+            if sti.GetNames((*fd).memid, &mut names, &mut cnames).is_ok() && cnames > 0 {
+                // A property-put's value parameter shares the member name in some
+                // typelibs; SetFuncAndParamNames only needs the leading names.
+                let ptrs: Vec<PCWSTR> =
+                    names[..cnames as usize].iter().map(|b| PCWSTR(b.as_ptr())).collect();
+                if let Err(e) = cti.SetFuncAndParamNames(added, &ptrs) {
+                    // A duplicate name (rare, from flattening) is non-fatal.
+                    eprintln!("  {name} (disp) member#{f} names: {e:?}; unnamed");
+                }
+            }
+            sti.ReleaseFuncDesc(fd);
+            added += 1;
+        }
+        cti.LayOut()?;
+        Ok(added as usize)
     }
 }
 

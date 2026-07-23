@@ -28,6 +28,7 @@ fn main() -> windows::core::Result<()> {
             ("_Font", 0x00020952_0000_0000_c000_000000000046),
             ("_ParagraphFormat", 0x00020953_0000_0000_c000_000000000046),
         ],
+        disp_wanted: wordcomshim::DISP_IFACES,
         default_file: "docxy-word.tlb",
     })
 }

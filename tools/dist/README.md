@@ -51,7 +51,12 @@ Office's real CLSID, plus the ProgIDs:
   no-Office box needs a type library for the universal marshaller; the shipped
   `.tlb` files (proven ABI-identical to Office's, see the oracle tests) supply it.
 
-Both late-bound (`IDispatch`) and early-bound (typed vtable) clients work.
+Both late-bound (`IDispatch`) and early-bound (typed vtable) clients work — the
+.NET Office PIA (Petrel's path), VBScript/`cscript`, and type-info-driven scripting
+clients like **pywin32** (`win32com.client.Dispatch` / `gencache.EnsureDispatch`),
+which the shims support by serving each object's real type information from the
+bundled `.tlb`. If Python + pywin32 are on the target, the conformance tests under
+`tools/comshim-tests/python/` and `tools/wordshim-tests/python/` exercise that path.
 
 ## Nothing is stomped
 

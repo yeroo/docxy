@@ -20,6 +20,11 @@
 #[cfg(windows)]
 pub use win::run;
 
+/// The dispinterfaces the shim serves + the mktypelib bin authors — (name, Office
+/// source IID, our docxy IID). Shared so the .tlb and the shim never drift.
+#[cfg(windows)]
+pub use win::DISP_IFACES;
+
 #[cfg(windows)]
 mod win {
     // COM interface methods are PascalCase by contract (they map to Excel's
@@ -49,6 +54,60 @@ mod win {
     use windows::core::{
         BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
     };
+
+    /// OUR authored type library's LIBID (see the mktypelib bin's `docxy_libid`).
+    /// We source per-object typeinfo from HERE — our own registered docxy-excel.tlb
+    /// — so it works on a machine with NO Excel (the VDI), not just this dev box.
+    const DOCXY_LIBID: GUID = GUID::from_u128(0x7b3f9e21_4c1a_4e8b_a2d6_9f5c1e0b7a31);
+
+    /// The dispinterfaces we author + serve, as (name, Office source IID, our
+    /// docxy IID). The mktypelib bin copies each Office dispinterface (real memids
+    /// + invkinds) into our .tlb under OUR IID; the shim's `GetTypeInfo` returns
+    /// that IID's typeinfo, so a typeinfo-driven late-bound client (pywin32, VB6)
+    /// introspects each object correctly. Single source of truth for both.
+    // Names are prefixed `Docxy` so they never collide with the identically-named
+    // dual `wanted` interfaces in the same typelib (a typelib requires unique type
+    // names); the name is cosmetic for the dispatch path (clients read members).
+    pub const DISP_IFACES: &[(&str, u128, u128)] = &[
+        ("DocxyApplication", 0x000208d5_0000_0000_c000_000000000046, 0xd0c9a001_0208_d500_a2d6_9f5c1e0b7a31),
+        ("DocxyWorkbooks", 0x000208db_0000_0000_c000_000000000046, 0xd0c9a002_0208_db00_a2d6_9f5c1e0b7a31),
+        ("DocxyWorkbook", 0x000208da_0000_0000_c000_000000000046, 0xd0c9a003_0208_da00_a2d6_9f5c1e0b7a31),
+        ("DocxyWorksheets", 0x000208b1_0000_0000_c000_000000000046, 0xd0c9a004_0208_b100_a2d6_9f5c1e0b7a31),
+        ("DocxyWorksheet", 0x000208d8_0000_0000_c000_000000000046, 0xd0c9a005_0208_d800_a2d6_9f5c1e0b7a31),
+        ("DocxyRange", 0x00020846_0000_0000_c000_000000000046, 0xd0c9a006_0002_0846_a2d6_9f5c1e0b7a31),
+        ("DocxyFont", 0x0002084d_0000_0000_c000_000000000046, 0xd0c9a007_0002_084d_a2d6_9f5c1e0b7a31),
+        ("DocxyInterior", 0x00020870_0000_0000_c000_000000000046, 0xd0c9a008_0002_0870_a2d6_9f5c1e0b7a31),
+    ];
+
+    /// Return the ITypeInfo for one of OUR dispinterface IIDs from our registered
+    /// docxy typelib. Errs (→ client falls back to typeinfo-less dynamic) when the
+    /// .tlb isn't registered.
+    fn docxy_typeinfo(iid_u128: u128) -> Result<windows::Win32::System::Com::ITypeInfo> {
+        unsafe {
+            windows::Win32::System::Ole::LoadRegTypeLib(&DOCXY_LIBID, 1, 0, 0)?
+                .GetTypeInfoOfGuid(&GUID::from_u128(iid_u128))
+        }
+    }
+
+    /// The two IDispatch typeinfo methods for an object, sourcing its dispinterface
+    /// typeinfo by OUR docxy IID.
+    macro_rules! xl_typeinfo {
+        ($iid:expr) => {
+            fn GetTypeInfoCount(&self) -> Result<u32> {
+                Ok(1)
+            }
+            fn GetTypeInfo(
+                &self,
+                i: u32,
+                _l: u32,
+            ) -> Result<windows::Win32::System::Com::ITypeInfo> {
+                if i != 0 {
+                    return Err(DISP_E_BADINDEX.into());
+                }
+                docxy_typeinfo($iid)
+            }
+        };
+    }
 
     /// Our own coclass CLSID — a brand-new GUID, NEVER Microsoft's Excel CLSID
     /// {00024500-…}. `Excel.Application` (the ProgID) points here in HKCU.
@@ -696,7 +755,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Application_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a001_0208_d500_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -787,7 +846,7 @@ mod win {
                         log("Application::Quit");
                         PostQuitMessage(0);
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -814,7 +873,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Workbooks_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a002_0208_db00_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -858,7 +917,7 @@ mod win {
                     }
                     118 => put(result, VARIANT::from(reg(|r| r.books.len() as i32))),
                     277 => {} // Close all — no-op
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -892,7 +951,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Workbook_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a003_0208_da00_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -1002,7 +1061,7 @@ mod win {
                         };
                         put(result, VARIANT::from(BSTR::from(out.as_str())));
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1029,7 +1088,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Worksheets_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a004_0208_b100_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -1069,7 +1128,7 @@ mod win {
                         // set; multi-sheet add lands with the broader coverage pass).
                         put_obj(result, Worksheet { book, sheet: 0 });
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1151,7 +1210,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Worksheet_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a005_0208_d800_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -1319,7 +1378,7 @@ mod win {
                         );
                     }
                     304 | 235 => {} // Activate / Select — no-op
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1400,7 +1459,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Range_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a006_0002_0846_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -1707,7 +1766,7 @@ mod win {
                         };
                         put(result, VARIANT::from(BSTR::from(s.as_str())));
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1871,7 +1930,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Font_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a007_0002_084d_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -1962,7 +2021,7 @@ mod win {
                             put(result, VARIANT::from(BSTR::from(n.as_str())));
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1970,7 +2029,7 @@ mod win {
     }
 
     impl IDispatch_Impl for Interior_Impl {
-        no_typeinfo!();
+        xl_typeinfo!(0xd0c9a008_0002_0870_a2d6_9f5c1e0b7a31);
         fn GetIDsOfNames(
             &self,
             _riid: *const GUID,
@@ -2018,7 +2077,7 @@ mod win {
                             }
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -2068,7 +2127,7 @@ mod win {
             _riid: *const GUID,
             _lcid: u32,
             wflags: DISPATCH_FLAGS,
-            _params: *const DISPPARAMS,
+            params: *const DISPPARAMS,
             result: *mut VARIANT,
             _ei: *mut EXCEPINFO,
             _ae: *mut u32,
@@ -2098,7 +2157,7 @@ mod win {
                             apply_style(book, sheet, rect, |xf| xf.border = true);
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
