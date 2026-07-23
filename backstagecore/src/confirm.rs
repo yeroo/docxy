@@ -54,6 +54,11 @@ impl<A: Clone> Confirm<A> {
         self.yes
     }
 
+    /// The prompt text shown in the dialog.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
     /// Keys: ←/→/Tab move between Yes/No, y/n choose directly, Enter confirms
     /// the selection, Esc cancels.
     pub fn key(&mut self, key: KeyEvent) -> ConfirmOutcome<A> {
