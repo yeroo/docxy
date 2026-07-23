@@ -24,8 +24,21 @@ mod win {
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    use docxcore::model::{Align, Block, Document, Inline, Paragraph, ParProps, Run, RunProps};
+    use docxcore::model::{
+        Align, Block, Cell, Document, Inline, Paragraph, ParProps, Row, Run, RunProps, Table, VMerge,
+    };
     use docxcore::package::{Package, load_package, new_package, save_package};
+
+    /// A plain single-line bordered `w:tblPr` for tables the shim creates (Word's
+    /// `Tables.Add` makes a bordered table by default).
+    const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
+<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+</w:tblBorders></w:tblPr>";
 
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, E_FAIL, E_NOTIMPL,
@@ -195,6 +208,97 @@ mod win {
                 .and_then(|p| p.rsplit(['\\', '/']).next())
                 .unwrap_or("Document1")
                 .to_string()
+        }
+
+        // ---- tables ----
+
+        fn table_count(&self) -> usize {
+            self.pkg
+                .document
+                .body
+                .iter()
+                .filter(|b| matches!(b, Block::Table(_)))
+                .count()
+        }
+
+        /// Append a rows×cols bordered table; returns its 1-based table number.
+        fn add_table(&mut self, rows: usize, cols: usize) -> usize {
+            let cols = cols.max(1);
+            let cell = || Cell {
+                grid_span: 1,
+                v_merge: VMerge::default(),
+                blocks: vec![Block::Paragraph(Paragraph::default())],
+                raw_tcpr: None,
+            };
+            let table = Table {
+                grid: vec![0; cols],
+                rows: (0..rows.max(1))
+                    .map(|_| Row {
+                        cells: (0..cols).map(|_| cell()).collect(),
+                        raw_props: vec![],
+                    })
+                    .collect(),
+                raw_tblpr: Some(TBLPR.to_string()),
+            };
+            self.pkg.document.body.push(Block::Table(table));
+            self.saved = false;
+            self.table_count()
+        }
+
+        /// The 1-based Nth table's block.
+        fn table_mut(&mut self, tno: usize) -> Option<&mut Table> {
+            self.pkg
+                .document
+                .body
+                .iter_mut()
+                .filter_map(|b| match b {
+                    Block::Table(t) => Some(t),
+                    _ => None,
+                })
+                .nth(tno.saturating_sub(1))
+        }
+
+        /// Set a cell's text (1-based row/col) in the current character format.
+        fn set_cell_text(&mut self, tno: usize, row: usize, col: usize, text: &str) {
+            let props = self.cur.clone();
+            if let Some(t) = self.table_mut(tno) {
+                if let Some(c) = t
+                    .rows
+                    .get_mut(row.saturating_sub(1))
+                    .and_then(|r| r.cells.get_mut(col.saturating_sub(1)))
+                {
+                    c.blocks = vec![Block::Paragraph(Paragraph {
+                        props: ParProps::default(),
+                        content: vec![Inline::Run(Run {
+                            text: text.to_string(),
+                            props,
+                        })],
+                    })];
+                }
+            }
+            self.saved = false;
+        }
+
+        fn cell_text(&self, tno: usize, row: usize, col: usize) -> String {
+            self.pkg
+                .document
+                .body
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Table(t) => Some(t),
+                    _ => None,
+                })
+                .nth(tno.saturating_sub(1))
+                .and_then(|t| t.rows.get(row.saturating_sub(1)))
+                .and_then(|r| r.cells.get(col.saturating_sub(1)))
+                .map(|c| {
+                    c.blocks
+                        .iter()
+                        .map(|b| b.plain_text())
+                        .collect::<Vec<_>>()
+                        .join("\r")
+                })
+                .unwrap_or_default()
         }
     }
 
@@ -437,6 +541,17 @@ mod win {
                     i.cast().expect("interface derives IDispatch")
                 }
             }
+        };
+    }
+    /// For objects whose primary interface already IS IDispatch (the collection /
+    /// leaf helpers that a client only ever uses late-bound).
+    macro_rules! into_disp_idispatch {
+        ($($struct:ty),+ $(,)?) => {
+            $(impl IntoDisp for $struct {
+                fn into_disp(self) -> IDispatch {
+                    self.into()
+                }
+            })+
         };
     }
 
@@ -1120,6 +1235,7 @@ mod win {
             "path" => 7,
             "activate" | "select" => 8,
             "paragraphs" => 9,
+            "tables" => 10,
             _ => return None,
         })
     }
@@ -1175,6 +1291,7 @@ mod win {
                         r.docs.get(doc).and_then(|d| d.path.clone()).unwrap_or_default()
                     }).as_str()))),
                     8 => {} // Activate / Select — no-op
+                    10 => put_disp(result, Tables { doc }),
                     _ => return unhandled(id, wflags, result),
                 }
                 Ok(())
@@ -1548,6 +1665,208 @@ mod win {
                                         }
                                     }
                                     d.saved = false;
+                                }
+                            });
+                        }
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tables: Document.Tables.Add(range, rows, cols) -> Table.Cell(r,c).Range.Text
+    // Late-bound (IDispatch); collections/leaves a report generator walks.
+    // -----------------------------------------------------------------------
+
+    #[implement(IDispatch)]
+    struct Tables {
+        doc: usize,
+    }
+    #[implement(IDispatch)]
+    struct WordTable {
+        doc: usize,
+        tno: usize,
+    }
+    #[implement(IDispatch)]
+    struct WordCell {
+        doc: usize,
+        tno: usize,
+        row: usize,
+        col: usize,
+    }
+    #[implement(IDispatch)]
+    struct CellRange {
+        doc: usize,
+        tno: usize,
+        row: usize,
+        col: usize,
+    }
+    into_disp_idispatch!(Tables, WordTable, WordCell, CellRange);
+
+    fn tables_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "add" => 1,
+            "item" | "_default" => 2,
+            "count" => 3,
+            _ => return None,
+        })
+    }
+    impl IDispatch_Impl for Tables_Impl {
+        no_typeinfo!();
+        dispatch_names!("Tables", tables_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let doc = self.doc;
+            unsafe {
+                log(&format!("Tables[{doc}]::Invoke id={id}"));
+                match id {
+                    // Add(Range, NumRows, NumColumns, …) — args after the range.
+                    1 => {
+                        let rows = arg_i32(params, 1).unwrap_or(1).max(1) as usize;
+                        let cols = arg_i32(params, 2).unwrap_or(1).max(1) as usize;
+                        let tno = reg(|r| r.docs.get_mut(doc).map(|d| d.add_table(rows, cols)))
+                            .unwrap_or(0);
+                        put_disp(result, WordTable { doc, tno });
+                    }
+                    2 => {
+                        let tno = arg_i32(params, 0).unwrap_or(1).max(1) as usize;
+                        put_disp(result, WordTable { doc, tno });
+                    }
+                    3 => put(result, VARIANT::from(reg(|r| r.docs.get(doc).map(|d| d.table_count()).unwrap_or(0)) as i32)),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn table_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "cell" => 1,
+            "rows" => 2,
+            "columns" => 3,
+            _ => return None,
+        })
+    }
+    impl IDispatch_Impl for WordTable_Impl {
+        no_typeinfo!();
+        dispatch_names!("Table", table_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (doc, tno) = (self.doc, self.tno);
+            unsafe {
+                log(&format!("Table[{doc}/{tno}]::Invoke id={id}"));
+                match id {
+                    // Cell(Row, Column)
+                    1 => {
+                        let row = arg_i32(params, 0).unwrap_or(1).max(1) as usize;
+                        let col = arg_i32(params, 1).unwrap_or(1).max(1) as usize;
+                        put_disp(result, WordCell { doc, tno, row, col });
+                    }
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn cell_member_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "range" => 1,
+            _ => return None,
+        })
+    }
+    impl IDispatch_Impl for WordCell_Impl {
+        no_typeinfo!();
+        dispatch_names!("Cell", cell_member_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            _params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (doc, tno, row, col) = (self.doc, self.tno, self.row, self.col);
+            unsafe {
+                match id {
+                    1 => put_disp(result, CellRange { doc, tno, row, col }),
+                    _ => return unhandled(id, wflags, result),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn cellrange_id(name: &str) -> Option<i32> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "text" => 1,
+            "insertafter" | "insertbefore" => 2,
+            _ => return None,
+        })
+    }
+    impl IDispatch_Impl for CellRange_Impl {
+        no_typeinfo!();
+        dispatch_names!("CellRange", cellrange_id);
+        fn Invoke(
+            &self,
+            id: i32,
+            _riid: *const GUID,
+            _lcid: u32,
+            wflags: DISPATCH_FLAGS,
+            params: *const DISPPARAMS,
+            result: *mut VARIANT,
+            _ei: *mut EXCEPINFO,
+            _ae: *mut u32,
+        ) -> Result<()> {
+            let (doc, tno, row, col) = (self.doc, self.tno, self.row, self.col);
+            unsafe {
+                match id {
+                    1 => {
+                        if is_put(wflags) {
+                            let s = arg_string(params, 0).unwrap_or_default();
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    d.set_cell_text(tno, row, col, &s)
+                                }
+                            });
+                        } else {
+                            let t = reg(|r| {
+                                r.docs.get(doc).map(|d| d.cell_text(tno, row, col)).unwrap_or_default()
+                            });
+                            put(result, VARIANT::from(BSTR::from(t.as_str())));
+                        }
+                    }
+                    2 => {
+                        if let Some(s) = arg_string(params, 0) {
+                            reg(|r| {
+                                if let Some(d) = r.docs.get_mut(doc) {
+                                    let cur = d.cell_text(tno, row, col);
+                                    d.set_cell_text(tno, row, col, &(cur + &s))
                                 }
                             });
                         }
