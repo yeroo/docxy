@@ -55,9 +55,13 @@ if (HavePyWin32) {
     Record 'pywin32' 'Excel' ($LASTEXITCODE -eq 0)
     & python (Join-Path $tools 'wordshim-tests\python\pywin32_conformance.py') | Out-Null
     Record 'pywin32' 'Word' ($LASTEXITCODE -eq 0)
+    # pywin32's OWN upstream Office corpus (testMSOffice.py ops). Contract: 0 faults.
+    & python (Join-Path $tools 'comshim-tests\corpus\pywin32_msoffice_corpus.py') | Out-Null
+    Record 'pywin32 upstream corpus' 'Excel+Word (no-fault)' ($LASTEXITCODE -eq 0)
 } else {
     Record 'pywin32' 'Excel' $null
     Record 'pywin32' 'Word' $null
+    Record 'pywin32 upstream corpus' 'Excel+Word (no-fault)' $null
 }
 
 # --- PowerShell COM, under whichever hosts exist ---

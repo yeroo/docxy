@@ -247,16 +247,28 @@ impl IDispatch_Impl for NullObject_Impl {
     }
     fn Invoke(
         &self,
-        id: i32,
+        _id: i32,
         _riid: *const GUID,
         _lcid: u32,
         wflags: DISPATCH_FLAGS,
-        params: *const DISPPARAMS,
+        _params: *const DISPPARAMS,
         result: *mut VARIANT,
         _ei: *mut EXCEPINFO,
         _ae: *mut u32,
     ) -> Result<()> {
-        unsafe { unhandled(id, wflags, params, result) }
+        // A NullObject must NEVER fault — it is the graceful-degradation sink, so a
+        // host can walk/call/coerce an unmodeled chain (Columns.EntireColumn.AutoFit(),
+        // some.Unknown.Thing) without an error aborting its export. Every get/call
+        // returns another NullObject so the chain keeps flowing; a put is swallowed.
+        // Unlike a REAL modeled object (which routes through `unhandled`, where an
+        // absent default property correctly yields DISP_E_MEMBERNOTFOUND), the null
+        // sink returns itself even for DISPID_VALUE so coercions don't fault.
+        unsafe {
+            if !is_put(wflags) {
+                put(result, VARIANT::from(null_dispatch()));
+            }
+        }
+        Ok(())
     }
 }
 
