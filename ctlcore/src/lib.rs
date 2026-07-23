@@ -42,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single control request handed to the consumer. Reply exactly once with
 /// [`reply_ok`](Request::reply_ok) or [`reply_err`](Request::reply_err); if the
@@ -151,7 +150,7 @@ impl Drop for Server {
 pub fn serve(dir: &Path, instance: &str) -> std::io::Result<(Server, Receiver<Request>)> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    let token = mint_token(port);
+    let token = mint_token();
 
     std::fs::create_dir_all(dir)?;
     let discovery = dir.join(format!("{instance}.json"));
@@ -283,7 +282,7 @@ fn dispatch_line(line: &str, token: &str, tx: &mpsc::Sender<Request>) -> Result<
     };
     let id = msg.get("id").cloned().unwrap_or(Json::Null);
 
-    if msg.get_str("token") != Some(token) {
+    if !constant_time_eq(msg.get_str("token").unwrap_or(""), token) {
         return Err(err_line(&id, "unauthorized: bad or missing token"));
     }
     let Some(verb) = msg.get_str("verb") else {
@@ -318,23 +317,82 @@ fn err_line(id: &Json, msg: &str) -> String {
     .to_line()
 }
 
-/// Derive a hard-to-guess token from process-unique, per-run entropy. This is a
-/// loopback dev-tool capability check, not a cryptographic secret: it combines
-/// the wall clock, the pid, the chosen port, and an ASLR-influenced heap address.
-fn mint_token(port: u16) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let heap = Box::new(0u8);
-    let addr = (&*heap as *const u8) as u128;
-    let mixed = nanos
-        ^ (pid << 17)
-        ^ ((port as u128) << 40)
-        ^ addr.rotate_left(29)
-        ^ addr.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    format!("{mixed:032x}")
+/// Mint the capability token that gates the control surface, from 256 bits of
+/// OS randomness (hex-encoded). This token is the *only* barrier against a
+/// different local (non-admin) user who can `connect()` to the loopback port
+/// but can't read the discovery file, and it authorizes verbs that read all
+/// mail and send/delete/move messages — so it must be a real secret. Deriving
+/// it from observable per-process values (pid, port, start time) would leave
+/// only a handful of secret bits; the OS CSPRNG closes that.
+fn mint_token() -> String {
+    os_random_bytes(32)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Reads `n` bytes from the OS CSPRNG. ctlcore is deliberately
+/// dependency-free, so the RNG is reached through a hand-declared FFI on
+/// Windows (`BCryptGenRandom`, no `windows-sys` dependency) and a
+/// `/dev/urandom` read elsewhere — mirroring how the mail crate sources its
+/// PKCE randomness. Panics if the OS RNG is unavailable: a control surface
+/// with a guessable token must not come up at all.
+#[cfg(windows)]
+fn os_random_bytes(n: usize) -> Vec<u8> {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut core::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG: with a null algorithm handle, select
+    // the system-preferred RNG (no handle to allocate/close).
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    let mut buf = vec![0u8; n];
+    // SAFETY: `buf` is a valid, uniquely-owned buffer of length `n`; we pass
+    // its exact length and a null algorithm handle, which per the BCrypt docs
+    // selects the system-preferred RNG.
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    assert!(status == 0, "BCryptGenRandom failed: NTSTATUS {status:#x}");
+    buf
+}
+
+/// See the `windows` cfg of this function. Reads OS randomness from
+/// `/dev/urandom` on non-Windows targets.
+#[cfg(not(windows))]
+fn os_random_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    f.read_exact(&mut buf).expect("read /dev/urandom");
+    buf
+}
+
+/// Constant-time equality for the per-request token check, so a remote caller
+/// can't learn the token a matching character at a time through response
+/// timing. The token's length is fixed and not itself a secret, so a length
+/// mismatch may short-circuit.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +495,26 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::time::Duration;
+
+    #[test]
+    fn mint_token_is_256_bits_of_hex_and_unique() {
+        let a = mint_token();
+        let b = mint_token();
+        assert_eq!(a.len(), 64, "32 random bytes → 64 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Two mints from the OS CSPRNG must not collide (the old derivation
+        // could, when pid/port/start-time repeated). M1.
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_only_identical() {
+        assert!(constant_time_eq("deadbeef", "deadbeef"));
+        assert!(!constant_time_eq("deadbeef", "deadbee0")); // same length, differs
+        assert!(!constant_time_eq("deadbeef", "dead")); // length mismatch
+        assert!(!constant_time_eq("", "x"));
+        assert!(constant_time_eq("", ""));
+    }
 
     /// Drive the consumer side on a detached background thread: echo the verb
     /// back as the result, or error on `verb == "boom"`. Detached (not joined) so

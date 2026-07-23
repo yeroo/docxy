@@ -26,6 +26,8 @@ docxcore = { version = "0.4.0", path = "../docxcore" }
 ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
 ratatui = "0.29"
+ribboncore = { version = "0.1.0", path = "../ribboncore" }
+backstagecore = { version = "0.1.0", path = "../backstagecore" }
 # OS clipboard bridge (copy/paste across applications).
 arboard = "3"
 # Inline images (kitty/iTerm2/Sixel, with a half-block fallback).

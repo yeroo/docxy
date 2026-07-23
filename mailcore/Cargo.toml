@@ -1,0 +1,27 @@
+[package]
+name = "mailcore"
+description = "Headless engine for lookxy: OAuth2 auth-code + PKCE auth, a Microsoft Graph mail client, a local SQLite store, and a background sync engine."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["email", "outlook", "exchange", "graph", "tui"]
+categories = ["email", "api-bindings"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Blocking HTTP with rustls TLS; native certs so corporate TLS-inspection roots work.
+ureq = { version = "2.10", features = ["tls", "native-certs"] }
+# Local mail store. Bundled SQLite (no system-lib dep); bundled enables FTS5 (-DSQLITE_ENABLE_FTS5), so search needs no extra feature.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Shared rich-text editing model (compose editor buffer <-> email HTML).
+editcore = { version = "0.1.0", path = "../editcore" }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (CryptProtectData / CryptUnprotectData) for the token cache at rest.
+windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }

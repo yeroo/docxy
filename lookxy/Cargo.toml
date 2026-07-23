@@ -1,0 +1,43 @@
+[package]
+name = "lookxy"
+description = "Lookxy — a terminal (TUI) Outlook/Exchange mail client over Microsoft Graph."
+# Versioned independently of the docxy/docxcore release train.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["email", "outlook", "exchange", "graph", "tui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "lookxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Shared backstage chrome (the styled left-menu column), also used by
+# docxy/xlsxy/yppxy's File backstage.
+backstagecore = { version = "0.1.0", path = "../backstagecore" }
+# Path + version so `lookxy` can be published once `mailcore` is on crates.io.
+mailcore = { version = "0.1.0", path = "../mailcore" }
+ribboncore = { version = "0.1.0", path = "../ribboncore" }
+# Shared rich-text editing model (the compose view's body editor buffer).
+editcore = { version = "0.1.0", path = "../editcore" }
+# The agent control surface (loopback-TCP + newline-JSON), used to drive the
+# live mailbox from a sibling agwinterm pane.
+ctlcore = { version = "0.4.0", path = "../ctlcore" }
+# ratatui re-exports crossterm, so we don't depend on crossterm separately.
+ratatui = "0.29"
+# Display-column widths for correct alignment + truncation with wide glyphs.
+unicode-width = "0.2"
+# Terminal graphics protocol detection + encoding for painting decoded inline
+# images over the reading pane's reserved bands (see `ui::reading`).
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+# Decodes inline image bytes (cid/data: attachments) before handing them to
+# ratatui-image's encoder.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
