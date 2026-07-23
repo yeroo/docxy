@@ -3304,12 +3304,22 @@ impl App {
         let mrow = m.row as usize;
         let col =
             (m.column as usize).saturating_sub(self.doc_x0 as usize) + self.doc_hscroll as usize;
-        // A left-click in the ribbon area drives the ribbon; other events (wheel,
-        // drag) fall through to the document so scrolling works anywhere.
+        // A left-click in the ribbon area drives the ribbon. The press, any
+        // micro-drag it carries, and its release must ALL be consumed here —
+        // otherwise a Drag/Up over the ribbon falls through to the document and
+        // drags the text selection off wherever it was (e.g. clicking Bold while
+        // a word is selected moves the selection instead of bolding it). Wheel
+        // events still fall through so scrolling works anywhere over the ribbon.
         if mrow < self.ribbon_h {
-            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                self.ribbon_click(m.column, m.row);
-                return;
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.ribbon_click(m.column, m.row);
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    return;
+                }
+                _ => {}
             }
         }
         // Ignore left-clicks on the ruler row (between the ribbon and the document).
@@ -7269,6 +7279,48 @@ mod tests {
         assert!(
             !app.follow_caret,
             "dragging shouldn't fight the user's scroll"
+        );
+    }
+
+    #[test]
+    fn ribbon_area_drag_does_not_move_document_selection() {
+        // Regression: clicking a ribbon button while text was selected moved the
+        // selection instead of running the button. A real click is
+        // Down→Drag→Up; only Down was intercepted over the ribbon, so the Drag/Up
+        // leaked to the document as a text-selection drag.
+        let mut app = app_with(&["hello world"]);
+        app.ribbon_open = true;
+        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            app.ribbon_h > 3,
+            "ribbon body must cover button row 1 (y=3)"
+        );
+        // Select "hello" by dragging in the document (sets the drag anchor).
+        let y = app.doc_y0;
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.doc_x0,
+            y,
+        ));
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.doc_x0 + 5,
+            y,
+        ));
+        let before = app
+            .editor
+            .selection_range()
+            .expect("dragging selected some text");
+        // A drag + release over the ribbon (row 3, the Bold row) must be swallowed.
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 14, 3));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 14, 3));
+        assert_eq!(
+            before,
+            app.editor
+                .selection_range()
+                .expect("selection must be preserved"),
+            "a drag/release over the ribbon must not touch the document selection"
         );
     }
 
