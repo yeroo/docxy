@@ -929,7 +929,18 @@ impl Docxy {
             Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
             Control::Large(cmd) => self.icon_btn(cmd, !icon_only, pal, cx),
             Control::Column(cmds) => {
-                v_flex().gap(px(1.)).children(cmds.iter().map(|cm| self.icon_btn(cm, !icon_only, pal, cx))).into_any_element()
+                // Office caps a button column at 3 rows; extra buttons wrap into
+                // the next column so nothing overflows the ribbon body height.
+                let cols: Vec<AnyElement> = cmds
+                    .chunks(3)
+                    .map(|chunk| {
+                        v_flex()
+                            .gap(px(1.))
+                            .children(chunk.iter().map(|cm| self.icon_btn(cm, !icon_only, pal, cx)))
+                            .into_any_element()
+                    })
+                    .collect();
+                h_flex().items_start().gap_1().children(cols).into_any_element()
             }
             Control::Separator => div().w(px(1.)).h(px(44.)).bg(pal.border).mx_1().into_any_element(),
             _ => div().into_any_element(),
