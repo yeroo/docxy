@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use docxcore::editor::{Caret, Clip, Editor};
-use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table};
+use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table, VertAlign};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -953,7 +953,7 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
-    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -987,6 +987,8 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("i", "italic", "Italic", Italic, "Ctrl+I").toggle(),
                 cmdt("u", "underline", "Underline", Underline, "Ctrl+U").toggle(),
                 cmdt("s", "strikethrough", "Strikethrough", Strike, "").toggle(),
+                cmdt("sub", "subscript", "Subscript", Sub, "").toggle(),
+                cmdt("sup", "superscript", "Superscript", Super, "").toggle(),
                 Control::Separator,
                 cmdt("color", "text-color", "Font colour", FontColor, "").toggle(),
                 cmdt("hl", "highlight", "Text highlight", Highlight, "").toggle(),
@@ -1146,7 +1148,19 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
         }
         let word_off = off;
         off += word.chars().count();
-        let size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
+        let mut size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
+        // Superscript / subscript render ~0.7× and are nudged up/down.
+        let vshift = match props.vert_align {
+            VertAlign::Superscript => {
+                size *= 0.72;
+                Some(-(base * 0.35))
+            }
+            VertAlign::Subscript => {
+                size *= 0.72;
+                Some(base * 0.18)
+            }
+            VertAlign::Baseline => None,
+        };
         let color: Hsla = if is_link {
             hsla_u(LINK)
         } else {
@@ -1161,6 +1175,7 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                 .when(props.italic, |d| d.italic())
                 .when(props.underline || is_link, |d| d.underline())
                 .when(props.strike, |d| d.line_through())
+                .when_some(vshift, |d, dy| d.relative().top(px(dy)))
                 // Selection wins over any run highlight so the selected range reads
                 // as one contiguous band.
                 .when_some(props.highlight.as_deref().filter(|_| !selected), |d, name| {
@@ -1490,6 +1505,8 @@ impl Docxy {
                 Italic => e.toggle_italic(),
                 Underline => e.toggle_underline(),
                 Strike => e.toggle_strike(),
+                Super => e.toggle_vert_align(VertAlign::Superscript),
+                Sub => e.toggle_vert_align(VertAlign::Subscript),
                 Grow => e.resize_font(2),
                 Shrink => e.resize_font(-2),
                 AlignL => e.set_align(Align::Left),
