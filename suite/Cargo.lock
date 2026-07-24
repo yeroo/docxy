@@ -4441,6 +4441,7 @@ dependencies = [
  "docxcore",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
  "serde",
  "serde_json",

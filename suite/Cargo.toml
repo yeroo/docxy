@@ -25,6 +25,9 @@ repository = "https://github.com/yeroo/docxy"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
+# Bundled icon/font assets (SVG icons for buttons + the window controls). Without
+# registering these via `.with_assets(Assets)`, icon elements render blank.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
 
 # Matches gpui-component's own patch (its build assumes it).
 [patch.crates-io]

@@ -337,8 +337,10 @@ fn placeholder(kind: Kind) -> impl IntoElement {
 }
 
 fn main() {
-    gpui_platform::application().run(move |cx: &mut App| {
-        gpui_component::init(cx);
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
