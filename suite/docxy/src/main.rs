@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::package::Package;
 use docxcore::model::{Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -151,6 +152,12 @@ struct DocTab {
     /// Review comments anchored in this document (markers live in the body; the
     /// text/author is stored here and written to comments.xml on save).
     comments: Vec<Comment>,
+    /// The original package this doc was loaded from, kept so a save re-serializes
+    /// only document.xml back into it and preserves every other part (footnotes,
+    /// headers/footers, images, themes, …). `None` for a new empty document.
+    pkg: Option<Package>,
+    /// Footnotes / endnotes parsed from the package (display-only side panel).
+    notes: Vec<docxcore::notes::Note>,
 }
 
 struct Docxy {
@@ -185,6 +192,8 @@ struct Docxy {
     show_comments: bool,
     // Navigation (heading outline) side panel — View ▸ Navigation.
     show_nav: bool,
+    // Footnotes/endnotes side panel — Review ▸ Notes.
+    show_notes: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -251,37 +260,59 @@ fn empty_doc() -> Document {
     docxcore::markdown::from_markdown("# Untitled\n\n")
 }
 
-/// Load a `.docx` from bytes into a document + its review comments.
-fn load_bytes(bytes: &[u8]) -> Option<(Document, Vec<Comment>)> {
-    let pkg = docxcore::package::load_package(bytes).ok()?;
-    let comments = docxcore::comments::parse_comments(&pkg);
-    Some((pkg.document, comments))
+/// A loaded document with everything a tab needs to hold and re-save it losslessly.
+struct Loaded {
+    doc: Document,
+    comments: Vec<Comment>,
+    notes: Vec<docxcore::notes::Note>,
+    pkg: Option<Package>,
+    status: SharedString,
 }
 
-fn doc_from_path(path: &PathBuf) -> (Document, Vec<Comment>, SharedString) {
-    match std::fs::read(path) {
-        Ok(bytes) => match load_bytes(&bytes) {
-            Some((doc, comments)) => (doc, comments, "loaded".into()),
-            None => (empty_doc(), vec![], "load error".into()),
-        },
-        Err(e) => (empty_doc(), vec![], format!("read error: {e}").into()),
+impl Loaded {
+    fn empty(status: impl Into<SharedString>) -> Self {
+        Loaded { doc: empty_doc(), comments: vec![], notes: vec![], pkg: None, status: status.into() }
+    }
+    fn into_tab(self, kind: Kind, title: SharedString, path: Option<PathBuf>, dirty: bool) -> DocTab {
+        DocTab { kind, title, path, surface: Surface::Doc(Editor::new(self.doc)), dirty, status: self.status, comments: self.comments, pkg: self.pkg, notes: self.notes }
     }
 }
 
-fn sample_doc() -> (Document, Vec<Comment>) {
-    load_bytes(include_bytes!("../../../assets/sample.docx")).unwrap_or_else(|| (empty_doc(), vec![]))
+/// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
+fn load_bytes(bytes: &[u8]) -> Loaded {
+    match docxcore::package::load_package(bytes) {
+        Ok(pkg) => Loaded {
+            doc: pkg.document.clone(),
+            comments: docxcore::comments::parse_comments(&pkg),
+            notes: docxcore::notes::parse_notes(&pkg),
+            pkg: Some(pkg),
+            status: "loaded".into(),
+        },
+        Err(e) => Loaded::empty(format!("load error: {e:?}")),
+    }
 }
 
-fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, SharedString) {
+fn doc_from_path(path: &PathBuf) -> Loaded {
+    match std::fs::read(path) {
+        Ok(bytes) => load_bytes(&bytes),
+        Err(e) => Loaded::empty(format!("read error: {e}")),
+    }
+}
+
+fn sample_doc() -> Loaded {
+    load_bytes(include_bytes!("../../../assets/sample.docx"))
+}
+
+fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, Vec<docxcore::notes::Note>, Option<Package>, SharedString) {
     match kind {
         Kind::Docx => match path {
             Some(p) => {
-                let (doc, comments, status) = doc_from_path(p);
-                (Surface::Doc(Editor::new(doc)), comments, status)
+                let l = doc_from_path(p);
+                (Surface::Doc(Editor::new(l.doc)), l.comments, l.notes, l.pkg, l.status)
             }
-            None => (Surface::Doc(Editor::new(empty_doc())), vec![], "untitled".into()),
+            None => (Surface::Doc(Editor::new(empty_doc())), vec![], vec![], None, "untitled".into()),
         },
-        _ => (Surface::Placeholder, vec![], "".into()),
+        _ => (Surface::Placeholder, vec![], vec![], None, "".into()),
     }
 }
 
@@ -297,14 +328,37 @@ fn hot_dir() -> PathBuf {
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
 /// lists (so markers survive the round-trip and open correctly in Word).
-fn doc_to_docx(doc: &Document, comments: &[Comment]) -> Vec<u8> {
-    let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-    let mut pkg = if has_list { docxcore::package::new_markdown_package(doc.clone()) } else { docxcore::package::new_package(doc.clone()) };
-    // Write comments.xml (+ part/rel/content-type) for each stored comment so the
-    // markers already in the body resolve to real comments in Word.
+fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> Vec<u8> {
+    use std::collections::HashSet;
+    // With the original package in hand, re-serialize just document.xml back into
+    // it — every other part (footnotes, headers/footers, images, themes, …) is
+    // preserved. Otherwise build a minimal package (new/empty documents).
+    let mut pkg = match base {
+        Some(p) => {
+            let mut p = p.clone();
+            p.document = doc.clone();
+            p
+        }
+        None => {
+            let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+            if has_list { docxcore::package::new_markdown_package(doc.clone()) } else { docxcore::package::new_package(doc.clone()) }
+        }
+    };
+    // Reconcile comments.xml with the tab's comment list: the base already holds the
+    // comments it was loaded with, so only remove the deleted ones and add the new.
+    let existing: Vec<i32> = base.map(|p| docxcore::comments::parse_comments(p).iter().filter_map(|c| c.id.parse().ok()).collect()).unwrap_or_default();
+    let current: HashSet<i32> = comments.iter().filter_map(|c| c.id.parse().ok()).collect();
+    for id in &existing {
+        if !current.contains(id) {
+            pkg.remove_comment(*id);
+        }
+    }
+    let existing_set: HashSet<i32> = existing.iter().copied().collect();
     for c in comments {
         if let Ok(id) = c.id.parse::<i32>() {
-            pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
+            if !existing_set.contains(&id) {
+                pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
+            }
         }
     }
     docxcore::package::save_package(&pkg)
@@ -323,26 +377,21 @@ impl Docxy {
             // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
             // back to the real file on disk, then to an empty doc.
             let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
-            let (surface, comments, status) = match (t.kind, &hot) {
+            let tab = match (t.kind, &hot) {
                 (Kind::Docx, Some(hp)) => {
-                    let (doc, comments, _) = doc_from_path(hp);
-                    (Surface::Doc(Editor::new(doc)), comments, if t.dirty { "unsaved — restored".into() } else { "loaded".into() })
+                    let mut l = doc_from_path(hp);
+                    l.status = if t.dirty { "unsaved — restored".into() } else { "loaded".into() };
+                    l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
                 }
-                _ => build_surface(t.kind, path.as_ref()),
+                _ => {
+                    let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
+                    DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments, pkg, notes }
+                }
             };
-            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments });
+            tabs.push(tab);
         }
         if tabs.is_empty() {
-            let (doc, comments) = sample_doc();
-            tabs.push(DocTab {
-                kind: Kind::Docx,
-                title: "sample.docx".into(),
-                path: None,
-                surface: Surface::Doc(Editor::new(doc)),
-                dirty: false,
-                status: "loaded".into(),
-                comments,
-            });
+            tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
         let this = Self {
@@ -369,6 +418,7 @@ impl Docxy {
             show_marks: false,
             show_comments: false,
             show_nav: false,
+            show_notes: false,
         };
         this.persist();
         this
@@ -386,7 +436,7 @@ impl Docxy {
                 // held across a restart (closing never prompts to save).
                 let hot = if let Surface::Doc(ed) = &t.surface {
                     let p = hd.join(format!("tab-{i}.docx"));
-                    std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments)).ok().map(|_| p.display().to_string())
+                    std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref())).ok().map(|_| p.display().to_string())
                 } else {
                     None
                 };
@@ -427,7 +477,7 @@ impl Docxy {
             Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
-        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![] });
+        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![] });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -467,7 +517,7 @@ impl Docxy {
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
-        let bytes = doc_to_docx(&editor.doc, &tab.comments);
+        let bytes = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
         let path = tab
             .path
             .clone()
@@ -503,16 +553,9 @@ impl Docxy {
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new().add_filter("Word document", &["docx"]).pick_file() {
-            let (doc, comments, status) = doc_from_path(&path);
-            self.tabs.push(DocTab {
-                kind: Kind::Docx,
-                title: file_name(&path).into(),
-                path: Some(path),
-                surface: Surface::Doc(Editor::new(doc)),
-                dirty: false,
-                status,
-                comments,
-            });
+            let title = file_name(&path).into();
+            let tab = doc_from_path(&path).into_tab(Kind::Docx, title, Some(path), false);
+            self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
         }
         self.backstage = false;
@@ -1051,6 +1094,38 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The footnotes/endnotes side panel (display-only).
+    fn notes_panel(&self, pal: Pal, _cx: &mut Context<Self>) -> AnyElement {
+        let notes = self.tabs.get(self.active).map(|t| t.notes.clone()).unwrap_or_default();
+        let mut list = v_flex().id("notes-list").flex_1().overflow_y_scroll().gap_2().p_2();
+        if notes.is_empty() {
+            list = list.child(div().text_size(px(12.)).text_color(pal.dim).p_2().child("No footnotes or endnotes."));
+        }
+        for n in &notes {
+            let tag = if n.endnote { "endnote" } else { "footnote" };
+            list = list.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .child(div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(hsla_u(BRAND)).child(SharedString::from(format!("{tag} {}", n.id))))
+                    .child(div().text_size(px(13.)).text_color(pal.fg).child(SharedString::from(n.text.clone()))),
+            );
+        }
+        v_flex()
+            .w(px(280.))
+            .h_full()
+            .border_l_1()
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).border_b_1().border_color(pal.border).child(SharedString::from(format!("Notes ({})", notes.len()))))
+            .child(list)
+            .into_any_element()
+    }
+
     /// Route a keystroke to the find bar while it is open.
     fn find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         match key {
@@ -1309,7 +1384,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak,
+    InsertField, PageBreak, ToggleNotes,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1405,6 +1480,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             rs::group("Comments", 40, vec![rs::column(vec![
                 cmdt("newcomment", "comment-add", "New comment", NewComment, ""),
                 cmdt("togglecomments", "comment", "Comments pane", ToggleComments, ""),
+                cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, ""),
             ])]),
             rs::group("Editing", 30, vec![rs::column(vec![
                 cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
@@ -1774,6 +1850,10 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                 let shown = if text.is_empty() { "[field]".to_string() } else { text.clone() };
                 spans.push(div().px(px(2.)).rounded_sm().bg(pal.panel).text_size(px(base)).text_color(pal.fg).child(SharedString::from(shown)).into_any_element());
             }
+            Inline::FootnoteRef { id, .. } => {
+                // A superscript note number in the brand colour.
+                spans.push(div().text_size(px(base * 0.72)).text_color(hsla_u(BRAND)).relative().top(px(-(base * 0.35))).child(SharedString::from(id.to_string())).into_any_element());
+            }
             other => {
                 let tag = match other {
                     Inline::SmartArt { .. } => "[diagram]",
@@ -1965,6 +2045,10 @@ impl Docxy {
             }
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             PageBreak => self.insert_page_break(window, cx),
+            ToggleNotes => {
+                self.show_notes = !self.show_notes;
+                self.refocus(window, cx);
+            }
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -2008,7 +2092,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes => {}
             }),
         }
     }
@@ -2417,7 +2501,15 @@ impl Render for Docxy {
         // The body is the document, flanked by the navigation and comments panes.
         let nav_panel = (is_doc && self.show_nav).then(|| self.nav_panel(pal, cx));
         let comments_panel = (is_doc && self.show_comments).then(|| self.comments_panel(pal, cx));
-        let body = h_flex().flex_1().min_h(px(0.)).overflow_hidden().when_some(nav_panel, |d, n| d.child(n)).child(content).when_some(comments_panel, |d, p| d.child(p));
+        let notes_panel = (is_doc && self.show_notes).then(|| self.notes_panel(pal, cx));
+        let body = h_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .when_some(nav_panel, |d, n| d.child(n))
+            .child(content)
+            .when_some(comments_panel, |d, p| d.child(p))
+            .when_some(notes_panel, |d, p| d.child(p));
 
         v_flex()
             .size_full()
