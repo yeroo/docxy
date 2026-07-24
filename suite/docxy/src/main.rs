@@ -5,16 +5,15 @@
 //! `<config>/docxy/session.json` and restored on launch; closing never prompts.
 //!
 //! The docx surface is a THIN view over `docxcore::editor::Editor` — the exact
-//! lossless engine the terminal docxy uses — so it renders the real document with
-//! its formatting (Phase 1: faithful rendering + lossless save; interactive
-//! editing is the next phase).
+//! lossless engine the terminal docxy uses. Phase 1 rendered it; Phase 2 makes it
+//! editable: a focusable view with a caret, routing keys into the engine's ops.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 
-use docxcore::editor::Editor;
-use docxcore::model::{Align, Block, Document, Inline, Paragraph, Run, RunProps, Table};
+use docxcore::editor::{Caret, Editor};
+use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -77,12 +76,15 @@ struct DocTab {
     title: SharedString,
     path: Option<PathBuf>,
     surface: Surface,
+    dirty: bool,
     status: SharedString,
 }
 
 struct Docxy {
     tabs: Vec<DocTab>,
     active: usize,
+    focus: FocusHandle,
+    focused: bool,
 }
 
 fn empty_doc() -> Document {
@@ -115,7 +117,7 @@ fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, SharedString) 
 }
 
 impl Docxy {
-    fn new() -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let session: Session = std::fs::read(session_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -125,7 +127,14 @@ impl Docxy {
         for t in &session.tabs {
             let path = t.path.as_ref().map(PathBuf::from);
             let (surface, status) = build_surface(t.kind, path.as_ref());
-            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, status });
+            tabs.push(DocTab {
+                kind: t.kind,
+                title: t.title.clone().into(),
+                path,
+                surface,
+                dirty: false,
+                status,
+            });
         }
         if tabs.is_empty() {
             tabs.push(DocTab {
@@ -133,11 +142,12 @@ impl Docxy {
                 title: "sample.docx".into(),
                 path: None,
                 surface: Surface::Doc(Editor::new(sample_doc())),
+                dirty: false,
                 status: "loaded".into(),
             });
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
-        let this = Self { tabs, active };
+        let this = Self { tabs, active, focus: cx.focus_handle(), focused: false };
         this.persist();
         this
     }
@@ -168,7 +178,7 @@ impl Docxy {
             Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
-        self.tabs.push(DocTab { kind, title, path: None, surface, status: "new".into() });
+        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into() });
         self.active = self.tabs.len() - 1;
         self.persist();
         cx.notify();
@@ -205,15 +215,106 @@ impl Docxy {
             .path
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(tab.title.to_string()));
-        tab.status = match std::fs::write(&path, &bytes) {
+        match std::fs::write(&path, &bytes) {
             Ok(()) => {
                 tab.path = Some(path.clone());
-                format!("saved {} bytes → {}", bytes.len(), path.display()).into()
+                tab.dirty = false;
+                tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
             }
-            Err(e) => format!("save failed: {e}").into(),
-        };
+            Err(e) => tab.status = format!("save failed: {e}").into(),
+        }
         self.persist();
         cx.notify();
+    }
+
+    /// Route a keystroke into the active doc's editor engine.
+    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        let ctrl = m.control || m.platform;
+        // Ctrl+S saves (needs &mut self; handle before borrowing the editor).
+        if ctrl && ev.keystroke.key == "s" {
+            self.save_active(cx);
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Surface::Doc(ed) = &mut tab.surface else { return };
+        let key = ev.keystroke.key.as_str();
+        let shift = m.shift;
+
+        let changed = if ctrl {
+            match key {
+                "b" => yes(|| ed.toggle_bold()),
+                "i" => yes(|| ed.toggle_italic()),
+                "u" => yes(|| ed.toggle_underline()),
+                "z" => {
+                    ed.undo();
+                    true
+                }
+                "y" => {
+                    ed.redo();
+                    true
+                }
+                "a" => {
+                    ed.select_all();
+                    false
+                }
+                _ => false,
+            }
+        } else {
+            ed.extend_selection(shift);
+            match key {
+                "backspace" => yes(|| ed.backspace()),
+                "delete" => yes(|| ed.delete_forward()),
+                "enter" => yes(|| ed.insert_newline()),
+                "tab" => yes(|| ed.insert_str("\t")),
+                "left" => no(|| ed.move_left()),
+                "right" => no(|| ed.move_right()),
+                "home" => no(|| ed.move_home()),
+                "end" => no(|| ed.move_end()),
+                "up" => no(|| move_vert(ed, false)),
+                "down" => no(|| move_vert(ed, true)),
+                _ => match ev.keystroke.key_char.as_deref() {
+                    Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
+                        ed.insert_str(c);
+                        true
+                    }
+                    _ => false,
+                },
+            }
+        };
+        if changed {
+            tab.dirty = true;
+        }
+        cx.notify();
+    }
+}
+
+fn yes(mut f: impl FnMut()) -> bool {
+    f();
+    true
+}
+fn no(mut f: impl FnMut()) -> bool {
+    f();
+    false
+}
+
+/// Crude vertical movement: jump to the nearest adjacent top-level paragraph,
+/// keeping the column. (True visual up/down needs a layout line-map — later.)
+fn move_vert(ed: &mut Editor, down: bool) {
+    if ed.caret.path.len() != 1 {
+        return;
+    }
+    let i = ed.caret.path[0];
+    let col = ed.caret.offset;
+    let n = ed.doc.body.len();
+    let candidates: Vec<usize> = if down { (i + 1..n).collect() } else { (0..i).rev().collect() };
+    for j in candidates {
+        if let Block::Paragraph(p) = &ed.doc.body[j] {
+            let len = p.plain_text().chars().count();
+            ed.caret = Caret::at(vec![j], col.min(len));
+            ed.clear_selection();
+            return;
+        }
     }
 }
 
@@ -225,46 +326,73 @@ const FG: u32 = 0xd4d4d4;
 const DIM: u32 = 0x858585;
 const ACCENT: u32 = 0x4ec9b0;
 const LINK: u32 = 0x4ea1f4;
+const CARET: u32 = 0x4ec9b0;
 
 fn hex_rgb(s: &str) -> Option<u32> {
     let s = s.trim_start_matches('#');
     (s.len() == 6).then(|| u32::from_str_radix(s, 16).ok()).flatten()
 }
 
-/// One styled word (kept inclusive of its trailing space) as a span.
-fn word_span(word: &str, props: &RunProps, base_px: f32, is_link: bool) -> AnyElement {
-    let size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base_px);
-    let color = if is_link {
-        LINK
-    } else {
-        props.color.as_deref().and_then(hex_rgb).unwrap_or(FG)
-    };
-    div()
-        .child(SharedString::from(word.to_string()))
-        .text_size(px(size))
-        .text_color(rgb(color))
-        .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
-        .when(props.italic, |d| d.italic())
-        .when(props.underline || is_link, |d| d.underline())
-        .when(props.strike, |d| d.line_through())
-        .when(props.highlight.is_some(), |d| d.bg(rgb(0x5b5b2a)))
-        .into_any_element()
+fn split_at_char(s: &str, n: usize) -> (&str, &str) {
+    let idx = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+    s.split_at(idx)
 }
 
-fn run_spans(runs: impl Iterator<Item = (String, RunProps)>, base_px: f32, is_link: bool) -> Vec<AnyElement> {
-    let mut out = Vec::new();
-    for (text, props) in runs {
-        if text.is_empty() {
+fn caret_bar() -> AnyElement {
+    div().w(px(2.)).h(px(19.)).bg(rgb(CARET)).into_any_element()
+}
+
+fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool) {
+    for word in text.split_inclusive(' ') {
+        if word.is_empty() {
             continue;
         }
-        for word in text.split_inclusive(' ') {
-            out.push(word_span(word, &props, base_px, is_link));
-        }
+        let size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
+        let color = if is_link { LINK } else { props.color.as_deref().and_then(hex_rgb).unwrap_or(FG) };
+        out.push(
+            div()
+                .child(SharedString::from(word.to_string()))
+                .text_size(px(size))
+                .text_color(rgb(color))
+                .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
+                .when(props.italic, |d| d.italic())
+                .when(props.underline || is_link, |d| d.underline())
+                .when(props.strike, |d| d.line_through())
+                .when(props.highlight.is_some(), |d| d.bg(rgb(0x5b5b2a)))
+                .into_any_element(),
+        );
     }
-    out
 }
 
-fn paragraph_el(p: &Paragraph) -> AnyElement {
+/// Emit `text`, inserting the caret bar if `caret` (a paragraph char offset)
+/// falls within this run. `idx` tracks the running char offset; `caret` is set to
+/// None once consumed so it's drawn exactly once.
+fn emit_run(
+    out: &mut Vec<AnyElement>,
+    text: &str,
+    props: &RunProps,
+    base: f32,
+    is_link: bool,
+    idx: &mut usize,
+    caret: &mut Option<usize>,
+) {
+    let len = text.chars().count();
+    if let Some(off) = *caret {
+        if off >= *idx && off <= *idx + len {
+            let (a, b) = split_at_char(text, off - *idx);
+            emit_words(out, a, props, base, is_link);
+            out.push(caret_bar());
+            emit_words(out, b, props, base, is_link);
+            *caret = None;
+            *idx += len;
+            return;
+        }
+    }
+    emit_words(out, text, props, base, is_link);
+    *idx += len;
+}
+
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -276,20 +404,20 @@ fn paragraph_el(p: &Paragraph) -> AnyElement {
     let is_heading = p.props.heading_level.is_some();
 
     let mut spans: Vec<AnyElement> = Vec::new();
+    let mut idx = 0usize;
     if p.props.num_id.is_some() {
         let marker = if p.props.ilvl % 2 == 1 { "\u{25E6} " } else { "\u{2022} " };
-        spans.push(word_span(marker, &RunProps::default(), base, false));
+        emit_words(&mut spans, marker, &RunProps::default(), base, false);
     }
     for inline in &p.content {
         match inline {
-            Inline::Run(r) => {
-                spans.extend(run_spans(std::iter::once((r.text.clone(), r.props.clone())), base, false));
-            }
+            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret),
             Inline::Hyperlink(h) => {
-                let runs = h.runs.iter().map(|r: &Run| (r.text.clone(), r.props.clone()));
-                spans.extend(run_spans(runs, base, true));
+                for r in &h.runs {
+                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret);
+                }
             }
-            Inline::Tab(_) => spans.push(word_span("    ", &RunProps::default(), base, false)),
+            Inline::Tab(_) => emit_run(&mut spans, "    ", &RunProps::default(), base, false, &mut idx, &mut caret),
             Inline::Break(_) => spans.push(div().w_full().h(px(0.)).into_any_element()),
             other => {
                 let tag = match other {
@@ -301,20 +429,17 @@ fn paragraph_el(p: &Paragraph) -> AnyElement {
                     _ => "[image]",
                 };
                 spans.push(
-                    div()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(rgb(PANEL))
-                        .text_size(px(12.))
-                        .text_color(rgb(DIM))
-                        .child(tag)
-                        .into_any_element(),
+                    div().px_1().rounded_sm().bg(rgb(PANEL)).text_size(px(12.)).text_color(rgb(DIM)).child(tag).into_any_element(),
                 );
             }
         }
     }
+    // caret at end of paragraph (or empty paragraph)
+    if caret.is_some() {
+        spans.push(caret_bar());
+    }
 
-    let mut row = h_flex().w_full().flex_wrap();
+    let mut row = h_flex().w_full().flex_wrap().min_h(px(base + 6.));
     row = match p.props.align {
         Align::Center => row.justify_center(),
         Align::Right => row.justify_end(),
@@ -330,16 +455,9 @@ fn table_el(t: &Table) -> AnyElement {
     for row in &t.rows {
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(block_el).collect();
+            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None)).collect();
             cells.push(
-                v_flex()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .border_1()
-                    .border_color(rgb(0x3a3a3a))
-                    .children(inner)
-                    .into_any_element(),
+                v_flex().flex_1().px_2().py_1().border_1().border_color(rgb(0x3a3a3a)).children(inner).into_any_element(),
             );
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
@@ -347,22 +465,23 @@ fn table_el(t: &Table) -> AnyElement {
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block) -> AnyElement {
+fn block_el(b: &Block, caret: Option<usize>) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p),
+        Block::Paragraph(p) => paragraph_el(p, caret),
         Block::Table(t) => table_el(t),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
 }
 
 impl Render for Docxy {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focused {
+            self.focus.focus(window, cx);
+            self.focused = true;
+        }
+
         let new_btn = |id: &'static str, label: &'static str, kind: Kind| {
-            Button::new(id)
-                .small()
-                .ghost()
-                .label(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.add_tab(kind, cx)))
+            Button::new(id).small().ghost().label(label).on_click(cx.listener(move |this, _, _, cx| this.add_tab(kind, cx)))
         };
         let can_save = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)));
 
@@ -377,24 +496,19 @@ impl Render for Docxy {
                 .child(new_btn("new-mail", "+ Mail", Kind::Look))
                 .when(can_save, |d| {
                     d.child(
-                        Button::new("save")
-                            .small()
-                            .primary()
-                            .label("Save .docx")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_active(cx))),
+                        Button::new("save").small().primary().label("Save .docx").on_click(cx.listener(|this, _, _, cx| this.save_active(cx))),
                     )
                 }),
         );
 
         let tabs = self.tabs.iter().enumerate().map(|(i, t)| {
-            let label = format!("{} {}", t.kind.glyph(), t.title);
+            let mark = if t.dirty { " \u{2022}" } else { "" };
+            let label = format!("{} {}{}", t.kind.glyph(), t.title, mark);
             Tab::new().child(label).suffix(
-                Button::new(("close", i)).xsmall().ghost().label("\u{00d7}").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.close_tab(i, cx);
-                    },
-                )),
+                Button::new(("close", i)).xsmall().ghost().label("\u{00d7}").on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(i, cx);
+                })),
             )
         });
         let tab_bar = TabBar::new("docxy-tabs")
@@ -406,7 +520,15 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(t) => match &t.surface {
                 Surface::Doc(editor) => {
-                    let blocks: Vec<AnyElement> = editor.doc.body.iter().map(block_el).collect();
+                    let caret_block = if editor.caret.path.len() == 1 { Some(editor.caret.path[0]) } else { None };
+                    let caret_off = editor.caret.offset;
+                    let blocks: Vec<AnyElement> = editor
+                        .doc
+                        .body
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| block_el(b, (Some(i) == caret_block).then_some(caret_off)))
+                        .collect();
                     v_flex()
                         .id("doc-scroll")
                         .flex_1()
@@ -421,14 +543,7 @@ impl Render for Docxy {
                 }
                 Surface::Placeholder => placeholder(t.kind).into_any_element(),
             },
-            None => v_flex()
-                .flex_1()
-                .bg(rgb(BG))
-                .items_center()
-                .justify_center()
-                .text_color(rgb(DIM))
-                .child("No documents — use + Doc / + Sheet / + Mail")
-                .into_any_element(),
+            None => v_flex().flex_1().bg(rgb(BG)).items_center().justify_center().text_color(rgb(DIM)).child("No documents — use + Doc / + Sheet / + Mail").into_any_element(),
         };
 
         let status = h_flex()
@@ -440,9 +555,17 @@ impl Render for Docxy {
             .text_color(rgb(DIM))
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
             .child(div().flex_1())
-            .child("Phase 1 · faithful render (read-only)");
+            .child("Phase 2 · editable — type, ⌫/⏎, ←→ Home/End, Ctrl+B/I/U, Ctrl+Z/Y, Ctrl+S");
 
-        v_flex().size_full().bg(rgb(BG)).child(title_bar).child(tab_bar).child(content).child(status)
+        v_flex()
+            .size_full()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .bg(rgb(BG))
+            .child(title_bar)
+            .child(tab_bar)
+            .child(content)
+            .child(status)
     }
 }
 
@@ -476,7 +599,7 @@ fn main() {
                 ..Default::default()
             };
             cx.open_window(options, |window, cx| {
-                let view = cx.new(|_| Docxy::new());
+                let view = cx.new(|cx| Docxy::new(cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open docxy window");
