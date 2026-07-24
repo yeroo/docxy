@@ -182,6 +182,8 @@ enum FindField {
 enum PickKind {
     Color,
     Highlight,
+    FontName,
+    FontSize,
 }
 
 /// Everything a rendered word/atom needs to turn a click into a caret move: the
@@ -457,10 +459,15 @@ impl Docxy {
     }
 
     /// Place the caret at an explicit paragraph path + char offset (used by
-    /// click-to-caret), collapsing any selection and refocusing the document.
-    fn set_caret(&mut self, path: Vec<usize>, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// click-to-caret). With `extend` (Shift-click) it keeps/starts an anchor so
+    /// the click extends the selection; otherwise it collapses any selection.
+    fn set_caret(&mut self, path: Vec<usize>, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ed) = self.active_editor() {
-            ed.clear_selection();
+            if extend {
+                ed.extend_selection(true); // anchor at the current caret if none, else keep it
+            } else {
+                ed.clear_selection();
+            }
             ed.caret = Caret::at(path, offset);
             ed.clamp();
         }
@@ -610,6 +617,16 @@ impl Docxy {
         self.with_editor(window, cx, |e| e.set_highlight(name));
     }
 
+    fn apply_font(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| e.set_font(&name));
+    }
+
+    fn apply_size(&mut self, pts: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| e.set_font_size(pts * 2));
+    }
+
     /// The swatch strip shown under the ribbon while a picker is open.
     fn picker_bar(&self, kind: PickKind, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let swatch = |bg: Hsla, ring: bool| {
@@ -619,7 +636,12 @@ impl Docxy {
         row = row.child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(78.)).child(match kind {
             PickKind::Color => "Font colour",
             PickKind::Highlight => "Highlight",
+            PickKind::FontName => "Font",
+            PickKind::FontSize => "Size",
         }));
+        let chip = |id_key: usize, label: SharedString, tag: &'static str| {
+            div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
+        };
         match kind {
             PickKind::Color => {
                 // Automatic (clear) chip.
@@ -662,6 +684,17 @@ impl Docxy {
                 for (i, &name) in HIGHLIGHT_SWATCHES.iter().enumerate() {
                     let (c, _) = highlight_rgb(name);
                     row = row.child(swatch(hsla_u(c), false).id(("hl", i)).on_click(cx.listener(move |this, _, window, cx| this.apply_highlight(Some(name.to_string()), window, cx))));
+                }
+            }
+            PickKind::FontName => {
+                for (i, &name) in FONT_NAMES.iter().enumerate() {
+                    // Preview each name in its own font family.
+                    row = row.child(chip(i, name.into(), "fn").font_family(name).on_click(cx.listener(move |this, _, window, cx| this.apply_font(name.to_string(), window, cx))));
+                }
+            }
+            PickKind::FontSize => {
+                for (i, &pts) in FONT_SIZES.iter().enumerate() {
+                    row = row.child(chip(i, pts.to_string().into(), "fs").on_click(cx.listener(move |this, _, window, cx| this.apply_size(pts, window, cx))));
                 }
             }
         }
@@ -920,7 +953,7 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
-    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -947,6 +980,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("paste", "paste", "Paste", Paste, "Ctrl+V"),
             ])]),
             rs::group("Font", 40, vec![
+                cmdt("fontname", "font-name", "Font", FontName, "").toggle(),
+                cmdt("fontsize", "font-size", "Font size", FontSize, "").toggle(),
+                Control::Separator,
                 cmdt("b", "bold", "Bold", Bold, "Ctrl+B").toggle(),
                 cmdt("i", "italic", "Italic", Italic, "Ctrl+I").toggle(),
                 cmdt("u", "underline", "Underline", Underline, "Ctrl+U").toggle(),
@@ -1092,6 +1128,10 @@ const COLOR_SWATCHES: &[u32] = &[
 ];
 /// Highlight swatches (Word highlight names). `None` = no highlight (clear).
 const HIGHLIGHT_SWATCHES: &[&str] = &["yellow", "green", "cyan", "magenta", "blue", "red", "darkYellow", "darkGreen", "darkCyan", "darkRed", "darkBlue", "lightGray"];
+/// Font families offered in the Font-name picker.
+const FONT_NAMES: &[&str] = &["Calibri", "Cambria", "Arial", "Times New Roman", "Georgia", "Verdana", "Tahoma", "Segoe UI", "Courier New", "Consolas", "Comic Sans MS"];
+/// Point sizes offered in the Font-size picker.
+const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
 fn caret_bar() -> AnyElement {
     div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
@@ -1132,9 +1172,10 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                 .when_some(click, |d, c| {
                     let ent = c.ent.clone();
                     let path = c.path.to_vec();
-                    d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    d.cursor_text().on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                         cx.stop_propagation();
-                        ent.update(cx, |this, cx| this.set_caret(path.clone(), word_off, window, cx));
+                        let extend = ev.modifiers.shift;
+                        ent.update(cx, |this, cx| this.set_caret(path.clone(), word_off, extend, window, cx));
                     })
                 })
                 .into_any_element(),
@@ -1212,9 +1253,10 @@ fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize
             .when_some(click, |d, c| {
                 let ent = c.ent.clone();
                 let path = c.path.to_vec();
-                d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                d.cursor_text().on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
-                    ent.update(cx, |this, cx| this.set_caret(path.clone(), pos, window, cx));
+                    let extend = ev.modifiers.shift;
+                    ent.update(cx, |this, cx| this.set_caret(path.clone(), pos, extend, window, cx));
                 })
             })
             .into_any_element(),
@@ -1329,8 +1371,9 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
-            d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                ent.update(cx, |this, cx| this.set_caret(path.clone(), para_end, window, cx));
+            d.cursor_text().on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                let extend = ev.modifiers.shift;
+                ent.update(cx, |this, cx| this.set_caret(path.clone(), para_end, extend, window, cx));
             })
         })
         .child(row.children(spans))
@@ -1440,6 +1483,8 @@ impl Docxy {
             Find => self.toggle_find(window, cx),
             FontColor => self.toggle_picker(PickKind::Color, window, cx),
             Highlight => self.toggle_picker(PickKind::Highlight, window, cx),
+            FontName => self.toggle_picker(PickKind::FontName, window, cx),
+            FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1471,7 +1516,7 @@ impl Docxy {
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize => {}
             }),
         }
     }
