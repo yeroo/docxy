@@ -16,8 +16,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, E_POINTER, S_FALSE,
-    S_OK,
+    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX,
+    DISP_E_MEMBERNOTFOUND, E_POINTER, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
@@ -176,7 +176,28 @@ pub fn synth_name(id: i32) -> Option<String> {
 
 /// The default arm for any dispid an object doesn't handle: log the member and
 /// degrade benignly — swallow a put, hand back a do-nothing object for a get.
-pub unsafe fn unhandled(id: i32, wflags: DISPATCH_FLAGS, result: *mut VARIANT) -> Result<()> {
+pub unsafe fn unhandled(
+    id: i32,
+    wflags: DISPATCH_FLAGS,
+    params: *const DISPPARAMS,
+    result: *mut VARIANT,
+) -> Result<()> {
+    // DISPID_VALUE (0) with NO arguments reaching this fall-through means the
+    // object has no default property (Workbook, Worksheet, Application...). A get
+    // of it must fail with DISP_E_MEMBERNOTFOUND, NOT a benign NullObject:
+    // well-behaved late-bound clients (pywin32's dynamic layer, some C++/Delphi
+    // hosts) probe an object's default value on receipt, and a NullObject answer
+    // makes them substitute that null for the real object — silently no-opping
+    // the whole call chain. Objects that DO have a default handle id=0 first.
+    // NB: pywin32 sends the probe as METHOD|PROPERTYGET (same flags as an indexed
+    // `coll(1)` call), so the arg count is the only reliable discriminator — a
+    // real default-indexed get like `unknownColl(1)` has cArgs>=1 and must keep
+    // degrading gracefully (return the do-nothing object so the chain flows).
+    let cargs = if params.is_null() { 0 } else { unsafe { (*params).cArgs } };
+    if id == 0 && cargs == 0 && !is_put(wflags) {
+        log("  -> default-value probe on an object with no default -> DISP_E_MEMBERNOTFOUND");
+        return Err(DISP_E_MEMBERNOTFOUND.into());
+    }
     let member = synth_name(id).unwrap_or_else(|| format!("dispid {id}"));
     log(&format!(
         "  -> unmodeled '{member}' (put={}) -> benign",
@@ -226,7 +247,7 @@ impl IDispatch_Impl for NullObject_Impl {
     }
     fn Invoke(
         &self,
-        id: i32,
+        _id: i32,
         _riid: *const GUID,
         _lcid: u32,
         wflags: DISPATCH_FLAGS,
@@ -235,7 +256,19 @@ impl IDispatch_Impl for NullObject_Impl {
         _ei: *mut EXCEPINFO,
         _ae: *mut u32,
     ) -> Result<()> {
-        unsafe { unhandled(id, wflags, result) }
+        // A NullObject must NEVER fault — it is the graceful-degradation sink, so a
+        // host can walk/call/coerce an unmodeled chain (Columns.EntireColumn.AutoFit(),
+        // some.Unknown.Thing) without an error aborting its export. Every get/call
+        // returns another NullObject so the chain keeps flowing; a put is swallowed.
+        // Unlike a REAL modeled object (which routes through `unhandled`, where an
+        // absent default property correctly yields DISP_E_MEMBERNOTFOUND), the null
+        // sink returns itself even for DISPID_VALUE so coercions don't fault.
+        unsafe {
+            if !is_put(wflags) {
+                put(result, VARIANT::from(null_dispatch()));
+            }
+        }
+        Ok(())
     }
 }
 

@@ -15,6 +15,11 @@
 #[cfg(windows)]
 pub use win::run;
 
+/// The dispinterfaces the shim serves + the mkwordtypelib bin authors — (name,
+/// Word source IID, our docxy IID). Shared so the .tlb and the shim never drift.
+#[cfg(windows)]
+pub use win::DISP_IFACES;
+
 #[cfg(windows)]
 mod win {
     #![allow(non_snake_case)]
@@ -54,6 +59,57 @@ mod win {
     use windows::core::{
         BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
     };
+
+    /// OUR authored type library's LIBID (mkwordtypelib's `docxy_libid`). We
+    /// source per-object typeinfo from our own registered docxy-word.tlb so it
+    /// works on a machine with NO Word (the VDI).
+    const DOCXY_LIBID: GUID = GUID::from_u128(0x9c2f4a11_7d33_4b6e_b1a4_2e7c8d5f0a92);
+
+    /// The dispinterfaces we author + serve, as (name, Word source IID, our docxy
+    /// IID). The mkwordtypelib bin copies each Word dispinterface (real memids +
+    /// invkinds) into our .tlb under OUR IID; the shim's `GetTypeInfo` returns that
+    /// IID's typeinfo so a typeinfo-driven late-bound client (pywin32) introspects
+    /// each object correctly. Single source of truth for both. Names are prefixed
+    /// `Docxy` to avoid colliding with the dual interfaces in the same typelib.
+    pub const DISP_IFACES: &[(&str, u128, u128)] = &[
+        ("DocxyWordApplication", 0x00020970_0000_0000_c000_000000000046, 0xd0c9b001_0002_0970_b1a4_2e7c8d5f0a92),
+        ("DocxyDocuments", 0x0002096c_0000_0000_c000_000000000046, 0xd0c9b002_0002_096c_b1a4_2e7c8d5f0a92),
+        ("DocxyDocument", 0x0002096b_0000_0000_c000_000000000046, 0xd0c9b003_0002_096b_b1a4_2e7c8d5f0a92),
+        ("DocxySelection", 0x00020975_0000_0000_c000_000000000046, 0xd0c9b004_0002_0975_b1a4_2e7c8d5f0a92),
+        ("DocxyWordRange", 0x0002095e_0000_0000_c000_000000000046, 0xd0c9b005_0002_095e_b1a4_2e7c8d5f0a92),
+        ("DocxyWordFont", 0x00020952_0000_0000_c000_000000000046, 0xd0c9b006_0002_0952_b1a4_2e7c8d5f0a92),
+        ("DocxyParagraphFormat", 0x00020953_0000_0000_c000_000000000046, 0xd0c9b007_0002_0953_b1a4_2e7c8d5f0a92),
+    ];
+
+    /// Return the ITypeInfo for one of OUR dispinterface IIDs from our registered
+    /// docxy typelib. Errs (→ client falls back to typeinfo-less dynamic) when the
+    /// .tlb isn't registered.
+    fn docxy_typeinfo(iid_u128: u128) -> Result<windows::Win32::System::Com::ITypeInfo> {
+        unsafe {
+            windows::Win32::System::Ole::LoadRegTypeLib(&DOCXY_LIBID, 1, 0, 0)?
+                .GetTypeInfoOfGuid(&GUID::from_u128(iid_u128))
+        }
+    }
+
+    /// The two IDispatch typeinfo methods for an object, sourcing its dispinterface
+    /// typeinfo by OUR docxy IID.
+    macro_rules! wd_typeinfo {
+        ($iid:expr) => {
+            fn GetTypeInfoCount(&self) -> Result<u32> {
+                Ok(1)
+            }
+            fn GetTypeInfo(
+                &self,
+                i: u32,
+                _l: u32,
+            ) -> Result<windows::Win32::System::Com::ITypeInfo> {
+                if i != 0 {
+                    return Err(DISP_E_BADINDEX.into());
+                }
+                docxy_typeinfo($iid)
+            }
+        };
+    }
 
     /// Our own coclass CLSID — a brand-new GUID, never Microsoft's Word CLSID.
     const SHIM_CLSID: GUID = GUID::from_u128(0x9c2f4a10_7d33_4b6e_b1a4_2e7c8d5f0a92);
@@ -877,21 +933,23 @@ mod win {
         }
     }
 
+    // Word's REAL _Application dispids (so a typeinfo-driven client like pywin32,
+    // which reads our authored dispinterface, calls the same ids our Invoke serves).
     fn app_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "name" => 1,
-            "version" => 2,
-            "visible" => 3,
-            "documents" => 4,
-            "activedocument" => 5,
-            "selection" => 6,
-            "quit" => 7,
+            "name" => 0,
+            "version" => 24,
+            "visible" => 23,
+            "documents" => 6,
+            "activedocument" => 3,
+            "selection" => 5,
+            "quit" => 1105,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for Application_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b001_0002_0970_b1a4_2e7c8d5f0a92);
         dispatch_names!("Application", app_id);
         fn Invoke(
             &self,
@@ -907,9 +965,9 @@ mod win {
             unsafe {
                 log(&format!("Application::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    1 => put(result, VARIANT::from("Microsoft Word")),
-                    2 => put(result, VARIANT::from("16.0")),
-                    3 => {
+                    0 => put(result, VARIANT::from("Microsoft Word")),
+                    24 => put(result, VARIANT::from("16.0")),
+                    23 => {
                         if is_put(wflags) {
                             reg(|r| {
                                 r.visible = arg(params, 0)
@@ -920,20 +978,20 @@ mod win {
                             put(result, VARIANT::from(reg(|r| r.visible)));
                         }
                     }
-                    4 => put_disp(result, Documents),
-                    5 => {
+                    6 => put_disp(result, Documents),
+                    3 => {
                         let doc = reg(|r| r.active);
                         put_disp(result, DocumentObj { doc });
                     }
-                    6 => {
+                    5 => {
                         let doc = reg(|r| r.active);
                         put_disp(result, Selection { doc });
                     }
-                    7 => {
+                    1105 => {
                         log("Application::Quit");
                         PostQuitMessage(0);
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -947,18 +1005,19 @@ mod win {
     #[implement(IDocuments)]
     struct Documents;
 
+    // Word's REAL Documents dispids.
     fn documents_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "add" => 1,
-            "open" => 2,
-            "item" | "_default" => 3,
-            "count" => 4,
+            "add" => 14,
+            "open" => 19,
+            "item" | "_default" => 0,
+            "count" => 2,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for Documents_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b002_0002_096c_b1a4_2e7c8d5f0a92);
         dispatch_names!("Documents", documents_id);
         fn Invoke(
             &self,
@@ -974,7 +1033,7 @@ mod win {
             unsafe {
                 log(&format!("Documents::Invoke id={id}"));
                 match id {
-                    1 => {
+                    14 => {
                         let doc = reg(|r| {
                             r.docs.push(DocState::new());
                             r.active = r.docs.len() - 1;
@@ -982,7 +1041,7 @@ mod win {
                         });
                         put_disp(result, DocumentObj { doc });
                     }
-                    2 => {
+                    19 => {
                         let Some(path) = arg_string(params, 0) else {
                             return Err(DISP_E_BADINDEX.into());
                         };
@@ -1001,15 +1060,15 @@ mod win {
                             }
                         }
                     }
-                    3 => {
+                    0 => {
                         let idx = (arg_i32(params, 0).unwrap_or(1).max(1) as usize) - 1;
                         if !reg(|r| idx < r.docs.len()) {
                             return Err(DISP_E_BADINDEX.into());
                         }
                         put_disp(result, DocumentObj { doc: idx });
                     }
-                    4 => put(result, VARIANT::from(reg(|r| r.docs.len() as i32))),
-                    _ => return unhandled(id, wflags, result),
+                    2 => put(result, VARIANT::from(reg(|r| r.docs.len() as i32))),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1025,24 +1084,29 @@ mod win {
         doc: usize,
     }
 
+    // Word's REAL _Document dispids.
     fn document_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "content" | "range" => 1,
-            "saveas" | "saveas2" | "saveas2000" => 2,
-            "save" => 3,
-            "close" => 4,
-            "name" => 5,
-            "fullname" => 6,
-            "path" => 7,
-            "activate" | "select" => 8,
-            "paragraphs" => 9,
-            "tables" => 10,
+            "content" => 41,
+            "range" => 2000,
+            "saveas" => 376,
+            "saveas2" => 568,
+            "saveas2000" => 102,
+            "save" => 108,
+            "close" => 1105,
+            "name" => 0,
+            "fullname" => 29,
+            "path" => 3,
+            "activate" => 113,
+            "select" => 65535,
+            "paragraphs" => 16,
+            "tables" => 6,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for DocumentObj_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b003_0002_096b_b1a4_2e7c8d5f0a92);
         dispatch_names!("Document", document_id);
         fn Invoke(
             &self,
@@ -1059,8 +1123,9 @@ mod win {
             unsafe {
                 log(&format!("Document[{doc}]::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    1 => put_disp(result, Range { doc }),
-                    2 => {
+                    41 | 2000 => put_disp(result, Range { doc }), // Content / Range
+                    // SaveAs / SaveAs2 / SaveAs2000 — filename in arg 0.
+                    102 | 376 | 568 => {
                         let Some(path) = arg_string(params, 0) else {
                             return Err(windows::Win32::Foundation::E_FAIL.into());
                         };
@@ -1071,7 +1136,7 @@ mod win {
                             _ => return Err(windows::Win32::Foundation::E_FAIL.into()),
                         }
                     }
-                    3 => {
+                    108 => {
                         let res = reg(|r| {
                             r.docs.get_mut(doc).map(|d| {
                                 d.path
@@ -1084,16 +1149,16 @@ mod win {
                             log("Document.Save: no path (needs SaveAs)");
                         }
                     }
-                    4 => {} // Close — keep the slot so indices stay stable
-                    5 => put(result, VARIANT::from(BSTR::from(reg(|r| {
+                    1105 => {} // Close — keep the slot so indices stay stable
+                    0 => put(result, VARIANT::from(BSTR::from(reg(|r| {
                         r.docs.get(doc).map(|d| d.name()).unwrap_or_default()
                     }).as_str()))),
-                    6 | 7 => put(result, VARIANT::from(BSTR::from(reg(|r| {
+                    3 | 29 => put(result, VARIANT::from(BSTR::from(reg(|r| {
                         r.docs.get(doc).and_then(|d| d.path.clone()).unwrap_or_default()
-                    }).as_str()))),
-                    8 => {} // Activate / Select — no-op
-                    10 => put_disp(result, Tables { doc }),
-                    _ => return unhandled(id, wflags, result),
+                    }).as_str()))), // Path / FullName
+                    113 | 65535 => {} // Activate / Select — no-op
+                    6 => put_disp(result, Tables { doc }),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1109,27 +1174,30 @@ mod win {
         doc: usize,
     }
 
+    // Word's REAL Selection dispids. Bold/Italic/Underline are NOT direct Selection
+    // members in Word (they live on Font); we expose them as a convenience, so they
+    // get high ids that can't collide with a real dispid the typeinfo might carry.
     fn selection_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "typetext" => 1,
-            "typeparagraph" => 2,
-            "text" => 3,
-            "insertafter" => 4,
-            "insertbefore" => 5,
-            "range" => 6,
-            "font" => 10,
-            "bold" => 11,
-            "italic" => 12,
-            "underline" => 13,
-            "paragraphformat" => 14,
-            "style" => 16,
-            "insertbreak" => 17,
+            "typetext" => 507,
+            "typeparagraph" => 512,
+            "text" => 0,
+            "insertafter" => 104,
+            "insertbefore" => 102,
+            "range" => 400,
+            "font" => 5,
+            "bold" => 0x6001,
+            "italic" => 0x6002,
+            "underline" => 0x6003,
+            "paragraphformat" => 1102,
+            "style" => 8,
+            "insertbreak" => 122,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for Selection_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b004_0002_0975_b1a4_2e7c8d5f0a92);
         dispatch_names!("Selection", selection_id);
         fn Invoke(
             &self,
@@ -1146,7 +1214,7 @@ mod win {
             unsafe {
                 log(&format!("Selection[{doc}]::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    1 => {
+                    507 => {
                         if let Some(s) = arg_string(params, 0) {
                             reg(|r| {
                                 if let Some(d) = r.docs.get_mut(doc) {
@@ -1155,12 +1223,12 @@ mod win {
                             });
                         }
                     }
-                    2 => reg(|r| {
+                    512 => reg(|r| {
                         if let Some(d) = r.docs.get_mut(doc) {
                             d.type_paragraph()
                         }
                     }),
-                    3 => {
+                    0 => {
                         if is_put(wflags) {
                             let s = arg_string(params, 0).unwrap_or_default();
                             reg(|r| {
@@ -1173,7 +1241,7 @@ mod win {
                             put(result, VARIANT::from(BSTR::from(t.as_str())));
                         }
                     }
-                    4 | 5 => {
+                    104 | 102 => {
                         if let Some(s) = arg_string(params, 0) {
                             reg(|r| {
                                 if let Some(d) = r.docs.get_mut(doc) {
@@ -1182,15 +1250,15 @@ mod win {
                             });
                         }
                     }
-                    6 => put_disp(result, Range { doc }),
-                    10 => put_disp(result, WordFont { doc, all: false }),
-                    11 => return bool_prop(doc, false, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    12 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    13 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
-                    14 => put_disp(result, ParaFmt { doc, all: false }),
+                    400 => put_disp(result, Range { doc }),
+                    5 => put_disp(result, WordFont { doc, all: false }),
+                    0x6001 => return bool_prop(doc, false, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    0x6002 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    0x6003 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    1102 => put_disp(result, ParaFmt { doc, all: false }),
                     // InsertBreak([Type]) — wdPageBreak(7)/Column(8)/Line(6);
                     // section breaks (0..3) fall back to a page break.
-                    17 => {
+                    122 => {
                         let kind = match arg_i32(params, 0) {
                             Some(8) => BreakKind::Column,
                             Some(6) => BreakKind::Line,
@@ -1203,7 +1271,7 @@ mod win {
                         });
                     }
                     // Style — a style name ("Heading 1") or a wdStyle int.
-                    16 => {
+                    8 => {
                         if is_put(wflags) {
                             if let Some(v) = arg(params, 0) {
                                 if vt_of(v) == VT_BSTR {
@@ -1223,7 +1291,7 @@ mod win {
                             }
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1239,24 +1307,26 @@ mod win {
         doc: usize,
     }
 
+    // Word's REAL Range dispids.
     fn range_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "text" => 1,
-            "insertafter" => 2,
-            "insertbefore" => 3,
-            "insertparagraphafter" | "insertparagraph" => 4,
-            "font" => 10,
-            "bold" => 11,
-            "italic" => 12,
-            "underline" => 13,
-            "paragraphformat" => 14,
-            "listformat" => 20,
+            "text" => 0,
+            "insertafter" => 104,
+            "insertbefore" => 102,
+            "insertparagraphafter" => 161,
+            "insertparagraph" => 160,
+            "font" => 5,
+            "bold" => 130,
+            "italic" => 131,
+            "underline" => 139,
+            "paragraphformat" => 1102,
+            "listformat" => 68,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for Range_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b005_0002_095e_b1a4_2e7c8d5f0a92);
         dispatch_names!("Range", range_id);
         fn Invoke(
             &self,
@@ -1273,7 +1343,7 @@ mod win {
             unsafe {
                 log(&format!("Range[{doc}]::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    1 => {
+                    0 => {
                         if is_put(wflags) {
                             let s = arg_string(params, 0).unwrap_or_default();
                             reg(|r| {
@@ -1286,7 +1356,7 @@ mod win {
                             put(result, VARIANT::from(BSTR::from(t.as_str())));
                         }
                     }
-                    2 | 3 => {
+                    104 | 102 => {
                         if let Some(s) = arg_string(params, 0) {
                             reg(|r| {
                                 if let Some(d) = r.docs.get_mut(doc) {
@@ -1295,19 +1365,19 @@ mod win {
                             });
                         }
                     }
-                    4 => reg(|r| {
+                    160 | 161 => reg(|r| {
                         if let Some(d) = r.docs.get_mut(doc) {
                             d.type_paragraph()
                         }
                     }),
                     // Range.Font/Bold/etc. format the EXISTING text (all runs).
-                    10 => put_disp(result, WordFont { doc, all: true }),
-                    11 => return bool_prop(doc, true, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    12 => return bool_prop(doc, true, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    13 => return bool_prop(doc, true, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
-                    14 => put_disp(result, ParaFmt { doc, all: true }),
-                    20 => put_disp(result, ListFormat { doc }),
-                    _ => return unhandled(id, wflags, result),
+                    5 => put_disp(result, WordFont { doc, all: true }),
+                    130 => return bool_prop(doc, true, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    131 => return bool_prop(doc, true, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    139 => return bool_prop(doc, true, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    1102 => put_disp(result, ParaFmt { doc, all: true }),
+                    68 => put_disp(result, ListFormat { doc }),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1394,20 +1464,21 @@ mod win {
         ))
     }
 
+    // Word's REAL _Font dispids.
     fn font_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "bold" => 1,
-            "italic" => 2,
-            "underline" => 3,
-            "size" => 4,
-            "name" => 5,
-            "color" => 6,
+            "bold" => 130,
+            "italic" => 131,
+            "underline" => 140,
+            "size" => 141,
+            "name" => 142,
+            "color" => 159,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for WordFont_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b006_0002_0952_b1a4_2e7c8d5f0a92);
         dispatch_names!("Font", font_id);
         fn Invoke(
             &self,
@@ -1424,10 +1495,10 @@ mod win {
             unsafe {
                 log(&format!("Font[{doc}]::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    1 => return bool_prop(doc, all, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    2 => return bool_prop(doc, all, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    3 => return bool_prop(doc, all, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
-                    4 => {
+                    130 => return bool_prop(doc, all, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
+                    131 => return bool_prop(doc, all, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
+                    140 => return bool_prop(doc, all, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    141 => {
                         if is_put(wflags) {
                             if let Some(pt) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
                                 let hp = (pt * 2.0).round() as u32;
@@ -1435,36 +1506,37 @@ mod win {
                             }
                         }
                     }
-                    5 => {
+                    142 => {
                         if is_put(wflags) {
                             if let Some(nm) = arg_string(params, 0) {
                                 set_font(doc, all, |p| p.font = Some(nm.clone()));
                             }
                         }
                     }
-                    6 => {
+                    159 => {
                         if is_put(wflags) {
                             if let Some(hex) = arg_i32(params, 0).and_then(word_color_hex) {
                                 set_font(doc, all, |p| p.color = Some(hex.clone()));
                             }
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
         }
     }
 
+    // Word's REAL _ParagraphFormat dispids.
     fn paraformat_id(name: &str) -> Option<i32> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "alignment" => 1,
+            "alignment" => 101,
             _ => return None,
         })
     }
 
     impl IDispatch_Impl for ParaFmt_Impl {
-        no_typeinfo!();
+        wd_typeinfo!(0xd0c9b007_0002_0953_b1a4_2e7c8d5f0a92);
         dispatch_names!("ParagraphFormat", paraformat_id);
         fn Invoke(
             &self,
@@ -1482,7 +1554,7 @@ mod win {
                 log(&format!("ParagraphFormat[{doc}]::Invoke id={id}"));
                 match id {
                     // Alignment: WdParagraphAlignment 0=Left 1=Center 2=Right 3=Justify.
-                    1 => {
+                    101 => {
                         if is_put(wflags) {
                             let a = match arg_i32(params, 0) {
                                 Some(1) => Align::Center,
@@ -1505,7 +1577,7 @@ mod win {
                             });
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1563,7 +1635,7 @@ mod win {
             _riid: *const GUID,
             _lcid: u32,
             wflags: DISPATCH_FLAGS,
-            _params: *const DISPPARAMS,
+            params: *const DISPPARAMS,
             result: *mut VARIANT,
             _ei: *mut EXCEPINFO,
             _ae: *mut u32,
@@ -1575,7 +1647,7 @@ mod win {
                     1 => Some(true),
                     2 => Some(false),
                     3 => None,
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 };
                 reg(|r| {
                     if let Some(d) = r.docs.get_mut(doc) {
@@ -1626,7 +1698,7 @@ mod win {
                         put_disp(result, WordTable { doc, tno });
                     }
                     3 => put(result, VARIANT::from(reg(|r| r.docs.get(doc).map(|d| d.table_count()).unwrap_or(0)) as i32)),
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1665,7 +1737,7 @@ mod win {
                         let col = arg_i32(params, 1).unwrap_or(1).max(1) as usize;
                         put_disp(result, WordCell { doc, tno, row, col });
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1687,7 +1759,7 @@ mod win {
             _riid: *const GUID,
             _lcid: u32,
             wflags: DISPATCH_FLAGS,
-            _params: *const DISPPARAMS,
+            params: *const DISPPARAMS,
             result: *mut VARIANT,
             _ei: *mut EXCEPINFO,
             _ae: *mut u32,
@@ -1696,7 +1768,7 @@ mod win {
             unsafe {
                 match id {
                     1 => put_disp(result, CellRange { doc, tno, row, col }),
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }
@@ -1752,7 +1824,7 @@ mod win {
                             });
                         }
                     }
-                    _ => return unhandled(id, wflags, result),
+                    _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
             }

@@ -20,7 +20,14 @@ installed Excel type library.
 
 It answers **both** binding styles a .NET client (like Petrel) can use:
 
-- **Late-bound** (`IDispatch::Invoke`) — `CreateObject`, VBScript, C# `dynamic`.
+- **Late-bound** (`IDispatch::Invoke`) — `CreateObject`, VBScript, C# `dynamic`,
+  and **type-info-driven** scripting clients like **pywin32**. The latter don't
+  just call by name; they read each object's **type information** to tell
+  properties from methods. So every navigable object implements
+  `IDispatch::GetTypeInfo`, returning its dispinterface (Excel's real DISPIDs +
+  property/method kinds) from our authored typelib — which makes
+  `win32com.client.Dispatch("Excel.Application")` and `gencache.EnsureDispatch`
+  drive the shim correctly, with no Excel installed.
 - **Early-bound** (typed vtable) — the Office PIA. Our objects implement Excel's
   dual interfaces in exact vtable order (generated from the typelib), so a
   `(Excel.Application)` cast and typed member calls succeed. The subtlety that
@@ -51,6 +58,7 @@ swallowed, a get/call returns a do-nothing object so chains like
 | Area | State |
 |---|---|
 | **Activation** | ✅ late-bound (IDispatch) **and** early-bound (typed vtable), both in-process (DLL) and out-of-process (EXE) |
+| **Scripting clients** | ✅ pywin32 (`Dispatch` + `gencache.EnsureDispatch`) via per-object `GetTypeInfo` (dispinterfaces authored into our .tlb); verified by `tools/comshim-tests/python/pywin32_conformance.py` |
 | **Create path** | ✅ `Workbooks.Add` → `Worksheets(n)` → `Range`/`Cells`/`Offset`/`Resize` writes → `=SUM` formulas → `SaveAs`; real Excel opens the result with no repair |
 | **Formatting** | ✅ Font bold/italic/color, Interior fill, NumberFormat, HorizontalAlignment — written into `styles.xml`, rendered by real Excel |
 | **Robustness** | ✅ unmodeled members degrade gracefully + are logged; unmodeled early-bound slots log their interface+slot before a clean `E_NOTIMPL` |
