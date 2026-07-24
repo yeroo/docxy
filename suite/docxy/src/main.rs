@@ -161,6 +161,19 @@ struct Docxy {
     clip: Option<Clip>,
     theme_pref: ThemePref,
     applied: Option<ThemeMode>,
+    // Find & replace bar (Ctrl+F). Self-managed text fields (no gpui-component
+    // InputState entity) — keystrokes route here while `find_open`.
+    find_open: bool,
+    find_query: String,
+    replace_text: String,
+    find_field: FindField,
+    find_case: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FindField {
+    Query,
+    Replace,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -270,6 +283,11 @@ impl Docxy {
             clip: None,
             theme_pref: session.theme,
             applied: None,
+            find_open: false,
+            find_query: String::new(),
+            replace_text: String::new(),
+            find_field: FindField::Query,
+            find_case: false,
         };
         this.persist();
         this
@@ -455,10 +473,251 @@ impl Docxy {
         }
     }
 
+    // ---- find & replace ----------------------------------------------------
+
+    /// Open the find bar (focused on the query field) or close it.
+    fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = !self.find_open;
+        if self.find_open {
+            self.find_field = FindField::Query;
+            // Seed from the current selection, if any, for a quick "find selected".
+            if let Some(ed) = self.active_editor() {
+                let sel = ed.selection_text();
+                if !sel.is_empty() && !sel.contains('\n') {
+                    self.find_query = sel;
+                }
+            }
+            self.find_step(false, false, cx); // highlight the first match
+            self.refocus(window, cx);
+        } else {
+            self.refocus(window, cx);
+        }
+    }
+
+    /// Number of matches for the current query in the active document.
+    fn match_count(&self) -> usize {
+        if self.find_query.is_empty() {
+            return 0;
+        }
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => ed.find_all(&self.find_query, self.find_case).len(),
+            _ => 0,
+        }
+    }
+
+    /// Move to the next/previous match and select it (so it highlights).
+    /// `from_start` restarts the search from the document top (used as-you-type).
+    fn find_step(&mut self, reverse: bool, from_start: bool, cx: &mut Context<Self>) {
+        let q = self.find_query.clone();
+        let cs = self.find_case;
+        if let Some(ed) = self.active_editor() {
+            if from_start {
+                ed.move_doc_start();
+                ed.clear_selection();
+            }
+            if let Some(m) = ed.find_next(&q, cs, reverse) {
+                ed.select_match(&m);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Replace the current match (if one is selected) and advance to the next.
+    fn replace_one(&mut self, cx: &mut Context<Self>) {
+        let with = self.replace_text.clone();
+        let q = self.find_query.clone();
+        let cs = self.find_case;
+        let mut changed = false;
+        if let Some(ed) = self.active_editor() {
+            if ed.has_selection() {
+                ed.replace_current_with(&with);
+                changed = true;
+            }
+            if let Some(m) = ed.find_next(&q, cs, false) {
+                ed.select_match(&m);
+            }
+        }
+        if changed {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Replace every match; report the count in the status line.
+    fn replace_all_now(&mut self, cx: &mut Context<Self>) {
+        let with = self.replace_text.clone();
+        let q = self.find_query.clone();
+        let cs = self.find_case;
+        let mut n = 0;
+        if let Some(ed) = self.active_editor() {
+            n = ed.replace_all(&q, &with, cs);
+        }
+        if n > 0 {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.dirty = true;
+                t.status = format!("replaced {n}").into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Route a keystroke to the find bar while it is open.
+    fn find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match key {
+            "escape" => return self.toggle_find(window, cx),
+            "enter" => {
+                if self.find_field == FindField::Replace {
+                    self.replace_one(cx);
+                } else {
+                    self.find_step(shift, false, cx);
+                }
+                return;
+            }
+            // Tab is swallowed by gpui's focus traversal, so also accept Up/Down to
+            // move between the Find and Replace fields (Tab still works if delivered).
+            "tab" | "down" | "up" => {
+                self.find_field = match (self.find_field, key) {
+                    (FindField::Query, "up") => FindField::Query,
+                    (FindField::Replace, "down") => FindField::Replace,
+                    (FindField::Query, _) => FindField::Replace,
+                    (FindField::Replace, _) => FindField::Query,
+                };
+                cx.notify();
+                return;
+            }
+            "backspace" => {
+                let f = self.find_field;
+                let field = if f == FindField::Query { &mut self.find_query } else { &mut self.replace_text };
+                field.pop();
+                if f == FindField::Query {
+                    self.find_step(false, true, cx);
+                } else {
+                    cx.notify();
+                }
+                return;
+            }
+            _ => {}
+        }
+        if let Some(c) = ev.keystroke.key_char.as_deref() {
+            if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                let f = self.find_field;
+                if f == FindField::Query {
+                    self.find_query.push_str(c);
+                    self.find_step(false, true, cx);
+                } else {
+                    self.replace_text.push_str(c);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The find & replace bar, shown under the ribbon while `find_open`.
+    fn find_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.match_count();
+        let count_txt = if self.find_query.is_empty() {
+            String::new()
+        } else if count == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{count} match{}", if count == 1 { "" } else { "es" })
+        };
+
+        let field = |label: &'static str, text: &str, active: bool| {
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .h(px(24.))
+                .min_w(px(150.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(if active { hsla_u(BRAND) } else { pal.border })
+                .bg(pal.panel)
+                .child(div().text_size(px(10.)).text_color(pal.dim).child(label))
+                .child(div().text_size(px(13.)).text_color(pal.fg).child(SharedString::from(text.to_string())))
+                .when(active, |d| d.child(caret_bar()))
+        };
+
+        let icon_btn = |id: &'static str, glyph: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(14.))
+                .text_color(pal.fg)
+                .when(on, |d| d.bg(pal.hover))
+                .hover(|d| d.bg(pal.hover))
+                .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+                .child(glyph)
+        };
+        let text_btn = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .px_2()
+                .h(px(24.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(pal.fg)
+                .hover(|d| d.bg(pal.hover))
+                .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+                .child(label)
+        };
+
+        h_flex()
+            .w_full()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .child(field("Find", &self.find_query, self.find_field == FindField::Query).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.find_field = FindField::Query;
+                cx.notify();
+            })))
+            .child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(68.)).child(SharedString::from(count_txt)))
+            .child(icon_btn("f-prev", "\u{2191}", false).on_click(cx.listener(|this, _, _, cx| this.find_step(true, false, cx))))
+            .child(icon_btn("f-next", "\u{2193}", false).on_click(cx.listener(|this, _, _, cx| this.find_step(false, false, cx))))
+            .child(div().w(px(1.)).h(px(18.)).bg(pal.border))
+            .child(field("Replace", &self.replace_text, self.find_field == FindField::Replace).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.find_field = FindField::Replace;
+                cx.notify();
+            })))
+            .child(text_btn("f-rep", "Replace").on_click(cx.listener(|this, _, _, cx| this.replace_one(cx))))
+            .child(text_btn("f-all", "All").on_click(cx.listener(|this, _, _, cx| this.replace_all_now(cx))))
+            .child(div().flex_1())
+            .child(icon_btn("f-case", "Aa", self.find_case).on_click(cx.listener(|this, _, _, cx| {
+                this.find_case = !this.find_case;
+                this.find_step(false, true, cx);
+            })))
+            .child(icon_btn("f-close", "\u{00d7}", false).on_click(cx.listener(|this, _, window, cx| this.toggle_find(window, cx))))
+            .into_any_element()
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = &ev.keystroke.modifiers;
         let ctrl = m.control || m.platform;
+        let shift = m.shift;
         let key = ev.keystroke.key.clone();
+        // Ctrl+F toggles the find bar; while it's open, all keys go to it.
+        if ctrl && key == "f" {
+            return self.toggle_find(window, cx);
+        }
+        if self.find_open {
+            return self.find_key(ev, shift, key.as_str(), window, cx);
+        }
         if ctrl {
             match key.as_str() {
                 "s" => return self.save_active(window, cx),
@@ -473,7 +732,6 @@ impl Docxy {
                 _ => {}
             }
         }
-        let shift = m.shift;
         let Some(ed) = self.active_editor() else { return };
         if key == "escape" {
             ed.clear_selection();
@@ -557,7 +815,7 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
-    Bullets, Numbers, IndentInc, IndentDec, ClearFmt,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -622,6 +880,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             cmdt("hr", "rule", "Horizontal rule", HRule, ""),
         ])])]),
         rs::tab("Review", "R", vec![rs::group("Editing", 40, vec![rs::column(vec![
+            cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
             cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
             cmdt("case", "case", "Change case", Case, ""),
         ])])]),
@@ -989,6 +1248,7 @@ impl Docxy {
             Paste => self.do_paste(window, cx),
             LaunchFont => self.launch_msg("Font — advanced dialog coming soon", window, cx),
             LaunchParagraph => self.launch_msg("Paragraph — advanced dialog coming soon", window, cx),
+            Find => self.toggle_find(window, cx),
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1020,7 +1280,7 @@ impl Docxy {
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find => {}
             }),
         }
     }
@@ -1390,6 +1650,7 @@ impl Render for Docxy {
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
         let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
+        let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -1427,7 +1688,7 @@ impl Render for Docxy {
             .text_color(dim)
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
             .child(div().flex_1())
-            .child("type · Ctrl+B/I/U · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
+            .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
 
         v_flex()
             .size_full()
@@ -1437,6 +1698,7 @@ impl Render for Docxy {
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
+            .when_some(find_bar, |d, f| d.child(f))
             .child(content)
             .child(status)
             .into_any_element()
