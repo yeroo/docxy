@@ -765,7 +765,9 @@ impl Docxy {
                     .px_3()
                     .py_1()
                     .cursor_pointer()
+                    .rounded_t_sm()
                     .text_size(px(12.))
+                    .when(!is_file, |d| d.hover(|d| d.bg(Hsla { a: 0.10, ..fg })))
                     .when(is_file, |d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)).font_weight(FontWeight::BOLD).rounded_t_sm())
                     .when(active, |d| d.text_color(rgb(BRAND)).border_b_2().border_color(rgb(BRAND)))
                     .when(!active && !is_file, |d| d.text_color(fg))
@@ -965,6 +967,7 @@ impl Docxy {
             .rounded(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 16., pal.fg))
             .when(show_label, |d| d.child(div().text_size(px(12.)).text_color(pal.fg).child(SharedString::from(cmd.label))))
             .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
@@ -1133,8 +1136,10 @@ impl Render for Docxy {
         let panel = t.secondary;
         let sidebar = t.sidebar;
         let tab_active = t.tab_active;
-        let accent = t.accent;
-        let pal = Pal { fg, dim, border, panel, hover: accent };
+        // A theme-adaptive hover tint: a low-alpha wash of the foreground, so it's
+        // clearly visible as a highlight on both light and dark grounds.
+        let hover = Hsla { a: 0.12, ..fg };
+        let pal = Pal { fg, dim, border, panel, hover };
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
