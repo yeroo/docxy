@@ -170,6 +170,8 @@ struct Docxy {
     find_case: bool,
     // Font-colour / highlight swatch picker (None = closed).
     picker: Option<PickKind>,
+    // Scroll handle for the document body, so the caret can be kept in view.
+    doc_scroll: ScrollHandle,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -318,6 +320,7 @@ impl Docxy {
             find_field: FindField::Query,
             find_case: false,
             picker: None,
+            doc_scroll: ScrollHandle::new(),
         };
         this.persist();
         this
@@ -467,6 +470,18 @@ impl Docxy {
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    /// Scroll the document so the caret's top-level block is in view (keyboard
+    /// navigation/typing in a long document shouldn't let the caret drift off).
+    fn scroll_to_caret(&self) {
+        if let Some(t) = self.tabs.get(self.active) {
+            if let Surface::Doc(ed) = &t.surface {
+                if let Some(&b) = ed.caret.path.first() {
+                    self.doc_scroll.scroll_to_item(b);
+                }
+            }
+        }
     }
 
     /// Place the caret at an explicit paragraph path + char offset (used by
@@ -943,6 +958,7 @@ impl Docxy {
                 t.dirty = true;
             }
         }
+        self.scroll_to_caret();
         cx.notify();
     }
 }
@@ -1946,7 +1962,7 @@ impl Render for Docxy {
                         .enumerate()
                         .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
                         .collect();
-                    v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
+                    v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
