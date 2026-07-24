@@ -212,6 +212,8 @@ struct Docxy {
     show_nav: bool,
     // Footnotes/endnotes side panel — Review ▸ Notes.
     show_notes: bool,
+    // Print Layout: render the document on a page sheet with margins (View).
+    page_view: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -441,6 +443,7 @@ impl Docxy {
             show_comments: false,
             show_nav: false,
             show_notes: false,
+            page_view: false,
         };
         this.persist();
         this
@@ -1522,7 +1525,7 @@ enum Act {
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     InsertField, PageBreak, ToggleNotes, InsertTable,
-    RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable,
+    RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1611,43 +1614,39 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
             ])]),
         ]),
+        // Insert: headline commands as large buttons (Word's Insert tab style).
         rs::tab("Insert", "N", vec![
-            rs::group("Pages", 40, vec![rs::column(vec![
-                cmdt("pagebreak", "rule", "Page break", PageBreak, ""),
-            ])]),
-            rs::group("Tables", 35, vec![rs::column(vec![
-                cmdt("table", "table", "Table", InsertTable, ""),
-            ])]),
-            rs::group("Text", 30, vec![rs::column(vec![
-                cmdt("field", "case", "Field", InsertField, ""),
-            ])]),
-            rs::group("Symbols", 20, vec![rs::column(vec![
-                cmdt("hr", "rule", "Horizontal rule", HRule, ""),
-            ])]),
+            rs::group("Pages", 40, vec![Control::Large(cmdt("pagebreak", "rule", "Page Break", PageBreak, ""))]),
+            rs::group("Tables", 35, vec![Control::Large(cmdt("table", "table", "Table", InsertTable, ""))]),
+            rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, ""))]),
+            rs::group("Symbols", 20, vec![Control::Large(cmdt("hr", "rule", "Rule", HRule, ""))]),
         ]),
+        // Review: a large New Comment + a small pane-toggle column, then Editing.
         rs::tab("Review", "R", vec![
-            rs::group("Comments", 40, vec![rs::column(vec![
-                cmdt("newcomment", "comment-add", "New comment", NewComment, ""),
-                cmdt("togglecomments", "comment", "Comments pane", ToggleComments, ""),
-                cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, ""),
-            ])]),
+            rs::group("Comments", 40, vec![
+                Control::Large(cmdt("newcomment", "comment-add", "New Comment", NewComment, "")),
+                rs::column(vec![
+                    cmdt("togglecomments", "comment", "Comments pane", ToggleComments, ""),
+                    cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, ""),
+                ]),
+            ]),
             rs::group("Editing", 30, vec![rs::column(vec![
                 cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
                 cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
                 cmdt("case", "case", "Change case", Case, ""),
             ])]),
         ]),
+        // View: a large Print Layout toggle, then Show and Appearance columns.
         rs::tab("View", "W", vec![
-            rs::group("Panes", 40, vec![rs::column(vec![
+            rs::group("Views", 40, vec![Control::Large(cmdt("printlayout", "print-layout", "Print Layout", PrintLayout, ""))]),
+            rs::group("Show", 30, vec![rs::column(vec![
+                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
                 cmdt("nav", "select-all", "Navigation", ToggleNav, ""),
                 cmdt("viewcomments", "comment", "Comments pane", ToggleComments, ""),
             ])]),
-            rs::group("Show", 30, vec![rs::column(vec![
-                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
-                cmdt("autohide", "rule", "Collapse ribbon", AutoHideRibbon, "Ctrl+F1"),
-            ])]),
             rs::group("Appearance", 20, vec![rs::column(vec![
                 cmdt("darkmode", "case", "Theme", DarkMode, ""),
+                cmdt("autohide", "rule", "Collapse ribbon", AutoHideRibbon, "Ctrl+F1"),
             ])]),
         ]),
     ])
@@ -2263,6 +2262,10 @@ impl Docxy {
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
+            PrintLayout => {
+                self.page_view = !self.page_view;
+                self.refocus(window, cx);
+            }
             PageBreak => self.insert_page_break(window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
@@ -2303,7 +2306,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout => {}
             }),
         }
     }
@@ -2528,9 +2531,11 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A large icon-over-label ribbon button (e.g. Paste).
+    /// A large icon-over-label ribbon button (e.g. Paste, Table).
     fn large_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
+        let on = self.act_active(act);
+        let tip: SharedString = cmd.label.into();
         div()
             .id(cmd.id)
             .flex()
@@ -2542,11 +2547,12 @@ impl Docxy {
             .h_full()
             .rounded(px(4.))
             .cursor_pointer()
+            .when(on, |d| d.bg(Hsla { a: 0.20, ..hsla_u(BRAND) }))
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 26., pal.fg))
             .child(div().text_size(px(11.)).text_color(pal.fg).child(SharedString::from(cmd.label)))
-            .tooltip(move |window, cx| Tooltip::new("Paste").build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             .into_any_element()
     }
@@ -2580,6 +2586,7 @@ impl Docxy {
             ToggleComments => self.show_comments,
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
+            PrintLayout => self.page_view,
             _ => false,
         }
     }
@@ -2878,7 +2885,14 @@ impl Render for Docxy {
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
                     let ent = cx.entity();
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal, marks: self.show_marks };
+                    // In Print Layout the sheet is always a light page (dark ink on
+                    // white) regardless of the app theme, like Word's document surface.
+                    let doc_pal = if self.page_view {
+                        Pal { fg: hsla_u(0x202020), dim: hsla_u(0x808080), border: hsla_u(0xcccccc), panel: hsla_u(0xf0f0f0), hover: Hsla { a: 0.08, ..hsla_u(0x000000) }, sel: pal.sel }
+                    } else {
+                        pal
+                    };
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks };
                     let blocks: Vec<AnyElement> = editor
                         .doc
                         .body
@@ -2886,7 +2900,40 @@ impl Render for Docxy {
                         .enumerate()
                         .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
                         .collect();
-                    v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
+                    if self.page_view {
+                        // A white page sheet with the section's margins, centred on a
+                        // grey canvas.
+                        let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
+                        let tw = |t: i32| px((t.max(0) as f32) / 15.0); // twips → px @ ~96dpi
+                        let canvas = if self.applied == Some(ThemeMode::Dark) { hsla_u(0x2b2b2b) } else { hsla_u(0x9a9a9a) };
+                        let page = v_flex()
+                            .w(tw(geom.w))
+                            .min_h(tw(geom.h))
+                            .bg(hsla_u(0xffffff))
+                            .text_color(doc_pal.fg)
+                            .border_1()
+                            .border_color(hsla_u(0xd0d0d0))
+                            .pt(tw(geom.mt))
+                            .pr(tw(geom.mr))
+                            .pb(tw(geom.mb))
+                            .pl(tw(geom.ml))
+                            .gap_1()
+                            .children(blocks);
+                        v_flex()
+                            .id("doc-scroll")
+                            .track_scroll(&self.doc_scroll)
+                            .flex_1()
+                            .h_full()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .bg(canvas)
+                            .items_center()
+                            .py(px(24.))
+                            .child(page)
+                            .into_any_element()
+                    } else {
+                        v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
+                    }
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
