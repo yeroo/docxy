@@ -2366,9 +2366,43 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Whether a toggle command is currently "on" for the caret's formatting, so
+    /// the ribbon button can show a pressed state (Word highlights e.g. Bold when
+    /// the caret sits in bold text).
+    fn act_active(&self, act: Act) -> bool {
+        use Act::*;
+        let doc = match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => Some(ed),
+            _ => None,
+        };
+        let rp = doc.map(|ed| ed.caret_props());
+        let pp = doc.map(|ed| ed.caret_para_props());
+        match act {
+            Bold => rp.map_or(false, |p| p.bold),
+            Italic => rp.map_or(false, |p| p.italic),
+            Underline => rp.map_or(false, |p| p.underline),
+            Strike => rp.map_or(false, |p| p.strike),
+            Super => rp.map_or(false, |p| p.vert_align == VertAlign::Superscript),
+            Sub => rp.map_or(false, |p| p.vert_align == VertAlign::Subscript),
+            AlignL => pp.map_or(false, |p| p.align == Align::Left),
+            AlignC => pp.map_or(false, |p| p.align == Align::Center),
+            AlignR => pp.map_or(false, |p| p.align == Align::Right),
+            AlignJ => pp.map_or(false, |p| p.align == Align::Justify),
+            Bullets => doc.map_or(false, |ed| ed.all_in_list(NUM_BULLET)),
+            Numbers => doc.map_or(false, |ed| ed.all_in_list(NUM_DECIMAL)),
+            ParaBorders => pp.map_or(false, |p| p.borders.bottom.is_some()),
+            ShowHide => self.show_marks,
+            ToggleComments => self.show_comments,
+            ToggleNav => self.show_nav,
+            ToggleNotes => self.show_notes,
+            _ => false,
+        }
+    }
+
     fn icon_btn(&self, cmd: &rs::Cmd<Act>, show_label: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
         let tip = cmd.tip;
+        let on = self.act_active(act);
         let tip_text: SharedString = if tip.shortcut.is_empty() {
             tip.title.into()
         } else {
@@ -2383,6 +2417,9 @@ impl Docxy {
             .h(px(22.))
             .rounded(px(4.))
             .cursor_pointer()
+            // Pressed/checked state: a soft brand wash + brand border, like Word.
+            .when(on, |d| d.bg(Hsla { a: 0.20, ..hsla_u(BRAND) }).border_1().border_color(hsla_u(BRAND)))
+            .when(!on, |d| d.border_1().border_color(gpui::transparent_black()))
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 16., pal.fg))
