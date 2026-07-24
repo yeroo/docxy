@@ -183,6 +183,8 @@ struct Docxy {
     show_marks: bool,
     // Comments review side panel (View / Review ▸ Comments).
     show_comments: bool,
+    // Navigation (heading outline) side panel — View ▸ Navigation.
+    show_nav: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -355,6 +357,7 @@ impl Docxy {
             comment_text: String::new(),
             show_marks: false,
             show_comments: false,
+            show_nav: false,
         };
         this.persist();
         this
@@ -950,6 +953,62 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Navigate the caret to the start of a top-level block and scroll to it.
+    fn goto_block(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_caret(vec![block], 0, false, window, cx);
+        self.scroll_to_caret();
+    }
+
+    /// The navigation (heading outline) side panel — click a heading to jump.
+    fn nav_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let headings: Vec<(usize, u8, String)> = match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => ed
+                .doc
+                .body
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| match b {
+                    Block::Paragraph(p) => p.props.heading_level.map(|lvl| (i, lvl as u8, p.plain_text())),
+                    _ => None,
+                })
+                .filter(|(_, _, t)| !t.trim().is_empty())
+                .collect(),
+            _ => vec![],
+        };
+        let mut list = v_flex().id("nav-list").flex_1().overflow_y_scroll().gap_0p5().p_2();
+        if headings.is_empty() {
+            list = list.child(div().text_size(px(12.)).text_color(pal.dim).p_2().child("No headings."));
+        }
+        for (i, lvl, text) in &headings {
+            let block = *i;
+            let indent = (lvl.saturating_sub(1)) as f32 * 12.0;
+            list = list.child(
+                div()
+                    .id(("nav", block))
+                    .pl(px(8.0 + indent))
+                    .pr_2()
+                    .py_1()
+                    .rounded(px(3.))
+                    .text_size(px(if *lvl <= 1 { 13. } else { 12. }))
+                    .text_color(if *lvl <= 1 { pal.fg } else { pal.dim })
+                    .when(*lvl <= 1, |d| d.font_weight(FontWeight::MEDIUM))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(pal.hover))
+                    .child(SharedString::from(text.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| this.goto_block(block, window, cx))),
+            );
+        }
+        v_flex()
+            .w(px(240.))
+            .h_full()
+            .border_r_1()
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).border_b_1().border_color(pal.border).child("Navigation"))
+            .child(list)
+            .into_any_element()
+    }
+
     /// Route a keystroke to the find bar while it is open.
     fn find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         match key {
@@ -1207,7 +1266,7 @@ enum Act {
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
-    Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments,
+    Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1303,9 +1362,16 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             ])]),
         ]),
         rs::tab("View", "W", vec![
-            rs::group("Show", 40, vec![rs::column(vec![
-                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
+            rs::group("Panes", 40, vec![rs::column(vec![
+                cmdt("nav", "select-all", "Navigation", ToggleNav, ""),
                 cmdt("viewcomments", "comment", "Comments pane", ToggleComments, ""),
+            ])]),
+            rs::group("Show", 30, vec![rs::column(vec![
+                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
+                cmdt("autohide", "rule", "Collapse ribbon", AutoHideRibbon, "Ctrl+F1"),
+            ])]),
+            rs::group("Appearance", 20, vec![rs::column(vec![
+                cmdt("darkmode", "case", "Theme", DarkMode, ""),
             ])]),
         ]),
     ])
@@ -1828,6 +1894,15 @@ impl Docxy {
                 self.show_comments = !self.show_comments;
                 self.refocus(window, cx);
             }
+            ToggleNav => {
+                self.show_nav = !self.show_nav;
+                self.refocus(window, cx);
+            }
+            DarkMode => self.cycle_theme(window, cx),
+            AutoHideRibbon => {
+                self.ribbon_min = !self.ribbon_min;
+                self.refocus(window, cx);
+            }
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1871,7 +1946,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon => {}
             }),
         }
     }
@@ -2277,9 +2352,10 @@ impl Render for Docxy {
             .child(div().flex_1())
             .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
 
-        // The body is the document, plus the comments review pane when toggled on.
+        // The body is the document, flanked by the navigation and comments panes.
+        let nav_panel = (is_doc && self.show_nav).then(|| self.nav_panel(pal, cx));
         let comments_panel = (is_doc && self.show_comments).then(|| self.comments_panel(pal, cx));
-        let body = h_flex().flex_1().min_h(px(0.)).overflow_hidden().child(content).when_some(comments_panel, |d, p| d.child(p));
+        let body = h_flex().flex_1().min_h(px(0.)).overflow_hidden().when_some(nav_panel, |d, n| d.child(n)).child(content).when_some(comments_panel, |d, p| d.child(p));
 
         v_flex()
             .size_full()
