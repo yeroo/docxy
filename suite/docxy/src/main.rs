@@ -1179,18 +1179,30 @@ impl Render for Docxy {
             })
             .collect();
 
+        // NOTE: the "docxy" brand label and the flex_1 spacer are plain,
+        // non-interactive divs, so TitleBar's own drag region shows through them
+        // — that idle space is natively draggable and double-click maximizes.
+        // Only the *interactive* clusters (chips, theme button) swallow the
+        // mouse-down so a drag on them doesn't start a window move.
         let title_bar = TitleBar::new().child(
             h_flex()
                 .w_full()
                 .items_center()
                 .gap_2()
                 .pl_2()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(BRAND)).child("docxy"))
-                .child(h_flex().items_center().gap_1().children(chips))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(chips),
+                )
                 .child(div().flex_1())
                 .child(
-                    Button::new("theme").ghost().xsmall().label(theme_pref.label()).on_click(cx.listener(|this, _, window, cx| this.cycle_theme(window, cx))),
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Button::new("theme").ghost().xsmall().label(theme_pref.label()).on_click(cx.listener(|this, _, window, cx| this.cycle_theme(window, cx)))),
                 ),
         );
 
