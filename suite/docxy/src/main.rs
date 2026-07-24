@@ -199,7 +199,18 @@ enum PickKind {
     Highlight,
     FontName,
     FontSize,
+    Field,
 }
+
+/// The fields offered by the Insert ▸ Field picker: (label, instruction, fallback).
+const FIELDS: &[(&str, &str, &str)] = &[
+    ("Date", "DATE \\@ \"M/d/yyyy\"", ""),
+    ("Time", "TIME \\@ \"h:mm AM/PM\"", ""),
+    ("Page", "PAGE", "1"),
+    ("Pages", "NUMPAGES", "1"),
+    ("Author", "AUTHOR", "docxy"),
+    ("File name", "FILENAME", ""),
+];
 
 /// Everything a rendered word/atom needs to turn a click into a caret move: the
 /// view handle to update and the paragraph's block path. Cheap to copy (borrows).
@@ -691,6 +702,31 @@ impl Docxy {
         self.with_editor(window, cx, |e| e.set_font_size(pts * 2));
     }
 
+    /// Field evaluation context: the current clock, author and file name.
+    fn field_context(&self) -> docxcore::field::FieldContext {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| docxcore::field::civil_from_unix(d.as_secs() as i64));
+        let filename = self.tabs.get(self.active).map(|t| t.title.to_string()).unwrap_or_default();
+        let mut props = docxcore::field::DocProps::default();
+        props.author = "docxy".to_string();
+        docxcore::field::FieldContext { now, props, filename }
+    }
+
+    /// Insert a field (`<w:fldSimple>`) with its computed value at the caret.
+    fn insert_field(&mut self, instr: &'static str, fallback: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        let ctx = self.field_context();
+        let val = docxcore::field::eval_field_ctx(instr, &ctx).unwrap_or_else(|| fallback.to_string());
+        let raw = format!("<w:fldSimple w:instr=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:fldSimple>", xml_escape(instr), xml_escape(&val));
+        self.with_editor(window, cx, |e| e.paste(&Clip { paras: vec![vec![Inline::Field { raw, text: val }]] }));
+    }
+
+    fn insert_page_break(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_editor(window, cx, |e| e.paste(&Clip { paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]] }));
+    }
+
     /// The swatch strip shown under the ribbon while a picker is open.
     fn picker_bar(&self, kind: PickKind, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let swatch = |bg: Hsla, ring: bool| {
@@ -702,6 +738,7 @@ impl Docxy {
             PickKind::Highlight => "Highlight",
             PickKind::FontName => "Font",
             PickKind::FontSize => "Size",
+            PickKind::Field => "Field",
         }));
         let chip = |id_key: usize, label: SharedString, tag: &'static str| {
             div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
@@ -759,6 +796,11 @@ impl Docxy {
             PickKind::FontSize => {
                 for (i, &pts) in FONT_SIZES.iter().enumerate() {
                     row = row.child(chip(i, pts.to_string().into(), "fs").on_click(cx.listener(move |this, _, window, cx| this.apply_size(pts, window, cx))));
+                }
+            }
+            PickKind::Field => {
+                for (i, &(label, instr, fallback)) in FIELDS.iter().enumerate() {
+                    row = row.child(chip(i, label.into(), "fld").on_click(cx.listener(move |this, _, window, cx| this.insert_field(instr, fallback, window, cx))));
                 }
             }
         }
@@ -1267,6 +1309,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
+    InsertField, PageBreak,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1347,9 +1390,17 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("h3", "heading-3", "Heading 3", H3, ""),
             ]),
         ])]),
-        rs::tab("Insert", "N", vec![rs::group("Symbols", 40, vec![rs::column(vec![
-            cmdt("hr", "rule", "Horizontal rule", HRule, ""),
-        ])])]),
+        rs::tab("Insert", "N", vec![
+            rs::group("Pages", 40, vec![rs::column(vec![
+                cmdt("pagebreak", "rule", "Page break", PageBreak, ""),
+            ])]),
+            rs::group("Text", 30, vec![rs::column(vec![
+                cmdt("field", "case", "Field", InsertField, ""),
+            ])]),
+            rs::group("Symbols", 20, vec![rs::column(vec![
+                cmdt("hr", "rule", "Horizontal rule", HRule, ""),
+            ])]),
+        ]),
         rs::tab("Review", "R", vec![
             rs::group("Comments", 40, vec![rs::column(vec![
                 cmdt("newcomment", "comment-add", "New comment", NewComment, ""),
@@ -1441,6 +1492,10 @@ fn hsla_u(c: u32) -> Hsla {
 fn hex_rgb(s: &str) -> Option<u32> {
     let s = s.trim_start_matches('#');
     (s.len() == 6).then(|| u32::from_str_radix(s, 16).ok()).flatten()
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Map a Word highlight name (`w:highlight`) to an approximate RGB, and whether
@@ -1713,13 +1768,18 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                     );
                 }
             }
+            Inline::Field { text, .. } => {
+                // Show the field's cached value with a subtle shade so it reads as a
+                // field, not plain text.
+                let shown = if text.is_empty() { "[field]".to_string() } else { text.clone() };
+                spans.push(div().px(px(2.)).rounded_sm().bg(pal.panel).text_size(px(base)).text_color(pal.fg).child(SharedString::from(shown)).into_any_element());
+            }
             other => {
                 let tag = match other {
                     Inline::SmartArt { .. } => "[diagram]",
                     Inline::Chart { .. } => "[chart]",
                     Inline::Equation { .. } => "[equation]",
                     Inline::TextBox { .. } => "[textbox]",
-                    Inline::Field { .. } => "[field]",
                     _ => "[image]",
                 };
                 spans.push(div().px_1().rounded_sm().bg(pal.panel).text_size(px(12.)).text_color(pal.dim).child(tag).into_any_element());
@@ -1903,6 +1963,8 @@ impl Docxy {
                 self.ribbon_min = !self.ribbon_min;
                 self.refocus(window, cx);
             }
+            InsertField => self.toggle_picker(PickKind::Field, window, cx),
+            PageBreak => self.insert_page_break(window, cx),
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1946,7 +2008,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak => {}
             }),
         }
     }
