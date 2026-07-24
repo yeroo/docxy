@@ -225,7 +225,11 @@ enum PickKind {
     FontName,
     FontSize,
     Field,
+    Table,
 }
+
+/// Table sizes offered by the Insert ▸ Table picker: (label, rows, cols).
+const TABLE_PRESETS: &[(&str, usize, usize)] = &[("2×2", 2, 2), ("3×2", 3, 2), ("3×3", 3, 3), ("4×3", 4, 3), ("5×3", 5, 3), ("5×5", 5, 5)];
 
 /// The fields offered by the Insert ▸ Field picker: (label, instruction, fallback).
 const FIELDS: &[(&str, &str, &str)] = &[
@@ -786,6 +790,38 @@ impl Docxy {
         self.with_editor(window, cx, |e| e.paste(&Clip { paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]] }));
     }
 
+    /// Insert an empty `rows`×`cols` bordered table after the caret's block, and
+    /// move the caret into its first cell.
+    fn insert_table(&mut self, rows: usize, cols: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use docxcore::model::{Cell, Row, Table, VMerge};
+        self.picker = None;
+        const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
+<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+</w:tblBorders></w:tblPr>";
+        let col_w = (9360 / cols.max(1)) as u32;
+        let mk_cell = || Cell { grid_span: 1, v_merge: VMerge::None, blocks: vec![Block::Paragraph(Paragraph::default())], raw_tcpr: None };
+        let mk_row = || Row { cells: (0..cols).map(|_| mk_cell()).collect(), raw_props: vec![] };
+        let table = Table { grid: vec![col_w; cols], rows: (0..rows).map(|_| mk_row()).collect(), raw_tblpr: Some(TBLPR.to_string()) };
+        let idx = self.active;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            if let Surface::Doc(ed) = &mut t.surface {
+                let at = ed.caret.path.first().copied().unwrap_or(0).min(ed.doc.body.len().saturating_sub(1));
+                let pos = (at + 1).min(ed.doc.body.len());
+                ed.doc.body.insert(pos, Block::Table(table));
+                ed.clear_selection();
+                ed.caret = Caret::at(vec![pos, 0, 0, 0], 0);
+                ed.clamp();
+            }
+            t.dirty = true;
+        }
+        self.refocus(window, cx);
+    }
+
     /// The swatch strip shown under the ribbon while a picker is open.
     fn picker_bar(&self, kind: PickKind, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let swatch = |bg: Hsla, ring: bool| {
@@ -798,6 +834,7 @@ impl Docxy {
             PickKind::FontName => "Font",
             PickKind::FontSize => "Size",
             PickKind::Field => "Field",
+            PickKind::Table => "Table",
         }));
         let chip = |id_key: usize, label: SharedString, tag: &'static str| {
             div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
@@ -860,6 +897,11 @@ impl Docxy {
             PickKind::Field => {
                 for (i, &(label, instr, fallback)) in FIELDS.iter().enumerate() {
                     row = row.child(chip(i, label.into(), "fld").on_click(cx.listener(move |this, _, window, cx| this.insert_field(instr, fallback, window, cx))));
+                }
+            }
+            PickKind::Table => {
+                for (i, &(label, r, c)) in TABLE_PRESETS.iter().enumerate() {
+                    row = row.child(chip(i, label.into(), "tbl").on_click(cx.listener(move |this, _, window, cx| this.insert_table(r, c, window, cx))));
                 }
             }
         }
@@ -1400,7 +1442,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes,
+    InsertField, PageBreak, ToggleNotes, InsertTable,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1492,6 +1534,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
         rs::tab("Insert", "N", vec![
             rs::group("Pages", 40, vec![rs::column(vec![
                 cmdt("pagebreak", "rule", "Page break", PageBreak, ""),
+            ])]),
+            rs::group("Tables", 35, vec![rs::column(vec![
+                cmdt("table", "table", "Table", InsertTable, ""),
             ])]),
             rs::group("Text", 30, vec![rs::column(vec![
                 cmdt("field", "case", "Field", InsertField, ""),
@@ -2079,6 +2124,7 @@ impl Docxy {
                 self.refocus(window, cx);
             }
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
+            InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             PageBreak => self.insert_page_break(window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
@@ -2119,7 +2165,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable => {}
             }),
         }
     }
