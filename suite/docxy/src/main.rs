@@ -11,8 +11,9 @@
 
 use std::path::PathBuf;
 
+use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor};
-use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table, VertAlign};
+use docxcore::model::{Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -147,6 +148,9 @@ struct DocTab {
     surface: Surface,
     dirty: bool,
     status: SharedString,
+    /// Review comments anchored in this document (markers live in the body; the
+    /// text/author is stored here and written to comments.xml on save).
+    comments: Vec<Comment>,
 }
 
 struct Docxy {
@@ -172,6 +176,13 @@ struct Docxy {
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
     doc_scroll: ScrollHandle,
+    // New-comment entry bar (Review ▸ New comment); routes keys while open.
+    comment_open: bool,
+    comment_text: String,
+    // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
+    show_marks: bool,
+    // Comments review side panel (View / Review ▸ Comments).
+    show_comments: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -205,6 +216,7 @@ struct RenderCtx<'a> {
     spans: &'a [(Vec<usize>, usize, usize)],
     ent: &'a Entity<Docxy>,
     pal: Pal,
+    marks: bool,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -226,28 +238,37 @@ fn empty_doc() -> Document {
     docxcore::markdown::from_markdown("# Untitled\n\n")
 }
 
-fn doc_from_path(path: &PathBuf) -> (Document, SharedString) {
-    match std::fs::read(path).map(|b| docxcore::load::load(&b)) {
-        Ok(Ok(doc)) => (doc, "loaded".into()),
-        Ok(Err(e)) => (empty_doc(), format!("load error: {e:?}").into()),
-        Err(e) => (empty_doc(), format!("read error: {e}").into()),
+/// Load a `.docx` from bytes into a document + its review comments.
+fn load_bytes(bytes: &[u8]) -> Option<(Document, Vec<Comment>)> {
+    let pkg = docxcore::package::load_package(bytes).ok()?;
+    let comments = docxcore::comments::parse_comments(&pkg);
+    Some((pkg.document, comments))
+}
+
+fn doc_from_path(path: &PathBuf) -> (Document, Vec<Comment>, SharedString) {
+    match std::fs::read(path) {
+        Ok(bytes) => match load_bytes(&bytes) {
+            Some((doc, comments)) => (doc, comments, "loaded".into()),
+            None => (empty_doc(), vec![], "load error".into()),
+        },
+        Err(e) => (empty_doc(), vec![], format!("read error: {e}").into()),
     }
 }
 
-fn sample_doc() -> Document {
-    docxcore::load::load(include_bytes!("../../../assets/sample.docx")).unwrap_or_else(|_| empty_doc())
+fn sample_doc() -> (Document, Vec<Comment>) {
+    load_bytes(include_bytes!("../../../assets/sample.docx")).unwrap_or_else(|| (empty_doc(), vec![]))
 }
 
-fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, SharedString) {
+fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, SharedString) {
     match kind {
         Kind::Docx => match path {
             Some(p) => {
-                let (doc, status) = doc_from_path(p);
-                (Surface::Doc(Editor::new(doc)), status)
+                let (doc, comments, status) = doc_from_path(p);
+                (Surface::Doc(Editor::new(doc)), comments, status)
             }
-            None => (Surface::Doc(Editor::new(empty_doc())), "untitled".into()),
+            None => (Surface::Doc(Editor::new(empty_doc())), vec![], "untitled".into()),
         },
-        _ => (Surface::Placeholder, "".into()),
+        _ => (Surface::Placeholder, vec![], "".into()),
     }
 }
 
@@ -263,9 +284,16 @@ fn hot_dir() -> PathBuf {
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
 /// lists (so markers survive the round-trip and open correctly in Word).
-fn doc_to_docx(doc: &Document) -> Vec<u8> {
+fn doc_to_docx(doc: &Document, comments: &[Comment]) -> Vec<u8> {
     let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-    let pkg = if has_list { docxcore::package::new_markdown_package(doc.clone()) } else { docxcore::package::new_package(doc.clone()) };
+    let mut pkg = if has_list { docxcore::package::new_markdown_package(doc.clone()) } else { docxcore::package::new_package(doc.clone()) };
+    // Write comments.xml (+ part/rel/content-type) for each stored comment so the
+    // markers already in the body resolve to real comments in Word.
+    for c in comments {
+        if let Ok(id) = c.id.parse::<i32>() {
+            pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
+        }
+    }
     docxcore::package::save_package(&pkg)
 }
 
@@ -282,23 +310,25 @@ impl Docxy {
             // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
             // back to the real file on disk, then to an empty doc.
             let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
-            let (surface, status) = match (t.kind, &hot) {
+            let (surface, comments, status) = match (t.kind, &hot) {
                 (Kind::Docx, Some(hp)) => {
-                    let (doc, _) = doc_from_path(hp);
-                    (Surface::Doc(Editor::new(doc)), if t.dirty { "unsaved — restored".into() } else { "loaded".into() })
+                    let (doc, comments, _) = doc_from_path(hp);
+                    (Surface::Doc(Editor::new(doc)), comments, if t.dirty { "unsaved — restored".into() } else { "loaded".into() })
                 }
                 _ => build_surface(t.kind, path.as_ref()),
             };
-            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status });
+            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments });
         }
         if tabs.is_empty() {
+            let (doc, comments) = sample_doc();
             tabs.push(DocTab {
                 kind: Kind::Docx,
                 title: "sample.docx".into(),
                 path: None,
-                surface: Surface::Doc(Editor::new(sample_doc())),
+                surface: Surface::Doc(Editor::new(doc)),
                 dirty: false,
                 status: "loaded".into(),
+                comments,
             });
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
@@ -321,6 +351,10 @@ impl Docxy {
             find_case: false,
             picker: None,
             doc_scroll: ScrollHandle::new(),
+            comment_open: false,
+            comment_text: String::new(),
+            show_marks: false,
+            show_comments: false,
         };
         this.persist();
         this
@@ -338,7 +372,7 @@ impl Docxy {
                 // held across a restart (closing never prompts to save).
                 let hot = if let Surface::Doc(ed) = &t.surface {
                     let p = hd.join(format!("tab-{i}.docx"));
-                    std::fs::write(&p, doc_to_docx(&ed.doc)).ok().map(|_| p.display().to_string())
+                    std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments)).ok().map(|_| p.display().to_string())
                 } else {
                     None
                 };
@@ -379,7 +413,7 @@ impl Docxy {
             Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
-        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into() });
+        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![] });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -419,7 +453,7 @@ impl Docxy {
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
-        let bytes = doc_to_docx(&editor.doc);
+        let bytes = doc_to_docx(&editor.doc, &tab.comments);
         let path = tab
             .path
             .clone()
@@ -455,7 +489,7 @@ impl Docxy {
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new().add_filter("Word document", &["docx"]).pick_file() {
-            let (doc, status) = doc_from_path(&path);
+            let (doc, comments, status) = doc_from_path(&path);
             self.tabs.push(DocTab {
                 kind: Kind::Docx,
                 title: file_name(&path).into(),
@@ -463,6 +497,7 @@ impl Docxy {
                 surface: Surface::Doc(Editor::new(doc)),
                 dirty: false,
                 status,
+                comments,
             });
             self.active = self.tabs.len() - 1;
         }
@@ -727,6 +762,194 @@ impl Docxy {
         row.into_any_element()
     }
 
+    // ---- comments ----------------------------------------------------------
+
+    /// The next numeric comment id for the active tab (max existing + 1).
+    fn next_comment_id(&self) -> i32 {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.comments.iter().filter_map(|c| c.id.parse::<i32>().ok()).max().map(|m| m + 1).unwrap_or(1))
+            .unwrap_or(1)
+    }
+
+    /// Begin a new comment on the current selection (opens the comment entry bar).
+    fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_sel = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
+        if !has_sel {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = "Select text first, then add a comment".into();
+            }
+            return self.refocus(window, cx);
+        }
+        self.comment_open = true;
+        self.comment_text.clear();
+        self.picker = None;
+        self.find_open = false;
+        self.refocus(window, cx);
+    }
+
+    /// Commit the pending comment: wrap the selection in markers, store the text.
+    fn commit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.comment_text.trim().to_string();
+        self.comment_open = false;
+        if text.is_empty() {
+            return self.refocus(window, cx);
+        }
+        let id = self.next_comment_id();
+        let idx = self.active;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            if let Surface::Doc(ed) = &mut t.surface {
+                let quoted = ed.selection_text();
+                if !ed.add_comment(&id.to_string()) {
+                    t.status = "No selection to comment on".into();
+                    return self.refocus(window, cx);
+                }
+                let author = "docxy".to_string();
+                t.comments.push(Comment { id: id.to_string(), author, initials: "D".into(), date: String::new(), text, quoted });
+                t.dirty = true;
+                t.status = format!("Comment {id} added").into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Route a keystroke to the comment entry bar while it is open.
+    fn comment_key(&mut self, ev: &KeyDownEvent, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match key {
+            "escape" => {
+                self.comment_open = false;
+                self.comment_text.clear();
+                return self.refocus(window, cx);
+            }
+            "enter" => return self.commit_comment(window, cx),
+            "backspace" => {
+                self.comment_text.pop();
+                return cx.notify();
+            }
+            _ => {}
+        }
+        if let Some(c) = ev.keystroke.key_char.as_deref() {
+            if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                self.comment_text.push_str(c);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The comment entry bar, shown under the ribbon while `comment_open`.
+    fn comment_bar(&self, pal: Pal, _cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .child(icon_svg("comment-add", 14., hsla_u(BRAND)))
+            .child(div().text_size(px(11.)).text_color(pal.dim).child("New comment"))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .px_2()
+                    .h(px(24.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(hsla_u(BRAND))
+                    .bg(pal.panel)
+                    .child(div().text_size(px(13.)).text_color(pal.fg).child(SharedString::from(self.comment_text.clone())))
+                    .child(caret_bar()),
+            )
+            .child(div().text_size(px(11.)).text_color(pal.dim).child("Enter to add · Esc to cancel"))
+            .into_any_element()
+    }
+
+    /// Delete a comment: strip its markers from the body and drop it from the list.
+    fn delete_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if let Surface::Doc(ed) = &mut t.surface {
+                ed.remove_comment_markers(&id);
+            }
+            t.comments.retain(|c| c.id != id);
+            t.dirty = true;
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Select the text a comment is anchored to (find its quoted run).
+    fn goto_comment(&mut self, quoted: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !quoted.is_empty() {
+            if let Some(ed) = self.active_editor() {
+                if let Some(m) = ed.find_next(&quoted, true, false) {
+                    ed.select_match(&m);
+                }
+            }
+        }
+        self.scroll_to_caret();
+        self.refocus(window, cx);
+    }
+
+    /// The comments review side panel (toggled from Review/View ▸ Comments pane).
+    fn comments_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let comments = self.tabs.get(self.active).map(|t| t.comments.clone()).unwrap_or_default();
+        let mut list = v_flex().id("cmt-list").flex_1().overflow_y_scroll().gap_2().p_2();
+        if comments.is_empty() {
+            list = list.child(div().text_size(px(12.)).text_color(pal.dim).p_2().child("No comments. Select text, then Review \u{203A} New comment."));
+        }
+        for c in &comments {
+            let id = c.id.clone();
+            let quoted = c.quoted.clone();
+            list = list.child(
+                v_flex()
+                    .id(("cmt", id.parse::<usize>().unwrap_or(0)))
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(hsla_u(BRAND)).child(SharedString::from(c.author.clone())))
+                            .child(
+                                div()
+                                    .id(("cmtx", id.parse::<usize>().unwrap_or(0)))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(pal.dim)
+                                    .hover(|d| d.bg(pal.hover))
+                                    .child("\u{00d7}")
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_comment(id.clone(), window, cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(!c.quoted.is_empty(), |d| d.child(div().text_size(px(11.)).italic().text_color(pal.dim).child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted)))))
+                    .child(div().text_size(px(13.)).text_color(pal.fg).child(SharedString::from(c.text.clone())))
+                    .on_click(cx.listener(move |this, _, window, cx| this.goto_comment(quoted.clone(), window, cx))),
+            );
+        }
+        v_flex()
+            .w(px(280.))
+            .h_full()
+            .border_l_1()
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).border_b_1().border_color(pal.border).child(SharedString::from(format!("Comments ({})", comments.len()))))
+            .child(list)
+            .into_any_element()
+    }
+
     /// Route a keystroke to the find bar while it is open.
     fn find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         match key {
@@ -879,6 +1102,9 @@ impl Docxy {
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
         }
+        if self.comment_open {
+            return self.comment_key(ev, key.as_str(), window, cx);
+        }
         if self.find_open {
             return self.find_key(ev, shift, key.as_str(), window, cx);
         }
@@ -980,7 +1206,8 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
-    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
+    Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1038,26 +1265,49 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("aj", "align-justify", "Justify", AlignJ, "").toggle(),
             ])
             .launcher(LaunchParagraph),
+            rs::group("Arrange", 25, vec![rs::column(vec![
+                cmdt("sort", "sort", "Sort paragraphs", Sort, ""),
+                cmdt("borders", "border-bottom", "Bottom border", ParaBorders, ""),
+                cmdt("firstline", "indent-increase", "First-line indent", FirstLine, ""),
+                cmdt("hanging", "indent-decrease", "Hanging indent", Hanging, ""),
+            ])]),
             rs::group("Editing", 20, vec![
                 cmdt("undo", "undo", "Undo", Undo, "Ctrl+Z").toggle(),
                 cmdt("redo", "redo", "Redo", Redo, "Ctrl+Y").toggle(),
             ]),
         ]),
-        rs::tab("Styles", "S", vec![rs::group("Styles", 40, vec![rs::column(vec![
-            cmdt("normal", "paragraph", "Normal", Normal, ""),
-            cmdt("h1", "heading-1", "Heading 1", H1, ""),
-            cmdt("h2", "heading-2", "Heading 2", H2, ""),
-            cmdt("h3", "heading-3", "Heading 3", H3, ""),
-        ])])]),
+        rs::tab("Styles", "S", vec![rs::group("Styles", 40, vec![
+            rs::column(vec![
+                cmdt("title", "paragraph", "Title", Title, ""),
+                cmdt("subtitle", "paragraph", "Subtitle", Subtitle, ""),
+                cmdt("normal", "paragraph", "Normal", Normal, ""),
+            ]),
+            rs::column(vec![
+                cmdt("h1", "heading-1", "Heading 1", H1, ""),
+                cmdt("h2", "heading-2", "Heading 2", H2, ""),
+                cmdt("h3", "heading-3", "Heading 3", H3, ""),
+            ]),
+        ])]),
         rs::tab("Insert", "N", vec![rs::group("Symbols", 40, vec![rs::column(vec![
             cmdt("hr", "rule", "Horizontal rule", HRule, ""),
         ])])]),
-        rs::tab("Review", "R", vec![rs::group("Editing", 40, vec![rs::column(vec![
-            cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
-            cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
-            cmdt("case", "case", "Change case", Case, ""),
-        ])])]),
-        rs::tab("View", "W", vec![]),
+        rs::tab("Review", "R", vec![
+            rs::group("Comments", 40, vec![rs::column(vec![
+                cmdt("newcomment", "comment-add", "New comment", NewComment, ""),
+                cmdt("togglecomments", "comment", "Comments pane", ToggleComments, ""),
+            ])]),
+            rs::group("Editing", 30, vec![rs::column(vec![
+                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
+                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
+                cmdt("case", "case", "Change case", Case, ""),
+            ])]),
+        ]),
+        rs::tab("View", "W", vec![
+            rs::group("Show", 40, vec![rs::column(vec![
+                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
+                cmdt("viewcomments", "comment", "Comments pane", ToggleComments, ""),
+            ])]),
+        ]),
     ])
 }
 
@@ -1281,16 +1531,19 @@ fn emit_run(
 
 /// A tab is ONE char in the engine but rendered as spaces; keep `idx` in sync and
 /// let it participate in caret/selection like any other char.
-fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, click: Option<Click>, pal: Pal) {
+fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, click: Option<Click>, marks: bool, pal: Pal) {
     let pos = *idx;
     if *caret == Some(pos) {
         out.push(caret_bar());
         *caret = None;
     }
     let selected = sel.map_or(false, |(s, e)| s < e && s <= pos && pos < e);
+    // With formatting marks on, show a tab arrow; otherwise blank em-spaces.
+    let glyph = if marks { "\u{2192}\u{2003}" } else { "\u{2003}\u{2003}" };
     out.push(
         div()
-            .child(SharedString::from("\u{2003}\u{2003}"))
+            .child(SharedString::from(glyph))
+            .when(marks, |d| d.text_color(pal.dim))
             .when(selected, |d| d.bg(pal.sel))
             .when_some(click, |d, c| {
                 let ent = c.ent.clone();
@@ -1349,7 +1602,7 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     out
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, pal: Pal) -> AnyElement {
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, pal: Pal) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -1374,8 +1627,26 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                     emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel, click, pal);
                 }
             }
-            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, click, pal),
+            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, click, marks, pal),
             Inline::Break(_) => emit_break(&mut spans, &mut idx, &mut caret),
+            Inline::Raw(xml) => {
+                // Comment reference → a small badge; other raw XML (range markers,
+                // bookmarks, …) is invisible content and renders nothing.
+                if xml.contains("commentReference") {
+                    spans.push(
+                        div()
+                            .px(px(3.))
+                            .rounded(px(3.))
+                            .bg(hsla_u(0xF2C744))
+                            .text_size(px(9.))
+                            .text_color(rgb(0x1a1a1a))
+                            .relative()
+                            .top(px(-(base * 0.35)))
+                            .child("\u{1F4AC}")
+                            .into_any_element(),
+                    );
+                }
+            }
             other => {
                 let tag = match other {
                     Inline::SmartArt { .. } => "[diagram]",
@@ -1392,6 +1663,11 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     if caret.is_some() {
         spans.push(caret_bar());
     }
+    // A pilcrow at the paragraph end when formatting marks are shown.
+    if marks {
+        spans.push(div().text_size(px(base)).text_color(pal.dim).child("\u{00B6}").into_any_element());
+    }
+    let has_border = p.props.borders.bottom.is_some();
     let mut row = h_flex().w_full().flex_wrap().min_h(px(base + 6.));
     row = match p.props.align {
         Align::Center => row.justify_center(),
@@ -1410,6 +1686,7 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         .py_0p5()
         .pl(px(pad))
         .when(is_heading, |d| d.mt_2())
+        .when(has_border, |d| d.border_b_1().border_color(pal.fg).pb_1())
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
@@ -1451,7 +1728,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
             let caret = (ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
             let sel = ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e));
             let click = Some(Click { ent: ctx.ent, path: &path });
-            paragraph_el(p, caret, sel, marker, click, ctx.pal)
+            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.pal)
         }
         Block::Table(t) => table_el(t, &path, ctx),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
@@ -1542,6 +1819,15 @@ impl Docxy {
             Highlight => self.toggle_picker(PickKind::Highlight, window, cx),
             FontName => self.toggle_picker(PickKind::FontName, window, cx),
             FontSize => self.toggle_picker(PickKind::FontSize, window, cx),
+            NewComment => self.start_comment(window, cx),
+            ShowHide => {
+                self.show_marks = !self.show_marks;
+                self.refocus(window, cx);
+            }
+            ToggleComments => {
+                self.show_comments = !self.show_comments;
+                self.refocus(window, cx);
+            }
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1574,8 +1860,18 @@ impl Docxy {
                 Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
+                FirstLine => e.set_first_line(720),
+                Hanging => e.set_first_line(-720),
+                Sort => e.sort_paragraphs(),
+                ParaBorders => {
+                    let has = e.caret_para_props().borders.bottom.is_some();
+                    let b = if has { ParBorders::default() } else { ParBorders { top: None, bottom: Some(BorderKind::Single) } };
+                    e.set_para_border(b);
+                }
+                Title => e.set_para_style(Some("Title")),
+                Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments => {}
             }),
         }
     }
@@ -1947,6 +2243,7 @@ impl Render for Docxy {
         let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
+        let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -1954,7 +2251,7 @@ impl Render for Docxy {
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
                     let ent = cx.entity();
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal };
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal, marks: self.show_marks };
                     let blocks: Vec<AnyElement> = editor
                         .doc
                         .body
@@ -1962,7 +2259,7 @@ impl Render for Docxy {
                         .enumerate()
                         .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
                         .collect();
-                    v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
+                    v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
@@ -1980,6 +2277,10 @@ impl Render for Docxy {
             .child(div().flex_1())
             .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
 
+        // The body is the document, plus the comments review pane when toggled on.
+        let comments_panel = (is_doc && self.show_comments).then(|| self.comments_panel(pal, cx));
+        let body = h_flex().flex_1().min_h(px(0.)).overflow_hidden().child(content).when_some(comments_panel, |d, p| d.child(p));
+
         v_flex()
             .size_full()
             .track_focus(&self.focus)
@@ -1990,7 +2291,8 @@ impl Render for Docxy {
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
-            .child(content)
+            .when_some(comment_bar, |d, c| d.child(c))
+            .child(body)
             .child(status)
             .into_any_element()
     }
