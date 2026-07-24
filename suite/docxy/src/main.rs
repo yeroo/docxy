@@ -149,6 +149,8 @@ enum RibbonTab {
     Insert,
     Review,
     View,
+    /// Contextual Table Tools tab — only reachable while the caret is in a table.
+    Table,
 }
 
 // ---- runtime ---------------------------------------------------------------
@@ -788,6 +790,83 @@ impl Docxy {
 
     fn insert_page_break(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_editor(window, cx, |e| e.paste(&Clip { paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]] }));
+    }
+
+    /// If the caret is inside a table, the (block index, row, cell).
+    fn caret_table(&self) -> Option<(usize, usize, usize)> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => {
+                let p = &ed.caret.path;
+                (p.len() >= 3 && matches!(ed.doc.body.get(p[0]), Some(Block::Table(_)))).then(|| (p[0], p[1], p[2]))
+            }
+            _ => None,
+        }
+    }
+
+    /// An empty table cell (one blank paragraph).
+    fn empty_cell() -> docxcore::model::Cell {
+        docxcore::model::Cell { grid_span: 1, v_merge: docxcore::model::VMerge::None, blocks: vec![Block::Paragraph(Paragraph::default())], raw_tcpr: None }
+    }
+
+    /// Run a Table Tools operation relative to the caret's cell.
+    fn table_op(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        use Act::*;
+        let Some((tb, row, col)) = self.caret_table() else { return self.refocus(window, cx) };
+        let idx = self.active;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            if let Surface::Doc(ed) = &mut t.surface {
+                if let Some(Block::Table(table)) = ed.doc.body.get_mut(tb) {
+                    let ncols = table.grid.len().max(table.rows.first().map_or(0, |r| r.cells.len()));
+                    match act {
+                        RowAbove | RowBelow => {
+                            let at = if matches!(act, RowAbove) { row } else { row + 1 };
+                            let new = docxcore::model::Row { cells: (0..ncols).map(|_| Self::empty_cell()).collect(), raw_props: vec![] };
+                            table.rows.insert(at.min(table.rows.len()), new);
+                            ed.caret = Caret::at(vec![tb, at.min(table.rows.len() - 1), col.min(ncols - 1), 0], 0);
+                        }
+                        ColLeft | ColRight => {
+                            let at = if matches!(act, ColLeft) { col } else { col + 1 };
+                            for r in &mut table.rows {
+                                r.cells.insert(at.min(r.cells.len()), Self::empty_cell());
+                            }
+                            let w = table.grid.first().copied().unwrap_or(2340);
+                            table.grid.insert(at.min(table.grid.len()), w);
+                            ed.caret = Caret::at(vec![tb, row, at, 0], 0);
+                        }
+                        DelRow => {
+                            if table.rows.len() > 1 {
+                                table.rows.remove(row);
+                                let nr = table.rows.len();
+                                ed.caret = Caret::at(vec![tb, row.min(nr - 1), col.min(ncols - 1), 0], 0);
+                            }
+                        }
+                        DelCol => {
+                            if ncols > 1 {
+                                for r in &mut table.rows {
+                                    if col < r.cells.len() {
+                                        r.cells.remove(col);
+                                    }
+                                }
+                                if col < table.grid.len() {
+                                    table.grid.remove(col);
+                                }
+                                ed.caret = Caret::at(vec![tb, row, col.min(ncols - 2), 0], 0);
+                            }
+                        }
+                        DelTable => {
+                            ed.doc.body.remove(tb);
+                            let at = tb.min(ed.doc.body.len().saturating_sub(1));
+                            ed.caret = Caret::at(vec![at], 0);
+                        }
+                        _ => {}
+                    }
+                    ed.clear_selection();
+                    ed.clamp();
+                }
+            }
+            t.dirty = true;
+        }
+        self.refocus(window, cx);
     }
 
     /// Insert an empty `rows`×`cols` bordered table after the caret's block, and
@@ -1443,6 +1522,7 @@ enum Act {
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     InsertField, PageBreak, ToggleNotes, InsertTable,
+    RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1579,7 +1659,30 @@ fn ribbon_tab_index(t: RibbonTab) -> usize {
         RibbonTab::Insert => 1,
         RibbonTab::Review => 2,
         RibbonTab::View => 3,
+        RibbonTab::Table => 0, // handled specially (see ribbon_body / table_tab)
     }
+}
+
+/// The contextual Table Tools tab, shown only while the caret is in a table.
+fn table_tab() -> rs::Tab<Act> {
+    use Act::*;
+    rs::tab("Table", "T", vec![
+        rs::group("Rows & Columns", 40, vec![rs::rows(vec![
+            vec![
+                rs::btn(cmdt("rowabove", "table-insert-row", "Insert row above", RowAbove, "")),
+                rs::btn(cmdt("colleft", "table-insert-column", "Insert column left", ColLeft, "")),
+                rs::btn(cmdt("delrow", "table-delete-row", "Delete row", DelRow, "")),
+            ],
+            vec![
+                rs::btn(cmdt("rowbelow", "table-insert-row", "Insert row below", RowBelow, "")),
+                rs::btn(cmdt("colright", "table-insert-column", "Insert column right", ColRight, "")),
+                rs::btn(cmdt("delcol", "table-delete-column", "Delete column", DelCol, "")),
+            ],
+        ])]),
+        rs::group("Table", 20, vec![rs::column(vec![
+            cmdt("deltable", "table-dismiss", "Delete table", DelTable, ""),
+        ])]),
+    ])
 }
 
 /// Rough natural width (px) of a group, for responsive collapse decisions.
@@ -2063,6 +2166,29 @@ impl Docxy {
                     })),
             );
         }
+        // Contextual Table Tools tab — only while the caret is in a table. It reads
+        // with a coloured accent (Word shows contextual tabs tinted).
+        if self.caret_table().is_some() {
+            let active = !self.backstage && self.ribbon_tab == RibbonTab::Table;
+            let accent = hsla_u(0xC0_5B_2E); // a warm contextual accent
+            strip = strip.child(
+                div()
+                    .id(("rtab", 99usize))
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .rounded_t_sm()
+                    .text_size(px(12.))
+                    .text_color(accent)
+                    .hover(|d| d.bg(Hsla { a: 0.10, ..accent }))
+                    .when(active, |d| d.border_b_2().border_color(accent).font_weight(FontWeight::BOLD))
+                    .child("Table")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ribbon_tab = RibbonTab::Table;
+                        this.refocus(window, cx);
+                    })),
+            );
+        }
         // right side: the ribbon collapse/expand chevron
         strip = strip.child(div().flex_1());
         strip = strip.child(
@@ -2125,6 +2251,7 @@ impl Docxy {
             }
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
+            RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PageBreak => self.insert_page_break(window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
@@ -2165,7 +2292,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => {}
             }),
         }
     }
@@ -2176,7 +2303,8 @@ impl Docxy {
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let ribbon = docxy_ribbon();
-        let tab = &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)];
+        let ctx_tab = table_tab();
+        let tab = if self.ribbon_tab == RibbonTab::Table { &ctx_tab } else { &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)] };
         let avail = (width - 28.0).max(120.0);
 
         // 1) drop control labels if the full layout overflows.
@@ -2722,6 +2850,10 @@ impl Render for Docxy {
         }
 
         let is_doc = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)));
+        // The contextual Table tab is only valid while the caret is in a table.
+        if self.ribbon_tab == RibbonTab::Table && self.caret_table().is_none() {
+            self.ribbon_tab = RibbonTab::Home;
+        }
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
         let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
