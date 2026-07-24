@@ -116,8 +116,19 @@ pub enum Control<A> {
     Gallery(Gallery<A>),
     /// A two-state toggle (e.g. Bold/Italic) — `checked` is resolved at render.
     Toggle(Cmd<A>),
+    /// A group's small controls laid out as explicit rows (the Office placement
+    /// rule — the Font and Paragraph groups are two such rows). Each inner `Vec`
+    /// is one left-to-right row of [`Cell`]s.
+    Rows(Vec<Vec<Cell<A>>>),
     /// A thin vertical separator between controls.
     Separator,
+}
+
+/// One cell in a [`Control::Rows`] grid: a small icon button, or a combo box that
+/// shows the current value and opens a picker (Font name / Font size).
+pub enum Cell<A> {
+    Btn(Cmd<A>),
+    Combo { cmd: Cmd<A>, wide: bool },
 }
 
 /// A gallery control — a scrollable grid/row of visual choices.
@@ -201,6 +212,21 @@ impl<A> Group<A> {
 /// A column of up to three small buttons.
 pub fn column<A>(cmds: Vec<Cmd<A>>) -> Control<A> {
     Control::Column(cmds)
+}
+
+/// A grid of small controls in explicit rows (the Office two-row layout).
+pub fn rows<A>(rows: Vec<Vec<Cell<A>>>) -> Control<A> {
+    Control::Rows(rows)
+}
+
+/// A small icon button cell.
+pub fn btn<A>(cmd: Cmd<A>) -> Cell<A> {
+    Cell::Btn(cmd)
+}
+
+/// A combo-box cell (Font name = wide, Font size = narrow).
+pub fn combo<A>(cmd: Cmd<A>, wide: bool) -> Cell<A> {
+    Cell::Combo { cmd, wide }
 }
 
 /// A tab: `tab(name, key_tip, groups)`.

@@ -55,6 +55,23 @@ fn icon_svg(name: &str, size: f32, color: Hsla) -> Svg {
     svg().path(SharedString::from(format!("icons/{name}.svg"))).size(px(size)).text_color(color).flex_none()
 }
 
+/// A small Quick-Access-Toolbar icon button (Undo/Redo in the title bar).
+fn qat_btn(id: &'static str, icon: &'static str, tip: &'static str, pal: Pal, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(20.))
+        .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|d| d.bg(pal.hover))
+        .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+        .child(icon_svg(icon, 14., pal.fg))
+        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
+        .on_click(on_click)
+}
+
 // ---- session model ---------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1380,10 +1397,10 @@ fn no(mut f: impl FnMut()) -> bool {
 enum Act {
     Bold, Italic, Underline, Strike, Grow, Shrink,
     AlignL, AlignC, AlignR, AlignJ,
-    Cut, Copy, Paste, Undo, Redo,
+    Cut, Copy, Paste,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
-    Sort, ParaBorders, FirstLine, Hanging, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
+    Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     InsertField, PageBreak, ToggleNotes,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
@@ -1405,53 +1422,60 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
     use Act::*;
     rs::Ribbon::new(vec![
         rs::tab("Home", "H", vec![
-            rs::group("Clipboard", 10, vec![rs::column(vec![
-                cmdt("cut", "cut", "Cut", Cut, "Ctrl+X"),
-                cmdt("copy", "copy", "Copy", Copy, "Ctrl+C"),
-                cmdt("paste", "paste", "Paste", Paste, "Ctrl+V"),
-            ])]),
-            rs::group("Font", 40, vec![
-                cmdt("fontname", "font-name", "Font", FontName, "").toggle(),
-                cmdt("fontsize", "font-size", "Font size", FontSize, "").toggle(),
-                Control::Separator,
-                cmdt("b", "bold", "Bold", Bold, "Ctrl+B").toggle(),
-                cmdt("i", "italic", "Italic", Italic, "Ctrl+I").toggle(),
-                cmdt("u", "underline", "Underline", Underline, "Ctrl+U").toggle(),
-                cmdt("s", "strikethrough", "Strikethrough", Strike, "").toggle(),
-                cmdt("sub", "subscript", "Subscript", Sub, "").toggle(),
-                cmdt("sup", "superscript", "Superscript", Super, "").toggle(),
-                Control::Separator,
-                cmdt("color", "text-color", "Font colour", FontColor, "").toggle(),
-                cmdt("hl", "highlight", "Text highlight", Highlight, "").toggle(),
-                Control::Separator,
-                cmdt("grow", "font-increase", "Grow font", Grow, "").toggle(),
-                cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").toggle(),
-                Control::Separator,
-                cmdt("clearfmt", "clear-format", "Clear formatting", ClearFmt, "").toggle(),
-            ])
-            .launcher(LaunchFont),
-            rs::group("Paragraph", 30, vec![
-                cmdt("bullets", "list-bullet", "Bullets", Bullets, "").toggle(),
-                cmdt("numbers", "list-numbered", "Numbering", Numbers, "").toggle(),
-                cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M").toggle(),
-                cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M").toggle(),
-                Control::Separator,
-                cmdt("al", "align-left", "Align left", AlignL, "").toggle(),
-                cmdt("ac", "align-center", "Center", AlignC, "").toggle(),
-                cmdt("ar", "align-right", "Align right", AlignR, "").toggle(),
-                cmdt("aj", "align-justify", "Justify", AlignJ, "").toggle(),
-            ])
-            .launcher(LaunchParagraph),
-            rs::group("Arrange", 25, vec![rs::column(vec![
-                cmdt("sort", "sort", "Sort paragraphs", Sort, ""),
-                cmdt("borders", "border-bottom", "Bottom border", ParaBorders, ""),
-                cmdt("firstline", "indent-increase", "First-line indent", FirstLine, ""),
-                cmdt("hanging", "indent-decrease", "Hanging indent", Hanging, ""),
-            ])]),
-            rs::group("Editing", 20, vec![
-                cmdt("undo", "undo", "Undo", Undo, "Ctrl+Z").toggle(),
-                cmdt("redo", "redo", "Redo", Redo, "Ctrl+Y").toggle(),
+            // Clipboard: a large Paste button + a small Cut/Copy column (Word).
+            rs::group("Clipboard", 10, vec![
+                Control::Large(cmdt("paste", "paste", "Paste", Paste, "Ctrl+V")),
+                rs::column(vec![
+                    cmdt("cut", "cut", "Cut", Cut, "Ctrl+X"),
+                    cmdt("copy", "copy", "Copy", Copy, "Ctrl+C"),
+                ]),
             ]),
+            // Font: two rows — combos + size controls on top, character toggles below.
+            rs::group("Font", 40, vec![rs::rows(vec![
+                vec![
+                    rs::combo(cmdt("fontname", "font-name", "Font", FontName, ""), true),
+                    rs::combo(cmdt("fontsize", "font-size", "Font size", FontSize, ""), false),
+                    rs::btn(cmdt("grow", "font-increase", "Grow font", Grow, "")),
+                    rs::btn(cmdt("shrink", "font-decrease", "Shrink font", Shrink, "")),
+                    rs::btn(cmdt("case", "case", "Change case", Case, "")),
+                    rs::btn(cmdt("clearfmt", "clear-format", "Clear formatting", ClearFmt, "")),
+                ],
+                vec![
+                    rs::btn(cmdt("b", "bold", "Bold", Bold, "Ctrl+B")),
+                    rs::btn(cmdt("i", "italic", "Italic", Italic, "Ctrl+I")),
+                    rs::btn(cmdt("u", "underline", "Underline", Underline, "Ctrl+U")),
+                    rs::btn(cmdt("s", "strikethrough", "Strikethrough", Strike, "")),
+                    rs::btn(cmdt("sub", "subscript", "Subscript", Sub, "")),
+                    rs::btn(cmdt("sup", "superscript", "Superscript", Super, "")),
+                    rs::btn(cmdt("color", "text-color", "Font colour", FontColor, "")),
+                    rs::btn(cmdt("hl", "highlight", "Text highlight", Highlight, "")),
+                ],
+            ])])
+            .launcher(LaunchFont),
+            // Paragraph: two rows — lists/indent/sort/marks on top, alignment below.
+            rs::group("Paragraph", 30, vec![rs::rows(vec![
+                vec![
+                    rs::btn(cmdt("bullets", "list-bullet", "Bullets", Bullets, "")),
+                    rs::btn(cmdt("numbers", "list-numbered", "Numbering", Numbers, "")),
+                    rs::btn(cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M")),
+                    rs::btn(cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M")),
+                    rs::btn(cmdt("sort", "sort", "Sort", Sort, "")),
+                    rs::btn(cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "")),
+                ],
+                vec![
+                    rs::btn(cmdt("al", "align-left", "Align left", AlignL, "")),
+                    rs::btn(cmdt("ac", "align-center", "Center", AlignC, "")),
+                    rs::btn(cmdt("ar", "align-right", "Align right", AlignR, "")),
+                    rs::btn(cmdt("aj", "align-justify", "Justify", AlignJ, "")),
+                    rs::btn(cmdt("borders", "border-bottom", "Bottom border", ParaBorders, "")),
+                ],
+            ])])
+            .launcher(LaunchParagraph),
+            // Editing: a labelled column (Word: Find / Replace / Select).
+            rs::group("Editing", 20, vec![rs::column(vec![
+                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
+                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
+            ])]),
         ]),
         rs::tab("Styles", "S", vec![rs::group("Styles", 40, vec![
             rs::column(vec![
@@ -1519,16 +1543,8 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     let mut w: f32 = 22.0;
     for c in &g.items {
         w += match c {
-            // Toggles stack 3-high into columns, so each contributes ~a third of a
-            // ~30px column's width.
-            Control::Toggle(_) => 11.0,
-            Control::Large(_) => {
-                if icon_only {
-                    32.0
-                } else {
-                    74.0
-                }
-            }
+            Control::Toggle(_) => 26.0,
+            Control::Large(_) => 58.0,
             Control::Column(_) => {
                 if icon_only {
                     34.0
@@ -1536,6 +1552,24 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
                     104.0
                 }
             }
+            // A two-row grid: its width is that of the widest row.
+            Control::Rows(rows) => rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| match cell {
+                            rs::Cell::Combo { wide, .. } => {
+                                if *wide {
+                                    106.0
+                                } else {
+                                    48.0
+                                }
+                            }
+                            rs::Cell::Btn(_) => 25.0,
+                        })
+                        .sum::<f32>()
+                })
+                .fold(0.0_f32, f32::max),
             Control::Separator => 10.0,
             _ => 30.0,
         };
@@ -2064,12 +2098,6 @@ impl Docxy {
                 AlignC => e.set_align(Align::Center),
                 AlignR => e.set_align(Align::Right),
                 AlignJ => e.set_align(Align::Justify),
-                Undo => {
-                    e.undo();
-                }
-                Redo => {
-                    e.redo();
-                }
                 Normal => e.set_para_style(None),
                 H1 => e.set_para_style(Some("Heading1")),
                 H2 => e.set_para_style(Some("Heading2")),
@@ -2083,8 +2111,6 @@ impl Docxy {
                 Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
-                FirstLine => e.set_first_line(720),
-                Hanging => e.set_first_line(-720),
                 Sort => e.sort_paragraphs(),
                 ParaBorders => {
                     let has = e.caret_para_props().borders.bottom.is_some();
@@ -2141,37 +2167,8 @@ impl Docxy {
         h_flex().w_full().h(px(98.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
-    /// Pack a run of small toggle buttons into columns of up to 3 (the ribbon body
-    /// is three small-button rows tall), so they read as a compact grid instead of
-    /// one long horizontal strip — the Office ribbon placement rule for the small
-    /// buttons in a group.
-    fn toggle_grid(&self, cmds: &[&rs::Cmd<Act>], pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let cols: Vec<AnyElement> = cmds
-            .chunks(3)
-            .map(|chunk| v_flex().gap(px(1.)).children(chunk.iter().map(|cm| self.icon_btn(cm, false, pal, cx))).into_any_element())
-            .collect();
-        h_flex().items_start().gap(px(1.)).children(cols).into_any_element()
-    }
-
     fn render_group(&self, g: &rs::Group<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        // Collect consecutive small toggle buttons and lay them out as a column
-        // grid; render every other control (Large / Column / Separator) inline.
-        let mut controls: Vec<AnyElement> = Vec::new();
-        let mut run: Vec<&rs::Cmd<Act>> = Vec::new();
-        for c in &g.items {
-            if let Control::Toggle(cmd) = c {
-                run.push(cmd);
-            } else {
-                if !run.is_empty() {
-                    controls.push(self.toggle_grid(&run, pal, cx));
-                    run.clear();
-                }
-                controls.push(self.render_control(c, icon_only, pal, cx));
-            }
-        }
-        if !run.is_empty() {
-            controls.push(self.toggle_grid(&run, pal, cx));
-        }
+        let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, icon_only, pal, cx)).collect();
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
             .items_center()
@@ -2207,7 +2204,7 @@ impl Docxy {
     fn render_control(&self, c: &Control<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         match c {
             Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
-            Control::Large(cmd) => self.icon_btn(cmd, !icon_only, pal, cx),
+            Control::Large(cmd) => self.large_btn(cmd, pal, cx),
             Control::Column(cmds) => {
                 // Office caps a button column at 3 rows; extra buttons wrap into
                 // the next column so nothing overflows the ribbon body height.
@@ -2222,9 +2219,98 @@ impl Docxy {
                     .collect();
                 h_flex().items_start().gap_1().children(cols).into_any_element()
             }
+            // The Office two-row layout: each inner Vec is one left-to-right row.
+            Control::Rows(rows) => {
+                let rendered: Vec<AnyElement> = rows
+                    .iter()
+                    .map(|row| {
+                        h_flex()
+                            .items_center()
+                            .gap(px(1.))
+                            .children(row.iter().map(|cell| self.render_cell(cell, pal, cx)))
+                            .into_any_element()
+                    })
+                    .collect();
+                v_flex().items_start().gap(px(2.)).children(rendered).into_any_element()
+            }
             Control::Separator => div().w(px(1.)).h(px(44.)).bg(pal.border).mx_1().into_any_element(),
             _ => div().into_any_element(),
         }
+    }
+
+    fn render_cell(&self, cell: &rs::Cell<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        match cell {
+            rs::Cell::Btn(cmd) => self.icon_btn(cmd, false, pal, cx),
+            rs::Cell::Combo { cmd, wide } => self.combo_box(cmd, *wide, pal, cx),
+        }
+    }
+
+    /// The current font family / size at the caret (for the Font combos).
+    fn caret_run_props(&self) -> Option<RunProps> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => Some(ed.caret_props()),
+            _ => None,
+        }
+    }
+
+    /// A Font-group combo box showing the current value with a dropdown chevron.
+    fn combo_box(&self, cmd: &rs::Cmd<Act>, wide: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let props = self.caret_run_props();
+        let value: SharedString = if cmd.id == "fontname" {
+            props.and_then(|p| p.font).unwrap_or_else(|| "Calibri".into()).into()
+        } else {
+            props
+                .and_then(|p| p.size_half_pts)
+                .map(|h| {
+                    let s = h as f32 / 2.0;
+                    if s.fract() == 0.0 { format!("{}", s as u32) } else { format!("{s}") }
+                })
+                .unwrap_or_else(|| "11".into())
+                .into()
+        };
+        let act = cmd.act;
+        div()
+            .id(cmd.id)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .w(px(if wide { 104. } else { 46. }))
+            .h(px(22.))
+            .px_1p5()
+            .rounded(px(3.))
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .cursor_pointer()
+            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .child(div().text_size(px(11.)).text_color(pal.fg).overflow_hidden().child(value))
+            .child(div().text_size(px(8.)).text_color(pal.dim).child("\u{25BE}"))
+            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .into_any_element()
+    }
+
+    /// A large icon-over-label ribbon button (e.g. Paste).
+    fn large_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let act = cmd.act;
+        div()
+            .id(cmd.id)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .px_2()
+            .h_full()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(icon_svg(cmd.icon.0, 26., pal.fg))
+            .child(div().text_size(px(11.)).text_color(pal.fg).child(SharedString::from(cmd.label)))
+            .tooltip(move |window, cx| Tooltip::new("Paste").build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .into_any_element()
     }
 
     fn icon_btn(&self, cmd: &rs::Cmd<Act>, show_label: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -2469,6 +2555,16 @@ impl Render for Docxy {
                 .gap_2()
                 .pl_2()
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(BRAND)).child("docxy"))
+                // Quick Access Toolbar: Undo / Redo (Word keeps these here, not on
+                // the ribbon).
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(qat_btn("qat-undo", "undo", "Undo (Ctrl+Z)", pal, cx.listener(|this, _, window, cx| this.with_editor(window, cx, |e| { e.undo(); }))))
+                        .child(qat_btn("qat-redo", "redo", "Redo (Ctrl+Y)", pal, cx.listener(|this, _, window, cx| this.with_editor(window, cx, |e| { e.redo(); })))),
+                )
                 .child(
                     h_flex()
                         .items_center()
