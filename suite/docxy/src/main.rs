@@ -168,12 +168,20 @@ struct Docxy {
     replace_text: String,
     find_field: FindField,
     find_case: bool,
+    // Font-colour / highlight swatch picker (None = closed).
+    picker: Option<PickKind>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum FindField {
     Query,
     Replace,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PickKind {
+    Color,
+    Highlight,
 }
 
 /// Everything a rendered word/atom needs to turn a click into a caret move: the
@@ -296,6 +304,7 @@ impl Docxy {
             replace_text: String::new(),
             find_field: FindField::Query,
             find_case: false,
+            picker: None,
         };
         this.persist();
         this
@@ -584,6 +593,81 @@ impl Docxy {
         cx.notify();
     }
 
+    // ---- font colour / highlight pickers -----------------------------------
+
+    fn toggle_picker(&mut self, kind: PickKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = if self.picker == Some(kind) { None } else { Some(kind) };
+        self.refocus(window, cx);
+    }
+
+    fn apply_color(&mut self, hex: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| e.set_color(hex));
+    }
+
+    fn apply_highlight(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| e.set_highlight(name));
+    }
+
+    /// The swatch strip shown under the ribbon while a picker is open.
+    fn picker_bar(&self, kind: PickKind, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let swatch = |bg: Hsla, ring: bool| {
+            div().size(px(20.)).rounded(px(3.)).border_1().border_color(if ring { pal.fg } else { pal.border }).bg(bg).cursor_pointer().hover(|d| d.border_color(hsla_u(BRAND)))
+        };
+        let mut row = h_flex().w_full().items_center().flex_wrap().gap_1p5().px_3().py_1().bg(pal.panel).border_b_1().border_color(pal.border);
+        row = row.child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(78.)).child(match kind {
+            PickKind::Color => "Font colour",
+            PickKind::Highlight => "Highlight",
+        }));
+        match kind {
+            PickKind::Color => {
+                // Automatic (clear) chip.
+                row = row.child(
+                    div()
+                        .id("col-auto")
+                        .px_2()
+                        .h(px(20.))
+                        .rounded(px(3.))
+                        .text_size(px(11.))
+                        .text_color(pal.fg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(pal.hover))
+                        .child("Automatic")
+                        .on_click(cx.listener(|this, _, window, cx| this.apply_color(None, window, cx))),
+                );
+                for &c in COLOR_SWATCHES {
+                    let hex = format!("{c:06X}");
+                    row = row.child(swatch(hsla_u(c), c == 0xFFFFFF).id(("col", c as usize)).on_click(cx.listener(move |this, _, window, cx| this.apply_color(Some(hex.clone()), window, cx))));
+                }
+            }
+            PickKind::Highlight => {
+                row = row.child(
+                    div()
+                        .id("hl-none")
+                        .px_2()
+                        .h(px(20.))
+                        .rounded(px(3.))
+                        .text_size(px(11.))
+                        .text_color(pal.fg)
+                        .border_1()
+                        .border_color(pal.border)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(pal.hover))
+                        .child("None")
+                        .on_click(cx.listener(|this, _, window, cx| this.apply_highlight(None, window, cx))),
+                );
+                for (i, &name) in HIGHLIGHT_SWATCHES.iter().enumerate() {
+                    let (c, _) = highlight_rgb(name);
+                    row = row.child(swatch(hsla_u(c), false).id(("hl", i)).on_click(cx.listener(move |this, _, window, cx| this.apply_highlight(Some(name.to_string()), window, cx))));
+                }
+            }
+        }
+        row.into_any_element()
+    }
+
     /// Route a keystroke to the find bar while it is open.
     fn find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         match key {
@@ -836,7 +920,7 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
-    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -867,6 +951,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 cmdt("i", "italic", "Italic", Italic, "Ctrl+I").toggle(),
                 cmdt("u", "underline", "Underline", Underline, "Ctrl+U").toggle(),
                 cmdt("s", "strikethrough", "Strikethrough", Strike, "").toggle(),
+                Control::Separator,
+                cmdt("color", "text-color", "Font colour", FontColor, "").toggle(),
+                cmdt("hl", "highlight", "Text highlight", Highlight, "").toggle(),
                 Control::Separator,
                 cmdt("grow", "font-increase", "Grow font", Grow, "").toggle(),
                 cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").toggle(),
@@ -975,6 +1062,37 @@ fn hex_rgb(s: &str) -> Option<u32> {
     (s.len() == 6).then(|| u32::from_str_radix(s, 16).ok()).flatten()
 }
 
+/// Map a Word highlight name (`w:highlight`) to an approximate RGB, and whether
+/// its text should read dark (true) or light (false).
+fn highlight_rgb(name: &str) -> (u32, bool) {
+    match name {
+        "yellow" => (0xFFFF00, true),
+        "green" => (0x00FF00, true),
+        "cyan" => (0x00FFFF, true),
+        "magenta" => (0xFF00FF, true),
+        "blue" => (0x0000FF, false),
+        "red" => (0xFF0000, false),
+        "darkYellow" => (0x808000, false),
+        "darkGreen" => (0x008000, false),
+        "darkCyan" => (0x008080, false),
+        "darkMagenta" => (0x800080, false),
+        "darkBlue" => (0x000080, false),
+        "darkRed" => (0x800000, false),
+        "lightGray" => (0xC0C0C0, true),
+        "darkGray" => (0x808080, false),
+        "black" => (0x000000, false),
+        "white" => (0xFFFFFF, true),
+        _ => (0xFFF29A, true),
+    }
+}
+
+/// Office-style font-colour swatches (hex, no `#`). `None` = automatic (clear).
+const COLOR_SWATCHES: &[u32] = &[
+    0x000000, 0x404040, 0x808080, 0xBFBFBF, 0xFFFFFF, 0xC00000, 0xFF0000, 0xFFC000, 0xFFFF00, 0x92D050, 0x00B050, 0x00B0F0, 0x0070C0, 0x002060, 0x7030A0,
+];
+/// Highlight swatches (Word highlight names). `None` = no highlight (clear).
+const HIGHLIGHT_SWATCHES: &[&str] = &["yellow", "green", "cyan", "magenta", "blue", "red", "darkYellow", "darkGreen", "darkCyan", "darkRed", "darkBlue", "lightGray"];
+
 fn caret_bar() -> AnyElement {
     div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
 }
@@ -1005,7 +1123,10 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                 .when(props.strike, |d| d.line_through())
                 // Selection wins over any run highlight so the selected range reads
                 // as one contiguous band.
-                .when(!selected && props.highlight.is_some(), |d| d.bg(rgb(0xfff29a)).text_color(rgb(0x333300)))
+                .when_some(props.highlight.as_deref().filter(|_| !selected), |d, name| {
+                    let (c, dark) = highlight_rgb(name);
+                    d.bg(rgb(c)).text_color(if dark { rgb(0x1a1a1a) } else { rgb(0xf5f5f5) })
+                })
                 .when(selected, |d| d.bg(pal.sel))
                 // Click-to-caret: place the caret at this word's start offset.
                 .when_some(click, |d, c| {
@@ -1317,6 +1438,8 @@ impl Docxy {
             LaunchFont => self.launch_msg("Font — advanced dialog coming soon", window, cx),
             LaunchParagraph => self.launch_msg("Paragraph — advanced dialog coming soon", window, cx),
             Find => self.toggle_find(window, cx),
+            FontColor => self.toggle_picker(PickKind::Color, window, cx),
+            Highlight => self.toggle_picker(PickKind::Highlight, window, cx),
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -1348,7 +1471,7 @@ impl Docxy {
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight => {}
             }),
         }
     }
@@ -1719,6 +1842,7 @@ impl Render for Docxy {
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
         let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
+        let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -1769,6 +1893,7 @@ impl Render for Docxy {
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(find_bar, |d, f| d.child(f))
+            .when_some(picker_bar, |d, p| d.child(p))
             .child(content)
             .child(status)
             .into_any_element()
