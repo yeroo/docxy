@@ -194,6 +194,17 @@ struct Click<'a> {
     path: &'a [usize],
 }
 
+/// Shared state for the recursive document renderer, so caret/selection/clicks
+/// resolve correctly at any nesting depth (top-level blocks and table cells).
+#[derive(Clone, Copy)]
+struct RenderCtx<'a> {
+    caret_path: &'a [usize],
+    caret_off: usize,
+    spans: &'a [(Vec<usize>, usize, usize)],
+    ent: &'a Entity<Docxy>,
+    pal: Pal,
+}
+
 /// Colours the document renderer needs, pulled from the active theme.
 #[derive(Clone, Copy)]
 struct Pal {
@@ -1395,23 +1406,38 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         .into_any_element()
 }
 
-fn table_el(t: &Table, pal: Pal) -> AnyElement {
+fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     let mut rows = Vec::new();
-    for row in &t.rows {
+    for (ri, row) in t.rows.iter().enumerate() {
         let mut cells = Vec::new();
-        for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, None, None, pal)).collect();
-            cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(pal.border).children(inner).into_any_element());
+        for (ci, cell) in row.cells.iter().enumerate() {
+            let inner: Vec<AnyElement> = cell
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(k, b)| {
+                    let mut cp = path.to_vec();
+                    cp.extend_from_slice(&[ri, ci, k]);
+                    block_el(b, cp, None, ctx)
+                })
+                .collect();
+            cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(ctx.pal.border).children(inner).into_any_element());
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
     }
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, pal: Pal) -> AnyElement {
+/// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
+fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p, caret, sel, marker, click, pal),
-        Block::Table(t) => table_el(t, pal),
+        Block::Paragraph(p) => {
+            let caret = (ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
+            let sel = ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e));
+            let click = Some(Click { ent: ctx.ent, path: &path });
+            paragraph_el(p, caret, sel, marker, click, ctx.pal)
+        }
+        Block::Table(t) => table_el(t, &path, ctx),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
 }
@@ -1909,24 +1935,16 @@ impl Render for Docxy {
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
-                    let caret_block = (editor.caret.path.len() == 1).then_some(editor.caret.path[0]);
-                    let off = editor.caret.offset;
-                    // Selection ranges, keyed by top-level block (nested table spans
-                    // aren't highlighted yet).
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
                     let ent = cx.entity();
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal };
                     let blocks: Vec<AnyElement> = editor
                         .doc
                         .body
                         .iter()
                         .enumerate()
-                        .map(|(i, b)| {
-                            let caret = (Some(i) == caret_block).then_some(off);
-                            let sel = spans.iter().find(|(p, _, _)| p.len() == 1 && p[0] == i).map(|(_, s, e)| (*s, *e));
-                            let bp = [i];
-                            block_el(b, caret, sel, markers[i].as_deref(), Some(Click { ent: &ent, path: &bp }), pal)
-                        })
+                        .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
                         .collect();
                     v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                 }
