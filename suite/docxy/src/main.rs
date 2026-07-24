@@ -146,7 +146,6 @@ fn session_path() -> PathBuf {
 #[derive(Clone, Copy, PartialEq)]
 enum RibbonTab {
     Home,
-    Styles,
     Insert,
     Review,
     View,
@@ -1471,24 +1470,25 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 ],
             ])])
             .launcher(LaunchParagraph),
+            // Styles: a gallery of style thumbnails (Word keeps this on Home).
+            rs::group("Styles", 35, vec![Control::Gallery(rs::Gallery {
+                id: "styles",
+                tip: rs::ScreenTip::default(),
+                items: vec![
+                    rs::GalleryItem { label: "Normal", preview: "normal", act: Normal },
+                    rs::GalleryItem { label: "Title", preview: "title", act: Title },
+                    rs::GalleryItem { label: "Subtitle", preview: "subtitle", act: Subtitle },
+                    rs::GalleryItem { label: "Heading 1", preview: "h1", act: H1 },
+                    rs::GalleryItem { label: "Heading 2", preview: "h2", act: H2 },
+                    rs::GalleryItem { label: "Heading 3", preview: "h3", act: H3 },
+                ],
+            })]),
             // Editing: a labelled column (Word: Find / Replace / Select).
             rs::group("Editing", 20, vec![rs::column(vec![
                 cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
                 cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
             ])]),
         ]),
-        rs::tab("Styles", "S", vec![rs::group("Styles", 40, vec![
-            rs::column(vec![
-                cmdt("title", "paragraph", "Title", Title, ""),
-                cmdt("subtitle", "paragraph", "Subtitle", Subtitle, ""),
-                cmdt("normal", "paragraph", "Normal", Normal, ""),
-            ]),
-            rs::column(vec![
-                cmdt("h1", "heading-1", "Heading 1", H1, ""),
-                cmdt("h2", "heading-2", "Heading 2", H2, ""),
-                cmdt("h3", "heading-3", "Heading 3", H3, ""),
-            ]),
-        ])]),
         rs::tab("Insert", "N", vec![
             rs::group("Pages", 40, vec![rs::column(vec![
                 cmdt("pagebreak", "rule", "Page break", PageBreak, ""),
@@ -1531,10 +1531,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
 fn ribbon_tab_index(t: RibbonTab) -> usize {
     match t {
         RibbonTab::Home => 0,
-        RibbonTab::Styles => 1,
-        RibbonTab::Insert => 2,
-        RibbonTab::Review => 3,
-        RibbonTab::View => 4,
+        RibbonTab::Insert => 1,
+        RibbonTab::Review => 2,
+        RibbonTab::View => 3,
     }
 }
 
@@ -1570,6 +1569,7 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
                         .sum::<f32>()
                 })
                 .fold(0.0_f32, f32::max),
+            Control::Gallery(gal) => gal.items.len() as f32 * 80.0,
             Control::Separator => 10.0,
             _ => 30.0,
         };
@@ -1981,16 +1981,15 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 
 impl Docxy {
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        let names = ["File", "Home", "Styles", "Insert", "Review", "View"];
+        let names = ["File", "Home", "Insert", "Review", "View"];
         let mut strip = h_flex().w_full().items_end().gap_1().px_2().pt_1().bg(panel);
         for (i, name) in names.iter().enumerate() {
             let is_file = i == 0;
             let this_tab = match i {
                 1 => Some(RibbonTab::Home),
-                2 => Some(RibbonTab::Styles),
-                3 => Some(RibbonTab::Insert),
-                4 => Some(RibbonTab::Review),
-                5 => Some(RibbonTab::View),
+                2 => Some(RibbonTab::Insert),
+                3 => Some(RibbonTab::Review),
+                4 => Some(RibbonTab::View),
                 _ => None,
             };
             let active = !self.backstage && this_tab == Some(self.ribbon_tab);
@@ -2233,9 +2232,63 @@ impl Docxy {
                     .collect();
                 v_flex().items_start().gap(px(2.)).children(rendered).into_any_element()
             }
+            Control::Gallery(gal) => self.style_gallery(gal, pal, cx),
             Control::Separator => div().w(px(1.)).h(px(44.)).bg(pal.border).mx_1().into_any_element(),
             _ => div().into_any_element(),
         }
+    }
+
+    /// The Styles gallery: a row of thumbnail boxes, each showing its name in that
+    /// style's own weight/size (Word's Style gallery).
+    fn style_gallery(&self, gal: &rs::Gallery<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let cur = self.tabs.get(self.active).and_then(|t| if let Surface::Doc(ed) = &t.surface { ed.caret_para_style() } else { None });
+        let boxes: Vec<AnyElement> = gal
+            .items
+            .iter()
+            .map(|it| {
+                let act = it.act;
+                // Map the preview hint to a thumbnail appearance.
+                let (size, weight) = match it.preview {
+                    "title" => (16.0, FontWeight::BOLD),
+                    "subtitle" => (12.0, FontWeight::NORMAL),
+                    "h1" => (14.0, FontWeight::BOLD),
+                    "h2" => (13.0, FontWeight::BOLD),
+                    "h3" => (12.0, FontWeight::SEMIBOLD),
+                    _ => (11.0, FontWeight::NORMAL),
+                };
+                let style_id = match it.preview {
+                    "title" => Some("Title"),
+                    "subtitle" => Some("Subtitle"),
+                    "h1" => Some("Heading1"),
+                    "h2" => Some("Heading2"),
+                    "h3" => Some("Heading3"),
+                    _ => None,
+                };
+                let selected = cur.as_deref() == style_id;
+                div()
+                    .id(it.label)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(76.))
+                    .h(px(40.))
+                    .px_1()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(if selected { hsla_u(BRAND) } else { pal.border })
+                    .bg(pal.panel)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(div().text_size(px(size)).font_weight(weight).text_color(pal.fg).overflow_hidden().child(SharedString::from(it.label)))
+                    .tooltip({
+                        let label = it.label;
+                        move |w, cx| Tooltip::new(label).build(w, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        h_flex().items_center().gap_1().children(boxes).into_any_element()
     }
 
     fn render_cell(&self, cell: &rs::Cell<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
