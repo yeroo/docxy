@@ -887,7 +887,7 @@ impl Docxy {
                     .into_any_element(),
             );
         }
-        h_flex().w_full().h(px(92.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
+        h_flex().w_full().h(px(98.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
     fn render_group(&self, g: &rs::Group<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -915,8 +915,8 @@ impl Docxy {
             .justify_between()
             .h_full()
             .px_2()
-            .py_1()
-            .gap_1()
+            .py_0p5()
+            .gap_0p5()
             .border_r_1()
             .border_color(pal.border)
             .child(h_flex().flex_1().items_center().gap_1().children(controls))
@@ -961,7 +961,7 @@ impl Docxy {
             .items_center()
             .gap_1p5()
             .px_2()
-            .h(px(24.))
+            .h(px(22.))
             .rounded(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
