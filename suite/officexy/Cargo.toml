@@ -1,0 +1,22 @@
+[package]
+name = "officexy"
+description = "officexy — the suite host: docxy / xlsxy / lookxy in tabs, on GPUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "officexy"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+docxcore = { path = "../../docxcore" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
