@@ -1824,9 +1824,14 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
         } else {
             props.color.as_deref().and_then(hex_rgb).map(hsla_u).unwrap_or(pal.fg)
         };
+        // Render each word as a StyledText so its TextLayout gives pixel-exact
+        // hit-testing (index_for_position), for a true click-anywhere caret.
+        let word_str = word.to_string();
+        let styled = StyledText::new(word_str.clone());
+        let layout = styled.layout().clone();
         out.push(
             div()
-                .child(SharedString::from(word.to_string()))
+                .child(styled)
                 .text_size(px(size))
                 .text_color(color)
                 .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
@@ -1841,14 +1846,20 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                     d.bg(rgb(c)).text_color(if dark { rgb(0x1a1a1a) } else { rgb(0xf5f5f5) })
                 })
                 .when(selected, |d| d.bg(pal.sel))
-                // Click-to-caret: place the caret at this word's start offset.
+                // Click-to-caret: place the caret at the exact character under the
+                // click (byte index from the layout → char count within the word).
                 .when_some(click, |d, c| {
                     let ent = c.ent.clone();
                     let path = c.path.to_vec();
+                    let layout = layout.clone();
+                    let word_str = word_str.clone();
                     d.cursor_text().on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                         cx.stop_propagation();
                         let extend = ev.modifiers.shift;
-                        ent.update(cx, |this, cx| this.set_caret(path.clone(), word_off, extend, window, cx));
+                        let byte = layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(word_str.len());
+                        let ch = word_str[..byte].chars().count();
+                        let off = word_off + ch;
+                        ent.update(cx, |this, cx| this.set_caret(path.clone(), off, extend, window, cx));
                     })
                 })
                 .into_any_element(),
