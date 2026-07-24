@@ -1489,9 +1489,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "docxcore"
+version = "0.4.0"
+dependencies = [
+ "opccore",
+]
+
+[[package]]
 name = "docxy-ui"
 version = "0.1.0"
 dependencies = [
+ "docxcore",
  "gpui",
  "gpui-component",
  "gpui_platform",
@@ -4444,6 +4452,10 @@ dependencies = [
  "zeroize",
  "zvariant",
 ]
+
+[[package]]
+name = "opccore"
+version = "0.1.0"
 
 [[package]]
 name = "open"

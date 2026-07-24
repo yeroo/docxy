@@ -18,3 +18,6 @@ path = "src/main.rs"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
+# The document engine (owned by the root workspace) — parses .docx and projects
+# it to markdown for the editor-style view. Cross-workspace path dep is fine.
+docxcore = { path = "../../docxcore" }
