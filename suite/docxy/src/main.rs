@@ -176,6 +176,14 @@ enum FindField {
     Replace,
 }
 
+/// Everything a rendered word/atom needs to turn a click into a caret move: the
+/// view handle to update and the paragraph's block path. Cheap to copy (borrows).
+#[derive(Clone, Copy)]
+struct Click<'a> {
+    ent: &'a Entity<Docxy>,
+    path: &'a [usize],
+}
+
 /// Colours the document renderer needs, pulled from the active theme.
 #[derive(Clone, Copy)]
 struct Pal {
@@ -437,6 +445,19 @@ impl Docxy {
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    /// Place the caret at an explicit paragraph path + char offset (used by
+    /// click-to-caret), collapsing any selection and refocusing the document.
+    fn set_caret(&mut self, path: Vec<usize>, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ed) = self.active_editor() {
+            ed.clear_selection();
+            ed.caret = Caret::at(path, offset);
+            ed.clamp();
+        }
+        self.focus.focus(window, cx);
+        self.focused = true;
+        cx.notify();
     }
 
     fn with_editor(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Editor)) {
@@ -958,11 +979,15 @@ fn caret_bar() -> AnyElement {
     div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
 }
 
-fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, selected: bool, pal: Pal) {
+#[allow(clippy::too_many_arguments)]
+fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, selected: bool, click: Option<Click>, seg_start: usize, pal: Pal) {
+    let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
             continue;
         }
+        let word_off = off;
+        off += word.chars().count();
         let size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
         let color: Hsla = if is_link {
             hsla_u(LINK)
@@ -982,6 +1007,15 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                 // as one contiguous band.
                 .when(!selected && props.highlight.is_some(), |d| d.bg(rgb(0xfff29a)).text_color(rgb(0x333300)))
                 .when(selected, |d| d.bg(pal.sel))
+                // Click-to-caret: place the caret at this word's start offset.
+                .when_some(click, |d, c| {
+                    let ent = c.ent.clone();
+                    let path = c.path.to_vec();
+                    d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        cx.stop_propagation();
+                        ent.update(cx, |this, cx| this.set_caret(path.clone(), word_off, window, cx));
+                    })
+                })
                 .into_any_element(),
         );
     }
@@ -990,6 +1024,7 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
 /// Emit one run's text, splicing in the caret bar and shading any part that falls
 /// inside the selection range `sel` (both are absolute char offsets within the
 /// paragraph). `idx` is advanced by the run's char length.
+#[allow(clippy::too_many_arguments)]
 fn emit_run(
     out: &mut Vec<AnyElement>,
     text: &str,
@@ -999,6 +1034,7 @@ fn emit_run(
     idx: &mut usize,
     caret: &mut Option<usize>,
     sel: Option<(usize, usize)>,
+    click: Option<Click>,
     pal: Pal,
 ) {
     let chars: Vec<char> = text.chars().collect();
@@ -1030,7 +1066,7 @@ fn emit_run(
         }
         let seg: String = chars[a..b].iter().collect();
         let selected = sel.map_or(false, |(s, e)| s < e && start + a >= s && start + b <= e);
-        emit_words(out, &seg, props, base, is_link, selected, pal);
+        emit_words(out, &seg, props, base, is_link, selected, click, start + a, pal);
     }
     if *caret == Some(end) {
         out.push(caret_bar());
@@ -1041,14 +1077,27 @@ fn emit_run(
 
 /// A tab is ONE char in the engine but rendered as spaces; keep `idx` in sync and
 /// let it participate in caret/selection like any other char.
-fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, pal: Pal) {
+fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, click: Option<Click>, pal: Pal) {
     let pos = *idx;
     if *caret == Some(pos) {
         out.push(caret_bar());
         *caret = None;
     }
     let selected = sel.map_or(false, |(s, e)| s < e && s <= pos && pos < e);
-    out.push(div().child(SharedString::from("\u{2003}\u{2003}")).when(selected, |d| d.bg(pal.sel)).into_any_element());
+    out.push(
+        div()
+            .child(SharedString::from("\u{2003}\u{2003}"))
+            .when(selected, |d| d.bg(pal.sel))
+            .when_some(click, |d, c| {
+                let ent = c.ent.clone();
+                let path = c.path.to_vec();
+                d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    cx.stop_propagation();
+                    ent.update(cx, |this, cx| this.set_caret(path.clone(), pos, window, cx));
+                })
+            })
+            .into_any_element(),
+    );
     *idx += 1;
 }
 
@@ -1095,7 +1144,7 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     out
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, pal: Pal) -> AnyElement {
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, pal: Pal) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -1108,17 +1157,19 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
     if let Some(m) = marker {
-        emit_words(&mut spans, m, &RunProps::default(), base, false, false, pal);
+        // The marker isn't document content — render it plain (non-clickable) so it
+        // never maps clicks to bogus offsets.
+        spans.push(div().text_size(px(base)).text_color(pal.dim).child(SharedString::from(m.to_string())).into_any_element());
     }
     for inline in &p.content {
         match inline {
-            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, pal),
+            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, click, pal),
             Inline::Hyperlink(h) => {
                 for r in &h.runs {
-                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel, pal);
+                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel, click, pal);
                 }
             }
-            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, pal),
+            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, click, pal),
             Inline::Break(_) => emit_break(&mut spans, &mut idx, &mut caret),
             other => {
                 let tag = match other {
@@ -1145,7 +1196,24 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
     // per list nesting level.
     let pad = (p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0;
-    v_flex().w_full().py_0p5().pl(px(pad)).when(is_heading, |d| d.mt_2()).child(row.children(spans)).into_any_element()
+    // The whole paragraph area is a click fallback (empty space past the text, the
+    // indent gutter) that drops the caret at the paragraph end. Word clicks fire
+    // first and stop propagation, so this only runs on a "past the text" click.
+    let para_end = idx;
+    v_flex()
+        .w_full()
+        .py_0p5()
+        .pl(px(pad))
+        .when(is_heading, |d| d.mt_2())
+        .when_some(click, |d, c| {
+            let ent = c.ent.clone();
+            let path = c.path.to_vec();
+            d.cursor_text().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                ent.update(cx, |this, cx| this.set_caret(path.clone(), para_end, window, cx));
+            })
+        })
+        .child(row.children(spans))
+        .into_any_element()
 }
 
 fn table_el(t: &Table, pal: Pal) -> AnyElement {
@@ -1153,7 +1221,7 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     for row in &t.rows {
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, None, pal)).collect();
+            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, None, None, pal)).collect();
             cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(pal.border).children(inner).into_any_element());
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
@@ -1161,9 +1229,9 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, pal: Pal) -> AnyElement {
+fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, pal: Pal) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p, caret, sel, marker, pal),
+        Block::Paragraph(p) => paragraph_el(p, caret, sel, marker, click, pal),
         Block::Table(t) => table_el(t, pal),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
@@ -1661,6 +1729,7 @@ impl Render for Docxy {
                     // aren't highlighted yet).
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
+                    let ent = cx.entity();
                     let blocks: Vec<AnyElement> = editor
                         .doc
                         .body
@@ -1669,7 +1738,8 @@ impl Render for Docxy {
                         .map(|(i, b)| {
                             let caret = (Some(i) == caret_block).then_some(off);
                             let sel = spans.iter().find(|(p, _, _)| p.len() == 1 && p[0] == i).map(|(_, s, e)| (*s, *e));
-                            block_el(b, caret, sel, markers[i].as_deref(), pal)
+                            let bp = [i];
+                            block_el(b, caret, sel, markers[i].as_deref(), Some(Click { ent: &ent, path: &bp }), pal)
                         })
                         .collect();
                     v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
