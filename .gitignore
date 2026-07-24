@@ -19,3 +19,6 @@
 # scripts/mmcompare) — rendered PNGs/HTMLs and its own node_modules.
 /scripts/mmcompare/out/
 /scripts/mmcompare/node_modules/
+
+# GPUI UI suite build output (separate workspace)
+/suite/target/

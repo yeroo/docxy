@@ -1,0 +1,40 @@
+# The GPUI-based cross-platform UI suite (docxy / xlsxy / lookxy) — a SEPARATE
+# workspace from the stable cores + COM shims at the repo root. GPUI is a heavy,
+# fast-moving, recent-Rust dependency pulled from the zed monorepo; keeping it in
+# its own workspace (own Cargo.lock, own MSRV/edition) means it never bloats or
+# destabilizes the cores/shims build. UI crates path-depend on the sibling cores
+# (../docxcore, ../gridcore, ...) which remain owned by the root workspace.
+[workspace]
+resolver = "2"
+members = ["docxy-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["yeroo"]
+repository = "https://github.com/yeroo/docxy"
+
+# gpui lives in the zed monorepo and is NOT semver-stable. gpui-component depends
+# on it with NO rev (zed's default branch), so we MUST match that spec exactly —
+# declaring our own `rev` creates a SECOND gpui copy and a type/symbol mismatch
+# (gpui-component built against a newer gpui than a stale pinned rev). Both use
+# `{ git = ".../zed" }`; cargo unifies them to one commit, and reproducibility
+# comes from our committed suite/Cargo.lock (bump with `cargo update -p gpui`).
+[workspace.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
+
+# Matches gpui-component's own patch (its build assumes it).
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
+
+# NOTE: gpui-component's workspace sets opt-level=3 for gpui in dev (it's laggy
+# unoptimized). We keep it at 0 FOR NOW so the huge gpui crate compiles fast enough
+# to finish in one shot; bump these back to 3 once the first build is cached and we
+# want a smooth dev runtime.
+[profile.dev.package.gpui]
+opt-level = 0
+[profile.dev.package.gpui_platform]
+opt-level = 0

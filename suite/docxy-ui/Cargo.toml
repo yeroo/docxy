@@ -1,0 +1,20 @@
+[package]
+name = "docxy-ui"
+description = "docxy — a GPUI desktop editor for .docx, in the docxy/xlsxy/lookxy suite."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# The product binary is `docxy`; the crate is `docxy-ui` to avoid colliding with
+# the existing terminal `docxy` crate in the root workspace.
+[[bin]]
+name = "docxy"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
