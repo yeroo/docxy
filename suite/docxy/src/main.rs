@@ -227,6 +227,64 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Run an editor op on the active doc from a ribbon click, then hand focus
+    /// back to the document so typing continues.
+    fn with_editor(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Editor)) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Surface::Doc(ed) = &mut tab.surface {
+                f(ed);
+                tab.dirty = true;
+            }
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// The Home-tab ribbon: formatting/paragraph/style commands wired to the same
+    /// engine ops the terminal docxy drives (via ribboncore). GPUI-native render
+    /// for now; a UI-agnostic shared ribbon model is a good follow-up.
+    fn ribbon(&self, cx: &mut Context<Self>) -> AnyElement {
+        let sep = || div().w(px(1.)).h(px(20.)).bg(rgb(0x3a3a3a)).mx_1();
+        h_flex()
+            .w_full()
+            .items_center()
+            .flex_wrap()
+            .px_2()
+            .py(px(4.))
+            .gap(px(2.))
+            .bg(rgb(0x2d2d30))
+            .border_b_1()
+            .border_color(rgb(0x3a3a3a))
+            // Font
+            .child(rbtn(cx, "rb-b", "B", |e| e.toggle_bold()))
+            .child(rbtn(cx, "rb-i", "I", |e| e.toggle_italic()))
+            .child(rbtn(cx, "rb-u", "U", |e| e.toggle_underline()))
+            .child(rbtn(cx, "rb-s", "S", |e| e.toggle_strike()))
+            .child(rbtn(cx, "rb-grow", "A+", |e| e.resize_font(2)))
+            .child(rbtn(cx, "rb-shrink", "A\u{2212}", |e| e.resize_font(-2)))
+            .child(sep())
+            // Paragraph alignment
+            .child(rbtn(cx, "rb-al", "\u{2637}L", |e| e.set_align(Align::Left)))
+            .child(rbtn(cx, "rb-ac", "\u{2637}C", |e| e.set_align(Align::Center)))
+            .child(rbtn(cx, "rb-ar", "\u{2637}R", |e| e.set_align(Align::Right)))
+            .child(rbtn(cx, "rb-aj", "\u{2637}J", |e| e.set_align(Align::Justify)))
+            .child(sep())
+            // Styles
+            .child(rbtn(cx, "rb-normal", "\u{00b6}", |e| e.set_para_style(None)))
+            .child(rbtn(cx, "rb-h1", "H1", |e| e.set_para_style(Some("Heading1"))))
+            .child(rbtn(cx, "rb-h2", "H2", |e| e.set_para_style(Some("Heading2"))))
+            .child(rbtn(cx, "rb-h3", "H3", |e| e.set_para_style(Some("Heading3"))))
+            .child(sep())
+            // History
+            .child(rbtn(cx, "rb-undo", "\u{21B6}", |e| {
+                e.undo();
+            }))
+            .child(rbtn(cx, "rb-redo", "\u{21B7}", |e| {
+                e.redo();
+            }))
+            .into_any_element()
+    }
+
     /// Route a keystroke into the active doc's editor engine.
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let m = &ev.keystroke.modifiers;
@@ -296,6 +354,20 @@ fn yes(mut f: impl FnMut()) -> bool {
 fn no(mut f: impl FnMut()) -> bool {
     f();
     false
+}
+
+/// A ribbon button: a ghost button whose click runs `op` on the active editor.
+fn rbtn(
+    cx: &mut Context<Docxy>,
+    id: &'static str,
+    label: &'static str,
+    op: impl Fn(&mut Editor) + 'static,
+) -> Button {
+    Button::new(id)
+        .ghost()
+        .xsmall()
+        .label(label)
+        .on_click(cx.listener(move |this, _, window, cx| this.with_editor(window, cx, |e| op(e))))
 }
 
 /// Crude vertical movement: jump to the nearest adjacent top-level paragraph,
@@ -517,6 +589,9 @@ impl Render for Docxy {
             .children(tabs)
             .on_click(cx.listener(|this, ix: &usize, _, cx| this.select_tab(*ix, cx)));
 
+        let ribbon = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)))
+            .then(|| self.ribbon(cx));
+
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(t) => match &t.surface {
                 Surface::Doc(editor) => {
@@ -564,6 +639,7 @@ impl Render for Docxy {
             .bg(rgb(BG))
             .child(title_bar)
             .child(tab_bar)
+            .when_some(ribbon, |d, r| d.child(r))
             .child(content)
             .child(status)
     }

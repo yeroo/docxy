@@ -33,11 +33,10 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 
-# NOTE: gpui-component's workspace sets opt-level=3 for gpui in dev (it's laggy
-# unoptimized). We keep it at 0 FOR NOW so the huge gpui crate compiles fast enough
-# to finish in one shot; bump these back to 3 once the first build is cached and we
-# want a smooth dev runtime.
+# gpui is laggy fully-unoptimized (per-frame/per-key redraw), so give it opt-level=1
+# for a smooth editor runtime while keeping compile time reasonable. It's a one-time
+# gpui recompile; our own crate then stays fast to iterate.
 [profile.dev.package.gpui]
-opt-level = 0
+opt-level = 1
 [profile.dev.package.gpui_platform]
-opt-level = 0
+opt-level = 1
