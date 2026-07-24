@@ -1,0 +1,16 @@
+[package]
+name = "ribbonspec"
+description = "UI-agnostic Office-style ribbon MODEL (tabs/groups/controls/commands), shared by the terminal (ratatui) and desktop (GPUI) renderers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Zero rendering/UI dependencies on purpose: this crate is pure data + layout
+# intent, so both the ratatui and the gpui renderers can consume the exact same
+# ribbon definition. Builds on every target (no cfg gating needed).
+
+[lints]
+workspace = true
