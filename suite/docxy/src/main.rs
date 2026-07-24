@@ -214,6 +214,8 @@ struct Docxy {
     show_notes: bool,
     // Print Layout: render the document on a page sheet with margins (View).
     page_view: bool,
+    // Horizontal ruler with margin/indent/tab markers (View ▸ Ruler).
+    show_ruler: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -444,6 +446,7 @@ impl Docxy {
             show_nav: false,
             show_notes: false,
             page_view: false,
+            show_ruler: false,
         };
         this.persist();
         this
@@ -1064,6 +1067,76 @@ impl Docxy {
         }
     }
 
+    /// A Word-style horizontal ruler: the page/margins, tick marks, tab stops and
+    /// the current paragraph's first-line / left (other-rows) indent markers.
+    fn ruler(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.tabs.get(self.active);
+        let geom = tab.and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+        let (indent, first_line) = match tab.map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => ed.caret_para_indent(),
+            _ => (0, 0),
+        };
+        // twips → px at ~96dpi.
+        let d = 15.0_f32;
+        let pw = geom.w as f32 / d;
+        let ml = geom.ml as f32 / d;
+        let mr = geom.mr as f32 / d;
+        let ind = indent as f32 / d;
+        let fl = first_line as f32 / d;
+        let _ = cx;
+
+        let paint = canvas(
+            move |_b, _w, _a| {},
+            move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
+                let x = |v: f32| b.origin.x + px(v);
+                let top = b.origin.y;
+                let h = f32::from(b.size.height);
+                let base = hsla_u(0xb8b8b8); // margin ground
+                let white = hsla_u(0xffffff);
+                let tick = hsla_u(0x707070);
+                let brand = hsla_u(BRAND);
+                // ruler ground + white content strip between the margins.
+                window.paint_quad(fill(b, base));
+                window.paint_quad(fill(Bounds::from_corners(point(x(ml), top + px(3.)), point(x(pw - mr), top + px(h - 3.))), white));
+                // Tick marks every 1/8", taller at each inch, measured from the left
+                // margin (Word's zero point).
+                let inch = 96.0;
+                let step = inch / 8.0;
+                let mut i = 0;
+                let mut xx = ml;
+                while xx <= pw - mr + 0.5 {
+                    let major = i % 8 == 0;
+                    let th = if major { h * 0.42 } else if i % 4 == 0 { h * 0.30 } else { h * 0.18 };
+                    let y1 = top + px((h - th) * 0.5);
+                    let y2 = top + px((h + th) * 0.5);
+                    window.paint_quad(fill(Bounds::from_corners(point(x(xx), y1), point(x(xx + 1.0), y2)), tick));
+                    xx += step;
+                    i += 1;
+                }
+                let z = point(0.0_f32, 0.0);
+                // First-line indent: a downward triangle at the top edge.
+                let flx = ml + ind + fl;
+                let mut t1 = Path::new(point(x(flx - 5.0), top + px(1.)));
+                t1.push_triangle((point(x(flx - 5.0), top + px(1.)), point(x(flx + 5.0), top + px(1.)), point(x(flx), top + px(8.))), (z, z, z));
+                window.paint_path(t1, brand);
+                // Left / other-rows indent: an upward triangle at the bottom edge.
+                let lx = ml + ind;
+                let by = top + px(h - 1.);
+                let mut t2 = Path::new(point(x(lx - 5.0), by));
+                t2.push_triangle((point(x(lx - 5.0), by), point(x(lx + 5.0), by), point(x(lx), top + px(h - 8.))), (z, z, z));
+                window.paint_path(t2, brand);
+            },
+        );
+
+        h_flex()
+            .w_full()
+            .justify_center()
+            .bg(hsla_u(0xdedede))
+            .py_0p5()
+            .child(div().w(px(pw)).h(px(18.)).child(paint.size_full()))
+            .into_any_element()
+    }
+
     /// The comment entry bar, shown under the ribbon while `comment_open`.
     fn comment_bar(&self, pal: Pal, _cx: &mut Context<Self>) -> AnyElement {
         h_flex()
@@ -1525,7 +1598,7 @@ enum Act {
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     InsertField, PageBreak, ToggleNotes, InsertTable,
-    RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout,
+    RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
@@ -1640,6 +1713,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
         rs::tab("View", "W", vec![
             rs::group("Views", 40, vec![Control::Large(cmdt("printlayout", "print-layout", "Print Layout", PrintLayout, ""))]),
             rs::group("Show", 30, vec![rs::column(vec![
+                cmdt("ruler", "rule", "Ruler", ToggleRuler, ""),
                 cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
                 cmdt("nav", "select-all", "Navigation", ToggleNav, ""),
                 cmdt("viewcomments", "comment", "Comments pane", ToggleComments, ""),
@@ -2266,6 +2340,10 @@ impl Docxy {
                 self.page_view = !self.page_view;
                 self.refocus(window, cx);
             }
+            ToggleRuler => {
+                self.show_ruler = !self.show_ruler;
+                self.refocus(window, cx);
+            }
             PageBreak => self.insert_page_break(window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
@@ -2306,7 +2384,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -2587,6 +2665,7 @@ impl Docxy {
             ToggleNav => self.show_nav,
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
+            ToggleRuler => self.show_ruler,
             _ => false,
         }
     }
@@ -2878,6 +2957,7 @@ impl Render for Docxy {
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
+        let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -2975,6 +3055,7 @@ impl Render for Docxy {
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(comment_bar, |d, c| d.child(c))
+            .when_some(ruler, |d, r| d.child(r))
             .child(body)
             .child(status)
             .into_any_element()
