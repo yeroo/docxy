@@ -324,7 +324,13 @@ impl Docxy {
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
-        let bytes = docxcore::package::save_package(&docxcore::package::new_package(editor.doc.clone()));
+        let doc = editor.doc.clone();
+        // When the document uses lists, save with a package that defines the
+        // numbering part (numId 1 = bullets, 2 = decimal) so markers survive the
+        // round-trip and open correctly in Word.
+        let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+        let pkg = if has_list { docxcore::package::new_markdown_package(doc) } else { docxcore::package::new_package(doc) };
+        let bytes = docxcore::package::save_package(&pkg);
         let path = tab
             .path
             .clone()
@@ -456,6 +462,9 @@ impl Docxy {
                     true
                 }
                 "a" => no(|| ed.select_all()),
+                // Indent / outdent (Ctrl+M, Ctrl+Shift+M).
+                "m" if shift => yes(|| ed.change_indent(-720)),
+                "m" => yes(|| ed.change_indent(720)),
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
                 "left" => no(|| ed.move_word_left()),
                 "right" => no(|| ed.move_word_right()),
@@ -510,10 +519,17 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
+    Bullets, Numbers, IndentInc, IndentDec, ClearFmt,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
 }
+
+// The two numbering ids new_markdown_package defines: 1 = bullets, 2 = decimal.
+// Applying a list sets a paragraph's num_id to one of these, and save writes a
+// numbering part that defines them (so the list renders in Word too).
+const NUM_BULLET: i32 = 1;
+const NUM_DECIMAL: i32 = 2;
 
 /// A command with a Fluent icon id + ScreenTip (title = label, + shortcut).
 fn cmdt(id: &'static str, icon: &'static str, label: &'static str, act: Act, shortcut: &'static str) -> rs::Cmd<Act> {
@@ -537,9 +553,16 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 Control::Separator,
                 cmdt("grow", "font-increase", "Grow font", Grow, "").toggle(),
                 cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").toggle(),
+                Control::Separator,
+                cmdt("clearfmt", "clear-format", "Clear formatting", ClearFmt, "").toggle(),
             ])
             .launcher(LaunchFont),
             rs::group("Paragraph", 30, vec![
+                cmdt("bullets", "list-bullet", "Bullets", Bullets, "").toggle(),
+                cmdt("numbers", "list-numbered", "Numbering", Numbers, "").toggle(),
+                cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M").toggle(),
+                cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M").toggle(),
+                Control::Separator,
                 cmdt("al", "align-left", "Align left", AlignL, "").toggle(),
                 cmdt("ac", "align-center", "Center", AlignC, "").toggle(),
                 cmdt("ar", "align-right", "Align right", AlignR, "").toggle(),
@@ -743,7 +766,39 @@ fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usi
     *idx += 1;
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, pal: Pal) -> AnyElement {
+/// Compute the list marker text for each top-level block (`None` = not a list
+/// item). Bullets use •/◦ by level; decimal lists get real ordinals that restart
+/// per level and break whenever a non-list block interrupts the run.
+fn list_markers(body: &[Block]) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut counts: Vec<u32> = Vec::new();
+    for b in body {
+        let marker = match b {
+            Block::Paragraph(p) if p.props.num_id.is_some() => {
+                let ilvl = p.props.ilvl as usize;
+                if p.props.num_id == Some(NUM_DECIMAL) {
+                    if counts.len() <= ilvl {
+                        counts.resize(ilvl + 1, 0);
+                    }
+                    counts.truncate(ilvl + 1); // returning to a shallower level restarts deeper ones
+                    counts[ilvl] += 1;
+                    Some(format!("{}. ", counts[ilvl]))
+                } else {
+                    counts.clear();
+                    Some(if ilvl % 2 == 1 { "\u{25E6} ".to_string() } else { "\u{2022} ".to_string() })
+                }
+            }
+            _ => {
+                counts.clear();
+                None
+            }
+        };
+        out.push(marker);
+    }
+    out
+}
+
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, pal: Pal) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -755,9 +810,8 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
-    if p.props.num_id.is_some() {
-        let marker = if p.props.ilvl % 2 == 1 { "\u{25E6} " } else { "\u{2022} " };
-        emit_words(&mut spans, marker, &RunProps::default(), base, false, false, pal);
+    if let Some(m) = marker {
+        emit_words(&mut spans, m, &RunProps::default(), base, false, false, pal);
     }
     for inline in &p.content {
         match inline {
@@ -791,7 +845,10 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         Align::Right => row.justify_end(),
         _ => row,
     };
-    v_flex().w_full().py_0p5().when(is_heading, |d| d.mt_2()).child(row.children(spans)).into_any_element()
+    // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
+    // per list nesting level.
+    let pad = (p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0;
+    v_flex().w_full().py_0p5().pl(px(pad)).when(is_heading, |d| d.mt_2()).child(row.children(spans)).into_any_element()
 }
 
 fn table_el(t: &Table, pal: Pal) -> AnyElement {
@@ -799,7 +856,7 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     for row in &t.rows {
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, pal)).collect();
+            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, None, pal)).collect();
             cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(pal.border).children(inner).into_any_element());
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
@@ -807,9 +864,9 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, pal: Pal) -> AnyElement {
+fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, pal: Pal) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p, caret, sel, pal),
+        Block::Paragraph(p) => paragraph_el(p, caret, sel, marker, pal),
         Block::Table(t) => table_el(t, pal),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
@@ -918,6 +975,13 @@ impl Docxy {
                 HRule => e.insert_hrule(),
                 SelectAll => e.select_all(),
                 Case => e.cycle_case(),
+                // Toggle: if every selected paragraph is already in this list, drop
+                // it; otherwise apply it.
+                Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
+                Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
+                IndentInc => e.change_indent(720),
+                IndentDec => e.change_indent(-720),
+                ClearFmt => e.clear_run_formatting(),
                 Cut | Copy | Paste | LaunchFont | LaunchParagraph => {}
             }),
         }
@@ -1297,6 +1361,7 @@ impl Render for Docxy {
                     // Selection ranges, keyed by top-level block (nested table spans
                     // aren't highlighted yet).
                     let spans = editor.selection_spans();
+                    let markers = list_markers(&editor.doc.body);
                     let blocks: Vec<AnyElement> = editor
                         .doc
                         .body
@@ -1305,7 +1370,7 @@ impl Render for Docxy {
                         .map(|(i, b)| {
                             let caret = (Some(i) == caret_block).then_some(off);
                             let sel = spans.iter().find(|(p, _, _)| p.len() == 1 && p[0] == i).map(|(_, s, e)| (*s, *e));
-                            block_el(b, caret, sel, pal)
+                            block_el(b, caret, sel, markers[i].as_deref(), pal)
                         })
                         .collect();
                     v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
