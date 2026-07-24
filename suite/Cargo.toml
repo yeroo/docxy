@@ -6,7 +6,7 @@
 # (../docxcore, ../gridcore, ...) which remain owned by the root workspace.
 [workspace]
 resolver = "2"
-members = ["docxy-ui", "officexy"]
+members = ["docxy"]
 
 [workspace.package]
 version = "0.1.0"

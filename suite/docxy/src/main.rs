@@ -1,9 +1,9 @@
-//! officexy — the suite host: docxy / xlsxy / lookxy in tabs, on GPUI.
+//! docxy — the suite host: docxy / xlsxy / lookxy in tabs, on GPUI.
 //!
 //! One window with a custom title bar (minimize / maximize / close), a tab strip,
 //! and a content area. Tabs AND their unsaved content survive restart: the whole
 //! session (which tabs, which files, the current editor text) is written to
-//! `<config>/officexy/session.json` on every edit and structural change, and
+//! `<config>/docxy/session.json` on every edit and structural change, and
 //! restored on launch — closing never prompts to save (hot-exit).
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -59,7 +59,7 @@ struct Session {
 fn session_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("officexy")
+        .join("docxy")
         .join("session.json")
 }
 
@@ -86,12 +86,12 @@ struct DocTab {
     _sub: Option<Subscription>,
 }
 
-struct Officexy {
+struct Docxy {
     tabs: Vec<DocTab>,
     active: usize,
 }
 
-impl Officexy {
+impl Docxy {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let session = load_session();
         let mut this = Self { tabs: Vec::new(), active: 0 };
@@ -250,7 +250,7 @@ const DIM: u32 = 0x858585;
 const ACCENT: u32 = 0x4ec9b0;
 const DIRTY: u32 = 0xe2c08d;
 
-impl Render for Officexy {
+impl Render for Docxy {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- title bar: app name + New buttons (min/max/close added by TitleBar) ---
         let new_btn = |id: &'static str, label: &'static str, kind: Kind| {
@@ -264,7 +264,7 @@ impl Render for Officexy {
                 .items_center()
                 .gap_2()
                 .pl_2()
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("officexy"))
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("docxy"))
                 .child(new_btn("new-doc", "+ Doc", Kind::Docx))
                 .child(new_btn("new-sheet", "+ Sheet", Kind::Xlsx))
                 .child(new_btn("new-mail", "+ Mail", Kind::Look))
@@ -294,7 +294,7 @@ impl Render for Officexy {
                     })),
             )
         });
-        let tab_bar = TabBar::new("officexy-tabs")
+        let tab_bar = TabBar::new("docxy-tabs")
             .w_full()
             .selected_index(self.active)
             .children(tabs)
@@ -350,9 +350,9 @@ fn main() {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| Officexy::new(window, cx));
+            let view = cx.new(|cx| Docxy::new(window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         })
-        .expect("failed to open officexy window");
+        .expect("failed to open docxy window");
     });
 }

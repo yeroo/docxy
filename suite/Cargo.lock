@@ -1517,13 +1517,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "docxy-ui"
+name = "docxy"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "docxcore",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4431,20 +4435,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "officexy"
-version = "0.1.0"
-dependencies = [
- "dirs 5.0.1",
- "docxcore",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "gpui_platform",
- "serde",
- "serde_json",
 ]
 
 [[package]]
