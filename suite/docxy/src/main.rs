@@ -18,7 +18,9 @@ use gpui::*;
 use gpui_component::{
     ActiveTheme, Root, Sizable, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    tooltip::Tooltip,
+    v_flex,
 };
 use ribbonspec::{self as rs, Control};
 use rust_embed::RustEmbed;
@@ -485,6 +487,9 @@ enum Act {
     AlignL, AlignC, AlignR, AlignJ,
     Cut, Copy, Paste, Undo, Redo,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
+    // Dialog-box launchers (open advanced dialogs — placeholder until we have a
+    // dialog system).
+    LaunchFont, LaunchParagraph,
 }
 
 /// A command with a Fluent icon id + ScreenTip (title = label, + shortcut).
@@ -509,13 +514,15 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 Control::Separator,
                 cmdt("grow", "font-increase", "Grow font", Grow, "").toggle(),
                 cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").toggle(),
-            ]),
+            ])
+            .launcher(LaunchFont),
             rs::group("Paragraph", 30, vec![
                 cmdt("al", "align-left", "Align left", AlignL, "").toggle(),
                 cmdt("ac", "align-center", "Center", AlignC, "").toggle(),
                 cmdt("ar", "align-right", "Align right", AlignR, "").toggle(),
                 cmdt("aj", "align-justify", "Justify", AlignJ, "").toggle(),
-            ]),
+            ])
+            .launcher(LaunchParagraph),
             rs::group("Editing", 20, vec![
                 cmdt("undo", "undo", "Undo", Undo, "Ctrl+Z").toggle(),
                 cmdt("redo", "redo", "Redo", Redo, "Ctrl+Y").toggle(),
@@ -746,12 +753,21 @@ impl Docxy {
     }
 
     /// Dispatch a ribbon command to the engine / app, then refocus the document.
+    fn launch_msg(&mut self, msg: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status = SharedString::from(msg.to_string());
+        }
+        self.refocus(window, cx);
+    }
+
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         use Act::*;
         match act {
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
+            LaunchFont => self.launch_msg("Font — advanced dialog coming soon", window, cx),
+            LaunchParagraph => self.launch_msg("Paragraph — advanced dialog coming soon", window, cx),
             _ => self.with_editor(window, cx, |e| match act {
                 Bold => e.toggle_bold(),
                 Italic => e.toggle_italic(),
@@ -776,7 +792,7 @@ impl Docxy {
                 HRule => e.insert_hrule(),
                 SelectAll => e.select_all(),
                 Case => e.cycle_case(),
-                Cut | Copy | Paste => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph => {}
             }),
         }
     }
@@ -787,11 +803,29 @@ impl Docxy {
         let ribbon = docxy_ribbon();
         let tab = &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)];
         let groups: Vec<AnyElement> = tab.groups.iter().map(|g| self.render_group(g, pal, cx)).collect();
-        h_flex().w_full().h(px(84.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
+        h_flex().w_full().h(px(92.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
     fn render_group(&self, g: &rs::Group<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, pal, cx)).collect();
+        // group title row + optional dialog-box launcher (⤢)
+        let title_row = h_flex()
+            .items_center()
+            .gap_1()
+            .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
+            .when_some(g.launcher, |d, act| {
+                d.child(
+                    div()
+                        .id(SharedString::from(format!("launch-{}", g.title)))
+                        .text_size(px(10.))
+                        .text_color(pal.dim)
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(pal.fg))
+                        .child("\u{2922}")
+                        .tooltip(|w, cx| Tooltip::new("More options").build(w, cx))
+                        .on_click(cx.listener(move |this, _, w, cx| this.dispatch(act, w, cx))),
+                )
+            });
         v_flex()
             .items_center()
             .justify_between()
@@ -801,8 +835,8 @@ impl Docxy {
             .gap_1()
             .border_r_1()
             .border_color(pal.border)
-            .child(h_flex().items_start().gap_1().children(controls))
-            .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
+            .child(h_flex().flex_1().items_center().gap_1().children(controls))
+            .child(title_row)
             .into_any_element()
     }
 
@@ -820,6 +854,12 @@ impl Docxy {
 
     fn icon_btn(&self, cmd: &rs::Cmd<Act>, show_label: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
+        let tip = cmd.tip;
+        let tip_text: SharedString = if tip.shortcut.is_empty() {
+            tip.title.into()
+        } else {
+            format!("{}  \u{00b7}  {}", tip.title, tip.shortcut).into()
+        };
         div()
             .id(cmd.id)
             .flex()
@@ -832,6 +872,7 @@ impl Docxy {
             .hover(|d| d.bg(pal.hover))
             .child(icon_svg(cmd.icon.0, 16., pal.fg))
             .when(show_label, |d| d.child(div().text_size(px(12.)).text_color(pal.fg).child(SharedString::from(cmd.label))))
+            .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             .into_any_element()
     }
