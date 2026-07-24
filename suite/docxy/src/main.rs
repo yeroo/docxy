@@ -149,6 +149,7 @@ struct Docxy {
     focus: FocusHandle,
     focused: bool,
     ribbon_tab: RibbonTab,
+    ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
     clip: Option<Clip>,
@@ -233,6 +234,7 @@ impl Docxy {
             focus: cx.focus_handle(),
             focused: false,
             ribbon_tab: RibbonTab::Home,
+            ribbon_min: false,
             backstage: false,
             bs_new: false,
             clip: None,
@@ -418,6 +420,11 @@ impl Docxy {
                 "c" => return self.do_copy(false, window, cx),
                 "x" => return self.do_copy(true, window, cx),
                 "v" => return self.do_paste(window, cx),
+                "f1" => {
+                    self.ribbon_min = !self.ribbon_min;
+                    cx.notify();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -553,6 +560,33 @@ fn ribbon_tab_index(t: RibbonTab) -> usize {
         RibbonTab::Review => 3,
         RibbonTab::View => 4,
     }
+}
+
+/// Rough natural width (px) of a group, for responsive collapse decisions.
+fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
+    let mut w: f32 = 22.0;
+    for c in &g.items {
+        w += match c {
+            Control::Toggle(_) => 30.0,
+            Control::Large(_) => {
+                if icon_only {
+                    32.0
+                } else {
+                    74.0
+                }
+            }
+            Control::Column(_) => {
+                if icon_only {
+                    34.0
+                } else {
+                    104.0
+                }
+            }
+            Control::Separator => 10.0,
+            _ => 30.0,
+        };
+    }
+    w.max(44.0)
 }
 
 fn move_vert(ed: &mut Editor, down: bool) {
@@ -748,6 +782,23 @@ impl Docxy {
                     })),
             );
         }
+        // right side: the ribbon collapse/expand chevron
+        strip = strip.child(div().flex_1());
+        strip = strip.child(
+            div()
+                .id("ribbon-min")
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(fg)
+                .child(if self.ribbon_min { "\u{2304}" } else { "\u{2303}" })
+                .tooltip(|w, cx| Tooltip::new("Collapse the ribbon  \u{00b7}  Ctrl+F1").build(w, cx))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.ribbon_min = !this.ribbon_min;
+                    this.refocus(window, cx);
+                })),
+        );
         let _ = dim;
         strip.into_any_element()
     }
@@ -798,16 +849,49 @@ impl Docxy {
     }
 
     /// The ribbon body for the active tab, rendered from the shared ribbonspec
-    /// model with Fluent icons.
-    fn ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    /// model with Fluent icons — and RESPONSIVE: as `width` drops, control labels
+    /// are dropped first, then the lowest-`priority` groups collapse into an
+    /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
+    fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let ribbon = docxy_ribbon();
         let tab = &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)];
-        let groups: Vec<AnyElement> = tab.groups.iter().map(|g| self.render_group(g, pal, cx)).collect();
+        let avail = (width - 28.0).max(120.0);
+
+        // 1) drop control labels if the full layout overflows.
+        let icon_only = tab.groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
+        // 2) collapse lowest-priority groups until what remains fits.
+        let mut shown: Vec<usize> = (0..tab.groups.len()).collect();
+        loop {
+            let total: f32 = shown.iter().map(|&i| group_est(&tab.groups[i], icon_only)).sum();
+            if total <= avail || shown.len() <= 1 {
+                break;
+            }
+            let victim = *shown.iter().min_by_key(|&&i| tab.groups[i].priority).unwrap();
+            shown.retain(|&i| i != victim);
+        }
+        let hidden = tab.groups.len() - shown.len();
+
+        let mut groups: Vec<AnyElement> =
+            shown.iter().map(|&i| self.render_group(&tab.groups[i], icon_only, pal, cx)).collect();
+        if hidden > 0 {
+            groups.push(
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .h_full()
+                    .px_2()
+                    .gap_1()
+                    .text_color(pal.dim)
+                    .child(div().text_size(px(18.)).child("\u{22EF}"))
+                    .child(div().text_size(px(9.)).child(SharedString::from(format!("{hidden} more"))))
+                    .into_any_element(),
+            );
+        }
         h_flex().w_full().h(px(92.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
-    fn render_group(&self, g: &rs::Group<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, pal, cx)).collect();
+    fn render_group(&self, g: &rs::Group<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, icon_only, pal, cx)).collect();
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
             .items_center()
@@ -840,12 +924,12 @@ impl Docxy {
             .into_any_element()
     }
 
-    fn render_control(&self, c: &Control<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    fn render_control(&self, c: &Control<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         match c {
             Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
-            Control::Large(cmd) => self.icon_btn(cmd, true, pal, cx),
+            Control::Large(cmd) => self.icon_btn(cmd, !icon_only, pal, cx),
             Control::Column(cmds) => {
-                v_flex().gap(px(1.)).children(cmds.iter().map(|cm| self.icon_btn(cm, true, pal, cx))).into_any_element()
+                v_flex().gap(px(1.)).children(cmds.iter().map(|cm| self.icon_btn(cm, !icon_only, pal, cx))).into_any_element()
             }
             Control::Separator => div().w(px(1.)).h(px(44.)).bg(pal.border).mx_1().into_any_element(),
             _ => div().into_any_element(),
@@ -1100,8 +1184,9 @@ impl Render for Docxy {
         }
 
         let is_doc = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)));
+        let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        let ribbon_body = is_doc.then(|| self.ribbon_body(pal, cx));
+        let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -1164,7 +1249,7 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
-            window_min_size: Some(size(px(720.), px(460.))),
+            window_min_size: Some(size(px(460.), px(420.))),
             kind: WindowKind::Normal,
             ..Default::default()
         };
