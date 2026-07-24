@@ -1,10 +1,11 @@
 //! docxy — the doc-centric desktop suite (docs / sheets / mail in tabs), on GPUI.
 //!
 //! A thin GPUI view over `docxcore::editor::Editor` — the lossless engine the
-//! terminal docxy uses. Custom title bar (min/max/close), an Office-style ribbon
-//! (File backstage + Home/Styles/Insert/Review/View tabs of titled command
-//! groups), a document tab strip, and a rich editable document surface. Session
-//! hot-exit: open tabs/files persist to `<config>/docxy/session.json`.
+//! terminal docxy uses. Custom title bar hosting the document tabs + window
+//! controls, an Office-style ribbon (File backstage + Home/Styles/Insert/Review/
+//! View tabs of titled command groups), and a rich editable document surface.
+//! Theming (Auto/Light/Dark) follows gpui-component's theme; session hot-exit
+//! persists open tabs/files + the theme choice to `<config>/docxy/session.json`.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -15,11 +16,9 @@ use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    Root, Sizable, TitleBar,
+    ActiveTheme, Root, Sizable, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants},
-    h_flex,
-    tab::{Tab, TabBar},
-    v_flex,
+    h_flex, v_flex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +41,31 @@ impl Kind {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+enum ThemePref {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    fn label(self) -> &'static str {
+        match self {
+            ThemePref::Auto => "\u{25D1} Auto",
+            ThemePref::Light => "\u{2600} Light",
+            ThemePref::Dark => "\u{263D} Dark",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            ThemePref::Auto => ThemePref::Light,
+            ThemePref::Light => ThemePref::Dark,
+            ThemePref::Dark => ThemePref::Auto,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PersistTab {
     kind: Kind,
@@ -53,6 +77,8 @@ struct PersistTab {
 struct Session {
     tabs: Vec<PersistTab>,
     active: usize,
+    #[serde(default)]
+    theme: ThemePref,
 }
 
 fn session_path() -> PathBuf {
@@ -93,8 +119,24 @@ struct Docxy {
     focused: bool,
     ribbon_tab: RibbonTab,
     backstage: bool,
+    bs_new: bool,
     clip: Option<Clip>,
+    theme_pref: ThemePref,
+    applied: Option<ThemeMode>,
 }
+
+/// Colours the document renderer needs, pulled from the active theme.
+#[derive(Clone, Copy)]
+struct Pal {
+    fg: Hsla,
+    dim: Hsla,
+    border: Hsla,
+    panel: Hsla,
+}
+
+const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
+const LINK: u32 = 0x2f6fdb;
+const FILE_FG: u32 = 0xffffff;
 
 fn empty_doc() -> Document {
     docxcore::markdown::from_markdown("# Untitled\n\n")
@@ -160,7 +202,10 @@ impl Docxy {
             focused: false,
             ribbon_tab: RibbonTab::Home,
             backstage: false,
+            bs_new: false,
             clip: None,
+            theme_pref: session.theme,
+            applied: None,
         };
         this.persist();
         this
@@ -176,7 +221,7 @@ impl Docxy {
                 path: t.path.as_ref().map(|p| p.display().to_string()),
             })
             .collect();
-        let session = Session { tabs, active: self.active };
+        let session = Session { tabs, active: self.active, theme: self.theme_pref };
         if let Ok(json) = serde_json::to_string_pretty(&session) {
             let p = session_path();
             if let Some(dir) = p.parent() {
@@ -191,6 +236,13 @@ impl Docxy {
         cx.notify();
     }
 
+    fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_pref = self.theme_pref.next();
+        self.applied = None; // force re-apply on next render
+        self.persist();
+        self.refocus(window, cx);
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         let (title, surface): (SharedString, Surface) = match kind {
             Kind::Docx => ("Untitled.docx".into(), Surface::Doc(Editor::new(empty_doc()))),
@@ -200,6 +252,7 @@ impl Docxy {
         self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into() });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
+        self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
     }
@@ -251,6 +304,7 @@ impl Docxy {
             Err(e) => tab.status = format!("save failed: {e}").into(),
         }
         self.backstage = false;
+        self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
     }
@@ -283,11 +337,11 @@ impl Docxy {
             self.active = self.tabs.len() - 1;
         }
         self.backstage = false;
+        self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
     }
 
-    /// Run an editor op on the active doc from a ribbon click, then refocus.
     fn with_editor(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Editor)) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             if let Surface::Doc(ed) = &mut tab.surface {
@@ -322,7 +376,6 @@ impl Docxy {
         }
     }
 
-    /// Route a keystroke into the active doc's editor engine.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = &ev.keystroke.modifiers;
         let ctrl = m.control || m.platform;
@@ -394,18 +447,11 @@ fn no(mut f: impl FnMut()) -> bool {
     false
 }
 
-/// A ribbon button that runs an editor op on the active doc.
 fn rbtn(cx: &mut Context<Docxy>, id: &'static str, label: &'static str, op: impl Fn(&mut Editor) + 'static) -> Button {
     Button::new(id).ghost().xsmall().label(label).on_click(cx.listener(move |this, _, window, cx| this.with_editor(window, cx, |e| op(e))))
 }
 
-/// A ribbon button that runs an app-level action.
-fn abtn(
-    cx: &mut Context<Docxy>,
-    id: &'static str,
-    label: &'static str,
-    f: impl Fn(&mut Docxy, &mut Window, &mut Context<Docxy>) + 'static,
-) -> Button {
+fn abtn(cx: &mut Context<Docxy>, id: &'static str, label: &'static str, f: impl Fn(&mut Docxy, &mut Window, &mut Context<Docxy>) + 'static) -> Button {
     Button::new(id).ghost().xsmall().label(label).on_click(cx.listener(move |this, _, window, cx| f(this, window, cx)))
 }
 
@@ -427,17 +473,11 @@ fn move_vert(ed: &mut Editor, down: bool) {
     }
 }
 
-// ---- palette + doc rendering -----------------------------------------------
+// ---- doc rendering (theme-aware) -------------------------------------------
 
-const BG: u32 = 0x1e1e1e;
-const PANEL: u32 = 0x252526;
-const RIBBON: u32 = 0x2d2d30;
-const RAIL: u32 = 0x333337;
-const FG: u32 = 0xd4d4d4;
-const DIM: u32 = 0x858585;
-const DIV: u32 = 0x3a3a3a;
-const ACCENT: u32 = 0x4ec9b0;
-const LINK: u32 = 0x4ea1f4;
+fn hsla_u(c: u32) -> Hsla {
+    rgb(c).into()
+}
 
 fn hex_rgb(s: &str) -> Option<u32> {
     let s = s.trim_start_matches('#');
@@ -450,49 +490,53 @@ fn split_at_char(s: &str, n: usize) -> (&str, &str) {
 }
 
 fn caret_bar() -> AnyElement {
-    div().w(px(2.)).h(px(19.)).bg(rgb(ACCENT)).into_any_element()
+    div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
 }
 
-fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool) {
+fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, pal: Pal) {
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
             continue;
         }
         let size = props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
-        let color = if is_link { LINK } else { props.color.as_deref().and_then(hex_rgb).unwrap_or(FG) };
+        let color: Hsla = if is_link {
+            hsla_u(LINK)
+        } else {
+            props.color.as_deref().and_then(hex_rgb).map(hsla_u).unwrap_or(pal.fg)
+        };
         out.push(
             div()
                 .child(SharedString::from(word.to_string()))
                 .text_size(px(size))
-                .text_color(rgb(color))
+                .text_color(color)
                 .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
                 .when(props.italic, |d| d.italic())
                 .when(props.underline || is_link, |d| d.underline())
                 .when(props.strike, |d| d.line_through())
-                .when(props.highlight.is_some(), |d| d.bg(rgb(0x5b5b2a)))
+                .when(props.highlight.is_some(), |d| d.bg(rgb(0xfff29a)).text_color(rgb(0x333300)))
                 .into_any_element(),
         );
     }
 }
 
-fn emit_run(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, idx: &mut usize, caret: &mut Option<usize>) {
+fn emit_run(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, idx: &mut usize, caret: &mut Option<usize>, pal: Pal) {
     let len = text.chars().count();
     if let Some(off) = *caret {
         if off >= *idx && off <= *idx + len {
             let (a, b) = split_at_char(text, off - *idx);
-            emit_words(out, a, props, base, is_link);
+            emit_words(out, a, props, base, is_link, pal);
             out.push(caret_bar());
-            emit_words(out, b, props, base, is_link);
+            emit_words(out, b, props, base, is_link, pal);
             *caret = None;
             *idx += len;
             return;
         }
     }
-    emit_words(out, text, props, base, is_link);
+    emit_words(out, text, props, base, is_link, pal);
     *idx += len;
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>) -> AnyElement {
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, pal: Pal) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -506,17 +550,17 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>) -> AnyElement {
     let mut idx = 0usize;
     if p.props.num_id.is_some() {
         let marker = if p.props.ilvl % 2 == 1 { "\u{25E6} " } else { "\u{2022} " };
-        emit_words(&mut spans, marker, &RunProps::default(), base, false);
+        emit_words(&mut spans, marker, &RunProps::default(), base, false, pal);
     }
     for inline in &p.content {
         match inline {
-            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret),
+            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, pal),
             Inline::Hyperlink(h) => {
                 for r in &h.runs {
-                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret);
+                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, pal);
                 }
             }
-            Inline::Tab(_) => emit_run(&mut spans, "    ", &RunProps::default(), base, false, &mut idx, &mut caret),
+            Inline::Tab(_) => emit_run(&mut spans, "    ", &RunProps::default(), base, false, &mut idx, &mut caret, pal),
             Inline::Break(_) => spans.push(div().w_full().h(px(0.)).into_any_element()),
             other => {
                 let tag = match other {
@@ -527,7 +571,7 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>) -> AnyElement {
                     Inline::Field { .. } => "[field]",
                     _ => "[image]",
                 };
-                spans.push(div().px_1().rounded_sm().bg(rgb(PANEL)).text_size(px(12.)).text_color(rgb(DIM)).child(tag).into_any_element());
+                spans.push(div().px_1().rounded_sm().bg(pal.panel).text_size(px(12.)).text_color(pal.dim).child(tag).into_any_element());
             }
         }
     }
@@ -543,30 +587,30 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>) -> AnyElement {
     v_flex().w_full().py_0p5().when(is_heading, |d| d.mt_2()).child(row.children(spans)).into_any_element()
 }
 
-fn table_el(t: &Table) -> AnyElement {
+fn table_el(t: &Table, pal: Pal) -> AnyElement {
     let mut rows = Vec::new();
     for row in &t.rows {
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None)).collect();
-            cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(rgb(DIV)).children(inner).into_any_element());
+            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, pal)).collect();
+            cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(pal.border).children(inner).into_any_element());
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
     }
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block, caret: Option<usize>) -> AnyElement {
+fn block_el(b: &Block, caret: Option<usize>, pal: Pal) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p, caret),
-        Block::Table(t) => table_el(t),
+        Block::Paragraph(p) => paragraph_el(p, caret, pal),
+        Block::Table(t) => table_el(t, pal),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
 }
 
-// ---- ribbon + backstage rendering ------------------------------------------
+// ---- chrome: ribbon + backstage --------------------------------------------
 
-fn group_box(title: &'static str, buttons: Vec<Button>) -> AnyElement {
+fn group_box(title: &'static str, border: Hsla, dim: Hsla, buttons: Vec<Button>) -> AnyElement {
     v_flex()
         .items_center()
         .justify_between()
@@ -574,16 +618,16 @@ fn group_box(title: &'static str, buttons: Vec<Button>) -> AnyElement {
         .px_2()
         .gap_1()
         .border_r_1()
-        .border_color(rgb(DIV))
+        .border_color(border)
         .child(h_flex().flex_wrap().items_center().justify_center().gap(px(2.)).max_w(px(190.)).children(buttons))
-        .child(div().text_size(px(9.)).text_color(rgb(DIM)).child(title))
+        .child(div().text_size(px(9.)).text_color(dim).child(title))
         .into_any_element()
 }
 
 impl Docxy {
-    fn ribbon_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let names = ["File", "Home", "Styles", "Insert", "Review", "View"];
-        let mut strip = h_flex().w_full().items_end().gap_1().px_2().pt_1().bg(rgb(RIBBON));
+        let mut strip = h_flex().w_full().items_end().gap_1().px_2().pt_1().bg(panel);
         for (i, name) in names.iter().enumerate() {
             let is_file = i == 0;
             let this_tab = match i {
@@ -602,13 +646,14 @@ impl Docxy {
                     .py_1()
                     .cursor_pointer()
                     .text_size(px(12.))
-                    .when(is_file, |d| d.bg(rgb(ACCENT)).text_color(rgb(0x102b26)).font_weight(FontWeight::BOLD).rounded_t_sm())
-                    .when(active, |d| d.text_color(rgb(ACCENT)).border_b_2().border_color(rgb(ACCENT)))
-                    .when(!active && !is_file, |d| d.text_color(rgb(FG)))
+                    .when(is_file, |d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)).font_weight(FontWeight::BOLD).rounded_t_sm())
+                    .when(active, |d| d.text_color(rgb(BRAND)).border_b_2().border_color(rgb(BRAND)))
+                    .when(!active && !is_file, |d| d.text_color(fg))
                     .child(*name)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_file {
                             this.backstage = true;
+                            this.bs_new = false;
                             cx.notify();
                         } else if let Some(t) = this_tab {
                             this.ribbon_tab = t;
@@ -617,18 +662,20 @@ impl Docxy {
                     })),
             );
         }
+        let _ = dim;
         strip.into_any_element()
     }
 
-    fn ribbon_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn ribbon_body(&self, border: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let gb = |title, btns| group_box(title, border, dim, btns);
         let groups: Vec<AnyElement> = match self.ribbon_tab {
             RibbonTab::Home => vec![
-                group_box("Clipboard", vec![
+                gb("Clipboard", vec![
                     abtn(cx, "cut", "\u{2702} Cut", |t, w, cx| t.do_copy(true, w, cx)),
                     abtn(cx, "copy", "\u{29C9} Copy", |t, w, cx| t.do_copy(false, w, cx)),
                     abtn(cx, "paste", "\u{1F4CB} Paste", |t, w, cx| t.do_paste(w, cx)),
                 ]),
-                group_box("Font", vec![
+                gb("Font", vec![
                     rbtn(cx, "b", "B", |e| e.toggle_bold()),
                     rbtn(cx, "i", "I", |e| e.toggle_italic()),
                     rbtn(cx, "u", "U", |e| e.toggle_underline()),
@@ -636,7 +683,7 @@ impl Docxy {
                     rbtn(cx, "grow", "A+", |e| e.resize_font(2)),
                     rbtn(cx, "shr", "A\u{2212}", |e| e.resize_font(-2)),
                 ]),
-                group_box("Paragraph", vec![
+                gb("Paragraph", vec![
                     rbtn(cx, "al", "\u{2637}L", |e| e.set_align(Align::Left)),
                     rbtn(cx, "ac", "\u{2637}C", |e| e.set_align(Align::Center)),
                     rbtn(cx, "ar", "\u{2637}R", |e| e.set_align(Align::Right)),
@@ -644,7 +691,7 @@ impl Docxy {
                     rbtn(cx, "ind", "\u{2192}|", |e| e.change_indent(1)),
                     rbtn(cx, "out", "|\u{2190}", |e| e.change_indent(-1)),
                 ]),
-                group_box("Editing", vec![
+                gb("Editing", vec![
                     rbtn(cx, "undo", "\u{21B6}", |e| {
                         e.undo();
                     }),
@@ -653,29 +700,29 @@ impl Docxy {
                     }),
                 ]),
             ],
-            RibbonTab::Styles => vec![group_box("Styles", vec![
+            RibbonTab::Styles => vec![gb("Styles", vec![
                 rbtn(cx, "normal", "\u{00b6} Normal", |e| e.set_para_style(None)),
                 rbtn(cx, "h1", "Heading 1", |e| e.set_para_style(Some("Heading1"))),
                 rbtn(cx, "h2", "Heading 2", |e| e.set_para_style(Some("Heading2"))),
                 rbtn(cx, "h3", "Heading 3", |e| e.set_para_style(Some("Heading3"))),
             ])],
-            RibbonTab::Insert => vec![group_box("Symbols", vec![
+            RibbonTab::Insert => vec![gb("Symbols", vec![
                 rbtn(cx, "hr", "\u{2015} Horizontal rule", |e| e.insert_hrule()),
                 rbtn(cx, "para", "\u{00b6} Paragraph", |e| e.insert_newline()),
             ])],
-            RibbonTab::Review => vec![group_box("Editing", vec![
+            RibbonTab::Review => vec![gb("Editing", vec![
                 rbtn(cx, "selall", "Select all", |e| e.select_all()),
                 rbtn(cx, "case", "Aa Case", |e| e.cycle_case()),
             ])],
-            RibbonTab::View => vec![group_box("Show", vec![abtn(cx, "backstage2", "File \u{2026}", |t, _w, cx| {
+            RibbonTab::View => vec![gb("File", vec![abtn(cx, "backstage2", "Backstage \u{2026}", |t, _w, cx| {
                 t.backstage = true;
                 cx.notify();
             })])],
         };
-        h_flex().w_full().h(px(76.)).items_stretch().px_1().bg(rgb(RIBBON)).border_b_1().border_color(rgb(DIV)).children(groups).into_any_element()
+        h_flex().w_full().h(px(76.)).items_stretch().px_1().bg(panel).border_b_1().border_color(border).children(groups).into_any_element()
     }
 
-    fn backstage_view(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn backstage_view(&self, bg: Hsla, fg: Hsla, dim: Hsla, sidebar: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let rail_item = |cx: &mut Context<Self>, id: &'static str, label: &'static str, f: fn(&mut Docxy, &mut Window, &mut Context<Docxy>)| {
             div()
                 .id(id)
@@ -684,144 +731,242 @@ impl Docxy {
                 .py_2()
                 .cursor_pointer()
                 .rounded_sm()
-                .text_color(rgb(FG))
-                .hover(|d| d.bg(rgb(0x3f3f46)))
+                .text_color(fg)
+                .hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| f(this, window, cx)))
         };
-
-        let active = self.tabs.get(self.active);
-        let (cur_title, cur_path) = active
-            .map(|t| (t.title.to_string(), t.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not saved yet".into())))
-            .unwrap_or_else(|| ("—".into(), "".into()));
-
-        let recents: Vec<AnyElement> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                div()
-                    .id(("recent", i))
-                    .w_full()
-                    .px_3()
-                    .py_1p5()
-                    .cursor_pointer()
-                    .rounded_sm()
-                    .text_color(rgb(FG))
-                    .hover(|d| d.bg(rgb(0x2d2d30)))
-                    .child(format!("{} {}", t.kind.glyph(), t.title))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.backstage = false;
-                        this.select_tab(i, window, cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect();
 
         let rail = v_flex()
             .w(px(220.))
             .h_full()
             .py_3()
             .gap_1()
-            .bg(rgb(RAIL))
+            .bg(sidebar)
             .child(
                 div()
                     .id("bs-back")
                     .px_4()
                     .py_2()
                     .cursor_pointer()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(BRAND))
                     .child("\u{2190} Back")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.backstage = false;
+                        this.bs_new = false;
                         this.refocus(window, cx);
                     })),
             )
-            .child(rail_item(cx, "new", "New", |t, w, cx| t.add_tab(Kind::Docx, w, cx)))
-            .child(rail_item(cx, "open", "Open\u{2026}", |t, w, cx| t.open_file(w, cx)))
-            .child(rail_item(cx, "save", "Save", |t, w, cx| t.save_active(w, cx)))
-            .child(rail_item(cx, "saveas", "Save As\u{2026}", |t, w, cx| t.save_as(w, cx)))
-            .child(rail_item(cx, "close", "Close", |t, w, cx| {
+            .child(
+                div()
+                    .id("bs-new")
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .text_color(fg)
+                    .hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
+                    .child("New")
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.bs_new = true;
+                        cx.notify();
+                    })),
+            )
+            .child(rail_item(cx, "bs-open", "Open\u{2026}", |t, w, cx| t.open_file(w, cx)))
+            .child(rail_item(cx, "bs-save", "Save", |t, w, cx| t.save_active(w, cx)))
+            .child(rail_item(cx, "bs-saveas", "Save As\u{2026}", |t, w, cx| t.save_as(w, cx)))
+            .child(rail_item(cx, "bs-close", "Close", |t, w, cx| {
                 let a = t.active;
                 t.backstage = false;
                 t.close_tab(a, w, cx);
             }));
 
-        let pane = v_flex()
-            .flex_1()
-            .h_full()
-            .p_8()
-            .gap_4()
-            .bg(rgb(BG))
-            .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(rgb(FG)).child(cur_title))
-            .child(div().text_size(px(12.)).text_color(rgb(DIM)).child(cur_path))
-            .child(div().text_size(px(13.)).text_color(rgb(ACCENT)).mt_4().child("Open"))
-            .child(v_flex().gap_0p5().children(recents));
+        let pane = if self.bs_new {
+            let card = |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, name: &'static str, sub: &'static str, kind: Kind| {
+                v_flex()
+                    .id(id)
+                    .w(px(150.))
+                    .h(px(160.))
+                    .p_3()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(dim)
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(rgb(BRAND)))
+                    .child(div().text_size(px(40.)).child(glyph))
+                    .child(div().text_color(fg).font_weight(FontWeight::BOLD).child(name))
+                    .child(div().text_size(px(11.)).text_color(dim).child(sub))
+                    .on_click(cx.listener(move |this, _, window, cx| this.add_tab(kind, window, cx)))
+            };
+            v_flex()
+                .flex_1()
+                .h_full()
+                .p_8()
+                .gap_4()
+                .bg(bg)
+                .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(fg).child("New"))
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(card(cx, "new-doc-card", Kind::Docx.glyph(), "Document", "Blank .docx", Kind::Docx))
+                        .child(card(cx, "new-xls-card", Kind::Xlsx.glyph(), "Spreadsheet", "Blank .xlsx", Kind::Xlsx))
+                        .child(card(cx, "new-mail-card", Kind::Look.glyph(), "Mail", "New message", Kind::Look)),
+                )
+                .into_any_element()
+        } else {
+            let active = self.tabs.get(self.active);
+            let (cur_title, cur_path) = active
+                .map(|t| (t.title.to_string(), t.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not saved yet".into())))
+                .unwrap_or_else(|| ("—".into(), "".into()));
+            let recents: Vec<AnyElement> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    div()
+                        .id(("recent", i))
+                        .px_3()
+                        .py_1p5()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .text_color(fg)
+                        .hover(|d| d.bg(sidebar))
+                        .child(format!("{} {}", t.kind.glyph(), t.title))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.backstage = false;
+                            this.select_tab(i, window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            v_flex()
+                .flex_1()
+                .h_full()
+                .p_8()
+                .gap_4()
+                .bg(bg)
+                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(fg).child(cur_title))
+                .child(div().text_size(px(12.)).text_color(dim).child(cur_path))
+                .child(div().text_size(px(13.)).text_color(rgb(BRAND)).mt_4().child("Open"))
+                .child(v_flex().gap_0p5().children(recents))
+                .into_any_element()
+        };
 
-        h_flex().size_full().child(rail).child(pane).into_any_element()
+        h_flex().size_full().bg(bg).child(rail).child(pane).into_any_element()
     }
 }
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Apply the theme choice (Auto follows the OS appearance).
+        let desired = match self.theme_pref {
+            ThemePref::Auto => ThemeMode::from(window.appearance()),
+            ThemePref::Light => ThemeMode::Light,
+            ThemePref::Dark => ThemeMode::Dark,
+        };
+        if self.applied != Some(desired) {
+            Theme::change(desired, Some(window), cx);
+            self.applied = Some(desired);
+        }
         if !self.focused {
             self.focus.focus(window, cx);
             self.focused = true;
         }
 
-        let new_btn = |id: &'static str, label: &'static str, kind: Kind| {
-            Button::new(id).small().ghost().label(label).on_click(cx.listener(move |this, _, window, cx| this.add_tab(kind, window, cx)))
-        };
+        let t = cx.theme();
+        let bg = t.background;
+        let fg = t.foreground;
+        let dim = t.muted_foreground;
+        let border = t.border;
+        let panel = t.secondary;
+        let sidebar = t.sidebar;
+        let tab_active = t.tab_active;
+        let pal = Pal { fg, dim, border, panel };
+
+        // --- title bar: wordmark + document tab chips + theme toggle ---
+        let theme_pref = self.theme_pref;
+        let chips: Vec<AnyElement> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tb)| {
+                let active = i == self.active && !self.backstage;
+                let mark = if tb.dirty { " \u{2022}" } else { "" };
+                h_flex()
+                    .id(("chip", i))
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(24.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .when(active, |d| d.bg(tab_active).text_color(fg))
+                    .when(!active, |d| d.text_color(dim))
+                    .child(SharedString::from(format!("{} {}{}", tb.kind.glyph(), tb.title, mark)))
+                    .child(
+                        div()
+                            .id(("chipx", i))
+                            .px_1()
+                            .rounded_sm()
+                            .hover(|d| d.bg(border))
+                            .child("\u{00d7}")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(i, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_tab(i, window, cx)))
+                    .into_any_element()
+            })
+            .collect();
+
         let title_bar = TitleBar::new().child(
             h_flex()
+                .w_full()
                 .items_center()
                 .gap_2()
                 .pl_2()
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("docxy"))
-                .child(new_btn("new-doc", "+ Doc", Kind::Docx))
-                .child(new_btn("new-sheet", "+ Sheet", Kind::Xlsx))
-                .child(new_btn("new-mail", "+ Mail", Kind::Look)),
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(BRAND)).child("docxy"))
+                .child(h_flex().items_center().gap_1().children(chips))
+                .child(div().flex_1())
+                .child(
+                    Button::new("theme").ghost().xsmall().label(theme_pref.label()).on_click(cx.listener(|this, _, window, cx| this.cycle_theme(window, cx))),
+                ),
         );
 
         if self.backstage {
-            let backstage = self.backstage_view(cx);
-            return v_flex().size_full().bg(rgb(BG)).track_focus(&self.focus).child(title_bar).child(backstage).into_any_element();
+            let backstage = self.backstage_view(bg, fg, dim, sidebar, cx);
+            return v_flex().size_full().bg(bg).track_focus(&self.focus).child(title_bar).child(backstage).into_any_element();
         }
 
         let is_doc = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)));
-        let ribbon_tabs = self.ribbon_tabs(cx);
-        let ribbon_body = is_doc.then(|| self.ribbon_body(cx));
-
-        let doc_tabs = self.tabs.iter().enumerate().map(|(i, t)| {
-            let mark = if t.dirty { " \u{2022}" } else { "" };
-            let label = format!("{} {}{}", t.kind.glyph(), t.title, mark);
-            Tab::new().child(label).suffix(Button::new(("close", i)).xsmall().ghost().label("\u{00d7}").on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.close_tab(i, window, cx);
-            })))
-        });
-        let tab_bar = TabBar::new("docxy-tabs").w_full().selected_index(self.active).children(doc_tabs).on_click(cx.listener(|this, ix: &usize, window, cx| this.select_tab(*ix, window, cx)));
+        let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
+        let ribbon_body = is_doc.then(|| self.ribbon_body(border, dim, panel, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
-            Some(t) => match &t.surface {
+            Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
                     let caret_block = (editor.caret.path.len() == 1).then_some(editor.caret.path[0]);
                     let off = editor.caret.offset;
-                    let blocks: Vec<AnyElement> = editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, (Some(i) == caret_block).then_some(off))).collect();
-                    v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(rgb(BG)).text_color(rgb(FG)).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
+                    let blocks: Vec<AnyElement> = editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, (Some(i) == caret_block).then_some(off), pal)).collect();
+                    v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                 }
-                Surface::Placeholder => placeholder(t.kind).into_any_element(),
+                Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
-            None => v_flex().flex_1().bg(rgb(BG)).items_center().justify_center().text_color(rgb(DIM)).child("No documents — use + Doc / + Sheet / + Mail").into_any_element(),
+            None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
         };
 
         let status = h_flex()
             .w_full()
             .px_4()
             .py_1()
-            .bg(rgb(PANEL))
+            .bg(panel)
             .text_size(px(11.))
-            .text_color(rgb(DIM))
+            .text_color(dim)
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
             .child(div().flex_1())
             .child("type · Ctrl+B/I/U · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
@@ -830,18 +975,17 @@ impl Render for Docxy {
             .size_full()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            .bg(rgb(BG))
+            .bg(bg)
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
-            .child(tab_bar)
             .child(content)
             .child(status)
             .into_any_element()
     }
 }
 
-fn placeholder(kind: Kind) -> impl IntoElement {
+fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
     let (name, blurb) = match kind {
         Kind::Xlsx => ("xlsxy", "the spreadsheet grid (gridcore) lands here next"),
         Kind::Look => ("lookxy", "mail list + reading pane (mailcore) lands here next"),
@@ -849,12 +993,12 @@ fn placeholder(kind: Kind) -> impl IntoElement {
     };
     v_flex()
         .flex_1()
-        .bg(rgb(BG))
+        .bg(bg)
         .items_center()
         .justify_center()
         .gap_2()
-        .child(div().text_color(rgb(ACCENT)).font_weight(FontWeight::BOLD).text_size(px(20.)).child(name))
-        .child(div().text_color(rgb(DIM)).child(blurb))
+        .child(div().text_color(rgb(BRAND)).font_weight(FontWeight::BOLD).text_size(px(20.)).child(name))
+        .child(div().text_color(dim).child(blurb))
 }
 
 fn main() {
