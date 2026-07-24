@@ -8,8 +8,11 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+# The app is branded "docxy" (shown in the UI), but the produced executable is
+# `suite.exe` so it never collides with the existing terminal `docxy` binary in
+# the root workspace.
 [[bin]]
-name = "docxy"
+name = "suite"
 path = "src/main.rs"
 
 [dependencies]
