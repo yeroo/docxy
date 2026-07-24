@@ -1549,6 +1549,8 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "rfd",
+ "ribbonspec",
+ "rust-embed",
  "serde",
  "serde_json",
 ]
@@ -5490,6 +5492,10 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "ribbonspec"
+version = "0.4.0"
 
 [[package]]
 name = "ring"

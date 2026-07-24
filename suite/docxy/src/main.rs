@@ -20,7 +20,36 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex, v_flex,
 };
+use ribbonspec::{self as rs, Control};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+// ---- assets: bundle our MIT Fluent icons + gpui-component's own assets -------
+
+#[derive(RustEmbed)]
+#[folder = "assets/icons"]
+#[prefix = "icons/"]
+struct Icons;
+
+/// Serves our embedded Fluent icon SVGs (`icons/*.svg`), falling back to
+/// gpui-component's bundled assets for everything else.
+struct DocxyAssets;
+impl AssetSource for DocxyAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if let Some(f) = Icons::get(path) {
+            return Ok(Some(f.data));
+        }
+        gpui_component_assets::Assets.load(path)
+    }
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        gpui_component_assets::Assets.list(path)
+    }
+}
+
+fn icon_svg(name: &str, size: f32, color: Hsla) -> Svg {
+    svg().path(SharedString::from(format!("icons/{name}.svg"))).size(px(size)).text_color(color).flex_none()
+}
 
 // ---- session model ---------------------------------------------------------
 
@@ -132,6 +161,7 @@ struct Pal {
     dim: Hsla,
     border: Hsla,
     panel: Hsla,
+    hover: Hsla,
 }
 
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
@@ -447,12 +477,75 @@ fn no(mut f: impl FnMut()) -> bool {
     false
 }
 
-fn rbtn(cx: &mut Context<Docxy>, id: &'static str, label: &'static str, op: impl Fn(&mut Editor) + 'static) -> Button {
-    Button::new(id).ghost().xsmall().label(label).on_click(cx.listener(move |this, _, window, cx| this.with_editor(window, cx, |e| op(e))))
+// ---- the ribbon, defined once via ribbonspec (shared model) ----------------
+
+#[derive(Clone, Copy)]
+enum Act {
+    Bold, Italic, Underline, Strike, Grow, Shrink,
+    AlignL, AlignC, AlignR, AlignJ,
+    Cut, Copy, Paste, Undo, Redo,
+    Normal, H1, H2, H3, HRule, SelectAll, Case,
 }
 
-fn abtn(cx: &mut Context<Docxy>, id: &'static str, label: &'static str, f: impl Fn(&mut Docxy, &mut Window, &mut Context<Docxy>) + 'static) -> Button {
-    Button::new(id).ghost().xsmall().label(label).on_click(cx.listener(move |this, _, window, cx| f(this, window, cx)))
+/// A command with a Fluent icon id + ScreenTip (title = label, + shortcut).
+fn cmdt(id: &'static str, icon: &'static str, label: &'static str, act: Act, shortcut: &'static str) -> rs::Cmd<Act> {
+    rs::cmd(id, icon, label, act).tip(label, "", shortcut)
+}
+
+fn docxy_ribbon() -> rs::Ribbon<Act> {
+    use Act::*;
+    rs::Ribbon::new(vec![
+        rs::tab("Home", "H", vec![
+            rs::group("Clipboard", 10, vec![rs::column(vec![
+                cmdt("cut", "cut", "Cut", Cut, "Ctrl+X"),
+                cmdt("copy", "copy", "Copy", Copy, "Ctrl+C"),
+                cmdt("paste", "paste", "Paste", Paste, "Ctrl+V"),
+            ])]),
+            rs::group("Font", 40, vec![
+                cmdt("b", "bold", "Bold", Bold, "Ctrl+B").toggle(),
+                cmdt("i", "italic", "Italic", Italic, "Ctrl+I").toggle(),
+                cmdt("u", "underline", "Underline", Underline, "Ctrl+U").toggle(),
+                cmdt("s", "strikethrough", "Strikethrough", Strike, "").toggle(),
+                Control::Separator,
+                cmdt("grow", "font-increase", "Grow font", Grow, "").toggle(),
+                cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").toggle(),
+            ]),
+            rs::group("Paragraph", 30, vec![
+                cmdt("al", "align-left", "Align left", AlignL, "").toggle(),
+                cmdt("ac", "align-center", "Center", AlignC, "").toggle(),
+                cmdt("ar", "align-right", "Align right", AlignR, "").toggle(),
+                cmdt("aj", "align-justify", "Justify", AlignJ, "").toggle(),
+            ]),
+            rs::group("Editing", 20, vec![
+                cmdt("undo", "undo", "Undo", Undo, "Ctrl+Z").toggle(),
+                cmdt("redo", "redo", "Redo", Redo, "Ctrl+Y").toggle(),
+            ]),
+        ]),
+        rs::tab("Styles", "S", vec![rs::group("Styles", 40, vec![rs::column(vec![
+            cmdt("normal", "paragraph", "Normal", Normal, ""),
+            cmdt("h1", "heading-1", "Heading 1", H1, ""),
+            cmdt("h2", "heading-2", "Heading 2", H2, ""),
+            cmdt("h3", "heading-3", "Heading 3", H3, ""),
+        ])])]),
+        rs::tab("Insert", "N", vec![rs::group("Symbols", 40, vec![rs::column(vec![
+            cmdt("hr", "rule", "Horizontal rule", HRule, ""),
+        ])])]),
+        rs::tab("Review", "R", vec![rs::group("Editing", 40, vec![rs::column(vec![
+            cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
+            cmdt("case", "case", "Change case", Case, ""),
+        ])])]),
+        rs::tab("View", "W", vec![]),
+    ])
+}
+
+fn ribbon_tab_index(t: RibbonTab) -> usize {
+    match t {
+        RibbonTab::Home => 0,
+        RibbonTab::Styles => 1,
+        RibbonTab::Insert => 2,
+        RibbonTab::Review => 3,
+        RibbonTab::View => 4,
+    }
 }
 
 fn move_vert(ed: &mut Editor, down: bool) {
@@ -610,20 +703,6 @@ fn block_el(b: &Block, caret: Option<usize>, pal: Pal) -> AnyElement {
 
 // ---- chrome: ribbon + backstage --------------------------------------------
 
-fn group_box(title: &'static str, border: Hsla, dim: Hsla, buttons: Vec<Button>) -> AnyElement {
-    v_flex()
-        .items_center()
-        .justify_between()
-        .h_full()
-        .px_2()
-        .gap_1()
-        .border_r_1()
-        .border_color(border)
-        .child(h_flex().flex_wrap().items_center().justify_center().gap(px(2.)).max_w(px(190.)).children(buttons))
-        .child(div().text_size(px(9.)).text_color(dim).child(title))
-        .into_any_element()
-}
-
 impl Docxy {
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let names = ["File", "Home", "Styles", "Insert", "Review", "View"];
@@ -666,60 +745,95 @@ impl Docxy {
         strip.into_any_element()
     }
 
-    fn ribbon_body(&self, border: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        let gb = |title, btns| group_box(title, border, dim, btns);
-        let groups: Vec<AnyElement> = match self.ribbon_tab {
-            RibbonTab::Home => vec![
-                gb("Clipboard", vec![
-                    abtn(cx, "cut", "\u{2702} Cut", |t, w, cx| t.do_copy(true, w, cx)),
-                    abtn(cx, "copy", "\u{29C9} Copy", |t, w, cx| t.do_copy(false, w, cx)),
-                    abtn(cx, "paste", "\u{1F4CB} Paste", |t, w, cx| t.do_paste(w, cx)),
-                ]),
-                gb("Font", vec![
-                    rbtn(cx, "b", "B", |e| e.toggle_bold()),
-                    rbtn(cx, "i", "I", |e| e.toggle_italic()),
-                    rbtn(cx, "u", "U", |e| e.toggle_underline()),
-                    rbtn(cx, "s", "S", |e| e.toggle_strike()),
-                    rbtn(cx, "grow", "A+", |e| e.resize_font(2)),
-                    rbtn(cx, "shr", "A\u{2212}", |e| e.resize_font(-2)),
-                ]),
-                gb("Paragraph", vec![
-                    rbtn(cx, "al", "\u{2637}L", |e| e.set_align(Align::Left)),
-                    rbtn(cx, "ac", "\u{2637}C", |e| e.set_align(Align::Center)),
-                    rbtn(cx, "ar", "\u{2637}R", |e| e.set_align(Align::Right)),
-                    rbtn(cx, "aj", "\u{2637}J", |e| e.set_align(Align::Justify)),
-                    rbtn(cx, "ind", "\u{2192}|", |e| e.change_indent(1)),
-                    rbtn(cx, "out", "|\u{2190}", |e| e.change_indent(-1)),
-                ]),
-                gb("Editing", vec![
-                    rbtn(cx, "undo", "\u{21B6}", |e| {
-                        e.undo();
-                    }),
-                    rbtn(cx, "redo", "\u{21B7}", |e| {
-                        e.redo();
-                    }),
-                ]),
-            ],
-            RibbonTab::Styles => vec![gb("Styles", vec![
-                rbtn(cx, "normal", "\u{00b6} Normal", |e| e.set_para_style(None)),
-                rbtn(cx, "h1", "Heading 1", |e| e.set_para_style(Some("Heading1"))),
-                rbtn(cx, "h2", "Heading 2", |e| e.set_para_style(Some("Heading2"))),
-                rbtn(cx, "h3", "Heading 3", |e| e.set_para_style(Some("Heading3"))),
-            ])],
-            RibbonTab::Insert => vec![gb("Symbols", vec![
-                rbtn(cx, "hr", "\u{2015} Horizontal rule", |e| e.insert_hrule()),
-                rbtn(cx, "para", "\u{00b6} Paragraph", |e| e.insert_newline()),
-            ])],
-            RibbonTab::Review => vec![gb("Editing", vec![
-                rbtn(cx, "selall", "Select all", |e| e.select_all()),
-                rbtn(cx, "case", "Aa Case", |e| e.cycle_case()),
-            ])],
-            RibbonTab::View => vec![gb("File", vec![abtn(cx, "backstage2", "Backstage \u{2026}", |t, _w, cx| {
-                t.backstage = true;
-                cx.notify();
-            })])],
-        };
-        h_flex().w_full().h(px(76.)).items_stretch().px_1().bg(panel).border_b_1().border_color(border).children(groups).into_any_element()
+    /// Dispatch a ribbon command to the engine / app, then refocus the document.
+    fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        use Act::*;
+        match act {
+            Cut => self.do_copy(true, window, cx),
+            Copy => self.do_copy(false, window, cx),
+            Paste => self.do_paste(window, cx),
+            _ => self.with_editor(window, cx, |e| match act {
+                Bold => e.toggle_bold(),
+                Italic => e.toggle_italic(),
+                Underline => e.toggle_underline(),
+                Strike => e.toggle_strike(),
+                Grow => e.resize_font(2),
+                Shrink => e.resize_font(-2),
+                AlignL => e.set_align(Align::Left),
+                AlignC => e.set_align(Align::Center),
+                AlignR => e.set_align(Align::Right),
+                AlignJ => e.set_align(Align::Justify),
+                Undo => {
+                    e.undo();
+                }
+                Redo => {
+                    e.redo();
+                }
+                Normal => e.set_para_style(None),
+                H1 => e.set_para_style(Some("Heading1")),
+                H2 => e.set_para_style(Some("Heading2")),
+                H3 => e.set_para_style(Some("Heading3")),
+                HRule => e.insert_hrule(),
+                SelectAll => e.select_all(),
+                Case => e.cycle_case(),
+                Cut | Copy | Paste => {}
+            }),
+        }
+    }
+
+    /// The ribbon body for the active tab, rendered from the shared ribbonspec
+    /// model with Fluent icons.
+    fn ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ribbon = docxy_ribbon();
+        let tab = &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)];
+        let groups: Vec<AnyElement> = tab.groups.iter().map(|g| self.render_group(g, pal, cx)).collect();
+        h_flex().w_full().h(px(84.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
+    }
+
+    fn render_group(&self, g: &rs::Group<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, pal, cx)).collect();
+        v_flex()
+            .items_center()
+            .justify_between()
+            .h_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_r_1()
+            .border_color(pal.border)
+            .child(h_flex().items_start().gap_1().children(controls))
+            .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
+            .into_any_element()
+    }
+
+    fn render_control(&self, c: &Control<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        match c {
+            Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
+            Control::Large(cmd) => self.icon_btn(cmd, true, pal, cx),
+            Control::Column(cmds) => {
+                v_flex().gap(px(1.)).children(cmds.iter().map(|cm| self.icon_btn(cm, true, pal, cx))).into_any_element()
+            }
+            Control::Separator => div().w(px(1.)).h(px(44.)).bg(pal.border).mx_1().into_any_element(),
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn icon_btn(&self, cmd: &rs::Cmd<Act>, show_label: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let act = cmd.act;
+        div()
+            .id(cmd.id)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .h(px(24.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .child(icon_svg(cmd.icon.0, 16., pal.fg))
+            .when(show_label, |d| d.child(div().text_size(px(12.)).text_color(pal.fg).child(SharedString::from(cmd.label))))
+            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .into_any_element()
     }
 
     fn backstage_view(&self, bg: Hsla, fg: Hsla, dim: Hsla, sidebar: Hsla, cx: &mut Context<Self>) -> AnyElement {
@@ -883,7 +997,8 @@ impl Render for Docxy {
         let panel = t.secondary;
         let sidebar = t.sidebar;
         let tab_active = t.tab_active;
-        let pal = Pal { fg, dim, border, panel };
+        let accent = t.accent;
+        let pal = Pal { fg, dim, border, panel, hover: accent };
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
@@ -945,7 +1060,7 @@ impl Render for Docxy {
 
         let is_doc = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(_)));
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        let ribbon_body = is_doc.then(|| self.ribbon_body(border, dim, panel, cx));
+        let ribbon_body = is_doc.then(|| self.ribbon_body(pal, cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
@@ -1002,7 +1117,7 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
 }
 
 fn main() {
-    gpui_platform::application().with_assets(gpui_component_assets::Assets).run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = WindowOptions {
