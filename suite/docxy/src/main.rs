@@ -102,6 +102,12 @@ struct PersistTab {
     kind: Kind,
     title: String,
     path: Option<String>,
+    #[serde(default)]
+    dirty: bool,
+    /// Hot-exit sidecar `.docx` holding this tab's current (possibly unsaved)
+    /// content. Restored in preference to `path` so edits survive a restart.
+    #[serde(default)]
+    hot: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -205,6 +211,20 @@ fn file_name(path: &PathBuf) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled.docx".into())
 }
 
+/// Directory holding the hot-exit sidecars — one `.docx` per open Doc tab, kept in
+/// sync on each persist so unsaved edits survive a restart.
+fn hot_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("docxy").join("hot")
+}
+
+/// Serialize a document to `.docx` bytes, adding a numbering part when it uses
+/// lists (so markers survive the round-trip and open correctly in Word).
+fn doc_to_docx(doc: &Document) -> Vec<u8> {
+    let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+    let pkg = if has_list { docxcore::package::new_markdown_package(doc.clone()) } else { docxcore::package::new_package(doc.clone()) };
+    docxcore::package::save_package(&pkg)
+}
+
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
         let session: Session = std::fs::read(session_path())
@@ -215,8 +235,17 @@ impl Docxy {
         let mut tabs = Vec::new();
         for t in &session.tabs {
             let path = t.path.as_ref().map(PathBuf::from);
-            let (surface, status) = build_surface(t.kind, path.as_ref());
-            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: false, status });
+            // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
+            // back to the real file on disk, then to an empty doc.
+            let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
+            let (surface, status) = match (t.kind, &hot) {
+                (Kind::Docx, Some(hp)) => {
+                    let (doc, _) = doc_from_path(hp);
+                    (Surface::Doc(Editor::new(doc)), if t.dirty { "unsaved — restored".into() } else { "loaded".into() })
+                }
+                _ => build_surface(t.kind, path.as_ref()),
+            };
+            tabs.push(DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status });
         }
         if tabs.is_empty() {
             tabs.push(DocTab {
@@ -247,13 +276,28 @@ impl Docxy {
     }
 
     fn persist(&self) {
+        let hd = hot_dir();
+        let _ = std::fs::create_dir_all(&hd);
         let tabs = self
             .tabs
             .iter()
-            .map(|t| PersistTab {
-                kind: t.kind,
-                title: t.title.to_string(),
-                path: t.path.as_ref().map(|p| p.display().to_string()),
+            .enumerate()
+            .map(|(i, t)| {
+                // Write the tab's live content to a sidecar so unsaved edits are
+                // held across a restart (closing never prompts to save).
+                let hot = if let Surface::Doc(ed) = &t.surface {
+                    let p = hd.join(format!("tab-{i}.docx"));
+                    std::fs::write(&p, doc_to_docx(&ed.doc)).ok().map(|_| p.display().to_string())
+                } else {
+                    None
+                };
+                PersistTab {
+                    kind: t.kind,
+                    title: t.title.to_string(),
+                    path: t.path.as_ref().map(|p| p.display().to_string()),
+                    dirty: t.dirty,
+                    hot,
+                }
             })
             .collect();
         let session = Session { tabs, active: self.active, theme: self.theme_pref };
@@ -324,13 +368,7 @@ impl Docxy {
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
-        let doc = editor.doc.clone();
-        // When the document uses lists, save with a package that defines the
-        // numbering part (numId 1 = bullets, 2 = decimal) so markers survive the
-        // round-trip and open correctly in Word.
-        let has_list = doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-        let pkg = if has_list { docxcore::package::new_markdown_package(doc) } else { docxcore::package::new_package(doc) };
-        let bytes = docxcore::package::save_package(&pkg);
+        let bytes = doc_to_docx(&editor.doc);
         let path = tab
             .path
             .clone()
@@ -1434,6 +1472,14 @@ fn main() {
         };
         cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| Docxy::new(cx));
+            // Hot-exit: capture the latest (possibly unsaved) content when the
+            // window is closed, so a restart restores exactly what was open — no
+            // save prompt.
+            let on_close = view.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                on_close.update(cx, |this, _| this.persist());
+                true
+            });
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("failed to open docxy window");
