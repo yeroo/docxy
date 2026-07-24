@@ -1519,7 +1519,9 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     let mut w: f32 = 22.0;
     for c in &g.items {
         w += match c {
-            Control::Toggle(_) => 30.0,
+            // Toggles stack 3-high into columns, so each contributes ~a third of a
+            // ~30px column's width.
+            Control::Toggle(_) => 11.0,
             Control::Large(_) => {
                 if icon_only {
                     32.0
@@ -2139,8 +2141,37 @@ impl Docxy {
         h_flex().w_full().h(px(98.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
+    /// Pack a run of small toggle buttons into columns of up to 3 (the ribbon body
+    /// is three small-button rows tall), so they read as a compact grid instead of
+    /// one long horizontal strip — the Office ribbon placement rule for the small
+    /// buttons in a group.
+    fn toggle_grid(&self, cmds: &[&rs::Cmd<Act>], pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let cols: Vec<AnyElement> = cmds
+            .chunks(3)
+            .map(|chunk| v_flex().gap(px(1.)).children(chunk.iter().map(|cm| self.icon_btn(cm, false, pal, cx))).into_any_element())
+            .collect();
+        h_flex().items_start().gap(px(1.)).children(cols).into_any_element()
+    }
+
     fn render_group(&self, g: &rs::Group<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, icon_only, pal, cx)).collect();
+        // Collect consecutive small toggle buttons and lay them out as a column
+        // grid; render every other control (Large / Column / Separator) inline.
+        let mut controls: Vec<AnyElement> = Vec::new();
+        let mut run: Vec<&rs::Cmd<Act>> = Vec::new();
+        for c in &g.items {
+            if let Control::Toggle(cmd) = c {
+                run.push(cmd);
+            } else {
+                if !run.is_empty() {
+                    controls.push(self.toggle_grid(&run, pal, cx));
+                    run.clear();
+                }
+                controls.push(self.render_control(c, icon_only, pal, cx));
+            }
+        }
+        if !run.is_empty() {
+            controls.push(self.toggle_grid(&run, pal, cx));
+        }
         // group title row + optional dialog-box launcher (⤢)
         let title_row = h_flex()
             .items_center()
