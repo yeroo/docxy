@@ -165,6 +165,7 @@ struct Pal {
     border: Hsla,
     panel: Hsla,
     hover: Hsla,
+    sel: Hsla,
 }
 
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
@@ -430,6 +431,17 @@ impl Docxy {
         }
         let shift = m.shift;
         let Some(ed) = self.active_editor() else { return };
+        if key == "escape" {
+            ed.clear_selection();
+            cx.notify();
+            return;
+        }
+        // Navigation keys extend the selection when Shift is held and collapse it
+        // otherwise; every other key leaves the anchor alone (typing, backspace and
+        // delete handle any active selection themselves in the engine).
+        if matches!(key.as_str(), "left" | "right" | "home" | "end" | "up" | "down") {
+            ed.extend_selection(shift);
+        }
         let changed = if ctrl {
             match key.as_str() {
                 "b" => yes(|| ed.toggle_bold()),
@@ -444,10 +456,14 @@ impl Docxy {
                     true
                 }
                 "a" => no(|| ed.select_all()),
+                // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
+                "left" => no(|| ed.move_word_left()),
+                "right" => no(|| ed.move_word_right()),
+                "home" => no(|| ed.move_doc_start()),
+                "end" => no(|| ed.move_doc_end()),
                 _ => false,
             }
         } else {
-            ed.extend_selection(shift);
             match key.as_str() {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
@@ -618,16 +634,11 @@ fn hex_rgb(s: &str) -> Option<u32> {
     (s.len() == 6).then(|| u32::from_str_radix(s, 16).ok()).flatten()
 }
 
-fn split_at_char(s: &str, n: usize) -> (&str, &str) {
-    let idx = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
-    s.split_at(idx)
-}
-
 fn caret_bar() -> AnyElement {
     div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
 }
 
-fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, pal: Pal) {
+fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, selected: bool, pal: Pal) {
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
             continue;
@@ -647,30 +658,92 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                 .when(props.italic, |d| d.italic())
                 .when(props.underline || is_link, |d| d.underline())
                 .when(props.strike, |d| d.line_through())
-                .when(props.highlight.is_some(), |d| d.bg(rgb(0xfff29a)).text_color(rgb(0x333300)))
+                // Selection wins over any run highlight so the selected range reads
+                // as one contiguous band.
+                .when(!selected && props.highlight.is_some(), |d| d.bg(rgb(0xfff29a)).text_color(rgb(0x333300)))
+                .when(selected, |d| d.bg(pal.sel))
                 .into_any_element(),
         );
     }
 }
 
-fn emit_run(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, idx: &mut usize, caret: &mut Option<usize>, pal: Pal) {
-    let len = text.chars().count();
-    if let Some(off) = *caret {
-        if off >= *idx && off <= *idx + len {
-            let (a, b) = split_at_char(text, off - *idx);
-            emit_words(out, a, props, base, is_link, pal);
-            out.push(caret_bar());
-            emit_words(out, b, props, base, is_link, pal);
-            *caret = None;
-            *idx += len;
-            return;
+/// Emit one run's text, splicing in the caret bar and shading any part that falls
+/// inside the selection range `sel` (both are absolute char offsets within the
+/// paragraph). `idx` is advanced by the run's char length.
+fn emit_run(
+    out: &mut Vec<AnyElement>,
+    text: &str,
+    props: &RunProps,
+    base: f32,
+    is_link: bool,
+    idx: &mut usize,
+    caret: &mut Option<usize>,
+    sel: Option<(usize, usize)>,
+    pal: Pal,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let start = *idx;
+    let end = start + len;
+    // Cut the run at the caret and at each selection boundary that lands inside it,
+    // so each resulting segment is uniformly selected-or-not.
+    let mut cuts: Vec<usize> = vec![0, len];
+    let add = |abs: usize, cuts: &mut Vec<usize>| {
+        if abs > start && abs < end {
+            cuts.push(abs - start);
         }
+    };
+    if let Some(c) = *caret {
+        add(c, &mut cuts);
     }
-    emit_words(out, text, props, base, is_link, pal);
-    *idx += len;
+    if let Some((s, e)) = sel {
+        add(s, &mut cuts);
+        add(e, &mut cuts);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if *caret == Some(start + a) {
+            out.push(caret_bar());
+            *caret = None;
+        }
+        let seg: String = chars[a..b].iter().collect();
+        let selected = sel.map_or(false, |(s, e)| s < e && start + a >= s && start + b <= e);
+        emit_words(out, &seg, props, base, is_link, selected, pal);
+    }
+    if *caret == Some(end) {
+        out.push(caret_bar());
+        *caret = None;
+    }
+    *idx = end;
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, pal: Pal) -> AnyElement {
+/// A tab is ONE char in the engine but rendered as spaces; keep `idx` in sync and
+/// let it participate in caret/selection like any other char.
+fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, pal: Pal) {
+    let pos = *idx;
+    if *caret == Some(pos) {
+        out.push(caret_bar());
+        *caret = None;
+    }
+    let selected = sel.map_or(false, |(s, e)| s < e && s <= pos && pos < e);
+    out.push(div().child(SharedString::from("\u{2003}\u{2003}")).when(selected, |d| d.bg(pal.sel)).into_any_element());
+    *idx += 1;
+}
+
+/// A line break is ONE char in the engine; render it as a wrap and keep `idx` in
+/// sync (so caret/selection offsets past it stay correct).
+fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>) {
+    if *caret == Some(*idx) {
+        out.push(caret_bar());
+        *caret = None;
+    }
+    out.push(div().w_full().h(px(0.)).into_any_element());
+    *idx += 1;
+}
+
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, pal: Pal) -> AnyElement {
     let base = match p.props.heading_level {
         Some(1) => 26.0,
         Some(2) => 22.0,
@@ -684,18 +757,18 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, pal: Pal) -> AnyElement
     let mut idx = 0usize;
     if p.props.num_id.is_some() {
         let marker = if p.props.ilvl % 2 == 1 { "\u{25E6} " } else { "\u{2022} " };
-        emit_words(&mut spans, marker, &RunProps::default(), base, false, pal);
+        emit_words(&mut spans, marker, &RunProps::default(), base, false, false, pal);
     }
     for inline in &p.content {
         match inline {
-            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, pal),
+            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, pal),
             Inline::Hyperlink(h) => {
                 for r in &h.runs {
-                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, pal);
+                    emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel, pal);
                 }
             }
-            Inline::Tab(_) => emit_run(&mut spans, "    ", &RunProps::default(), base, false, &mut idx, &mut caret, pal),
-            Inline::Break(_) => spans.push(div().w_full().h(px(0.)).into_any_element()),
+            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, pal),
+            Inline::Break(_) => emit_break(&mut spans, &mut idx, &mut caret),
             other => {
                 let tag = match other {
                     Inline::SmartArt { .. } => "[diagram]",
@@ -726,7 +799,7 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     for row in &t.rows {
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, pal)).collect();
+            let inner: Vec<AnyElement> = cell.blocks.iter().map(|b| block_el(b, None, None, pal)).collect();
             cells.push(v_flex().flex_1().px_2().py_1().border_1().border_color(pal.border).children(inner).into_any_element());
         }
         rows.push(h_flex().w_full().children(cells).into_any_element());
@@ -734,9 +807,9 @@ fn table_el(t: &Table, pal: Pal) -> AnyElement {
     v_flex().w_full().my_2().children(rows).into_any_element()
 }
 
-fn block_el(b: &Block, caret: Option<usize>, pal: Pal) -> AnyElement {
+fn block_el(b: &Block, caret: Option<usize>, sel: Option<(usize, usize)>, pal: Pal) -> AnyElement {
     match b {
-        Block::Paragraph(p) => paragraph_el(p, caret, pal),
+        Block::Paragraph(p) => paragraph_el(p, caret, sel, pal),
         Block::Table(t) => table_el(t, pal),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
@@ -1139,7 +1212,7 @@ impl Render for Docxy {
         // A theme-adaptive hover tint: a low-alpha wash of the foreground, so it's
         // clearly visible as a highlight on both light and dark grounds.
         let hover = Hsla { a: 0.12, ..fg };
-        let pal = Pal { fg, dim, border, panel, hover };
+        let pal = Pal { fg, dim, border, panel, hover, sel: t.selection };
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
@@ -1221,7 +1294,20 @@ impl Render for Docxy {
                 Surface::Doc(editor) => {
                     let caret_block = (editor.caret.path.len() == 1).then_some(editor.caret.path[0]);
                     let off = editor.caret.offset;
-                    let blocks: Vec<AnyElement> = editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, (Some(i) == caret_block).then_some(off), pal)).collect();
+                    // Selection ranges, keyed by top-level block (nested table spans
+                    // aren't highlighted yet).
+                    let spans = editor.selection_spans();
+                    let blocks: Vec<AnyElement> = editor
+                        .doc
+                        .body
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            let caret = (Some(i) == caret_block).then_some(off);
+                            let sel = spans.iter().find(|(p, _, _)| p.len() == 1 && p[0] == i).map(|(_, s, e)| (*s, *e));
+                            block_el(b, caret, sel, pal)
+                        })
+                        .collect();
                     v_flex().id("doc-scroll").flex_1().overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
