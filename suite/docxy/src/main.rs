@@ -192,6 +192,8 @@ struct HfEdit {
     editor: Editor,
     part_name: String,
     is_header: bool,
+    /// Which reference type is being edited: `"default"`, `"first"`, or `"even"`.
+    variant: &'static str,
 }
 
 struct Docxy {
@@ -667,7 +669,7 @@ impl Docxy {
     /// Enter header (or footer) edit mode: resolve the existing part or create a
     /// fresh one, parse its blocks into an editor, and switch to Print Layout so
     /// the margin area is visible. No-op for markdown/package-less tabs.
-    fn enter_hf(&mut self, is_header: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn enter_hf(&mut self, is_header: bool, variant: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_hf(); // commit any header/footer already open
         let idx = self.active;
         let Some(tab) = self.tabs.get_mut(idx) else { return };
@@ -678,9 +680,9 @@ impl Docxy {
             tab.status = "Headers/footers need a .docx (not a Markdown document)".into();
             return self.refocus(window, cx);
         };
-        let part_name = match hf_part_name(pkg, is_header) {
+        let part_name = match hf_part_name_typed(pkg, is_header, variant) {
             Some(n) => n,
-            None => match pkg.create_hf(is_header) {
+            None => match pkg.create_hf(is_header, variant) {
                 Some(n) => {
                     tab.dirty = true;
                     n
@@ -693,10 +695,12 @@ impl Docxy {
         };
         let blocks = parse_hf_part(pkg, &part_name);
         let doc = docxcore::model::Document { body: blocks };
-        tab.hf_edit = Some(HfEdit { editor: Editor::new(doc), part_name, is_header });
+        tab.hf_edit = Some(HfEdit { editor: Editor::new(doc), part_name, is_header, variant });
         self.page_view = true;
         if let Some(t) = self.tabs.get_mut(idx) {
-            t.status = if is_header { "Editing header — press Esc to return to the document".into() } else { "Editing footer — press Esc to return to the document".into() };
+            let region = if is_header { "header" } else { "footer" };
+            let vlabel = match variant { "first" => "first-page ", "even" => "even-page ", _ => "" };
+            t.status = format!("Editing {vlabel}{region} — press Esc to return to the document").into();
         }
         self.refocus(window, cx);
     }
@@ -727,6 +731,124 @@ impl Docxy {
             tab.status = "Closed header/footer".into();
         }
         self.refocus(window, cx);
+    }
+
+    /// Toggle "Different First Page" (`<w:titlePg/>`); off while editing the
+    /// first-page variant drops the edit session back to the default variant.
+    fn toggle_title_pg(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_hf();
+        let idx = self.active;
+        let mut on = false;
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            if let Some(pkg) = tab.pkg.as_mut() {
+                on = !pkg.has_title_pg();
+                pkg.set_title_pg(on);
+                tab.dirty = true;
+            }
+        }
+        if !on {
+            if let Some((is_h, "first")) = self.tabs.get(idx).and_then(|t| t.hf_edit.as_ref()).map(|h| (h.is_header, h.variant)) {
+                return self.enter_hf(is_h, "default", window, cx);
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Toggle "Different Odd & Even Pages" (`<w:evenAndOddHeaders/>`); off while
+    /// editing the even variant drops back to the default variant.
+    fn toggle_even_odd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_hf();
+        let idx = self.active;
+        let mut on = false;
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            if let Some(pkg) = tab.pkg.as_mut() {
+                on = !pkg.has_even_odd();
+                pkg.set_even_odd(on);
+                tab.dirty = true;
+            }
+        }
+        if !on {
+            if let Some((is_h, "even")) = self.tabs.get(idx).and_then(|t| t.hf_edit.as_ref()).map(|h| (h.is_header, h.variant)) {
+                return self.enter_hf(is_h, "default", window, cx);
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// The contextual Header & Footer toolbar, shown while editing one. Lets the
+    /// user switch region (header/footer) and variant (default/first/even) and
+    /// toggle the "Different First Page" / "Different Odd & Even" section options.
+    fn hf_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.tabs.get(self.active);
+        let hf = tab.and_then(|t| t.hf_edit.as_ref());
+        let (is_header, variant) = hf.map(|h| (h.is_header, h.variant)).unwrap_or((true, "default"));
+        let title_pg = tab.and_then(|t| t.pkg.as_ref()).is_some_and(|p| p.has_title_pg());
+        let even_odd = tab.and_then(|t| t.pkg.as_ref()).is_some_and(|p| p.has_even_odd());
+        let pill = move |id: &'static str, label: SharedString, active: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .text_size(px(12.))
+                .text_color(if active { hsla_u(BRAND) } else { pal.fg })
+                .border_1()
+                .border_color(if active { hsla_u(BRAND) } else { pal.border })
+                .cursor_pointer()
+                .hover(|d| d.bg(pal.hover))
+                .child(label)
+        };
+        let check = move |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(pal.fg)
+                .hover(|d| d.text_color(hsla_u(BRAND)))
+                .child(
+                    div()
+                        .size(px(13.))
+                        .rounded(px(2.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(if on { hsla_u(BRAND) } else { pal.border })
+                        .bg(if on { hsla_u(BRAND) } else { Hsla { a: 0., ..pal.fg } })
+                        .when(on, |d| d.child(div().text_size(px(9.)).text_color(rgb(0xffffff)).child("\u{2713}"))),
+                )
+                .child(label)
+        };
+        let sep = || div().w(px(1.)).h(px(16.)).bg(pal.border);
+        h_flex()
+            .w_full()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(96.)).child("Header & Footer"))
+            .child(pill("hf-hdr", "Header".into(), is_header).on_click(cx.listener(move |t, _, w, c| t.enter_hf(true, variant, w, c))))
+            .child(pill("hf-ftr", "Footer".into(), !is_header).on_click(cx.listener(move |t, _, w, c| t.enter_hf(false, variant, w, c))))
+            .child(sep())
+            .child(pill("hf-def", "Default".into(), variant == "default").on_click(cx.listener(move |t, _, w, c| t.enter_hf(is_header, "default", w, c))))
+            .when(title_pg, |d| d.child(pill("hf-first", "First page".into(), variant == "first").on_click(cx.listener(move |t, _, w, c| t.enter_hf(is_header, "first", w, c)))))
+            .when(even_odd, |d| d.child(pill("hf-even", "Even".into(), variant == "even").on_click(cx.listener(move |t, _, w, c| t.enter_hf(is_header, "even", w, c)))))
+            .child(sep())
+            .child(check("hf-tp", "Different First Page", title_pg).on_click(cx.listener(|t, _, w, c| t.toggle_title_pg(w, c))))
+            .child(check("hf-eo", "Different Odd & Even", even_odd).on_click(cx.listener(|t, _, w, c| t.toggle_even_odd(w, c))))
+            .child(div().flex_1())
+            .child(pill("hf-close", "Close".into(), false).on_click(cx.listener(|t, _, w, c| t.exit_hf(w, c))))
+            .into_any_element()
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2676,16 +2798,24 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
-/// Resolve the package part name (e.g. `word/header1.xml`) backing the default
-/// header (or footer) via the section's reference → relationship → target.
-fn hf_part_name(pkg: &Package, is_header: bool) -> Option<String> {
+/// Resolve the package part name (e.g. `word/header1.xml`) backing a specific
+/// header/footer reference type (`"default"`, `"first"`, `"even"`).
+fn hf_part_name_typed(pkg: &Package, is_header: bool, wtype: &str) -> Option<String> {
     let sect = pkg.sect_pr();
     let kind = if is_header { "headerReference" } else { "footerReference" };
-    let rid = ["default", "first", "even"].iter().find_map(|t| docxcore::load::header_footer_ref_rid(sect, kind, t))?;
+    let rid = docxcore::load::header_footer_ref_rid(sect, kind, wtype)?;
     let rels_bytes = pkg.part("word/_rels/document.xml.rels")?;
     let rels = docxcore::load::parse_rels_xml(&String::from_utf8_lossy(rels_bytes));
     let target = rels.target(&rid)?;
     Some(format!("word/{}", target.trim_start_matches('/')))
+}
+
+/// Blocks of a specific header/footer variant, or empty if that ref is absent.
+fn header_footer_blocks_typed(pkg: &Package, is_header: bool, wtype: &str) -> Vec<Block> {
+    match hf_part_name_typed(pkg, is_header, wtype) {
+        Some(name) => parse_hf_part(pkg, &name),
+        None => vec![],
+    }
 }
 
 /// Parse the blocks of a specific header/footer part.
@@ -2696,12 +2826,6 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
     docxcore::load::parse_header_footer(&String::from_utf8_lossy(xml), &rels)
 }
 
-fn header_footer_blocks(pkg: &Package, is_header: bool) -> Vec<Block> {
-    match hf_part_name(pkg, is_header) {
-        Some(name) => parse_hf_part(pkg, &name),
-        None => vec![],
-    }
-}
 
 /// Render header/footer blocks read-only (no caret, no click) for the page margins.
 fn hf_els(blocks: &[Block], pal: Pal) -> Vec<AnyElement> {
@@ -3234,8 +3358,8 @@ impl Docxy {
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
-            EditHeader => self.enter_hf(true, window, cx),
-            EditFooter => self.enter_hf(false, window, cx),
+            EditHeader => self.enter_hf(true, "default", window, cx),
+            EditFooter => self.enter_hf(false, "default", window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
@@ -3867,6 +3991,7 @@ impl Render for Docxy {
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
+        let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
 
         let content: AnyElement = match self.tabs.get(self.active) {
@@ -3898,33 +4023,70 @@ impl Render for Docxy {
                         let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
                         let ranges = paginate(body, content_h, content_w);
                         let show_ruler = self.show_ruler;
-                        // Header / footer content (repeated on every page in the margins).
-                        let (hdr, ftr) = tab.pkg.as_ref().map(|p| (header_footer_blocks(p, true), header_footer_blocks(p, false))).unwrap_or_default();
-                        // While editing a header/footer, show that region's LIVE editor
-                        // blocks (not the stale package copy), editable on the first page.
-                        let editing_header = hf.is_some_and(|h| h.is_header);
-                        let editing_footer = hf.is_some_and(|h| !h.is_header);
+                        // Per-page header/footer. A section can carry distinct
+                        // first-page (w:titlePg) and even-page (evenAndOddHeaders)
+                        // variants; every other page uses the "default" one.
+                        let pkg = tab.pkg.as_ref();
+                        let title_pg = pkg.is_some_and(|p| p.has_title_pg());
+                        let even_odd = pkg.is_some_and(|p| p.has_even_odd());
+                        let refp = |kind: &str, wt: &str| pkg.is_some_and(|p| docxcore::load::header_footer_ref_rid(p.sect_pr(), kind, wt).is_some());
+                        let (h_first_ref, h_even_ref) = (refp("headerReference", "first"), refp("headerReference", "even"));
+                        let (f_first_ref, f_even_ref) = (refp("footerReference", "first"), refp("footerReference", "even"));
+                        let parse = |is_h: bool, wt: &str| pkg.map(|p| header_footer_blocks_typed(p, is_h, wt)).unwrap_or_default();
+                        let (hdef, hfirst, heven) = (parse(true, "default"), parse(true, "first"), parse(true, "even"));
+                        let (fdef, ffirst, feven) = (parse(false, "default"), parse(false, "first"), parse(false, "even"));
+                        let variant_for = |page1: usize, is_h: bool| -> &'static str {
+                            let (fr, ev) = if is_h { (h_first_ref, h_even_ref) } else { (f_first_ref, f_even_ref) };
+                            if page1 == 1 && title_pg && fr {
+                                "first"
+                            } else if page1 % 2 == 0 && even_odd && ev {
+                                "even"
+                            } else {
+                                "default"
+                            }
+                        };
+                        let pick = |is_h: bool, wt: &str| -> &[Block] {
+                            match (is_h, wt) {
+                                (true, "first") => &hfirst,
+                                (true, "even") => &heven,
+                                (true, _) => &hdef,
+                                (false, "first") => &ffirst,
+                                (false, "even") => &feven,
+                                (false, _) => &fdef,
+                            }
+                        };
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
                         let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true });
-                        let hdr_disp: &[Block] = if editing_header { &hf.unwrap().editor.doc.body } else { &hdr };
-                        let ftr_disp: &[Block] = if editing_footer { &hf.unwrap().editor.doc.body } else { &ftr };
-                        let has_hf = !hdr.is_empty() || !ftr.is_empty() || hf.is_some();
+                        // The first page whose region+variant matches the one being
+                        // edited is the editable page (fallback page 0, so the surface
+                        // is always visible even for a not-yet-shown variant).
+                        let edit_page = hf.map(|h| (0..ranges.len()).find(|&i| variant_for(i + 1, h.is_header) == h.variant).unwrap_or(0));
+                        let has_hf = [&hdef, &hfirst, &heven, &fdef, &ffirst, &feven].iter().any(|v| !v.is_empty()) || hf.is_some();
+                        // One region's margin content for a given page: the live editor
+                        // blocks (editable on the edit page), else the read-only variant.
+                        let region_children = |pi: usize, is_h: bool| -> Vec<AnyElement> {
+                            let dv = variant_for(pi + 1, is_h);
+                            if let (Some(h), Some(ep)) = (hf, edit_page) {
+                                if h.is_header == is_h {
+                                    if pi == ep {
+                                        return h.editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect();
+                                    }
+                                    let blocks: &[Block] = if dv == h.variant { &h.editor.doc.body } else { pick(is_h, dv) };
+                                    return hf_els(blocks, doc_pal);
+                                }
+                            }
+                            hf_els(pick(is_h, dv), doc_pal)
+                        };
                         let sheets: Vec<AnyElement> = ranges
-                            .into_iter()
+                            .iter()
+                            .copied()
                             .enumerate()
                             .map(|(pi, (s, e))| {
                                 let page_blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
-                                // Editable on page 0 when this region is being edited; read-only otherwise.
-                                let hdr_children: Vec<AnyElement> = if editing_header && pi == 0 {
-                                    hdr_disp.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect()
-                                } else {
-                                    hf_els(hdr_disp, doc_pal)
-                                };
-                                let ftr_children: Vec<AnyElement> = if editing_footer && pi == 0 {
-                                    ftr_disp.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect()
-                                } else {
-                                    hf_els(ftr_disp, doc_pal)
-                                };
+                                let hdr_children = region_children(pi, true);
+                                let ftr_children = region_children(pi, false);
+                                let edit_hdr_here = hf.is_some_and(|h| h.is_header) && Some(pi) == edit_page;
+                                let edit_ftr_here = hf.is_some_and(|h| !h.is_header) && Some(pi) == edit_page;
                                 let page_base = v_flex()
                                     .w(tw(geom.w))
                                     .min_h(tw(geom.h))
@@ -3932,15 +4094,24 @@ impl Render for Docxy {
                                     .text_color(doc_pal.fg)
                                     .border_1()
                                     .border_color(hsla_u(0xd0d0d0));
-                                // Tint the region being edited so it reads as the active area.
-                                let hdr_bg = if editing_header { Hsla { a: 0.5, ..hsla_u(0xeef4ff) } } else { hsla_u(0xffffff) };
-                                let ftr_bg = if editing_footer { Hsla { a: 0.5, ..hsla_u(0xeef4ff) } } else { hsla_u(0xffffff) };
+                                // Tint the region actively being edited on this page.
+                                let tint = Hsla { a: 0.5, ..hsla_u(0xeef4ff) };
+                                let hdr_bg = if edit_hdr_here { tint } else { hsla_u(0xffffff) };
+                                let ftr_bg = if edit_ftr_here { tint } else { hsla_u(0xffffff) };
                                 let page = if has_hf {
                                     // Header in the top margin, content in the middle, footer
-                                    // in the bottom margin.
+                                    // in the bottom margin. The body area exits header/footer
+                                    // editing on click (Word's "click the document to leave").
+                                    let mut mid = v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).gap_1().children(page_blocks);
+                                    if hf.is_some() {
+                                        let ent2 = ent.clone();
+                                        mid = mid.cursor_pointer().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                            ent2.update(cx, |this, cx| this.exit_hf(window, cx));
+                                        });
+                                    }
                                     page_base
                                         .child(div().min_h(tw(geom.mt)).pt(tw(geom.mt / 2)).pl(tw(geom.ml)).pr(tw(geom.mr)).bg(hdr_bg).children(hdr_children))
-                                        .child(v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).gap_1().children(page_blocks))
+                                        .child(mid)
                                         .child(div().min_h(tw(geom.mb)).pl(tw(geom.ml)).pr(tw(geom.mr)).bg(ftr_bg).children(ftr_children))
                                 } else {
                                     page_base.pt(tw(geom.mt)).pr(tw(geom.mr)).pb(tw(geom.mb)).pl(tw(geom.ml)).gap_1().children(page_blocks)
@@ -4079,6 +4250,7 @@ impl Render for Docxy {
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(comment_bar, |d, c| d.child(c))
+            .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
             .child(body)
             .child(status)

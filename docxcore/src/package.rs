@@ -170,11 +170,12 @@ impl Package {
         }
     }
 
-    /// Create a new, empty default header (`is_header`) or footer part and wire it
-    /// up: add the part, a `[Content_Types].xml` override, a relationship in
-    /// `document.xml.rels`, and a `<w:headerReference>`/`<w:footerReference>` in
-    /// the section properties. Returns the new part name.
-    pub fn create_hf(&mut self, is_header: bool) -> Option<String> {
+    /// Create a new, empty header (`is_header`) or footer part of the given
+    /// reference type (`"default"`, `"first"`, or `"even"`) and wire it up: add
+    /// the part, a `[Content_Types].xml` override, a relationship in
+    /// `document.xml.rels`, and a `<w:headerReference>`/`<w:footerReference>` of
+    /// that type in the section properties. Returns the new part name.
+    pub fn create_hf(&mut self, is_header: bool, hf_type: &str) -> Option<String> {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let (kind, tag, ct, reltype) = if is_header {
@@ -225,10 +226,85 @@ impl Package {
             self.set_part("[Content_Types].xml", new_ct.into_bytes());
         }
 
-        // Section reference (must be the first child of sectPr).
-        let reference = format!("<w:{kind}Reference w:type=\"default\" r:id=\"{rid}\"/>");
+        // Section reference (must be among the first children of sectPr).
+        let reference = format!("<w:{kind}Reference w:type=\"{hf_type}\" r:id=\"{rid}\"/>");
         self.sect_pr = inject_sect_child(&self.sect_pr, &reference);
         Some(part_name)
+    }
+
+    /// Whether the section has a distinct first-page header/footer (`<w:titlePg/>`).
+    pub fn has_title_pg(&self) -> bool {
+        self.sect_pr.contains("<w:titlePg")
+    }
+
+    /// Toggle a distinct first-page header/footer (`<w:titlePg/>` in the section).
+    /// When turning it off, the "first" parts are left in place (as Word does).
+    pub fn set_title_pg(&mut self, on: bool) {
+        if on == self.has_title_pg() {
+            return;
+        }
+        if on {
+            // titlePg belongs near the end of CT_SectPr, so append before the close.
+            self.sect_pr = append_sect_child(&self.sect_pr, "<w:titlePg/>");
+        } else {
+            self.sect_pr = remove_element(&self.sect_pr, "w:titlePg");
+        }
+    }
+
+    /// Whether the document uses distinct even/odd page headers/footers
+    /// (`<w:evenAndOddHeaders/>` in `word/settings.xml`).
+    pub fn has_even_odd(&self) -> bool {
+        self.part("word/settings.xml")
+            .map(|b| String::from_utf8_lossy(b).contains("<w:evenAndOddHeaders"))
+            .unwrap_or(false)
+    }
+
+    /// Toggle distinct even/odd headers/footers, editing (or creating)
+    /// `word/settings.xml`'s `<w:evenAndOddHeaders/>` flag.
+    pub fn set_even_odd(&mut self, on: bool) {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let name = "word/settings.xml";
+        if let Some(b) = self.part(name) {
+            let xml = String::from_utf8_lossy(b).into_owned();
+            let has = xml.contains("<w:evenAndOddHeaders");
+            if on && !has {
+                // evenAndOddHeaders is an early child of CT_Settings.
+                let gt = xml.find("<w:settings").and_then(|s| xml[s..].find('>').map(|e| s + e + 1));
+                if let Some(pos) = gt {
+                    let new = format!("{}<w:evenAndOddHeaders/>{}", &xml[..pos], &xml[pos..]);
+                    self.set_part(name, new.into_bytes());
+                }
+            } else if !on && has {
+                self.set_part(name, remove_element(&xml, "w:evenAndOddHeaders").into_bytes());
+            }
+            return;
+        }
+        if !on {
+            return; // nothing to turn off
+        }
+        // No settings part yet — create a minimal one and wire it up.
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:settings xmlns:w=\"{W_NS}\"><w:evenAndOddHeaders/></w:settings>"
+        );
+        self.parts.push((name.to_string(), body.into_bytes()));
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            if !ct.contains("settings+xml") {
+                let ov = "<Override PartName=\"/word/settings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>";
+                self.set_part("[Content_Types].xml", ct.replacen("</Types>", &format!("{ov}</Types>"), 1).into_bytes());
+            }
+        }
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            if !rels.contains("settings.xml") {
+                let rid = next_rid(&rels);
+                let rel = format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/settings\" Target=\"settings.xml\"/>");
+                self.set_part(rels_name, rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1).into_bytes());
+            }
+        }
     }
 
     /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
@@ -648,6 +724,53 @@ fn inject_sect_child(sect: &str, child: &str) -> String {
     }
     let (head, tail) = sect.split_at(gt + 1);
     format!("{head}{child}{tail}")
+}
+
+/// Append a child just before `</w:sectPr>` (for elements like `<w:titlePg/>`
+/// that belong near the end of `CT_SectPr`). Expands a self-closing sectPr.
+fn append_sect_child(sect: &str, child: &str) -> String {
+    if sect.is_empty() {
+        return format!("<w:sectPr>{child}</w:sectPr>");
+    }
+    if let Some(gt) = sect.find('>') {
+        if sect[..gt].ends_with('/') {
+            return format!("{}>{child}</w:sectPr>", &sect[..gt - 1]);
+        }
+    }
+    match sect.rfind("</w:sectPr>") {
+        Some(i) => format!("{}{child}{}", &sect[..i], &sect[i..]),
+        None => format!("{sect}{child}"),
+    }
+}
+
+/// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
+fn remove_element(xml: &str, name: &str) -> String {
+    let open = format!("<{name}");
+    let Some(start) = xml.find(&open) else {
+        return xml.to_string();
+    };
+    // Boundary check: the char after the name must end the tag name.
+    let after = &xml[start + open.len()..];
+    if !after.starts_with([' ', '/', '>', '\t', '\n', '\r']) {
+        return xml.to_string();
+    }
+    let Some(rel_gt) = after.find('>') else {
+        return xml.to_string();
+    };
+    let gt = start + open.len() + rel_gt;
+    let end = if xml[..gt].ends_with('/') {
+        gt + 1 // self-closing <name/>
+    } else {
+        let close = format!("</{name}>");
+        match xml[gt..].find(&close) {
+            Some(c) => gt + c + close.len(),
+            None => gt + 1,
+        }
+    };
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..start]);
+    out.push_str(&xml[end..]);
+    out
 }
 
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
@@ -1115,7 +1238,7 @@ mod tests {
         let mut pkg = new_package(Document {
             body: vec![Block::Paragraph(Paragraph::default())],
         });
-        let name = pkg.create_hf(true).expect("created header");
+        let name = pkg.create_hf(true, "default").expect("created header");
         assert_eq!(name, "word/header1.xml");
         assert!(pkg.part(&name).is_some(), "header part missing");
         let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
@@ -1147,9 +1270,43 @@ mod tests {
 
         // A second create picks the next name and id.
         let mut pkg2 = pkg;
-        let name2 = pkg2.create_hf(false).expect("created footer");
+        let name2 = pkg2.create_hf(false, "default").expect("created footer");
         assert_eq!(name2, "word/footer1.xml");
         assert!(pkg2.sect_pr().contains("footerReference"));
+    }
+
+    #[test]
+    fn first_page_and_even_odd_toggles() {
+        use crate::model::{Block, Document, Paragraph};
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        // First-page header/footer.
+        assert!(!pkg.has_title_pg());
+        pkg.set_title_pg(true);
+        assert!(pkg.has_title_pg() && pkg.sect_pr().contains("<w:titlePg/>"));
+        pkg.set_title_pg(true); // idempotent
+        assert_eq!(pkg.sect_pr().matches("<w:titlePg").count(), 1);
+        let first = pkg.create_hf(true, "first").expect("first header");
+        assert!(pkg.sect_pr().contains("w:type=\"first\""));
+        assert_eq!(crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some(), true);
+        pkg.set_title_pg(false);
+        assert!(!pkg.has_title_pg() && !pkg.sect_pr().contains("titlePg"));
+        assert!(pkg.part(&first).is_some(), "first part kept when toggled off");
+
+        // Even/odd headers (creates settings.xml from scratch here).
+        assert!(!pkg.has_even_odd());
+        pkg.set_even_odd(true);
+        assert!(pkg.has_even_odd());
+        assert!(pkg.part("word/settings.xml").is_some());
+        pkg.create_hf(true, "even").expect("even header");
+        assert!(pkg.sect_pr().contains("w:type=\"even\""));
+        pkg.set_even_odd(false);
+        assert!(!pkg.has_even_odd());
+
+        // Everything still saves + reloads cleanly.
+        let bytes = save_package(&pkg);
+        assert!(load_package(&bytes).is_ok());
     }
 
     #[test]
