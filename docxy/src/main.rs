@@ -32,7 +32,10 @@ use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::parse_header_footer;
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::markdown::{from_markdown, to_markdown_with};
-use docxcore::model::{Align, Block, Document, Hyperlink, Inline, PageGeom, Run, RunProps};
+use docxcore::model::{
+    Align, Block, BreakKind, Cell, Document, Hyperlink, Inline, PageGeom, Row, Run, RunProps,
+    Table, VMerge,
+};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, new_markdown_package, new_package, save_package};
 use docxcore::render::{
@@ -593,6 +596,8 @@ enum PickerKind {
     FontSize,
     FontColor,
     Highlight,
+    Symbol,
+    LineSpacing,
 }
 
 impl PickerKind {
@@ -602,6 +607,8 @@ impl PickerKind {
             PickerKind::FontSize => " Font Size ",
             PickerKind::FontColor => " Font Colour ",
             PickerKind::Highlight => " Highlight ",
+            PickerKind::Symbol => " Symbol ",
+            PickerKind::LineSpacing => " Line Spacing ",
         }
     }
     fn items(self) -> &'static [&'static str] {
@@ -643,7 +650,28 @@ impl PickerKind {
                 "Gray",
                 "Dark Yellow",
             ],
+            PickerKind::Symbol => &[
+                "\u{2014}", "\u{2013}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}", "\u{00AE}",
+                "\u{2122}", "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}", "\u{2264}",
+                "\u{2265}", "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}", "\u{00A5}",
+                "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{201C}", "\u{201D}", "\u{03B1}",
+                "\u{03B2}", "\u{03C0}", "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}", "\u{2605}",
+            ],
+            PickerKind::LineSpacing => &["1.0", "1.15", "1.5", "2.0", "2.5", "3.0"],
         }
+    }
+}
+
+/// The `w:line` twips (auto rule) for a line-spacing picker label.
+fn line_spacing_twips(label: &str) -> Option<i32> {
+    match label {
+        "1.0" => Some(240),
+        "1.15" => Some(276),
+        "1.5" => Some(360),
+        "2.0" => Some(480),
+        "2.5" => Some(600),
+        "3.0" => Some(720),
+        _ => None,
     }
 }
 
@@ -1171,6 +1199,25 @@ impl App {
             InsertField => {
                 self.insert_field = Some(InsertFieldDialog { sel: 0 });
                 self.dirty = true;
+            }
+            InsertSymbol => self.open_picker(PickerKind::Symbol),
+            LineSpacing => self.open_picker(PickerKind::LineSpacing),
+            PageNumber => {
+                let inl = self.build_field(FieldKind::Page);
+                self.editor.paste(&Clip { paras: vec![vec![inl]] });
+                self.after_edit();
+                self.status = Some("Inserted page number".to_string());
+            }
+            PageBreak => {
+                self.editor
+                    .paste(&Clip { paras: vec![vec![Inline::Break(BreakKind::Page)]] });
+                self.after_edit();
+                self.status = Some("Inserted page break".to_string());
+            }
+            InsertTable => {
+                self.insert_table(2, 2);
+                self.after_edit();
+                self.status = Some("Inserted 2×2 table".to_string());
             }
             Paste => self.do_paste(),
             Bold => {
@@ -2741,6 +2788,42 @@ impl App {
     }
 
     /// Build a simple field (`<w:fldSimple>`) inline with its computed value.
+    /// Insert a bordered `rows`×`cols` table just after the caret's block, with
+    /// the caret landing in the first cell.
+    fn insert_table(&mut self, rows: usize, cols: usize) {
+        const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
+<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+</w:tblBorders></w:tblPr>";
+        let col_w = (9360 / cols.max(1)) as u32;
+        let mk_cell = || Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
+            raw_tcpr: None,
+        };
+        let mk_row = || Row {
+            cells: (0..cols).map(|_| mk_cell()).collect(),
+            raw_props: vec![],
+        };
+        let table = Table {
+            grid: vec![col_w; cols],
+            rows: (0..rows).map(|_| mk_row()).collect(),
+            raw_tblpr: Some(TBLPR.to_string()),
+        };
+        let body = &mut self.editor.doc.body;
+        let at = self.editor.caret.path.first().copied().unwrap_or(0).min(body.len().saturating_sub(1));
+        let pos = (at + 1).min(body.len());
+        body.insert(pos, Block::Table(table));
+        self.editor.clear_selection();
+        self.editor.caret = Caret::at(vec![pos, 0, 0, 0], 0);
+        self.editor.clamp();
+    }
+
     fn build_field(&self, kind: FieldKind) -> Inline {
         let text = self.field_value(kind);
         let raw = format!(
@@ -2985,7 +3068,10 @@ impl App {
     }
 
     fn open_picker(&mut self, kind: PickerKind) {
-        if !self.editor.has_selection() {
+        // Symbol inserts at the caret and Line Spacing applies to the caret
+        // paragraph, so neither needs a selection; the font/colour pickers do.
+        let needs_sel = !matches!(kind, PickerKind::Symbol | PickerKind::LineSpacing);
+        if needs_sel && !self.editor.has_selection() {
             self.status = Some(format!("Select text first, then {}", kind.title().trim()));
             self.dirty = true;
             return;
@@ -3010,6 +3096,12 @@ impl App {
             }
             PickerKind::FontColor => self.editor.set_color(color_hex(item)),
             PickerKind::Highlight => self.editor.set_highlight(highlight_name(item)),
+            PickerKind::Symbol => self.editor.insert_str(item),
+            PickerKind::LineSpacing => {
+                if let Some(line) = line_spacing_twips(item) {
+                    self.editor.set_line_spacing(line, "auto");
+                }
+            }
         }
         self.after_edit();
         self.status = Some(format!("{}: {item}", p.kind.title().trim()));
@@ -7743,6 +7835,52 @@ mod tests {
         app.run_act(ribbon::Act::Bold);
         app.run_act(ribbon::Act::ClearFormatting);
         assert!(!run0(&app).props.bold, "clear formatting left bold on");
+    }
+
+    #[test]
+    fn lesson_16_page_break() {
+        let mut app = app_with(&["text"]);
+        app.editor.move_end();
+        app.run_act(ribbon::Act::PageBreak);
+        let has_break = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(BreakKind::Page)))));
+        assert!(has_break, "no page break inserted");
+    }
+
+    #[test]
+    fn lesson_17_page_number() {
+        let mut app = app_with(&["text"]);
+        app.editor.move_end();
+        app.run_act(ribbon::Act::PageNumber);
+        let has_page = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Field { raw, .. } if raw.contains("PAGE")))));
+        assert!(has_page, "no PAGE field inserted");
+    }
+
+    #[test]
+    fn lesson_18_insert_table() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::InsertTable);
+        let t = app.editor.doc.body.iter().find_map(|b| if let Block::Table(t) = b { Some(t) } else { None }).expect("no table inserted");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 2);
+    }
+
+    #[test]
+    fn lesson_19_insert_symbol() {
+        let mut app = app_with(&["text"]);
+        app.editor.move_end();
+        app.run_act(ribbon::Act::InsertSymbol);
+        assert!(app.font_picker.is_some(), "symbol picker did not open");
+        app.apply_picker(); // sel 0 = em dash
+        assert!(first_line(&app).ends_with('\u{2014}'), "em dash not inserted: {}", first_line(&app));
+    }
+
+    #[test]
+    fn lesson_20_line_spacing() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::LineSpacing);
+        app.font_picker.as_mut().expect("line-spacing picker").sel = 2; // "1.5"
+        app.apply_picker();
+        assert_eq!(props0(&app).spacing.line, Some(360), "line spacing not 1.5x");
     }
 
     #[test]

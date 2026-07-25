@@ -96,6 +96,16 @@ pub enum Act {
     ApplyStyle(&'static str),
     /// Open the Apply-Styles dialog (every style the document defines).
     StylesDialog,
+    /// Open the line-spacing menu (1.0 / 1.15 / 1.5 / 2.0 / …).
+    LineSpacing,
+    /// Open the symbol picker and insert the chosen glyph.
+    InsertSymbol,
+    /// Insert a PAGE field at the caret (page number).
+    PageNumber,
+    /// Insert a table at the caret.
+    InsertTable,
+    /// Insert a page break at the caret.
+    PageBreak,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -262,7 +272,7 @@ fn home_groups(markdown: bool) -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("1──", 3, Numbering, "Numbering — numbered list"),
                     Seg::Gap(" "),
-                    btn("•◦─", 3, Todo("Multilevel list"), "Multilevel list"),
+                    btn("↕≣", 2, LineSpacing, "Line and paragraph spacing"),
                     Seg::Gap(" "),
                     btn("ind-", 4, DecreaseIndent, "Decrease indent (Ctrl+Shift+M)"),
                     Seg::Gap(" "),
@@ -398,18 +408,21 @@ fn insert_groups() -> Vec<Group> {
             title: "Pages",
             width: 10,
             rows: [
-                vec![btn(
-                    "Page Break",
-                    10,
-                    Todo("Page Break"),
-                    "Insert a page break",
-                )],
+                vec![btn("Page Break", 10, PageBreak, "Insert a page break")],
                 vec![btn(
                     "Blank Page",
                     10,
                     Todo("Blank Page"),
                     "Insert a blank page",
                 )],
+            ],
+        },
+        Group {
+            title: "Tables",
+            width: 10,
+            rows: [
+                vec![btn("⊞ Table", 8, InsertTable, "Insert a table")],
+                vec![btn("# Page No.", 10, PageNumber, "Insert a page number")],
             ],
         },
         Group {
@@ -435,7 +448,7 @@ fn insert_groups() -> Vec<Group> {
                     HorizontalLine,
                     "Insert a horizontal line (or type --- then Enter)",
                 )],
-                vec![btn("Ω Symbol", 8, Todo("Symbol"), "Insert a symbol")],
+                vec![btn("Ω Symbol", 8, InsertSymbol, "Insert a symbol")],
             ],
         },
     ]
