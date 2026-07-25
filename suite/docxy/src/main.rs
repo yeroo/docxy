@@ -1898,6 +1898,22 @@ impl Docxy {
                     cx.notify();
                     return;
                 }
+                // Zoom (Ctrl+= / Ctrl+- / Ctrl+0), the browser-standard gesture.
+                "=" | "+" => {
+                    self.zoom = (self.zoom + 0.1).min(3.0);
+                    cx.notify();
+                    return;
+                }
+                "-" => {
+                    self.zoom = (self.zoom - 0.1).max(0.5);
+                    cx.notify();
+                    return;
+                }
+                "0" => {
+                    self.zoom = 1.0;
+                    cx.notify();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -3729,6 +3745,32 @@ impl Render for Docxy {
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
         };
 
+        // Word-style counts for the status bar's left cluster: total pages
+        // (estimated by the same paginator Print Layout uses) and word count.
+        let doc_stats: Option<(usize, usize)> = is_doc
+            .then(|| self.tabs.get(self.active))
+            .flatten()
+            .and_then(|tab| match &tab.surface {
+                Surface::Doc(ed) => {
+                    let words = ed.doc.plain_text().split_whitespace().count();
+                    let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
+                    let ch = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
+                    let cw = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
+                    let pages = paginate(&ed.doc.body, ch, cw).len().max(1);
+                    Some((words, pages))
+                }
+                _ => None,
+            });
+        let stats_text = doc_stats.map(|(w, p)| {
+            SharedString::from(format!(
+                "{} page{} \u{00b7} {} word{}",
+                p,
+                if p == 1 { "" } else { "s" },
+                w,
+                if w == 1 { "" } else { "s" }
+            ))
+        });
+
         let zoom_btn = |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
             div()
                 .id(id)
@@ -3756,6 +3798,7 @@ impl Render for Docxy {
             .text_size(px(11.))
             .text_color(dim)
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
+            .when_some(stats_text, |d, s| d.child(div().text_color(dim).child("·")).child(div().text_color(dim).child(s)))
             .child(div().flex_1())
             .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S")
             // Zoom controls (Word's bottom-right zoom).
