@@ -3110,6 +3110,50 @@ fn paginate(blocks: &[Block], content_h: f32, content_w: f32) -> Vec<(usize, usi
     pages
 }
 
+/// Flow blocks into `ncols` columns per page (newspaper columns). Each column
+/// holds `content_h` worth of content estimated at the per-column width; a page
+/// is `ncols` such columns. Returns one `Vec<(start,end)>` (the columns) per page.
+fn paginate_cols(blocks: &[Block], content_h: f32, col_w: f32, ncols: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut pages: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut page: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0.0_f32;
+    let flush_col = |page: &mut Vec<(usize, usize)>, pages: &mut Vec<Vec<(usize, usize)>>, start: usize, i: usize| {
+        page.push((start, i));
+        if page.len() >= ncols {
+            pages.push(std::mem::take(page));
+        }
+    };
+    for (i, b) in blocks.iter().enumerate() {
+        let bh = block_height_est(b, col_w);
+        if acc + bh > content_h && i > start {
+            flush_col(&mut page, &mut pages, start, i);
+            start = i;
+            acc = 0.0;
+        }
+        acc += bh;
+        if has_page_break(b) {
+            flush_col(&mut page, &mut pages, start, i + 1);
+            // A hard break ends the current column *and* the page.
+            if !page.is_empty() {
+                pages.push(std::mem::take(&mut page));
+            }
+            start = i + 1;
+            acc = 0.0;
+        }
+    }
+    if start < blocks.len() {
+        flush_col(&mut page, &mut pages, start, blocks.len());
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        pages.push(vec![(0, blocks.len())]);
+    }
+    pages
+}
+
 fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(body.len());
     let mut counts: Vec<u32> = Vec::new();
@@ -4344,7 +4388,15 @@ impl Render for Docxy {
                         let canvas = if self.applied == Some(ThemeMode::Dark) { hsla_u(0x2b2b2b) } else { hsla_u(0x9a9a9a) };
                         let content_h = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
                         let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
-                        let ranges = paginate(body, content_h, content_w);
+                        // Newspaper columns: flow the body into N columns per page.
+                        let ncols = geom.cols.max(1) as usize;
+                        let colgap = geom.col_space.max(0) as f32 / 15.0;
+                        let col_w = if ncols > 1 { ((content_w - colgap * (ncols as f32 - 1.0)) / ncols as f32).max(1.0) } else { content_w };
+                        let pages: Vec<Vec<(usize, usize)>> = if ncols > 1 {
+                            paginate_cols(body, content_h, col_w, ncols)
+                        } else {
+                            paginate(body, content_h, content_w).into_iter().map(|r| vec![r]).collect()
+                        };
                         let show_ruler = self.show_ruler;
                         // Per-page header/footer. A section can carry distinct
                         // first-page (w:titlePg) and even-page (evenAndOddHeaders)
@@ -4385,7 +4437,7 @@ impl Render for Docxy {
                         // The first page whose region+variant matches the one being
                         // edited is the editable page (fallback page 0, so the surface
                         // is always visible even for a not-yet-shown variant).
-                        let edit_page = hf.map(|h| (0..ranges.len()).find(|&i| variant_for(i + 1, h.is_header) == h.variant).unwrap_or(0));
+                        let edit_page = hf.map(|h| (0..pages.len()).find(|&i| variant_for(i + 1, h.is_header) == h.variant).unwrap_or(0));
                         let has_hf = [&hdef, &hfirst, &heven, &fdef, &ffirst, &feven].iter().any(|v| !v.is_empty()) || hf.is_some();
                         // One region's margin content for a given page: the live editor
                         // blocks (editable on the edit page), else the read-only variant.
@@ -4402,12 +4454,27 @@ impl Render for Docxy {
                             }
                             hf_els(pick(is_h, dv), doc_pal, &measurer, hf_w)
                         };
-                        let sheets: Vec<AnyElement> = ranges
+                        // The middle content of a page: a single flow, or an N-column
+                        // row (each column its own block range) when in columns mode.
+                        let build_mid = |cols: &[(usize, usize)]| -> AnyElement {
+                            if cols.len() <= 1 {
+                                let (s, e) = cols.first().copied().unwrap_or((0, 0));
+                                let blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
+                                return v_flex().w_full().gap_1().children(blocks).into_any_element();
+                            }
+                            let column_els: Vec<AnyElement> = cols
+                                .iter()
+                                .map(|&(s, e)| {
+                                    let blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
+                                    v_flex().flex_1().min_w(px(0.)).gap_1().children(blocks).into_any_element()
+                                })
+                                .collect();
+                            h_flex().w_full().items_start().gap(tw(geom.col_space)).children(column_els).into_any_element()
+                        };
+                        let sheets: Vec<AnyElement> = pages
                             .iter()
-                            .copied()
                             .enumerate()
-                            .map(|(pi, (s, e))| {
-                                let page_blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
+                            .map(|(pi, cols_ranges)| {
                                 let hdr_children = region_children(pi, true);
                                 let ftr_children = region_children(pi, false);
                                 let edit_hdr_here = hf.is_some_and(|h| h.is_header) && Some(pi) == edit_page;
@@ -4427,7 +4494,7 @@ impl Render for Docxy {
                                     // Header in the top margin, content in the middle, footer
                                     // in the bottom margin. The body area exits header/footer
                                     // editing on click (Word's "click the document to leave").
-                                    let mut mid = v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).gap_1().children(page_blocks);
+                                    let mut mid = v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).child(build_mid(cols_ranges));
                                     if hf.is_some() {
                                         let ent2 = ent.clone();
                                         mid = mid.cursor_pointer().on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
@@ -4439,7 +4506,7 @@ impl Render for Docxy {
                                         .child(mid)
                                         .child(div().min_h(tw(geom.mb)).pl(tw(geom.ml)).pr(tw(geom.mr)).bg(ftr_bg).children(ftr_children))
                                 } else {
-                                    page_base.pt(tw(geom.mt)).pr(tw(geom.mr)).pb(tw(geom.mb)).pl(tw(geom.ml)).gap_1().children(page_blocks)
+                                    page_base.pt(tw(geom.mt)).pr(tw(geom.mr)).pb(tw(geom.mb)).pl(tw(geom.ml)).child(build_mid(cols_ranges))
                                 };
                                 h_flex()
                                     .items_stretch()
