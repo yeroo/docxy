@@ -651,11 +651,15 @@ impl PickerKind {
                 "Dark Yellow",
             ],
             PickerKind::Symbol => &[
-                "\u{2014}", "\u{2013}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}", "\u{00AE}",
-                "\u{2122}", "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}", "\u{2264}",
-                "\u{2265}", "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}", "\u{00A5}",
-                "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{201C}", "\u{201D}", "\u{03B1}",
-                "\u{03B2}", "\u{03C0}", "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}", "\u{2605}",
+                "\u{2014}", "\u{2013}", "\u{2011}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}",
+                "\u{00AE}", "\u{2122}", "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}",
+                "\u{2264}", "\u{2265}", "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}",
+                "\u{00A5}",
+                // Typographic quotes: guillemets, low/high, angle.
+                "\u{00AB}", "\u{00BB}", "\u{201E}", "\u{201C}", "\u{201D}", "\u{201A}", "\u{2018}",
+                "\u{2019}", "\u{2039}", "\u{203A}",
+                "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{03B1}", "\u{03B2}", "\u{03C0}",
+                "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}", "\u{2605}",
             ],
             PickerKind::LineSpacing => &["1.0", "1.15", "1.5", "2.0", "2.5", "3.0"],
         }
@@ -7881,6 +7885,19 @@ mod tests {
         app.font_picker.as_mut().expect("line-spacing picker").sel = 2; // "1.5"
         app.apply_picker();
         assert_eq!(props0(&app).spacing.line, Some(360), "line spacing not 1.5x");
+    }
+
+    #[test]
+    fn lesson_21_typographic_quotes() {
+        // The signature typesetting lesson: proper guillemets are in the picker.
+        let mut app = app_with(&["text"]);
+        app.editor.move_end();
+        app.run_act(ribbon::Act::InsertSymbol);
+        let items = PickerKind::Symbol.items();
+        let idx = items.iter().position(|&s| s == "\u{00AB}").expect("no guillemet in symbol picker");
+        app.font_picker.as_mut().unwrap().sel = idx;
+        app.apply_picker();
+        assert!(first_line(&app).ends_with('\u{00AB}'), "guillemet not inserted");
     }
 
     #[test]

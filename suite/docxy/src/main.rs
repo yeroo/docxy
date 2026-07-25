@@ -311,11 +311,14 @@ const TABLE_PRESETS: &[(&str, usize, usize)] = &[("2×2", 2, 2), ("3×2", 3, 2),
 /// The characters offered by the Insert ▸ Symbol picker — Word's common set:
 /// typographic punctuation, currency, arrows, and maths.
 const SYMBOLS: &[&str] = &[
-    "\u{2014}", "\u{2013}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}", "\u{00AE}", "\u{2122}",
-    "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}", "\u{2248}", "\u{2264}", "\u{2265}",
-    "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}", "\u{00A5}", "\u{00A2}", "\u{2190}",
-    "\u{2192}", "\u{2191}", "\u{2193}", "\u{201C}", "\u{201D}", "\u{2018}", "\u{2019}", "\u{03B1}",
-    "\u{03B2}", "\u{03C0}", "\u{03BC}", "\u{03A9}", "\u{2211}", "\u{221A}", "\u{2212}", "\u{2605}",
+    "\u{2014}", "\u{2013}", "\u{2011}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}", "\u{00AE}",
+    "\u{2122}", "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}", "\u{2248}", "\u{2264}",
+    "\u{2265}", "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}", "\u{00A5}", "\u{00A2}",
+    // Typographic quotes: guillemets, low/high quotes, angle quotes.
+    "\u{00AB}", "\u{00BB}", "\u{201E}", "\u{201C}", "\u{201D}", "\u{201A}", "\u{2018}", "\u{2019}",
+    "\u{2039}", "\u{203A}",
+    "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{03B1}", "\u{03B2}", "\u{03C0}", "\u{03BC}",
+    "\u{03A9}", "\u{2211}", "\u{221A}", "\u{2212}", "\u{2605}",
 ];
 
 /// The fields offered by the Insert ▸ Field picker: (label, instruction, fallback).
