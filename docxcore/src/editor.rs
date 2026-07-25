@@ -202,6 +202,15 @@ impl Editor {
         }
     }
 
+    /// Insert a tab (`<w:tab/>`) at the caret. A tab is its own inline in the
+    /// model (not a `\t` character in run text), so it advances to the next tab
+    /// stop when rendered — a literal `\t` would collapse to nothing.
+    pub fn insert_tab(&mut self) {
+        self.paste(&Clip {
+            paras: vec![vec![Inline::Tab(crate::model::RunProps::default())]],
+        });
+    }
+
     pub fn insert_newline(&mut self) {
         self.checkpoint(EditKind::Structural);
         let off = self.caret.offset;
@@ -2291,6 +2300,21 @@ mod tests {
         ed.anchor = Some(Caret::top(0, 1));
         ed.caret = Caret::top(1, 2);
         assert_eq!(ed.selection_spans(), vec![(vec![0], 1, 3), (vec![1], 0, 2)]);
+    }
+
+    #[test]
+    fn insert_tab_adds_a_tab_inline() {
+        let mut ed = Editor::new(doc(&["ab"]));
+        ed.caret = Caret::at(vec![0], 1); // between a and b
+        ed.insert_tab();
+        let Block::Paragraph(p) = &ed.doc.body[0] else { panic!() };
+        assert!(
+            p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+            "no tab inline inserted: {:?}",
+            p.content
+        );
+        // The tab counts as one caret position and the caret advanced past it.
+        assert_eq!(ed.caret.offset, 2);
     }
 
     #[test]

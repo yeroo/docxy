@@ -251,7 +251,14 @@ struct Docxy {
     mini_bar: Option<Point<Pixels>>,
     // Document zoom factor (1.0 = 100%), controlled from the status bar.
     zoom: f32,
+    // While a ruler marker is being dragged, the screen x of a vertical guide
+    // line drawn down the page (Word's drag guide). None when not dragging.
+    ruler_guide: Option<f32>,
 }
+
+// gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
+// on_key_down, so a tab must be inserted through a bound action instead.
+actions!(docxy, [InsertTabAction, OutdentAction]);
 
 #[derive(Clone, Copy, PartialEq)]
 enum KeyTip {
@@ -551,6 +558,7 @@ impl Docxy {
             context_menu: None,
             mini_bar: None,
             zoom: 1.0,
+            ruler_guide: None,
         };
         this.persist();
         this
@@ -1464,24 +1472,45 @@ impl Docxy {
         };
         let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
         self.ruler_drag = Some(RulerDrag { handle, start_x: x, start_indent: indent, start_first: first, start_right: right, start_ml: geom.ml, start_mr: geom.mr });
+        self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
     }
 
     /// Update the dragged ruler marker (x is the live pointer position; only the
-    /// delta from the drag start is used).
+    /// delta from the drag start is used). Markers snap to the 1/8" ruler grid
+    /// (Word's sticky ruler), and a vertical guide line is tracked down the page.
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
         let delta = ((x - d.start_x) * 15.0).round() as i32; // px → twips
-        match d.handle {
-            RulerHandle::FirstLine => self.with_editor(window, cx, |e| e.set_first_line(d.start_first + delta)),
-            RulerHandle::Left => self.with_editor(window, cx, |e| e.set_indent((d.start_indent + delta).max(0), d.start_first)),
+        let x0 = self.ruler_x0.get(); // left-margin screen x
+        let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+        let content_w = (geom.w - geom.ml - geom.mr).max(0);
+        let origin = x0 - geom.ml as f32 / 15.0; // page's left-edge screen x
+        let tw = |t: i32| t as f32 / 15.0;
+        let guide = match d.handle {
+            RulerHandle::FirstLine => {
+                // Snap the marker (indent + first) to the grid, keep indent fixed.
+                let marker = snap_twips(d.start_indent + d.start_first + delta);
+                let first = marker - d.start_indent;
+                self.with_editor(window, cx, |e| e.set_first_line(first));
+                x0 + tw(d.start_indent + first)
+            }
+            RulerHandle::Left => {
+                let ind = snap_twips((d.start_indent + delta).max(0));
+                let first = d.start_first;
+                self.with_editor(window, cx, |e| e.set_indent(ind, first));
+                x0 + tw(ind)
+            }
             // Dragging the right marker left (negative delta) increases the indent.
-            RulerHandle::Right => self.with_editor(window, cx, |e| e.set_right_indent((d.start_right - delta).max(0))),
+            RulerHandle::Right => {
+                let ri = snap_twips((d.start_right - delta).max(0));
+                self.with_editor(window, cx, |e| e.set_right_indent(ri));
+                x0 + tw(content_w - ri)
+            }
             RulerHandle::MarginLeft | RulerHandle::MarginRight => {
-                let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
                 let (ml, mr) = match d.handle {
-                    RulerHandle::MarginLeft => ((d.start_ml + delta).max(0), geom.mr),
-                    _ => (geom.ml, (d.start_mr - delta).max(0)),
+                    RulerHandle::MarginLeft => (snap_twips((d.start_ml + delta).max(0)), geom.mr),
+                    _ => (geom.ml, snap_twips((d.start_mr - delta).max(0))),
                 };
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     if let Some(pkg) = t.pkg.as_mut() {
@@ -1489,9 +1518,14 @@ impl Docxy {
                         t.dirty = true;
                     }
                 }
-                cx.notify();
+                match d.handle {
+                    RulerHandle::MarginLeft => origin + tw(ml),
+                    _ => origin + tw(geom.w - mr),
+                }
             }
-        }
+        };
+        self.ruler_guide = Some(guide);
+        cx.notify();
     }
 
     /// Add a tab stop at the clicked ruler position (mapped from the stored
@@ -1522,6 +1556,7 @@ impl Docxy {
 
     fn ruler_drag_end(&mut self, cx: &mut Context<Self>) {
         if self.ruler_drag.take().is_some() {
+            self.ruler_guide = None;
             cx.notify();
         }
     }
@@ -1631,15 +1666,17 @@ impl Docxy {
             inch += 1;
         }
 
-        // Draggable handles over the two indent markers.
-        let handle = |id: &'static str, cx_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
+        // Draggable indent handles, split into a TOP band (first-line marker) and
+        // a BOTTOM band (left / right markers) so they never overlap where they
+        // share an x (e.g. a paragraph with no indent) and each stays grabbable.
+        let handle = |id: &'static str, cx_px: f32, top_px: f32, h_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
             div()
                 .id(id)
                 .absolute()
                 .left(px(cx_px - 6.0))
-                .top(px(0.))
+                .top(px(top_px))
                 .w(px(12.))
-                .h(px(h))
+                .h(px(h_px))
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
                     cx.stop_propagation();
@@ -1647,16 +1684,17 @@ impl Docxy {
                 }))
         };
 
-        // A thin margin-boundary grab strip (invisible) for dragging page margins.
-        let margin_handle = |id: &'static str, cx_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
+        // Margin grab strips sit in the grey zone just OUTSIDE the white content
+        // area (Word's margin boundary), clear of the indent markers.
+        let margin_handle = |id: &'static str, left_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
             div()
                 .id(id)
                 .absolute()
-                .left(px(cx_px - 3.0))
+                .left(px(left_px))
                 .top(px(0.))
-                .w(px(6.))
+                .w(px(8.))
                 .h(px(h))
-                .cursor_pointer()
+                .cursor_col_resize()
                 .on_mouse_down(MouseButton::Left, cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
                     cx.stop_propagation();
                     this.ruler_drag_start(which, f32::from(ev.position.x), cx);
@@ -1673,11 +1711,11 @@ impl Docxy {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 this.ruler_click_tab(f32::from(ev.position.x), window, cx);
             }))
-            .child(margin_handle("rh-mleft", ml, RulerHandle::MarginLeft, cx))
+            .child(margin_handle("rh-mleft", ml - 8.0, RulerHandle::MarginLeft, cx))
             .child(margin_handle("rh-mright", content_r, RulerHandle::MarginRight, cx))
-            .child(handle("rh-first", ml + ind + fl, RulerHandle::FirstLine, cx))
-            .child(handle("rh-left", ml + ind, RulerHandle::Left, cx))
-            .child(handle("rh-right", right_marker, RulerHandle::Right, cx));
+            .child(handle("rh-first", ml + ind + fl, 0.0, h * 0.5, RulerHandle::FirstLine, cx))
+            .child(handle("rh-left", ml + ind, h * 0.5, h * 0.5, RulerHandle::Left, cx))
+            .child(handle("rh-right", right_marker, h * 0.5, h * 0.5, RulerHandle::Right, cx));
 
         // The tab-type selector box at the far left (click to cycle L/Centre/Right).
         let tab_glyph = match self.ruler_tab {
@@ -1706,6 +1744,8 @@ impl Docxy {
             .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
             .on_click(cx.listener(|this, _, window, cx| this.cycle_ruler_tab(window, cx)));
 
+        // Drag move/end are handled at the window root (so a drag survives the
+        // pointer leaving this thin strip); the ruler itself only starts drags.
         h_flex()
             .w_full()
             .items_center()
@@ -1713,12 +1753,6 @@ impl Docxy {
             .gap(px(3.))
             .bg(hsla_u(0xdedede))
             .py_0p5()
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
-                if this.ruler_drag.is_some() {
-                    this.ruler_drag_move(f32::from(ev.position.x), window, cx);
-                }
-            }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _w, cx| this.ruler_drag_end(cx)))
             .child(selector)
             .child(container)
             .into_any_element()
@@ -2119,6 +2153,28 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
+    /// swallows Tab for focus traversal before on_key_down sees it).
+    fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+            return;
+        }
+        self.mini_bar = None;
+        self.context_menu = None;
+        self.with_editor(window, cx, |e| e.insert_tab());
+        self.scroll_to_caret();
+    }
+
+    /// Shift+Tab decreases the paragraph indent (Word's outdent).
+    fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+            return;
+        }
+        self.mini_bar = None;
+        self.context_menu = None;
+        self.with_editor(window, cx, |e| e.change_indent(-720));
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = &ev.keystroke.modifiers;
         let ctrl = m.control || m.platform;
@@ -2230,7 +2286,7 @@ impl Docxy {
                 "backspace" => yes(|| ed.backspace()),
                 "delete" => yes(|| ed.delete_forward()),
                 "enter" => yes(|| ed.insert_newline()),
-                "tab" => yes(|| ed.insert_str("\t")),
+                "tab" => yes(|| ed.insert_tab()),
                 "left" => no(|| ed.move_left()),
                 "right" => no(|| ed.move_right()),
                 "home" => no(|| ed.move_home()),
@@ -2599,8 +2655,17 @@ const FONT_NAMES: &[&str] = &["Calibri", "Cambria", "Arial", "Times New Roman", 
 /// Point sizes offered in the Font-size picker.
 const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
+/// Snap a twips measurement to the nearest 1/8" ruler gridline (180 twips), so
+/// dragging a ruler marker sticks to the visible ticks like Word's ruler.
+fn snap_twips(v: i32) -> i32 {
+    const GRID: i32 = 180; // 1/8 inch
+    ((v as f32 / GRID as f32).round() as i32) * GRID
+}
+
 fn caret_bar() -> AnyElement {
-    div().w(px(2.)).h(px(19.)).bg(rgb(BRAND)).into_any_element()
+    // Negative side margins cancel the 2px width so the caret takes no layout
+    // space — it sits between glyphs without nudging them apart to make room.
+    div().w(px(2.)).h(px(19.)).ml(px(-1.)).mr(px(-1.)).bg(rgb(BRAND)).into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4233,9 +4298,23 @@ impl Render for Docxy {
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            // End a text drag-selection wherever the button is released; if it left
-            // a non-empty selection, pop the mini formatting toolbar there.
+            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)))
+            .on_action(cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)))
+            // Ruler drags are tracked at the window level so they keep working when
+            // the pointer leaves the thin ruler strip (gpui move events are
+            // hitbox-scoped, so a ruler-only handler would stop the moment the
+            // cursor moved off it).
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if this.ruler_drag.is_some() {
+                    this.ruler_drag_move(f32::from(ev.position.x), window, cx);
+                }
+            }))
+            // End a text drag-selection or a ruler drag wherever the button is
+            // released; a non-empty text selection pops the mini formatting toolbar.
             .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                if this.ruler_drag.is_some() {
+                    this.ruler_drag_end(cx);
+                }
                 if this.selecting {
                     this.selecting = false;
                     let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
@@ -4256,6 +4335,10 @@ impl Render for Docxy {
             .child(status)
             .when_some(mini_bar, |d, m| d.child(m))
             .when_some(context_menu, |d, m| d.child(m))
+            // A vertical guide line down the page while a ruler marker is dragged.
+            .when_some(self.ruler_guide, |d, gx| {
+                d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))
+            })
             .into_any_element()
     }
 }
@@ -4279,6 +4362,12 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
 fn main() {
     gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
+        // actions so the document can insert a tab / outdent instead.
+        cx.bind_keys([
+            KeyBinding::new("tab", InsertTabAction, None),
+            KeyBinding::new("shift-tab", OutdentAction, None),
+        ]);
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
