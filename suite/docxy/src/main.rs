@@ -2405,6 +2405,34 @@ fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usi
 /// Compute the list marker text for each top-level block (`None` = not a list
 /// item). Bullets use •/◦ by level; decimal lists get real ordinals that restart
 /// per level and break whenever a non-list block interrupts the run.
+/// Extract the header (or footer) block content from a package: resolve the
+/// section's header/footerReference rId → part → parse. Empty if none.
+fn header_footer_blocks(pkg: &Package, is_header: bool) -> Vec<Block> {
+    let sect = pkg.sect_pr();
+    let kind = if is_header { "headerReference" } else { "footerReference" };
+    let rid = match ["default", "first", "even"].iter().find_map(|t| docxcore::load::header_footer_ref_rid(sect, kind, t)) {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let Some(rels_bytes) = pkg.part("word/_rels/document.xml.rels") else { return vec![] };
+    let rels = docxcore::load::parse_rels_xml(&String::from_utf8_lossy(rels_bytes));
+    let Some(target) = rels.target(&rid) else { return vec![] };
+    let part_name = format!("word/{}", target.trim_start_matches('/'));
+    let Some(xml) = pkg.part(&part_name) else { return vec![] };
+    docxcore::load::parse_header_footer(&String::from_utf8_lossy(xml), &rels)
+}
+
+/// Render header/footer blocks read-only (no caret, no click) for the page margins.
+fn hf_els(blocks: &[Block], pal: Pal) -> Vec<AnyElement> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, pal)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Rough rendered height (px) of a block, for paginating Print Layout. Text is
 /// estimated from a character-per-line calc; close enough to place page breaks.
 fn block_height_est(b: &Block, content_w: f32) -> f32 {
@@ -3412,23 +3440,30 @@ impl Render for Docxy {
                         let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
                         let ranges = paginate(body, content_h, content_w);
                         let show_ruler = self.show_ruler;
+                        // Header / footer content (repeated on every page in the margins).
+                        let (hdr, ftr) = tab.pkg.as_ref().map(|p| (header_footer_blocks(p, true), header_footer_blocks(p, false))).unwrap_or_default();
+                        let has_hf = !hdr.is_empty() || !ftr.is_empty();
                         let sheets: Vec<AnyElement> = ranges
                             .into_iter()
                             .map(|(s, e)| {
                                 let page_blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
-                                let page = v_flex()
+                                let page_base = v_flex()
                                     .w(tw(geom.w))
                                     .min_h(tw(geom.h))
                                     .bg(hsla_u(0xffffff))
                                     .text_color(doc_pal.fg)
                                     .border_1()
-                                    .border_color(hsla_u(0xd0d0d0))
-                                    .pt(tw(geom.mt))
-                                    .pr(tw(geom.mr))
-                                    .pb(tw(geom.mb))
-                                    .pl(tw(geom.ml))
-                                    .gap_1()
-                                    .children(page_blocks);
+                                    .border_color(hsla_u(0xd0d0d0));
+                                let page = if has_hf {
+                                    // Header in the top margin, content in the middle, footer
+                                    // in the bottom margin.
+                                    page_base
+                                        .child(div().min_h(tw(geom.mt)).pt(tw(geom.mt / 2)).pl(tw(geom.ml)).pr(tw(geom.mr)).children(hf_els(&hdr, doc_pal)))
+                                        .child(v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).gap_1().children(page_blocks))
+                                        .child(div().min_h(tw(geom.mb)).pl(tw(geom.ml)).pr(tw(geom.mr)).children(hf_els(&ftr, doc_pal)))
+                                } else {
+                                    page_base.pt(tw(geom.mt)).pr(tw(geom.mr)).pb(tw(geom.mb)).pl(tw(geom.ml)).gap_1().children(page_blocks)
+                                };
                                 h_flex()
                                     .items_stretch()
                                     .gap(px(3.))
