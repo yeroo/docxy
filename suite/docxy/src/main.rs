@@ -352,6 +352,9 @@ struct RenderCtx<'a> {
     active: bool,
     /// Text measurer for tab-stop positioning.
     meas: &'a Measurer,
+    /// Content width (px) when rendering header/footer paragraphs, enabling the
+    /// implicit centre/right tab stops. `None` for body paragraphs.
+    hf_width: Option<f32>,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -2930,11 +2933,11 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
 
 
 /// Render header/footer blocks read-only (no caret, no click) for the page margins.
-fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer) -> Vec<AnyElement> {
+fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<AnyElement> {
     blocks
         .iter()
         .filter_map(|b| match b {
-            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, 1.0, pal, Some(meas))),
+            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, 1.0, pal, Some(meas), Some(hf_width))),
             _ => None,
         })
         .collect()
@@ -3029,7 +3032,8 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, zoom: f32, pal: Pal, meas: Option<&Measurer>) -> AnyElement {
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, zoom: f32, pal: Pal, meas: Option<&Measurer>, hf_width: Option<f32>) -> AnyElement {
+    use docxcore::model::TabAlign;
     let base = zoom
         * match p.props.heading_level {
             Some(1) => 26.0,
@@ -3048,20 +3052,70 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
     let pad_l = zoom * ((p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0);
     let interval = zoom * 720.0 / 15.0; // Word's default tab stop: every 1/2"
-    let customs: Vec<f32> = p.props.tabs.iter().map(|t| zoom * t.pos as f32 / 15.0).collect();
-    let max_custom = customs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut customs: Vec<(f32, TabAlign)> = p.props.tabs.iter().map(|t| (zoom * t.pos as f32 / 15.0, t.align)).collect();
+    // Header/footer paragraphs with no explicit tabs get Word's implicit centre +
+    // right stops, so a centred title / right-aligned page number lands correctly.
+    if customs.is_empty() {
+        if let Some(w) = hf_width {
+            customs.push((w * 0.5, TabAlign::Center));
+            // A few px inside the edge so a right-aligned segment ending exactly at
+            // the content width doesn't trip the row's flex-wrap onto a new line.
+            customs.push(((w - 4.0).max(0.0), TabAlign::Right));
+        }
+    }
+    let max_custom = customs.iter().map(|(c, _)| *c).fold(f32::NEG_INFINITY, f32::max);
     let mut x = 0.0_f32;
     // Only paragraphs that actually contain a tab need per-run width measurement.
     let has_tab = p.content.iter().any(|i| matches!(i, Inline::Tab(_)));
+    let m = meas.filter(|_| has_tab);
     // Width of a run's text at its effective size (matching emit_words' sizing).
     let run_w = |r: &docxcore::model::Run| -> f32 {
-        match meas.filter(|_| has_tab) {
+        match m {
             Some(m) => {
                 let sz = r.props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
                 m.width(&r.text, sz, r.props.bold, r.props.italic)
             }
             None => 0.0,
         }
+    };
+    // The rendered width of a single inline (for tracking x and looking ahead to
+    // size centre/right tabs). Inlines with no measurable text contribute 0.
+    let inline_w = |it: &Inline| -> f32 {
+        match it {
+            Inline::Run(r) => run_w(r),
+            Inline::Hyperlink(h) => h.runs.iter().map(run_w).sum(),
+            Inline::Field { text, .. } => m.map(|m| m.width(if text.is_empty() { "[field]" } else { text }, base, false, false)).unwrap_or(0.0),
+            Inline::FootnoteRef { id, .. } => m.map(|m| m.width(&id.to_string(), base * 0.72, false, false)).unwrap_or(0.0),
+            _ => 0.0,
+        }
+    };
+    // Total width of content from index `from` up to the next tab / break / end —
+    // the segment a centre/right tab must position.
+    let seg_width = |from: usize| -> f32 {
+        p.content[from..].iter().take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(_))).map(&inline_w).sum()
+    };
+    // The next tab stop strictly past `xm` (twips-px from the margin) and its
+    // alignment: the nearest custom stop, else the default 1/2" grid (defaults
+    // are suppressed up to the last custom stop, as Word does).
+    let next_stop = |xm: f32| -> (f32, TabAlign) {
+        let mut pos = f32::INFINITY;
+        let mut align = TabAlign::Left;
+        for &(c, a) in &customs {
+            if c > xm + 0.5 && c < pos {
+                pos = c;
+                align = a;
+            }
+        }
+        let lo = xm.max(if max_custom.is_finite() { max_custom } else { 0.0 });
+        let mut d = ((lo / interval).floor() + 1.0) * interval;
+        while d <= xm + 0.5 {
+            d += interval;
+        }
+        if d < pos {
+            pos = d;
+            align = TabAlign::Left;
+        }
+        (pos, align)
     };
 
     if let Some(m) = marker {
@@ -3072,7 +3126,8 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
             x += ms.width(m, base, false, false);
         }
     }
-    for inline in &p.content {
+    for i in 0..p.content.len() {
+        let inline = &p.content[i];
         match inline {
             Inline::Run(r) => {
                 emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, click, pal);
@@ -3085,20 +3140,16 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                 }
             }
             Inline::Tab(_) => {
-                // Advance to the next tab stop past the current x (from the margin).
+                // Advance to the next stop; centre/right stops position the segment
+                // that follows (up to the next tab) so it centres on / ends at it.
                 let xm = pad_l + x;
-                let lo = xm.max(if max_custom.is_finite() { max_custom } else { 0.0 });
-                let mut d = ((lo / interval).floor() + 1.0) * interval;
-                while d <= xm + 0.5 {
-                    d += interval;
+                let (stop, align) = next_stop(xm);
+                let w = match align {
+                    TabAlign::Left => stop - xm,
+                    TabAlign::Right => stop - seg_width(i + 1) - xm,
+                    TabAlign::Center => stop - seg_width(i + 1) / 2.0 - xm,
                 }
-                let mut next = d;
-                for &c in &customs {
-                    if c > xm + 0.5 {
-                        next = next.min(c);
-                    }
-                }
-                let w = (next - xm).max(3.0);
+                .max(3.0);
                 emit_tab(&mut spans, &mut idx, &mut caret, sel, click, marks, base, w, pal);
                 x += w;
             }
@@ -3129,10 +3180,12 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                 // field, not plain text.
                 let shown = if text.is_empty() { "[field]".to_string() } else { text.clone() };
                 spans.push(div().px(px(2.)).rounded_sm().bg(pal.panel).text_size(px(base)).text_color(pal.fg).child(SharedString::from(shown)).into_any_element());
+                x += inline_w(inline);
             }
             Inline::FootnoteRef { id, .. } => {
                 // A superscript note number in the brand colour.
                 spans.push(div().text_size(px(base * 0.72)).text_color(hsla_u(BRAND)).relative().top(px(-(base * 0.35))).child(SharedString::from(id.to_string())).into_any_element());
+                x += inline_w(inline);
             }
             other => {
                 let tag = match other {
@@ -3224,7 +3277,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
             let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
             let sel = ctx.active.then(|| ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e))).flatten();
             let click = ctx.active.then_some(Click { ent: ctx.ent, path: &path });
-            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal, Some(ctx.meas))
+            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal, Some(ctx.meas), ctx.hf_width)
         }
         Block::Table(t) => table_el(t, &path, ctx),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
@@ -4163,7 +4216,7 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom, active: hf.is_none(), meas: &measurer };
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom, active: hf.is_none(), meas: &measurer, hf_width: None };
                     let body = &editor.doc.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete white page sheets
@@ -4208,8 +4261,10 @@ impl Render for Docxy {
                                 (false, _) => &fdef,
                             }
                         };
+                        // Header/footer text-area width, for the implicit centre/right tab stops.
+                        let hf_w = self.zoom * (geom.w - geom.ml - geom.mr).max(0) as f32 / 15.0;
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
-                        let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true, meas: &measurer });
+                        let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true, meas: &measurer, hf_width: Some(hf_w) });
                         // The first page whose region+variant matches the one being
                         // edited is the editable page (fallback page 0, so the surface
                         // is always visible even for a not-yet-shown variant).
@@ -4225,10 +4280,10 @@ impl Render for Docxy {
                                         return h.editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect();
                                     }
                                     let blocks: &[Block] = if dv == h.variant { &h.editor.doc.body } else { pick(is_h, dv) };
-                                    return hf_els(blocks, doc_pal, &measurer);
+                                    return hf_els(blocks, doc_pal, &measurer, hf_w);
                                 }
                             }
-                            hf_els(pick(is_h, dv), doc_pal, &measurer)
+                            hf_els(pick(is_h, dv), doc_pal, &measurer, hf_w)
                         };
                         let sheets: Vec<AnyElement> = ranges
                             .iter()
