@@ -231,6 +231,8 @@ struct Docxy {
     selecting: bool,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
+    // Right-click context menu position (window coords), if open.
+    context_menu: Option<Point<Pixels>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -512,6 +514,7 @@ impl Docxy {
             ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             selecting: false,
             keytips: KeyTip::Off,
+            context_menu: None,
         };
         this.persist();
         this
@@ -2821,6 +2824,68 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// The right-click context menu (clipboard + quick formatting), anchored at the
+    /// click position, over a full-window backdrop that dismisses it.
+    fn context_menu_el(&self, at: Point<Pixels>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let item = |cx: &mut Context<Self>, id: &'static str, label: &'static str, icon: &'static str, act: Act| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(pal.fg)
+                .hover(|d| d.bg(pal.hover))
+                .when(!icon.is_empty(), |d| d.child(icon_svg(icon, 14., pal.fg)))
+                .when(icon.is_empty(), |d| d.child(div().w(px(14.))))
+                .child(SharedString::from(label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.context_menu = None;
+                    this.dispatch(act, window, cx);
+                }))
+        };
+        let sep = || div().h(px(1.)).mx_2().my_0p5().bg(pal.border);
+        let menu = v_flex()
+            .absolute()
+            .left(at.x)
+            .top(at.y)
+            .w(px(200.))
+            .py_1()
+            .rounded_md()
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border)
+            .shadow_lg()
+            .child(item(cx, "cm-cut", "Cut", "cut", Act::Cut))
+            .child(item(cx, "cm-copy", "Copy", "copy", Act::Copy))
+            .child(item(cx, "cm-paste", "Paste", "paste", Act::Paste))
+            .child(sep())
+            .child(item(cx, "cm-bold", "Bold", "bold", Act::Bold))
+            .child(item(cx, "cm-italic", "Italic", "italic", Act::Italic))
+            .child(item(cx, "cm-underline", "Underline", "underline", Act::Underline))
+            .child(sep())
+            .child(item(cx, "cm-comment", "New Comment", "comment-add", Act::NewComment));
+        // Full-window backdrop to catch outside clicks / right-clicks.
+        div()
+            .id("cm-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _w, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _w, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .child(menu)
+            .into_any_element()
+    }
+
     /// Handle a letter pressed while KeyTips are showing: pick a tab (Tabs level)
     /// or run a command (Commands level).
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -3627,13 +3692,20 @@ impl Render for Docxy {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
+            // Right-click anywhere in the document body opens the context menu.
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                this.context_menu = Some(ev.position);
+                cx.notify();
+            }))
             .when_some(nav_panel, |d, n| d.child(n))
             .child(content)
             .when_some(comments_panel, |d, p| d.child(p))
             .when_some(notes_panel, |d, p| d.child(p));
+        let context_menu = self.context_menu.map(|at| self.context_menu_el(at, pal, cx));
 
         v_flex()
             .size_full()
+            .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             // End a text drag-selection wherever the button is released.
@@ -3653,6 +3725,7 @@ impl Render for Docxy {
             .when_some(ruler, |d, r| d.child(r))
             .child(body)
             .child(status)
+            .when_some(context_menu, |d, m| d.child(m))
             .into_any_element()
     }
 }
