@@ -528,7 +528,16 @@ impl Docxy {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
-        let this = Self {
+        let this = Self::build(tabs, active, session.theme, cx);
+        this.persist();
+        this
+    }
+
+    /// Assemble the app state from ready tabs, with everything else at defaults.
+    /// The disk-free half of `new`, so tests can seed a known document without
+    /// touching the user's session.
+    fn build(tabs: Vec<DocTab>, active: usize, theme_pref: ThemePref, cx: &mut Context<Self>) -> Self {
+        Self {
             tabs,
             active,
             focus: cx.focus_handle(),
@@ -538,7 +547,7 @@ impl Docxy {
             backstage: false,
             bs_new: false,
             clip: None,
-            theme_pref: session.theme,
+            theme_pref,
             applied: None,
             find_open: false,
             find_query: String::new(),
@@ -564,10 +573,9 @@ impl Docxy {
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
-        };
-        this.persist();
-        this
+        }
     }
+
 
     fn persist(&self) {
         let hd = hot_dir();
