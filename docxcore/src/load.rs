@@ -973,6 +973,19 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     }
                     p.skip_element();
                 }
+                "w:spacing" => {
+                    props.spacing = crate::model::Spacing {
+                        before: frame_int(p, "w:before"),
+                        after: frame_int(p, "w:after"),
+                        before_lines: frame_int(p, "w:beforeLines"),
+                        after_lines: frame_int(p, "w:afterLines"),
+                        before_auto: frame_str(p, "w:beforeAutospacing"),
+                        after_auto: frame_str(p, "w:afterAutospacing"),
+                        line: frame_int(p, "w:line"),
+                        line_rule: frame_str(p, "w:lineRule"),
+                    };
+                    p.skip_element();
+                }
                 "w:sectPr" => {
                     // A mid-document section break — preserve it verbatim.
                     let start = p.start_pos();

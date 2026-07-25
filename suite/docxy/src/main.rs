@@ -2002,12 +2002,28 @@ enum Act {
     Cut, Copy, Paste,
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
-    Sort, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
+    Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
     InsertField, PageBreak, ToggleNotes, InsertTable,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
+}
+
+/// The common Word line-spacing presets, as (multiple, `w:line` twips). The Line
+/// Spacing ribbon button cycles through these.
+const LINE_SPACINGS: [(f32, i32); 4] = [(1.0, 240), (1.15, 276), (1.5, 360), (2.0, 480)];
+
+/// Given the caret paragraph's current line multiple, the `w:line` value of the
+/// next preset in the cycle. An unrecognized/absent value jumps to 1.5×, which is
+/// a visible change from Word's single-spaced default.
+fn next_line_spacing(cur: Option<f32>) -> i32 {
+    let idx = cur.and_then(|c| LINE_SPACINGS.iter().position(|(m, _)| (m - c).abs() < 0.03));
+    let next = match idx {
+        Some(i) => (i + 1) % LINE_SPACINGS.len(),
+        None => 2, // 1.5×
+    };
+    LINE_SPACINGS[next].1
 }
 
 // The two numbering ids new_markdown_package defines: 1 = bullets, 2 = decimal.
@@ -2062,6 +2078,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                     rs::btn(cmdt("numbers", "list-numbered", "Numbering", Numbers, "").key("N")),
                     rs::btn(cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M").key("O")),
                     rs::btn(cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M").key("P")),
+                    rs::btn(cmdt("linespacing", "line-spacing", "Line and Paragraph Spacing", LineSpacing, "").key("Y")),
                     rs::btn(cmdt("sort", "sort", "Sort", Sort, "").key("S")),
                     rs::btn(cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "").key("H")),
                 ],
@@ -2688,7 +2705,10 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         spans.push(div().text_size(px(base)).text_color(pal.dim).child("\u{00B6}").into_any_element());
     }
     let has_border = p.props.borders.bottom.is_some();
-    let mut row = h_flex().w_full().flex_wrap().min_h(px(base + 6.));
+    // Line spacing (auto-rule multiple; exact/atLeast fall back to single here).
+    let line_mult = p.props.spacing.line_multiple().unwrap_or(1.0).clamp(0.5, 4.0);
+    let line_h = base * 1.35 * line_mult;
+    let mut row = h_flex().w_full().flex_wrap().min_h(px(line_h.max(base + 6.))).line_height(px(line_h));
     row = match p.props.align {
         Align::Center => row.justify_center(),
         Align::Right => row.justify_end(),
@@ -2702,9 +2722,14 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     // indent gutter) that drops the caret at the paragraph end. Word clicks fire
     // first and stop propagation, so this only runs on a "past the text" click.
     let para_end = idx;
+    // Space before / after the paragraph (`w:spacing` before/after, twips → px).
+    let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
+    let sp_after = zoom * (p.props.spacing.after.unwrap_or(0).max(0) as f32) / 15.0;
     v_flex()
         .w_full()
         .py_0p5()
+        .when(sp_before > 0.5, |d| d.pt(px(sp_before)))
+        .when(sp_after > 0.5, |d| d.pb(px(sp_after)))
         .pl(px(pad))
         .pr(px(pad_r))
         .when(is_heading, |d| d.mt_2())
@@ -3075,6 +3100,9 @@ impl Docxy {
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
                 Sort => e.sort_paragraphs(),
+                // Word's Line Spacing button is a dropdown; we cycle the common
+                // presets (1.0 → 1.15 → 1.5 → 2.0 → back), all auto-rule.
+                LineSpacing => e.set_line_spacing(next_line_spacing(e.caret_line_multiple()), "auto"),
                 ParaBorders => {
                     let has = e.caret_para_props().borders.bottom.is_some();
                     let b = if has { ParBorders::default() } else { ParBorders { top: None, bottom: Some(BorderKind::Single) } };

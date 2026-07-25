@@ -159,6 +159,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.indent != 0
         || props.indent_right != 0
         || props.first_line != 0
+        || !props.spacing.is_empty()
         || !props.tabs.is_empty()
         || !props.raw_props.is_empty();
     if !has_any {
@@ -261,6 +262,44 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         }
         x.push_str("</w:tabs>");
         parts.push((ppr_rank("tabs"), x));
+    }
+    if !props.spacing.is_empty() {
+        let sp = &props.spacing;
+        let mut x = String::from("<w:spacing");
+        // Emitted in CT_Spacing schema order (Word ignores attribute order, but
+        // matching the schema keeps diffs against real files small).
+        if let Some(v) = sp.before {
+            x.push_str(&format!(" w:before=\"{v}\""));
+        }
+        if let Some(v) = sp.before_lines {
+            x.push_str(&format!(" w:beforeLines=\"{v}\""));
+        }
+        if let Some(a) = &sp.before_auto {
+            x.push_str(" w:beforeAutospacing=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
+        }
+        if let Some(v) = sp.after {
+            x.push_str(&format!(" w:after=\"{v}\""));
+        }
+        if let Some(v) = sp.after_lines {
+            x.push_str(&format!(" w:afterLines=\"{v}\""));
+        }
+        if let Some(a) = &sp.after_auto {
+            x.push_str(" w:afterAutospacing=\"");
+            esc_attr(a, &mut x);
+            x.push('"');
+        }
+        if let Some(v) = sp.line {
+            x.push_str(&format!(" w:line=\"{v}\""));
+        }
+        if let Some(r) = &sp.line_rule {
+            x.push_str(" w:lineRule=\"");
+            esc_attr(r, &mut x);
+            x.push('"');
+        }
+        x.push_str("/>");
+        parts.push((ppr_rank("spacing"), x));
     }
     if props.indent != 0 || props.first_line != 0 || props.indent_right != 0 {
         let mut x = String::from("<w:ind");
@@ -546,15 +585,19 @@ mod tests {
 
     #[test]
     fn preserves_unmodeled_para_table_and_cell_props() {
-        // A paragraph carrying shading + spacing (both unmodeled), and a table
-        // whose tblPr / trPr / tcPr carry borders + shading — none of which the
-        // model represents — must all survive a save round-trip instead of being
-        // silently dropped (docxy gap D-1).
+        // A paragraph carrying shading (unmodeled) + spacing (modeled), and a
+        // table whose tblPr / trPr / tcPr carry borders + shading — none of which
+        // the model represents — must all survive a save round-trip instead of
+        // being silently dropped (docxy gap D-1).
         let ppr = ParProps {
             raw_props: vec![
                 "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FFFF00\"/>".to_string(),
-                "<w:spacing w:before=\"120\" w:after=\"120\"/>".to_string(),
             ],
+            spacing: crate::model::Spacing {
+                before: Some(120),
+                after: Some(120),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cell = Cell {

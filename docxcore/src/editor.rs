@@ -934,6 +934,24 @@ impl Editor {
         self.caret_para_props().indent_right
     }
 
+    /// Set the line spacing (`w:line` + `w:lineRule`) of the selected paragraphs.
+    /// Word's presets are all `auto`-rule: 240 = single, 276 = 1.15, 360 = 1.5,
+    /// 480 = double. Space before/after is left untouched.
+    pub fn set_line_spacing(&mut self, line: i32, rule: &str) {
+        let rule = rule.to_string();
+        self.for_each_para(move |pr| {
+            pr.spacing.line = Some(line);
+            pr.spacing.line_rule = Some(rule.clone());
+        });
+    }
+
+    /// The line-spacing multiple at the caret (1.0 = single, 1.5, 2.0, …), or
+    /// `None` when the paragraph uses an exact/at-least rule or no line spacing.
+    /// Used to light the active line-spacing choice in the ribbon.
+    pub fn caret_line_multiple(&self) -> Option<f32> {
+        self.caret_para_props().spacing.line_multiple()
+    }
+
     /// Replace the direct tab stops of the selected paragraphs.
     pub fn set_tabs(&mut self, tabs: Vec<crate::model::TabStop>) {
         self.for_each_para(move |pr| pr.tabs = tabs.clone());
@@ -2273,6 +2291,25 @@ mod tests {
         ed.anchor = Some(Caret::top(0, 1));
         ed.caret = Caret::top(1, 2);
         assert_eq!(ed.selection_spans(), vec![(vec![0], 1, 3), (vec![1], 0, 2)]);
+    }
+
+    #[test]
+    fn line_spacing_sets_and_reads_multiple() {
+        let mut ed = Editor::new(doc(&["a", "b"]));
+        ed.anchor = Some(Caret::top(0, 0));
+        ed.caret = Caret::top(1, 1);
+        ed.set_line_spacing(360, "auto"); // 1.5×
+        for b in &ed.doc.body {
+            if let Block::Paragraph(p) = b {
+                assert_eq!(p.props.spacing.line, Some(360));
+                assert_eq!(p.props.spacing.line_rule.as_deref(), Some("auto"));
+            }
+        }
+        ed.caret = Caret::top(0, 0);
+        assert_eq!(ed.caret_line_multiple(), Some(1.5));
+        // An exact rule is not a plain multiple.
+        ed.set_line_spacing(240, "exact");
+        assert_eq!(ed.caret_line_multiple(), None);
     }
 
     #[test]

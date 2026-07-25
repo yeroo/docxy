@@ -221,10 +221,65 @@ pub struct ParProps {
     /// Right indent in twips (`w:ind w:right`/`w:end`). Pulls the paragraph's right
     /// edge in from the right margin.
     pub indent_right: i32,
-    /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`, spacing
-    /// `w:spacing`, `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
+    /// Paragraph spacing (`w:spacing`): line spacing plus space before/after.
+    /// All-`None` means no `w:spacing` element is emitted.
+    pub spacing: Spacing,
+    /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`,
+    /// `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
     /// silently drop them. Re-emitted in `w:pPr` in document order.
     pub raw_props: Vec<String>,
+}
+
+/// Paragraph spacing (`w:spacing`). Every CT_Spacing attribute is modeled so a
+/// paragraph's spacing round-trips losslessly while `line`/`line_rule` stay
+/// editable. Absent attributes are `None`; an all-`None` `Spacing` emits nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Spacing {
+    /// Space before the paragraph, in twips (`w:before`).
+    pub before: Option<i32>,
+    /// Space after the paragraph, in twips (`w:after`).
+    pub after: Option<i32>,
+    /// Space before, in hundredths of a line (`w:beforeLines`).
+    pub before_lines: Option<i32>,
+    /// Space after, in hundredths of a line (`w:afterLines`).
+    pub after_lines: Option<i32>,
+    /// `w:beforeAutospacing` (ST_OnOff) — kept as its raw token for losslessness.
+    pub before_auto: Option<String>,
+    /// `w:afterAutospacing` (ST_OnOff) — kept as its raw token.
+    pub after_auto: Option<String>,
+    /// Line spacing value (`w:line`). Meaning depends on `line_rule`: in 240ths of
+    /// a line for `auto` (240 = single, 360 = 1.5×, 480 = double), or twips for
+    /// `exact`/`atLeast`.
+    pub line: Option<i32>,
+    /// `w:lineRule`: `"auto"`, `"exact"`, or `"atLeast"`.
+    pub line_rule: Option<String>,
+}
+
+impl Spacing {
+    /// No spacing attributes set — no `w:spacing` element is written.
+    pub fn is_empty(&self) -> bool {
+        self.before.is_none()
+            && self.after.is_none()
+            && self.before_lines.is_none()
+            && self.after_lines.is_none()
+            && self.before_auto.is_none()
+            && self.after_auto.is_none()
+            && self.line.is_none()
+            && self.line_rule.is_none()
+    }
+
+    /// The line-spacing multiple (e.g. 1.0, 1.5, 2.0) when `line_rule` is `auto`
+    /// (or absent, which Word treats as `auto`). `None` for `exact`/`atLeast`.
+    pub fn line_multiple(&self) -> Option<f32> {
+        let auto = self
+            .line_rule
+            .as_deref()
+            .map_or(true, |r| r == "auto");
+        if !auto {
+            return None;
+        }
+        self.line.map(|l| l as f32 / 240.0)
+    }
 }
 
 /// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
