@@ -127,6 +127,8 @@ struct PersistTab {
     /// content. Restored in preference to `path` so edits survive a restart.
     #[serde(default)]
     hot: Option<String>,
+    #[serde(default)]
+    markdown: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -176,6 +178,8 @@ struct DocTab {
     pkg: Option<Package>,
     /// Footnotes / endnotes parsed from the package (display-only side panel).
     notes: Vec<docxcore::notes::Note>,
+    /// This tab is Markdown-backed (opened from a `.md`); Save writes Markdown.
+    markdown: bool,
 }
 
 struct Docxy {
@@ -321,16 +325,22 @@ struct Loaded {
     comments: Vec<Comment>,
     notes: Vec<docxcore::notes::Note>,
     pkg: Option<Package>,
+    markdown: bool,
     status: SharedString,
 }
 
 impl Loaded {
     fn empty(status: impl Into<SharedString>) -> Self {
-        Loaded { doc: empty_doc(), comments: vec![], notes: vec![], pkg: None, status: status.into() }
+        Loaded { doc: empty_doc(), comments: vec![], notes: vec![], pkg: None, markdown: false, status: status.into() }
     }
     fn into_tab(self, kind: Kind, title: SharedString, path: Option<PathBuf>, dirty: bool) -> DocTab {
-        DocTab { kind, title, path, surface: Surface::Doc(Editor::new(self.doc)), dirty, status: self.status, comments: self.comments, pkg: self.pkg, notes: self.notes }
+        DocTab { kind, title, path, surface: Surface::Doc(Editor::new(self.doc)), dirty, status: self.status, comments: self.comments, pkg: self.pkg, notes: self.notes, markdown: self.markdown }
     }
+}
+
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    let l = path.to_string_lossy().to_lowercase();
+    l.ends_with(".md") || l.ends_with(".markdown") || l.ends_with(".mdown")
 }
 
 /// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
@@ -341,6 +351,7 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             comments: docxcore::comments::parse_comments(&pkg),
             notes: docxcore::notes::parse_notes(&pkg),
             pkg: Some(pkg),
+            markdown: false,
             status: "loaded".into(),
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
@@ -349,6 +360,14 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
 
 fn doc_from_path(path: &PathBuf) -> Loaded {
     match std::fs::read(path) {
+        Ok(bytes) if is_markdown_path(path) => Loaded {
+            doc: docxcore::markdown::from_markdown(&String::from_utf8_lossy(&bytes)),
+            comments: vec![],
+            notes: vec![],
+            pkg: None,
+            markdown: true,
+            status: "loaded (markdown)".into(),
+        },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
     }
@@ -432,7 +451,7 @@ impl Docxy {
             // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
             // back to the real file on disk, then to an empty doc.
             let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
-            let tab = match (t.kind, &hot) {
+            let mut tab = match (t.kind, &hot) {
                 (Kind::Docx, Some(hp)) => {
                     let mut l = doc_from_path(hp);
                     l.status = if t.dirty { "unsaved — restored".into() } else { "loaded".into() };
@@ -440,9 +459,12 @@ impl Docxy {
                 }
                 _ => {
                     let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
-                    DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments, pkg, notes }
+                    let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
+                    DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments, pkg, notes, markdown }
                 }
             };
+            // The hot sidecar is always .docx; restore the Markdown flag from session.
+            tab.markdown = t.markdown || tab.markdown;
             tabs.push(tab);
         }
         if tabs.is_empty() {
@@ -507,6 +529,7 @@ impl Docxy {
                     path: t.path.as_ref().map(|p| p.display().to_string()),
                     dirty: t.dirty,
                     hot,
+                    markdown: t.markdown,
                 }
             })
             .collect();
@@ -538,7 +561,7 @@ impl Docxy {
             Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
-        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![] });
+        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![], markdown: false });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -578,7 +601,12 @@ impl Docxy {
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
-        let bytes = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+        // Markdown-backed tabs save as Markdown; everything else as lossless .docx.
+        let bytes = if tab.markdown {
+            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
+        } else {
+            doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
+        };
         let path = tab
             .path
             .clone()
@@ -600,10 +628,15 @@ impl Docxy {
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let start = self.tabs.get(self.active).map(|t| t.title.to_string()).unwrap_or_else(|| "Untitled.docx".into());
-        if let Some(path) =
-            rfd::FileDialog::new().add_filter("Word document", &["docx"]).set_file_name(start).save_file()
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Word document", &["docx"])
+            .add_filter("Markdown", &["md", "markdown"])
+            .set_file_name(start)
+            .save_file()
         {
             if let Some(tab) = self.tabs.get_mut(self.active) {
+                // Choosing a .md name switches the tab to Markdown, and vice-versa.
+                tab.markdown = is_markdown_path(&path);
                 tab.path = Some(path);
             }
             self.save_active(window, cx);
@@ -613,7 +646,7 @@ impl Docxy {
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("Word document", &["docx"]).pick_file() {
+        if let Some(path) = rfd::FileDialog::new().add_filter("Word or Markdown", &["docx", "md", "markdown"]).add_filter("Word document", &["docx"]).add_filter("Markdown", &["md", "markdown"]).pick_file() {
             let title = file_name(&path).into();
             let tab = doc_from_path(&path).into_tab(Kind::Docx, title, Some(path), false);
             self.tabs.push(tab);
