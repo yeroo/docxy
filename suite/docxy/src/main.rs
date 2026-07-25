@@ -229,6 +229,15 @@ struct Docxy {
     ruler_x0: std::rc::Rc<std::cell::Cell<f32>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
+    // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
+    keytips: KeyTip,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyTip {
+    Off,
+    Tabs,
+    Commands,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -502,6 +511,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             selecting: false,
+            keytips: KeyTip::Off,
         };
         this.persist();
         this
@@ -1834,6 +1844,24 @@ impl Docxy {
         let ctrl = m.control || m.platform;
         let shift = m.shift;
         let key = ev.keystroke.key.clone();
+        // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
+        // letters pick a tab / run a command instead of typing.
+        if (key == "alt" || key == "f10") && !ctrl {
+            self.keytips = if self.keytips == KeyTip::Off { KeyTip::Tabs } else { KeyTip::Off };
+            cx.notify();
+            return;
+        }
+        if self.keytips != KeyTip::Off {
+            if key == "escape" {
+                self.keytips = if self.keytips == KeyTip::Commands { KeyTip::Tabs } else { KeyTip::Off };
+                cx.notify();
+                return;
+            }
+            if let Some(c) = ev.keystroke.key_char.as_deref().filter(|c| c.chars().count() == 1 && c.chars().next().is_some_and(|ch| ch.is_ascii_alphanumeric())) {
+                return self.keytip_input(c, window, cx);
+            }
+            return; // swallow other keys while KeyTips are up
+        }
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
@@ -1968,10 +1996,10 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
         rs::tab("Home", "H", vec![
             // Clipboard: a large Paste button + a small Cut/Copy column (Word).
             rs::group("Clipboard", 10, vec![
-                Control::Large(cmdt("paste", "paste", "Paste", Paste, "Ctrl+V")),
+                Control::Large(cmdt("paste", "paste", "Paste", Paste, "Ctrl+V").key("V")),
                 rs::column(vec![
-                    cmdt("cut", "cut", "Cut", Cut, "Ctrl+X"),
-                    cmdt("copy", "copy", "Copy", Copy, "Ctrl+C"),
+                    cmdt("cut", "cut", "Cut", Cut, "Ctrl+X").key("X"),
+                    cmdt("copy", "copy", "Copy", Copy, "Ctrl+C").key("C"),
                 ]),
             ]),
             // Font: two rows — combos + size controls on top, character toggles below.
@@ -1979,39 +2007,39 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 vec![
                     rs::combo(cmdt("fontname", "font-name", "Font", FontName, ""), true),
                     rs::combo(cmdt("fontsize", "font-size", "Font size", FontSize, ""), false),
-                    rs::btn(cmdt("grow", "font-increase", "Grow font", Grow, "")),
-                    rs::btn(cmdt("shrink", "font-decrease", "Shrink font", Shrink, "")),
-                    rs::btn(cmdt("case", "case", "Change case", Case, "")),
-                    rs::btn(cmdt("clearfmt", "clear-format", "Clear formatting", ClearFmt, "")),
+                    rs::btn(cmdt("grow", "font-increase", "Grow font", Grow, "").key("G")),
+                    rs::btn(cmdt("shrink", "font-decrease", "Shrink font", Shrink, "").key("K")),
+                    rs::btn(cmdt("case", "case", "Change case", Case, "").key("7")),
+                    rs::btn(cmdt("clearfmt", "clear-format", "Clear formatting", ClearFmt, "").key("E")),
                 ],
                 vec![
-                    rs::btn(cmdt("b", "bold", "Bold", Bold, "Ctrl+B")),
-                    rs::btn(cmdt("i", "italic", "Italic", Italic, "Ctrl+I")),
-                    rs::btn(cmdt("u", "underline", "Underline", Underline, "Ctrl+U")),
-                    rs::btn(cmdt("s", "strikethrough", "Strikethrough", Strike, "")),
-                    rs::btn(cmdt("sub", "subscript", "Subscript", Sub, "")),
-                    rs::btn(cmdt("sup", "superscript", "Superscript", Super, "")),
-                    rs::btn(cmdt("color", "text-color", "Font colour", FontColor, "")),
-                    rs::btn(cmdt("hl", "highlight", "Text highlight", Highlight, "")),
+                    rs::btn(cmdt("b", "bold", "Bold", Bold, "Ctrl+B").key("1")),
+                    rs::btn(cmdt("i", "italic", "Italic", Italic, "Ctrl+I").key("2")),
+                    rs::btn(cmdt("u", "underline", "Underline", Underline, "Ctrl+U").key("3")),
+                    rs::btn(cmdt("s", "strikethrough", "Strikethrough", Strike, "").key("4")),
+                    rs::btn(cmdt("sub", "subscript", "Subscript", Sub, "").key("5")),
+                    rs::btn(cmdt("sup", "superscript", "Superscript", Super, "").key("6")),
+                    rs::btn(cmdt("color", "text-color", "Font colour", FontColor, "").key("8")),
+                    rs::btn(cmdt("hl", "highlight", "Text highlight", Highlight, "").key("9")),
                 ],
             ])])
             .launcher(LaunchFont),
             // Paragraph: two rows — lists/indent/sort/marks on top, alignment below.
             rs::group("Paragraph", 30, vec![rs::rows(vec![
                 vec![
-                    rs::btn(cmdt("bullets", "list-bullet", "Bullets", Bullets, "")),
-                    rs::btn(cmdt("numbers", "list-numbered", "Numbering", Numbers, "")),
-                    rs::btn(cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M")),
-                    rs::btn(cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M")),
-                    rs::btn(cmdt("sort", "sort", "Sort", Sort, "")),
-                    rs::btn(cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "")),
+                    rs::btn(cmdt("bullets", "list-bullet", "Bullets", Bullets, "").key("U")),
+                    rs::btn(cmdt("numbers", "list-numbered", "Numbering", Numbers, "").key("N")),
+                    rs::btn(cmdt("inddec", "indent-decrease", "Decrease indent", IndentDec, "Ctrl+Shift+M").key("O")),
+                    rs::btn(cmdt("indinc", "indent-increase", "Increase indent", IndentInc, "Ctrl+M").key("P")),
+                    rs::btn(cmdt("sort", "sort", "Sort", Sort, "").key("S")),
+                    rs::btn(cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "").key("H")),
                 ],
                 vec![
-                    rs::btn(cmdt("al", "align-left", "Align left", AlignL, "")),
-                    rs::btn(cmdt("ac", "align-center", "Center", AlignC, "")),
-                    rs::btn(cmdt("ar", "align-right", "Align right", AlignR, "")),
-                    rs::btn(cmdt("aj", "align-justify", "Justify", AlignJ, "")),
-                    rs::btn(cmdt("borders", "border-bottom", "Bottom border", ParaBorders, "")),
+                    rs::btn(cmdt("al", "align-left", "Align left", AlignL, "").key("L")),
+                    rs::btn(cmdt("ac", "align-center", "Center", AlignC, "").key("A")),
+                    rs::btn(cmdt("ar", "align-right", "Align right", AlignR, "").key("R")),
+                    rs::btn(cmdt("aj", "align-justify", "Justify", AlignJ, "").key("J")),
+                    rs::btn(cmdt("borders", "border-bottom", "Bottom border", ParaBorders, "").key("B")),
                 ],
             ])])
             .launcher(LaunchParagraph),
@@ -2030,44 +2058,44 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             })]),
             // Editing: a labelled column (Word: Find / Replace / Select).
             rs::group("Editing", 20, vec![rs::column(vec![
-                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
-                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
+                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F").key("F"),
+                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A").key("D"),
             ])]),
         ]),
         // Insert: headline commands as large buttons (Word's Insert tab style).
         rs::tab("Insert", "N", vec![
-            rs::group("Pages", 40, vec![Control::Large(cmdt("pagebreak", "rule", "Page Break", PageBreak, ""))]),
-            rs::group("Tables", 35, vec![Control::Large(cmdt("table", "table", "Table", InsertTable, ""))]),
-            rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, ""))]),
-            rs::group("Symbols", 20, vec![Control::Large(cmdt("hr", "rule", "Rule", HRule, ""))]),
+            rs::group("Pages", 40, vec![Control::Large(cmdt("pagebreak", "rule", "Page Break", PageBreak, "").key("B"))]),
+            rs::group("Tables", 35, vec![Control::Large(cmdt("table", "table", "Table", InsertTable, "").key("T"))]),
+            rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q"))]),
+            rs::group("Symbols", 20, vec![Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("H"))]),
         ]),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
         rs::tab("Review", "R", vec![
             rs::group("Comments", 40, vec![
-                Control::Large(cmdt("newcomment", "comment-add", "New Comment", NewComment, "")),
+                Control::Large(cmdt("newcomment", "comment-add", "New Comment", NewComment, "").key("C")),
                 rs::column(vec![
-                    cmdt("togglecomments", "comment", "Comments pane", ToggleComments, ""),
-                    cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, ""),
+                    cmdt("togglecomments", "comment", "Comments pane", ToggleComments, "").key("P"),
+                    cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
                 ]),
             ]),
             rs::group("Editing", 30, vec![rs::column(vec![
-                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F"),
-                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A"),
-                cmdt("case", "case", "Change case", Case, ""),
+                cmdt("find", "find", "Find & Replace", Find, "Ctrl+F").key("F"),
+                cmdt("selall", "select-all", "Select all", SelectAll, "Ctrl+A").key("D"),
+                cmdt("case", "case", "Change case", Case, "").key("7"),
             ])]),
         ]),
         // View: a large Print Layout toggle, then Show and Appearance columns.
         rs::tab("View", "W", vec![
-            rs::group("Views", 40, vec![Control::Large(cmdt("printlayout", "print-layout", "Print Layout", PrintLayout, ""))]),
+            rs::group("Views", 40, vec![Control::Large(cmdt("printlayout", "print-layout", "Print Layout", PrintLayout, "").key("P"))]),
             rs::group("Show", 30, vec![rs::column(vec![
-                cmdt("ruler", "rule", "Ruler", ToggleRuler, ""),
-                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, ""),
-                cmdt("nav", "select-all", "Navigation", ToggleNav, ""),
-                cmdt("viewcomments", "comment", "Comments pane", ToggleComments, ""),
+                cmdt("ruler", "rule", "Ruler", ToggleRuler, "").key("R"),
+                cmdt("showhide", "paragraph", "Formatting marks", ShowHide, "").key("M"),
+                cmdt("nav", "select-all", "Navigation", ToggleNav, "").key("N"),
+                cmdt("viewcomments", "comment", "Comments pane", ToggleComments, "").key("C"),
             ])]),
             rs::group("Appearance", 20, vec![rs::column(vec![
-                cmdt("darkmode", "case", "Theme", DarkMode, ""),
-                cmdt("autohide", "rule", "Collapse ribbon", AutoHideRibbon, "Ctrl+F1"),
+                cmdt("darkmode", "case", "Theme", DarkMode, "").key("T"),
+                cmdt("autohide", "rule", "Collapse ribbon", AutoHideRibbon, "Ctrl+F1").key("A"),
             ])]),
         ]),
     ])
@@ -2081,6 +2109,37 @@ fn ribbon_tab_index(t: RibbonTab) -> usize {
         RibbonTab::View => 3,
         RibbonTab::Table => 0, // handled specially (see ribbon_body / table_tab)
     }
+}
+
+/// Find the command in a control whose KeyTip matches `key` (case-insensitive).
+fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
+    let m = |cmd: &rs::Cmd<Act>| (!cmd.key_tip.is_empty() && cmd.key_tip.eq_ignore_ascii_case(key)).then_some(cmd.act);
+    match c {
+        Control::Large(cmd) | Control::Toggle(cmd) => m(cmd),
+        Control::Column(cmds) => cmds.iter().find_map(m),
+        Control::Rows(rows) => rows.iter().flatten().find_map(|cell| match cell {
+            rs::Cell::Btn(cmd) => m(cmd),
+            rs::Cell::Combo { cmd, .. } => m(cmd),
+        }),
+        _ => None,
+    }
+}
+
+/// Find a command in a tab by its KeyTip letter.
+fn tab_keytip_cmd(tab: &rs::Tab<Act>, key: &str) -> Option<Act> {
+    tab.groups.iter().flat_map(|g| g.items.iter()).find_map(|c| control_keytip(c, key))
+}
+
+/// A small KeyTip access-key badge, centred at the bottom of its host element.
+fn keytip_badge(text: &str) -> AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_end()
+        .justify_center()
+        .child(div().px(px(3.)).rounded(px(2.)).bg(hsla_u(0xf2d24b)).text_size(px(9.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(text.to_string())))
+        .into_any_element()
 }
 
 /// The contextual Table Tools tab, shown only while the caret is in a table.
@@ -2681,9 +2740,12 @@ impl Docxy {
                 _ => None,
             };
             let active = !self.backstage && this_tab == Some(self.ribbon_tab);
+            let tab_key = ["F", "H", "N", "R", "W"][i];
+            let show_kt = self.keytips == KeyTip::Tabs;
             strip = strip.child(
                 div()
                     .id(("rtab", i))
+                    .relative()
                     .px_3()
                     .py_1()
                     .cursor_pointer()
@@ -2694,6 +2756,7 @@ impl Docxy {
                     .when(active, |d| d.text_color(rgb(BRAND)).border_b_2().border_color(rgb(BRAND)))
                     .when(!active && !is_file, |d| d.text_color(fg))
                     .child(*name)
+                    .when(show_kt, |d| d.child(keytip_badge(tab_key)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_file {
                             this.backstage = true;
@@ -2756,6 +2819,50 @@ impl Docxy {
             t.status = SharedString::from(msg.to_string());
         }
         self.refocus(window, cx);
+    }
+
+    /// Handle a letter pressed while KeyTips are showing: pick a tab (Tabs level)
+    /// or run a command (Commands level).
+    fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.keytips {
+            KeyTip::Tabs => {
+                if c.eq_ignore_ascii_case("F") {
+                    self.keytips = KeyTip::Off;
+                    self.backstage = true;
+                    self.bs_new = false;
+                    return cx.notify();
+                }
+                let ribbon = docxy_ribbon();
+                if let Some(i) = ribbon.tabs.iter().position(|t| t.key_tip.eq_ignore_ascii_case(c)) {
+                    self.ribbon_tab = match i {
+                        0 => RibbonTab::Home,
+                        1 => RibbonTab::Insert,
+                        2 => RibbonTab::Review,
+                        _ => RibbonTab::View,
+                    };
+                    self.keytips = KeyTip::Commands;
+                } else if c.eq_ignore_ascii_case("T") && self.caret_table().is_some() {
+                    self.ribbon_tab = RibbonTab::Table;
+                    self.keytips = KeyTip::Commands;
+                } else {
+                    self.keytips = KeyTip::Off;
+                }
+                cx.notify();
+            }
+            KeyTip::Commands => {
+                let ribbon = docxy_ribbon();
+                let table = table_tab();
+                let tab = if self.ribbon_tab == RibbonTab::Table { &table } else { &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)] };
+                let act = tab_keytip_cmd(tab, c);
+                self.keytips = KeyTip::Off;
+                if let Some(a) = act {
+                    self.dispatch(a, window, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            KeyTip::Off => {}
+        }
     }
 
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
@@ -3070,8 +3177,10 @@ impl Docxy {
         let act = cmd.act;
         let on = self.act_active(act);
         let tip: SharedString = cmd.label.into();
+        let keytip = (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         div()
             .id(cmd.id)
+            .relative()
             .flex()
             .flex_col()
             .items_center()
@@ -3086,6 +3195,7 @@ impl Docxy {
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 26., pal.fg))
             .child(div().text_size(px(11.)).text_color(pal.fg).child(SharedString::from(cmd.label)))
+            .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             .into_any_element()
@@ -3135,8 +3245,10 @@ impl Docxy {
         } else {
             format!("{}  \u{00b7}  {}", tip.title, tip.shortcut).into()
         };
+        let keytip = (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         div()
             .id(cmd.id)
+            .relative()
             .flex()
             .items_center()
             .gap_1p5()
@@ -3151,6 +3263,7 @@ impl Docxy {
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 16., pal.fg))
             .when(show_label, |d| d.child(div().text_size(px(12.)).text_color(pal.fg).child(SharedString::from(cmd.label))))
+            .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             .into_any_element()
