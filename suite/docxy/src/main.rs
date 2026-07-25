@@ -223,6 +223,8 @@ struct Docxy {
     // The ruler content area's left-margin screen x, written by the ruler canvas
     // each paint and read by click handlers to map a click to a tab position.
     ruler_x0: std::rc::Rc<std::cell::Cell<f32>>,
+    // A text drag-selection is in progress (mouse down in the doc, not yet up).
+    selecting: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -477,6 +479,7 @@ impl Docxy {
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+            selecting: false,
         };
         this.persist();
         this
@@ -649,6 +652,36 @@ impl Docxy {
         }
         self.focus.focus(window, cx);
         self.focused = true;
+        cx.notify();
+    }
+
+    /// Start a mouse drag-selection at a click. Without Shift it plants a fresh
+    /// anchor at the click; with Shift it extends the existing selection.
+    fn begin_select(&mut self, path: Vec<usize>, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ed) = self.active_editor() {
+            if extend {
+                ed.extend_selection(true); // anchor at the current caret if none
+            } else {
+                ed.clear_selection();
+            }
+            ed.caret = Caret::at(path, offset);
+            if !extend {
+                ed.extend_selection(true); // plant the anchor here so a drag extends from it
+            }
+            ed.clamp();
+        }
+        self.selecting = true;
+        self.focus.focus(window, cx);
+        self.focused = true;
+        cx.notify();
+    }
+
+    /// Extend the drag-selection to the character under the cursor (anchor stays).
+    fn extend_select(&mut self, path: Vec<usize>, offset: usize, cx: &mut Context<Self>) {
+        if let Some(ed) = self.active_editor() {
+            ed.caret = Caret::at(path, offset);
+            ed.clamp();
+        }
         cx.notify();
     }
 
@@ -2200,21 +2233,41 @@ fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32
                     d.bg(rgb(c)).text_color(if dark { rgb(0x1a1a1a) } else { rgb(0xf5f5f5) })
                 })
                 .when(selected, |d| d.bg(pal.sel))
-                // Click-to-caret: place the caret at the exact character under the
-                // click (byte index from the layout → char count within the word).
+                // Click / drag-to-caret: place the caret at the exact character under
+                // the pointer (byte index from the layout → char count within the
+                // word), and while the button is held extend the selection.
                 .when_some(click, |d, c| {
                     let ent = c.ent.clone();
                     let path = c.path.to_vec();
-                    let layout = layout.clone();
-                    let word_str = word_str.clone();
-                    d.cursor_text().on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                        cx.stop_propagation();
-                        let extend = ev.modifiers.shift;
-                        let byte = layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(word_str.len());
-                        let ch = word_str[..byte].chars().count();
-                        let off = word_off + ch;
-                        ent.update(cx, |this, cx| this.set_caret(path.clone(), off, extend, window, cx));
-                    })
+                    let off_at = {
+                        let layout = layout.clone();
+                        let word_str = word_str.clone();
+                        move |pos| {
+                            let byte = layout.index_for_position(pos).unwrap_or_else(|e| e).min(word_str.len());
+                            word_off + word_str[..byte].chars().count()
+                        }
+                    };
+                    d.cursor_text()
+                        .on_mouse_down(MouseButton::Left, {
+                            let ent = ent.clone();
+                            let path = path.clone();
+                            let off_at = off_at.clone();
+                            move |ev, window, cx| {
+                                cx.stop_propagation();
+                                let extend = ev.modifiers.shift;
+                                let off = off_at(ev.position);
+                                ent.update(cx, |this, cx| this.begin_select(path.clone(), off, extend, window, cx));
+                            }
+                        })
+                        .on_mouse_move(move |ev, _window, cx| {
+                            let off = off_at(ev.position);
+                            let path = path.clone();
+                            ent.update(cx, move |this, cx| {
+                                if this.selecting {
+                                    this.extend_select(path, off, cx);
+                                }
+                            });
+                        })
                 })
                 .into_any_element(),
         );
@@ -3338,6 +3391,13 @@ impl Render for Docxy {
             .size_full()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            // End a text drag-selection wherever the button is released.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _w, cx| {
+                if this.selecting {
+                    this.selecting = false;
+                    cx.notify();
+                }
+            }))
             .bg(bg)
             .child(title_bar)
             .child(ribbon_tabs)
