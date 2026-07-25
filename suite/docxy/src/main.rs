@@ -350,6 +350,8 @@ struct RenderCtx<'a> {
     /// while a header/footer is being edited) no caret is drawn and clicks are
     /// inert, so the inactive surface reads as dimmed and untouchable.
     active: bool,
+    /// Text measurer for tab-stop positioning.
+    meas: &'a Measurer,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -2668,6 +2670,36 @@ fn caret_bar() -> AnyElement {
     div().w(px(2.)).h(px(19.)).ml(px(-1.)).mr(px(-1.)).bg(rgb(BRAND)).into_any_element()
 }
 
+/// Synchronous text-width measurement (via the window's text system + the ambient
+/// base font), so a tab can advance content to an absolute tab-stop column
+/// instead of a fixed gap.
+struct Measurer {
+    ts: std::sync::Arc<WindowTextSystem>,
+    base: Font,
+}
+
+impl Measurer {
+    fn new(window: &Window) -> Self {
+        Measurer { ts: window.text_system().clone(), base: window.text_style().font() }
+    }
+    /// Rendered pixel width of `text` at `size` px in the base font (bold/italic
+    /// applied), matching how `emit_words` shapes it.
+    fn width(&self, text: &str, size: f32, bold: bool, italic: bool) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let mut font = self.base.clone();
+        if bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if italic {
+            font.style = FontStyle::Italic;
+        }
+        let run = TextRun { len: text.len(), font, color: hsla_u(0), ..Default::default() };
+        f32::from(self.ts.shape_line(SharedString::from(text.to_string()), px(size), &[run], None).width())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_words(out: &mut Vec<AnyElement>, text: &str, props: &RunProps, base: f32, is_link: bool, selected: bool, click: Option<Click>, seg_start: usize, pal: Pal) {
     let mut off = seg_start;
@@ -2812,21 +2844,26 @@ fn emit_run(
     *idx = end;
 }
 
-/// A tab is ONE char in the engine but rendered as spaces; keep `idx` in sync and
-/// let it participate in caret/selection like any other char.
-fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, click: Option<Click>, marks: bool, pal: Pal) {
+/// A tab is ONE char in the engine; render it as a fixed-width spacer that
+/// advances to its tab stop (`width` px, computed by the caller). Keeps `idx` in
+/// sync and participates in caret/selection like any other char.
+#[allow(clippy::too_many_arguments)]
+fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize>, sel: Option<(usize, usize)>, click: Option<Click>, marks: bool, base: f32, width: f32, pal: Pal) {
     let pos = *idx;
     if *caret == Some(pos) {
         out.push(caret_bar());
         *caret = None;
     }
     let selected = sel.map_or(false, |(s, e)| s < e && s <= pos && pos < e);
-    // With formatting marks on, show a tab arrow; otherwise blank em-spaces.
-    let glyph = if marks { "\u{2192}\u{2003}" } else { "\u{2003}\u{2003}" };
+    let w = width.max(3.0);
     out.push(
         div()
-            .child(SharedString::from(glyph))
-            .when(marks, |d| d.text_color(pal.dim))
+            .flex_none()
+            .w(px(w))
+            .h(px(base))
+            .overflow_hidden()
+            // With formatting marks on, a tab arrow sits at the start of the gap.
+            .when(marks, |d| d.flex().items_center().text_size(px(base * 0.9)).text_color(pal.dim).child("\u{2192}"))
             .when(selected, |d| d.bg(pal.sel))
             .when_some(click, |d, c| {
                 let ent = c.ent.clone();
@@ -2893,11 +2930,11 @@ fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
 
 
 /// Render header/footer blocks read-only (no caret, no click) for the page margins.
-fn hf_els(blocks: &[Block], pal: Pal) -> Vec<AnyElement> {
+fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer) -> Vec<AnyElement> {
     blocks
         .iter()
         .filter_map(|b| match b {
-            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, 1.0, pal)),
+            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, 1.0, pal, Some(meas))),
             _ => None,
         })
         .collect()
@@ -2992,7 +3029,7 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, zoom: f32, pal: Pal) -> AnyElement {
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, zoom: f32, pal: Pal, meas: Option<&Measurer>) -> AnyElement {
     let base = zoom
         * match p.props.heading_level {
             Some(1) => 26.0,
@@ -3005,21 +3042,70 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
+
+    // Tab-stop geometry. `x` tracks the running pixel width from the row's left
+    // edge; a tab advances it to the next stop measured from the text margin. The
+    // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
+    let pad_l = zoom * ((p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0);
+    let interval = zoom * 720.0 / 15.0; // Word's default tab stop: every 1/2"
+    let customs: Vec<f32> = p.props.tabs.iter().map(|t| zoom * t.pos as f32 / 15.0).collect();
+    let max_custom = customs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut x = 0.0_f32;
+    // Only paragraphs that actually contain a tab need per-run width measurement.
+    let has_tab = p.content.iter().any(|i| matches!(i, Inline::Tab(_)));
+    // Width of a run's text at its effective size (matching emit_words' sizing).
+    let run_w = |r: &docxcore::model::Run| -> f32 {
+        match meas.filter(|_| has_tab) {
+            Some(m) => {
+                let sz = r.props.size_half_pts.map(|h| h as f32 / 2.0 * 1.333).unwrap_or(base);
+                m.width(&r.text, sz, r.props.bold, r.props.italic)
+            }
+            None => 0.0,
+        }
+    };
+
     if let Some(m) = marker {
         // The marker isn't document content — render it plain (non-clickable) so it
         // never maps clicks to bogus offsets.
         spans.push(div().text_size(px(base)).text_color(pal.dim).child(SharedString::from(m.to_string())).into_any_element());
+        if let Some(ms) = meas.filter(|_| has_tab) {
+            x += ms.width(m, base, false, false);
+        }
     }
     for inline in &p.content {
         match inline {
-            Inline::Run(r) => emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, click, pal),
+            Inline::Run(r) => {
+                emit_run(&mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, click, pal);
+                x += run_w(r);
+            }
             Inline::Hyperlink(h) => {
                 for r in &h.runs {
                     emit_run(&mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel, click, pal);
+                    x += run_w(r);
                 }
             }
-            Inline::Tab(_) => emit_tab(&mut spans, &mut idx, &mut caret, sel, click, marks, pal),
-            Inline::Break(_) => emit_break(&mut spans, &mut idx, &mut caret),
+            Inline::Tab(_) => {
+                // Advance to the next tab stop past the current x (from the margin).
+                let xm = pad_l + x;
+                let lo = xm.max(if max_custom.is_finite() { max_custom } else { 0.0 });
+                let mut d = ((lo / interval).floor() + 1.0) * interval;
+                while d <= xm + 0.5 {
+                    d += interval;
+                }
+                let mut next = d;
+                for &c in &customs {
+                    if c > xm + 0.5 {
+                        next = next.min(c);
+                    }
+                }
+                let w = (next - xm).max(3.0);
+                emit_tab(&mut spans, &mut idx, &mut caret, sel, click, marks, base, w, pal);
+                x += w;
+            }
+            Inline::Break(_) => {
+                emit_break(&mut spans, &mut idx, &mut caret);
+                x = 0.0; // a hard break restarts the line
+            }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
                 // bookmarks, …) is invisible content and renders nothing.
@@ -3138,7 +3224,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
             let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
             let sel = ctx.active.then(|| ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e))).flatten();
             let click = ctx.active.then_some(Click { ent: ctx.ent, path: &path });
-            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal)
+            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal, Some(ctx.meas))
         }
         Block::Table(t) => table_el(t, &path, ctx),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
@@ -4059,6 +4145,8 @@ impl Render for Docxy {
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
 
+        // Text measurer for tab-stop positioning (shared across the document).
+        let measurer = Measurer::new(window);
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
@@ -4075,7 +4163,7 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom, active: hf.is_none() };
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom, active: hf.is_none(), meas: &measurer };
                     let body = &editor.doc.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete white page sheets
@@ -4121,7 +4209,7 @@ impl Render for Docxy {
                             }
                         };
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
-                        let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true });
+                        let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true, meas: &measurer });
                         // The first page whose region+variant matches the one being
                         // edited is the editable page (fallback page 0, so the surface
                         // is always visible even for a not-yet-shown variant).
@@ -4137,10 +4225,10 @@ impl Render for Docxy {
                                         return h.editor.doc.body.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect();
                                     }
                                     let blocks: &[Block] = if dv == h.variant { &h.editor.doc.body } else { pick(is_h, dv) };
-                                    return hf_els(blocks, doc_pal);
+                                    return hf_els(blocks, doc_pal, &measurer);
                                 }
                             }
-                            hf_els(pick(is_h, dv), doc_pal)
+                            hf_els(pick(is_h, dv), doc_pal, &measurer)
                         };
                         let sheets: Vec<AnyElement> = ranges
                             .iter()
