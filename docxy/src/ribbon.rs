@@ -106,6 +106,10 @@ pub enum Act {
     InsertTable,
     /// Insert a page break at the caret.
     PageBreak,
+    /// Cycle newspaper columns (1 → 2 → 3) for the section.
+    Columns,
+    /// Toggle automatic hyphenation for the document.
+    Hyphenation,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -423,6 +427,14 @@ fn insert_groups() -> Vec<Group> {
             rows: [
                 vec![btn("⊞ Table", 8, InsertTable, "Insert a table")],
                 vec![btn("# Page No.", 10, PageNumber, "Insert a page number")],
+            ],
+        },
+        Group {
+            title: "Layout",
+            width: 12,
+            rows: [
+                vec![btn("▐▐ Columns", 10, Columns, "Newspaper columns (1/2/3)")],
+                vec![btn("‑ Hyphenate", 11, Hyphenation, "Toggle automatic hyphenation")],
             ],
         },
         Group {

@@ -259,34 +259,53 @@ impl Package {
             .unwrap_or(false)
     }
 
-    /// Toggle distinct even/odd headers/footers, editing (or creating)
-    /// `word/settings.xml`'s `<w:evenAndOddHeaders/>` flag.
+    /// Toggle distinct even/odd headers/footers (`<w:evenAndOddHeaders/>`).
     pub fn set_even_odd(&mut self, on: bool) {
+        self.set_settings_flag("w:evenAndOddHeaders", on);
+    }
+
+    /// Whether automatic hyphenation is on (`<w:autoHyphenation/>` in settings).
+    pub fn has_auto_hyphenation(&self) -> bool {
+        self.part("word/settings.xml")
+            .map(|b| String::from_utf8_lossy(b).contains("<w:autoHyphenation"))
+            .unwrap_or(false)
+    }
+
+    /// Toggle automatic hyphenation for the document (`<w:autoHyphenation/>`).
+    /// docxy doesn't hyphenate its own on-screen layout, but Word honours the
+    /// flag when it lays the document out for print.
+    pub fn set_auto_hyphenation(&mut self, on: bool) {
+        self.set_settings_flag("w:autoHyphenation", on);
+    }
+
+    /// Add or remove a boolean flag element (e.g. `w:evenAndOddHeaders`,
+    /// `w:autoHyphenation`) in `word/settings.xml`, creating the part (+ its
+    /// content-type and relationship) if it doesn't exist yet.
+    fn set_settings_flag(&mut self, elem: &str, on: bool) {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let name = "word/settings.xml";
+        let tag = format!("<{elem}");
         if let Some(b) = self.part(name) {
             let xml = String::from_utf8_lossy(b).into_owned();
-            let has = xml.contains("<w:evenAndOddHeaders");
+            let has = xml.contains(&tag);
             if on && !has {
-                // evenAndOddHeaders is an early child of CT_Settings.
                 let gt = xml.find("<w:settings").and_then(|s| xml[s..].find('>').map(|e| s + e + 1));
                 if let Some(pos) = gt {
-                    let new = format!("{}<w:evenAndOddHeaders/>{}", &xml[..pos], &xml[pos..]);
+                    let new = format!("{}<{elem}/>{}", &xml[..pos], &xml[pos..]);
                     self.set_part(name, new.into_bytes());
                 }
             } else if !on && has {
-                self.set_part(name, remove_element(&xml, "w:evenAndOddHeaders").into_bytes());
+                self.set_part(name, remove_element(&xml, elem).into_bytes());
             }
             return;
         }
         if !on {
             return; // nothing to turn off
         }
-        // No settings part yet — create a minimal one and wire it up.
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-             <w:settings xmlns:w=\"{W_NS}\"><w:evenAndOddHeaders/></w:settings>"
+             <w:settings xmlns:w=\"{W_NS}\"><{elem}/></w:settings>"
         );
         self.parts.push((name.to_string(), body.into_bytes()));
         if let Some(b) = self.part("[Content_Types].xml") {
@@ -305,6 +324,28 @@ impl Package {
                 self.set_part(rels_name, rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1).into_bytes());
             }
         }
+    }
+
+    /// The number of newspaper columns in the body section (`w:cols w:num`).
+    pub fn columns(&self) -> i32 {
+        self.page_geom().cols
+    }
+
+    /// Set the number of newspaper columns (`w:cols w:num`) in the body section,
+    /// with an equal gap. docxy still renders a single column on screen, but the
+    /// column layout round-trips and Word lays it out in columns.
+    pub fn set_columns(&mut self, num: i32) {
+        let num = num.max(1);
+        let mut s = std::mem::take(&mut self.sect_pr);
+        s = remove_element(&s, "w:cols");
+        let child = if num <= 1 {
+            "<w:cols w:space=\"720\"/>".to_string()
+        } else {
+            format!("<w:cols w:num=\"{num}\" w:space=\"720\" w:equalWidth=\"1\"/>")
+        };
+        // `w:cols` follows `w:pgMar` in CT_SectPr; place it just after when present.
+        s = insert_after_element(&s, "w:pgMar", &child);
+        self.sect_pr = s;
     }
 
     /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
@@ -741,6 +782,30 @@ fn append_sect_child(sect: &str, child: &str) -> String {
         Some(i) => format!("{}{child}{}", &sect[..i], &sect[i..]),
         None => format!("{sect}{child}"),
     }
+}
+
+/// Insert `child` immediately after the `after` element (self-closing or with a
+/// close tag). Falls back to appending before `</w:sectPr>` when `after` is
+/// absent, keeping the child in a valid `CT_SectPr` position.
+fn insert_after_element(sect: &str, after: &str, child: &str) -> String {
+    let open = format!("<{after}");
+    let Some(start) = sect.find(&open) else {
+        return append_sect_child(sect, child);
+    };
+    let Some(rel_gt) = sect[start..].find('>') else {
+        return append_sect_child(sect, child);
+    };
+    let gt = start + rel_gt;
+    let end = if sect[..gt].ends_with('/') {
+        gt + 1 // self-closing <after/>
+    } else {
+        let close = format!("</{after}>");
+        match sect[gt..].find(&close) {
+            Some(c) => gt + c + close.len(),
+            None => gt + 1,
+        }
+    };
+    format!("{}{child}{}", &sect[..end], &sect[end..])
 }
 
 /// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
@@ -1273,6 +1338,35 @@ mod tests {
         let name2 = pkg2.create_hf(false, "default").expect("created footer");
         assert_eq!(name2, "word/footer1.xml");
         assert!(pkg2.sect_pr().contains("footerReference"));
+    }
+
+    #[test]
+    fn columns_and_hyphenation_round_trip() {
+        use crate::model::{Block, Document, Paragraph};
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        assert_eq!(pkg.columns(), 1);
+        pkg.set_columns(2);
+        assert_eq!(pkg.columns(), 2);
+        assert!(pkg.sect_pr().contains("w:num=\"2\""));
+        // Changing again replaces (not duplicates) the cols element.
+        pkg.set_columns(3);
+        assert_eq!(pkg.sect_pr().matches("<w:cols").count(), 1);
+        assert_eq!(pkg.columns(), 3);
+        pkg.set_columns(1);
+        assert_eq!(pkg.columns(), 1);
+
+        assert!(!pkg.has_auto_hyphenation());
+        pkg.set_auto_hyphenation(true);
+        assert!(pkg.has_auto_hyphenation());
+        assert!(pkg.part("word/settings.xml").is_some());
+        pkg.set_auto_hyphenation(false);
+        assert!(!pkg.has_auto_hyphenation());
+
+        let bytes = save_package(&pkg);
+        let re = load_package(&bytes).expect("reload");
+        assert_eq!(re.page_geom().cols, 1);
     }
 
     #[test]

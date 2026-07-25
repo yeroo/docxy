@@ -111,8 +111,16 @@ function Part($docx, $name) {
 
 # ---- scenarios: each returns a list of "PASS/FAIL: message" strings ----------
 
-$VK = @{ Ctrl = 0x11; F10 = 0x79; Esc = 0x1B; Home = 0x24; Tab = 0x09;
-    A = 0x41; B = 0x42; G = 0x47; H = 0x48; I = 0x49; M = 0x4D; N = 0x4E; S = 0x53; U = 0x55; W = 0x57; Y = 0x59 }
+$VK = @{ Ctrl = 0x11; Shift = 0x10; F10 = 0x79; Esc = 0x1B; Home = 0x24; Tab = 0x09; Space = 0x20;
+    A = 0x41; B = 0x42; C = 0x43; G = 0x47; H = 0x48; I = 0x49; M = 0x4D; N = 0x4E; S = 0x53; U = 0x55; W = 0x57; Y = 0x59; Z = 0x5A }
+
+function Chord2($p, [byte]$m1, [byte]$m2, [byte]$vk) {
+    [U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+    [U]::keybd_event($m1, 0, 0, [IntPtr]::Zero); Start-Sleep -Milliseconds 25
+    [U]::keybd_event($m2, 0, 0, [IntPtr]::Zero); Start-Sleep -Milliseconds 25
+    Key $p $vk
+    [U]::keybd_event($m2, 0, 2, [IntPtr]::Zero); [U]::keybd_event($m1, 0, 2, [IntPtr]::Zero); Start-Sleep -Milliseconds 120
+}
 
 function Test-Tab($doc) {
     $p = Launch
@@ -215,6 +223,29 @@ function Test-Indent($doc) {
     $xml = Part $doc "word/document.xml"
     if ($xml -match '<w:ind ') { "PASS: Ctrl+M writes an indent" } else { "FAIL: no w:ind" }
 }
+function Test-Columns($doc) {
+    $p = Launch
+    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.C   # Insert -> Columns (cycles to 2)
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match 'w:cols w:num="2"') { "PASS: Columns writes w:cols num=2" } else { "FAIL: no 2-column section" }
+}
+function Test-Hyphenation($doc) {
+    $p = Launch
+    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.Z   # Insert -> Hyphenation (on)
+    SaveClose $p
+    $xml = Part $doc "word/settings.xml"
+    if ($xml -match '<w:autoHyphenation') { "PASS: Hyphenation writes autoHyphenation" } else { "FAIL: no autoHyphenation flag" }
+}
+function Test-Nbsp($doc) {
+    $p = Launch
+    Click $p 200 343
+    Chord2 $p $VK.Ctrl $VK.Shift $VK.Space        # Ctrl+Shift+Space -> non-breaking space
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    $nbsp = [string][char]0x00A0
+    if ($xml.Contains($nbsp)) { "PASS: Ctrl+Shift+Space inserts a non-breaking space" } else { "FAIL: no non-breaking space" }
+}
 function Test-Symbol($doc) {
     $p = Launch
     Click $p 200 343
@@ -239,7 +270,10 @@ $scenarios = @(
     @{ n = "line-spacing"; f = ${function:Test-LineSpacing} },
     @{ n = "page-number"; f = ${function:Test-PageNumber} },
     @{ n = "no-spacing"; f = ${function:Test-NoSpacing} },
-    @{ n = "symbol"; f = ${function:Test-Symbol} }
+    @{ n = "symbol"; f = ${function:Test-Symbol} },
+    @{ n = "columns"; f = ${function:Test-Columns} },
+    @{ n = "hyphenation"; f = ${function:Test-Hyphenation} },
+    @{ n = "nbsp"; f = ${function:Test-Nbsp} }
 )
 
 $results = @()

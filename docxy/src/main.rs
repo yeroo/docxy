@@ -1223,6 +1223,24 @@ impl App {
                 self.after_edit();
                 self.status = Some("Inserted 2×2 table".to_string());
             }
+            Columns => {
+                let next = match self.pkg.columns() {
+                    1 => 2,
+                    2 => 3,
+                    _ => 1,
+                };
+                self.pkg.set_columns(next);
+                self.modified = true;
+                self.dirty = true;
+                self.status = Some(format!("Columns: {next}"));
+            }
+            Hyphenation => {
+                let on = !self.pkg.has_auto_hyphenation();
+                self.pkg.set_auto_hyphenation(on);
+                self.modified = true;
+                self.dirty = true;
+                self.status = Some(format!("Automatic hyphenation: {}", if on { "on" } else { "off" }));
+            }
             Paste => self.do_paste(),
             Bold => {
                 self.editor.toggle_bold();
@@ -4147,6 +4165,11 @@ impl App {
             }
             KeyCode::F(3) if shift => {
                 self.editor.cycle_case();
+                self.after_edit();
+            }
+            KeyCode::Char(' ') if ctrl && shift => {
+                // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
+                self.editor.insert_str("\u{00A0}");
                 self.after_edit();
             }
             KeyCode::Char(' ') if ctrl => {
@@ -7898,6 +7921,30 @@ mod tests {
         app.font_picker.as_mut().unwrap().sel = idx;
         app.apply_picker();
         assert!(first_line(&app).ends_with('\u{00AB}'), "guillemet not inserted");
+    }
+
+    #[test]
+    fn lesson_22_columns() {
+        let mut app = app_with(&["text"]);
+        assert_eq!(app.pkg.columns(), 1);
+        app.run_act(ribbon::Act::Columns);
+        assert_eq!(app.pkg.columns(), 2, "columns not set to 2");
+    }
+
+    #[test]
+    fn lesson_23_hyphenation() {
+        let mut app = app_with(&["text"]);
+        assert!(!app.pkg.has_auto_hyphenation());
+        app.run_act(ribbon::Act::Hyphenation);
+        assert!(app.pkg.has_auto_hyphenation(), "hyphenation not turned on");
+    }
+
+    #[test]
+    fn lesson_24_non_breaking_space() {
+        let mut app = app_with(&["ab"]);
+        app.editor.move_end();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert!(first_line(&app).ends_with('\u{00A0}'), "no non-breaking space inserted");
     }
 
     #[test]

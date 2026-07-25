@@ -1186,6 +1186,42 @@ impl Docxy {
         self.with_editor(window, cx, move |e| e.insert_str(&s));
     }
 
+    /// Cycle the section's newspaper columns 1 → 2 → 3 → 1 (Layout ▸ Columns).
+    /// docxy renders a single column, but the layout round-trips and Word lays it
+    /// out in columns.
+    fn cycle_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Some(pkg) = tab.pkg.as_mut() {
+                let next = match pkg.columns() {
+                    1 => 2,
+                    2 => 3,
+                    _ => 1,
+                };
+                pkg.set_columns(next);
+                tab.dirty = true;
+                tab.status = format!("Columns: {next}").into();
+            } else {
+                tab.status = "Columns need a .docx (not Markdown)".into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Toggle automatic hyphenation for the document (Layout ▸ Hyphenation).
+    fn toggle_hyphenation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Some(pkg) = tab.pkg.as_mut() {
+                let on = !pkg.has_auto_hyphenation();
+                pkg.set_auto_hyphenation(on);
+                tab.dirty = true;
+                tab.status = if on { "Automatic hyphenation: on".into() } else { "Automatic hyphenation: off".into() };
+            } else {
+                tab.status = "Hyphenation needs a .docx (not Markdown)".into();
+            }
+        }
+        self.refocus(window, cx);
+    }
+
     /// Apply an auto-rule line spacing to the selected paragraphs (Line Spacing menu).
     fn apply_line_spacing(&mut self, line: i32, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
@@ -2348,6 +2384,8 @@ impl Docxy {
                 // Indent / outdent (Ctrl+M, Ctrl+Shift+M).
                 "m" if shift => yes(|| ed.change_indent(-720)),
                 "m" => yes(|| ed.change_indent(720)),
+                // Non-breaking space (Ctrl+Shift+Space), a typesetting staple.
+                "space" if shift => yes(|| ed.insert_str("\u{00A0}")),
                 // Word- and document-wise motion (Ctrl+←/→, Ctrl+Home/End).
                 "left" => no(|| ed.move_word_left()),
                 "right" => no(|| ed.move_word_right()),
@@ -2405,7 +2443,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter, PageNumber, NoSpacing,
+    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter, PageNumber, NoSpacing, Columns, Hyphenation,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
@@ -2521,6 +2559,10 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             rs::group("Symbols", 20, vec![
                 Control::Large(cmdt("symbol", "symbol", "Symbol", InsertSymbol, "").key("S")),
                 Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("L")),
+            ]),
+            rs::group("Layout", 22, vec![
+                Control::Large(cmdt("columns", "columns", "Columns", Columns, "").key("C")),
+                Control::Large(cmdt("hyphen", "hyphenation", "Hyphenation", Hyphenation, "").key("Z")),
             ]),
         ]),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
@@ -3632,6 +3674,8 @@ impl Docxy {
             EditHeader => self.enter_hf(true, "default", window, cx),
             EditFooter => self.enter_hf(false, "default", window, cx),
             PageNumber => self.insert_field("PAGE", "1", window, cx),
+            Columns => self.cycle_columns(window, cx),
+            Hyphenation => self.toggle_hyphenation(window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
@@ -3689,7 +3733,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | LineSpacing | EditHeader | EditFooter | PageNumber | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | LineSpacing | EditHeader | EditFooter | PageNumber | Columns | Hyphenation | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }
