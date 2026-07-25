@@ -303,6 +303,7 @@ enum PickKind {
     Table,
     Symbol,
     LineSpacing,
+    Equation,
 }
 
 /// Table sizes offered by the Insert ▸ Table picker: (label, rows, cols).
@@ -319,6 +320,21 @@ const SYMBOLS: &[&str] = &[
     "\u{2039}", "\u{203A}",
     "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{03B1}", "\u{03B2}", "\u{03C0}", "\u{03BC}",
     "\u{03A9}", "\u{2211}", "\u{221A}", "\u{2212}", "\u{2605}",
+];
+
+/// Common equation templates offered by Insert ▸ Equation: (label, LaTeX). The
+/// engine turns the LaTeX into real Word OMML on insert.
+const EQUATIONS: &[(&str, &str)] = &[
+    ("x\u{00B2}", "x^2"),
+    ("a\u{207F}", "a^{n}"),
+    ("a/b", "\\frac{a}{b}"),
+    ("\u{221A}x", "\\sqrt{x}"),
+    ("\u{03A3}", "\\sum_{i=1}^{n} i"),
+    ("\u{222B}", "\\int_{a}^{b} f(x)\\,dx"),
+    ("lim", "\\lim_{x \\to \\infty} f(x)"),
+    ("\u{03B1}\u{03B2}\u{03B3}", "\\alpha\\beta\\gamma"),
+    ("a\u{00B2}+b\u{00B2}=c\u{00B2}", "a^2 + b^2 = c^2"),
+    ("Quadratic", "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}"),
 ];
 
 /// The fields offered by the Insert ▸ Field picker: (label, instruction, fallback).
@@ -1186,6 +1202,12 @@ impl Docxy {
         self.with_editor(window, cx, move |e| e.insert_str(&s));
     }
 
+    /// Insert an inline math equation from a LaTeX template (Insert ▸ Equation).
+    fn insert_equation(&mut self, latex: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, move |e| e.insert_equation(latex, false));
+    }
+
     /// Cycle the section's newspaper columns 1 → 2 → 3 → 1 (Layout ▸ Columns).
     /// docxy renders a single column, but the layout round-trips and Word lays it
     /// out in columns.
@@ -1367,6 +1389,7 @@ impl Docxy {
             PickKind::Table => "Table",
             PickKind::Symbol => "Symbol",
             PickKind::LineSpacing => "Line spacing",
+            PickKind::Equation => "Equation",
         }));
         let chip = |id_key: usize, label: SharedString, tag: &'static str| {
             div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
@@ -1492,6 +1515,11 @@ impl Docxy {
                 let after = if has_after { "Remove space after" } else { "Add space after" };
                 row = row.child(chip(100, before.into(), "lsb").on_click(cx.listener(|this, _, window, cx| this.toggle_space_before(window, cx))));
                 row = row.child(chip(101, after.into(), "lsa").on_click(cx.listener(|this, _, window, cx| this.toggle_space_after(window, cx))));
+            }
+            PickKind::Equation => {
+                for (i, &(label, latex)) in EQUATIONS.iter().enumerate() {
+                    row = row.child(chip(i, label.into(), "eq").on_click(cx.listener(move |this, _, window, cx| this.insert_equation(latex, window, cx))));
+                }
             }
         }
         row.into_any_element()
@@ -2443,7 +2471,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter, PageNumber, NoSpacing, Columns, Hyphenation,
+    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter, PageNumber, NoSpacing, Columns, Hyphenation, InsertEquation,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
@@ -2557,6 +2585,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             ]),
             rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q"))]),
             rs::group("Symbols", 20, vec![
+                Control::Large(cmdt("equation", "equation", "Equation", InsertEquation, "").key("E")),
                 Control::Large(cmdt("symbol", "symbol", "Symbol", InsertSymbol, "").key("S")),
                 Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("L")),
             ]),
@@ -3339,11 +3368,17 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                 spans.push(div().text_size(px(base * 0.72)).text_color(hsla_u(BRAND)).relative().top(px(-(base * 0.35))).child(SharedString::from(id.to_string())).into_any_element());
                 x += inline_w(inline);
             }
+            Inline::Equation { text, latex, .. } => {
+                // Math renders as its Unicode form (falling back to the LaTeX),
+                // in a faint math tint — docxy can't typeset, but the equation
+                // is visible and editable-as-text rather than a "[equation]" stub.
+                let shown = if !text.is_empty() { text.clone() } else { latex.clone().unwrap_or_default() };
+                spans.push(div().px(px(3.)).rounded_sm().bg(Hsla { a: 0.14, ..hsla_u(BRAND) }).text_size(px(base)).text_color(pal.fg).italic().child(SharedString::from(shown)).into_any_element());
+            }
             other => {
                 let tag = match other {
                     Inline::SmartArt { .. } => "[diagram]",
                     Inline::Chart { .. } => "[chart]",
-                    Inline::Equation { .. } => "[equation]",
                     Inline::TextBox { .. } => "[textbox]",
                     _ => "[image]",
                 };
@@ -3714,6 +3749,7 @@ impl Docxy {
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
+            InsertEquation => self.toggle_picker(PickKind::Equation, window, cx),
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             EditHeader => self.enter_hf(true, "default", window, cx),
             EditFooter => self.enter_hf(false, "default", window, cx),
@@ -3777,7 +3813,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | LineSpacing | EditHeader | EditFooter | PageNumber | Columns | Hyphenation | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing | EditHeader | EditFooter | PageNumber | Columns | Hyphenation | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }

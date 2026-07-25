@@ -110,6 +110,8 @@ pub enum Act {
     Columns,
     /// Toggle automatic hyphenation for the document.
     Hyphenation,
+    /// Open the equation-template picker and insert the chosen formula.
+    InsertEquation,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -452,7 +454,7 @@ fn insert_groups() -> Vec<Group> {
         },
         Group {
             title: "Symbols",
-            width: 13,
+            width: 19,
             rows: [
                 vec![btn(
                     "─ Horiz. Line",
@@ -460,7 +462,11 @@ fn insert_groups() -> Vec<Group> {
                     HorizontalLine,
                     "Insert a horizontal line (or type --- then Enter)",
                 )],
-                vec![btn("Ω Symbol", 8, InsertSymbol, "Insert a symbol")],
+                vec![
+                    btn("π Equation", 10, InsertEquation, "Insert an equation"),
+                    Seg::Gap(" "),
+                    btn("Ω Symbol", 8, InsertSymbol, "Insert a symbol"),
+                ],
             ],
         },
     ]

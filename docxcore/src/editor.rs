@@ -278,6 +278,16 @@ impl Editor {
         }
     }
 
+    /// Insert a math equation from LaTeX at the caret. Generates OMML (so it
+    /// saves as real Word math), renders Unicode for display, and keeps the
+    /// LaTeX source. `display` selects a block (`oMathPara`) over an inline one.
+    pub fn insert_equation(&mut self, latex: &str, display: bool) {
+        let raw = crate::latex::latex_to_omml(latex, display);
+        let text = crate::omath::render_omath(&raw);
+        let inl = Inline::Equation { raw, text, latex: Some(latex.to_string()) };
+        self.paste(&Clip { paras: vec![vec![inl]] });
+    }
+
     pub fn backspace(&mut self) {
         if self.has_selection() {
             self.delete_selection();
@@ -2316,6 +2326,17 @@ mod tests {
         ed.anchor = Some(Caret::top(0, 1));
         ed.caret = Caret::top(1, 2);
         assert_eq!(ed.selection_spans(), vec![(vec![0], 1, 3), (vec![1], 0, 2)]);
+    }
+
+    #[test]
+    fn insert_equation_builds_omml_and_text() {
+        let mut ed = Editor::new(doc(&[""]));
+        ed.insert_equation("x^2", false);
+        let Block::Paragraph(p) = &ed.doc.body[0] else { panic!() };
+        let eq = p.content.iter().find_map(|i| if let Inline::Equation { raw, text, latex } = i { Some((raw, text, latex)) } else { None }).expect("equation inline");
+        assert!(eq.0.contains("<m:oMath"), "no OMML: {}", eq.0);
+        assert_eq!(eq.2.as_deref(), Some("x^2"));
+        assert!(!eq.1.is_empty(), "no rendered text");
     }
 
     #[test]

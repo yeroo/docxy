@@ -598,7 +598,23 @@ enum PickerKind {
     Highlight,
     Symbol,
     LineSpacing,
+    Equation,
 }
+
+/// Common equation templates for Insert ▸ Equation: (label, LaTeX). The engine
+/// turns the LaTeX into real Word OMML on insert.
+const EQUATIONS: &[(&str, &str)] = &[
+    ("x\u{00B2}", "x^2"),
+    ("a\u{207F}", "a^{n}"),
+    ("a/b", "\\frac{a}{b}"),
+    ("\u{221A}x", "\\sqrt{x}"),
+    ("\u{03A3}", "\\sum_{i=1}^{n} i"),
+    ("\u{222B}", "\\int_{a}^{b} f(x)\\,dx"),
+    ("lim", "\\lim_{x \\to \\infty} f(x)"),
+    ("\u{03B1}\u{03B2}\u{03B3}", "\\alpha\\beta\\gamma"),
+    ("a\u{00B2}+b\u{00B2}=c\u{00B2}", "a^2 + b^2 = c^2"),
+    ("Quadratic", "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}"),
+];
 
 impl PickerKind {
     fn title(self) -> &'static str {
@@ -609,6 +625,7 @@ impl PickerKind {
             PickerKind::Highlight => " Highlight ",
             PickerKind::Symbol => " Symbol ",
             PickerKind::LineSpacing => " Line Spacing ",
+            PickerKind::Equation => " Equation ",
         }
     }
     fn items(self) -> &'static [&'static str] {
@@ -662,6 +679,10 @@ impl PickerKind {
                 "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}", "\u{2605}",
             ],
             PickerKind::LineSpacing => &["1.0", "1.15", "1.5", "2.0", "2.5", "3.0"],
+            PickerKind::Equation => &[
+                "x\u{00B2}", "a\u{207F}", "a/b", "\u{221A}x", "\u{03A3}", "\u{222B}", "lim",
+                "\u{03B1}\u{03B2}\u{03B3}", "a\u{00B2}+b\u{00B2}=c\u{00B2}", "Quadratic",
+            ],
         }
     }
 }
@@ -1205,6 +1226,7 @@ impl App {
                 self.dirty = true;
             }
             InsertSymbol => self.open_picker(PickerKind::Symbol),
+            InsertEquation => self.open_picker(PickerKind::Equation),
             LineSpacing => self.open_picker(PickerKind::LineSpacing),
             PageNumber => {
                 let inl = self.build_field(FieldKind::Page);
@@ -3092,7 +3114,7 @@ impl App {
     fn open_picker(&mut self, kind: PickerKind) {
         // Symbol inserts at the caret and Line Spacing applies to the caret
         // paragraph, so neither needs a selection; the font/colour pickers do.
-        let needs_sel = !matches!(kind, PickerKind::Symbol | PickerKind::LineSpacing);
+        let needs_sel = !matches!(kind, PickerKind::Symbol | PickerKind::LineSpacing | PickerKind::Equation);
         if needs_sel && !self.editor.has_selection() {
             self.status = Some(format!("Select text first, then {}", kind.title().trim()));
             self.dirty = true;
@@ -3122,6 +3144,11 @@ impl App {
             PickerKind::LineSpacing => {
                 if let Some(line) = line_spacing_twips(item) {
                     self.editor.set_line_spacing(line, "auto");
+                }
+            }
+            PickerKind::Equation => {
+                if let Some(&(_, latex)) = EQUATIONS.iter().find(|(l, _)| *l == item) {
+                    self.editor.insert_equation(latex, false);
                 }
             }
         }
@@ -7945,6 +7972,19 @@ mod tests {
         app.editor.move_end();
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
         assert!(first_line(&app).ends_with('\u{00A0}'), "no non-breaking space inserted");
+    }
+
+    #[test]
+    fn lesson_25_insert_equation() {
+        let mut app = app_with(&["text"]);
+        app.editor.move_end();
+        app.run_act(ribbon::Act::InsertEquation);
+        assert!(app.font_picker.is_some(), "equation picker did not open");
+        // sel 0 = "x²" -> latex "x^2"
+        app.apply_picker();
+        let has_eq = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p)
+            if p.content.iter().any(|i| matches!(i, Inline::Equation { raw, .. } if raw.contains("m:oMath")))));
+        assert!(has_eq, "no OMML equation inserted");
     }
 
     #[test]

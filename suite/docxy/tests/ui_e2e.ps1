@@ -112,7 +112,7 @@ function Part($docx, $name) {
 # ---- scenarios: each returns a list of "PASS/FAIL: message" strings ----------
 
 $VK = @{ Ctrl = 0x11; Shift = 0x10; F10 = 0x79; Esc = 0x1B; Home = 0x24; Tab = 0x09; Space = 0x20;
-    A = 0x41; B = 0x42; C = 0x43; G = 0x47; H = 0x48; I = 0x49; M = 0x4D; N = 0x4E; S = 0x53; U = 0x55; W = 0x57; Y = 0x59; Z = 0x5A }
+    A = 0x41; B = 0x42; C = 0x43; E = 0x45; G = 0x47; H = 0x48; I = 0x49; M = 0x4D; N = 0x4E; S = 0x53; U = 0x55; W = 0x57; Y = 0x59; Z = 0x5A }
 
 function Chord2($p, [byte]$m1, [byte]$m2, [byte]$vk) {
     [U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
@@ -223,6 +223,15 @@ function Test-Indent($doc) {
     $xml = Part $doc "word/document.xml"
     if ($xml -match '<w:ind ') { "PASS: Ctrl+M writes an indent" } else { "FAIL: no w:ind" }
 }
+function Test-Equation($doc) {
+    $p = Launch
+    Click $p 200 343
+    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.E   # Insert -> Equation (opens the gallery)
+    Click $p 107 178                              # first template (x^2)
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match '<m:oMath') { "PASS: Equation inserts OMML (Word math)" } else { "FAIL: no OMML equation" }
+}
 function Test-Columns($doc) {
     $p = Launch
     Key $p $VK.F10; Key $p $VK.N; Key $p $VK.C   # Insert -> Columns (cycles to 2)
@@ -271,6 +280,7 @@ $scenarios = @(
     @{ n = "page-number"; f = ${function:Test-PageNumber} },
     @{ n = "no-spacing"; f = ${function:Test-NoSpacing} },
     @{ n = "symbol"; f = ${function:Test-Symbol} },
+    @{ n = "equation"; f = ${function:Test-Equation} },
     @{ n = "columns"; f = ${function:Test-Columns} },
     @{ n = "hyphenation"; f = ${function:Test-Hyphenation} },
     @{ n = "nbsp"; f = ${function:Test-Nbsp} }
