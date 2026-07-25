@@ -42,7 +42,9 @@ a false positive from pre-existing content), launches the app, drives it, saves
 | `italic`      | Ctrl+A, Ctrl+I                           | `<w:i/>` |
 | `header`      | Insert ▸ Edit Header (KeyTips), type, Esc | `header1.xml` contains the text |
 | `first-page`  | Edit Header ▸ Different First Page toggle | `<w:titlePg/>` |
-| `line-spacing`| Home ▸ Line Spacing (KeyTip)             | `w:line="360"` (1.5×) |
+| `line-spacing`| Home ▸ Line Spacing menu ▸ 1.5×          | `w:line="360"` |
+| `page-number` | Insert ▸ Page Number (KeyTips)           | `w:instr="PAGE"` field |
+| `no-spacing`  | Home ▸ No Spacing style (gallery)        | `w:line="240"` (single) |
 | `symbol`      | Insert ▸ Symbol (KeyTip) ▸ pick em dash  | em dash in the text |
 
 ## Gotchas baked into the harness

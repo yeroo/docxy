@@ -961,6 +961,22 @@ impl Editor {
         self.caret_para_props().spacing.line_multiple()
     }
 
+    /// Set the space before / after the selected paragraphs, in twips (`None`
+    /// removes the attribute). Word's "Add Space Before/After Paragraph".
+    pub fn set_space_before(&mut self, twips: Option<i32>) {
+        self.for_each_para(move |pr| pr.spacing.before = twips);
+    }
+    pub fn set_space_after(&mut self, twips: Option<i32>) {
+        self.for_each_para(move |pr| pr.spacing.after = twips);
+    }
+    /// The space before / after (twips) at the caret, for the ribbon menu state.
+    pub fn caret_space_before(&self) -> Option<i32> {
+        self.caret_para_props().spacing.before
+    }
+    pub fn caret_space_after(&self) -> Option<i32> {
+        self.caret_para_props().spacing.after
+    }
+
     /// Replace the direct tab stops of the selected paragraphs.
     pub fn set_tabs(&mut self, tabs: Vec<crate::model::TabStop>) {
         self.for_each_para(move |pr| pr.tabs = tabs.clone());

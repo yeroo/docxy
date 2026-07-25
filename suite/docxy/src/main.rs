@@ -302,6 +302,7 @@ enum PickKind {
     Field,
     Table,
     Symbol,
+    LineSpacing,
 }
 
 /// Table sizes offered by the Insert ▸ Table picker: (label, rows, cols).
@@ -1182,6 +1183,27 @@ impl Docxy {
         self.with_editor(window, cx, move |e| e.insert_str(&s));
     }
 
+    /// Apply an auto-rule line spacing to the selected paragraphs (Line Spacing menu).
+    fn apply_line_spacing(&mut self, line: i32, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, move |e| e.set_line_spacing(line, "auto"));
+    }
+    /// Toggle 12pt of space before / after the selected paragraphs.
+    fn toggle_space_before(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| {
+            let on = e.caret_space_before().unwrap_or(0) > 0;
+            e.set_space_before(if on { None } else { Some(240) });
+        });
+    }
+    fn toggle_space_after(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.with_editor(window, cx, |e| {
+            let on = e.caret_space_after().unwrap_or(0) > 0;
+            e.set_space_after(if on { None } else { Some(240) });
+        });
+    }
+
     /// If the caret is inside a table, the (block index, row, cell).
     fn caret_table(&self) -> Option<(usize, usize, usize)> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
@@ -1305,6 +1327,7 @@ impl Docxy {
             PickKind::Field => "Field",
             PickKind::Table => "Table",
             PickKind::Symbol => "Symbol",
+            PickKind::LineSpacing => "Line spacing",
         }));
         let chip = |id_key: usize, label: SharedString, tag: &'static str| {
             div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
@@ -1395,6 +1418,41 @@ impl Docxy {
                             .on_click(cx.listener(move |this, _, window, cx| this.insert_symbol(s, window, cx))),
                     );
                 }
+            }
+            PickKind::LineSpacing => {
+                // Word's Line Spacing menu: the multiples with the current one lit,
+                // then Add/Remove space before/after the paragraph.
+                let (cur, has_before, has_after) = match self.tabs.get(self.active).map(|t| &t.surface) {
+                    Some(Surface::Doc(ed)) => (ed.caret_line_multiple(), ed.caret_space_before().unwrap_or(0) > 0, ed.caret_space_after().unwrap_or(0) > 0),
+                    _ => (None, false, false),
+                };
+                for (i, &(label, mult, line)) in LINE_SPACINGS.iter().enumerate() {
+                    let active = cur.is_some_and(|c| (c - mult).abs() < 0.03);
+                    row = row.child(
+                        div()
+                            .id(("ls", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .min_w(px(34.))
+                            .h(px(22.))
+                            .px_2()
+                            .rounded(px(3.))
+                            .text_size(px(12.))
+                            .text_color(if active { hsla_u(BRAND) } else { pal.fg })
+                            .border_1()
+                            .border_color(if active { hsla_u(BRAND) } else { pal.border })
+                            .cursor_pointer()
+                            .hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, window, cx| this.apply_line_spacing(line, window, cx))),
+                    );
+                }
+                row = row.child(div().w(px(1.)).h(px(16.)).bg(pal.border));
+                let before = if has_before { "Remove space before" } else { "Add space before" };
+                let after = if has_after { "Remove space after" } else { "Add space after" };
+                row = row.child(chip(100, before.into(), "lsb").on_click(cx.listener(|this, _, window, cx| this.toggle_space_before(window, cx))));
+                row = row.child(chip(101, after.into(), "lsa").on_click(cx.listener(|this, _, window, cx| this.toggle_space_after(window, cx))));
             }
         }
         row.into_any_element()
@@ -2344,28 +2402,22 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter,
+    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter, PageNumber, NoSpacing,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
     LaunchFont, LaunchParagraph,
 }
 
-/// The common Word line-spacing presets, as (multiple, `w:line` twips). The Line
-/// Spacing ribbon button cycles through these.
-const LINE_SPACINGS: [(f32, i32); 4] = [(1.0, 240), (1.15, 276), (1.5, 360), (2.0, 480)];
-
-/// Given the caret paragraph's current line multiple, the `w:line` value of the
-/// next preset in the cycle. An unrecognized/absent value jumps to 1.5×, which is
-/// a visible change from Word's single-spaced default.
-fn next_line_spacing(cur: Option<f32>) -> i32 {
-    let idx = cur.and_then(|c| LINE_SPACINGS.iter().position(|(m, _)| (m - c).abs() < 0.03));
-    let next = match idx {
-        Some(i) => (i + 1) % LINE_SPACINGS.len(),
-        None => 2, // 1.5×
-    };
-    LINE_SPACINGS[next].1
-}
+/// Word's line-spacing menu presets, as (label, multiple, `w:line` twips).
+const LINE_SPACINGS: &[(&str, f32, i32)] = &[
+    ("1.0", 1.0, 240),
+    ("1.15", 1.15, 276),
+    ("1.5", 1.5, 360),
+    ("2.0", 2.0, 480),
+    ("2.5", 2.5, 600),
+    ("3.0", 3.0, 720),
+];
 
 // The two numbering ids new_markdown_package defines: 1 = bullets, 2 = decimal.
 // Applying a list sets a paragraph's num_id to one of these, and save writes a
@@ -2436,13 +2488,15 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             rs::group("Styles", 35, vec![Control::Gallery(rs::Gallery {
                 id: "styles",
                 tip: rs::ScreenTip::default(),
+                // Word's Quick Styles order: Normal, No Spacing, headings, then Title/Subtitle.
                 items: vec![
                     rs::GalleryItem { label: "Normal", preview: "normal", act: Normal },
-                    rs::GalleryItem { label: "Title", preview: "title", act: Title },
-                    rs::GalleryItem { label: "Subtitle", preview: "subtitle", act: Subtitle },
+                    rs::GalleryItem { label: "No Spacing", preview: "normal", act: NoSpacing },
                     rs::GalleryItem { label: "Heading 1", preview: "h1", act: H1 },
                     rs::GalleryItem { label: "Heading 2", preview: "h2", act: H2 },
                     rs::GalleryItem { label: "Heading 3", preview: "h3", act: H3 },
+                    rs::GalleryItem { label: "Title", preview: "title", act: Title },
+                    rs::GalleryItem { label: "Subtitle", preview: "subtitle", act: Subtitle },
                 ],
             })]),
             // Editing: a labelled column (Word: Find / Replace / Select).
@@ -2458,6 +2512,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             rs::group("Header & Footer", 34, vec![
                 Control::Large(cmdt("header", "header", "Edit Header", EditHeader, "").key("H")),
                 Control::Large(cmdt("footer", "footer", "Edit Footer", EditFooter, "").key("O")),
+                Control::Large(cmdt("pagenum", "page-number", "Page Number", PageNumber, "").key("G")),
             ]),
             rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q"))]),
             rs::group("Symbols", 20, vec![
@@ -3570,8 +3625,10 @@ impl Docxy {
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
+            LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             EditHeader => self.enter_hf(true, "default", window, cx),
             EditFooter => self.enter_hf(false, "default", window, cx),
+            PageNumber => self.insert_field("PAGE", "1", window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
@@ -3600,6 +3657,14 @@ impl Docxy {
                 AlignR => e.set_align(Align::Right),
                 AlignJ => e.set_align(Align::Justify),
                 Normal => e.set_para_style(None),
+                // No Spacing: Word's body style with single spacing and no space
+                // before/after. Modelled as Normal + explicit zeroed spacing.
+                NoSpacing => {
+                    e.set_para_style(None);
+                    e.set_space_before(Some(0));
+                    e.set_space_after(Some(0));
+                    e.set_line_spacing(240, "auto");
+                }
                 H1 => e.set_para_style(Some("Heading1")),
                 H2 => e.set_para_style(Some("Heading2")),
                 H3 => e.set_para_style(Some("Heading3")),
@@ -3613,9 +3678,6 @@ impl Docxy {
                 IndentInc => e.change_indent(720),
                 IndentDec => e.change_indent(-720),
                 Sort => e.sort_paragraphs(),
-                // Word's Line Spacing button is a dropdown; we cycle the common
-                // presets (1.0 → 1.15 → 1.5 → 2.0 → back), all auto-rule.
-                LineSpacing => e.set_line_spacing(next_line_spacing(e.caret_line_multiple()), "auto"),
                 ParaBorders => {
                     let has = e.caret_para_props().borders.bottom.is_some();
                     let b = if has { ParBorders::default() } else { ParBorders { top: None, bottom: Some(BorderKind::Single) } };
@@ -3624,7 +3686,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | EditHeader | EditFooter | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | LineSpacing | EditHeader | EditFooter | PageNumber | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }

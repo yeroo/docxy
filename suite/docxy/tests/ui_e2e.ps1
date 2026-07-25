@@ -112,7 +112,7 @@ function Part($docx, $name) {
 # ---- scenarios: each returns a list of "PASS/FAIL: message" strings ----------
 
 $VK = @{ Ctrl = 0x11; F10 = 0x79; Esc = 0x1B; Home = 0x24; Tab = 0x09;
-    A = 0x41; B = 0x42; H = 0x48; I = 0x49; N = 0x4E; S = 0x53; W = 0x57; Y = 0x59 }
+    A = 0x41; B = 0x42; G = 0x47; H = 0x48; I = 0x49; N = 0x4E; S = 0x53; W = 0x57; Y = 0x59 }
 
 function Test-Tab($doc) {
     $p = Launch
@@ -161,10 +161,27 @@ function Test-FirstPage($doc) {
 function Test-LineSpacing($doc) {
     $p = Launch
     Click $p 200 343
-    Key $p $VK.F10; Key $p $VK.H; Key $p $VK.Y   # Home -> Line spacing (cycles to 1.5x)
+    Key $p $VK.F10; Key $p $VK.H; Key $p $VK.Y   # Home -> Line spacing (opens the menu)
+    Click $p 207 179                              # click the "1.5" chip
     SaveClose $p
     $xml = Part $doc "word/document.xml"
-    if ($xml -match 'w:line="360"') { "PASS: line spacing writes w:line=360 (1.5x)" } else { "FAIL: no w:line=360" }
+    if ($xml -match 'w:line="360"') { "PASS: line spacing menu writes w:line=360 (1.5x)" } else { "FAIL: no w:line=360" }
+}
+function Test-PageNumber($doc) {
+    $p = Launch
+    Click $p 200 343
+    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.G   # Insert -> Page Number (PAGE field)
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match 'w:instr="PAGE"') { "PASS: Page Number inserts a PAGE field" } else { "FAIL: no PAGE field" }
+}
+function Test-NoSpacing($doc) {
+    $p = Launch
+    Click $p 200 343                              # caret in the paragraph
+    Click $p 706 107                              # the "No Spacing" style in the gallery (Home is active)
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match 'w:line="240"') { "PASS: No Spacing sets single spacing (w:line=240)" } else { "FAIL: No Spacing not applied" }
 }
 function Test-Symbol($doc) {
     $p = Launch
@@ -184,6 +201,8 @@ $scenarios = @(
     @{ n = "header"; f = ${function:Test-Header} },
     @{ n = "first-page"; f = ${function:Test-FirstPage} },
     @{ n = "line-spacing"; f = ${function:Test-LineSpacing} },
+    @{ n = "page-number"; f = ${function:Test-PageNumber} },
+    @{ n = "no-spacing"; f = ${function:Test-NoSpacing} },
     @{ n = "symbol"; f = ${function:Test-Symbol} }
 )
 
@@ -200,7 +219,7 @@ foreach ($s in $scenarios) {
 }
 
 Get-Process suite -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-$fail = ($results | Where-Object { $_.Result -notlike "PASS*" }).Count
+$fail = @($results | Where-Object { $_.Result -notlike "PASS*" }).Count
 Write-Host ""
 Write-Host "==== $($results.Count - $fail)/$($results.Count) passed ====" -ForegroundColor $(if ($fail) { "Red" } else { "Green" })
 if ($fail) { exit 1 } else { exit 0 }
