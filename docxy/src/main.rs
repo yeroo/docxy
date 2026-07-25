@@ -2359,7 +2359,7 @@ impl App {
         };
         let part = match existing {
             Some(p) => p,
-            None => match self.pkg.create_hf(is_header) {
+            None => match self.pkg.create_hf(is_header, "default") {
                 Some(p) => {
                     if is_header {
                         self.header_part = Some(p.clone());
@@ -7604,6 +7604,156 @@ mod tests {
             DocColor::BrightBlue,
         ] {
             let _ = map_color(c);
+        }
+    }
+
+
+    // ---- "Word basics" curriculum ------------------------------------------
+    // Each standard beginner-Word lesson, run through the real key / ribbon
+    // handlers and checked on the resulting document. Mirrors suite/docxy's
+    // ui_e2e.ps1 so the same lessons are covered on both the TUI and the UI.
+
+    fn run0(app: &App) -> &Run {
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => p.content.iter().find_map(|i| if let Inline::Run(r) = i { Some(r) } else { None }).expect("a run"),
+            _ => panic!("expected a paragraph"),
+        }
+    }
+    fn props0(app: &App) -> &ParProps {
+        match &app.editor.doc.body[0] {
+            Block::Paragraph(p) => &p.props,
+            _ => panic!("expected a paragraph"),
+        }
+    }
+
+    #[test]
+    fn lesson_01_type_text() {
+        let mut app = app_with(&["Hell"]);
+        app.editor.move_end();
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(first_line(&app), "Hello");
+    }
+
+    #[test]
+    fn lesson_02_bold_italic_underline() {
+        let mut app = app_with(&["text"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bold);
+        app.run_act(ribbon::Act::Italic);
+        app.run_act(ribbon::Act::Underline);
+        let r = run0(&app);
+        assert!(r.props.bold && r.props.italic && r.props.underline, "B/I/U not all applied");
+    }
+
+    #[test]
+    fn lesson_03_apply_heading() {
+        let mut app = app_with(&["Chapter One"]);
+        app.run_act(ribbon::Act::ApplyStyle("Heading1"));
+        assert_eq!(props0(&app).heading_level, Some(1));
+    }
+
+    #[test]
+    fn lesson_04_no_spacing_style() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::ApplyStyle("NoSpacing"));
+        assert_eq!(props0(&app).style_id.as_deref(), Some("NoSpacing"));
+    }
+
+    #[test]
+    fn lesson_05_bulleted_list() {
+        let mut app = app_with(&["item"]);
+        app.run_act(ribbon::Act::Bullets);
+        assert!(props0(&app).num_id.is_some(), "no bullet list applied");
+    }
+
+    #[test]
+    fn lesson_06_numbered_list() {
+        let mut app = app_with(&["item"]);
+        app.run_act(ribbon::Act::Numbering);
+        assert!(props0(&app).num_id.is_some(), "no numbered list applied");
+    }
+
+    #[test]
+    fn lesson_07_center_align() {
+        let mut app = app_with(&["centered"]);
+        app.run_act(ribbon::Act::AlignCenter);
+        assert_eq!(props0(&app).align, Align::Center);
+    }
+
+    #[test]
+    fn lesson_08_increase_indent() {
+        let mut app = app_with(&["indent me"]);
+        app.run_act(ribbon::Act::IncreaseIndent);
+        assert!(props0(&app).indent > 0, "indent not increased");
+    }
+
+    #[test]
+    fn lesson_09_change_case() {
+        let mut app = app_with(&["hello"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::ChangeCase);
+        assert_ne!(first_line(&app), "hello", "case not changed");
+    }
+
+    #[test]
+    fn lesson_10_find_and_replace() {
+        let mut app = app_with(&["x y x"]);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x'))); // query
+        app.on_key(key(KeyCode::Tab)); // to replace field
+        app.on_key(key(KeyCode::Char('Z'))); // replacement
+        app.on_key(ctrl(KeyCode::Char('a'))); // replace all
+        assert_eq!(first_line(&app), "Z y Z");
+    }
+
+    #[test]
+    fn lesson_11_undo_redo() {
+        let mut app = app_with(&["a"]);
+        app.editor.move_end();
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(first_line(&app), "ab");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(first_line(&app), "a");
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(first_line(&app), "ab");
+    }
+
+    #[test]
+    fn lesson_12_edit_header() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        assert!(app.hf_edit.is_some(), "header edit not entered");
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::Char('i')));
+        assert_eq!(first_line(&app), "Hi", "typed header text missing");
+    }
+
+    #[test]
+    fn lesson_13_grow_font() {
+        let mut app = app_with(&["text"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::GrowFont);
+        assert!(run0(&app).props.size_half_pts.is_some(), "grow font set no size");
+    }
+
+    #[test]
+    fn lesson_14_clear_formatting() {
+        let mut app = app_with(&["text"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bold);
+        app.run_act(ribbon::Act::ClearFormatting);
+        assert!(!run0(&app).props.bold, "clear formatting left bold on");
+    }
+
+    #[test]
+    fn lesson_15_save_captures_edits() {
+        let mut app = app_with(&["Hello"]);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::Bold);
+        let doc = app.current_document();
+        match &doc.body[0] {
+            Block::Paragraph(p) => assert!(p.content.iter().any(|i| matches!(i, Inline::Run(r) if r.props.bold))),
+            _ => panic!(),
         }
     }
 

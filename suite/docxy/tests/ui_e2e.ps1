@@ -112,7 +112,7 @@ function Part($docx, $name) {
 # ---- scenarios: each returns a list of "PASS/FAIL: message" strings ----------
 
 $VK = @{ Ctrl = 0x11; F10 = 0x79; Esc = 0x1B; Home = 0x24; Tab = 0x09;
-    A = 0x41; B = 0x42; G = 0x47; H = 0x48; I = 0x49; N = 0x4E; S = 0x53; W = 0x57; Y = 0x59 }
+    A = 0x41; B = 0x42; G = 0x47; H = 0x48; I = 0x49; M = 0x4D; N = 0x4E; S = 0x53; U = 0x55; W = 0x57; Y = 0x59 }
 
 function Test-Tab($doc) {
     $p = Launch
@@ -183,6 +183,38 @@ function Test-NoSpacing($doc) {
     $xml = Part $doc "word/document.xml"
     if ($xml -match 'w:line="240"') { "PASS: No Spacing sets single spacing (w:line=240)" } else { "FAIL: No Spacing not applied" }
 }
+function Test-Heading($doc) {
+    $p = Launch
+    Click $p 200 343
+    Click $p 782 107                              # "Heading 1" in the Styles gallery
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match 'w:val="Heading1"') { "PASS: Heading 1 applies pStyle Heading1" } else { "FAIL: no Heading1 style" }
+}
+function Test-CenterAlign($doc) {
+    $p = Launch
+    Click $p 200 343
+    Key $p $VK.F10; Key $p $VK.H; Key $p $VK.A   # Home -> Center
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match 'w:jc w:val="center"') { "PASS: Center writes jc=center" } else { "FAIL: no jc=center" }
+}
+function Test-Bullets($doc) {
+    $p = Launch
+    Click $p 200 343
+    Key $p $VK.F10; Key $p $VK.H; Key $p $VK.U   # Home -> Bullets
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match '<w:numPr>') { "PASS: Bullets writes a numPr" } else { "FAIL: no numPr" }
+}
+function Test-Indent($doc) {
+    $p = Launch
+    Click $p 200 343
+    Chord $p $VK.Ctrl $VK.M                        # Ctrl+M -> increase indent
+    SaveClose $p
+    $xml = Part $doc "word/document.xml"
+    if ($xml -match '<w:ind ') { "PASS: Ctrl+M writes an indent" } else { "FAIL: no w:ind" }
+}
 function Test-Symbol($doc) {
     $p = Launch
     Click $p 200 343
@@ -200,6 +232,10 @@ $scenarios = @(
     @{ n = "italic"; f = ${function:Test-Italic} },
     @{ n = "header"; f = ${function:Test-Header} },
     @{ n = "first-page"; f = ${function:Test-FirstPage} },
+    @{ n = "heading"; f = ${function:Test-Heading} },
+    @{ n = "center-align"; f = ${function:Test-CenterAlign} },
+    @{ n = "bullets"; f = ${function:Test-Bullets} },
+    @{ n = "indent"; f = ${function:Test-Indent} },
     @{ n = "line-spacing"; f = ${function:Test-LineSpacing} },
     @{ n = "page-number"; f = ${function:Test-PageNumber} },
     @{ n = "no-spacing"; f = ${function:Test-NoSpacing} },
