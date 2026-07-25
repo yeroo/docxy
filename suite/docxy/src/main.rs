@@ -180,6 +180,18 @@ struct DocTab {
     notes: Vec<docxcore::notes::Note>,
     /// This tab is Markdown-backed (opened from a `.md`); Save writes Markdown.
     markdown: bool,
+    /// When `Some`, the header or footer is being edited (Word's header/footer
+    /// edit mode): keystrokes/clicks route to this editor instead of the body,
+    /// and its blocks are serialized back into the package part on exit/save.
+    hf_edit: Option<HfEdit>,
+}
+
+/// Live header/footer edit session: an editor over the parsed header/footer
+/// blocks, plus the package part they came from so edits can be written back.
+struct HfEdit {
+    editor: Editor,
+    part_name: String,
+    is_header: bool,
 }
 
 struct Docxy {
@@ -325,6 +337,10 @@ struct RenderCtx<'a> {
     pal: Pal,
     marks: bool,
     zoom: f32,
+    /// Whether this surface currently has the caret. When false (e.g. the body
+    /// while a header/footer is being edited) no caret is drawn and clicks are
+    /// inert, so the inactive surface reads as dimmed and untouchable.
+    active: bool,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -361,7 +377,7 @@ impl Loaded {
         Loaded { doc: empty_doc(), comments: vec![], notes: vec![], pkg: None, markdown: false, status: status.into() }
     }
     fn into_tab(self, kind: Kind, title: SharedString, path: Option<PathBuf>, dirty: bool) -> DocTab {
-        DocTab { kind, title, path, surface: Surface::Doc(Editor::new(self.doc)), dirty, status: self.status, comments: self.comments, pkg: self.pkg, notes: self.notes, markdown: self.markdown }
+        DocTab { kind, title, path, surface: Surface::Doc(Editor::new(self.doc)), dirty, status: self.status, comments: self.comments, pkg: self.pkg, notes: self.notes, markdown: self.markdown, hf_edit: None }
     }
 }
 
@@ -487,7 +503,7 @@ impl Docxy {
                 _ => {
                     let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
                     let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
-                    DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments, pkg, notes, markdown }
+                    DocTab { kind: t.kind, title: t.title.clone().into(), path, surface, dirty: t.dirty, status, comments, pkg, notes, markdown, hf_edit: None }
                 }
             };
             // The hot sidecar is always .docx; restore the Markdown flag from session.
@@ -592,7 +608,7 @@ impl Docxy {
             Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
-        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![], markdown: false });
+        self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -629,7 +645,92 @@ impl Docxy {
         }
     }
 
+    /// The editor keystrokes/clicks currently drive: the header/footer editor when
+    /// in HF edit mode, otherwise the document body. All editing routes through
+    /// this so the same machinery serves both surfaces.
+    fn edit_target(&mut self) -> Option<&mut Editor> {
+        let tab = self.tabs.get_mut(self.active)?;
+        if let Some(hf) = tab.hf_edit.as_mut() {
+            return Some(&mut hf.editor);
+        }
+        match &mut tab.surface {
+            Surface::Doc(ed) => Some(ed),
+            _ => None,
+        }
+    }
+
+    /// Whether the active tab is currently in header/footer edit mode.
+    fn hf_active(&self) -> bool {
+        self.tabs.get(self.active).is_some_and(|t| t.hf_edit.is_some())
+    }
+
+    /// Enter header (or footer) edit mode: resolve the existing part or create a
+    /// fresh one, parse its blocks into an editor, and switch to Print Layout so
+    /// the margin area is visible. No-op for markdown/package-less tabs.
+    fn enter_hf(&mut self, is_header: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_hf(); // commit any header/footer already open
+        let idx = self.active;
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        if !matches!(tab.surface, Surface::Doc(_)) {
+            return;
+        }
+        let Some(pkg) = tab.pkg.as_mut() else {
+            tab.status = "Headers/footers need a .docx (not a Markdown document)".into();
+            return self.refocus(window, cx);
+        };
+        let part_name = match hf_part_name(pkg, is_header) {
+            Some(n) => n,
+            None => match pkg.create_hf(is_header) {
+                Some(n) => {
+                    tab.dirty = true;
+                    n
+                }
+                None => {
+                    tab.status = "Could not create the header/footer part".into();
+                    return self.refocus(window, cx);
+                }
+            },
+        };
+        let blocks = parse_hf_part(pkg, &part_name);
+        let doc = docxcore::model::Document { body: blocks };
+        tab.hf_edit = Some(HfEdit { editor: Editor::new(doc), part_name, is_header });
+        self.page_view = true;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.status = if is_header { "Editing header — press Esc to return to the document".into() } else { "Editing footer — press Esc to return to the document".into() };
+        }
+        self.refocus(window, cx);
+    }
+
+    /// Serialize the open header/footer editor back into its package part (called
+    /// on exit and before every save) so edits persist. Leaves the session open.
+    fn flush_hf(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(hf) = tab.hf_edit.as_ref() else { return };
+        let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
+        let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
+        );
+        let part_name = hf.part_name.clone();
+        if let Some(pkg) = tab.pkg.as_mut() {
+            pkg.set_part(&part_name, xml.into_bytes());
+        }
+        tab.dirty = true;
+    }
+
+    /// Leave header/footer edit mode, committing edits to the package part.
+    fn exit_hf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_hf();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.hf_edit = None;
+            tab.status = "Closed header/footer".into();
+        }
+        self.refocus(window, cx);
+    }
+
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
         // Markdown-backed tabs save as Markdown; everything else as lossless .docx.
@@ -705,7 +806,7 @@ impl Docxy {
     /// click-to-caret). With `extend` (Shift-click) it keeps/starts an anchor so
     /// the click extends the selection; otherwise it collapses any selection.
     fn set_caret(&mut self, path: Vec<usize>, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ed) = self.active_editor() {
+        if let Some(ed) = self.edit_target() {
             if extend {
                 ed.extend_selection(true); // anchor at the current caret if none, else keep it
             } else {
@@ -724,7 +825,7 @@ impl Docxy {
     fn begin_select(&mut self, path: Vec<usize>, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.mini_bar = None;
         self.context_menu = None;
-        if let Some(ed) = self.active_editor() {
+        if let Some(ed) = self.edit_target() {
             if extend {
                 ed.extend_selection(true); // anchor at the current caret if none
             } else {
@@ -744,7 +845,7 @@ impl Docxy {
 
     /// Extend the drag-selection to the character under the cursor (anchor stays).
     fn extend_select(&mut self, path: Vec<usize>, offset: usize, cx: &mut Context<Self>) {
-        if let Some(ed) = self.active_editor() {
+        if let Some(ed) = self.edit_target() {
             ed.caret = Caret::at(path, offset);
             ed.clamp();
         }
@@ -753,7 +854,11 @@ impl Docxy {
 
     fn with_editor(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Editor)) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Surface::Doc(ed) = &mut tab.surface {
+            // Route to the header/footer editor while it's open, else the body.
+            if let Some(hf) = tab.hf_edit.as_mut() {
+                f(&mut hf.editor);
+                tab.dirty = true;
+            } else if let Surface::Doc(ed) = &mut tab.surface {
                 f(ed);
                 tab.dirty = true;
             }
@@ -763,7 +868,7 @@ impl Docxy {
 
     fn do_copy(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
         let mut dirty = false;
-        if let Some(ed) = self.active_editor() {
+        if let Some(ed) = self.edit_target() {
             let c = if cut { dirty = true; ed.cut() } else { ed.copy() };
             if c.is_some() {
                 self.clip = c;
@@ -1918,6 +2023,10 @@ impl Docxy {
         // Any key dismisses the floating mini toolbar / context menu.
         self.mini_bar = None;
         self.context_menu = None;
+        // In header/footer edit mode, Esc returns to the document body.
+        if key == "escape" && self.hf_active() {
+            return self.exit_hf(window, cx);
+        }
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
@@ -1958,7 +2067,7 @@ impl Docxy {
                 _ => {}
             }
         }
-        let Some(ed) = self.active_editor() else { return };
+        let Some(ed) = self.edit_target() else { return };
         if key == "escape" {
             ed.clear_selection();
             cx.notify();
@@ -2044,7 +2153,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol,
+    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol, EditHeader, EditFooter,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
@@ -2155,10 +2264,14 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
         rs::tab("Insert", "N", vec![
             rs::group("Pages", 40, vec![Control::Large(cmdt("pagebreak", "rule", "Page Break", PageBreak, "").key("B"))]),
             rs::group("Tables", 35, vec![Control::Large(cmdt("table", "table", "Table", InsertTable, "").key("T"))]),
+            rs::group("Header & Footer", 34, vec![
+                Control::Large(cmdt("header", "header", "Edit Header", EditHeader, "").key("H")),
+                Control::Large(cmdt("footer", "footer", "Edit Footer", EditFooter, "").key("O")),
+            ]),
             rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q"))]),
             rs::group("Symbols", 20, vec![
                 Control::Large(cmdt("symbol", "symbol", "Symbol", InsertSymbol, "").key("S")),
-                Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("H")),
+                Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("L")),
             ]),
         ]),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
@@ -2558,19 +2671,36 @@ fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usi
 /// per level and break whenever a non-list block interrupts the run.
 /// Extract the header (or footer) block content from a package: resolve the
 /// section's header/footerReference rId → part → parse. Empty if none.
-fn header_footer_blocks(pkg: &Package, is_header: bool) -> Vec<Block> {
+// OOXML namespaces used when re-serializing an edited header/footer part.
+const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+
+/// Resolve the package part name (e.g. `word/header1.xml`) backing the default
+/// header (or footer) via the section's reference → relationship → target.
+fn hf_part_name(pkg: &Package, is_header: bool) -> Option<String> {
     let sect = pkg.sect_pr();
     let kind = if is_header { "headerReference" } else { "footerReference" };
-    let rid = match ["default", "first", "even"].iter().find_map(|t| docxcore::load::header_footer_ref_rid(sect, kind, t)) {
-        Some(r) => r,
-        None => return vec![],
-    };
+    let rid = ["default", "first", "even"].iter().find_map(|t| docxcore::load::header_footer_ref_rid(sect, kind, t))?;
+    let rels_bytes = pkg.part("word/_rels/document.xml.rels")?;
+    let rels = docxcore::load::parse_rels_xml(&String::from_utf8_lossy(rels_bytes));
+    let target = rels.target(&rid)?;
+    Some(format!("word/{}", target.trim_start_matches('/')))
+}
+
+/// Parse the blocks of a specific header/footer part.
+fn parse_hf_part(pkg: &Package, part_name: &str) -> Vec<Block> {
     let Some(rels_bytes) = pkg.part("word/_rels/document.xml.rels") else { return vec![] };
     let rels = docxcore::load::parse_rels_xml(&String::from_utf8_lossy(rels_bytes));
-    let Some(target) = rels.target(&rid) else { return vec![] };
-    let part_name = format!("word/{}", target.trim_start_matches('/'));
-    let Some(xml) = pkg.part(&part_name) else { return vec![] };
+    let Some(xml) = pkg.part(part_name) else { return vec![] };
     docxcore::load::parse_header_footer(&String::from_utf8_lossy(xml), &rels)
+}
+
+fn header_footer_blocks(pkg: &Package, is_header: bool) -> Vec<Block> {
+    match hf_part_name(pkg, is_header) {
+        Some(name) => parse_hf_part(pkg, &name),
+        None => vec![],
+    }
 }
 
 /// Render header/footer blocks read-only (no caret, no click) for the page margins.
@@ -2816,9 +2946,9 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
 fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -> AnyElement {
     match b {
         Block::Paragraph(p) => {
-            let caret = (ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
-            let sel = ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e));
-            let click = Some(Click { ent: ctx.ent, path: &path });
+            let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
+            let sel = ctx.active.then(|| ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e))).flatten();
+            let click = ctx.active.then_some(Click { ent: ctx.ent, path: &path });
             paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal)
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -3104,6 +3234,8 @@ impl Docxy {
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
+            EditHeader => self.enter_hf(true, window, cx),
+            EditFooter => self.enter_hf(false, window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
@@ -3156,7 +3288,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | EditHeader | EditFooter | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -3750,7 +3882,10 @@ impl Render for Docxy {
                     } else {
                         pal
                     };
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom };
+                    // While a header/footer is being edited the body is inactive
+                    // (no caret, clicks inert) so it visually recedes.
+                    let hf = tab.hf_edit.as_ref();
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom, active: hf.is_none() };
                     let body = &editor.doc.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete white page sheets
@@ -3765,11 +3900,31 @@ impl Render for Docxy {
                         let show_ruler = self.show_ruler;
                         // Header / footer content (repeated on every page in the margins).
                         let (hdr, ftr) = tab.pkg.as_ref().map(|p| (header_footer_blocks(p, true), header_footer_blocks(p, false))).unwrap_or_default();
-                        let has_hf = !hdr.is_empty() || !ftr.is_empty();
+                        // While editing a header/footer, show that region's LIVE editor
+                        // blocks (not the stale package copy), editable on the first page.
+                        let editing_header = hf.is_some_and(|h| h.is_header);
+                        let editing_footer = hf.is_some_and(|h| !h.is_header);
+                        let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
+                        let hf_ctx = hf.map(|h| RenderCtx { caret_path: &h.editor.caret.path, caret_off: h.editor.caret.offset, spans: &hf_spans, ent: &ent, pal: doc_pal, marks: false, zoom: self.zoom, active: true });
+                        let hdr_disp: &[Block] = if editing_header { &hf.unwrap().editor.doc.body } else { &hdr };
+                        let ftr_disp: &[Block] = if editing_footer { &hf.unwrap().editor.doc.body } else { &ftr };
+                        let has_hf = !hdr.is_empty() || !ftr.is_empty() || hf.is_some();
                         let sheets: Vec<AnyElement> = ranges
                             .into_iter()
-                            .map(|(s, e)| {
+                            .enumerate()
+                            .map(|(pi, (s, e))| {
                                 let page_blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
+                                // Editable on page 0 when this region is being edited; read-only otherwise.
+                                let hdr_children: Vec<AnyElement> = if editing_header && pi == 0 {
+                                    hdr_disp.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect()
+                                } else {
+                                    hf_els(hdr_disp, doc_pal)
+                                };
+                                let ftr_children: Vec<AnyElement> = if editing_footer && pi == 0 {
+                                    ftr_disp.iter().enumerate().map(|(i, b)| block_el(b, vec![i], None, hf_ctx.unwrap())).collect()
+                                } else {
+                                    hf_els(ftr_disp, doc_pal)
+                                };
                                 let page_base = v_flex()
                                     .w(tw(geom.w))
                                     .min_h(tw(geom.h))
@@ -3777,13 +3932,16 @@ impl Render for Docxy {
                                     .text_color(doc_pal.fg)
                                     .border_1()
                                     .border_color(hsla_u(0xd0d0d0));
+                                // Tint the region being edited so it reads as the active area.
+                                let hdr_bg = if editing_header { Hsla { a: 0.5, ..hsla_u(0xeef4ff) } } else { hsla_u(0xffffff) };
+                                let ftr_bg = if editing_footer { Hsla { a: 0.5, ..hsla_u(0xeef4ff) } } else { hsla_u(0xffffff) };
                                 let page = if has_hf {
                                     // Header in the top margin, content in the middle, footer
                                     // in the bottom margin.
                                     page_base
-                                        .child(div().min_h(tw(geom.mt)).pt(tw(geom.mt / 2)).pl(tw(geom.ml)).pr(tw(geom.mr)).children(hf_els(&hdr, doc_pal)))
+                                        .child(div().min_h(tw(geom.mt)).pt(tw(geom.mt / 2)).pl(tw(geom.ml)).pr(tw(geom.mr)).bg(hdr_bg).children(hdr_children))
                                         .child(v_flex().flex_1().pl(tw(geom.ml)).pr(tw(geom.mr)).gap_1().children(page_blocks))
-                                        .child(div().min_h(tw(geom.mb)).pl(tw(geom.ml)).pr(tw(geom.mr)).children(hf_els(&ftr, doc_pal)))
+                                        .child(div().min_h(tw(geom.mb)).pl(tw(geom.ml)).pr(tw(geom.mr)).bg(ftr_bg).children(ftr_children))
                                 } else {
                                     page_base.pt(tw(geom.mt)).pr(tw(geom.mr)).pb(tw(geom.mb)).pl(tw(geom.ml)).gap_1().children(page_blocks)
                                 };
