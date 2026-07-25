@@ -216,6 +216,22 @@ struct Docxy {
     page_view: bool,
     // Horizontal ruler with margin/indent/tab markers (View ▸ Ruler).
     show_ruler: bool,
+    // In-progress drag of a ruler indent marker.
+    ruler_drag: Option<RulerDrag>,
+}
+
+#[derive(Clone, Copy)]
+enum RulerHandle {
+    FirstLine,
+    Left,
+}
+
+#[derive(Clone, Copy)]
+struct RulerDrag {
+    handle: RulerHandle,
+    start_x: f32,
+    start_indent: i32,
+    start_first: i32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -447,6 +463,7 @@ impl Docxy {
             show_notes: false,
             page_view: false,
             show_ruler: false,
+            ruler_drag: None,
         };
         this.persist();
         this
@@ -1067,73 +1084,171 @@ impl Docxy {
         }
     }
 
-    /// A Word-style horizontal ruler: the page/margins, tick marks, tab stops and
-    /// the current paragraph's first-line / left (other-rows) indent markers.
-    fn ruler(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tab = self.tabs.get(self.active);
-        let geom = tab.and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
-        let (indent, first_line) = match tab.map(|t| &t.surface) {
+    /// Begin dragging a ruler indent marker.
+    fn ruler_drag_start(&mut self, handle: RulerHandle, x: f32, cx: &mut Context<Self>) {
+        let (indent, first) = match self.tabs.get(self.active).map(|t| &t.surface) {
             Some(Surface::Doc(ed)) => ed.caret_para_indent(),
             _ => (0, 0),
         };
-        // twips → px at ~96dpi.
-        let d = 15.0_f32;
+        self.ruler_drag = Some(RulerDrag { handle, start_x: x, start_indent: indent, start_first: first });
+        cx.notify();
+    }
+
+    /// Update the paragraph indent while a ruler marker is dragged (x is the live
+    /// pointer position; only the delta from the drag start is used).
+    fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.ruler_drag else { return };
+        let delta = ((x - d.start_x) * 15.0).round() as i32; // px → twips
+        self.with_editor(window, cx, |e| match d.handle {
+            // First-line marker: change the first-line delta, keep the left indent.
+            RulerHandle::FirstLine => e.set_first_line(d.start_first + delta),
+            // Left marker: move the whole left indent (both lines), keep first-line.
+            RulerHandle::Left => e.set_indent((d.start_indent + delta).max(0), d.start_first),
+        });
+    }
+
+    fn ruler_drag_end(&mut self, cx: &mut Context<Self>) {
+        if self.ruler_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A Word-style horizontal ruler: the page/margins, tick marks, tab stops and
+    /// the current paragraph's first-line / left (other-rows) indent markers.
+    fn ruler(&self, cx: &mut Context<Self>) -> AnyElement {
+        use docxcore::model::{TabAlign, TabStop};
+        let tab = self.tabs.get(self.active);
+        let geom = tab.and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+        let (indent, first_line, tabs): (i32, i32, Vec<TabStop>) = match tab.map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => {
+                let (i, f) = ed.caret_para_indent();
+                (i, f, ed.caret_para_props().tabs.clone())
+            }
+            _ => (0, 0, vec![]),
+        };
+        let d = 15.0_f32; // twips → px at ~96dpi
         let pw = geom.w as f32 / d;
         let ml = geom.ml as f32 / d;
         let mr = geom.mr as f32 / d;
         let ind = indent as f32 / d;
         let fl = first_line as f32 / d;
-        let _ = cx;
+        let content_r = pw - mr;
+        let h = 22.0_f32;
 
         let paint = canvas(
             move |_b, _w, _a| {},
             move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
                 let x = |v: f32| b.origin.x + px(v);
                 let top = b.origin.y;
-                let h = f32::from(b.size.height);
-                let base = hsla_u(0xb8b8b8); // margin ground
+                let base = hsla_u(0xb8b8b8);
                 let white = hsla_u(0xffffff);
                 let tick = hsla_u(0x707070);
                 let brand = hsla_u(BRAND);
-                // ruler ground + white content strip between the margins.
+                let dim = hsla_u(0x555555);
                 window.paint_quad(fill(b, base));
-                window.paint_quad(fill(Bounds::from_corners(point(x(ml), top + px(3.)), point(x(pw - mr), top + px(h - 3.))), white));
-                // Tick marks every 1/8", taller at each inch, measured from the left
-                // margin (Word's zero point).
-                let inch = 96.0;
-                let step = inch / 8.0;
+                window.paint_quad(fill(Bounds::from_corners(point(x(ml), top + px(3.)), point(x(content_r), top + px(h - 3.))), white));
+                // Tick marks every 1/8", taller each inch, from the left margin.
+                let step = 96.0 / 8.0;
                 let mut i = 0;
                 let mut xx = ml;
-                while xx <= pw - mr + 0.5 {
+                while xx <= content_r + 0.5 {
                     let major = i % 8 == 0;
-                    let th = if major { h * 0.42 } else if i % 4 == 0 { h * 0.30 } else { h * 0.18 };
-                    let y1 = top + px((h - th) * 0.5);
-                    let y2 = top + px((h + th) * 0.5);
-                    window.paint_quad(fill(Bounds::from_corners(point(x(xx), y1), point(x(xx + 1.0), y2)), tick));
+                    let th = if major { h * 0.34 } else if i % 4 == 0 { h * 0.24 } else { h * 0.15 };
+                    window.paint_quad(fill(Bounds::from_corners(point(x(xx), top + px((h - th) * 0.5)), point(x(xx + 1.0), top + px((h + th) * 0.5))), tick));
                     xx += step;
                     i += 1;
                 }
+                // Default tab stops (every 0.5") as tiny ticks along the baseline.
+                let mut tx = ml + 48.0;
+                while tx <= content_r {
+                    window.paint_quad(fill(Bounds::from_corners(point(x(tx), top + px(h - 4.)), point(x(tx + 1.0), top + px(h - 2.))), hsla_u(0x999999)));
+                    tx += 48.0;
+                }
+                // Custom tab stops (from the paragraph) as L / ⊥ / ⌐ markers.
+                for t in &tabs {
+                    let sx = x(ml + t.pos as f32 / d);
+                    let yb = top + px(h - 5.);
+                    // vertical stem
+                    window.paint_quad(fill(Bounds::from_corners(point(sx, top + px(h - 11.)), point(sx + px(1.5), yb)), dim));
+                    // foot direction encodes alignment
+                    let (fx0, fx1) = match t.align {
+                        TabAlign::Left => (0.0, 5.0),
+                        TabAlign::Right => (-5.0, 0.0),
+                        TabAlign::Center => (-3.0, 3.0),
+                    };
+                    window.paint_quad(fill(Bounds::from_corners(point(sx + px(fx0), yb - px(1.5)), point(sx + px(fx1), yb)), dim));
+                }
                 let z = point(0.0_f32, 0.0);
-                // First-line indent: a downward triangle at the top edge.
+                // First-line indent — downward triangle at the top.
                 let flx = ml + ind + fl;
                 let mut t1 = Path::new(point(x(flx - 5.0), top + px(1.)));
                 t1.push_triangle((point(x(flx - 5.0), top + px(1.)), point(x(flx + 5.0), top + px(1.)), point(x(flx), top + px(8.))), (z, z, z));
                 window.paint_path(t1, brand);
-                // Left / other-rows indent: an upward triangle at the bottom edge.
+                // Left / other-rows indent — upward triangle + a square below it.
                 let lx = ml + ind;
                 let by = top + px(h - 1.);
-                let mut t2 = Path::new(point(x(lx - 5.0), by));
-                t2.push_triangle((point(x(lx - 5.0), by), point(x(lx + 5.0), by), point(x(lx), top + px(h - 8.))), (z, z, z));
+                let mut t2 = Path::new(point(x(lx - 5.0), by - px(4.)));
+                t2.push_triangle((point(x(lx - 5.0), by - px(4.)), point(x(lx + 5.0), by - px(4.)), point(x(lx), by - px(11.))), (z, z, z));
                 window.paint_path(t2, brand);
+                window.paint_quad(fill(Bounds::from_corners(point(x(lx - 4.0), by - px(4.)), point(x(lx + 4.0), by)), brand));
+                // Right indent — upward triangle at the right margin (static: the
+                // model has no right-indent field).
+                let rx = content_r;
+                let mut t3 = Path::new(point(x(rx - 5.0), by));
+                t3.push_triangle((point(x(rx - 5.0), by), point(x(rx + 5.0), by), point(x(rx), top + px(h - 8.))), (z, z, z));
+                window.paint_path(t3, brand);
             },
         );
+
+        // Measurement numbers (1, 2, 3 …) at each inch from the left margin.
+        let mut numbers = div().absolute().size_full();
+        let mut inch = 1;
+        loop {
+            let xx = ml + inch as f32 * 96.0;
+            if xx > content_r - 6.0 {
+                break;
+            }
+            numbers = numbers.child(div().absolute().left(px(xx - 3.0)).top(px(4.0)).text_size(px(8.)).text_color(hsla_u(0x555555)).child(SharedString::from(inch.to_string())));
+            inch += 1;
+        }
+
+        // Draggable handles over the two indent markers.
+        let handle = |id: &'static str, cx_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .absolute()
+                .left(px(cx_px - 6.0))
+                .top(px(0.))
+                .w(px(12.))
+                .h(px(h))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.ruler_drag_start(which, f32::from(ev.position.x), cx);
+                }))
+        };
+
+        let container = div()
+            .relative()
+            .w(px(pw))
+            .h(px(h))
+            .child(paint.size_full())
+            .child(numbers)
+            .child(handle("rh-first", ml + ind + fl, RulerHandle::FirstLine, cx))
+            .child(handle("rh-left", ml + ind, RulerHandle::Left, cx));
 
         h_flex()
             .w_full()
             .justify_center()
             .bg(hsla_u(0xdedede))
             .py_0p5()
-            .child(div().w(px(pw)).h(px(18.)).child(paint.size_full()))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if this.ruler_drag.is_some() {
+                    this.ruler_drag_move(f32::from(ev.position.x), window, cx);
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _w, cx| this.ruler_drag_end(cx)))
+            .child(container)
             .into_any_element()
     }
 
@@ -1172,7 +1287,19 @@ impl Docxy {
                 }
             },
         );
-        div().w(px(18.)).flex_none().child(paint.size_full()).into_any_element()
+        // Measurement numbers down the ruler at each inch from the top margin.
+        let mut numbers = div().absolute().size_full();
+        let mut inch = 1;
+        loop {
+            let yy = mt + inch as f32 * 96.0;
+            // stop numbering a little before the bottom margin using a generous page.
+            if yy > (geom.h as f32 / d) - mb - 6.0 {
+                break;
+            }
+            numbers = numbers.child(div().absolute().top(px(yy - 5.0)).left(px(4.0)).text_size(px(8.)).text_color(hsla_u(0x555555)).child(SharedString::from(inch.to_string())));
+            inch += 1;
+        }
+        div().relative().w(px(18.)).flex_none().child(paint.size_full()).child(numbers).into_any_element()
     }
 
     /// The comment entry bar, shown under the ribbon while `comment_open`.
