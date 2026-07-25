@@ -2372,6 +2372,65 @@ fn emit_break(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usi
 /// Compute the list marker text for each top-level block (`None` = not a list
 /// item). Bullets use •/◦ by level; decimal lists get real ordinals that restart
 /// per level and break whenever a non-list block interrupts the run.
+/// Rough rendered height (px) of a block, for paginating Print Layout. Text is
+/// estimated from a character-per-line calc; close enough to place page breaks.
+fn block_height_est(b: &Block, content_w: f32) -> f32 {
+    match b {
+        Block::Paragraph(p) => {
+            let base = match p.props.heading_level {
+                Some(1) => 26.0,
+                Some(2) => 22.0,
+                Some(3) => 19.0,
+                Some(4) => 17.0,
+                Some(_) => 15.0,
+                None => 14.5,
+            };
+            let lh = base * 1.4;
+            let chars = p.plain_text().chars().count().max(1) as f32;
+            let cpl = (content_w / (base * 0.5)).max(1.0);
+            let breaks = p.content.iter().filter(|i| matches!(i, Inline::Break(_))).count() as f32;
+            let lines = (chars / cpl).ceil().max(1.0) + breaks;
+            lines * lh + if p.props.heading_level.is_some() { base } else { 4.0 }
+        }
+        Block::Table(t) => t.rows.len() as f32 * 30.0 + 8.0,
+        Block::Raw(_) => 0.0,
+    }
+}
+
+/// Does this block force a page break (a `w:br` of type page)?
+fn has_page_break(b: &Block) -> bool {
+    matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page))))
+}
+
+/// Group top-level block indices into pages by accumulated estimated height and
+/// hard page breaks. Returns `[start, end)` block ranges, one per page.
+fn paginate(blocks: &[Block], content_h: f32, content_w: f32) -> Vec<(usize, usize)> {
+    let mut pages = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0.0_f32;
+    for (i, b) in blocks.iter().enumerate() {
+        let bh = block_height_est(b, content_w);
+        if acc + bh > content_h && i > start {
+            pages.push((start, i));
+            start = i;
+            acc = 0.0;
+        }
+        acc += bh;
+        if has_page_break(b) {
+            pages.push((start, i + 1));
+            start = i + 1;
+            acc = 0.0;
+        }
+    }
+    if start < blocks.len() {
+        pages.push((start, blocks.len()));
+    }
+    if pages.is_empty() {
+        pages.push((0, blocks.len()));
+    }
+    pages
+}
+
 fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(body.len());
     let mut counts: Vec<u32> = Vec::new();
@@ -3309,39 +3368,42 @@ impl Render for Docxy {
                         pal
                     };
                     let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks };
-                    let blocks: Vec<AnyElement> = editor
-                        .doc
-                        .body
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
-                        .collect();
+                    let body = &editor.doc.body;
                     if self.page_view {
-                        // A white page sheet with the section's margins, centred on a
-                        // grey canvas.
+                        // Print Layout: split the body into discrete white page sheets
+                        // (section margins), stacked on a grey canvas.
                         let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
                         let tw = |t: i32| px((t.max(0) as f32) / 15.0); // twips → px @ ~96dpi
                         let canvas = if self.applied == Some(ThemeMode::Dark) { hsla_u(0x2b2b2b) } else { hsla_u(0x9a9a9a) };
-                        let page = v_flex()
-                            .w(tw(geom.w))
-                            .min_h(tw(geom.h))
-                            .bg(hsla_u(0xffffff))
-                            .text_color(doc_pal.fg)
-                            .border_1()
-                            .border_color(hsla_u(0xd0d0d0))
-                            .pt(tw(geom.mt))
-                            .pr(tw(geom.mr))
-                            .pb(tw(geom.mb))
-                            .pl(tw(geom.ml))
-                            .gap_1()
-                            .children(blocks);
-                        // Pair the page with a vertical ruler on its left (Print
-                        // Layout), stretched to the page height, when the ruler is on.
-                        let sheet = h_flex()
-                            .items_stretch()
-                            .gap(px(3.))
-                            .when(self.show_ruler, |d| d.child(self.vruler()))
-                            .child(page);
+                        let content_h = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
+                        let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
+                        let ranges = paginate(body, content_h, content_w);
+                        let show_ruler = self.show_ruler;
+                        let sheets: Vec<AnyElement> = ranges
+                            .into_iter()
+                            .map(|(s, e)| {
+                                let page_blocks: Vec<AnyElement> = (s..e).map(|i| block_el(&body[i], vec![i], markers[i].as_deref(), ctx)).collect();
+                                let page = v_flex()
+                                    .w(tw(geom.w))
+                                    .min_h(tw(geom.h))
+                                    .bg(hsla_u(0xffffff))
+                                    .text_color(doc_pal.fg)
+                                    .border_1()
+                                    .border_color(hsla_u(0xd0d0d0))
+                                    .pt(tw(geom.mt))
+                                    .pr(tw(geom.mr))
+                                    .pb(tw(geom.mb))
+                                    .pl(tw(geom.ml))
+                                    .gap_1()
+                                    .children(page_blocks);
+                                h_flex()
+                                    .items_stretch()
+                                    .gap(px(3.))
+                                    .when(show_ruler, |d| d.child(self.vruler()))
+                                    .child(page)
+                                    .into_any_element()
+                            })
+                            .collect();
                         v_flex()
                             .id("doc-scroll")
                             .track_scroll(&self.doc_scroll)
@@ -3351,10 +3413,12 @@ impl Render for Docxy {
                             .overflow_y_scroll()
                             .bg(canvas)
                             .items_center()
+                            .gap(px(18.))
                             .py(px(24.))
-                            .child(sheet)
+                            .children(sheets)
                             .into_any_element()
                     } else {
+                        let blocks: Vec<AnyElement> = body.iter().enumerate().map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx)).collect();
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
