@@ -233,6 +233,8 @@ struct Docxy {
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
     context_menu: Option<Point<Pixels>>,
+    // Floating mini formatting toolbar shown after a drag-selection (window coords).
+    mini_bar: Option<Point<Pixels>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -515,6 +517,7 @@ impl Docxy {
             selecting: false,
             keytips: KeyTip::Off,
             context_menu: None,
+            mini_bar: None,
         };
         this.persist();
         this
@@ -704,6 +707,8 @@ impl Docxy {
     /// Start a mouse drag-selection at a click. Without Shift it plants a fresh
     /// anchor at the click; with Shift it extends the existing selection.
     fn begin_select(&mut self, path: Vec<usize>, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.mini_bar = None;
+        self.context_menu = None;
         if let Some(ed) = self.active_editor() {
             if extend {
                 ed.extend_selection(true); // anchor at the current caret if none
@@ -1865,6 +1870,9 @@ impl Docxy {
             }
             return; // swallow other keys while KeyTips are up
         }
+        // Any key dismisses the floating mini toolbar / context menu.
+        self.mini_bar = None;
+        self.context_menu = None;
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
@@ -2886,6 +2894,47 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The floating mini formatting toolbar, anchored just above the selection.
+    fn mini_bar_el(&self, at: Point<Pixels>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let btn = |cx: &mut Context<Self>, id: &'static str, icon: &'static str, act: Act| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .when(self.act_active(act), |d| d.bg(Hsla { a: 0.20, ..hsla_u(BRAND) }))
+                .hover(|d| d.bg(pal.hover))
+                .child(icon_svg(icon, 15., pal.fg))
+                .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+        };
+        h_flex()
+            .absolute()
+            .left(at.x)
+            .top((at.y - px(36.)).max(px(2.)))
+            .items_center()
+            .gap(px(1.))
+            .p_0p5()
+            .rounded_md()
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(btn(cx, "mb-b", "bold", Act::Bold))
+            .child(btn(cx, "mb-i", "italic", Act::Italic))
+            .child(btn(cx, "mb-u", "underline", Act::Underline))
+            .child(btn(cx, "mb-s", "strikethrough", Act::Strike))
+            .child(div().w(px(1.)).h(px(18.)).mx_0p5().bg(pal.border))
+            .child(btn(cx, "mb-grow", "font-increase", Act::Grow))
+            .child(btn(cx, "mb-shrink", "font-decrease", Act::Shrink))
+            .child(btn(cx, "mb-color", "text-color", Act::FontColor))
+            .child(btn(cx, "mb-hl", "highlight", Act::Highlight))
+            .into_any_element()
+    }
+
     /// Handle a letter pressed while KeyTips are showing: pick a tab (Tabs level)
     /// or run a command (Commands level).
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -3702,16 +3751,20 @@ impl Render for Docxy {
             .when_some(comments_panel, |d, p| d.child(p))
             .when_some(notes_panel, |d, p| d.child(p));
         let context_menu = self.context_menu.map(|at| self.context_menu_el(at, pal, cx));
+        let mini_bar = (is_doc && self.context_menu.is_none()).then_some(self.mini_bar).flatten().map(|at| self.mini_bar_el(at, pal, cx));
 
         v_flex()
             .size_full()
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            // End a text drag-selection wherever the button is released.
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _w, cx| {
+            // End a text drag-selection wherever the button is released; if it left
+            // a non-empty selection, pop the mini formatting toolbar there.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
                 if this.selecting {
                     this.selecting = false;
+                    let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
+                    this.mini_bar = has_sel.then_some(ev.position);
                     cx.notify();
                 }
             }))
@@ -3725,6 +3778,7 @@ impl Render for Docxy {
             .when_some(ruler, |d, r| d.child(r))
             .child(body)
             .child(status)
+            .when_some(mini_bar, |d, m| d.child(m))
             .when_some(context_menu, |d, m| d.child(m))
             .into_any_element()
     }
