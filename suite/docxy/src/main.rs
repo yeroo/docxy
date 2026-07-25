@@ -280,10 +280,21 @@ enum PickKind {
     FontSize,
     Field,
     Table,
+    Symbol,
 }
 
 /// Table sizes offered by the Insert ▸ Table picker: (label, rows, cols).
 const TABLE_PRESETS: &[(&str, usize, usize)] = &[("2×2", 2, 2), ("3×2", 3, 2), ("3×3", 3, 3), ("4×3", 4, 3), ("5×3", 5, 3), ("5×5", 5, 5)];
+
+/// The characters offered by the Insert ▸ Symbol picker — Word's common set:
+/// typographic punctuation, currency, arrows, and maths.
+const SYMBOLS: &[&str] = &[
+    "\u{2014}", "\u{2013}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}", "\u{00AE}", "\u{2122}",
+    "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}", "\u{2248}", "\u{2264}", "\u{2265}",
+    "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}", "\u{00A5}", "\u{00A2}", "\u{2190}",
+    "\u{2192}", "\u{2191}", "\u{2193}", "\u{201C}", "\u{201D}", "\u{2018}", "\u{2019}", "\u{03B1}",
+    "\u{03B2}", "\u{03C0}", "\u{03BC}", "\u{03A9}", "\u{2211}", "\u{221A}", "\u{2212}", "\u{2605}",
+];
 
 /// The fields offered by the Insert ▸ Field picker: (label, instruction, fallback).
 const FIELDS: &[(&str, &str, &str)] = &[
@@ -916,6 +927,13 @@ impl Docxy {
         self.with_editor(window, cx, |e| e.paste(&Clip { paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]] }));
     }
 
+    /// Insert one symbol/special character at the caret (Insert ▸ Symbol).
+    fn insert_symbol(&mut self, s: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        let s = s.to_string();
+        self.with_editor(window, cx, move |e| e.insert_str(&s));
+    }
+
     /// If the caret is inside a table, the (block index, row, cell).
     fn caret_table(&self) -> Option<(usize, usize, usize)> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
@@ -1038,6 +1056,7 @@ impl Docxy {
             PickKind::FontSize => "Size",
             PickKind::Field => "Field",
             PickKind::Table => "Table",
+            PickKind::Symbol => "Symbol",
         }));
         let chip = |id_key: usize, label: SharedString, tag: &'static str| {
             div().id((tag, id_key)).flex().items_center().px_2().h(px(22.)).rounded(px(3.)).text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).cursor_pointer().hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND))).child(label)
@@ -1105,6 +1124,28 @@ impl Docxy {
             PickKind::Table => {
                 for (i, &(label, r, c)) in TABLE_PRESETS.iter().enumerate() {
                     row = row.child(chip(i, label.into(), "tbl").on_click(cx.listener(move |this, _, window, cx| this.insert_table(r, c, window, cx))));
+                }
+            }
+            PickKind::Symbol => {
+                for (i, &s) in SYMBOLS.iter().enumerate() {
+                    // A slightly larger, fixed-width chip so each glyph reads clearly.
+                    row = row.child(
+                        div()
+                            .id(("sym", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(24.))
+                            .rounded(px(3.))
+                            .text_size(px(15.))
+                            .text_color(pal.fg)
+                            .border_1()
+                            .border_color(pal.border)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND)))
+                            .child(SharedString::from(s))
+                            .on_click(cx.listener(move |this, _, window, cx| this.insert_symbol(s, window, cx))),
+                    );
                 }
             }
         }
@@ -2003,7 +2044,7 @@ enum Act {
     Normal, H1, H2, H3, HRule, SelectAll, Case,
     Bullets, Numbers, IndentInc, IndentDec, ClearFmt, Find, FontColor, Highlight, FontName, FontSize, Super, Sub, NewComment,
     Sort, LineSpacing, ParaBorders, Title, Subtitle, ShowHide, ToggleComments, ToggleNav, DarkMode, AutoHideRibbon,
-    InsertField, PageBreak, ToggleNotes, InsertTable,
+    InsertField, PageBreak, ToggleNotes, InsertTable, InsertSymbol,
     RowAbove, RowBelow, ColLeft, ColRight, DelRow, DelCol, DelTable, PrintLayout, ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
     // dialog system).
@@ -2115,7 +2156,10 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             rs::group("Pages", 40, vec![Control::Large(cmdt("pagebreak", "rule", "Page Break", PageBreak, "").key("B"))]),
             rs::group("Tables", 35, vec![Control::Large(cmdt("table", "table", "Table", InsertTable, "").key("T"))]),
             rs::group("Text", 30, vec![Control::Large(cmdt("field", "case", "Field", InsertField, "").key("Q"))]),
-            rs::group("Symbols", 20, vec![Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("H"))]),
+            rs::group("Symbols", 20, vec![
+                Control::Large(cmdt("symbol", "symbol", "Symbol", InsertSymbol, "").key("S")),
+                Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("H")),
+            ]),
         ]),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
         rs::tab("Review", "R", vec![
@@ -3059,6 +3103,7 @@ impl Docxy {
             }
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
             InsertTable => self.toggle_picker(PickKind::Table, window, cx),
+            InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => self.table_op(act, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
@@ -3111,7 +3156,7 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes | InsertTable | InsertSymbol | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
             }),
         }
     }
