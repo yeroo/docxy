@@ -3375,9 +3375,31 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
                 let shown = if !text.is_empty() { text.clone() } else { latex.clone().unwrap_or_default() };
                 spans.push(div().px(px(3.)).rounded_sm().bg(Hsla { a: 0.14, ..hsla_u(BRAND) }).text_size(px(base)).text_color(pal.fg).italic().child(SharedString::from(shown)).into_any_element());
             }
+            Inline::SmartArt { text, .. } => {
+                // docxy can't draw the diagram graphics, but the node labels are
+                // extracted from the diagram data — show them as a captioned box
+                // (matching the terminal editor) rather than a "[diagram]" stub.
+                let mut box_el = v_flex()
+                    .my(px(2.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .gap(px(1.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .bg(pal.panel)
+                    .child(div().text_size(px(9.)).text_color(hsla_u(BRAND)).child("\u{25C6} SmartArt"));
+                if text.is_empty() {
+                    box_el = box_el.child(div().text_size(px(base * 0.9)).text_color(pal.dim).child("(no text)"));
+                } else {
+                    for node in text {
+                        box_el = box_el.child(div().text_size(px(base * 0.9)).text_color(pal.fg).child(SharedString::from(format!("\u{2022} {node}"))));
+                    }
+                }
+                spans.push(box_el.into_any_element());
+            }
             other => {
                 let tag = match other {
-                    Inline::SmartArt { .. } => "[diagram]",
                     Inline::Chart { .. } => "[chart]",
                     Inline::TextBox { .. } => "[textbox]",
                     _ => "[image]",
