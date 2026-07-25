@@ -1137,6 +1137,44 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The vertical ruler on the left of the page (Print Layout): top/bottom
+    /// margins shaded, content white, tick marks every inch from the top margin.
+    fn vruler(&self) -> AnyElement {
+        let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+        let d = 15.0_f32;
+        let mt = geom.mt as f32 / d;
+        let mb = geom.mb as f32 / d;
+        let paint = canvas(
+            move |_b, _w, _a| {},
+            move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
+                let y = |v: f32| b.origin.y + px(v);
+                let left = b.origin.x;
+                let w = f32::from(b.size.width);
+                let hh = f32::from(b.size.height);
+                let base = hsla_u(0xb8b8b8);
+                let white = hsla_u(0xffffff);
+                let tick = hsla_u(0x707070);
+                // ground + white content strip between top and bottom margins.
+                window.paint_quad(fill(b, base));
+                window.paint_quad(fill(Bounds::from_corners(point(left + px(3.), y(mt)), point(left + px(w - 3.), y((hh - mb).max(mt)))), white));
+                // ticks every 1/8", taller each inch, measured from the top margin.
+                let step = 96.0 / 8.0;
+                let mut i = 0;
+                let mut yy = mt;
+                while yy <= hh - mb + 0.5 {
+                    let major = i % 8 == 0;
+                    let tw = if major { w * 0.42 } else if i % 4 == 0 { w * 0.30 } else { w * 0.18 };
+                    let x1 = left + px((w - tw) * 0.5);
+                    let x2 = left + px((w + tw) * 0.5);
+                    window.paint_quad(fill(Bounds::from_corners(point(x1, y(yy)), point(x2, y(yy + 1.0))), tick));
+                    yy += step;
+                    i += 1;
+                }
+            },
+        );
+        div().w(px(18.)).flex_none().child(paint.size_full()).into_any_element()
+    }
+
     /// The comment entry bar, shown under the ribbon while `comment_open`.
     fn comment_bar(&self, pal: Pal, _cx: &mut Context<Self>) -> AnyElement {
         h_flex()
@@ -2999,6 +3037,13 @@ impl Render for Docxy {
                             .pl(tw(geom.ml))
                             .gap_1()
                             .children(blocks);
+                        // Pair the page with a vertical ruler on its left (Print
+                        // Layout), stretched to the page height, when the ruler is on.
+                        let sheet = h_flex()
+                            .items_stretch()
+                            .gap(px(3.))
+                            .when(self.show_ruler, |d| d.child(self.vruler()))
+                            .child(page);
                         v_flex()
                             .id("doc-scroll")
                             .track_scroll(&self.doc_scroll)
@@ -3009,7 +3054,7 @@ impl Render for Docxy {
                             .bg(canvas)
                             .items_center()
                             .py(px(24.))
-                            .child(page)
+                            .child(sheet)
                             .into_any_element()
                     } else {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
