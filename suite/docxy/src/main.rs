@@ -235,6 +235,8 @@ struct Docxy {
     context_menu: Option<Point<Pixels>>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
+    // Document zoom factor (1.0 = 100%), controlled from the status bar.
+    zoom: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -311,6 +313,7 @@ struct RenderCtx<'a> {
     ent: &'a Entity<Docxy>,
     pal: Pal,
     marks: bool,
+    zoom: f32,
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -518,6 +521,7 @@ impl Docxy {
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
+            zoom: 1.0,
         };
         this.persist();
         this
@@ -2497,7 +2501,7 @@ fn hf_els(blocks: &[Block], pal: Pal) -> Vec<AnyElement> {
     blocks
         .iter()
         .filter_map(|b| match b {
-            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, pal)),
+            Block::Paragraph(p) => Some(paragraph_el(p, None, None, None, None, false, 1.0, pal)),
             _ => None,
         })
         .collect()
@@ -2591,15 +2595,17 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     out
 }
 
-fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, pal: Pal) -> AnyElement {
-    let base = match p.props.heading_level {
-        Some(1) => 26.0,
-        Some(2) => 22.0,
-        Some(3) => 19.0,
-        Some(4) => 17.0,
-        Some(_) => 15.0,
-        None => 14.5,
-    };
+#[allow(clippy::too_many_arguments)]
+fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usize)>, marker: Option<&str>, click: Option<Click>, marks: bool, zoom: f32, pal: Pal) -> AnyElement {
+    let base = zoom
+        * match p.props.heading_level {
+            Some(1) => 26.0,
+            Some(2) => 22.0,
+            Some(3) => 19.0,
+            Some(4) => 17.0,
+            Some(_) => 15.0,
+            None => 14.5,
+        };
     let is_heading = p.props.heading_level.is_some();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
@@ -2674,8 +2680,8 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     };
     // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
     // per list nesting level.
-    let pad = (p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0;
-    let pad_r = (p.props.indent_right.max(0) as f32) / 15.0;
+    let pad = zoom * ((p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0);
+    let pad_r = zoom * (p.props.indent_right.max(0) as f32) / 15.0;
     // The whole paragraph area is a click fallback (empty space past the text, the
     // indent gutter) that drops the caret at the paragraph end. Word clicks fire
     // first and stop propagation, so this only runs on a "past the text" click.
@@ -2728,7 +2734,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
             let caret = (ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
             let sel = ctx.spans.iter().find(|(pp, _, _)| pp.as_slice() == path.as_slice()).map(|(_, s, e)| (*s, *e));
             let click = Some(Click { ent: ctx.ent, path: &path });
-            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.pal)
+            paragraph_el(p, caret, sel, marker, click, ctx.marks, ctx.zoom, ctx.pal)
         }
         Block::Table(t) => table_el(t, &path, ctx),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
@@ -3655,13 +3661,14 @@ impl Render for Docxy {
                     } else {
                         pal
                     };
-                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks };
+                    let ctx = RenderCtx { caret_path: &editor.caret.path, caret_off: editor.caret.offset, spans: &spans, ent: &ent, pal: doc_pal, marks: self.show_marks, zoom: self.zoom };
                     let body = &editor.doc.body;
                     if self.page_view {
                         // Print Layout: split the body into discrete white page sheets
                         // (section margins), stacked on a grey canvas.
                         let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
-                        let tw = |t: i32| px((t.max(0) as f32) / 15.0); // twips → px @ ~96dpi
+                        let zoom = self.zoom;
+                        let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
                         let canvas = if self.applied == Some(ThemeMode::Dark) { hsla_u(0x2b2b2b) } else { hsla_u(0x9a9a9a) };
                         let content_h = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
                         let content_w = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
@@ -3722,16 +3729,39 @@ impl Render for Docxy {
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
         };
 
+        let zoom_btn = |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(16.))
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(fg)
+                .hover(|d| d.bg(pal.hover))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let z = if delta == 0.0 { 1.0 } else { this.zoom + delta };
+                    this.zoom = z.clamp(0.5, 3.0);
+                    this.refocus(window, cx);
+                }))
+        };
         let status = h_flex()
             .w_full()
             .px_4()
             .py_1()
+            .gap_2()
             .bg(panel)
             .text_size(px(11.))
             .text_color(dim)
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
             .child(div().flex_1())
-            .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S");
+            .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S")
+            // Zoom controls (Word's bottom-right zoom).
+            .child(zoom_btn(cx, "zoom-out", "\u{2212}", -0.1))
+            .child(div().id("zoom-pct").min_w(px(34.)).flex().justify_center().cursor_pointer().hover(|d| d.text_color(fg)).child(SharedString::from(format!("{}%", (self.zoom * 100.0).round() as i32))).on_click(cx.listener(|this, _, window, cx| { this.zoom = 1.0; this.refocus(window, cx); })))
+            .child(zoom_btn(cx, "zoom-in", "+", 0.1));
 
         // The body is the document, flanked by the navigation and comments panes.
         let nav_panel = (is_doc && self.show_nav).then(|| self.nav_panel(pal, cx));

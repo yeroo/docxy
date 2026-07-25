@@ -22,3 +22,6 @@
 
 # GPUI UI suite build output (separate workspace)
 /suite/target/
+
+.idea/
+~$*
