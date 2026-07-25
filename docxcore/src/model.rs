@@ -218,6 +218,9 @@ pub struct ParProps {
     /// (first line pulled left of the rest, as in lists/bibliographies). Zero =
     /// every line shares `indent`.
     pub first_line: i32,
+    /// Right indent in twips (`w:ind w:right`/`w:end`). Pulls the paragraph's right
+    /// edge in from the right margin.
+    pub indent_right: i32,
     /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`, spacing
     /// `w:spacing`, `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
     /// silently drop them. Re-emitted in `w:pPr` in document order.

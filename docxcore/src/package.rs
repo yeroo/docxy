@@ -306,6 +306,21 @@ impl Package {
         crate::model::PageGeom::from_sect_pr(&self.sect_pr)
     }
 
+    /// Set the page margins (twips) in the body section's `w:pgMar`, preserving
+    /// any header/footer/gutter attributes. Creates the element if absent.
+    pub fn set_page_margins(&mut self, top: i32, right: i32, bottom: i32, left: i32) {
+        let mut s = std::mem::take(&mut self.sect_pr);
+        if !s.contains("<w:pgMar") {
+            let mar = format!("<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>");
+            s = inject_sect_child(&s, &mar);
+        } else {
+            for (k, v) in [("w:top", top), ("w:right", right), ("w:bottom", bottom), ("w:left", left)] {
+                s = set_pgmar_attr(&s, k, v);
+            }
+        }
+        self.sect_pr = s;
+    }
+
     /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
     /// content-type if absent. `text` is the comment body (XML-escaped here).
     pub fn add_comment(&mut self, id: i32, author: &str, initials: &str, date: &str, text: &str) {
@@ -597,6 +612,29 @@ fn next_rid(rels: &str) -> String {
 
 /// Insert a child element as the first child of `<w:sectPr>` (creating/expanding
 /// the element as needed). References must precede other section properties.
+/// Replace (or add) a numeric attribute on the section's `<w:pgMar>` element.
+fn set_pgmar_attr(sect: &str, key: &str, val: i32) -> String {
+    let Some(ts) = sect.find("<w:pgMar") else {
+        return sect.to_string();
+    };
+    let Some(rel) = sect[ts..].find('>') else {
+        return sect.to_string();
+    };
+    let end = ts + rel; // index of '>'
+    let el = &sect[ts..end]; // element without the closing '>'
+    let k = format!("{key}=\"");
+    let new_el = if let Some(ks) = el.find(&k) {
+        let vs = ks + k.len();
+        let ve = el[vs..].find('"').map(|e| vs + e).unwrap_or(vs);
+        format!("{}{}{}", &el[..vs], val, &el[ve..])
+    } else {
+        let trimmed = el.trim_end_matches('/').trim_end();
+        let slash = if el.trim_end().ends_with('/') { "/" } else { "" };
+        format!("{trimmed} {key}=\"{val}\"{slash}")
+    };
+    format!("{}{}{}", &sect[..ts], new_el, &sect[end..])
+}
+
 fn inject_sect_child(sect: &str, child: &str) -> String {
     if sect.is_empty() {
         return format!("<w:sectPr>{child}</w:sectPr>");

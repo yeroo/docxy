@@ -216,14 +216,22 @@ struct Docxy {
     page_view: bool,
     // Horizontal ruler with margin/indent/tab markers (View ▸ Ruler).
     show_ruler: bool,
-    // In-progress drag of a ruler indent marker.
+    // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
+    // The tab-stop type placed when clicking the ruler (cycled via the corner box).
+    ruler_tab: docxcore::model::TabAlign,
+    // The ruler content area's left-margin screen x, written by the ruler canvas
+    // each paint and read by click handlers to map a click to a tab position.
+    ruler_x0: std::rc::Rc<std::cell::Cell<f32>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum RulerHandle {
     FirstLine,
     Left,
+    Right,
+    MarginLeft,
+    MarginRight,
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +240,9 @@ struct RulerDrag {
     start_x: f32,
     start_indent: i32,
     start_first: i32,
+    start_right: i32,
+    start_ml: i32,
+    start_mr: i32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -464,6 +475,8 @@ impl Docxy {
             page_view: false,
             show_ruler: false,
             ruler_drag: None,
+            ruler_tab: docxcore::model::TabAlign::Left,
+            ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
         };
         this.persist();
         this
@@ -1084,27 +1097,71 @@ impl Docxy {
         }
     }
 
-    /// Begin dragging a ruler indent marker.
+    /// Begin dragging a ruler marker.
     fn ruler_drag_start(&mut self, handle: RulerHandle, x: f32, cx: &mut Context<Self>) {
-        let (indent, first) = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => ed.caret_para_indent(),
-            _ => (0, 0),
+        let (indent, first, right) = match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => {
+                let (i, f) = ed.caret_para_indent();
+                (i, f, ed.caret_para_right_indent())
+            }
+            _ => (0, 0, 0),
         };
-        self.ruler_drag = Some(RulerDrag { handle, start_x: x, start_indent: indent, start_first: first });
+        let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+        self.ruler_drag = Some(RulerDrag { handle, start_x: x, start_indent: indent, start_first: first, start_right: right, start_ml: geom.ml, start_mr: geom.mr });
         cx.notify();
     }
 
-    /// Update the paragraph indent while a ruler marker is dragged (x is the live
-    /// pointer position; only the delta from the drag start is used).
+    /// Update the dragged ruler marker (x is the live pointer position; only the
+    /// delta from the drag start is used).
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
         let delta = ((x - d.start_x) * 15.0).round() as i32; // px → twips
-        self.with_editor(window, cx, |e| match d.handle {
-            // First-line marker: change the first-line delta, keep the left indent.
-            RulerHandle::FirstLine => e.set_first_line(d.start_first + delta),
-            // Left marker: move the whole left indent (both lines), keep first-line.
-            RulerHandle::Left => e.set_indent((d.start_indent + delta).max(0), d.start_first),
+        match d.handle {
+            RulerHandle::FirstLine => self.with_editor(window, cx, |e| e.set_first_line(d.start_first + delta)),
+            RulerHandle::Left => self.with_editor(window, cx, |e| e.set_indent((d.start_indent + delta).max(0), d.start_first)),
+            // Dragging the right marker left (negative delta) increases the indent.
+            RulerHandle::Right => self.with_editor(window, cx, |e| e.set_right_indent((d.start_right - delta).max(0))),
+            RulerHandle::MarginLeft | RulerHandle::MarginRight => {
+                let geom = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
+                let (ml, mr) = match d.handle {
+                    RulerHandle::MarginLeft => ((d.start_ml + delta).max(0), geom.mr),
+                    _ => (geom.ml, (d.start_mr - delta).max(0)),
+                };
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    if let Some(pkg) = t.pkg.as_mut() {
+                        pkg.set_page_margins(geom.mt, mr, geom.mb, ml);
+                        t.dirty = true;
+                    }
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Add a tab stop at the clicked ruler position (mapped from the stored
+    /// left-margin origin), or remove one if the click lands on an existing stop.
+    fn ruler_click_tab(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let pos = ((x - self.ruler_x0.get()) * 15.0).round() as i32;
+        if pos < 0 {
+            return;
+        }
+        let align = self.ruler_tab;
+        self.with_editor(window, cx, |e| {
+            if !e.remove_tab_stop_near(pos, 90) {
+                e.add_tab_stop(pos, align);
+            }
         });
+    }
+
+    /// Cycle the tab-stop type set by clicking the ruler (Left → Center → Right).
+    fn cycle_ruler_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use docxcore::model::TabAlign::*;
+        self.ruler_tab = match self.ruler_tab {
+            Left => Center,
+            Center => Right,
+            Right => Left,
+        };
+        self.refocus(window, cx);
     }
 
     fn ruler_drag_end(&mut self, cx: &mut Context<Self>) {
@@ -1119,12 +1176,12 @@ impl Docxy {
         use docxcore::model::{TabAlign, TabStop};
         let tab = self.tabs.get(self.active);
         let geom = tab.and_then(|t| t.pkg.as_ref()).map(|p| p.page_geom()).unwrap_or_default();
-        let (indent, first_line, tabs): (i32, i32, Vec<TabStop>) = match tab.map(|t| &t.surface) {
+        let (indent, first_line, indent_right, tabs): (i32, i32, i32, Vec<TabStop>) = match tab.map(|t| &t.surface) {
             Some(Surface::Doc(ed)) => {
                 let (i, f) = ed.caret_para_indent();
-                (i, f, ed.caret_para_props().tabs.clone())
+                (i, f, ed.caret_para_right_indent(), ed.caret_para_props().tabs.clone())
             }
-            _ => (0, 0, vec![]),
+            _ => (0, 0, 0, vec![]),
         };
         let d = 15.0_f32; // twips → px at ~96dpi
         let pw = geom.w as f32 / d;
@@ -1132,12 +1189,18 @@ impl Docxy {
         let mr = geom.mr as f32 / d;
         let ind = indent as f32 / d;
         let fl = first_line as f32 / d;
+        let rind = indent_right as f32 / d;
         let content_r = pw - mr;
+        let right_marker = content_r - rind;
         let h = 22.0_f32;
+        let x0_cell = self.ruler_x0.clone();
 
         let paint = canvas(
             move |_b, _w, _a| {},
             move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
+                // Record the left-margin screen x so click handlers can map a click
+                // to a tab position (twips from the left margin).
+                x0_cell.set(f32::from(b.origin.x) + ml);
                 let x = |v: f32| b.origin.x + px(v);
                 let top = b.origin.y;
                 let base = hsla_u(0xb8b8b8);
@@ -1191,9 +1254,9 @@ impl Docxy {
                 t2.push_triangle((point(x(lx - 5.0), by - px(4.)), point(x(lx + 5.0), by - px(4.)), point(x(lx), by - px(11.))), (z, z, z));
                 window.paint_path(t2, brand);
                 window.paint_quad(fill(Bounds::from_corners(point(x(lx - 4.0), by - px(4.)), point(x(lx + 4.0), by)), brand));
-                // Right indent — upward triangle at the right margin (static: the
-                // model has no right-indent field).
-                let rx = content_r;
+                // Right indent — upward triangle, positioned in from the right
+                // margin by the paragraph's right indent.
+                let rx = right_marker;
                 let mut t3 = Path::new(point(x(rx - 5.0), by));
                 t3.push_triangle((point(x(rx - 5.0), by), point(x(rx + 5.0), by), point(x(rx), top + px(h - 8.))), (z, z, z));
                 window.paint_path(t3, brand);
@@ -1228,18 +1291,70 @@ impl Docxy {
                 }))
         };
 
+        // A thin margin-boundary grab strip (invisible) for dragging page margins.
+        let margin_handle = |id: &'static str, cx_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .absolute()
+                .left(px(cx_px - 3.0))
+                .top(px(0.))
+                .w(px(6.))
+                .h(px(h))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.ruler_drag_start(which, f32::from(ev.position.x), cx);
+                }))
+        };
+
         let container = div()
             .relative()
             .w(px(pw))
             .h(px(h))
             .child(paint.size_full())
             .child(numbers)
+            // Click the content area to add/remove a tab stop of the current type.
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.ruler_click_tab(f32::from(ev.position.x), window, cx);
+            }))
+            .child(margin_handle("rh-mleft", ml, RulerHandle::MarginLeft, cx))
+            .child(margin_handle("rh-mright", content_r, RulerHandle::MarginRight, cx))
             .child(handle("rh-first", ml + ind + fl, RulerHandle::FirstLine, cx))
-            .child(handle("rh-left", ml + ind, RulerHandle::Left, cx));
+            .child(handle("rh-left", ml + ind, RulerHandle::Left, cx))
+            .child(handle("rh-right", right_marker, RulerHandle::Right, cx));
+
+        // The tab-type selector box at the far left (click to cycle L/Centre/Right).
+        let tab_glyph = match self.ruler_tab {
+            docxcore::model::TabAlign::Left => "L",
+            docxcore::model::TabAlign::Center => "\u{22A5}",
+            docxcore::model::TabAlign::Right => "\u{2510}",
+        };
+        // Same width + gap as the vertical ruler so the horizontal ruler content
+        // lines up with the page sheet (this box sits in the corner, Word-style).
+        let selector = div()
+            .id("ruler-tabtype")
+            .w(px(18.))
+            .h(px(18.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(2.))
+            .bg(hsla_u(0xffffff))
+            .border_1()
+            .border_color(hsla_u(0xb0b0b0))
+            .text_size(px(11.))
+            .text_color(hsla_u(0x333333))
+            .cursor_pointer()
+            .child(tab_glyph)
+            .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.cycle_ruler_tab(window, cx)));
 
         h_flex()
             .w_full()
+            .items_center()
             .justify_center()
+            .gap(px(3.))
             .bg(hsla_u(0xdedede))
             .py_0p5()
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -1248,6 +1363,7 @@ impl Docxy {
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _w, cx| this.ruler_drag_end(cx)))
+            .child(selector)
             .child(container)
             .into_any_element()
     }
@@ -2316,6 +2432,7 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
     // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
     // per list nesting level.
     let pad = (p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0;
+    let pad_r = (p.props.indent_right.max(0) as f32) / 15.0;
     // The whole paragraph area is a click fallback (empty space past the text, the
     // indent gutter) that drops the caret at the paragraph end. Word clicks fire
     // first and stop propagation, so this only runs on a "past the text" click.
@@ -2324,6 +2441,7 @@ fn paragraph_el(p: &Paragraph, mut caret: Option<usize>, sel: Option<(usize, usi
         .w_full()
         .py_0p5()
         .pl(px(pad))
+        .pr(px(pad_r))
         .when(is_heading, |d| d.mt_2())
         .when(has_border, |d| d.border_b_1().border_color(pal.fg).pb_1())
         .when_some(click, |d, c| {

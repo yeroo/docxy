@@ -917,11 +917,51 @@ impl Editor {
         self.for_each_para(move |pr| pr.first_line = first_line);
     }
 
+    /// Set the right indent (twips, clamped at 0) of the selected paragraphs.
+    pub fn set_right_indent(&mut self, right: i32) {
+        self.for_each_para(move |pr| pr.indent_right = right.max(0));
+    }
+
     /// The left indent and first-line delta at the caret (for syncing the
     /// Paragraph dialog and ribbon state).
     pub fn caret_para_indent(&self) -> (i32, i32) {
         let pr = self.caret_para_props();
         (pr.indent, pr.first_line)
+    }
+
+    /// The right indent (twips) at the caret.
+    pub fn caret_para_right_indent(&self) -> i32 {
+        self.caret_para_props().indent_right
+    }
+
+    /// Replace the direct tab stops of the selected paragraphs.
+    pub fn set_tabs(&mut self, tabs: Vec<crate::model::TabStop>) {
+        self.for_each_para(move |pr| pr.tabs = tabs.clone());
+    }
+
+    /// Add (or move) a tab stop at `pos` twips with the given alignment on the
+    /// caret's paragraph; a nearby existing stop (within ~1/8") is replaced.
+    pub fn add_tab_stop(&mut self, pos: i32, align: crate::model::TabAlign) {
+        use crate::model::{TabLeader, TabStop};
+        self.for_each_para(move |pr| {
+            pr.tabs.retain(|t| (t.pos - pos).abs() > 180);
+            pr.tabs.push(TabStop { pos, align, leader: TabLeader::None });
+            pr.tabs.sort_by_key(|t| t.pos);
+        });
+    }
+
+    /// Remove the tab stop nearest `pos` (within `tol` twips) on the caret's
+    /// paragraph. Returns true if one was removed.
+    pub fn remove_tab_stop_near(&mut self, pos: i32, tol: i32) -> bool {
+        let before = self.caret_para_props().tabs.len();
+        self.for_each_para(move |pr| {
+            if let Some((i, _)) = pr.tabs.iter().enumerate().min_by_key(|(_, t)| (t.pos - pos).abs()) {
+                if (pr.tabs[i].pos - pos).abs() <= tol {
+                    pr.tabs.remove(i);
+                }
+            }
+        });
+        self.caret_para_props().tabs.len() != before
     }
 
     /// Apply a paragraph style (`w:pStyle`) to the selected paragraphs, updating

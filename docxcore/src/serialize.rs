@@ -157,6 +157,8 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.borders.top.is_some()
         || props.borders.bottom.is_some()
         || props.indent != 0
+        || props.indent_right != 0
+        || props.first_line != 0
         || !props.tabs.is_empty()
         || !props.raw_props.is_empty();
     if !has_any {
@@ -260,10 +262,13 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         x.push_str("</w:tabs>");
         parts.push((ppr_rank("tabs"), x));
     }
-    if props.indent != 0 || props.first_line != 0 {
+    if props.indent != 0 || props.first_line != 0 || props.indent_right != 0 {
         let mut x = String::from("<w:ind");
         if props.indent != 0 {
             x.push_str(&format!(" w:left=\"{}\"", props.indent));
+        }
+        if props.indent_right != 0 {
+            x.push_str(&format!(" w:right=\"{}\"", props.indent_right));
         }
         // firstLine and hanging are mutually exclusive; both are non-negative.
         match props.first_line.cmp(&0) {
