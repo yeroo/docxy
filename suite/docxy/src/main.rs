@@ -256,7 +256,18 @@ enum SheetAct {
     Comma,
     InsertPivot,
     InsertChart,
+    FillColor,
+    FontColor,
+    ToggleBorder,
+    FreezePanes,
     Todo,
+}
+
+/// Which colour a sheet swatch picker is choosing.
+#[derive(Clone, Copy, PartialEq)]
+enum SheetPick {
+    Fill,
+    Font,
 }
 
 impl SheetView {
@@ -422,6 +433,8 @@ struct Docxy {
     // The spreadsheet clipboard: a rectangular block of cells from the last grid
     // copy/cut, pasted at the selection on Ctrl+V.
     grid_clip: Option<GridClip>,
+    // Open sheet colour-swatch picker (fill or font), None = closed.
+    sheet_pick: Option<SheetPick>,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -785,6 +798,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
+            sheet_pick: None,
         }
     }
 
@@ -1194,6 +1208,36 @@ impl Docxy {
     fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
     }
+    /// Set fill or font colour on the selection from a swatch (None = clear), and
+    /// close the picker.
+    fn sheet_apply_color(&mut self, pick: SheetPick, rgb: Option<(u8, u8, u8)>, cx: &mut Context<Self>) {
+        self.sheet_format(move |xf| match pick {
+            SheetPick::Fill => xf.fill = rgb,
+            SheetPick::Font => xf.color = rgb,
+        }, cx);
+        self.sheet_pick = None;
+        cx.notify();
+    }
+    /// Toggle a thin box border on the selected cells.
+    fn sheet_toggle_border(&mut self, cx: &mut Context<Self>) {
+        let on = !self.active_xf().border;
+        self.sheet_format(move |xf| xf.border = on, cx);
+    }
+    /// Freeze panes at the selected cell (toggles off if already frozen). Rows
+    /// above and columns left of the selection stay pinned while scrolling.
+    fn sheet_freeze(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            let cur = v.sheet().freeze;
+            let next = if cur != (0, 0) { (0, 0) } else { (r, c) };
+            if let Some(sheet) = v.pkg.workbook.sheets.get_mut(s) {
+                sheet.freeze = next;
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
 
     /// Insert a PivotTable for the selected range (or the used range): a fresh
     /// output sheet plus a live `PivotDef` (first text column → Rows, each numeric
@@ -1440,6 +1484,16 @@ impl Docxy {
             SheetAct::Comma => self.sheet_numfmt("#,##0.00", cx),
             SheetAct::InsertPivot => self.sheet_insert_pivot(cx),
             SheetAct::InsertChart => self.sheet_insert_chart(cx),
+            SheetAct::FillColor => {
+                self.sheet_pick = Some(SheetPick::Fill);
+                cx.notify();
+            }
+            SheetAct::FontColor => {
+                self.sheet_pick = Some(SheetPick::Font);
+                cx.notify();
+            }
+            SheetAct::ToggleBorder => self.sheet_toggle_border(cx),
+            SheetAct::FreezePanes => self.sheet_freeze(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -1483,6 +1537,7 @@ impl Docxy {
         }
         match key {
             "escape" => {
+                self.sheet_pick = None;
                 if let Some(v) = self.active_sheet_mut() {
                     v.editing = None;
                 }
@@ -4918,10 +4973,44 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The swatch strip shown under the ribbon while a sheet colour picker is open;
+    /// a swatch sets the fill or font colour of the selection.
+    fn sheet_picker_bar(&self, pick: SheetPick, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = h_flex().w_full().items_center().flex_wrap().gap_1p5().px_3().py_1().bg(pal.panel).border_b_1().border_color(pal.border);
+        row = row.child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(70.)).child(match pick {
+            SheetPick::Fill => "Fill colour",
+            SheetPick::Font => "Font colour",
+        }));
+        row = row.child(
+            div()
+                .id("sc-none")
+                .px_2().h(px(20.)).rounded(px(3.))
+                .text_size(px(11.)).text_color(pal.fg)
+                .border_1().border_color(pal.border)
+                .cursor_pointer().hover(|d| d.bg(pal.hover))
+                .child(if pick == SheetPick::Fill { "No fill" } else { "Automatic" })
+                .on_click(cx.listener(move |this, _, _, cx| this.sheet_apply_color(pick, None, cx))),
+        );
+        for &c in COLOR_SWATCHES {
+            let rgb = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
+            row = row.child(
+                div()
+                    .id(("sc", c as usize))
+                    .size(px(20.)).rounded(px(3.))
+                    .border_1().border_color(if c == 0xFFFFFF { pal.fg } else { pal.border })
+                    .bg(hsla_u(c))
+                    .cursor_pointer().hover(|d| d.border_color(hsla_u(BRAND)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.sheet_apply_color(pick, Some(rgb), cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
     /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         match self.ribbon_tab {
             RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
+            RibbonTab::View => self.sheet_view_ribbon(pal, cx),
             _ => self.sheet_home_ribbon(pal, cx),
         }
     }
@@ -4956,6 +5045,37 @@ impl Docxy {
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(None, "Column Chart", SheetAct::InsertChart, pal, cx))
+                .into_any_element()))
+            .into_any_element()
+    }
+
+    /// The View tab: a Window group with Freeze Panes, like Excel.
+    fn sheet_view_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let frozen = self.active_sheet().is_some_and(|v| v.sheet().freeze != (0, 0));
+        let group = |title: &str, body: AnyElement| -> AnyElement {
+            v_flex()
+                .h(px(94.))
+                .px_1p5()
+                .py(px(3.))
+                .justify_between()
+                .border_r_1()
+                .border_color(pal.border)
+                .child(div().flex_1().flex().items_center().child(body))
+                .child(div().w_full().text_size(px(10.)).text_color(pal.dim).text_center().child(title.to_string()))
+                .into_any_element()
+        };
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .child(group("Window", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, if frozen { "Unfreeze Panes" } else { "Freeze Panes" }, SheetAct::FreezePanes, pal, cx))
                 .into_any_element()))
             .into_any_element()
     }
@@ -5016,9 +5136,9 @@ impl Docxy {
                     self.sheet_ib("bold", SheetAct::Bold, xf.bold, pal, cx),
                     self.sheet_ib("italic", SheetAct::Italic, xf.italic, pal, cx),
                     self.sheet_ib("underline", SheetAct::Todo, false, pal, cx),
-                    self.sheet_ib("border-bottom", SheetAct::Todo, false, pal, cx),
-                    self.sheet_ib("highlight", SheetAct::Todo, false, pal, cx),
-                    self.sheet_ib("text-color", SheetAct::Todo, false, pal, cx),
+                    self.sheet_ib("border-bottom", SheetAct::ToggleBorder, xf.border, pal, cx),
+                    self.sheet_ib("highlight", SheetAct::FillColor, false, pal, cx),
+                    self.sheet_ib("text-color", SheetAct::FontColor, false, pal, cx),
                 ]),
             ])))
             // Alignment: top/mid/bottom + wrap; then left/center/right, indent, merge.
@@ -5615,6 +5735,7 @@ impl Render for Docxy {
         });
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
+        let sheet_pick_bar = self.active_is_sheet().then_some(self.sheet_pick).flatten().map(|p| self.sheet_picker_bar(p, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -5919,6 +6040,7 @@ impl Render for Docxy {
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
+            .when_some(sheet_pick_bar, |d, p| d.child(p))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
@@ -6063,6 +6185,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
         }
         let color = color_rgb.map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
         let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
+        let cell_border = xf.as_ref().is_some_and(|x| x.border);
         let mut cell = div()
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
             .w(px(col_px(sh.col_width(c))))
@@ -6075,6 +6198,8 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
             .border_r_1()
             .border_b_1()
             .border_color(gridline)
+            // A thin box border (xf border) darkens all four sides.
+            .when(cell_border, |d| d.border_1().border_color(hsla_u(0x7a7a7a)))
             .when(in_range && !selected, |d| d.bg(range_tint))
             .when(selected, |d| d.border_2().border_color(brand));
         if cell_editing {
@@ -6204,26 +6329,34 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
         .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
 
-    // ---- frozen column header + vertically-virtualized rows ----
+    // ---- frozen column header + frozen rows + vertically-virtualized rows ----
     // The rows go straight into a `uniform_list` (no horizontal-scroll wrapper —
     // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
     let header = sheet_col_header(view, ent, cols);
+    // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
+    // outside the virtualized list, so they stay put while the rest scrolls.
+    let (fr, _fc) = sh.freeze;
+    let fr = (fr as usize).min(total_rows).min(30);
+    let mut frozen = v_flex().flex_none();
+    for r in 0..fr {
+        frozen = frozen.child(sheet_row(view, ent, r as u32, cols));
+    }
     let ent_list = ent.clone();
     let list = uniform_list(
         "sheet-rows",
-        total_rows,
+        total_rows.saturating_sub(fr),
         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
             let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| sheet_row(v, &ent_list, i as u32, cols)).collect::<Vec<_>>()
+            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, cols)).collect::<Vec<_>>()
         }),
     )
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .track_scroll(&view.vscroll)
     .flex_1()
     .min_h(px(0.));
-    let grid_area = v_flex().flex_1().min_h(px(0.)).child(header).child(list);
+    let grid_area = v_flex().flex_1().min_h(px(0.)).child(header).child(frozen).child(list);
 
     // ---- sheet tabs (bottom) ----
     let mut tabs = h_flex().w_full().h(px(26.)).items_center().gap(px(1.)).px_2().bg(hsla_u(0xf1f1f1)).border_t_1().border_color(gridline);
