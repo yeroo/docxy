@@ -185,8 +185,22 @@ struct SheetView {
     redo: Vec<SheetSnapshot>,
     /// An in-progress column-resize drag (the header border being dragged).
     col_drag: Option<ColDrag>,
+    /// Live PivotTable definitions authored in the UI, one per output sheet, so
+    /// the field panel can re-place fields and recompute.
+    pivot_views: Vec<PivotDef>,
     /// Vertical scroll of the virtualized row list.
     vscroll: UniformListScrollHandle,
+}
+
+/// A UI-authored PivotTable: its source and, per source field, the role the user
+/// assigned (0 none, 1 rows, 2 columns, 3 values/Sum). Recomputed into `out_sheet`.
+#[derive(Clone)]
+struct PivotDef {
+    src_sheet: usize,
+    src_range: (u32, u32, u32, u32),
+    out_sheet: usize,
+    names: Vec<String>,
+    role: Vec<u8>,
 }
 
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
@@ -605,7 +619,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, vscroll: UniformListScrollHandle::new() };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], vscroll: UniformListScrollHandle::new() };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -1171,16 +1185,14 @@ impl Docxy {
         self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
     }
 
-    /// Insert a PivotTable summarizing the selected range (or the used range) onto
-    /// a fresh sheet: group by the first text column and Sum every numeric column,
-    /// with a grand-total row — computed by gridcore's pivot engine.
+    /// Insert a PivotTable for the selected range (or the used range): a fresh
+    /// output sheet plus a live `PivotDef` (first text column → Rows, each numeric
+    /// column → Sum Values) that the field panel can then re-place.
     fn sheet_insert_pivot(&mut self, cx: &mut Context<Self>) {
-        use gridcore::frame::{pivot, pivot_spec_from_names, pivot_table_strings, Agg, Frame};
-        use gridcore::sheet::{Cell, CellValue, Sheet};
+        use gridcore::frame::Frame;
+        use gridcore::sheet::{CellValue, Sheet};
         self.sheet_snapshot();
-        // 1) Build the pivot from the current selection (read-only phase).
-        let mut built: Option<(Vec<Vec<String>>, usize, usize)> = None;
-        let mut err: Option<String> = None;
+        let mut def: Option<PivotDef> = None;
         if let Some(v) = self.active_sheet() {
             let s = v.active;
             let (r0, c0, r1, c1) = if v.has_range() {
@@ -1190,11 +1202,10 @@ impl Docxy {
                 (0, 0, mr, mc)
             };
             let sh = v.sheet();
-            // Classify each column over the data rows: numeric → Sum measure,
-            // otherwise a candidate row (group-by) field.
-            let mut numeric: Vec<u32> = Vec::new();
-            let mut text: Vec<u32> = Vec::new();
-            for c in c0..=c1 {
+            let frame = Frame::from_range(&v.pkg.workbook, s, (r0, c0, r1, c1));
+            let mut role = vec![0u8; frame.names.len()];
+            let mut have_row = false;
+            for (i, c) in (c0..=c1).enumerate() {
                 let (mut nums, mut txts) = (0u32, 0u32);
                 for r in (r0 + 1)..=r1 {
                     match sh.cell(r, c).map(|cl| &cl.value) {
@@ -1204,65 +1215,143 @@ impl Docxy {
                     }
                 }
                 if nums > 0 && nums >= txts {
-                    numeric.push(c);
-                } else {
-                    text.push(c);
+                    role[i] = 3; // Values (Sum)
+                } else if !have_row {
+                    role[i] = 1; // Rows
+                    have_row = true;
                 }
             }
-            let row_col = text.first().copied().unwrap_or(c0);
-            let frame = Frame::from_range(&v.pkg.workbook, s, (r0, c0, r1, c1));
-            let name_of = |c: u32| frame.names.get((c - c0) as usize).cloned().unwrap_or_default();
-            let rowname = name_of(row_col);
-            let values: Vec<(String, Agg)> = if numeric.is_empty() {
-                vec![(rowname.clone(), Agg::Count)]
-            } else {
-                numeric.iter().map(|&c| (name_of(c), Agg::Sum)).collect()
-            };
-            match pivot_spec_from_names(&frame, std::slice::from_ref(&rowname), &[], &values) {
-                Ok(mut spec) => {
-                    spec.grand_rows = true;
-                    let out = pivot(&frame, &spec);
-                    built = Some((pivot_table_strings(&out), out.header_rows, out.label_cols));
-                }
-                Err(e) => err = Some(format!("PivotTable: no field named {e:?}")),
+            if !have_row && !role.is_empty() {
+                role[0] = 1;
             }
+            def = Some(PivotDef { src_sheet: s, src_range: (r0, c0, r1, c1), out_sheet: 0, names: frame.names.clone(), role });
         }
-        // 2) Write the computed pivot onto a new sheet and switch to it.
-        if let Some((strings, header_rows, label_cols)) = built {
+        if let Some(mut d) = def {
             if let Some(v) = self.active_sheet_mut() {
                 let n = v.pkg.workbook.sheets.iter().filter(|s| s.name.starts_with("Pivot")).count();
                 let name = if n == 0 { "Pivot".to_string() } else { format!("Pivot{}", n + 1) };
-                let mut sheet = Sheet { name, ..Default::default() };
-                for (ri, row) in strings.iter().enumerate() {
-                    for (ci, sv) in row.iter().enumerate() {
-                        if sv.is_empty() {
-                            continue;
-                        }
-                        // Body aggregates as numbers (right-aligned, reusable);
-                        // headers and row labels as text.
-                        let body = ri >= header_rows && ci >= label_cols;
-                        let cell = match (body, sv.parse::<f64>()) {
-                            (true, Ok(nf)) => Cell::number(nf),
-                            _ => Cell::text(sv),
-                        };
-                        sheet.set_cell(ri as u32, ci as u32, cell);
-                    }
-                }
-                v.pkg.workbook.sheets.push(sheet);
+                v.pkg.workbook.sheets.push(Sheet { name, ..Default::default() });
+                d.out_sheet = v.pkg.workbook.sheets.len() - 1;
+                v.pivot_views.push(d);
                 v.active = v.pkg.workbook.sheets.len() - 1;
                 v.sel = (0, 0);
                 v.anchor = (0, 0);
                 v.editing = None;
-                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
             }
+            let idx = self.active_sheet().map(|v| v.pivot_views.len() - 1).unwrap_or(0);
+            self.recompute_pivot(idx);
             self.mark_sheet_dirty();
         }
-        if let Some(e) = err {
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.status = e.into();
+        cx.notify();
+    }
+
+    /// (Re)compute pivot `idx` from its current field roles and write the result
+    /// onto its output sheet.
+    fn recompute_pivot(&mut self, idx: usize) {
+        use gridcore::frame::{pivot, pivot_table_strings, Agg, Frame, Measure, PivotSpec};
+        use gridcore::sheet::Cell;
+        let built = self.active_sheet().and_then(|v| {
+            let d = v.pivot_views.get(idx)?;
+            let frame = Frame::from_range(&v.pkg.workbook, d.src_sheet, d.src_range);
+            let pick = |want: u8| d.role.iter().enumerate().filter(move |(_, r)| **r == want).map(|(i, _)| i);
+            let rows: Vec<usize> = pick(1).collect();
+            let cols: Vec<usize> = pick(2).collect();
+            let measures: Vec<Measure> = pick(3)
+                .map(|i| Measure { col: i, agg: Agg::Sum, name: format!("Sum of {}", frame.names[i]), calc: None })
+                .collect();
+            let spec = PivotSpec { rows, cols, measures, grand_rows: true, grand_cols: true, ..Default::default() };
+            let out = pivot(&frame, &spec);
+            Some((pivot_table_strings(&out), out.header_rows, out.label_cols, d.out_sheet))
+        });
+        if let Some((strings, header_rows, label_cols, out_sheet)) = built {
+            if let Some(v) = self.active_sheet_mut() {
+                if let Some(sheet) = v.pkg.workbook.sheets.get_mut(out_sheet) {
+                    sheet.cells.clear();
+                    for (ri, row) in strings.iter().enumerate() {
+                        for (ci, sv) in row.iter().enumerate() {
+                            if sv.is_empty() {
+                                continue;
+                            }
+                            let body = ri >= header_rows && ci >= label_cols;
+                            let cell = match (body, sv.parse::<f64>()) {
+                                (true, Ok(nf)) => Cell::number(nf),
+                                _ => Cell::text(sv),
+                            };
+                            sheet.set_cell(ri as u32, ci as u32, cell);
+                        }
+                    }
+                }
+                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
             }
         }
+    }
+
+    /// The pivot definition whose output sheet is currently active, if any.
+    fn active_pivot(&self) -> Option<usize> {
+        let v = self.active_sheet()?;
+        v.pivot_views.iter().position(|d| d.out_sheet == v.active)
+    }
+
+    /// Cycle a source field's role in pivot `idx`: none → Rows → Columns → Values,
+    /// then recompute.
+    fn pivot_cycle_field(&mut self, idx: usize, field: usize, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(d) = v.pivot_views.get_mut(idx) {
+                if let Some(r) = d.role.get_mut(field) {
+                    *r = (*r + 1) % 4;
+                }
+            }
+        }
+        self.recompute_pivot(idx);
+        self.mark_sheet_dirty();
         cx.notify();
+    }
+
+    /// The "PivotTable Fields" side panel: each source field with its current
+    /// role badge; clicking cycles the role and recomputes.
+    fn pivot_panel(&self, idx: usize, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let Some(d) = self.active_sheet().and_then(|v| v.pivot_views.get(idx)) else {
+            return div().into_any_element();
+        };
+        let ent = cx.entity();
+        let mut fields = v_flex().gap(px(2.));
+        for (i, name) in d.names.iter().enumerate() {
+            let (badge, col) = match d.role.get(i).copied().unwrap_or(0) {
+                1 => ("Rows", hsla_u(BRAND)),
+                2 => ("Columns", hsla_u(0x2f6fdb)),
+                3 => ("\u{03A3} Values", hsla_u(0xc0705a)),
+                _ => ("", pal.dim),
+            };
+            let ent2 = ent.clone();
+            fields = fields.child(
+                div()
+                    .id(ElementId::Name(format!("pivfield-{i}").into()))
+                    .flex().items_center().justify_between().gap_2()
+                    .px_2().py(px(3.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|dd| dd.bg(pal.hover))
+                    .child(div().text_size(px(12.)).text_color(pal.fg).overflow_hidden().child(SharedString::from(name.clone())))
+                    .when(!badge.is_empty(), |dd| {
+                        dd.child(div().px_1p5().py(px(1.)).rounded(px(3.)).text_size(px(10.)).text_color(hsla_u(0xffffff)).bg(col).child(badge))
+                    })
+                    .on_click(move |_ev, _w, cx| {
+                        ent2.update(cx, |this, cx| this.pivot_cycle_field(idx, i, cx));
+                    }),
+            );
+        }
+        v_flex()
+            .w(px(232.))
+            .h_full()
+            .flex_none()
+            .bg(pal.panel)
+            .border_l_1()
+            .border_color(pal.border)
+            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("PivotTable Fields"))
+            .child(div().px_3().pb_1().text_size(px(10.)).text_color(pal.dim).child("Click a field: Rows \u{2192} Columns \u{2192} \u{03A3} Values \u{2192} off"))
+            .child(div().id("pivot-fields").flex_1().min_h(px(0.)).overflow_y_scroll().px_2().child(fields))
+            .into_any_element()
     }
 
     /// Dispatch a spreadsheet ribbon command.
@@ -1302,6 +1391,8 @@ impl Docxy {
                 "y" => self.sheet_redo(cx),
                 "b" => self.sheet_toggle_bold(cx),
                 "i" => self.sheet_toggle_italic(cx),
+                // Insert a PivotTable for the selection (also on the Insert ribbon).
+                "p" if shift => self.sheet_insert_pivot(cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -5704,6 +5795,8 @@ impl Render for Docxy {
         let nav_panel = (is_doc && self.show_nav).then(|| self.nav_panel(pal, cx));
         let comments_panel = (is_doc && self.show_comments).then(|| self.comments_panel(pal, cx));
         let notes_panel = (is_doc && self.show_notes).then(|| self.notes_panel(pal, cx));
+        // The PivotTable Fields panel, shown when a pivot output sheet is active.
+        let pivot_panel = self.active_pivot().map(|i| self.pivot_panel(i, pal, cx));
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
@@ -5716,7 +5809,8 @@ impl Render for Docxy {
             .when_some(nav_panel, |d, n| d.child(n))
             .child(content)
             .when_some(comments_panel, |d, p| d.child(p))
-            .when_some(notes_panel, |d, p| d.child(p));
+            .when_some(notes_panel, |d, p| d.child(p))
+            .when_some(pivot_panel, |d, p| d.child(p));
         let context_menu = self.context_menu.map(|at| self.context_menu_el(at, pal, cx));
         let mini_bar = (is_doc && self.context_menu.is_none()).then_some(self.mini_bar).flatten().map(|at| self.mini_bar_el(at, pal, cx));
 
@@ -6014,6 +6108,10 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
         .flex_1()
         .h_full()
         .min_h(px(0.))
+        // Allow the grid to shrink below its content width so a side panel (the
+        // PivotTable Fields list) can sit beside it instead of overflowing.
+        .min_w(px(0.))
+        .overflow_hidden()
         .bg(hsla_u(0xffffff))
         // Column-resize drag: track the pointer and release anywhere in the grid.
         .on_mouse_move(move |ev, _w, cx| {
