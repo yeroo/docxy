@@ -213,6 +213,9 @@ struct GridClip {
 }
 
 /// A spreadsheet ribbon command (the sheet counterpart to the document `Act`).
+/// Mirrors Excel's Home tab; `Todo` is an inert placeholder for commands whose
+/// engine support isn't wired yet (they render but do nothing), like Word's
+/// dialog-launcher stubs.
 #[derive(Clone, Copy)]
 enum SheetAct {
     Cut,
@@ -223,8 +226,12 @@ enum SheetAct {
     AlignL,
     AlignC,
     AlignR,
-    Undo,
-    Redo,
+    GrowFont,
+    ShrinkFont,
+    Percent,
+    Currency,
+    Comma,
+    Todo,
 }
 
 impl SheetView {
@@ -1151,6 +1158,17 @@ impl Docxy {
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.align = a, cx);
     }
+    /// Grow / shrink the font of the selection by one point (default base 11).
+    fn sheet_font_step(&mut self, delta: f64, cx: &mut Context<Self>) {
+        self.sheet_format(move |xf| {
+            let cur = xf.font_size.unwrap_or(11.0);
+            xf.font_size = Some((cur + delta).clamp(1.0, 409.0));
+        }, cx);
+    }
+    /// Apply a number format code to the selection (Excel's %, currency, comma).
+    fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
+        self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
+    }
 
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
@@ -1164,8 +1182,12 @@ impl Docxy {
             SheetAct::AlignL => self.sheet_align(Align::Left, cx),
             SheetAct::AlignC => self.sheet_align(Align::Center, cx),
             SheetAct::AlignR => self.sheet_align(Align::Right, cx),
-            SheetAct::Undo => self.sheet_undo(cx),
-            SheetAct::Redo => self.sheet_redo(cx),
+            SheetAct::GrowFont => self.sheet_font_step(1.0, cx),
+            SheetAct::ShrinkFont => self.sheet_font_step(-1.0, cx),
+            SheetAct::Percent => self.sheet_numfmt("0.00%", cx),
+            SheetAct::Currency => self.sheet_numfmt("$#,##0.00", cx),
+            SheetAct::Comma => self.sheet_numfmt("#,##0.00", cx),
+            SheetAct::Todo => {}
         }
         self.refocus(window, cx);
     }
@@ -4556,81 +4578,195 @@ impl Docxy {
     }
 
     /// One spreadsheet-ribbon button: a glyph/label that runs a `SheetAct`.
-    fn sheet_btn(&self, label: impl Into<SharedString>, bold: bool, italic: bool, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let label: SharedString = label.into();
+    /// A small icon-only Home button (the two-row Font/Alignment buttons).
+    fn sheet_ib(&self, icon: &'static str, act: SheetAct, on: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .id(ElementId::Name(format!("sheet-btn-{label}").into()))
-            .flex()
-            .items_center()
-            .justify_center()
-            .min_w(px(30.))
-            .h(px(24.))
-            .px_2()
-            .rounded(px(4.))
+            .id(ElementId::Name(format!("sib-{icon}").into()))
+            .flex().items_center().justify_center()
+            .size(px(22.))
+            .rounded(px(3.))
             .cursor_pointer()
-            .text_size(px(13.))
-            .text_color(pal.fg)
-            .when(bold, |d| d.font_weight(FontWeight::BOLD))
-            .when(italic, |d| d.italic())
+            .when(on, |d| d.bg(Hsla { a: 0.20, ..hsla_u(BRAND) }))
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
-            .child(label)
+            .child(icon_svg(icon, 15., pal.fg))
             .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
 
-    /// The spreadsheet ribbon body (Home): Clipboard, Font, Alignment, Undo.
+    /// A small glyph/text Home button (number formats, wrap, merge, …).
+    fn sheet_gb(&self, glyph: &'static str, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("sgb-{glyph}").into()))
+            .flex().items_center().justify_center()
+            .min_w(px(22.)).h(px(22.)).px_1()
+            .rounded(px(3.))
+            .cursor_pointer()
+            .text_size(px(12.)).text_color(pal.fg)
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(glyph)
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .into_any_element()
+    }
+
+    /// A small icon+label row (Clipboard Cut/Copy, Editing AutoSum/Fill/Clear).
+    fn sheet_rb(&self, icon: Option<&'static str>, label: &'static str, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("srb-{label}").into()))
+            .flex().items_center().gap_1p5().px_1().h(px(20.))
+            .rounded(px(3.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 14., pal.fg)))
+            .child(div().text_size(px(11.)).text_color(pal.fg).child(label))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .into_any_element()
+    }
+
+    /// A large icon-over-label Home button (Paste, Styles, Cells, Editing).
+    fn sheet_lb(&self, icon: Option<&'static str>, label: &'static str, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("slb-{label}").into()))
+            .flex().flex_col().items_center().justify_center().gap_0p5()
+            .w(px(54.)).h_full().px_1()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
+            .child(div().text_size(px(10.)).text_color(pal.fg).text_center().child(label))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .into_any_element()
+    }
+
+    /// A combo-box display (font name/size, number format) — inert for now.
+    fn sheet_combo(&self, value: &'static str, wide: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("scombo-{value}").into()))
+            .flex().items_center().justify_between().gap_1()
+            .w(px(if wide { 108. } else { 50. })).h(px(22.)).px_1p5()
+            .rounded(px(3.))
+            .border_1().border_color(pal.border).bg(pal.panel)
+            .cursor_pointer()
+            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .child(div().text_size(px(11.)).text_color(pal.fg).overflow_hidden().child(value))
+            .child(div().text_size(px(8.)).text_color(pal.dim).child("\u{25BE}"))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(SheetAct::Todo, window, cx)))
+            .into_any_element()
+    }
+
+    /// The spreadsheet ribbon body, laid out like Excel's Home tab: Clipboard,
+    /// Font, Alignment, Number, Styles, Cells, Editing.
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, buttons: Vec<AnyElement>| -> AnyElement {
+        let xf = self.active_xf();
+        // A group frame: content on top, a centered label (+ optional dialog
+        // launcher) at the bottom, and a right divider — exactly like the doc ribbon.
+        let group = |title: &str, launcher: bool, body: AnyElement| -> AnyElement {
             v_flex()
-                .h(px(92.))
-                .px_2()
-                .py(px(4.))
+                .h(px(94.))
+                .px_1p5()
+                .py(px(3.))
                 .justify_between()
                 .border_r_1()
                 .border_color(pal.border)
-                .child(h_flex().flex_1().items_center().gap(px(2.)).children(buttons))
-                .child(div().w_full().text_size(px(10.)).text_color(pal.dim).text_center().child(title.to_string()))
+                .child(div().flex_1().flex().items_center().child(body))
+                .child(
+                    h_flex().w_full().items_center().justify_center().gap_1()
+                        .child(div().text_size(px(10.)).text_color(pal.dim).child(title.to_string()))
+                        .when(launcher, |d| d.child(div().text_size(px(9.)).text_color(pal.dim).child("\u{2921}"))),
+                )
                 .into_any_element()
         };
+        let row = |kids: Vec<AnyElement>| h_flex().items_center().gap(px(2.)).children(kids).into_any_element();
+        let col = |kids: Vec<AnyElement>| v_flex().gap(px(1.)).children(kids).into_any_element();
+
         h_flex()
+            .id("sheet-ribbon")
             .w_full()
-            .h(px(98.))
+            .h(px(100.))
             .items_stretch()
             .px_1()
             .bg(pal.panel)
             .border_b_1()
             .border_color(pal.border)
-            .child(group(
-                "Clipboard",
-                vec![
-                    self.sheet_btn("Paste", false, false, SheetAct::Paste, pal, cx),
-                    self.sheet_btn("Cut", false, false, SheetAct::Cut, pal, cx),
-                    self.sheet_btn("Copy", false, false, SheetAct::Copy, pal, cx),
-                ],
-            ))
-            .child(group(
-                "Font",
-                vec![
-                    self.sheet_btn("B", true, false, SheetAct::Bold, pal, cx),
-                    self.sheet_btn("I", false, true, SheetAct::Italic, pal, cx),
-                ],
-            ))
-            .child(group(
-                "Alignment",
-                vec![
-                    self.sheet_btn("Left", false, false, SheetAct::AlignL, pal, cx),
-                    self.sheet_btn("Center", false, false, SheetAct::AlignC, pal, cx),
-                    self.sheet_btn("Right", false, false, SheetAct::AlignR, pal, cx),
-                ],
-            ))
-            .child(group(
-                "Undo",
-                vec![
-                    self.sheet_btn("\u{21B6}", false, false, SheetAct::Undo, pal, cx),
-                    self.sheet_btn("\u{21B7}", false, false, SheetAct::Redo, pal, cx),
-                ],
-            ))
+            .overflow_x_scroll()
+            // Clipboard: big Paste + a Cut/Copy/Format-Painter column.
+            .child(group("Clipboard", true, h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(Some("paste"), "Paste", SheetAct::Paste, pal, cx))
+                .child(col(vec![
+                    self.sheet_rb(Some("cut"), "Cut", SheetAct::Cut, pal, cx),
+                    self.sheet_rb(Some("copy"), "Copy", SheetAct::Copy, pal, cx),
+                    self.sheet_rb(None, "Format Painter", SheetAct::Todo, pal, cx),
+                ]))
+                .into_any_element()))
+            // Font: name/size combos + grow/shrink; then B/I/U, borders, fill, colour.
+            .child(group("Font", true, col(vec![
+                row(vec![
+                    self.sheet_combo("Calibri", true, pal, cx),
+                    self.sheet_combo("11", false, pal, cx),
+                    self.sheet_ib("font-increase", SheetAct::GrowFont, false, pal, cx),
+                    self.sheet_ib("font-decrease", SheetAct::ShrinkFont, false, pal, cx),
+                ]),
+                row(vec![
+                    self.sheet_ib("bold", SheetAct::Bold, xf.bold, pal, cx),
+                    self.sheet_ib("italic", SheetAct::Italic, xf.italic, pal, cx),
+                    self.sheet_ib("underline", SheetAct::Todo, false, pal, cx),
+                    self.sheet_ib("border-bottom", SheetAct::Todo, false, pal, cx),
+                    self.sheet_ib("highlight", SheetAct::Todo, false, pal, cx),
+                    self.sheet_ib("text-color", SheetAct::Todo, false, pal, cx),
+                ]),
+            ])))
+            // Alignment: top/mid/bottom + wrap; then left/center/right, indent, merge.
+            .child(group("Alignment", true, col(vec![
+                row(vec![
+                    self.sheet_gb("\u{2580}", SheetAct::Todo, pal, cx),
+                    self.sheet_gb("\u{25AC}", SheetAct::Todo, pal, cx),
+                    self.sheet_gb("\u{2584}", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(None, "Wrap Text", SheetAct::Todo, pal, cx),
+                ]),
+                row(vec![
+                    self.sheet_ib("align-left", SheetAct::AlignL, matches!(xf.align, gridcore::sheet::Align::Left), pal, cx),
+                    self.sheet_ib("align-center", SheetAct::AlignC, matches!(xf.align, gridcore::sheet::Align::Center), pal, cx),
+                    self.sheet_ib("align-right", SheetAct::AlignR, matches!(xf.align, gridcore::sheet::Align::Right), pal, cx),
+                    self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
+                    self.sheet_ib("indent-increase", SheetAct::Todo, false, pal, cx),
+                    self.sheet_rb(None, "Merge", SheetAct::Todo, pal, cx),
+                ]),
+            ])))
+            // Number: format combo; then currency/percent/comma + decimals.
+            .child(group("Number", true, col(vec![
+                row(vec![self.sheet_combo("General", true, pal, cx)]),
+                row(vec![
+                    self.sheet_gb("$", SheetAct::Currency, pal, cx),
+                    self.sheet_gb("%", SheetAct::Percent, pal, cx),
+                    self.sheet_gb(",", SheetAct::Comma, pal, cx),
+                    self.sheet_gb("\u{2192}.0", SheetAct::Todo, pal, cx),
+                    self.sheet_gb(".00\u{2190}", SheetAct::Todo, pal, cx),
+                ]),
+            ])))
+            // Styles: Conditional Formatting, Format as Table, Cell Styles.
+            .child(group("Styles", false, h_flex().h_full().items_center().gap_0p5()
+                .child(self.sheet_lb(None, "Conditional Formatting", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(Some("table"), "Format as Table", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            // Cells: Insert, Delete, Format.
+            .child(group("Cells", false, h_flex().h_full().items_center().gap_0p5()
+                .child(self.sheet_lb(None, "Insert", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Delete", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Format", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
+            .child(group("Editing", false, h_flex().h_full().items_center().gap_1()
+                .child(col(vec![
+                    self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
+                ]))
+                .child(self.sheet_lb(Some("sort"), "Sort & Filter", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
+                .into_any_element()))
             .into_any_element()
     }
 
