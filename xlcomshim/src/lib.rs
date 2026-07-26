@@ -44,7 +44,7 @@ mod win {
     use gridcore::sheet::{
         Align, Cell, CellValue, Styles, Xf, cell_name, parse_cell_name, parse_range_name,
     };
-    use gridcore::xlsx::{SheetPackage, new_xlsx, save_xlsx};
+    use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
 
     use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
     use windows::Win32::System::Com::{
@@ -194,6 +194,20 @@ mod win {
             }
         }
 
+        /// Load an existing `.xlsx` from disk (backs `Workbooks.Open`).
+        fn open(path: &str) -> Option<Book> {
+            let bytes = std::fs::read(path).ok()?;
+            let pkg = load_xlsx(&bytes).ok()?;
+            let engine = Engine::new(&pkg.workbook);
+            Some(Book {
+                pkg,
+                engine,
+                path: Some(path.to_string()),
+                saved: true,
+                dirty: false,
+            })
+        }
+
         fn recalc_if_dirty(&mut self) {
             if self.dirty {
                 self.engine.recalc_all(&mut self.pkg.workbook);
@@ -269,6 +283,14 @@ mod win {
 
     fn reg<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
         REG.with(|r| f(&mut r.borrow_mut()))
+    }
+
+    /// The string reported by `Application.Name`. Honest by default; an operator
+    /// who needs a client that literally checks for `"Microsoft Excel"` can set
+    /// `XLCOMSHIM_APP_NAME` in their own environment. Kept out of the default so
+    /// the shipped shim never presents itself as Microsoft's product.
+    fn app_name() -> String {
+        std::env::var("XLCOMSHIM_APP_NAME").unwrap_or_else(|_| "Docxy".to_string())
     }
 
 
@@ -784,7 +806,12 @@ mod win {
                     is_put(wflags)
                 ));
                 match id {
-                    110 => put(result, VARIANT::from("Docxy")),
+                    // Application.Name — honest by default. Some interop clients
+                    // gate behaviour on the literal string "Microsoft Excel"; an
+                    // operator who needs that compatibility can opt in for their
+                    // own session via the XLCOMSHIM_APP_NAME env var. We do NOT
+                    // ship a default that claims to be Microsoft's product.
+                    110 => put(result, VARIANT::from(app_name().as_str())),
                     392 => put(result, VARIANT::from("16.0")),
                     558 => {
                         if is_put(wflags) {
@@ -916,6 +943,28 @@ mod win {
                         put_obj(result, Workbook { book: idx });
                     }
                     118 => put(result, VARIANT::from(reg(|r| r.books.len() as i32))),
+                    1923 => {
+                        // Open(Filename, …) — load an existing .xlsx from disk.
+                        let Some(path) = arg_string(params, 0) else {
+                            log("Open: missing Filename");
+                            return Err(DISP_E_BADINDEX.into());
+                        };
+                        match Book::open(&path) {
+                            Some(b) => {
+                                let book = reg(|r| {
+                                    r.books.push(b);
+                                    r.active = r.books.len() - 1;
+                                    r.active
+                                });
+                                log(&format!("Open '{path}' -> book {book}"));
+                                put_obj(result, Workbook { book });
+                            }
+                            None => {
+                                log(&format!("Open '{path}' failed (missing or unparseable)"));
+                                return Err(E_FAIL.into());
+                            }
+                        }
+                    }
                     277 => {} // Close all — no-op
                     _ => return unhandled(id, wflags, params, result),
                 }

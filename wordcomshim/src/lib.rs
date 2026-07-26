@@ -519,6 +519,14 @@ mod win {
         REG.with(|r| f(&mut r.borrow_mut()))
     }
 
+    /// The string reported by `Application.Name`. Honest by default; an operator
+    /// who needs a client that literally checks for `"Microsoft Word"` can set
+    /// `WORDCOMSHIM_APP_NAME` in their own environment. Kept out of the default
+    /// so the shipped shim never presents itself as Microsoft's product.
+    fn app_name() -> String {
+        std::env::var("WORDCOMSHIM_APP_NAME").unwrap_or_else(|_| "Docxy".to_string())
+    }
+
 
     unsafe fn put_disp<T: IntoDisp>(pvarresult: *mut VARIANT, obj: T) {
         unsafe { put(pvarresult, VARIANT::from(obj.into_disp())) };
@@ -615,7 +623,7 @@ mod win {
 
     // Application
     unsafe fn vt_app_name(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
-        unsafe { out_bstr(ret, "Microsoft Word") }
+        unsafe { out_bstr(ret, &app_name()) }
     }
     unsafe fn vt_app_version(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
         unsafe { out_bstr(ret, "16.0") }
@@ -965,7 +973,8 @@ mod win {
             unsafe {
                 log(&format!("Application::Invoke id={id} put={}", is_put(wflags)));
                 match id {
-                    0 => put(result, VARIANT::from("Microsoft Word")),
+                    // Application.Name — honest default; opt in via WORDCOMSHIM_APP_NAME.
+                    0 => put(result, VARIANT::from(app_name().as_str())),
                     24 => put(result, VARIANT::from("16.0")),
                     23 => {
                         if is_put(wflags) {
