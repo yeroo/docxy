@@ -1190,7 +1190,7 @@ impl Docxy {
     /// column → Sum Values) that the field panel can then re-place.
     fn sheet_insert_pivot(&mut self, cx: &mut Context<Self>) {
         use gridcore::frame::Frame;
-        use gridcore::sheet::{CellValue, Sheet};
+        use gridcore::sheet::CellValue;
         self.sheet_snapshot();
         let mut def: Option<PivotDef> = None;
         if let Some(v) = self.active_sheet() {
@@ -1230,10 +1230,10 @@ impl Docxy {
             if let Some(v) = self.active_sheet_mut() {
                 let n = v.pkg.workbook.sheets.iter().filter(|s| s.name.starts_with("Pivot")).count();
                 let name = if n == 0 { "Pivot".to_string() } else { format!("Pivot{}", n + 1) };
-                v.pkg.workbook.sheets.push(Sheet { name, ..Default::default() });
-                d.out_sheet = v.pkg.workbook.sheets.len() - 1;
+                // add_sheet wires the OPC part + workbook entry so the sheet saves.
+                d.out_sheet = v.pkg.add_sheet(&name);
+                v.active = d.out_sheet;
                 v.pivot_views.push(d);
-                v.active = v.pkg.workbook.sheets.len() - 1;
                 v.sel = (0, 0);
                 v.anchor = (0, 0);
                 v.editing = None;
