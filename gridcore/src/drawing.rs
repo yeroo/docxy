@@ -156,6 +156,8 @@ fn parse_chart(xml: &str) -> ChartData {
     let mut in_title = false;
     let mut in_title_text = false;
     let mut in_v = false;
+    // Inside a <c:barChart> — its <c:barDir> refines "column" vs "bar".
+    let mut in_bar = false;
     let mut mode = 0u8; // 1 = series name (tx), 2 = category (cat), 3 = value (val)
     loop {
         match p.next() {
@@ -163,7 +165,21 @@ fn parse_chart(xml: &str) -> ChartData {
                 let name = local(p.name());
                 match name {
                     n if n.ends_with("Chart") && cd.kind.is_empty() => {
-                        cd.kind = n.trim_end_matches("Chart").to_string();
+                        // `barChart` covers BOTH orientations — the following
+                        // <c:barDir val="col|bar"/> decides. Default to "column"
+                        // (OOXML's own default is col) and refine on barDir.
+                        cd.kind = match n.trim_end_matches("Chart") {
+                            "bar" => {
+                                in_bar = true;
+                                "column".to_string()
+                            }
+                            other => other.to_string(),
+                        };
+                    }
+                    // Orientation of the enclosing barChart: col = vertical
+                    // columns, bar = horizontal bars.
+                    "barDir" if in_bar => {
+                        cd.kind = if p.attr("val") == "bar" { "bar" } else { "column" }.to_string();
                     }
                     "title" => in_title = true,
                     "ser" => cd.series.push(ChartSeries::default()),
@@ -269,13 +285,57 @@ mod tests {
         assert_eq!(ds.len(), 1);
         match &ds[0].kind {
             DrawingKind::Chart(c) => {
-                assert_eq!(c.kind, "bar");
+                // No <c:barDir> — OOXML's default orientation is col (vertical).
+                assert_eq!(c.kind, "column");
                 assert_eq!(c.title, "Sales");
                 assert_eq!(c.categories, vec!["North", "South"]);
                 assert_eq!(c.series.len(), 1);
                 assert_eq!(c.series[0].name, "Q1");
                 assert_eq!(c.series[0].values, vec![10.0, 20.0]);
             }
+            _ => panic!("expected chart"),
+        }
+    }
+
+    #[test]
+    fn bar_dir_decides_column_vs_bar() {
+        // A `barChart` is BOTH orientations; <c:barDir> decides. Getting this wrong
+        // made every loaded column chart render as horizontal bars.
+        let drawing = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from>
+              <xdr:to><xdr:col>8</xdr:col><xdr:row>15</xdr:row></xdr:to>
+              <xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></xdr:graphicFrame>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let chart_with = |dir: &str| {
+            format!(
+                r#"<c:chartSpace><c:chart><c:plotArea><c:barChart><c:barDir val="{dir}"/>
+                <c:ser><c:val><c:numRef><c:numCache><c:pt><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+                </c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        for (dir, want) in [("col", "column"), ("bar", "bar")] {
+            let chart = chart_with(dir);
+            let resolve = |rid: &str| {
+                (rid == "rId2").then(|| ("chart".to_string(), "xl/charts/chart1.xml".to_string()))
+            };
+            let get = |part: &str| (part == "xl/charts/chart1.xml").then(|| chart.clone());
+            let ds = parse_drawings(drawing, &resolve, &get);
+            match &ds[0].kind {
+                DrawingKind::Chart(c) => assert_eq!(c.kind, want, "barDir={dir}"),
+                _ => panic!("expected chart"),
+            }
+        }
+        // Other chart types keep their own element-derived kind.
+        let pie = r#"<c:chartSpace><c:chart><c:plotArea><c:pieChart>
+            <c:ser><c:val><c:numRef><c:numCache><c:pt><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+            </c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let resolve = |rid: &str| {
+            (rid == "rId2").then(|| ("chart".to_string(), "xl/charts/chart1.xml".to_string()))
+        };
+        let get = |part: &str| (part == "xl/charts/chart1.xml").then(|| pie.to_string());
+        match &parse_drawings(drawing, &resolve, &get)[0].kind {
+            DrawingKind::Chart(c) => assert_eq!(c.kind, "pie"),
             _ => panic!("expected chart"),
         }
     }
