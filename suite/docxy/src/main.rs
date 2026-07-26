@@ -458,6 +458,9 @@ struct Docxy {
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
     sheet_rename: Option<(usize, String)>,
+    // Grid width (px) captured each render, so the horizontal scroll track can map
+    // a click x back to a column fraction.
+    sheet_grid_w: f32,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -823,6 +826,7 @@ impl Docxy {
             grid_clip: None,
             sheet_pick: None,
             sheet_rename: None,
+            sheet_grid_w: 1000.0,
         }
     }
 
@@ -958,6 +962,27 @@ impl Docxy {
                 start += 1;
             }
             v.col0 = start.max(fc);
+        }
+    }
+
+    /// Jump the column scroll to the fraction of the horizontal track clicked at
+    /// window x `x` (the track spans SHEET_GUT..grid_w-12).
+    fn sheet_hbar_jump(&mut self, x: f32, cx: &mut Context<Self>) {
+        let w = self.sheet_grid_w;
+        let track = (w - 12.0 - SHEET_GUT).max(1.0);
+        let frac = ((x - SHEET_GUT) / track).clamp(0.0, 1.0);
+        if let Some(v) = self.active_sheet_mut() {
+            let (_, mc) = v.extent();
+            let (_, frz_c) = v.sheet().freeze;
+            let fc = frz_c.min(64);
+            let target = (frac * mc as f32).round() as u32;
+            v.col0 = target.max(fc).min(255);
+            // Keep the selection inside the new window so reconcile doesn't undo it.
+            if v.sel.1 < v.col0 {
+                v.sel.1 = v.col0;
+                v.anchor = v.sel;
+            }
+            cx.notify();
         }
     }
 
@@ -6073,6 +6098,7 @@ impl Render for Docxy {
             let panel = if self.active_pivot().is_some() { 232.0 } else { 0.0 };
             let w = f32::from(window.viewport_size().width) - panel;
             self.reconcile_sheet_hscroll((w - SHEET_GUT).max(120.0));
+            self.sheet_grid_w = w;
             w
         } else {
             0.0
@@ -6831,7 +6857,6 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         }
         cend += 1;
     }
-    let _ = max_c;
     // Total rows to virtualize over: the used range plus generous headroom.
     let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
@@ -6894,17 +6919,21 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let grid_area = v_flex()
         .flex_1()
         .min_h(px(0.))
-        // Shift+wheel scrolls columns; plain wheel falls through to the row list.
+        // Shift+wheel scrolls columns; plain wheel is left entirely alone so the
+        // row uniform_list keeps its own vertical scrolling. When we DO act on a
+        // shift-wheel we consume the event, so the list doesn't also scroll.
         .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
-            if ev.modifiers.shift {
-                let dy = match ev.delta {
-                    ScrollDelta::Lines(p) => p.y,
-                    ScrollDelta::Pixels(p) => f32::from(p.y) / SHEET_ROW_H,
-                };
-                let step = if dy < 0.0 { 1 } else if dy > 0.0 { -1 } else { 0 };
-                if step != 0 {
-                    this.sheet_hscroll(step, cx);
-                }
+            if !ev.modifiers.shift {
+                return;
+            }
+            let dy = match ev.delta {
+                ScrollDelta::Lines(p) => p.y,
+                ScrollDelta::Pixels(p) => f32::from(p.y) / SHEET_ROW_H,
+            };
+            let step = if dy < 0.0 { 1 } else if dy > 0.0 { -1 } else { 0 };
+            if step != 0 {
+                this.sheet_hscroll(step, cx);
+                cx.stop_propagation();
             }
         }))
         .child(header)
@@ -6980,24 +7009,58 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             }),
     );
 
-    // Floating chart cards over this sheet, staggered so multiples don't overlap:
-    // UI-authored charts plus any charts loaded from the workbook's drawings.
+    // Chart cards, positioned from their CELL ANCHOR so they scroll with the grid
+    // (Excel behaviour) instead of being pinned to the viewport corner.
+    // x: gutter + frozen columns + the anchor column's distance from col0.
+    // y: formula bar + column header + frozen rows + (anchor row - scrolled rows).
+    let scrolled_px = f32::from(view.vscroll.0.borrow().base_handle.offset().y);
+    let col_x = |ac: u32| -> Option<f32> {
+        if ac < fc {
+            // Anchored inside the frozen region: always visible at its fixed x.
+            return Some(SHEET_GUT + (0..ac).map(|c| col_px(sh.col_width(c))).sum::<f32>());
+        }
+        if ac < col0 {
+            return None; // scrolled off to the left
+        }
+        Some(SHEET_GUT + frozen_w + (col0..ac).map(|c| col_px(sh.col_width(c))).sum::<f32>())
+    };
+    // y is relative to the CHART LAYER's origin (top of the frozen-row band, i.e.
+    // just under the column header) — the layer clips, so a chart scrolled up
+    // slides under the header instead of drawing over it.
+    let row_y = |ar: u32| -> f32 {
+        if (ar as usize) < fr {
+            return ar as f32 * SHEET_ROW_H; // pinned frozen row
+        }
+        fr as f32 * SHEET_ROW_H + (ar - fr as u32) as f32 * SHEET_ROW_H + scrolled_px
+    };
     let loaded = sh.drawings.iter().filter_map(|d| match &d.kind {
-        gridcore::sheet::DrawingKind::Chart(cd) => Some(cd),
+        gridcore::sheet::DrawingKind::Chart(cd) => Some((d.from, cd)),
         _ => None,
     });
-    let charts: Vec<AnyElement> = view
+    let cards: Vec<AnyElement> = view
         .charts
         .iter()
         .filter(|c| c.sheet == view.active)
-        .map(|cv| &cv.data)
+        .map(|cv| (cv.from, &cv.data))
         .chain(loaded)
-        .enumerate()
-        .map(|(i, data)| {
-            let off = i as f32 * 26.;
-            div().absolute().top(px(62. + off)).right(px(26. + off)).child(chart_card(data)).into_any_element()
+        .filter_map(|(from, data)| {
+            // `from` is (row, col) for UI charts and gridcore drawings alike.
+            let (ar, ac) = from;
+            let x = col_x(ac)?;
+            let y = row_y(ar);
+            Some(div().absolute().left(px(x)).top(px(y)).child(chart_card(data)).into_any_element())
         })
         .collect();
+    // The clipping layer: spans the rows viewport (under the column header, above
+    // the h-scroll strip + sheet tabs). Non-interactive, so cell clicks pass through.
+    let chart_layer = div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(26. + SHEET_ROW_H))
+        .bottom(px(26. + 11.))
+        .overflow_hidden()
+        .children(cards);
 
     let ent_move = ent.clone();
     let ent_up = ent.clone();
@@ -7021,8 +7084,63 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         })
         .child(bar)
         .child(grid_area)
+        // Charts sit above the cells but CLIPPED to the rows viewport, so they
+        // scroll under the column header rather than floating over the chrome.
+        .child(chart_layer)
+        // Excel places the vertical scrollbar down the right edge of the grid; it
+        // overlays the rows area (below the formula bar, above the sheet tabs).
+        .child(
+            div()
+                .absolute()
+                .top(px(26. + SHEET_ROW_H))
+                .right_0()
+                .bottom(px(26.))
+                .w(px(12.))
+                .child(gpui_component::scroll::Scrollbar::vertical(&view.vscroll)),
+        )
+        // ...and the horizontal one along the bottom, left of the sheet tabs. The
+        // columns aren't a pixel scroller (they virtualize by offset), so this is a
+        // proportional indicator + click/drag target driven by col0.
+        .child(sheet_hbar(view, ent, max_c, col0, cend))
         .child(tabs)
-        .children(charts)
+        .into_any_element()
+}
+
+/// The horizontal scroll strip under the grid: an Excel-style track whose thumb
+/// spans the visible column window. Dragging or clicking the track scrolls
+/// columns (the grid virtualizes columns by offset, so this maps a fraction of
+/// the used width to a starting column rather than a pixel offset).
+fn sheet_hbar(view: &SheetView, ent: &Entity<Docxy>, max_c: u32, col0: u32, cend: u32) -> AnyElement {
+    let total = (max_c + 1).max(cend + 1).max(1);
+    let shown = (cend + 1).saturating_sub(col0).max(1);
+    let frac = (shown as f32 / total as f32).clamp(0.06, 1.0);
+    let pos = if total > shown { col0 as f32 / (total - shown) as f32 } else { 0.0 };
+    let ent_track = ent.clone();
+    div()
+        .absolute()
+        .left(px(SHEET_GUT))
+        .right(px(12.))
+        .bottom(px(26.))
+        .h(px(11.))
+        .bg(hsla_u(0xf1f1f1))
+        .border_t_1()
+        .border_color(hsla_u(0xd9d9d9))
+        // Click anywhere on the track to jump proportionally.
+        .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+            let x = f32::from(ev.position.x);
+            ent_track.update(cx, |this, cx| this.sheet_hbar_jump(x, cx));
+        })
+        .child(
+            // The thumb: sized to the visible fraction, offset by the scroll position.
+            div()
+                .absolute()
+                .top(px(2.))
+                .h(px(7.))
+                .left(relative((pos * (1.0 - frac)).clamp(0.0, 1.0)))
+                .w(relative(frac))
+                .rounded(px(3.))
+                .bg(hsla_u(0xa8a8a8)),
+        )
         .into_any_element()
 }
 
