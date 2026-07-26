@@ -205,7 +205,7 @@ struct ChartView {
 }
 
 /// A UI-authored PivotTable: its source and, per source field, the role the user
-/// assigned (0 none, 1 rows, 2 columns, 3 values/Sum). Recomputed into `out_sheet`.
+/// assigned (0 none, 1 rows, 2 columns, 3 values). Recomputed into `out_sheet`.
 #[derive(Clone)]
 struct PivotDef {
     src_sheet: usize,
@@ -213,7 +213,21 @@ struct PivotDef {
     out_sheet: usize,
     names: Vec<String>,
     role: Vec<u8>,
+    /// Per field, the aggregation index into [`PIVOT_AGGS`] (only meaningful for
+    /// Values fields; 0 = Sum). Parallel to `names`/`role`.
+    agg: Vec<u8>,
 }
+
+/// Aggregations a pivot value field can cycle through, with short badge labels.
+/// The index is what `PivotDef.agg` stores (0 = Sum, the default).
+const PIVOT_AGGS: [(gridcore::frame::Agg, &str); 6] = [
+    (gridcore::frame::Agg::Sum, "Sum"),
+    (gridcore::frame::Agg::Count, "Count"),
+    (gridcore::frame::Agg::Average, "Avg"),
+    (gridcore::frame::Agg::Max, "Max"),
+    (gridcore::frame::Agg::Min, "Min"),
+    (gridcore::frame::Agg::Product, "Product"),
+];
 
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
 struct SheetSnapshot {
@@ -1393,7 +1407,8 @@ impl Docxy {
             if !have_row && !role.is_empty() {
                 role[0] = 1;
             }
-            def = Some(PivotDef { src_sheet: s, src_range: (r0, c0, r1, c1), out_sheet: 0, names: frame.names.clone(), role });
+            let agg = vec![0u8; frame.names.len()];
+            def = Some(PivotDef { src_sheet: s, src_range: (r0, c0, r1, c1), out_sheet: 0, names: frame.names.clone(), role, agg });
         }
         if let Some(mut d) = def {
             if let Some(v) = self.active_sheet_mut() {
@@ -1417,7 +1432,7 @@ impl Docxy {
     /// (Re)compute pivot `idx` from its current field roles and write the result
     /// onto its output sheet.
     fn recompute_pivot(&mut self, idx: usize) {
-        use gridcore::frame::{pivot, pivot_table_strings, Agg, Frame, Measure, PivotSpec};
+        use gridcore::frame::{pivot, pivot_table_strings, Frame, Measure, PivotSpec};
         use gridcore::sheet::Cell;
         let built = self.active_sheet().and_then(|v| {
             let d = v.pivot_views.get(idx)?;
@@ -1426,7 +1441,10 @@ impl Docxy {
             let rows: Vec<usize> = pick(1).collect();
             let cols: Vec<usize> = pick(2).collect();
             let measures: Vec<Measure> = pick(3)
-                .map(|i| Measure { col: i, agg: Agg::Sum, name: format!("Sum of {}", frame.names[i]), calc: None })
+                .map(|i| {
+                    let (agg, lbl) = PIVOT_AGGS[d.agg.get(i).copied().unwrap_or(0) as usize % PIVOT_AGGS.len()];
+                    Measure { col: i, agg, name: format!("{lbl} of {}", frame.names[i]), calc: None }
+                })
                 .collect();
             let spec = PivotSpec { rows, cols, measures, grand_rows: true, grand_cols: true, ..Default::default() };
             let out = pivot(&frame, &spec);
@@ -1469,6 +1487,22 @@ impl Docxy {
             if let Some(d) = v.pivot_views.get_mut(idx) {
                 if let Some(r) = d.role.get_mut(field) {
                     *r = (*r + 1) % 4;
+                }
+            }
+        }
+        self.recompute_pivot(idx);
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Cycle a value field's aggregation (Sum → Count → Avg → Max → Min →
+    /// Product) in pivot `idx`, then recompute.
+    fn pivot_cycle_agg(&mut self, idx: usize, field: usize, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(d) = v.pivot_views.get_mut(idx) {
+                if let Some(a) = d.agg.get_mut(field) {
+                    *a = (*a + 1) % PIVOT_AGGS.len() as u8;
                 }
             }
         }
@@ -1546,29 +1580,54 @@ impl Docxy {
         let ent = cx.entity();
         let mut fields = v_flex().gap(px(2.));
         for (i, name) in d.names.iter().enumerate() {
-            let (badge, col) = match d.role.get(i).copied().unwrap_or(0) {
+            let role_val = d.role.get(i).copied().unwrap_or(0);
+            let (badge, col) = match role_val {
                 1 => ("Rows", hsla_u(BRAND)),
                 2 => ("Columns", hsla_u(0x2f6fdb)),
                 3 => ("\u{03A3} Values", hsla_u(0xc0705a)),
                 _ => ("", pal.dim),
             };
-            let ent2 = ent.clone();
-            fields = fields.child(
-                div()
-                    .id(ElementId::Name(format!("pivfield-{i}").into()))
-                    .flex().items_center().justify_between().gap_2()
-                    .px_2().py(px(3.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|dd| dd.bg(pal.hover))
-                    .child(div().text_size(px(12.)).text_color(pal.fg).overflow_hidden().child(SharedString::from(name.clone())))
-                    .when(!badge.is_empty(), |dd| {
-                        dd.child(div().px_1p5().py(px(1.)).rounded(px(3.)).text_size(px(10.)).text_color(hsla_u(0xffffff)).bg(col).child(badge))
-                    })
-                    .on_click(move |_ev, _w, cx| {
-                        ent2.update(cx, |this, cx| this.pivot_cycle_field(idx, i, cx));
-                    }),
-            );
+            let ent_role = ent.clone();
+            // Name + role badge: clicking cycles the field's role. Kept flex_1 so
+            // the whole row width remains the role target, with the aggregation
+            // chip (Values only) as a separate sibling click target beside it.
+            let name_area = div()
+                .id(ElementId::Name(format!("pivfield-{i}").into()))
+                .flex().flex_1().items_center().justify_between().gap_2()
+                .px_2().py(px(3.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|dd| dd.bg(pal.hover))
+                .child(div().text_size(px(12.)).text_color(pal.fg).overflow_hidden().child(SharedString::from(name.clone())))
+                .when(!badge.is_empty(), |dd| {
+                    dd.child(div().px_1p5().py(px(1.)).rounded(px(3.)).text_size(px(10.)).text_color(hsla_u(0xffffff)).bg(col).child(badge))
+                })
+                .on_click(move |_ev, _w, cx| {
+                    ent_role.update(cx, |this, cx| this.pivot_cycle_field(idx, i, cx));
+                });
+            let mut row = h_flex().items_center().gap_1().child(name_area);
+            if role_val == 3 {
+                let agg_lbl = PIVOT_AGGS[d.agg.get(i).copied().unwrap_or(0) as usize % PIVOT_AGGS.len()].1;
+                let ent_agg = ent.clone();
+                row = row.child(
+                    div()
+                        .id(ElementId::Name(format!("pivagg-{i}").into()))
+                        .flex_none()
+                        .px_1p5().py(px(1.))
+                        .rounded(px(3.))
+                        .text_size(px(10.))
+                        .text_color(pal.fg)
+                        .bg(pal.hover)
+                        .border_1().border_color(pal.border)
+                        .cursor_pointer()
+                        .hover(|dd| dd.bg(pal.panel))
+                        .child(SharedString::from(agg_lbl))
+                        .on_click(move |_ev, _w, cx| {
+                            ent_agg.update(cx, |this, cx| this.pivot_cycle_agg(idx, i, cx));
+                        }),
+                );
+            }
+            fields = fields.child(row);
         }
         v_flex()
             .w(px(232.))
@@ -1578,7 +1637,7 @@ impl Docxy {
             .border_l_1()
             .border_color(pal.border)
             .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("PivotTable Fields"))
-            .child(div().px_3().pb_1().text_size(px(10.)).text_color(pal.dim).child("Click a field: Rows \u{2192} Columns \u{2192} \u{03A3} Values \u{2192} off"))
+            .child(div().px_3().pb_1().text_size(px(10.)).text_color(pal.dim).child("Field: Rows \u{2192} Columns \u{2192} \u{03A3} Values \u{2192} off. On a Values field, click the chip to change Sum/Count/Avg/Max/Min."))
             .child(div().id("pivot-fields").flex_1().min_h(px(0.)).overflow_y_scroll().px_2().child(fields))
             .into_any_element()
     }
