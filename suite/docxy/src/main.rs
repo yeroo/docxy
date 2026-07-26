@@ -194,10 +194,13 @@ struct SheetView {
     vscroll: UniformListScrollHandle,
 }
 
-/// A UI-authored chart: which sheet it floats over, and its (cached) data.
+/// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
+/// and its (cached) data.
 #[derive(Clone)]
 struct ChartView {
     sheet: usize,
+    from: (u32, u32),
+    to: (u32, u32),
     data: gridcore::sheet::ChartData,
 }
 
@@ -1524,7 +1527,10 @@ impl Docxy {
             if !series.is_empty() {
                 let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: "bar".into(), categories, series };
                 let s = v.active;
-                v.charts.push(ChartView { sheet: s, data });
+                // Anchor the saved chart just right of the selected range.
+                let from = (r0, c1 + 2);
+                let to = (r0 + 16, c1 + 10);
+                v.charts.push(ChartView { sheet: s, from, to, data });
             }
         }
         self.mark_sheet_dirty();
@@ -1986,7 +1992,17 @@ impl Docxy {
     fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Sheet(v) = &tab.surface else { return };
-        let bytes = gridcore::xlsx::save_xlsx(&v.pkg);
+        // Persist UI-authored charts by adding them to a throwaway package clone
+        // (so the live package isn't mutated and charts aren't re-added each save).
+        let bytes = if v.charts.is_empty() {
+            gridcore::xlsx::save_xlsx(&v.pkg)
+        } else {
+            let mut pkg = v.pkg.clone();
+            for cv in &v.charts {
+                pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
+            }
+            gridcore::xlsx::save_xlsx(&pkg)
+        };
         let path = tab
             .path
             .clone()

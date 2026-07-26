@@ -1856,6 +1856,40 @@ pub(crate) fn esc_attr(s: &str) -> String {
     out
 }
 
+/// A self-contained `chartSpace` for a clustered column chart, with categories
+/// and per-series values cached as literals (`strLit`/`numLit`) so it renders
+/// without the source range.
+fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
+    let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
+    let cat_pts: String = (0..ncat)
+        .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", esc_attr(data.categories.get(i).map(|s| s.as_str()).unwrap_or(""))))
+        .collect();
+    let mut sers = String::new();
+    for (si, s) in data.series.iter().enumerate() {
+        let val_pts: String = (0..ncat)
+            .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", s.values.get(i).copied().unwrap_or(0.0)))
+            .collect();
+        sers.push_str(&format!(
+            "<c:ser><c:idx val=\"{si}\"/><c:order val=\"{si}\"/><c:tx><c:v>{}</c:v></c:tx>\
+<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>\
+<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val></c:ser>",
+            esc_attr(&s.name)
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>\
+<c:autoTitleDeleted val=\"0\"/><c:plotArea><c:layout/>\
+<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}\
+<c:axId val=\"111111111\"/><c:axId val=\"222222222\"/></c:barChart>\
+<c:catAx><c:axId val=\"111111111\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"222222222\"/></c:catAx>\
+<c:valAx><c:axId val=\"222222222\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"111111111\"/></c:valAx>\
+</c:plotArea><c:legend><c:legendPos val=\"b\"/><c:overlay val=\"0\"/></c:legend><c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>",
+        esc_attr(&data.title)
+    )
+}
+
 /// Replace the `ref="…"` attribute value of the first `prefix` element.
 /// Ensure `refreshOnLoad="1"` on the pivotCacheDefinition root element.
 /// Idempotent, so a second save stays byte-identical.
@@ -2137,6 +2171,82 @@ impl SheetPackage {
         });
         self.sheet_parts.push(part_name);
         self.workbook.sheets.len() - 1
+    }
+
+    /// Write a clustered column chart (cached literal data, self-contained) onto
+    /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
+    /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
+    /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
+    /// Also registers it in the model so it round-trips on reload.
+    pub fn add_chart(&mut self, sheet: usize, from: (u32, u32), to: (u32, u32), data: &crate::sheet::ChartData) {
+        if sheet >= self.workbook.sheets.len() {
+            return;
+        }
+        let mut cn = 1;
+        while self.part(&format!("xl/charts/chart{cn}.xml")).is_some() {
+            cn += 1;
+        }
+        let mut dn = 1;
+        while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
+            dn += 1;
+        }
+        let chart_part = format!("xl/charts/chart{cn}.xml");
+        let drawing_part = format!("xl/drawings/drawing{dn}.xml");
+
+        // 1) chart part + content type.
+        self.parts.push((chart_part.clone(), chart_space_xml(data).into_bytes()));
+        add_content_type_override(&mut self.parts, &format!("/{chart_part}"), "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
+
+        // 2) drawing part (anchor → chart via rId1) + content type.
+        let (fr, fc) = from;
+        let (tr, tc) = to;
+        let drawing_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<xdr:twoCellAnchor><xdr:from><xdr:col>{fc}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{fr}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+<xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
+<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart 1\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\
+<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\
+<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
+<xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"
+        );
+        self.parts.push((drawing_part.clone(), drawing_xml.into_bytes()));
+        add_content_type_override(&mut self.parts, &format!("/{drawing_part}"), "application/vnd.openxmlformats-officedocument.drawing+xml");
+
+        // 3) drawing rels → chart.
+        add_rel(
+            &mut self.parts,
+            &format!("xl/drawings/_rels/drawing{dn}.xml.rels"),
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+            &format!("../charts/chart{cn}.xml"),
+        );
+
+        // 4) worksheet rels → drawing (returns the rId to reference).
+        let sheet_part = self.sheet_parts[sheet].clone();
+        let (ws_dir, ws_file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part.as_str()));
+        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+        let rid = add_rel(
+            &mut self.parts,
+            &rels_part,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+            &format!("../drawings/drawing{dn}.xml"),
+        );
+
+        // 5) worksheet: ensure the `r` namespace, then add `<drawing r:id=…/>`.
+        if !rid.is_empty() {
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+                let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+                if !xml.contains("xmlns:r=") {
+                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
+                }
+                if !xml.contains("<drawing ") {
+                    xml = xml.replacen("</worksheet>", &format!("<drawing r:id=\"{rid}\"/></worksheet>"), 1);
+                }
+                p.1 = xml.into_bytes();
+            }
+        }
+
+        self.workbook.sheets[sheet].drawings.push(crate::sheet::Drawing { from, to, kind: crate::sheet::DrawingKind::Chart(data.clone()) });
     }
 
     /// Create a pivot table from scratch: writes a pivotCacheDefinition and
