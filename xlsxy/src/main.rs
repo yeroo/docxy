@@ -6085,6 +6085,26 @@ mod tests {
     }
 
     #[test]
+    fn rename_sheet_round_trips_through_save() {
+        // The TUI rename is model-only (gridcore::edit::rename_sheet); it relies on
+        // save_xlsx re-syncing workbook.xml (patch_sheet_names). Guard that path so
+        // a regression there can't silently drop the rename on reload.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        app.open_prompt(PromptKind::RenameSheet);
+        app.prompt.as_mut().unwrap().text = "Budget".to_string();
+        app.commit_prompt();
+
+        let reloaded = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let names: Vec<&str> = reloaded.workbook.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Budget"), "rename lost on reload: {names:?}");
+        assert!(!names.contains(&"Data"), "stale name survived: {names:?}");
+    }
+
+    #[test]
     fn formula_bar_text_reconstructs_input() {
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].set_cell(

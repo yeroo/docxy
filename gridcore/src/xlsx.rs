@@ -2601,10 +2601,11 @@ impl SheetPackage {
     /// (Wave-3's "remove both or neither" rule for `pivot.create`'s
     /// inverse). Pivots on later sheets keep pointing at the right sheet as
     /// indices shift down, same as `defined_names` scopes below.
-    /// Rename sheet `idx`, updating both the model and the `<sheet name="…">`
-    /// entry in `workbook.xml` (matched by document order). Rejects a name that
-    /// collides (case-insensitively) with another sheet, or an out-of-range /
-    /// empty name. Returns whether the rename happened.
+    /// Rename sheet `idx`, updating the model, any formulas that reference the
+    /// old sheet name (via [`crate::edit::rename_sheet`]), and the `<sheet
+    /// name="…">` entries in `workbook.xml`. Rejects a name that collides
+    /// (case-insensitively) with another sheet, or an out-of-range / empty
+    /// name. Returns whether the rename happened.
     pub fn rename_sheet(&mut self, idx: usize, name: &str) -> bool {
         let name = name.trim();
         if name.is_empty() || idx >= self.workbook.sheets.len() {
@@ -2619,32 +2620,12 @@ impl SheetPackage {
         {
             return false;
         }
-        self.workbook.sheets[idx].name = name.to_string();
+        // Model + cross-sheet formula references.
+        crate::edit::rename_sheet(&mut self.workbook, idx, name);
+        // Re-sync workbook.xml from the model (same helper save_xlsx uses).
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            // Walk to the idx-th <sheet …/> element (document order == model order).
-            let (mut pos, mut count, mut at) = (0usize, 0usize, None);
-            while let Some(rel) = xml[pos..].find("<sheet ") {
-                let start = pos + rel;
-                if count == idx {
-                    at = Some(start);
-                    break;
-                }
-                count += 1;
-                pos = start + "<sheet ".len();
-            }
-            if let Some(start) = at {
-                if let Some(gt) = xml[start..].find('>') {
-                    let elem_end = start + gt;
-                    if let Some(np) = xml[start..elem_end].find("name=\"") {
-                        let ns = start + np + "name=\"".len();
-                        if let Some(ne_rel) = xml[ns..elem_end].find('"') {
-                            let ne = ns + ne_rel;
-                            p.1 = format!("{}{}{}", &xml[..ns], esc_attr(name), &xml[ne..]).into_bytes();
-                        }
-                    }
-                }
-            }
+            p.1 = patch_sheet_names(&xml, &self.workbook.sheets).into_bytes();
         }
         true
     }
