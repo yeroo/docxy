@@ -6004,6 +6004,9 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
     let d1904 = view.pkg.workbook.date1904;
+    // The active sheet index for conditional-formatting lookups.
+    let sidx = view.active.min(view.pkg.workbook.sheets.len().saturating_sub(1));
+    let has_cf = !sh.cond_formats.is_empty();
     let (sr, sc) = view.sel;
     let (r0, c0, r1, c1) = view.range();
     let editing = view.editing.clone();
@@ -6037,10 +6040,28 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
             Align::Right => 2,
             Align::General => if is_num { 2 } else { 0 },
         };
-        let fill = xf.as_ref().and_then(|x| x.fill);
-        let color = xf.as_ref().and_then(|x| x.color).map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
-        let bold = xf.as_ref().is_some_and(|x| x.bold);
-        let italic = xf.as_ref().is_some_and(|x| x.italic);
+        let mut fill = xf.as_ref().and_then(|x| x.fill);
+        let mut color_rgb = xf.as_ref().and_then(|x| x.color);
+        let mut bold = xf.as_ref().is_some_and(|x| x.bold);
+        let mut italic = xf.as_ref().is_some_and(|x| x.italic);
+        // Conditional formatting overlays the base style where a rule matches.
+        if has_cf {
+            if let Some(dxf) = gridcore::cf::cell_dxf(&view.pkg.workbook, sidx, r, c) {
+                if dxf.fill.is_some() {
+                    fill = dxf.fill;
+                }
+                if dxf.color.is_some() {
+                    color_rgb = dxf.color;
+                }
+                if let Some(b) = dxf.bold {
+                    bold = b;
+                }
+                if let Some(i) = dxf.italic {
+                    italic = i;
+                }
+            }
+        }
+        let color = color_rgb.map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
         let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
         let mut cell = div()
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
