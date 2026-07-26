@@ -192,6 +192,10 @@ struct SheetView {
     charts: Vec<ChartView>,
     /// Vertical scroll of the virtualized row list.
     vscroll: UniformListScrollHandle,
+    /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
+    /// offset — rendered `col0..=cend` — so columns past the viewport are
+    /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
+    col0: u32,
 }
 
 /// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
@@ -661,7 +665,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new() };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new(), col0: 0 };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -919,6 +923,41 @@ impl Docxy {
             v.anchor = (0, 0);
             v.editing = None;
             cx.notify();
+        }
+    }
+
+    /// Adjust `col0` (horizontal scroll) so the selected column stays visible in
+    /// `avail_w` px of grid width. Called each render before drawing the grid, so
+    /// arrow-key navigation past the right edge scrolls columns into view.
+    fn reconcile_sheet_hscroll(&mut self, avail_w: f32) {
+        if let Some(v) = self.active_sheet_mut() {
+            let sc = v.sel.1;
+            if sc < v.col0 {
+                v.col0 = sc;
+                return;
+            }
+            // Shrink the window from the left until [col0..=sc] fits (sc at the
+            // right edge), so moving right past the last visible column scrolls.
+            let widths: Vec<f32> = (0..=sc).map(|c| col_px(v.sheet().col_width(c))).collect();
+            let mut start = v.col0;
+            let mut sum: f32 = (start..=sc).map(|c| widths[c as usize]).sum();
+            while sum > avail_w && start < sc {
+                sum -= widths[start as usize];
+                start += 1;
+            }
+            v.col0 = start;
+        }
+    }
+
+    /// Scroll horizontally by `delta` columns (Shift+wheel), clamped to the extent.
+    fn sheet_hscroll(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (_, mc) = v.extent();
+            let nv = (v.col0 as i32 + delta).clamp(0, mc as i32);
+            if nv as u32 != v.col0 {
+                v.col0 = nv as u32;
+                cx.notify();
+            }
         }
     }
 
@@ -6016,6 +6055,17 @@ impl Render for Docxy {
             self.focused = true;
         }
 
+        // Spreadsheet horizontal scroll: reconcile the column offset so the
+        // selected column stays visible, and remember the grid width for sheet_el.
+        let sheet_grid_w = if self.active_is_sheet() {
+            let panel = if self.active_pivot().is_some() { 232.0 } else { 0.0 };
+            let w = f32::from(window.viewport_size().width) - panel;
+            self.reconcile_sheet_hscroll((w - SHEET_GUT).max(120.0));
+            w
+        } else {
+            0.0
+        };
+
         let t = cx.theme();
         let bg = t.background;
         let fg = t.foreground;
@@ -6306,7 +6356,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), sheet_grid_w, cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -6477,7 +6527,7 @@ const SHEET_GUT: f32 = 46.0;
 
 /// The frozen column-letter header row (with drag-to-resize handles). Rendered
 /// once above the virtualized rows so it stays put while they scroll vertically.
-fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, cols: u32) -> AnyElement {
+fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, col0: u32, cend: u32) -> AnyElement {
     use gridcore::sheet::col_name;
     let sh = view.sheet();
     let gridline = hsla_u(0xd9d9d9);
@@ -6486,7 +6536,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, cols: u32) -> AnyElem
     let brand = hsla_u(BRAND);
     let (_, c0, _, c1) = view.range();
     let mut header = h_flex().child(div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
-    for c in 0..=cols {
+    for c in col0..=cend {
         let hl = c >= c0 && c <= c1;
         let ent_h = ent.clone();
         let handle = div()
@@ -6512,8 +6562,8 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, cols: u32) -> AnyElem
     header.into_any_element()
 }
 
-/// One data row: the row-number gutter cell plus `0..=cols` styled cells.
-fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyElement {
+/// One data row: the row-number gutter cell plus the visible `col0..=cend` cells.
+fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, col0: u32, cend: u32) -> AnyElement {
     use gridcore::sheet::{Align, CellValue};
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
@@ -6537,7 +6587,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
             .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
             .child(SharedString::from((r + 1).to_string())),
     );
-    for c in 0..=cols {
+    for c in col0..=cend {
         let selected = (r, c) == (sr, sc);
         let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
         let cell_editing = selected && editing.is_some();
@@ -6740,12 +6790,26 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
-    let cols = (max_c + 12).max(26).min(256);
+    // Horizontal column window: fill the available grid width with columns
+    // starting at the scroll offset col0 (+1 overflow), capped at 255. This is
+    // column virtualization by offset — the counterpart to the row uniform_list.
+    let col0 = view.col0.min(255);
+    let avail = (grid_w - SHEET_GUT).max(120.0);
+    let mut cend = col0;
+    let mut wsum = 0.0f32;
+    loop {
+        wsum += col_px(sh.col_width(cend));
+        if (wsum > avail && cend > col0) || cend >= 255 {
+            break;
+        }
+        cend += 1;
+    }
+    let _ = max_c;
     // Total rows to virtualize over: the used range plus generous headroom.
     let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
@@ -6784,14 +6848,14 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
-    let header = sheet_col_header(view, ent, cols);
+    let header = sheet_col_header(view, ent, col0, cend);
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
     let (fr, _fc) = sh.freeze;
     let fr = (fr as usize).min(total_rows).min(30);
     let mut frozen = v_flex().flex_none();
     for r in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, r as u32, cols));
+        frozen = frozen.child(sheet_row(view, ent, r as u32, col0, cend));
     }
     let ent_list = ent.clone();
     let list = uniform_list(
@@ -6799,14 +6863,32 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         total_rows.saturating_sub(fr),
         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
             let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, cols)).collect::<Vec<_>>()
+            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, col0, cend)).collect::<Vec<_>>()
         }),
     )
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .track_scroll(&view.vscroll)
     .flex_1()
     .min_h(px(0.));
-    let grid_area = v_flex().flex_1().min_h(px(0.)).child(header).child(frozen).child(list);
+    let grid_area = v_flex()
+        .flex_1()
+        .min_h(px(0.))
+        // Shift+wheel scrolls columns; plain wheel falls through to the row list.
+        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+            if ev.modifiers.shift {
+                let dy = match ev.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => f32::from(p.y) / SHEET_ROW_H,
+                };
+                let step = if dy < 0.0 { 1 } else if dy > 0.0 { -1 } else { 0 };
+                if step != 0 {
+                    this.sheet_hscroll(step, cx);
+                }
+            }
+        }))
+        .child(header)
+        .child(frozen)
+        .child(list);
 
     // ---- sheet tabs (bottom) ----
     let nsheets = view.pkg.workbook.sheets.len();
