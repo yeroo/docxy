@@ -258,7 +258,7 @@ enum SheetAct {
     Currency,
     Comma,
     InsertPivot,
-    InsertChart,
+    InsertChart(&'static str),
     FillColor,
     FontColor,
     ToggleBorder,
@@ -1479,7 +1479,7 @@ impl Docxy {
 
     /// Build a clustered column chart from the selected range (categories = first
     /// text column, one series per numeric column) and float it over the sheet.
-    fn sheet_insert_chart(&mut self, cx: &mut Context<Self>) {
+    fn sheet_insert_chart(&mut self, kind: &str, cx: &mut Context<Self>) {
         use gridcore::sheet::{CellValue, ChartData, ChartSeries};
         if let Some(v) = self.active_sheet_mut() {
             let (r0, c0, r1, c1) = if v.has_range() {
@@ -1525,7 +1525,7 @@ impl Docxy {
                 })
                 .collect();
             if !series.is_empty() {
-                let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: "bar".into(), categories, series };
+                let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: kind.to_string(), categories, series };
                 let s = v.active;
                 // Anchor the saved chart just right of the selected range.
                 let from = (r0, c1 + 2);
@@ -1601,7 +1601,7 @@ impl Docxy {
             SheetAct::Currency => self.sheet_numfmt("$#,##0.00", cx),
             SheetAct::Comma => self.sheet_numfmt("#,##0.00", cx),
             SheetAct::InsertPivot => self.sheet_insert_pivot(cx),
-            SheetAct::InsertChart => self.sheet_insert_chart(cx),
+            SheetAct::InsertChart(kind) => self.sheet_insert_chart(kind, cx),
             SheetAct::FillColor => {
                 self.sheet_pick = Some(SheetPick::Fill);
                 cx.notify();
@@ -1648,7 +1648,7 @@ impl Docxy {
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
                 "p" if shift => self.sheet_insert_pivot(cx),
                 // Insert a chart of the selection (also on the Insert ribbon).
-                "k" if shift => self.sheet_insert_chart(cx),
+                "k" if shift => self.sheet_insert_chart("column", cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -5269,7 +5269,10 @@ impl Docxy {
                 .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
-                .child(self.sheet_lb(None, "Column Chart", SheetAct::InsertChart, pal, cx))
+                .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
+                .child(self.sheet_lb(None, "Bar", SheetAct::InsertChart("bar"), pal, cx))
+                .child(self.sheet_lb(None, "Line", SheetAct::InsertChart("line"), pal, cx))
+                .child(self.sheet_lb(None, "Pie", SheetAct::InsertChart("pie"), pal, cx))
                 .into_any_element()))
             .into_any_element()
     }
@@ -6473,35 +6476,93 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
     let maxv = data.series.iter().flat_map(|s| s.values.iter().copied()).fold(0.0f64, f64::max).max(1.0);
     let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
     let plot_h = 148.0f32;
-    let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
-    for ci in 0..ncat {
-        let mut cluster = h_flex().items_end().gap(px(1.));
-        for (si, s) in data.series.iter().enumerate() {
-            let val = s.values.get(ci).copied().unwrap_or(0.0);
-            let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
-            cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
-        }
+    let cat_label = |ci: usize| {
         let label = data.categories.get(ci).cloned().unwrap_or_default();
-        plot = plot.child(
-            v_flex()
-                .items_center()
-                .justify_end()
-                .gap(px(2.))
-                .h(px(plot_h + 18.))
-                .child(cluster)
-                .child(div().text_size(px(8.)).text_color(hsla_u(0x666666)).max_w(px(52.)).overflow_hidden().child(SharedString::from(label))),
-        );
-    }
-    let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
-    for (si, s) in data.series.iter().enumerate() {
-        legend = legend.child(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(PALETTE[si % PALETTE.len()])))
-                .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(s.name.clone()))),
-        );
-    }
+        div().text_size(px(8.)).text_color(hsla_u(0x666666)).max_w(px(52.)).overflow_hidden().child(SharedString::from(label))
+    };
+
+    // The plot area is drawn differently per chart kind. Column/Bar/Line share a
+    // per-series legend; Pie's slices are per-category, so it builds its own.
+    let kind = data.kind.as_str();
+    let mut pie_legend: Option<AnyElement> = None;
+    let plot: AnyElement = match kind {
+        "bar" => {
+            // Horizontal bars: one row per category, width proportional to value.
+            let mut col = v_flex().flex_1().gap(px(3.)).px_2().py_2().justify_center();
+            for ci in 0..ncat {
+                let mut row = h_flex().items_center().gap(px(4.)).h(px(16.));
+                row = row.child(div().w(px(46.)).text_size(px(8.)).text_color(hsla_u(0x666666)).overflow_hidden().child(SharedString::from(data.categories.get(ci).cloned().unwrap_or_default())));
+                let mut bars = v_flex().flex_1().gap(px(1.));
+                for (si, s) in data.series.iter().enumerate() {
+                    let val = s.values.get(ci).copied().unwrap_or(0.0);
+                    let frac = (val.max(0.0) / maxv) as f32;
+                    bars = bars.child(div().h(px(6.)).w(relative(frac.clamp(0.02, 1.0))).rounded_r(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                }
+                row = row.child(bars);
+                col = col.child(row);
+            }
+            col.h(px(plot_h + 20.)).into_any_element()
+        }
+        "line" => {
+            // Point/line preview: each series' value plotted as a dot at its height.
+            let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
+            for ci in 0..ncat {
+                let mut stack = div().relative().w(px(14.)).h(px(plot_h));
+                for (si, s) in data.series.iter().enumerate() {
+                    let val = s.values.get(ci).copied().unwrap_or(0.0);
+                    let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
+                    stack = stack.child(div().absolute().bottom(px(h - 3.5)).left(px(3.5)).size(px(7.)).rounded(px(4.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                }
+                plot = plot.child(v_flex().items_center().justify_end().gap(px(2.)).h(px(plot_h + 18.)).child(stack).child(cat_label(ci)));
+            }
+            plot.into_any_element()
+        }
+        "pie" => {
+            // Pie preview as a 100%-stacked proportion bar; slices = categories,
+            // proportions from the first series. Legend is per-category.
+            let vals: Vec<f64> = (0..ncat).map(|ci| data.series.first().and_then(|s| s.values.get(ci)).copied().unwrap_or(0.0).max(0.0)).collect();
+            let total = vals.iter().sum::<f64>().max(1.0);
+            let mut bar = h_flex().w_full().h(px(30.)).rounded(px(4.)).overflow_hidden();
+            let mut leg = h_flex().gap_3().px_2().pb_1().flex_wrap();
+            for ci in 0..ncat {
+                let frac = (vals[ci] / total) as f32;
+                bar = bar.child(div().h_full().w(relative(frac.max(0.0))).bg(rgb(PALETTE[ci % PALETTE.len()])));
+                leg = leg.child(h_flex().items_center().gap_1()
+                    .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(PALETTE[ci % PALETTE.len()])))
+                    .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(data.categories.get(ci).cloned().unwrap_or_default()))));
+            }
+            pie_legend = Some(leg.into_any_element());
+            v_flex().flex_1().justify_center().gap(px(6.)).px_3().py_2().h(px(plot_h + 20.)).child(bar).into_any_element()
+        }
+        _ => {
+            // Column (default): vertical clustered bars.
+            let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
+            for ci in 0..ncat {
+                let mut cluster = h_flex().items_end().gap(px(1.));
+                for (si, s) in data.series.iter().enumerate() {
+                    let val = s.values.get(ci).copied().unwrap_or(0.0);
+                    let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
+                    cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                }
+                plot = plot.child(v_flex().items_center().justify_end().gap(px(2.)).h(px(plot_h + 18.)).child(cluster).child(cat_label(ci)));
+            }
+            plot.into_any_element()
+        }
+    };
+
+    let legend: AnyElement = pie_legend.unwrap_or_else(|| {
+        let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
+        for (si, s) in data.series.iter().enumerate() {
+            legend = legend.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(PALETTE[si % PALETTE.len()])))
+                    .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(s.name.clone()))),
+            );
+        }
+        legend.into_any_element()
+    });
     v_flex()
         .w(px(360.))
         .bg(hsla_u(0xffffff))

@@ -1864,27 +1864,53 @@ fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
     let cat_pts: String = (0..ncat)
         .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", esc_attr(data.categories.get(i).map(|s| s.as_str()).unwrap_or(""))))
         .collect();
-    let mut sers = String::new();
-    for (si, s) in data.series.iter().enumerate() {
+    let ser_xml = |si: usize, s: &crate::sheet::ChartSeries| -> String {
         let val_pts: String = (0..ncat)
             .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", s.values.get(i).copied().unwrap_or(0.0)))
             .collect();
-        sers.push_str(&format!(
+        format!(
             "<c:ser><c:idx val=\"{si}\"/><c:order val=\"{si}\"/><c:tx><c:v>{}</c:v></c:tx>\
 <c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>\
 <c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val></c:ser>",
             esc_attr(&s.name)
-        ));
-    }
+        )
+    };
+    let sers: String = data.series.iter().enumerate().map(|(si, s)| ser_xml(si, s)).collect();
+
+    // catAx + valAx, shared by the axed chart types (bar/column/line). Pie omits them.
+    const AXES: &str = "<c:catAx><c:axId val=\"111111111\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"222222222\"/></c:catAx>\
+<c:valAx><c:axId val=\"222222222\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"111111111\"/></c:valAx>";
+    const AX_IDS: &str = "<c:axId val=\"111111111\"/><c:axId val=\"222222222\"/>";
+
+    let (plot_body, axes): (String, &str) = match data.kind.as_str() {
+        "bar" => (
+            format!("<c:barChart><c:barDir val=\"bar\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"),
+            AXES,
+        ),
+        "line" => (
+            format!("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>{sers}<c:marker val=\"1\"/>{AX_IDS}</c:lineChart>"),
+            AXES,
+        ),
+        "pie" => {
+            // Pie takes a single series; extra series are invalid (that's doughnut).
+            let pie_ser = data.series.first().map(|s| ser_xml(0, s)).unwrap_or_default();
+            (
+                format!("<c:pieChart><c:varyColors val=\"1\"/>{pie_ser}<c:firstSliceAng val=\"0\"/></c:pieChart>"),
+                "",
+            )
+        }
+        _ => (
+            format!("<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"),
+            AXES,
+        ),
+    };
+
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
 <c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>\
 <c:autoTitleDeleted val=\"0\"/><c:plotArea><c:layout/>\
-<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}\
-<c:axId val=\"111111111\"/><c:axId val=\"222222222\"/></c:barChart>\
-<c:catAx><c:axId val=\"111111111\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"222222222\"/></c:catAx>\
-<c:valAx><c:axId val=\"222222222\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"111111111\"/></c:valAx>\
+{plot_body}{axes}\
 </c:plotArea><c:legend><c:legendPos val=\"b\"/><c:overlay val=\"0\"/></c:legend><c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>",
         esc_attr(&data.title)
     )
@@ -2777,6 +2803,41 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_space_xml_per_kind() {
+        use crate::sheet::{ChartData, ChartSeries};
+        let data = |kind: &str| ChartData {
+            title: "Sales".into(),
+            kind: kind.into(),
+            categories: vec!["Q1".into(), "Q2".into(), "Q3".into()],
+            series: vec![
+                ChartSeries { name: "East".into(), values: vec![1.0, 2.0, 3.0] },
+                ChartSeries { name: "West".into(), values: vec![4.0, 5.0, 6.0] },
+            ],
+        };
+        // Well-formedness proxy: equal open/close angle brackets and matched
+        // <c:chartSpace>…</c:chartSpace>, plus the expected plot element per kind.
+        for (kind, needle, forbidden) in [
+            ("column", "<c:barChart><c:barDir val=\"col\"/>", "<c:catAx"),
+            ("bar", "<c:barChart><c:barDir val=\"bar\"/>", "<c:catAx"),
+            ("line", "<c:lineChart>", "<c:catAx"),
+            ("pie", "<c:pieChart>", "<c:catAx"),
+        ] {
+            let xml = chart_space_xml(&data(kind));
+            assert!(xml.contains(needle), "{kind}: missing {needle}");
+            assert!(xml.matches('<').count() == xml.matches('>').count(), "{kind}: unbalanced angle brackets");
+            assert!(xml.matches("<c:chartSpace").count() == 1 && xml.contains("</c:chartSpace>"), "{kind}: chartSpace not closed");
+            // Pie carries no axes; the axed kinds must include the shared catAx.
+            if kind == "pie" {
+                assert!(!xml.contains(forbidden), "pie must not emit axes");
+                assert_eq!(xml.matches("<c:ser>").count(), 1, "pie takes a single series");
+            } else {
+                assert!(xml.contains(forbidden), "{kind}: missing axes");
+                assert_eq!(xml.matches("<c:ser>").count(), 2, "{kind}: both series expected");
+            }
+        }
+    }
 
     #[test]
     fn parse_frozen_pane() {
