@@ -159,7 +159,73 @@ enum RibbonTab {
 
 enum Surface {
     Doc(Editor),
+    Sheet(SheetView),
     Placeholder,
+}
+
+/// A spreadsheet tab's live state: the loaded workbook package, which sheet is
+/// active, the selected cell, and the grid's scroll handle.
+struct SheetView {
+    pkg: gridcore::xlsx::SheetPackage,
+    active: usize,
+    /// Selected cell, 0-based (row, col).
+    sel: (u32, u32),
+    /// When `Some`, the selected cell is being edited and this is the in-progress
+    /// input buffer (a leading `=` marks a formula).
+    editing: Option<String>,
+    /// The recalc engine, indexed over the workbook's formulas, so an edit
+    /// re-evaluates only the affected cells.
+    engine: gridcore::engine::Engine,
+    grid_scroll: ScrollHandle,
+}
+
+impl SheetView {
+    fn sheet(&self) -> &gridcore::sheet::Sheet {
+        &self.pkg.workbook.sheets[self.active.min(self.pkg.workbook.sheets.len().saturating_sub(1))]
+    }
+    /// The text to seed the editor with when re-editing a cell: `=formula` for a
+    /// formula, the raw literal otherwise (unformatted, so it round-trips).
+    fn edit_string(&self, row: u32, col: u32) -> String {
+        use gridcore::sheet::CellValue;
+        let sh = self.sheet();
+        match sh.cell(row, col) {
+            Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or("")),
+            Some(c) => match &c.value {
+                CellValue::Number(n) => n.to_string(),
+                CellValue::Text(s) => s.clone(),
+                CellValue::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+                CellValue::Error(e) => e.clone(),
+                CellValue::Empty => String::new(),
+            },
+            None => String::new(),
+        }
+    }
+    /// The display text for a cell (number-formatted via its style).
+    fn cell_text(&self, row: u32, col: u32) -> String {
+        let sh = self.sheet();
+        match sh.cell(row, col) {
+            Some(c) if !c.is_blank() => {
+                let xf = self.pkg.workbook.styles.xf(c.style);
+                gridcore::sheet::format_with(&xf, &c.value, self.pkg.workbook.date1904)
+            }
+            _ => String::new(),
+        }
+    }
+    /// The used extent (max row, max col) over the active sheet's cells + merges.
+    fn extent(&self) -> (u32, u32) {
+        let sh = self.sheet();
+        let mut r = 0u32;
+        let mut c = 0u32;
+        for &(row, col) in sh.cells.keys() {
+            r = r.max(row);
+            c = c.max(col);
+        }
+        for &(r0, c0, r1, c1) in &sh.merges {
+            r = r.max(r0).max(r1);
+            c = c.max(c0).max(c1);
+        }
+        (r, c)
+    }
 }
 
 struct DocTab {
@@ -454,6 +520,22 @@ fn sample_doc() -> Loaded {
     load_bytes(include_bytes!("../../../assets/sample.docx"))
 }
 
+/// Load a `.xlsx` into a spreadsheet surface (or a placeholder + error status).
+fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
+    match std::fs::read(path) {
+        Ok(bytes) => match gridcore::xlsx::load_xlsx(&bytes) {
+            Ok(pkg) => {
+                let n = pkg.workbook.sheets.len();
+                let engine = gridcore::engine::Engine::new(&pkg.workbook);
+                let view = SheetView { pkg, active: 0, sel: (0, 0), editing: None, engine, grid_scroll: ScrollHandle::new() };
+                (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
+            }
+            Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
+        },
+        Err(e) => (Surface::Placeholder, format!("read error: {e}").into()),
+    }
+}
+
 fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, Vec<docxcore::notes::Note>, Option<Package>, SharedString) {
     match kind {
         Kind::Docx => match path {
@@ -462,6 +544,13 @@ fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, 
                 (Surface::Doc(Editor::new(l.doc)), l.comments, l.notes, l.pkg, l.status)
             }
             None => (Surface::Doc(Editor::new(empty_doc())), vec![], vec![], None, "untitled".into()),
+        },
+        Kind::Xlsx => match path {
+            Some(p) => {
+                let (surface, status) = sheet_from_path(p);
+                (surface, vec![], vec![], None, status)
+            }
+            None => (Surface::Placeholder, vec![], vec![], None, "new workbook — open an .xlsx".into()),
         },
         _ => (Surface::Placeholder, vec![], vec![], None, "".into()),
     }
@@ -657,6 +746,179 @@ impl Docxy {
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    /// Move the spreadsheet selection to a cell (from a grid click), committing
+    /// any in-progress edit first.
+    fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx); // commit in place before moving away
+        }
+        if let Some(v) = self.active_sheet_mut() {
+            v.sel = (row, col);
+            v.editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Switch the active spreadsheet to another sheet (from a sheet-tab click).
+    fn select_sheet(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(Surface::Sheet(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
+            v.active = idx.min(v.pkg.workbook.sheets.len().saturating_sub(1));
+            v.sel = (0, 0);
+            v.editing = None;
+            cx.notify();
+        }
+    }
+
+    // ---- spreadsheet cell editing -----------------------------------------
+
+    fn active_sheet(&self) -> Option<&SheetView> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Sheet(v)) => Some(v),
+            _ => None,
+        }
+    }
+    fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
+        match self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
+            Some(Surface::Sheet(v)) => Some(v),
+            _ => None,
+        }
+    }
+    fn active_is_sheet(&self) -> bool {
+        matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Sheet(_)))
+    }
+    fn mark_sheet_dirty(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.dirty = true;
+        }
+    }
+
+    /// Begin editing the selected cell. `initial` seeds the buffer (a freshly
+    /// typed character); `None` re-edits the existing content (F2).
+    fn sheet_begin_edit(&mut self, initial: Option<String>, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
+        }
+        cx.notify();
+    }
+
+    /// Commit the in-progress edit (if any) into the workbook, recalc, and move
+    /// the selection by (dr, dc).
+    fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
+        let mut committed = false;
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(buf) = v.editing.take() {
+                let (r, c) = v.sel;
+                let s = v.active;
+                let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+                let cell = parse_cell_input(&buf, style);
+                v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
+                committed = true;
+            }
+        }
+        if committed {
+            self.mark_sheet_dirty();
+        }
+        self.sheet_move(dr, dc, cx);
+    }
+
+    /// Move the selection by (dr, dc), clamped at the top-left origin, discarding
+    /// any in-progress edit.
+    fn sheet_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+            v.editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Arrow-key navigation: commit an open edit first, then move.
+    fn sheet_nav(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
+        if editing {
+            self.sheet_commit(0, 0, cx);
+        }
+        self.sheet_move(dr, dc, cx);
+    }
+
+    /// Clear the selected cell's content (Delete / Backspace), keeping its style.
+    fn sheet_clear(&mut self, cx: &mut Context<Self>) {
+        let mut cleared = false;
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+            let cell = gridcore::sheet::Cell { style, ..Default::default() };
+            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
+            cleared = true;
+        }
+        if cleared {
+            self.mark_sheet_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
+    /// active surface is a sheet).
+    fn sheet_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if ctrl {
+            match key {
+                "s" => self.save_active(window, cx),
+                "f1" => {
+                    self.ribbon_min = !self.ribbon_min;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return; // other ctrl combos aren't wired for the grid yet
+        }
+        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        match key {
+            "escape" => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.editing = None;
+                }
+                cx.notify();
+            }
+            "enter" => self.sheet_commit(if shift { -1 } else { 1 }, 0, cx),
+            "f2" => self.sheet_begin_edit(None, cx),
+            "backspace" => {
+                if editing {
+                    if let Some(v) = self.active_sheet_mut() {
+                        if let Some(b) = v.editing.as_mut() {
+                            b.pop();
+                        }
+                    }
+                    cx.notify();
+                } else {
+                    self.sheet_clear(cx);
+                }
+            }
+            "delete" => {
+                if !editing {
+                    self.sheet_clear(cx);
+                }
+            }
+            "left" => self.sheet_nav(0, -1, editing, cx),
+            "right" => self.sheet_nav(0, 1, editing, cx),
+            "up" => self.sheet_nav(-1, 0, editing, cx),
+            "down" => self.sheet_nav(1, 0, editing, cx),
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        if let Some(v) = self.active_sheet_mut() {
+                            match v.editing.as_mut() {
+                                Some(buf) => buf.push_str(c),
+                                None => v.editing = Some(c.to_string()),
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
     }
 
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -893,6 +1155,13 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A spreadsheet tab: commit any open cell edit, then write .xlsx.
+        if self.active_is_sheet() {
+            if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+                self.sheet_commit(0, 0, cx);
+            }
+            return self.save_sheet(window, cx);
+        }
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Surface::Doc(editor) = &tab.surface else { return };
@@ -902,6 +1171,31 @@ impl Docxy {
         } else {
             doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
         };
+        let path = tab
+            .path
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(tab.title.to_string()));
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                tab.title = file_name(&path).into();
+                tab.path = Some(path.clone());
+                tab.dirty = false;
+                tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            }
+            Err(e) => tab.status = format!("save failed: {e}").into(),
+        }
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+    }
+
+    /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
+    /// re-writes into the loaded package), preserving styles and formulas.
+    fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Surface::Sheet(v) = &tab.surface else { return };
+        let bytes = gridcore::xlsx::save_xlsx(&v.pkg);
         let path = tab
             .path
             .clone()
@@ -941,9 +1235,20 @@ impl Docxy {
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("Word or Markdown", &["docx", "md", "markdown"]).add_filter("Word document", &["docx"]).add_filter("Markdown", &["md", "markdown"]).pick_file() {
-            let title = file_name(&path).into();
-            let tab = doc_from_path(&path).into_tab(Kind::Docx, title, Some(path), false);
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("All supported", &["docx", "md", "markdown", "xlsx"])
+            .add_filter("Word or Markdown", &["docx", "md", "markdown"])
+            .add_filter("Excel workbook", &["xlsx"])
+            .pick_file()
+        {
+            let title: SharedString = file_name(&path).into();
+            let is_xlsx = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
+            let tab = if is_xlsx {
+                let (surface, status) = sheet_from_path(&path);
+                DocTab { kind: Kind::Xlsx, title, path: Some(path), surface, dirty: false, status, comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None }
+            } else {
+                doc_from_path(&path).into_tab(Kind::Docx, title, Some(path), false)
+            };
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
         }
@@ -2299,6 +2604,10 @@ impl Docxy {
         }
         self.mini_bar = None;
         self.context_menu = None;
+        // On a sheet, Tab commits the edit and advances one cell to the right.
+        if self.active_is_sheet() {
+            return self.sheet_commit(0, 1, cx);
+        }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
     }
@@ -2310,6 +2619,10 @@ impl Docxy {
         }
         self.mini_bar = None;
         self.context_menu = None;
+        // On a sheet, Shift+Tab commits and moves one cell to the left.
+        if self.active_is_sheet() {
+            return self.sheet_commit(0, -1, cx);
+        }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
 
@@ -2339,6 +2652,11 @@ impl Docxy {
         // Any key dismisses the floating mini toolbar / context menu.
         self.mini_bar = None;
         self.context_menu = None;
+        // Spreadsheet surface: the grid has its own key handling (navigation,
+        // cell editing, recalc) — nothing routes to a text editor.
+        if self.active_is_sheet() {
+            return self.sheet_key(ev, ctrl, shift, key.as_str(), window, cx);
+        }
         // In header/footer edit mode, Esc returns to the document body.
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
@@ -2450,6 +2768,29 @@ impl Docxy {
         self.scroll_to_caret();
         cx.notify();
     }
+}
+
+/// Parse a cell's edit buffer into a `Cell`, Excel-style: `=…` is a formula, a
+/// bare number is numeric, TRUE/FALSE is boolean, anything else is text. The
+/// existing style index is carried over so formatting survives the edit.
+fn parse_cell_input(raw: &str, style: u32) -> gridcore::sheet::Cell {
+    use gridcore::sheet::{Cell, CellValue};
+    let t = raw.trim();
+    let mut cell = if t.is_empty() {
+        Cell::default()
+    } else if let Some(f) = t.strip_prefix('=') {
+        Cell::formula(f)
+    } else if let Ok(n) = t.parse::<f64>() {
+        Cell::number(n)
+    } else if t.eq_ignore_ascii_case("true") {
+        Cell { value: CellValue::Bool(true), ..Cell::default() }
+    } else if t.eq_ignore_ascii_case("false") {
+        Cell { value: CellValue::Bool(false), ..Cell::default() }
+    } else {
+        Cell::text(raw)
+    };
+    cell.style = style;
+    cell
 }
 
 fn yes(mut f: impl FnMut()) -> bool {
@@ -4592,6 +4933,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
+                Surface::Sheet(v) => sheet_el(v, &cx.entity()).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -4652,7 +4994,7 @@ impl Render for Docxy {
             .child(self.tabs.get(self.active).map(|t| t.status.clone()).unwrap_or_default())
             .when_some(stats_text, |d, s| d.child(div().text_color(dim).child("·")).child(div().text_color(dim).child(s)))
             .child(div().flex_1())
-            .child("type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S")
+            .child(if self.active_is_sheet() { "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save" } else { "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S" })
             // Zoom controls (Word's bottom-right zoom).
             .child(zoom_btn(cx, "zoom-out", "\u{2212}", -0.1))
             .child(div().id("zoom-pct").min_w(px(34.)).flex().justify_center().cursor_pointer().hover(|d| d.text_color(fg)).child(SharedString::from(format!("{}%", (self.zoom * 100.0).round() as i32))).on_click(cx.listener(|this, _, window, cx| { this.zoom = 1.0; this.refocus(window, cx); })))
@@ -4726,6 +5068,172 @@ impl Render for Docxy {
             })
             .into_any_element()
     }
+}
+
+/// Excel column width (character units) → pixels, clamped to a sane range.
+fn col_px(units: f64) -> f32 {
+    ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// Render a spreadsheet tab: a formula/reference bar, the scrollable cell grid
+/// (headers, gridlines, styled cells, selection), and the sheet tabs.
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
+    use gridcore::sheet::{col_name, cell_name, Align, CellValue};
+    let sh = view.sheet();
+    let styles = &view.pkg.workbook.styles;
+    let d1904 = view.pkg.workbook.date1904;
+    let (sr, sc) = view.sel;
+    let (max_r, max_c) = view.extent();
+    let rows = (max_r + 6).min(160);
+    let cols = (max_c + 2).min(30);
+
+    const ROW_H: f32 = 21.0;
+    const GUT: f32 = 46.0;
+    let gridline = hsla_u(0xd9d9d9);
+    let head_bg = hsla_u(0xf1f1f1);
+    let head_fg = hsla_u(0x5a5a5a);
+    let brand = hsla_u(BRAND);
+
+    let editing = view.editing.clone();
+    // ---- formula / reference bar ----
+    let sel_ref = cell_name(sr, sc);
+    let sel_content = if let Some(buf) = &editing {
+        buf.clone()
+    } else {
+        match sh.cell(sr, sc) {
+            Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or_default()),
+            _ => view.cell_text(sr, sc),
+        }
+    };
+    let bar = h_flex()
+        .w_full()
+        .h(px(26.))
+        .items_center()
+        .gap_2()
+        .px_2()
+        .bg(hsla_u(0xfafafa))
+        .border_b_1()
+        .border_color(gridline)
+        .child(div().min_w(px(64.)).px_2().py(px(2.)).rounded_sm().bg(hsla_u(0xffffff)).border_1().border_color(gridline).text_size(px(12.)).text_color(hsla_u(0x333333)).child(SharedString::from(sel_ref)))
+        .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
+        .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
+
+    // ---- header row (corner + column letters) ----
+    let mut header = h_flex().child(div().w(px(GUT)).h(px(ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
+    for c in 0..=cols {
+        let hl = c == sc;
+        header = header.child(
+            div().w(px(col_px(sh.col_width(c)))).h(px(ROW_H)).flex().items_center().justify_center()
+                .bg(if hl { brand } else { head_bg })
+                .border_r_1().border_b_1().border_color(gridline)
+                .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
+                .child(SharedString::from(col_name(c))),
+        );
+    }
+
+    // ---- data rows ----
+    let mut grid = v_flex().child(header);
+    for r in 0..=rows {
+        let hl_row = r == sr;
+        let mut row = h_flex().child(
+            div().w(px(GUT)).h(px(ROW_H)).flex().items_center().justify_center()
+                .bg(if hl_row { brand } else { head_bg })
+                .border_r_1().border_b_1().border_color(gridline)
+                .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
+                .child(SharedString::from((r + 1).to_string())),
+        );
+        for c in 0..=cols {
+            let selected = (r, c) == (sr, sc);
+            let cell_editing = selected && editing.is_some();
+            let (text, xf, is_num) = match sh.cell(r, c) {
+                Some(cl) if !cl.is_blank() => {
+                    let xf = styles.xf(cl.style);
+                    (gridcore::sheet::format_with(&xf, &cl.value, d1904), Some(xf), matches!(cl.value, CellValue::Number(_)))
+                }
+                _ => (String::new(), None, false),
+            };
+            let halign = match xf.as_ref().map(|x| x.align).unwrap_or(Align::General) {
+                Align::Left => 0,
+                Align::Center => 1,
+                Align::Right => 2,
+                Align::General => if is_num { 2 } else { 0 },
+            };
+            let fill = xf.as_ref().and_then(|x| x.fill);
+            let color = xf.as_ref().and_then(|x| x.color).map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
+            let bold = xf.as_ref().is_some_and(|x| x.bold);
+            let italic = xf.as_ref().is_some_and(|x| x.italic);
+            let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
+            let mut cell = div()
+                .w(px(col_px(sh.col_width(c))))
+                .h(px(ROW_H))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .bg(if cell_editing { hsla_u(0xffffff) } else { bg })
+                .border_r_1()
+                .border_b_1()
+                .border_color(gridline)
+                .when(selected, |d| d.border_2().border_color(brand));
+            if cell_editing {
+                // In-cell editor: left-aligned buffer with a caret bar.
+                cell = cell
+                    .justify_start()
+                    .child(div().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(editing.clone().unwrap_or_default())))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(brand));
+            } else {
+                cell = match halign {
+                    1 => cell.justify_center(),
+                    2 => cell.justify_end(),
+                    _ => cell.justify_start(),
+                };
+                if !text.is_empty() {
+                    cell = cell.child(
+                        div().text_size(px(12.)).text_color(color).when(bold, |d| d.font_weight(FontWeight::BOLD)).when(italic, |d| d.italic()).child(SharedString::from(text)),
+                    );
+                }
+            }
+            let ent2 = ent.clone();
+            cell = cell.on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                ent2.update(cx, |this, cx| this.select_cell(r, c, cx));
+            });
+            row = row.child(cell);
+        }
+        grid = grid.child(row);
+    }
+
+    // ---- sheet tabs (bottom) ----
+    let mut tabs = h_flex().w_full().h(px(26.)).items_center().gap(px(1.)).px_2().bg(hsla_u(0xf1f1f1)).border_t_1().border_color(gridline);
+    for (i, s) in view.pkg.workbook.sheets.iter().enumerate() {
+        let active = i == view.active;
+        let ent2 = ent.clone();
+        tabs = tabs.child(
+            div().px_3().h(px(20.)).flex().items_center().rounded_t(px(4.)).cursor_pointer().text_size(px(12.))
+                .bg(if active { hsla_u(0xffffff) } else { hsla_u(0xe4e4e4) })
+                .text_color(if active { hsla_u(0x1a1a1a) } else { hsla_u(0x666666) })
+                .child(SharedString::from(s.name.clone()))
+                .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                    ent2.update(cx, |this, cx| this.select_sheet(i, cx));
+                }),
+        );
+    }
+
+    v_flex()
+        .flex_1()
+        .min_h(px(0.))
+        .bg(hsla_u(0xffffff))
+        .child(bar)
+        .child(
+            div()
+                .id("sheet-grid")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_scroll()
+                .track_scroll(&view.grid_scroll)
+                .child(grid),
+        )
+        .child(tabs)
+        .into_any_element()
 }
 
 fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
