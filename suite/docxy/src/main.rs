@@ -231,6 +231,7 @@ enum SheetAct {
     Percent,
     Currency,
     Comma,
+    InsertPivot,
     Todo,
 }
 
@@ -1170,6 +1171,100 @@ impl Docxy {
         self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
     }
 
+    /// Insert a PivotTable summarizing the selected range (or the used range) onto
+    /// a fresh sheet: group by the first text column and Sum every numeric column,
+    /// with a grand-total row — computed by gridcore's pivot engine.
+    fn sheet_insert_pivot(&mut self, cx: &mut Context<Self>) {
+        use gridcore::frame::{pivot, pivot_spec_from_names, pivot_table_strings, Agg, Frame};
+        use gridcore::sheet::{Cell, CellValue, Sheet};
+        self.sheet_snapshot();
+        // 1) Build the pivot from the current selection (read-only phase).
+        let mut built: Option<(Vec<Vec<String>>, usize, usize)> = None;
+        let mut err: Option<String> = None;
+        if let Some(v) = self.active_sheet() {
+            let s = v.active;
+            let (r0, c0, r1, c1) = if v.has_range() {
+                v.range()
+            } else {
+                let (mr, mc) = v.extent();
+                (0, 0, mr, mc)
+            };
+            let sh = v.sheet();
+            // Classify each column over the data rows: numeric → Sum measure,
+            // otherwise a candidate row (group-by) field.
+            let mut numeric: Vec<u32> = Vec::new();
+            let mut text: Vec<u32> = Vec::new();
+            for c in c0..=c1 {
+                let (mut nums, mut txts) = (0u32, 0u32);
+                for r in (r0 + 1)..=r1 {
+                    match sh.cell(r, c).map(|cl| &cl.value) {
+                        Some(CellValue::Number(_)) => nums += 1,
+                        Some(CellValue::Text(_)) => txts += 1,
+                        _ => {}
+                    }
+                }
+                if nums > 0 && nums >= txts {
+                    numeric.push(c);
+                } else {
+                    text.push(c);
+                }
+            }
+            let row_col = text.first().copied().unwrap_or(c0);
+            let frame = Frame::from_range(&v.pkg.workbook, s, (r0, c0, r1, c1));
+            let name_of = |c: u32| frame.names.get((c - c0) as usize).cloned().unwrap_or_default();
+            let rowname = name_of(row_col);
+            let values: Vec<(String, Agg)> = if numeric.is_empty() {
+                vec![(rowname.clone(), Agg::Count)]
+            } else {
+                numeric.iter().map(|&c| (name_of(c), Agg::Sum)).collect()
+            };
+            match pivot_spec_from_names(&frame, std::slice::from_ref(&rowname), &[], &values) {
+                Ok(mut spec) => {
+                    spec.grand_rows = true;
+                    let out = pivot(&frame, &spec);
+                    built = Some((pivot_table_strings(&out), out.header_rows, out.label_cols));
+                }
+                Err(e) => err = Some(format!("PivotTable: no field named {e:?}")),
+            }
+        }
+        // 2) Write the computed pivot onto a new sheet and switch to it.
+        if let Some((strings, header_rows, label_cols)) = built {
+            if let Some(v) = self.active_sheet_mut() {
+                let n = v.pkg.workbook.sheets.iter().filter(|s| s.name.starts_with("Pivot")).count();
+                let name = if n == 0 { "Pivot".to_string() } else { format!("Pivot{}", n + 1) };
+                let mut sheet = Sheet { name, ..Default::default() };
+                for (ri, row) in strings.iter().enumerate() {
+                    for (ci, sv) in row.iter().enumerate() {
+                        if sv.is_empty() {
+                            continue;
+                        }
+                        // Body aggregates as numbers (right-aligned, reusable);
+                        // headers and row labels as text.
+                        let body = ri >= header_rows && ci >= label_cols;
+                        let cell = match (body, sv.parse::<f64>()) {
+                            (true, Ok(nf)) => Cell::number(nf),
+                            _ => Cell::text(sv),
+                        };
+                        sheet.set_cell(ri as u32, ci as u32, cell);
+                    }
+                }
+                v.pkg.workbook.sheets.push(sheet);
+                v.active = v.pkg.workbook.sheets.len() - 1;
+                v.sel = (0, 0);
+                v.anchor = (0, 0);
+                v.editing = None;
+                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            }
+            self.mark_sheet_dirty();
+        }
+        if let Some(e) = err {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.status = e.into();
+            }
+        }
+        cx.notify();
+    }
+
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
@@ -1187,6 +1282,7 @@ impl Docxy {
             SheetAct::Percent => self.sheet_numfmt("0.00%", cx),
             SheetAct::Currency => self.sheet_numfmt("$#,##0.00", cx),
             SheetAct::Comma => self.sheet_numfmt("#,##0.00", cx),
+            SheetAct::InsertPivot => self.sheet_insert_pivot(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -4661,9 +4757,51 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The spreadsheet ribbon body, laid out like Excel's Home tab: Clipboard,
-    /// Font, Alignment, Number, Styles, Cells, Editing.
+    /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        match self.ribbon_tab {
+            RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
+            _ => self.sheet_home_ribbon(pal, cx),
+        }
+    }
+
+    /// The Insert tab: a Tables group (PivotTable, Table) like Excel.
+    fn sheet_insert_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let group = |title: &str, body: AnyElement| -> AnyElement {
+            v_flex()
+                .h(px(94.))
+                .px_1p5()
+                .py(px(3.))
+                .justify_between()
+                .border_r_1()
+                .border_color(pal.border)
+                .child(div().flex_1().flex().items_center().child(body))
+                .child(div().w_full().text_size(px(10.)).text_color(pal.dim).text_center().child(title.to_string()))
+                .into_any_element()
+        };
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .child(group("Tables", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(Some("table"), "PivotTable", SheetAct::InsertPivot, pal, cx))
+                .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            .child(group("Charts", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, "Chart", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            .into_any_element()
+    }
+
+    /// The spreadsheet Home tab, laid out like Excel: Clipboard, Font, Alignment,
+    /// Number, Styles, Cells, Editing.
+    fn sheet_home_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let xf = self.active_xf();
         // A group frame: content on top, a centered label (+ optional dialog
         // launcher) at the bottom, and a right divider — exactly like the doc ribbon.
