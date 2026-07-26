@@ -1239,6 +1239,118 @@ impl Docxy {
         cx.notify();
     }
 
+    // ---- find & replace (sheet) -------------------------------------------
+
+    /// Route a keystroke to the open find bar (query / replace fields).
+    fn sheet_find_key(&mut self, ev: &KeyDownEvent, shift: bool, key: &str, cx: &mut Context<Self>) {
+        match key {
+            "escape" => self.find_open = false,
+            "enter" => return self.sheet_find_next(shift, cx),
+            "backspace" => match self.find_field {
+                FindField::Query => {
+                    self.find_query.pop();
+                }
+                FindField::Replace => {
+                    self.replace_text.pop();
+                }
+            },
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        match self.find_field {
+                            FindField::Query => self.find_query.push_str(c),
+                            FindField::Replace => self.replace_text.push_str(c),
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Select the next (or previous) cell whose display text contains the query,
+    /// wrapping around, scanning row-major from the current selection.
+    fn sheet_find_next(&mut self, back: bool, cx: &mut Context<Self>) {
+        let q = self.find_query.to_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        if let Some(v) = self.active_sheet_mut() {
+            let (mr, mc) = v.extent();
+            let ncols = mc as i64 + 1;
+            let total = (mr as i64 + 1) * ncols;
+            let (sr, sc) = v.sel;
+            let start = sr as i64 * ncols + sc as i64;
+            for step in 1..=total {
+                let idx = if back { (start - step).rem_euclid(total) } else { (start + step).rem_euclid(total) };
+                let r = (idx / ncols) as u32;
+                let c = (idx % ncols) as u32;
+                let t = v.cell_text(r, c).to_lowercase();
+                if !t.is_empty() && t.contains(&q) {
+                    v.sel = (r, c);
+                    v.anchor = (r, c);
+                    v.vscroll.scroll_to_item(r as usize, ScrollStrategy::Center);
+                    break;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Replace the query in the current cell (if it matches), then move to the next.
+    fn sheet_replace(&mut self, cx: &mut Context<Self>) {
+        let q = self.find_query.clone();
+        let rep = self.replace_text.clone();
+        if q.is_empty() {
+            return;
+        }
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            let text = v.cell_text(r, c);
+            if text.to_lowercase().contains(&q.to_lowercase()) {
+                let new = ci_replace(&text, &q, &rep);
+                let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+                v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), parse_cell_input(&new, style));
+            }
+        }
+        self.mark_sheet_dirty();
+        self.sheet_find_next(false, cx);
+    }
+
+    /// Replace the query in every matching cell of the sheet.
+    fn sheet_replace_all(&mut self, cx: &mut Context<Self>) {
+        let q = self.find_query.clone();
+        let rep = self.replace_text.clone();
+        if q.is_empty() {
+            return;
+        }
+        self.sheet_snapshot();
+        let mut n = 0u32;
+        if let Some(v) = self.active_sheet_mut() {
+            let (mr, mc) = v.extent();
+            let s = v.active;
+            let ql = q.to_lowercase();
+            for r in 0..=mr {
+                for c in 0..=mc {
+                    let text = v.cell_text(r, c);
+                    if !text.is_empty() && text.to_lowercase().contains(&ql) {
+                        let new = ci_replace(&text, &q, &rep);
+                        let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+                        v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), parse_cell_input(&new, style));
+                        n += 1;
+                    }
+                }
+            }
+        }
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status = format!("replaced {n}").into();
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Insert a PivotTable for the selected range (or the used range): a fresh
     /// output sheet plus a live `PivotDef` (first text column → Rows, each numeric
     /// column → Sum Values) that the field panel can then re-place.
@@ -1502,10 +1614,24 @@ impl Docxy {
     /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
     /// active surface is a sheet).
     fn sheet_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
+        if self.find_open && !(ctrl && matches!(key, "s")) {
+            if ctrl && key == "f" {
+                self.find_open = false;
+                cx.notify();
+                return;
+            }
+            return self.sheet_find_key(ev, shift, key, cx);
+        }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         if ctrl {
             match key {
                 "s" => self.save_active(window, cx),
+                "f" => {
+                    self.find_open = true;
+                    self.find_field = FindField::Query;
+                    cx.notify();
+                }
                 "c" => self.sheet_copy(false, cx),
                 "x" => self.sheet_copy(true, cx),
                 "v" => self.sheet_paste(cx),
@@ -3264,7 +3390,17 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
+        // While the find bar is open, Tab switches between the query and replace
+        // fields.
+        if self.find_open {
+            self.find_field = match self.find_field {
+                FindField::Query => FindField::Replace,
+                FindField::Replace => FindField::Query,
+            };
+            cx.notify();
+            return;
+        }
+        if self.keytips != KeyTip::Off || self.comment_open || self.backstage {
             return;
         }
         self.mini_bar = None;
@@ -3438,6 +3574,28 @@ impl Docxy {
 /// Parse a cell's edit buffer into a `Cell`, Excel-style: `=…` is a formula, a
 /// bare number is numeric, TRUE/FALSE is boolean, anything else is text. The
 /// existing style index is carried over so formatting survives the edit.
+/// Case-insensitive replace of every `needle` in `hay` with `rep` (ASCII-fold;
+/// byte offsets from the lowercased copy line up for the ASCII case).
+fn ci_replace(hay: &str, needle: &str, rep: &str) -> String {
+    if needle.is_empty() {
+        return hay.to_string();
+    }
+    let (hl, nl) = (hay.to_lowercase(), needle.to_lowercase());
+    if hl.len() != hay.len() {
+        // Non-ASCII fold changed lengths — fall back to a plain contains check.
+        return if hl.contains(&nl) { hay.replace(needle, rep) } else { hay.to_string() };
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(p) = hl[i..].find(&nl) {
+        out.push_str(&hay[i..i + p]);
+        out.push_str(rep);
+        i += p + needle.len();
+    }
+    out.push_str(&hay[i..]);
+    out
+}
+
 fn parse_cell_input(raw: &str, style: u32) -> gridcore::sheet::Cell {
     use gridcore::sheet::{Cell, CellValue};
     let t = raw.trim();
@@ -5006,6 +5164,57 @@ impl Docxy {
         row.into_any_element()
     }
 
+    /// The sheet Find & Replace bar (Ctrl+F): query + prev/next, replace + all.
+    fn sheet_find_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let qf = self.find_field == FindField::Query;
+        let rf = self.find_field == FindField::Replace;
+        let field = |id: &'static str, val: &str, focused: bool, ph: &'static str| {
+            let empty = val.is_empty();
+            div()
+                .id(id)
+                .flex().items_center().min_w(px(150.)).h(px(24.)).px_2()
+                .rounded(px(3.))
+                .border_1().border_color(if focused { hsla_u(BRAND) } else { pal.border })
+                .bg(hsla_u(0xffffff))
+                .cursor_text()
+                .text_size(px(12.)).text_color(if empty { hsla_u(0x999999) } else { hsla_u(0x1a1a1a) })
+                .child(SharedString::from(if empty { ph.to_string() } else { val.to_string() }))
+                .when(focused, |d| d.child(div().w(px(1.)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))))
+        };
+        let btn = |id: &'static str, label: SharedString| {
+            div().id(id).px_2().h(px(24.)).flex().items_center().justify_center().min_w(px(24.)).rounded(px(3.)).cursor_pointer().text_size(px(12.)).text_color(pal.fg).border_1().border_color(pal.border).hover(|d| d.bg(pal.hover)).child(label)
+        };
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(46.)).child("Find"))
+            .child(field("sf-q", &self.find_query, qf, "Find in sheet").on_click(cx.listener(|this, _, _, cx| {
+                this.find_field = FindField::Query;
+                cx.notify();
+            })))
+            .child(btn("sf-prev", "\u{25C0}".into()).on_click(cx.listener(|this, _, _, cx| this.sheet_find_next(true, cx))))
+            .child(btn("sf-next", "\u{25B6}".into()).on_click(cx.listener(|this, _, _, cx| this.sheet_find_next(false, cx))))
+            .child(div().text_size(px(11.)).text_color(pal.dim).child("Replace"))
+            .child(field("sf-r", &self.replace_text, rf, "Replace with").on_click(cx.listener(|this, _, _, cx| {
+                this.find_field = FindField::Replace;
+                cx.notify();
+            })))
+            .child(btn("sf-rep", "Replace".into()).on_click(cx.listener(|this, _, _, cx| this.sheet_replace(cx))))
+            .child(btn("sf-all", "All".into()).on_click(cx.listener(|this, _, _, cx| this.sheet_replace_all(cx))))
+            .child(div().flex_1())
+            .child(btn("sf-close", "\u{2715}".into()).on_click(cx.listener(|this, _, _, cx| {
+                this.find_open = false;
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
     /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         match self.ribbon_tab {
@@ -5736,6 +5945,7 @@ impl Render for Docxy {
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let sheet_pick_bar = self.active_is_sheet().then_some(self.sheet_pick).flatten().map(|p| self.sheet_picker_bar(p, pal, cx));
+        let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -6041,6 +6251,7 @@ impl Render for Docxy {
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(sheet_pick_bar, |d, p| d.child(p))
+            .when_some(sheet_find, |d, f| d.child(f))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
