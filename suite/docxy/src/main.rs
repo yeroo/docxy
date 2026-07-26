@@ -4624,18 +4624,23 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A large icon-over-label Home button (Paste, Styles, Cells, Editing).
+    /// A large icon-over-label Home button (Paste, Styles, Cells, Editing). The
+    /// label wraps at a word boundary (never mid-word) and the button sizes to it.
     fn sheet_lb(&self, icon: Option<&'static str>, label: &'static str, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let mut lines = v_flex().items_center();
+        for ln in label_lines(label) {
+            lines = lines.child(div().text_size(px(10.)).text_color(pal.fg).child(SharedString::from(ln)));
+        }
         div()
             .id(ElementId::Name(format!("slb-{label}").into()))
             .flex().flex_col().items_center().justify_center().gap_0p5()
-            .w(px(54.)).h_full().px_1()
+            .min_w(px(40.)).h_full().px_1p5()
             .rounded(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
-            .child(div().text_size(px(10.)).text_color(pal.fg).text_center().child(label))
+            .child(lines)
             .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
@@ -4953,6 +4958,11 @@ impl Docxy {
         let on = self.act_active(act);
         let tip: SharedString = cmd.label.into();
         let keytip = (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
+        // Wrap a multi-word label at a word boundary rather than breaking mid-word.
+        let mut label = v_flex().items_center();
+        for ln in label_lines(cmd.label) {
+            label = label.child(div().text_size(px(11.)).text_color(pal.fg).child(SharedString::from(ln)));
+        }
         div()
             .id(cmd.id)
             .relative()
@@ -4969,7 +4979,7 @@ impl Docxy {
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(icon_svg(cmd.icon.0, 26., pal.fg))
-            .child(div().text_size(px(11.)).text_color(pal.fg).child(SharedString::from(cmd.label)))
+            .child(label)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
@@ -5625,6 +5635,25 @@ impl Render for Docxy {
 /// Excel column width (character units) → pixels, clamped to a sane range.
 fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
+}
+
+/// Split a ribbon button label into at most two lines at a word boundary, so a
+/// large button wraps like Word/Excel ("Conditional" / "Formatting") instead of
+/// breaking mid-word. Short or single-word labels stay on one line.
+fn label_lines(label: &str) -> Vec<String> {
+    if label.len() <= 9 || !label.contains(' ') {
+        return vec![label.to_string()];
+    }
+    let mid = label.len() as isize / 2;
+    let split = label
+        .char_indices()
+        .filter(|(_, c)| *c == ' ')
+        .min_by_key(|(i, _)| (*i as isize - mid).abs())
+        .map(|(i, _)| i);
+    match split {
+        Some(i) => vec![label[..i].to_string(), label[i + 1..].to_string()],
+        None => vec![label.to_string()],
+    }
 }
 
 const SHEET_ROW_H: f32 = 21.0;
