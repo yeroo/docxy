@@ -168,15 +168,47 @@ enum Surface {
 struct SheetView {
     pkg: gridcore::xlsx::SheetPackage,
     active: usize,
-    /// Selected cell, 0-based (row, col).
+    /// Selected cell — the range's active corner (typing lands here), 0-based
+    /// (row, col).
     sel: (u32, u32),
+    /// The other corner of the selection range; equals `sel` when a single cell
+    /// is selected. `range()` normalizes the two into (r0,c0,r1,c1).
+    anchor: (u32, u32),
     /// When `Some`, the selected cell is being edited and this is the in-progress
     /// input buffer (a leading `=` marks a formula).
     editing: Option<String>,
     /// The recalc engine, indexed over the workbook's formulas, so an edit
     /// re-evaluates only the affected cells.
     engine: gridcore::engine::Engine,
+    /// Undo / redo stacks of workbook snapshots (with the selection at the time).
+    undo: Vec<SheetSnapshot>,
+    redo: Vec<SheetSnapshot>,
+    /// An in-progress column-resize drag (the header border being dragged).
+    col_drag: Option<ColDrag>,
     grid_scroll: ScrollHandle,
+}
+
+/// A point-in-time snapshot of a spreadsheet for undo/redo.
+struct SheetSnapshot {
+    wb: gridcore::sheet::Workbook,
+    active: usize,
+    sel: (u32, u32),
+    anchor: (u32, u32),
+}
+
+/// An in-progress column-resize drag: which column, and the mouse-x + width it
+/// started at (character units).
+#[derive(Clone, Copy)]
+struct ColDrag {
+    col: u32,
+    start_x: f32,
+    start_w: f64,
+}
+
+/// The grid clipboard: a rectangular block of cells copied from a sheet.
+#[derive(Clone)]
+struct GridClip {
+    cells: Vec<Vec<gridcore::sheet::Cell>>,
 }
 
 impl SheetView {
@@ -210,6 +242,25 @@ impl SheetView {
             }
             _ => String::new(),
         }
+    }
+    /// Restore this view from an undo/redo snapshot, rebuilding the recalc engine.
+    fn restore(&mut self, snap: SheetSnapshot) {
+        self.pkg.workbook = snap.wb;
+        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        self.active = snap.active.min(self.pkg.workbook.sheets.len().saturating_sub(1));
+        self.sel = snap.sel;
+        self.anchor = snap.anchor;
+        self.editing = None;
+    }
+    /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
+    fn range(&self) -> (u32, u32, u32, u32) {
+        let (ar, ac) = self.sel;
+        let (br, bc) = self.anchor;
+        (ar.min(br), ac.min(bc), ar.max(br), ac.max(bc))
+    }
+    /// Whether more than one cell is selected.
+    fn has_range(&self) -> bool {
+        self.sel != self.anchor
     }
     /// The used extent (max row, max col) over the active sheet's cells + merges.
     fn extent(&self) -> (u32, u32) {
@@ -320,6 +371,9 @@ struct Docxy {
     // While a ruler marker is being dragged, the screen x of a vertical guide
     // line drawn down the page (Word's drag guide). None when not dragging.
     ruler_guide: Option<f32>,
+    // The spreadsheet clipboard: a rectangular block of cells from the last grid
+    // copy/cut, pasted at the selection on Ctrl+V.
+    grid_clip: Option<GridClip>,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -527,7 +581,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), editing: None, engine, grid_scroll: ScrollHandle::new() };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, grid_scroll: ScrollHandle::new() };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -682,6 +736,7 @@ impl Docxy {
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
+            grid_clip: None,
         }
     }
 
@@ -748,11 +803,24 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    /// Move the spreadsheet selection to a cell (from a grid click), committing
-    /// any in-progress edit first.
+    /// Move the spreadsheet selection to a cell (from a grid click), collapsing
+    /// the range and committing any in-progress edit first.
     fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
+        }
+        if let Some(v) = self.active_sheet_mut() {
+            v.sel = (row, col);
+            v.anchor = (row, col);
+            v.editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Extend the selection to a cell (Shift+click), keeping the anchor.
+    fn extend_to(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx);
         }
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
@@ -766,6 +834,7 @@ impl Docxy {
         if let Some(Surface::Sheet(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.active = idx.min(v.pkg.workbook.sheets.len().saturating_sub(1));
             v.sel = (0, 0);
+            v.anchor = (0, 0);
             v.editing = None;
             cx.notify();
         }
@@ -804,10 +873,55 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Push a workbook snapshot onto the undo stack (clearing redo). Called before
+    /// each mutating grid operation.
+    fn sheet_snapshot(&mut self) {
+        if let Some(v) = self.active_sheet_mut() {
+            v.undo.push(SheetSnapshot { wb: v.pkg.workbook.clone(), active: v.active, sel: v.sel, anchor: v.anchor });
+            if v.undo.len() > 100 {
+                v.undo.remove(0);
+            }
+            v.redo.clear();
+        }
+    }
+
+    fn sheet_undo(&mut self, cx: &mut Context<Self>) {
+        let mut done = false;
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(snap) = v.undo.pop() {
+                v.redo.push(SheetSnapshot { wb: v.pkg.workbook.clone(), active: v.active, sel: v.sel, anchor: v.anchor });
+                v.restore(snap);
+                done = true;
+            }
+        }
+        if done {
+            self.mark_sheet_dirty();
+        }
+        cx.notify();
+    }
+
+    fn sheet_redo(&mut self, cx: &mut Context<Self>) {
+        let mut done = false;
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(snap) = v.redo.pop() {
+                v.undo.push(SheetSnapshot { wb: v.pkg.workbook.clone(), active: v.active, sel: v.sel, anchor: v.anchor });
+                v.restore(snap);
+                done = true;
+            }
+        }
+        if done {
+            self.mark_sheet_dirty();
+        }
+        cx.notify();
+    }
+
     /// Commit the in-progress edit (if any) into the workbook, recalc, and move
     /// the selection by (dr, dc).
     fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
-        let mut committed = false;
+        let has_edit = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        if has_edit {
+            self.sheet_snapshot();
+        }
         if let Some(v) = self.active_sheet_mut() {
             if let Some(buf) = v.editing.take() {
                 let (r, c) = v.sel;
@@ -815,18 +929,31 @@ impl Docxy {
                 let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
                 let cell = parse_cell_input(&buf, style);
                 v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
-                committed = true;
             }
         }
-        if committed {
+        if has_edit {
             self.mark_sheet_dirty();
         }
         self.sheet_move(dr, dc, cx);
     }
 
-    /// Move the selection by (dr, dc), clamped at the top-left origin, discarding
-    /// any in-progress edit.
+    /// Move the selection by (dr, dc), clamped at the top-left origin, collapsing
+    /// the range and discarding any in-progress edit.
     fn sheet_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+            v.anchor = v.sel;
+            v.editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Extend the selection by (dr, dc), keeping the anchor (Shift+arrow).
+    fn sheet_extend(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
+        if editing {
+            self.sheet_commit(0, 0, cx);
+        }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
@@ -843,38 +970,154 @@ impl Docxy {
         self.sheet_move(dr, dc, cx);
     }
 
-    /// Clear the selected cell's content (Delete / Backspace), keeping its style.
+    /// Clear the whole selected range's content (Delete / Backspace), keeping
+    /// each cell's style.
     fn sheet_clear(&mut self, cx: &mut Context<Self>) {
-        let mut cleared = false;
+        self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
+            let (r0, c0, r1, c1) = v.range();
             let s = v.active;
-            let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
-            let cell = gridcore::sheet::Cell { style, ..Default::default() };
-            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
-            cleared = true;
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+                    v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), gridcore::sheet::Cell { style, ..Default::default() });
+                }
+            }
         }
-        if cleared {
-            self.mark_sheet_dirty();
-        }
+        self.mark_sheet_dirty();
         cx.notify();
+    }
+
+    /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
+    /// system clipboard.
+    fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(v) = self.active_sheet() else { return };
+        let (r0, c0, r1, c1) = v.range();
+        let mut cells = Vec::new();
+        let mut tsv = String::new();
+        for r in r0..=r1 {
+            let mut row = Vec::new();
+            for c in c0..=c1 {
+                if c > c0 {
+                    tsv.push('\t');
+                }
+                tsv.push_str(&v.cell_text(r, c));
+                row.push(v.sheet().cell(r, c).cloned().unwrap_or_default());
+            }
+            cells.push(row);
+            tsv.push('\n');
+        }
+        self.grid_clip = Some(GridClip { cells });
+        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        if cut {
+            self.sheet_clear(cx); // snapshots, clears the range, marks dirty
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Paste at the selection: the grid clipboard when present (full-fidelity
+    /// cells), else the system clipboard parsed as TSV.
+    fn sheet_paste(&mut self, cx: &mut Context<Self>) {
+        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = &self.grid_clip {
+            clip.cells.clone()
+        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            text.replace("\r\n", "\n")
+                .trim_end_matches('\n')
+                .split('\n')
+                .map(|line| line.split('\t').map(|f| parse_cell_input(f, 0)).collect())
+                .collect()
+        } else {
+            return;
+        };
+        if block.is_empty() {
+            return;
+        }
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let (br, bc) = v.sel;
+            let s = v.active;
+            for (dr, row) in block.iter().enumerate() {
+                for (dc, cell) in row.iter().enumerate() {
+                    v.engine.set_cell(&mut v.pkg.workbook, (s, br + dr as u32, bc + dc as u32), cell.clone());
+                }
+            }
+            let h = block.len() as u32;
+            let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+            if h > 0 && w > 0 {
+                v.anchor = (br + h - 1, bc + w - 1);
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    // ---- column resize -----------------------------------------------------
+
+    fn col_resize_start(&mut self, col: u32, x: f32, _cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let w = v.sheet().col_width(col);
+            v.col_drag = Some(ColDrag { col, start_x: x, start_w: w });
+        }
+    }
+    fn col_resize_move(&mut self, x: f32, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let Some(v) = self.active_sheet_mut() {
+            if let Some(d) = v.col_drag {
+                // px → character units, inverting col_px: units = (px - 6) / 7.
+                let new_px = (col_px(d.start_w) + (x - d.start_x)).max(20.0);
+                let new_units = (((new_px - 6.0) / 7.0) as f64).max(0.5);
+                let s = v.active;
+                v.pkg.workbook.sheets[s].set_col_width(d.col, new_units);
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_sheet_dirty();
+            cx.notify();
+        }
+    }
+    fn col_resize_end(&mut self, cx: &mut Context<Self>) {
+        let mut was = false;
+        if let Some(v) = self.active_sheet_mut() {
+            was = v.col_drag.take().is_some();
+        }
+        if was {
+            cx.notify();
+        }
     }
 
     /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
     /// active surface is a sheet).
     fn sheet_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         if ctrl {
             match key {
                 "s" => self.save_active(window, cx),
+                "c" => self.sheet_copy(false, cx),
+                "x" => self.sheet_copy(true, cx),
+                "v" => self.sheet_paste(cx),
+                "z" => self.sheet_undo(cx),
+                "y" => self.sheet_redo(cx),
+                "a" => {
+                    // Select the whole used range.
+                    if let Some(v) = self.active_sheet_mut() {
+                        let (mr, mc) = v.extent();
+                        v.sel = (0, 0);
+                        v.anchor = (mr, mc);
+                        v.editing = None;
+                    }
+                    cx.notify();
+                }
                 "f1" => {
                     self.ribbon_min = !self.ribbon_min;
                     cx.notify();
                 }
                 _ => {}
             }
-            return; // other ctrl combos aren't wired for the grid yet
+            return;
         }
-        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         match key {
             "escape" => {
                 if let Some(v) = self.active_sheet_mut() {
@@ -901,6 +1144,10 @@ impl Docxy {
                     self.sheet_clear(cx);
                 }
             }
+            "left" if shift => self.sheet_extend(0, -1, editing, cx),
+            "right" if shift => self.sheet_extend(0, 1, editing, cx),
+            "up" if shift => self.sheet_extend(-1, 0, editing, cx),
+            "down" if shift => self.sheet_extend(1, 0, editing, cx),
             "left" => self.sheet_nav(0, -1, editing, cx),
             "right" => self.sheet_nav(0, 1, editing, cx),
             "up" => self.sheet_nav(-1, 0, editing, cx),
@@ -5093,10 +5340,16 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
+    let (r0, c0, r1, c1) = view.range();
+    let range_tint = Hsla { a: 0.14, ..brand };
 
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
-    let sel_ref = cell_name(sr, sc);
+    let sel_ref = if view.has_range() {
+        format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+    } else {
+        cell_name(sr, sc)
+    };
     let sel_content = if let Some(buf) = &editing {
         buf.clone()
     } else {
@@ -5118,23 +5371,36 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
         .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
 
-    // ---- header row (corner + column letters) ----
+    // ---- header row (corner + column letters, with drag-to-resize handles) ----
     let mut header = h_flex().child(div().w(px(GUT)).h(px(ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
     for c in 0..=cols {
-        let hl = c == sc;
+        let hl = c >= c0 && c <= c1;
+        let ent_h = ent.clone();
+        let handle = div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(5.))
+            .h(px(ROW_H))
+            .cursor_col_resize()
+            .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+                let x = f32::from(ev.position.x);
+                ent_h.update(cx, |this, cx| this.col_resize_start(c, x, cx));
+            });
         header = header.child(
-            div().w(px(col_px(sh.col_width(c)))).h(px(ROW_H)).flex().items_center().justify_center()
+            div().relative().w(px(col_px(sh.col_width(c)))).h(px(ROW_H)).flex().items_center().justify_center()
                 .bg(if hl { brand } else { head_bg })
                 .border_r_1().border_b_1().border_color(gridline)
                 .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
-                .child(SharedString::from(col_name(c))),
+                .child(SharedString::from(col_name(c)))
+                .child(handle),
         );
     }
 
     // ---- data rows ----
     let mut grid = v_flex().child(header);
     for r in 0..=rows {
-        let hl_row = r == sr;
+        let hl_row = r >= r0 && r <= r1;
         let mut row = h_flex().child(
             div().w(px(GUT)).h(px(ROW_H)).flex().items_center().justify_center()
                 .bg(if hl_row { brand } else { head_bg })
@@ -5144,6 +5410,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
         );
         for c in 0..=cols {
             let selected = (r, c) == (sr, sc);
+            let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
             let cell_editing = selected && editing.is_some();
             let (text, xf, is_num) = match sh.cell(r, c) {
                 Some(cl) if !cl.is_blank() => {
@@ -5174,6 +5441,8 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
                 .border_r_1()
                 .border_b_1()
                 .border_color(gridline)
+                // Range fill on the non-active cells of a multi-cell selection.
+                .when(in_range && !selected, |d| d.bg(range_tint))
                 .when(selected, |d| d.border_2().border_color(brand));
             if cell_editing {
                 // In-cell editor: left-aligned buffer with a caret bar.
@@ -5194,8 +5463,15 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
                 }
             }
             let ent2 = ent.clone();
-            cell = cell.on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
-                ent2.update(cx, |this, cx| this.select_cell(r, c, cx));
+            cell = cell.on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+                let shift = ev.modifiers.shift;
+                ent2.update(cx, |this, cx| {
+                    if shift {
+                        this.extend_to(r, c, cx)
+                    } else {
+                        this.select_cell(r, c, cx)
+                    }
+                });
             });
             row = row.child(cell);
         }
@@ -5218,10 +5494,20 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
         );
     }
 
+    let ent_move = ent.clone();
+    let ent_up = ent.clone();
     v_flex()
         .flex_1()
         .min_h(px(0.))
         .bg(hsla_u(0xffffff))
+        // Column-resize drag: track the pointer and release anywhere in the grid.
+        .on_mouse_move(move |ev, _w, cx| {
+            let x = f32::from(ev.position.x);
+            ent_move.update(cx, |this, cx| this.col_resize_move(x, cx));
+        })
+        .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
+            ent_up.update(cx, |this, cx| this.col_resize_end(cx));
+        })
         .child(bar)
         .child(
             div()
