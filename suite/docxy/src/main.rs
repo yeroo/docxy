@@ -185,8 +185,8 @@ struct SheetView {
     redo: Vec<SheetSnapshot>,
     /// An in-progress column-resize drag (the header border being dragged).
     col_drag: Option<ColDrag>,
-    /// Scroll handle for the grid (both axes).
-    grid_scroll: ScrollHandle,
+    /// Vertical scroll of the virtualized row list.
+    vscroll: UniformListScrollHandle,
 }
 
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
@@ -597,7 +597,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, grid_scroll: ScrollHandle::new() };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, vscroll: UniformListScrollHandle::new() };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -5349,7 +5349,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity()).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -5576,6 +5576,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
         let italic = xf.as_ref().is_some_and(|x| x.italic);
         let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
         let mut cell = div()
+            .id(ElementId::Name(format!("cell-{r}-{c}").into()))
             .w(px(col_px(sh.col_width(c))))
             .h(px(SHEET_ROW_H))
             .px(px(4.))
@@ -5606,16 +5607,20 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
             }
         }
         let ent2 = ent.clone();
-        cell = cell.on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
-            let shift = ev.modifiers.shift;
-            ent2.update(cx, |this, cx| {
-                if shift {
-                    this.extend_to(r, c, cx)
-                } else {
-                    this.select_cell(r, c, cx)
-                }
+        cell = cell
+            .on_click(move |ev, window, cx| {
+                let shift = ev.modifiers().shift;
+                ent2.update(cx, |this, cx| {
+                    if shift {
+                        this.extend_to(r, c, cx)
+                    } else {
+                        this.select_cell(r, c, cx)
+                    }
+                    // Keep keyboard focus on the grid after a click inside the
+                    // virtualized list (which would otherwise capture it).
+                    this.focus.focus(window, cx);
+                });
             });
-        });
         row = row.child(cell);
     }
     row.into_any_element()
@@ -5624,18 +5629,14 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
     let cols = (max_c + 12).max(26).min(256);
-    // Rows rendered: the used range plus headroom, bounded so one frame never
-    // builds an unreasonable number of cells. (No row virtualization: gpui's
-    // scroll container content-sizes its child, which is incompatible with a
-    // flex-height `uniform_list`; true virtualization would need gpui-component's
-    // virtualized Table.)
-    let rows = (max_r + 30).max(60).min(400);
+    // Total rows to virtualize over: the used range plus generous headroom.
+    let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
     let (r0, c0, r1, c1) = view.range();
 
@@ -5667,11 +5668,26 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
         .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
 
-    // ---- header + data rows (one both-axes scroll region) ----
-    let mut grid = v_flex().child(sheet_col_header(view, ent, cols));
-    for r in 0..=rows {
-        grid = grid.child(sheet_row(view, ent, r, cols));
-    }
+    // ---- frozen column header + vertically-virtualized rows ----
+    // The rows go straight into a `uniform_list` (no horizontal-scroll wrapper —
+    // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
+    // Columns are rendered to fill the viewport; a horizontal scroller can't be
+    // layered on without losing virtualization on raw gpui.
+    let header = sheet_col_header(view, ent, cols);
+    let ent_list = ent.clone();
+    let list = uniform_list(
+        "sheet-rows",
+        total_rows,
+        cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
+            let Some(v) = this.active_sheet() else { return Vec::new() };
+            range.map(|i| sheet_row(v, &ent_list, i as u32, cols)).collect::<Vec<_>>()
+        }),
+    )
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .track_scroll(&view.vscroll)
+    .flex_1()
+    .min_h(px(0.));
+    let grid_area = v_flex().flex_1().min_h(px(0.)).child(header).child(list);
 
     // ---- sheet tabs (bottom) ----
     let mut tabs = h_flex().w_full().h(px(26.)).items_center().gap(px(1.)).px_2().bg(hsla_u(0xf1f1f1)).border_t_1().border_color(gridline);
@@ -5705,15 +5721,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
             ent_up.update(cx, |this, cx| this.col_resize_end(cx));
         })
         .child(bar)
-        .child(
-            div()
-                .id("sheet-grid")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_scroll()
-                .track_scroll(&view.grid_scroll)
-                .child(grid),
-        )
+        .child(grid_area)
         .child(tabs)
         .into_any_element()
 }
