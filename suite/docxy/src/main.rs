@@ -185,6 +185,7 @@ struct SheetView {
     redo: Vec<SheetSnapshot>,
     /// An in-progress column-resize drag (the header border being dragged).
     col_drag: Option<ColDrag>,
+    /// Scroll handle for the grid (both axes).
     grid_scroll: ScrollHandle,
 }
 
@@ -5322,26 +5323,153 @@ fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
 }
 
-/// Render a spreadsheet tab: a formula/reference bar, the scrollable cell grid
-/// (headers, gridlines, styled cells, selection), and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
-    use gridcore::sheet::{col_name, cell_name, Align, CellValue};
-    let sh = view.sheet();
-    let styles = &view.pkg.workbook.styles;
-    let d1904 = view.pkg.workbook.date1904;
-    let (sr, sc) = view.sel;
-    let (max_r, max_c) = view.extent();
-    let rows = (max_r + 6).min(160);
-    let cols = (max_c + 2).min(30);
+const SHEET_ROW_H: f32 = 21.0;
+const SHEET_GUT: f32 = 46.0;
 
-    const ROW_H: f32 = 21.0;
-    const GUT: f32 = 46.0;
+/// The frozen column-letter header row (with drag-to-resize handles). Rendered
+/// once above the virtualized rows so it stays put while they scroll vertically.
+fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, cols: u32) -> AnyElement {
+    use gridcore::sheet::col_name;
+    let sh = view.sheet();
     let gridline = hsla_u(0xd9d9d9);
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
+    let (_, c0, _, c1) = view.range();
+    let mut header = h_flex().child(div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
+    for c in 0..=cols {
+        let hl = c >= c0 && c <= c1;
+        let ent_h = ent.clone();
+        let handle = div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(5.))
+            .h(px(SHEET_ROW_H))
+            .cursor_col_resize()
+            .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+                let x = f32::from(ev.position.x);
+                ent_h.update(cx, |this, cx| this.col_resize_start(c, x, cx));
+            });
+        header = header.child(
+            div().relative().w(px(col_px(sh.col_width(c)))).h(px(SHEET_ROW_H)).flex().items_center().justify_center()
+                .bg(if hl { brand } else { head_bg })
+                .border_r_1().border_b_1().border_color(gridline)
+                .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
+                .child(SharedString::from(col_name(c)))
+                .child(handle),
+        );
+    }
+    header.into_any_element()
+}
+
+/// One data row: the row-number gutter cell plus `0..=cols` styled cells.
+fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyElement {
+    use gridcore::sheet::{Align, CellValue};
+    let sh = view.sheet();
+    let styles = &view.pkg.workbook.styles;
+    let d1904 = view.pkg.workbook.date1904;
+    let (sr, sc) = view.sel;
     let (r0, c0, r1, c1) = view.range();
+    let editing = view.editing.clone();
+    let gridline = hsla_u(0xd9d9d9);
+    let head_bg = hsla_u(0xf1f1f1);
+    let head_fg = hsla_u(0x5a5a5a);
+    let brand = hsla_u(BRAND);
     let range_tint = Hsla { a: 0.14, ..brand };
+    let hl_row = r >= r0 && r <= r1;
+    let mut row = h_flex().child(
+        div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).flex().items_center().justify_center()
+            .bg(if hl_row { brand } else { head_bg })
+            .border_r_1().border_b_1().border_color(gridline)
+            .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
+            .child(SharedString::from((r + 1).to_string())),
+    );
+    for c in 0..=cols {
+        let selected = (r, c) == (sr, sc);
+        let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
+        let cell_editing = selected && editing.is_some();
+        let (text, xf, is_num) = match sh.cell(r, c) {
+            Some(cl) if !cl.is_blank() => {
+                let xf = styles.xf(cl.style);
+                (gridcore::sheet::format_with(&xf, &cl.value, d1904), Some(xf), matches!(cl.value, CellValue::Number(_)))
+            }
+            _ => (String::new(), None, false),
+        };
+        let halign = match xf.as_ref().map(|x| x.align).unwrap_or(Align::General) {
+            Align::Left => 0,
+            Align::Center => 1,
+            Align::Right => 2,
+            Align::General => if is_num { 2 } else { 0 },
+        };
+        let fill = xf.as_ref().and_then(|x| x.fill);
+        let color = xf.as_ref().and_then(|x| x.color).map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
+        let bold = xf.as_ref().is_some_and(|x| x.bold);
+        let italic = xf.as_ref().is_some_and(|x| x.italic);
+        let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
+        let mut cell = div()
+            .w(px(col_px(sh.col_width(c))))
+            .h(px(SHEET_ROW_H))
+            .px(px(4.))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .bg(if cell_editing { hsla_u(0xffffff) } else { bg })
+            .border_r_1()
+            .border_b_1()
+            .border_color(gridline)
+            .when(in_range && !selected, |d| d.bg(range_tint))
+            .when(selected, |d| d.border_2().border_color(brand));
+        if cell_editing {
+            cell = cell
+                .justify_start()
+                .child(div().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(editing.clone().unwrap_or_default())))
+                .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(brand));
+        } else {
+            cell = match halign {
+                1 => cell.justify_center(),
+                2 => cell.justify_end(),
+                _ => cell.justify_start(),
+            };
+            if !text.is_empty() {
+                cell = cell.child(
+                    div().text_size(px(12.)).text_color(color).when(bold, |d| d.font_weight(FontWeight::BOLD)).when(italic, |d| d.italic()).child(SharedString::from(text)),
+                );
+            }
+        }
+        let ent2 = ent.clone();
+        cell = cell.on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+            let shift = ev.modifiers.shift;
+            ent2.update(cx, |this, cx| {
+                if shift {
+                    this.extend_to(r, c, cx)
+                } else {
+                    this.select_cell(r, c, cx)
+                }
+            });
+        });
+        row = row.child(cell);
+    }
+    row.into_any_element()
+}
+
+/// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
+/// grid whose column header (and any frozen rows) stay pinned while the rows
+/// virtualize vertically via `uniform_list`; and the sheet tabs.
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
+    use gridcore::sheet::cell_name;
+    let sh = view.sheet();
+    let (sr, sc) = view.sel;
+    let (max_r, max_c) = view.extent();
+    let cols = (max_c + 12).max(26).min(256);
+    // Rows rendered: the used range plus headroom, bounded so one frame never
+    // builds an unreasonable number of cells. (No row virtualization: gpui's
+    // scroll container content-sizes its child, which is incompatible with a
+    // flex-height `uniform_list`; true virtualization would need gpui-component's
+    // virtualized Table.)
+    let rows = (max_r + 30).max(60).min(400);
+    let gridline = hsla_u(0xd9d9d9);
+    let (r0, c0, r1, c1) = view.range();
 
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
@@ -5371,111 +5499,10 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
         .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
 
-    // ---- header row (corner + column letters, with drag-to-resize handles) ----
-    let mut header = h_flex().child(div().w(px(GUT)).h(px(ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
-    for c in 0..=cols {
-        let hl = c >= c0 && c <= c1;
-        let ent_h = ent.clone();
-        let handle = div()
-            .absolute()
-            .top_0()
-            .right_0()
-            .w(px(5.))
-            .h(px(ROW_H))
-            .cursor_col_resize()
-            .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
-                let x = f32::from(ev.position.x);
-                ent_h.update(cx, |this, cx| this.col_resize_start(c, x, cx));
-            });
-        header = header.child(
-            div().relative().w(px(col_px(sh.col_width(c)))).h(px(ROW_H)).flex().items_center().justify_center()
-                .bg(if hl { brand } else { head_bg })
-                .border_r_1().border_b_1().border_color(gridline)
-                .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
-                .child(SharedString::from(col_name(c)))
-                .child(handle),
-        );
-    }
-
-    // ---- data rows ----
-    let mut grid = v_flex().child(header);
+    // ---- header + data rows (one both-axes scroll region) ----
+    let mut grid = v_flex().child(sheet_col_header(view, ent, cols));
     for r in 0..=rows {
-        let hl_row = r >= r0 && r <= r1;
-        let mut row = h_flex().child(
-            div().w(px(GUT)).h(px(ROW_H)).flex().items_center().justify_center()
-                .bg(if hl_row { brand } else { head_bg })
-                .border_r_1().border_b_1().border_color(gridline)
-                .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
-                .child(SharedString::from((r + 1).to_string())),
-        );
-        for c in 0..=cols {
-            let selected = (r, c) == (sr, sc);
-            let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
-            let cell_editing = selected && editing.is_some();
-            let (text, xf, is_num) = match sh.cell(r, c) {
-                Some(cl) if !cl.is_blank() => {
-                    let xf = styles.xf(cl.style);
-                    (gridcore::sheet::format_with(&xf, &cl.value, d1904), Some(xf), matches!(cl.value, CellValue::Number(_)))
-                }
-                _ => (String::new(), None, false),
-            };
-            let halign = match xf.as_ref().map(|x| x.align).unwrap_or(Align::General) {
-                Align::Left => 0,
-                Align::Center => 1,
-                Align::Right => 2,
-                Align::General => if is_num { 2 } else { 0 },
-            };
-            let fill = xf.as_ref().and_then(|x| x.fill);
-            let color = xf.as_ref().and_then(|x| x.color).map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
-            let bold = xf.as_ref().is_some_and(|x| x.bold);
-            let italic = xf.as_ref().is_some_and(|x| x.italic);
-            let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
-            let mut cell = div()
-                .w(px(col_px(sh.col_width(c))))
-                .h(px(ROW_H))
-                .px(px(4.))
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .bg(if cell_editing { hsla_u(0xffffff) } else { bg })
-                .border_r_1()
-                .border_b_1()
-                .border_color(gridline)
-                // Range fill on the non-active cells of a multi-cell selection.
-                .when(in_range && !selected, |d| d.bg(range_tint))
-                .when(selected, |d| d.border_2().border_color(brand));
-            if cell_editing {
-                // In-cell editor: left-aligned buffer with a caret bar.
-                cell = cell
-                    .justify_start()
-                    .child(div().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(editing.clone().unwrap_or_default())))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(brand));
-            } else {
-                cell = match halign {
-                    1 => cell.justify_center(),
-                    2 => cell.justify_end(),
-                    _ => cell.justify_start(),
-                };
-                if !text.is_empty() {
-                    cell = cell.child(
-                        div().text_size(px(12.)).text_color(color).when(bold, |d| d.font_weight(FontWeight::BOLD)).when(italic, |d| d.italic()).child(SharedString::from(text)),
-                    );
-                }
-            }
-            let ent2 = ent.clone();
-            cell = cell.on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
-                let shift = ev.modifiers.shift;
-                ent2.update(cx, |this, cx| {
-                    if shift {
-                        this.extend_to(r, c, cx)
-                    } else {
-                        this.select_cell(r, c, cx)
-                    }
-                });
-            });
-            row = row.child(cell);
-        }
-        grid = grid.child(row);
+        grid = grid.child(sheet_row(view, ent, r, cols));
     }
 
     // ---- sheet tabs (bottom) ----
@@ -5498,6 +5525,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>) -> AnyElement {
     let ent_up = ent.clone();
     v_flex()
         .flex_1()
+        .h_full()
         .min_h(px(0.))
         .bg(hsla_u(0xffffff))
         // Column-resize drag: track the pointer and release anywhere in the grid.
