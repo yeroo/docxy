@@ -188,8 +188,17 @@ struct SheetView {
     /// Live PivotTable definitions authored in the UI, one per output sheet, so
     /// the field panel can re-place fields and recompute.
     pivot_views: Vec<PivotDef>,
+    /// Charts authored in the UI, rendered as floating cards over their sheet.
+    charts: Vec<ChartView>,
     /// Vertical scroll of the virtualized row list.
     vscroll: UniformListScrollHandle,
+}
+
+/// A UI-authored chart: which sheet it floats over, and its (cached) data.
+#[derive(Clone)]
+struct ChartView {
+    sheet: usize,
+    data: gridcore::sheet::ChartData,
 }
 
 /// A UI-authored PivotTable: its source and, per source field, the role the user
@@ -246,6 +255,7 @@ enum SheetAct {
     Currency,
     Comma,
     InsertPivot,
+    InsertChart,
     Todo,
 }
 
@@ -619,7 +629,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], vscroll: UniformListScrollHandle::new() };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new() };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -1308,6 +1318,63 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Build a clustered column chart from the selected range (categories = first
+    /// text column, one series per numeric column) and float it over the sheet.
+    fn sheet_insert_chart(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::{CellValue, ChartData, ChartSeries};
+        if let Some(v) = self.active_sheet_mut() {
+            let (r0, c0, r1, c1) = if v.has_range() {
+                v.range()
+            } else {
+                let (mr, mc) = v.extent();
+                (0, 0, mr, mc)
+            };
+            let sh = v.sheet();
+            let mut cat_col: Option<u32> = None;
+            let mut num_cols: Vec<u32> = Vec::new();
+            for c in c0..=c1 {
+                let (mut nums, mut txts) = (0u32, 0u32);
+                for r in (r0 + 1)..=r1 {
+                    match sh.cell(r, c).map(|cl| &cl.value) {
+                        Some(CellValue::Number(_)) => nums += 1,
+                        Some(CellValue::Text(_)) => txts += 1,
+                        _ => {}
+                    }
+                }
+                if nums > 0 && nums >= txts {
+                    num_cols.push(c);
+                } else if cat_col.is_none() {
+                    cat_col = Some(c);
+                }
+            }
+            let cat_col = cat_col.unwrap_or(c0);
+            let data_rows: Vec<u32> = (r0 + 1..=r1).collect();
+            let categories: Vec<String> = data_rows.iter().map(|&r| v.cell_text(r, cat_col)).collect();
+            let title = v.cell_text(r0, cat_col);
+            let series: Vec<ChartSeries> = num_cols
+                .iter()
+                .map(|&c| {
+                    let name = v.cell_text(r0, c);
+                    let values = data_rows
+                        .iter()
+                        .map(|&r| match v.sheet().cell(r, c).map(|cl| &cl.value) {
+                            Some(CellValue::Number(n)) => *n,
+                            _ => 0.0,
+                        })
+                        .collect();
+                    ChartSeries { name, values }
+                })
+                .collect();
+            if !series.is_empty() {
+                let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: "bar".into(), categories, series };
+                let s = v.active;
+                v.charts.push(ChartView { sheet: s, data });
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// The "PivotTable Fields" side panel: each source field with its current
     /// role badge; clicking cycles the role and recomputes.
     fn pivot_panel(&self, idx: usize, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -1372,6 +1439,7 @@ impl Docxy {
             SheetAct::Currency => self.sheet_numfmt("$#,##0.00", cx),
             SheetAct::Comma => self.sheet_numfmt("#,##0.00", cx),
             SheetAct::InsertPivot => self.sheet_insert_pivot(cx),
+            SheetAct::InsertChart => self.sheet_insert_chart(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -1393,6 +1461,8 @@ impl Docxy {
                 "i" => self.sheet_toggle_italic(cx),
                 // Insert a PivotTable for the selection (also on the Insert ribbon).
                 "p" if shift => self.sheet_insert_pivot(cx),
+                // Insert a chart of the selection (also on the Insert ribbon).
+                "k" if shift => self.sheet_insert_chart(cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -4885,7 +4955,7 @@ impl Docxy {
                 .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
-                .child(self.sheet_lb(None, "Chart", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Column Chart", SheetAct::InsertChart, pal, cx))
                 .into_any_element()))
             .into_any_element()
     }
@@ -6023,6 +6093,54 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, cols: u32) -> AnyEle
     row.into_any_element()
 }
 
+/// A floating chart card: a clustered column chart drawn with div bars, plus a
+/// title and legend. Handles bar/column data (the common case) for any kind.
+fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
+    const PALETTE: [u32; 6] = [0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A];
+    let maxv = data.series.iter().flat_map(|s| s.values.iter().copied()).fold(0.0f64, f64::max).max(1.0);
+    let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
+    let plot_h = 148.0f32;
+    let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
+    for ci in 0..ncat {
+        let mut cluster = h_flex().items_end().gap(px(1.));
+        for (si, s) in data.series.iter().enumerate() {
+            let val = s.values.get(ci).copied().unwrap_or(0.0);
+            let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
+            cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+        }
+        let label = data.categories.get(ci).cloned().unwrap_or_default();
+        plot = plot.child(
+            v_flex()
+                .items_center()
+                .justify_end()
+                .gap(px(2.))
+                .h(px(plot_h + 18.))
+                .child(cluster)
+                .child(div().text_size(px(8.)).text_color(hsla_u(0x666666)).max_w(px(52.)).overflow_hidden().child(SharedString::from(label))),
+        );
+    }
+    let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
+    for (si, s) in data.series.iter().enumerate() {
+        legend = legend.child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(PALETTE[si % PALETTE.len()])))
+                .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(s.name.clone()))),
+        );
+    }
+    v_flex()
+        .w(px(360.))
+        .bg(hsla_u(0xffffff))
+        .border_1()
+        .border_color(hsla_u(0xcccccc))
+        .rounded(px(4.))
+        .child(div().w_full().text_center().py_1().text_size(px(12.)).font_weight(FontWeight::BOLD).text_color(hsla_u(0x222222)).child(SharedString::from(data.title.clone())))
+        .child(plot)
+        .child(legend)
+        .into_any_element()
+}
+
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
@@ -6102,6 +6220,25 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
         );
     }
 
+    // Floating chart cards over this sheet, staggered so multiples don't overlap:
+    // UI-authored charts plus any charts loaded from the workbook's drawings.
+    let loaded = sh.drawings.iter().filter_map(|d| match &d.kind {
+        gridcore::sheet::DrawingKind::Chart(cd) => Some(cd),
+        _ => None,
+    });
+    let charts: Vec<AnyElement> = view
+        .charts
+        .iter()
+        .filter(|c| c.sheet == view.active)
+        .map(|cv| &cv.data)
+        .chain(loaded)
+        .enumerate()
+        .map(|(i, data)| {
+            let off = i as f32 * 26.;
+            div().absolute().top(px(62. + off)).right(px(26. + off)).child(chart_card(data)).into_any_element()
+        })
+        .collect();
+
     let ent_move = ent.clone();
     let ent_up = ent.clone();
     v_flex()
@@ -6111,6 +6248,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
         // Allow the grid to shrink below its content width so a side panel (the
         // PivotTable Fields list) can sit beside it instead of overflowing.
         .min_w(px(0.))
+        .relative()
         .overflow_hidden()
         .bg(hsla_u(0xffffff))
         // Column-resize drag: track the pointer and release anywhere in the grid.
@@ -6124,6 +6262,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
         .child(bar)
         .child(grid_area)
         .child(tabs)
+        .children(charts)
         .into_any_element()
 }
 
