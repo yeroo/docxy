@@ -452,6 +452,8 @@ struct Docxy {
     grid_clip: Option<GridClip>,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
+    // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
+    sheet_rename: Option<(usize, String)>,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -816,6 +818,7 @@ impl Docxy {
             ruler_guide: None,
             grid_clip: None,
             sheet_pick: None,
+            sheet_rename: None,
         }
     }
 
@@ -917,6 +920,102 @@ impl Docxy {
             v.editing = None;
             cx.notify();
         }
+    }
+
+    /// Add a new blank sheet (unique "SheetN" name) and switch to it.
+    fn sheet_add(&mut self, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            // Pick the lowest "SheetN" not already taken.
+            let mut n = v.pkg.workbook.sheets.len() + 1;
+            let taken = |v: &SheetView, name: &str| v.pkg.workbook.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name));
+            while taken(v, &format!("Sheet{n}")) {
+                n += 1;
+            }
+            let idx = v.pkg.add_sheet(&format!("Sheet{n}"));
+            v.active = idx;
+            v.sel = (0, 0);
+            v.anchor = (0, 0);
+            v.editing = None;
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Delete sheet `idx` (guarded: never the last sheet). Fixes up the active
+    /// index and any pivot/chart views that referenced shifted sheet indices.
+    fn sheet_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            if v.pkg.workbook.sheets.len() <= 1 || !v.pkg.remove_sheet(idx) {
+                return;
+            }
+            // Drop views on the removed sheet; shift indices above it down one.
+            v.pivot_views.retain(|d| d.out_sheet != idx);
+            for d in &mut v.pivot_views {
+                if d.out_sheet > idx {
+                    d.out_sheet -= 1;
+                }
+                if d.src_sheet > idx {
+                    d.src_sheet -= 1;
+                }
+            }
+            v.charts.retain(|c| c.sheet != idx);
+            for c in &mut v.charts {
+                if c.sheet > idx {
+                    c.sheet -= 1;
+                }
+            }
+            if v.active >= v.pkg.workbook.sheets.len() {
+                v.active = v.pkg.workbook.sheets.len() - 1;
+            }
+            v.sel = (0, 0);
+            v.anchor = (0, 0);
+            v.editing = None;
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Begin an inline rename of tab `idx`, seeding the buffer with its name.
+    fn sheet_begin_rename(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let name = self
+            .active_sheet()
+            .and_then(|v| v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone()));
+        if let Some(name) = name {
+            self.sheet_rename = Some((idx, name));
+            cx.notify();
+        }
+    }
+
+    /// Route a keystroke into the active inline rename (char/backspace/enter/esc).
+    fn sheet_rename_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some((idx, mut buf)) = self.sheet_rename.clone() else { return };
+        match key {
+            "escape" => self.sheet_rename = None,
+            "enter" => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.pkg.rename_sheet(idx, &buf);
+                }
+                self.sheet_rename = None;
+                self.mark_sheet_dirty();
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_rename = Some((idx, buf));
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_rename = Some((idx, buf));
+            }
+        }
+        cx.notify();
     }
 
     // ---- spreadsheet cell editing -----------------------------------------
@@ -1679,6 +1778,10 @@ impl Docxy {
     /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
     /// active surface is a sheet).
     fn sheet_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // An inline sheet-tab rename swallows all typing until Enter/Esc.
+        if self.sheet_rename.is_some() {
+            return self.sheet_rename_key(ev, key, cx);
+        }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
             if ctrl && key == "f" {
@@ -6203,7 +6306,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -6637,7 +6740,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -6706,20 +6809,73 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, cx: &mut Context<Docxy>) -> A
     let grid_area = v_flex().flex_1().min_h(px(0.)).child(header).child(frozen).child(list);
 
     // ---- sheet tabs (bottom) ----
+    let nsheets = view.pkg.workbook.sheets.len();
     let mut tabs = h_flex().w_full().h(px(26.)).items_center().gap(px(1.)).px_2().bg(hsla_u(0xf1f1f1)).border_t_1().border_color(gridline);
     for (i, s) in view.pkg.workbook.sheets.iter().enumerate() {
         let active = i == view.active;
-        let ent2 = ent.clone();
-        tabs = tabs.child(
-            div().px_3().h(px(20.)).flex().items_center().rounded_t(px(4.)).cursor_pointer().text_size(px(12.))
-                .bg(if active { hsla_u(0xffffff) } else { hsla_u(0xe4e4e4) })
-                .text_color(if active { hsla_u(0x1a1a1a) } else { hsla_u(0x666666) })
-                .child(SharedString::from(s.name.clone()))
-                .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
-                    ent2.update(cx, |this, cx| this.select_sheet(i, cx));
-                }),
-        );
+        let renaming = rename.as_ref().is_some_and(|(ri, _)| *ri == i);
+        let mut tab = div()
+            .id(ElementId::Name(format!("sheet-tab-{i}").into()))
+            .px_3().h(px(20.)).flex().items_center().gap_1().rounded_t(px(4.)).cursor_pointer().text_size(px(12.))
+            .bg(if active { hsla_u(0xffffff) } else { hsla_u(0xe4e4e4) })
+            .text_color(if active { hsla_u(0x1a1a1a) } else { hsla_u(0x666666) });
+        if renaming {
+            // Inline editor: show the live buffer + a caret bar; typing is routed
+            // through sheet_rename_key (keyboard focus stays on the grid root).
+            let buf = rename.as_ref().map(|(_, b)| b.clone()).unwrap_or_default();
+            tab = tab
+                .bg(hsla_u(0xffffff))
+                .border_1().border_color(hsla_u(BRAND))
+                .child(div().min_w(px(8.)).child(SharedString::from(buf)))
+                .child(div().w(px(1.)).h(px(12.)).bg(hsla_u(BRAND)));
+        } else {
+            let ent_sel = ent.clone();
+            tab = tab
+                .child(div().child(SharedString::from(s.name.clone())))
+                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                    // Double-click renames; single-click selects.
+                    let dbl = ev.click_count >= 2;
+                    ent_sel.update(cx, |this, cx| {
+                        if dbl {
+                            // Focus the grid root so rename keystrokes route to sheet_key.
+                            this.focus.focus(window, cx);
+                            this.sheet_begin_rename(i, cx);
+                        } else {
+                            this.select_sheet(i, cx);
+                        }
+                    });
+                });
+            // A small × on the active tab (never on the last remaining sheet).
+            if active && nsheets > 1 {
+                let ent_del = ent.clone();
+                tab = tab.child(
+                    div()
+                        .id(ElementId::Name(format!("sheet-del-{i}").into()))
+                        .px(px(2.)).rounded(px(2.)).text_size(px(11.)).text_color(hsla_u(0x999999))
+                        .hover(|d| d.text_color(hsla_u(0xc0392b)).bg(hsla_u(0xececec)))
+                        .child("\u{00d7}")
+                        .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                            cx.stop_propagation();
+                            ent_del.update(cx, |this, cx| this.sheet_delete(i, cx));
+                        }),
+                );
+            }
+        }
+        tabs = tabs.child(tab);
     }
+    // ＋ new sheet.
+    let ent_add = ent.clone();
+    tabs = tabs.child(
+        div()
+            .id("sheet-add")
+            .px_2().h(px(20.)).flex().items_center().rounded_t(px(4.)).cursor_pointer().text_size(px(15.))
+            .text_color(hsla_u(0x666666))
+            .hover(|d| d.bg(hsla_u(0xe4e4e4)).text_color(hsla_u(0x1a1a1a)))
+            .child("+")
+            .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                ent_add.update(cx, |this, cx| this.sheet_add(cx));
+            }),
+    );
 
     // Floating chart cards over this sheet, staggered so multiples don't overlap:
     // UI-authored charts plus any charts loaded from the workbook's drawings.

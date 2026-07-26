@@ -2601,6 +2601,54 @@ impl SheetPackage {
     /// (Wave-3's "remove both or neither" rule for `pivot.create`'s
     /// inverse). Pivots on later sheets keep pointing at the right sheet as
     /// indices shift down, same as `defined_names` scopes below.
+    /// Rename sheet `idx`, updating both the model and the `<sheet name="…">`
+    /// entry in `workbook.xml` (matched by document order). Rejects a name that
+    /// collides (case-insensitively) with another sheet, or an out-of-range /
+    /// empty name. Returns whether the rename happened.
+    pub fn rename_sheet(&mut self, idx: usize, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || idx >= self.workbook.sheets.len() {
+            return false;
+        }
+        if self
+            .workbook
+            .sheets
+            .iter()
+            .enumerate()
+            .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name))
+        {
+            return false;
+        }
+        self.workbook.sheets[idx].name = name.to_string();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Walk to the idx-th <sheet …/> element (document order == model order).
+            let (mut pos, mut count, mut at) = (0usize, 0usize, None);
+            while let Some(rel) = xml[pos..].find("<sheet ") {
+                let start = pos + rel;
+                if count == idx {
+                    at = Some(start);
+                    break;
+                }
+                count += 1;
+                pos = start + "<sheet ".len();
+            }
+            if let Some(start) = at {
+                if let Some(gt) = xml[start..].find('>') {
+                    let elem_end = start + gt;
+                    if let Some(np) = xml[start..elem_end].find("name=\"") {
+                        let ns = start + np + "name=\"".len();
+                        if let Some(ne_rel) = xml[ns..elem_end].find('"') {
+                            let ne = ns + ne_rel;
+                            p.1 = format!("{}{}{}", &xml[..ns], esc_attr(name), &xml[ne..]).into_bytes();
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
             return false;
@@ -2803,6 +2851,28 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_sheet_updates_model_and_workbook_xml() {
+        let mut pkg = new_xlsx();
+        let s2 = pkg.add_sheet("Data");
+        assert_eq!(pkg.workbook.sheets[s2].name, "Data");
+        // Rename succeeds and updates both the model and workbook.xml.
+        assert!(pkg.rename_sheet(s2, "Budget"));
+        assert_eq!(pkg.workbook.sheets[s2].name, "Budget");
+        let wbxml = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
+        assert!(wbxml.contains("name=\"Budget\""), "workbook.xml not updated: {wbxml}");
+        assert!(!wbxml.contains("name=\"Data\""));
+        // Duplicate (case-insensitive) and empty names are rejected.
+        let first = pkg.workbook.sheets[0].name.clone();
+        assert!(!pkg.rename_sheet(s2, &first.to_uppercase()));
+        assert!(!pkg.rename_sheet(s2, "   "));
+        assert_eq!(pkg.workbook.sheets[s2].name, "Budget");
+        // Survives a save→load round-trip.
+        let bytes = save_xlsx(&pkg);
+        let re = load_xlsx(&bytes).unwrap();
+        assert!(re.workbook.sheets.iter().any(|s| s.name == "Budget"));
+    }
 
     #[test]
     fn chart_space_xml_per_kind() {
