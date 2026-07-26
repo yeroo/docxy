@@ -931,21 +931,33 @@ impl Docxy {
     /// arrow-key navigation past the right edge scrolls columns into view.
     fn reconcile_sheet_hscroll(&mut self, avail_w: f32) {
         if let Some(v) = self.active_sheet_mut() {
+            let (_, frz_c) = v.sheet().freeze;
+            let fc = frz_c.min(64);
+            // The scroll offset never enters the frozen region.
+            if v.col0 < fc {
+                v.col0 = fc;
+            }
             let sc = v.sel.1;
+            if sc < fc {
+                return; // a frozen column is always visible
+            }
             if sc < v.col0 {
-                v.col0 = sc;
+                v.col0 = sc.max(fc);
                 return;
             }
+            // Available width for the scrollable region excludes the pinned columns.
+            let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
+            let avail = (avail_w - frozen_w).max(80.0);
             // Shrink the window from the left until [col0..=sc] fits (sc at the
             // right edge), so moving right past the last visible column scrolls.
-            let widths: Vec<f32> = (0..=sc).map(|c| col_px(v.sheet().col_width(c))).collect();
+            let widths: Vec<f32> = (fc..=sc).map(|c| col_px(v.sheet().col_width(c))).collect();
             let mut start = v.col0;
-            let mut sum: f32 = (start..=sc).map(|c| widths[c as usize]).sum();
-            while sum > avail_w && start < sc {
-                sum -= widths[start as usize];
+            let mut sum: f32 = (start..=sc).map(|c| widths[(c - fc) as usize]).sum();
+            while sum > avail && start < sc {
+                sum -= widths[(start - fc) as usize];
                 start += 1;
             }
-            v.col0 = start;
+            v.col0 = start.max(fc);
         }
     }
 
@@ -6527,17 +6539,20 @@ const SHEET_GUT: f32 = 46.0;
 
 /// The frozen column-letter header row (with drag-to-resize handles). Rendered
 /// once above the virtualized rows so it stays put while they scroll vertically.
-fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, col0: u32, cend: u32) -> AnyElement {
+fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, cend: u32) -> AnyElement {
     use gridcore::sheet::col_name;
     let sh = view.sheet();
     let gridline = hsla_u(0xd9d9d9);
+    let freeze_line = hsla_u(0x8a8a8a);
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
     let (_, c0, _, c1) = view.range();
     let mut header = h_flex().child(div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
-    for c in col0..=cend {
+    // Frozen columns 0..fc pinned, then the scrollable window col0..=cend.
+    for c in (0..fc).chain(col0..=cend) {
         let hl = c >= c0 && c <= c1;
+        let on_freeze = fc > 0 && c + 1 == fc;
         let ent_h = ent.clone();
         let handle = div()
             .absolute()
@@ -6553,7 +6568,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, col0: u32, cend: u32)
         header = header.child(
             div().relative().w(px(col_px(sh.col_width(c)))).h(px(SHEET_ROW_H)).flex().items_center().justify_center()
                 .bg(if hl { brand } else { head_bg })
-                .border_r_1().border_b_1().border_color(gridline)
+                .border_r_1().border_b_1().border_color(if on_freeze { freeze_line } else { gridline })
                 .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
                 .child(SharedString::from(col_name(c)))
                 .child(handle),
@@ -6562,8 +6577,9 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, col0: u32, cend: u32)
     header.into_any_element()
 }
 
-/// One data row: the row-number gutter cell plus the visible `col0..=cend` cells.
-fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, col0: u32, cend: u32) -> AnyElement {
+/// One data row: the row-number gutter cell plus the visible cells (frozen
+/// columns `0..fc` pinned, then the scrollable window `col0..=cend`).
+fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, cend: u32) -> AnyElement {
     use gridcore::sheet::{Align, CellValue};
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
@@ -6575,6 +6591,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, col0: u32, cend: u32
     let (r0, c0, r1, c1) = view.range();
     let editing = view.editing.clone();
     let gridline = hsla_u(0xd9d9d9);
+    let freeze_line = hsla_u(0x8a8a8a);
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
@@ -6587,10 +6604,11 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, col0: u32, cend: u32
             .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
             .child(SharedString::from((r + 1).to_string())),
     );
-    for c in col0..=cend {
+    for c in (0..fc).chain(col0..=cend) {
         let selected = (r, c) == (sr, sc);
         let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
         let cell_editing = selected && editing.is_some();
+        let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
@@ -6639,7 +6657,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, col0: u32, cend: u32
             .bg(if cell_editing { hsla_u(0xffffff) } else { bg })
             .border_r_1()
             .border_b_1()
-            .border_color(gridline)
+            .border_color(if on_freeze { freeze_line } else { gridline })
             // A thin box border (xf border) darkens all four sides.
             .when(cell_border, |d| d.border_1().border_color(hsla_u(0x7a7a7a)))
             .when(in_range && !selected, |d| d.bg(range_tint))
@@ -6795,11 +6813,15 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let sh = view.sheet();
     let (sr, sc) = view.sel;
     let (max_r, max_c) = view.extent();
-    // Horizontal column window: fill the available grid width with columns
-    // starting at the scroll offset col0 (+1 overflow), capped at 255. This is
-    // column virtualization by offset — the counterpart to the row uniform_list.
-    let col0 = view.col0.min(255);
-    let avail = (grid_w - SHEET_GUT).max(120.0);
+    // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
+    let (frz_r, frz_c) = sh.freeze;
+    let fc = frz_c.min(64);
+    let frozen_w: f32 = (0..fc).map(|c| col_px(sh.col_width(c))).sum();
+    // Horizontal column window: frozen cols 0..fc are always drawn; the scrollable
+    // window fills the REMAINING width from the scroll offset col0 (kept >= fc).
+    // Column virtualization by offset — the counterpart to the row uniform_list.
+    let col0 = view.col0.max(fc).min(255);
+    let avail = (grid_w - SHEET_GUT - frozen_w).max(80.0);
     let mut cend = col0;
     let mut wsum = 0.0f32;
     loop {
@@ -6848,14 +6870,13 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
-    let header = sheet_col_header(view, ent, col0, cend);
+    let header = sheet_col_header(view, ent, fc, col0, cend);
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
-    let (fr, _fc) = sh.freeze;
-    let fr = (fr as usize).min(total_rows).min(30);
+    let fr = (frz_r as usize).min(total_rows).min(30);
     let mut frozen = v_flex().flex_none();
     for r in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, r as u32, col0, cend));
+        frozen = frozen.child(sheet_row(view, ent, r as u32, fc, col0, cend));
     }
     let ent_list = ent.clone();
     let list = uniform_list(
@@ -6863,7 +6884,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         total_rows.saturating_sub(fr),
         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
             let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, col0, cend)).collect::<Vec<_>>()
+            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, fc, col0, cend)).collect::<Vec<_>>()
         }),
     )
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)

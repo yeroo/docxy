@@ -1801,6 +1801,71 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
             out.insert_str(start, &cols_xml);
         }
     }
+
+    // Frozen panes: sync the first sheetView's <pane> from the model.
+    set_freeze_pane(&out, sheet.freeze)
+}
+
+/// Rewrite the frozen-pane state of the first `<sheetView>` from the model's
+/// `freeze` (rows, cols): inserts/updates `<pane … state="frozen"/>`, removes it
+/// when unfrozen, and creates a `<sheetViews>` block if the worksheet lacks one.
+/// Idempotent — a second save with the same freeze is byte-identical.
+fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
+    let (fr, fc) = freeze;
+    let pane = if fr == 0 && fc == 0 {
+        String::new()
+    } else {
+        let mut a = String::new();
+        if fc > 0 {
+            a.push_str(&format!(" xSplit=\"{fc}\""));
+        }
+        if fr > 0 {
+            a.push_str(&format!(" ySplit=\"{fr}\""));
+        }
+        format!(
+            "<pane{a} topLeftCell=\"{}\" activePane=\"bottomRight\" state=\"frozen\"/>",
+            cell_name(fr, fc)
+        )
+    };
+    // Drop any existing <pane …/> first (idempotent; also handles unfreeze).
+    let mut out = if let Some(ps) = xml.find("<pane") {
+        let pe = xml[ps..]
+            .find("/>")
+            .map(|i| ps + i + 2)
+            .or_else(|| xml[ps..].find("</pane>").map(|i| ps + i + "</pane>".len()))
+            .unwrap_or(ps);
+        format!("{}{}", &xml[..ps], &xml[pe..])
+    } else {
+        xml.to_string()
+    };
+    if pane.is_empty() {
+        return out;
+    }
+    // Insert into the first <sheetView> (expanding a self-closing one).
+    if let Some(sv) = find_element(&out, "sheetView") {
+        if let Some(gt) = out[sv..].find('>').map(|i| sv + i) {
+            if out.as_bytes()[gt - 1] == b'/' {
+                out = format!("{}>{}</sheetView>{}", &out[..gt - 1], pane, &out[gt + 1..]);
+            } else {
+                out.insert_str(gt + 1, &pane);
+            }
+            return out;
+        }
+    }
+    // No <sheetView>: insert a full block after <dimension …>, else after the
+    // <worksheet …> opening tag (both keep the schema's element order).
+    let block = format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
+    let anchor = find_element(&out, "dimension")
+        .and_then(|d| {
+            out[d..]
+                .find("/>")
+                .map(|i| d + i + 2)
+                .or_else(|| out[d..].find('>').map(|i| d + i + 1))
+        })
+        .or_else(|| out.find("<worksheet").and_then(|w| out[w..].find('>').map(|i| w + i + 1)));
+    if let Some(pos) = anchor {
+        out.insert_str(pos, &block);
+    }
     out
 }
 
@@ -2832,6 +2897,27 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freeze_round_trips_through_save() {
+        // Freeze set on the model must serialize to <pane> and reload identically,
+        // for both a template sheet (self-closing <sheetView/>) and an added sheet
+        // (no <sheetViews> at all).
+        let mut pkg = new_xlsx();
+        let added = pkg.add_sheet("Two");
+        pkg.workbook.sheets[0].freeze = (2, 3);
+        pkg.workbook.sheets[added].freeze = (1, 0);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].freeze, (2, 3));
+        assert_eq!(re.workbook.sheets[added].freeze, (1, 0));
+        // Unfreeze then save again → pane gone, freeze reads (0,0).
+        let mut re = re;
+        re.workbook.sheets[0].freeze = (0, 0);
+        let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
+        assert_eq!(re2.workbook.sheets[0].freeze, (0, 0));
+        let ws0 = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(!ws0.contains("<pane"), "unfreeze should remove the pane: {ws0}");
+    }
 
     #[test]
     fn rename_sheet_updates_model_and_workbook_xml() {
