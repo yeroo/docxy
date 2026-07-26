@@ -212,6 +212,21 @@ struct GridClip {
     cells: Vec<Vec<gridcore::sheet::Cell>>,
 }
 
+/// A spreadsheet ribbon command (the sheet counterpart to the document `Act`).
+#[derive(Clone, Copy)]
+enum SheetAct {
+    Cut,
+    Copy,
+    Paste,
+    Bold,
+    Italic,
+    AlignL,
+    AlignC,
+    AlignR,
+    Undo,
+    Redo,
+}
+
 impl SheetView {
     fn sheet(&self) -> &gridcore::sheet::Sheet {
         &self.pkg.workbook.sheets[self.active.min(self.pkg.workbook.sheets.len().saturating_sub(1))]
@@ -1089,6 +1104,72 @@ impl Docxy {
         }
     }
 
+    // ---- cell formatting (ribbon) -----------------------------------------
+
+    /// Apply a formatting change to every cell in the selection: mutate a copy of
+    /// each cell's `Xf`, intern it (dedup), and re-point the cell's style. Values
+    /// and formulas are untouched, so no recalc is needed.
+    fn sheet_format(&mut self, apply: impl Fn(&mut gridcore::sheet::Xf), cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let (r0, c0, r1, c1) = v.range();
+            let s = v.active;
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    let cur = v.sheet().cell(r, c).cloned();
+                    let mut xf = v.pkg.workbook.styles.xf(cur.as_ref().map(|cl| cl.style).unwrap_or(0));
+                    apply(&mut xf);
+                    let idx = v.pkg.workbook.styles.intern(xf);
+                    let mut cell = cur.unwrap_or_default();
+                    cell.style = idx;
+                    v.pkg.workbook.sheets[s].set_cell(r, c, cell);
+                }
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// The active cell's current `Xf` (for reading a toggle's current state).
+    fn active_xf(&self) -> gridcore::sheet::Xf {
+        self.active_sheet()
+            .map(|v| {
+                let (r, c) = v.sel;
+                v.pkg.workbook.styles.xf(v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0))
+            })
+            .unwrap_or_default()
+    }
+
+    fn sheet_toggle_bold(&mut self, cx: &mut Context<Self>) {
+        let on = !self.active_xf().bold;
+        self.sheet_format(move |xf| xf.bold = on, cx);
+    }
+    fn sheet_toggle_italic(&mut self, cx: &mut Context<Self>) {
+        let on = !self.active_xf().italic;
+        self.sheet_format(move |xf| xf.italic = on, cx);
+    }
+    fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
+        self.sheet_format(move |xf| xf.align = a, cx);
+    }
+
+    /// Dispatch a spreadsheet ribbon command.
+    fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
+        use gridcore::sheet::Align;
+        match act {
+            SheetAct::Cut => self.sheet_copy(true, cx),
+            SheetAct::Copy => self.sheet_copy(false, cx),
+            SheetAct::Paste => self.sheet_paste(cx),
+            SheetAct::Bold => self.sheet_toggle_bold(cx),
+            SheetAct::Italic => self.sheet_toggle_italic(cx),
+            SheetAct::AlignL => self.sheet_align(Align::Left, cx),
+            SheetAct::AlignC => self.sheet_align(Align::Center, cx),
+            SheetAct::AlignR => self.sheet_align(Align::Right, cx),
+            SheetAct::Undo => self.sheet_undo(cx),
+            SheetAct::Redo => self.sheet_redo(cx),
+        }
+        self.refocus(window, cx);
+    }
+
     /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
     /// active surface is a sheet).
     fn sheet_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1101,6 +1182,8 @@ impl Docxy {
                 "v" => self.sheet_paste(cx),
                 "z" => self.sheet_undo(cx),
                 "y" => self.sheet_redo(cx),
+                "b" => self.sheet_toggle_bold(cx),
+                "i" => self.sheet_toggle_italic(cx),
                 "a" => {
                     // Select the whole used range.
                     if let Some(v) = self.active_sheet_mut() {
@@ -4472,6 +4555,85 @@ impl Docxy {
         h_flex().w_full().h(px(98.)).items_stretch().px_1().bg(pal.panel).border_b_1().border_color(pal.border).children(groups).into_any_element()
     }
 
+    /// One spreadsheet-ribbon button: a glyph/label that runs a `SheetAct`.
+    fn sheet_btn(&self, label: impl Into<SharedString>, bold: bool, italic: bool, act: SheetAct, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let label: SharedString = label.into();
+        div()
+            .id(ElementId::Name(format!("sheet-btn-{label}").into()))
+            .flex()
+            .items_center()
+            .justify_center()
+            .min_w(px(30.))
+            .h(px(24.))
+            .px_2()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(pal.fg)
+            .when(bold, |d| d.font_weight(FontWeight::BOLD))
+            .when(italic, |d| d.italic())
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
+            .into_any_element()
+    }
+
+    /// The spreadsheet ribbon body (Home): Clipboard, Font, Alignment, Undo.
+    fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let group = |title: &str, buttons: Vec<AnyElement>| -> AnyElement {
+            v_flex()
+                .h(px(92.))
+                .px_2()
+                .py(px(4.))
+                .justify_between()
+                .border_r_1()
+                .border_color(pal.border)
+                .child(h_flex().flex_1().items_center().gap(px(2.)).children(buttons))
+                .child(div().w_full().text_size(px(10.)).text_color(pal.dim).text_center().child(title.to_string()))
+                .into_any_element()
+        };
+        h_flex()
+            .w_full()
+            .h(px(98.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .child(group(
+                "Clipboard",
+                vec![
+                    self.sheet_btn("Paste", false, false, SheetAct::Paste, pal, cx),
+                    self.sheet_btn("Cut", false, false, SheetAct::Cut, pal, cx),
+                    self.sheet_btn("Copy", false, false, SheetAct::Copy, pal, cx),
+                ],
+            ))
+            .child(group(
+                "Font",
+                vec![
+                    self.sheet_btn("B", true, false, SheetAct::Bold, pal, cx),
+                    self.sheet_btn("I", false, true, SheetAct::Italic, pal, cx),
+                ],
+            ))
+            .child(group(
+                "Alignment",
+                vec![
+                    self.sheet_btn("Left", false, false, SheetAct::AlignL, pal, cx),
+                    self.sheet_btn("Center", false, false, SheetAct::AlignC, pal, cx),
+                    self.sheet_btn("Right", false, false, SheetAct::AlignR, pal, cx),
+                ],
+            ))
+            .child(group(
+                "Undo",
+                vec![
+                    self.sheet_btn("\u{21B6}", false, false, SheetAct::Undo, pal, cx),
+                    self.sheet_btn("\u{21B7}", false, false, SheetAct::Redo, pal, cx),
+                ],
+            ))
+            .into_any_element()
+    }
+
     fn render_group(&self, g: &rs::Group<Act>, icon_only: bool, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let controls: Vec<AnyElement> = g.items.iter().map(|c| self.render_control(c, icon_only, pal, cx)).collect();
         // group title row + optional dialog-box launcher (⤢)
@@ -4999,7 +5161,13 @@ impl Render for Docxy {
         }
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        let ribbon_body = (is_doc && !self.ribbon_min).then(|| self.ribbon_body(vw, pal, cx));
+        let ribbon_body = (!self.ribbon_min && (is_doc || self.active_is_sheet())).then(|| {
+            if is_doc {
+                self.ribbon_body(vw, pal, cx)
+            } else {
+                self.sheet_ribbon_body(pal, cx)
+            }
+        });
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
