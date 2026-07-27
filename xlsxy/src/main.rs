@@ -696,6 +696,8 @@ enum PromptKind {
     ReplaceWith,
     /// Go To: a cell reference or defined name to jump to.
     GoTo,
+    /// Conditional formatting: a comparison like ">500" applied to the selection.
+    CondFormat,
 }
 
 struct Prompt {
@@ -744,6 +746,33 @@ struct FormatDialog {
 
 /// The Format Cells section tabs.
 const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
+
+/// Parse a conditional-format comparison like ">500", "<=100", "=42" into an
+/// Excel cellIs operator + operand (defaulting to greaterThan when no operator).
+fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
+    let s = s.trim();
+    let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
+        ("greaterThanOrEqual", r)
+    } else if let Some(r) = s.strip_prefix("<=") {
+        ("lessThanOrEqual", r)
+    } else if let Some(r) = s.strip_prefix("<>") {
+        ("notEqual", r)
+    } else if let Some(r) = s.strip_prefix('>') {
+        ("greaterThan", r)
+    } else if let Some(r) = s.strip_prefix('<') {
+        ("lessThan", r)
+    } else if let Some(r) = s.strip_prefix('=') {
+        ("equal", r)
+    } else {
+        ("greaterThan", s)
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some((op, rest.to_string()))
+    }
+}
 
 /// Number-format options offered by the picker: (label, format code).
 const NUMFMT_OPTIONS: &[(&str, Option<&str>)] = &[
@@ -2608,6 +2637,7 @@ impl App {
             FontColor => self.open_picker(PickKind::FontColor),
             FillColor => self.open_picker(PickKind::FillColor),
             MergeCenter => self.merge_toggle(),
+            CondFormat => self.open_prompt(PromptKind::CondFormat),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3153,6 +3183,31 @@ impl App {
         });
     }
 
+    /// Apply a "Highlight Cells" conditional-format rule to the selection from a
+    /// typed comparison (">500", "<=100", "=42"; leading operator parsed, default
+    /// greaterThan) using Excel's Light-Red-Fill / Dark-Red-Text preset.
+    fn commit_cond_format(&mut self, text: &str) {
+        let Some((op, val)) = parse_cf_input(text) else {
+            self.status = Some("Conditional format: enter a value, e.g. >500".into());
+            return;
+        };
+        let (r1, c1, r2, c2) = self.selection();
+        let s = self.sheet;
+        let dxf = gridcore::sheet::Dxf {
+            fill: Some((0xFF, 0xC7, 0xCE)),
+            color: Some((0x9C, 0x00, 0x06)),
+            bold: None,
+            italic: None,
+        };
+        self.pkg.add_conditional_format(s, (r1, c1, r2, c2), op, &val, None, dxf);
+        // add_conditional_format rewrites package parts; drop stale undo snapshots.
+        self.undo.clear();
+        self.redo.clear();
+        self.rebuild_engine();
+        self.modified = true;
+        self.status = Some(format!("Conditional format: value {op} {val}"));
+    }
+
     /// Merge & Center the selection (or unmerge if its top-left is already a merge
     /// origin). Centres the anchor cell; renders via the merge-aware grid draw.
     fn merge_toggle(&mut self) {
@@ -3653,6 +3708,7 @@ impl App {
             ),
             PromptKind::ReplaceWith => ("Replace with: ", String::new()),
             PromptKind::GoTo => ("Go to: ", String::new()),
+            PromptKind::CondFormat => ("Highlight where value (>500, <=100, =42): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -3688,6 +3744,7 @@ impl App {
                 }
             }
             PromptKind::GoTo => self.goto(&text),
+            PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -6020,6 +6077,42 @@ mod tests {
         let c = app.sheet().cell(3, 0).unwrap();
         assert_eq!(c.formula.as_deref(), Some("SUM(A1:A3)"));
         assert_eq!(c.value, CellValue::Number(12.0));
+    }
+
+    #[test]
+    fn parse_cf_input_operators() {
+        assert_eq!(parse_cf_input(">500"), Some(("greaterThan", "500".into())));
+        assert_eq!(parse_cf_input("<=100"), Some(("lessThanOrEqual", "100".into())));
+        assert_eq!(parse_cf_input("<>0"), Some(("notEqual", "0".into())));
+        assert_eq!(parse_cf_input("=42"), Some(("equal", "42".into())));
+        assert_eq!(parse_cf_input("42"), Some(("greaterThan", "42".into())));
+        assert_eq!(parse_cf_input("   "), None);
+    }
+
+    #[test]
+    fn cond_format_highlights_matching_cells() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::number(100.0));
+            sh.set_cell(1, 0, Cell::number(900.0));
+        }
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((1, 0)); // A1:A2
+        app.commit_cond_format(">500");
+
+        assert_eq!(app.pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert!(gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 0, 0).is_none());
+        let d = gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 1, 0).expect("900 > 500 matches");
+        assert_eq!(d.fill, Some((0xFF, 0xC7, 0xCE)));
+
+        // Round-trips.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
+        assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
     }
 
     #[test]

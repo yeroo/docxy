@@ -46,6 +46,7 @@ pub enum Act {
     FontColor,
     FillColor,
     MergeCenter,
+    CondFormat,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -180,7 +181,7 @@ fn home_groups() -> Vec<Group> {
             width: 8,
             rows: [
                 vec![btn("Format ▾", NumberFormat, "Number format…")],
-                vec![],
+                vec![btn("Cond Fmt", CondFormat, "Conditional formatting (highlight cells)")],
             ],
         },
         Group {
