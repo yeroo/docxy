@@ -2607,6 +2607,7 @@ impl App {
             NumberFormat => self.open_picker(PickKind::NumberFormat),
             FontColor => self.open_picker(PickKind::FontColor),
             FillColor => self.open_picker(PickKind::FillColor),
+            MergeCenter => self.merge_toggle(),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3150,6 +3151,27 @@ impl App {
             let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
             wb.sheets[s].set_cell(r, c, cell);
         });
+    }
+
+    /// Merge & Center the selection (or unmerge if its top-left is already a merge
+    /// origin). Centres the anchor cell; renders via the merge-aware grid draw.
+    fn merge_toggle(&mut self) {
+        use gridcore::sheet::Align;
+        let (r1, c1, r2, c2) = self.selection(); // raw: merging blank cells is valid
+        let s = self.sheet;
+        self.structural(move |wb| {
+            if let Some(i) = wb.sheets[s].merges.iter().position(|&(a, b, _, _)| a == r1 && b == c1) {
+                wb.sheets[s].merges.remove(i);
+            } else if r2 > r1 || c2 > c1 {
+                wb.sheets[s].merges.push((r1, c1, r2, c2));
+                let style = wb.sheets[s].cell(r1, c1).map(|x| x.style).unwrap_or(0);
+                let mut xf = wb.styles.xf(style);
+                xf.align = Align::Center;
+                let idx = wb.styles.intern(xf);
+                wb.sheets[s].cells.entry((r1, c1)).or_default().style = idx;
+            }
+        });
+        self.status = Some("Toggled Merge & Center".into());
     }
 
     /// Insert a chart from the selection: the first non-numeric column is the
@@ -4112,6 +4134,7 @@ fn draw(app: &mut App, f: &mut Frame) {
     let sheet = app.sheet();
     let styles = &app.pkg.workbook.styles;
     let date1904 = app.pkg.workbook.date1904;
+    let merges = sheet.merges.clone();
     let mut lines: Vec<RLine> = Vec::with_capacity(grid.height as usize);
     for &row in &vis_rows {
         let mut spans: Vec<RSpan> = Vec::with_capacity(app.vis_cols.len() + 1);
@@ -4120,15 +4143,38 @@ fn draw(app: &mut App, f: &mut Frame) {
             format!("{:>w$} ", row + 1, w = app.gutter_w as usize - 1),
             gut_style,
         ));
+        // Skip columns covered by a horizontal merge whose top-left is to the left.
+        let mut skip_to: i64 = -1;
         for &(col, _, w) in &app.vis_cols {
+            if (col as i64) <= skip_to {
+                continue;
+            }
+            // Merged regions: the top-left cell spans its columns' combined visible
+            // width; covered cells in the same row are skipped; cells under a
+            // vertical merge render blank (content lives only in the top-left).
+            let merge = merges.iter().find(|&&(mr1, mc1, mr2, mc2)| row >= mr1 && row <= mr2 && col >= mc1 && col <= mc2).copied();
+            let (w, blank_covered) = match merge {
+                Some((mr1, mc1, _mr2, mc2)) if row == mr1 && col == mc1 => {
+                    skip_to = mc2 as i64;
+                    let cw: u16 = app.vis_cols.iter().filter(|&&(cc, _, _)| cc >= col && cc <= mc2).map(|&(_, _, ww)| ww).sum();
+                    (cw.max(1), false)
+                }
+                Some((mr1, _, _, _)) if row == mr1 => continue, // covered in the top row
+                Some(_) => (w, true),                            // under a vertical merge
+                None => (w, false),
+            };
             let cell = sheet.cell(row, col);
             let xf = cell.map(|cl| styles.xf(cl.style)).unwrap_or_default();
-            let text = match cell {
-                Some(cl) if formula_view && cl.formula.is_some() => {
-                    format!("={}", cl.formula.as_ref().unwrap())
+            let text = if blank_covered {
+                String::new()
+            } else {
+                match cell {
+                    Some(cl) if formula_view && cl.formula.is_some() => {
+                        format!("={}", cl.formula.as_ref().unwrap())
+                    }
+                    Some(cl) => format_with(&xf, &cl.value, date1904),
+                    None => String::new(),
                 }
-                Some(cl) => format_with(&xf, &cl.value, date1904),
-                None => String::new(),
             };
             let numeric = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))
                 && xf.numfmt != NumFmt::Text;
@@ -5974,6 +6020,54 @@ mod tests {
         let c = app.sheet().cell(3, 0).unwrap();
         assert_eq!(c.formula.as_deref(), Some("SUM(A1:A3)"));
         assert_eq!(c.value, CellValue::Number(12.0));
+    }
+
+    #[test]
+    fn merge_toggle_merges_and_unmerges() {
+        use gridcore::sheet::{Align, Cell};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Title"));
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((0, 2)); // A1:C1
+        app.merge_toggle();
+        assert_eq!(app.pkg.workbook.sheets[0].merges, vec![(0, 0, 0, 2)]);
+        let xf = {
+            let c = app.sheet().cell(0, 0).unwrap();
+            app.pkg.workbook.styles.xf(c.style)
+        };
+        assert_eq!(xf.align, Align::Center); // anchor centred
+
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].merges, vec![(0, 0, 0, 2)]);
+
+        // Re-toggle on the anchor unmerges.
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.merge_toggle();
+        assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+    }
+
+    #[test]
+    fn merged_cells_render_spanned() {
+        use gridcore::sheet::Cell;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("MERGEDTITLE"));
+            sh.set_cell(0, 1, Cell::text("COVERED")); // hidden by the merge
+            sh.merges.push((0, 0, 0, 2));
+        }
+        app.rebuild_engine();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("MERGEDTITLE"), "top-left content missing");
+        assert!(!text.contains("COVERED"), "covered cell should be blanked");
     }
 
     #[test]

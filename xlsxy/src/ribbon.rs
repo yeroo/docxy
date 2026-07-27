@@ -45,6 +45,7 @@ pub enum Act {
     NumberFormat,
     FontColor,
     FillColor,
+    MergeCenter,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -152,7 +153,7 @@ fn home_groups() -> Vec<Group> {
         },
         Group {
             title: "Font",
-            width: 17,
+            width: 23,
             rows: [
                 vec![
                     btn("B", Bold, "Bold (Ctrl+B)"),
@@ -169,6 +170,8 @@ fn home_groups() -> Vec<Group> {
                     btn("Center", AlignCenter, "Align center"),
                     Seg::Gap(" "),
                     btn("Right", AlignRight, "Align right"),
+                    Seg::Gap(" "),
+                    btn("Merge", MergeCenter, "Merge & Center the selection (toggle)"),
                 ],
             ],
         },
