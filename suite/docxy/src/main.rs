@@ -285,6 +285,10 @@ enum SheetAct {
     DeleteComment,
     PrevComment,
     NextComment,
+    InsertRow,
+    DeleteRow,
+    InsertCol,
+    DeleteCol,
     Todo,
 }
 
@@ -293,6 +297,15 @@ enum SheetAct {
 enum SheetPick {
     Fill,
     Font,
+}
+
+/// A whole-row / whole-column structural edit at the selection.
+#[derive(Clone, Copy)]
+enum StructOp {
+    InsertRow,
+    DeleteRow,
+    InsertCol,
+    DeleteCol,
 }
 
 impl SheetView {
@@ -1502,6 +1515,27 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
+    /// rebuild the recalc engine so shifted formulas re-evaluate.
+    fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
+        use gridcore::edit;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let (r, c) = v.sel;
+            let wb = &mut v.pkg.workbook;
+            match op {
+                StructOp::InsertRow => edit::insert_rows(wb, s, r, 1),
+                StructOp::DeleteRow => edit::delete_rows(wb, s, r, 1),
+                StructOp::InsertCol => edit::insert_cols(wb, s, c, 1),
+                StructOp::DeleteCol => edit::delete_cols(wb, s, c, 1),
+            }
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Follow the hyperlink on cell (r,c) of the active sheet, if any: jump for an
     /// in-workbook `#Sheet!A1` target, else open the URL externally.
     fn sheet_follow_hyperlink(&mut self, r: u32, c: u32, cx: &mut Context<Self>) {
@@ -2069,6 +2103,10 @@ impl Docxy {
             SheetAct::DeleteComment => self.sheet_delete_comment(cx),
             SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
             SheetAct::NextComment => self.sheet_comment_nav(true, cx),
+            SheetAct::InsertRow => self.sheet_structural(StructOp::InsertRow, cx),
+            SheetAct::DeleteRow => self.sheet_structural(StructOp::DeleteRow, cx),
+            SheetAct::InsertCol => self.sheet_structural(StructOp::InsertCol, cx),
+            SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -5948,9 +5986,13 @@ impl Docxy {
                 .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             // Cells: Insert, Delete, Format.
-            .child(group("Cells", false, h_flex().h_full().items_center().gap_0p5()
-                .child(self.sheet_lb(None, "Insert", SheetAct::Todo, pal, cx))
-                .child(self.sheet_lb(None, "Delete", SheetAct::Todo, pal, cx))
+            .child(group("Cells", false, h_flex().h_full().items_center().gap_2()
+                .child(v_flex().gap_0p5()
+                    .child(self.sheet_rb(None, "Insert Row", SheetAct::InsertRow, pal, cx))
+                    .child(self.sheet_rb(None, "Insert Col", SheetAct::InsertCol, pal, cx)))
+                .child(v_flex().gap_0p5()
+                    .child(self.sheet_rb(None, "Delete Row", SheetAct::DeleteRow, pal, cx))
+                    .child(self.sheet_rb(None, "Delete Col", SheetAct::DeleteCol, pal, cx)))
                 .child(self.sheet_lb(None, "Format", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
