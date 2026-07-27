@@ -53,6 +53,8 @@ pub enum Act {
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
+    Subtotal,
+    Outline,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -279,6 +281,14 @@ fn insert_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Split", TextToColumns, "Text to Columns: split by a delimiter"),
                 ],
+            ],
+        },
+        Group {
+            title: "Outline",
+            width: 18,
+            rows: [
+                vec![btn("Σ Subtotal", Subtotal, "Insert subtotals at each change in the current column")],
+                vec![btn("⊟ Group ▾", Outline, "Collapse/expand the grouped detail rows")],
             ],
         },
     ]

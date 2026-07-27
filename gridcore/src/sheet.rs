@@ -444,6 +444,42 @@ impl Sheet {
         }
     }
 
+    /// The row's outline (grouping) level from its `<row outlineLevel="N">`
+    /// attribute; 0 when ungrouped.
+    pub fn row_outline(&self, row: u32) -> u8 {
+        self.row_attrs
+            .get(&row)
+            .and_then(|a| {
+                a.find("outlineLevel=\"").map(|i| i + "outlineLevel=\"".len()).and_then(|s| {
+                    a[s..].find('"').and_then(|e| a[s..s + e].parse::<u8>().ok())
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// Set the row's outline (grouping) level, preserving its other `<row>`
+    /// attributes. Level 0 removes the grouping.
+    pub fn set_row_outline(&mut self, row: u32, level: u8) {
+        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
+        let cleaned = strip_xml_attr(&cur, "outlineLevel");
+        let next = if level > 0 {
+            if cleaned.is_empty() { format!("outlineLevel=\"{level}\"") } else { format!("{cleaned} outlineLevel=\"{level}\"") }
+        } else {
+            cleaned
+        };
+        if next.is_empty() {
+            self.row_attrs.remove(&row);
+        } else {
+            self.row_attrs.insert(row, next);
+        }
+    }
+
+    /// The deepest outline level used by any row (for `<sheetFormatPr
+    /// outlineLevelRow>` and collapse controls). 0 when the sheet is flat.
+    pub fn max_row_outline(&self) -> u8 {
+        self.row_attrs.keys().map(|&r| self.row_outline(r)).max().unwrap_or(0)
+    }
+
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).
     pub fn col_hidden(&self, col: u32) -> bool {
         self.col_defs

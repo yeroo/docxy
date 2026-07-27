@@ -317,6 +317,111 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
     (r2 - r1 + 1) as usize
 }
 
+/// Insert subtotal rows into a region already grouped by `group_col`: at each
+/// change in that column's value, add a `SUBTOTAL(9, …)` row over the numeric
+/// `sum_cols` (inferred from the data when the slice is empty), then a grand
+/// total over the whole region. Detail rows are given outline level 1 so they
+/// collapse under their subtotal. The region must be sorted by `group_col`
+/// first (Excel requires this too). Grand totals use `SUBTOTAL` precisely
+/// because it skips the nested per-group subtotals. Returns the number of rows
+/// added (groups + 1), or 0 when there's nothing to total.
+pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u32, sum_cols: &[u32], has_header: bool) -> usize {
+    use crate::sheet::cell_name;
+    let start = if has_header { r1 + 1 } else { r1 };
+    if r2 < start {
+        return 0;
+    }
+    // Snapshot the detail rows as full-width cell vectors.
+    let (max_c, detail): (u32, Vec<Vec<Option<Cell>>>) = {
+        let Some(s) = wb.sheets.get(sheet) else {
+            return 0;
+        };
+        let (_, cols) = s.used_size();
+        if cols == 0 {
+            return 0;
+        }
+        let max_c = cols - 1;
+        let detail = (start..=r2)
+            .map(|r| (0..=max_c).map(|c| s.cell(r, c).cloned()).collect())
+            .collect();
+        (max_c, detail)
+    };
+    let gc = group_col as usize;
+    let key_of = |row: &[Option<Cell>]| row.get(gc).and_then(|c| c.as_ref()).map(|c| format!("{:?}", c.value)).unwrap_or_default();
+    let label_of = |row: &[Option<Cell>]| match row.get(gc).and_then(|c| c.as_ref()).map(|c| &c.value) {
+        Some(CellValue::Text(t)) => t.clone(),
+        Some(CellValue::Number(n)) => n.to_string(),
+        Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        _ => String::new(),
+    };
+    // Runs of consecutive equal group values: (label, start_idx, end_idx).
+    let mut runs: Vec<(String, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < detail.len() {
+        let k = key_of(&detail[i]);
+        let mut j = i;
+        while j + 1 < detail.len() && key_of(&detail[j + 1]) == k {
+            j += 1;
+        }
+        runs.push((label_of(&detail[i]), i, j));
+        i = j + 1;
+    }
+    if runs.is_empty() {
+        return 0;
+    }
+    // Which columns to total: the caller's list, or every numeric column but the
+    // group column.
+    let sum_set: Vec<u32> = if !sum_cols.is_empty() {
+        sum_cols.to_vec()
+    } else {
+        (0..=max_c)
+            .filter(|&c| c != group_col && detail.iter().any(|row| matches!(row.get(c as usize).and_then(|x| x.as_ref()).map(|x| &x.value), Some(CellValue::Number(_)))))
+            .collect()
+    };
+    let added = runs.len() + 1;
+    // Push the tail down to make room (adjusting formulas that reference it).
+    insert_rows(wb, sheet, r2 + 1, added as u32);
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    fn write_row(s: &mut Sheet, r: u32, row: &[Option<Cell>]) {
+        for (c, cell) in row.iter().enumerate() {
+            match cell {
+                Some(cl) => s.set_cell(r, c as u32, cl.clone()),
+                None => {
+                    s.cells.remove(&(r, c as u32));
+                }
+            }
+        }
+    }
+    let subtotal_row = |s: &mut Sheet, out: u32, label: &str, first: u32, last: u32| {
+        for c in 0..=max_c {
+            s.cells.remove(&(out, c));
+        }
+        s.set_row_outline(out, 0);
+        s.set_cell(out, group_col, Cell::text(label));
+        for &c in &sum_set {
+            let rng = format!("{}:{}", cell_name(first, c), cell_name(last, c));
+            s.set_cell(out, c, Cell::formula(&format!("SUBTOTAL(9,{rng})")));
+        }
+    };
+    let mut out = start;
+    for (label, si, ei) in &runs {
+        let first = out;
+        for idx in *si..=*ei {
+            write_row(s, out, &detail[idx]);
+            s.set_row_outline(out, 1);
+            out += 1;
+        }
+        let text = if label.is_empty() { "Total".to_string() } else { format!("{label} Total") };
+        subtotal_row(s, out, &text, first, out - 1);
+        out += 1;
+    }
+    // Grand total over the whole region; SUBTOTAL skips the nested subtotals.
+    subtotal_row(s, out, "Grand Total", start, out - 1);
+    added
+}
+
 /// Split each text cell in column `col` over rows `r1..=r2` at `delim`, writing
 /// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
 /// Numeric-looking parts become numbers. Rows without the delimiter are left
@@ -591,6 +696,41 @@ mod tests {
         assert_eq!(col(3, 0), Some(CellValue::Text("B".into())));
         assert_eq!(col(3, 1), Some(CellValue::Number(20.0)));
         assert_eq!(col(4, 1), Some(CellValue::Number(10.0)));
+    }
+
+    #[test]
+    fn subtotal_inserts_group_and_grand_totals() {
+        // Region A1:B5 — header + two groups (A: 1,2 / B: 4), pre-sorted.
+        let mut w = wb(&[
+            ("A1", Cell::text("Grp")),
+            ("B1", Cell::text("Amt")),
+            ("A2", Cell::text("A")),
+            ("B2", Cell::number(1.0)),
+            ("A3", Cell::text("A")),
+            ("B3", Cell::number(2.0)),
+            ("A4", Cell::text("B")),
+            ("B4", Cell::number(4.0)),
+        ]);
+        let added = subtotal(&mut w, 0, 0, 3, 0, &[], true);
+        assert_eq!(added, 3); // 2 group subtotals + grand total
+        let s = &w.sheets[0];
+        let txt = |r: u32, c: u32| s.cell(r, c).map(|cl| cl.value.clone());
+        // Layout: hdr, A/1, A/2, "A Total", B/4, "B Total", "Grand Total".
+        assert_eq!(txt(3, 0), Some(CellValue::Text("A Total".into())));
+        assert_eq!(txt(5, 0), Some(CellValue::Text("B Total".into())));
+        assert_eq!(txt(6, 0), Some(CellValue::Text("Grand Total".into())));
+        // Detail rows are grouped at outline level 1; totals stay at level 0.
+        assert_eq!(s.row_outline(1), 1);
+        assert_eq!(s.row_outline(2), 1);
+        assert_eq!(s.row_outline(3), 0);
+        assert_eq!(s.row_outline(4), 1);
+        assert_eq!(s.row_outline(6), 0);
+        // The subtotal formulas evaluate: A=3, B=4, grand=7 (SUBTOTAL skips nesting).
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(value_at(&w, "B4"), CellValue::Number(3.0)); // A Total
+        assert_eq!(value_at(&w, "B6"), CellValue::Number(4.0)); // B Total
+        assert_eq!(value_at(&w, "B7"), CellValue::Number(7.0)); // Grand Total
     }
 
     #[test]

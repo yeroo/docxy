@@ -306,6 +306,8 @@ enum SheetAct {
     TextToColumns,
     FormatAsTable,
     ProtectSheet,
+    Subtotal,
+    Outline,
     Todo,
 }
 
@@ -1933,6 +1935,58 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Subtotal: at each change in the selected column's value, insert a
+    /// SUBTOTAL(9,…) row over the numeric columns plus a grand total; detail
+    /// rows are grouped (outline level 1) for collapse. The region should be
+    /// sorted by that column first.
+    fn sheet_subtotal(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::CellValue;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let sc = v.sel.1;
+            let cur_r = v.sel.0;
+            let (max_r, max_c) = v.extent();
+            let sh = &v.pkg.workbook.sheets[s];
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            gridcore::edit::subtotal(&mut v.pkg.workbook, s, top, bottom, sc, &[], header);
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Collapse (hide) or expand all grouped detail rows (outline level ≥ 1),
+    /// leaving the subtotal rows visible.
+    fn sheet_toggle_outline(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let sh = &v.pkg.workbook.sheets[s];
+            let outlined: Vec<u32> = sh.row_attrs.keys().copied().filter(|&r| sh.row_outline(r) >= 1).collect();
+            if outlined.is_empty() {
+                return;
+            }
+            let any_visible = outlined.iter().any(|&r| !sh.row_hidden(r));
+            for &r in &outlined {
+                v.pkg.workbook.sheets[s].set_row_hidden(r, any_visible);
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Format as Table: wrap the active multi-cell selection (or the contiguous
     /// region grown around the cursor) in an Excel Table — banded, filterable,
     /// and styled by Excel on open. The first row becomes headers when it is all
@@ -2685,6 +2739,8 @@ impl Docxy {
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
+            SheetAct::Subtotal => self.sheet_subtotal(cx),
+            SheetAct::Outline => self.sheet_toggle_outline(cx),
             SheetAct::TextToColumns => {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
@@ -6735,6 +6791,10 @@ impl Docxy {
                 .child(self.sheet_lb(Some("table"), "Table", SheetAct::FormatAsTable, pal, cx))
                 .child(self.sheet_lb(None, "Data Validation", SheetAct::DataValidation, pal, cx))
                 .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
+                .into_any_element()))
+            .child(group("Outline", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, "Subtotal", SheetAct::Subtotal, pal, cx))
+                .child(self.sheet_lb(None, "Group / Ungroup", SheetAct::Outline, pal, cx))
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))

@@ -3380,6 +3380,21 @@ mod tests {
     }
 
     #[test]
+    fn row_outline_round_trips() {
+        use crate::sheet::Cell;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(1.0));
+        pkg.workbook.sheets[0].set_row_outline(0, 2);
+        pkg.workbook.sheets[0].set_row_hidden(0, true); // outline + hidden coexist
+        assert_eq!(pkg.workbook.sheets[0].max_row_outline(), 2);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].row_outline(0), 2);
+        assert!(re.workbook.sheets[0].row_hidden(0));
+        let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(ws.contains("outlineLevel=\"2\""), "{ws}");
+    }
+
+    #[test]
     fn sheet_protection_round_trips() {
         let mut pkg = new_xlsx();
         assert!(!pkg.workbook.sheets[0].is_protected());

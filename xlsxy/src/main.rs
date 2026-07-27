@@ -2682,6 +2682,8 @@ impl App {
             RemoveDuplicates => self.remove_duplicates(),
             TextToColumns => self.open_prompt(PromptKind::TextToColumns),
             FormatAsTable => self.format_as_table(),
+            Subtotal => self.subtotal(),
+            Outline => self.toggle_outline(),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3276,6 +3278,70 @@ impl App {
             removed = gridcore::edit::dedupe_rows(wb, s, top, bottom, header);
         });
         self.status = Some(format!("Removed {removed} duplicate row{}", if removed == 1 { "" } else { "s" }));
+    }
+
+    /// Subtotal: at each change in the cursor column's value, insert a
+    /// SUBTOTAL(9,…) row over the numeric columns, plus a grand total. The
+    /// region must already be sorted by that column. Detail rows are grouped
+    /// (outline level 1) so they can be collapsed with Group.
+    fn subtotal(&mut self) {
+        use gridcore::sheet::CellValue;
+        let s = self.sheet;
+        let sc = self.cur.1;
+        let cur_r = self.cur.0;
+        let (rc, cc) = self.sheet().used_size();
+        if rc == 0 || cc == 0 {
+            self.status = Some("Subtotal: the sheet is empty".into());
+            return;
+        }
+        let (max_r, max_c) = (rc - 1, cc - 1);
+        let (top, bottom, header) = {
+            let sh = self.sheet();
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                self.status = Some("Subtotal: put the cursor in the data".into());
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            (top, bottom, header)
+        };
+        let mut added = 0;
+        self.structural(|wb| {
+            added = gridcore::edit::subtotal(wb, s, top, bottom, sc, &[], header);
+        });
+        self.status = Some(if added == 0 {
+            "Subtotal: nothing to total".into()
+        } else {
+            format!("Inserted {added} subtotal row{} — use Group to collapse", if added == 1 { "" } else { "s" })
+        });
+    }
+
+    /// Toggle the outline: collapse (hide) all grouped detail rows to show just
+    /// the subtotals, or expand them again. Operates on rows with outline level
+    /// ≥ 1 anywhere on the sheet.
+    fn toggle_outline(&mut self) {
+        let s = self.sheet;
+        let sh = &self.pkg.workbook.sheets[s];
+        let outlined: Vec<u32> = sh.row_attrs.keys().copied().filter(|&r| sh.row_outline(r) >= 1).collect();
+        if outlined.is_empty() {
+            self.status = Some("No grouped rows — run Subtotal first".into());
+            return;
+        }
+        let any_visible = outlined.iter().any(|&r| !sh.row_hidden(r));
+        for &r in &outlined {
+            self.pkg.workbook.sheets[s].set_row_hidden(r, any_visible);
+        }
+        self.clamp_cursor();
+        self.modified = true;
+        self.status = Some(if any_visible { "Outline collapsed".into() } else { "Outline expanded".into() });
     }
 
     /// Format as Table: wrap the contiguous region around the cursor (or the
@@ -6494,6 +6560,38 @@ mod tests {
         app.pkg.workbook.sheets[0].set_protected(true);
         let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
         assert!(re.workbook.sheets[0].is_protected());
+    }
+
+    #[test]
+    fn subtotal_and_outline_collapse() {
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Grp"));
+            sh.set_cell(0, 1, Cell::text("Amt"));
+            for (i, (g, a)) in [("A", 1.0), ("A", 2.0), ("B", 4.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(g));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*a));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 0); // group by column A
+        app.anchor = None;
+        app.subtotal();
+        // Grand total row appears with the summed value.
+        let v = |r, c| app.sheet().cell(r, c).map(|cl| cl.value.clone());
+        assert_eq!(v(3, 0), Some(CellValue::Text("A Total".into())));
+        assert_eq!(v(6, 0), Some(CellValue::Text("Grand Total".into())));
+        assert_eq!(app.sheet().row_outline(1), 1);
+
+        // Collapse hides detail rows (outline ≥ 1); expand restores them.
+        app.toggle_outline();
+        assert!(app.sheet().row_hidden(1));
+        assert!(!app.sheet().row_hidden(3)); // subtotal row stays visible
+        app.toggle_outline();
+        assert!(!app.sheet().row_hidden(1));
     }
 
     #[test]
