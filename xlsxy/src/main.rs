@@ -700,6 +700,8 @@ enum PromptKind {
     CondFormat,
     /// Data validation: comma-separated allowed values → a dropdown list.
     DataValidation,
+    /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
+    Filter,
 }
 
 struct Prompt {
@@ -2648,6 +2650,7 @@ impl App {
             MergeCenter => self.merge_toggle(),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_prompt(PromptKind::DataValidation),
+            Filter => self.open_prompt(PromptKind::Filter),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3191,6 +3194,69 @@ impl App {
             let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
             wb.sheets[s].set_cell(r, c, cell);
         });
+    }
+
+    /// AutoFilter: hide the rows of the current region whose cursor-column value
+    /// fails the typed criteria (header row kept). "clear" unhides them all.
+    fn commit_filter(&mut self, text: &str) {
+        use gridcore::sheet::CellValue;
+        let s = self.sheet;
+        let sc = self.cur.1;
+        let cur_r = self.cur.0;
+        let (rc, cc) = self.sheet().used_size();
+        if rc == 0 || cc == 0 {
+            return;
+        }
+        let (max_r, max_c) = (rc - 1, cc - 1);
+        // Contiguous region around the cursor.
+        let (top, bottom, header) = {
+            let sh = self.sheet();
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            (top, bottom, header)
+        };
+        if text.trim().eq_ignore_ascii_case("clear") {
+            for r in top..=bottom {
+                self.pkg.workbook.sheets[s].set_row_hidden(r, false);
+            }
+            self.clamp_cursor();
+            self.modified = true;
+            self.status = Some("Filter cleared".into());
+            return;
+        }
+        let Some((op, operand)) = gridcore::filter::parse(text) else {
+            self.status = Some("Filter: enter a value or comparison".into());
+            return;
+        };
+        let start = if header { top + 1 } else { top };
+        let keep: Vec<bool> = (start..=bottom)
+            .map(|r| {
+                let v = self.sheet().cell(r, sc).map(|c| c.value.clone());
+                gridcore::filter::matches(v.as_ref(), op, &operand)
+            })
+            .collect();
+        let mut hidden = 0;
+        for (i, r) in (start..=bottom).enumerate() {
+            let hide = !keep[i];
+            if hide {
+                hidden += 1;
+            }
+            self.pkg.workbook.sheets[s].set_row_hidden(r, hide);
+        }
+        self.clamp_cursor();
+        self.modified = true;
+        self.status = Some(format!("Filtered by column: {hidden} rows hidden"));
     }
 
     /// Create a list data-validation (dropdown) over the selection from a
@@ -3748,6 +3814,7 @@ impl App {
             PromptKind::GoTo => ("Go to: ", String::new()),
             PromptKind::CondFormat => ("Highlight (>500, =42, 100..500 between, 'clear'): ", String::new()),
             PromptKind::DataValidation => ("Dropdown list (comma-separated values): ", String::new()),
+            PromptKind::Filter => ("Filter this column (=Laptop, >500, <>0, 'clear'): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -3785,6 +3852,7 @@ impl App {
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
+            PromptKind::Filter => self.commit_filter(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -6154,6 +6222,43 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn commit_filter_hides_nonmatching_rows() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            for (i, (name, qty)) in [("A", 300.0), ("B", 50.0), ("C", 900.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(name));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*qty));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 1); // Qty column, a data cell
+        app.anchor = None;
+        app.commit_filter(">100");
+        // header visible; A(300),C(900) kept; B(50) hidden.
+        let sh = app.sheet();
+        assert!(!sh.row_hidden(0)); // header
+        assert!(!sh.row_hidden(1)); // 300
+        assert!(sh.row_hidden(2)); // 50 hidden
+        assert!(!sh.row_hidden(3)); // 900
+
+        // Clear unhides everything.
+        app.commit_filter("clear");
+        let sh = app.sheet();
+        assert!(!sh.row_hidden(2));
+
+        // Text equals filter on the Item column.
+        app.cur = (1, 0);
+        app.commit_filter("=C");
+        let sh = app.sheet();
+        assert!(sh.row_hidden(1) && sh.row_hidden(2) && !sh.row_hidden(3));
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub enum Act {
     MergeCenter,
     CondFormat,
     DataValidation,
+    Filter,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -260,7 +261,7 @@ fn insert_groups() -> Vec<Group> {
             width: 14,
             rows: [
                 vec![btn("Validation", DataValidation, "Data validation (dropdown list)")],
-                vec![],
+                vec![btn("Filter ▾", Filter, "AutoFilter the current column")],
             ],
         },
     ]

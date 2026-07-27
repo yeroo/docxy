@@ -180,6 +180,21 @@ fn attr_hidden(attrs: &str) -> bool {
     attrs.contains("hidden=\"1\"") || attrs.contains("hidden=\"true\"")
 }
 
+/// Remove `name="…"` from a space-separated attribute string, tidying whitespace.
+fn strip_xml_attr(s: &str, name: &str) -> String {
+    let key = format!("{name}=\"");
+    let out = if let Some(i) = s.find(&key) {
+        let after = i + key.len();
+        match s[after..].find('"') {
+            Some(q) => format!("{}{}", &s[..i], &s[after + q + 1..]),
+            None => s.to_string(),
+        }
+    } else {
+        s.to_string()
+    };
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
     pub name: String,
@@ -391,6 +406,22 @@ impl Sheet {
     /// applied auto-filter (Excel persists all three as `hidden="1"`).
     pub fn row_hidden(&self, row: u32) -> bool {
         self.row_attrs.get(&row).is_some_and(|a| attr_hidden(a))
+    }
+
+    /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
+    pub fn set_row_hidden(&mut self, row: u32, hidden: bool) {
+        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
+        let cleaned = strip_xml_attr(&cur, "hidden");
+        let next = if hidden {
+            if cleaned.is_empty() { "hidden=\"1\"".to_string() } else { format!("{cleaned} hidden=\"1\"") }
+        } else {
+            cleaned
+        };
+        if next.is_empty() {
+            self.row_attrs.remove(&row);
+        } else {
+            self.row_attrs.insert(row, next);
+        }
     }
 
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).

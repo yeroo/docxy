@@ -300,6 +300,7 @@ enum SheetAct {
     Merge,
     CondFormat,
     DataValidation,
+    Filter,
     Todo,
 }
 
@@ -537,6 +538,8 @@ struct Docxy {
     sheet_cf_edit: Option<String>,
     // In-progress data-validation list entry (comma-separated allowed values).
     sheet_dv_edit: Option<String>,
+    // In-progress AutoFilter criteria entry for the selected column.
+    sheet_filter_edit: Option<String>,
 }
 
 /// Common number formats offered by the Number-group dropdown: (label, code).
@@ -923,6 +926,7 @@ impl Docxy {
             sheet_fmt_open: false,
             sheet_cf_edit: None,
             sheet_dv_edit: None,
+            sheet_filter_edit: None,
         }
     }
 
@@ -1530,6 +1534,80 @@ impl Docxy {
             }
         }
         cx.notify();
+    }
+
+    /// Apply an AutoFilter criteria to the selected column: hide the rows of the
+    /// contiguous region whose value fails it (header kept). "clear" unhides.
+    fn sheet_apply_filter(&mut self, text: &str, cx: &mut Context<Self>) {
+        use gridcore::sheet::CellValue;
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let sc = v.sel.1;
+            let cur_r = v.sel.0;
+            let (max_r, max_c) = v.extent();
+            // Contiguous region around the cursor.
+            let sh = &v.pkg.workbook.sheets[s];
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            let start = if header { top + 1 } else { top };
+            if text.trim().eq_ignore_ascii_case("clear") {
+                for r in top..=bottom {
+                    v.pkg.workbook.sheets[s].set_row_hidden(r, false);
+                }
+            } else if let Some((op, operand)) = gridcore::filter::parse(text) {
+                let keep: Vec<bool> = (start..=bottom)
+                    .map(|r| {
+                        let val = v.pkg.workbook.sheets[s].cell(r, sc).map(|c| c.value.clone());
+                        gridcore::filter::matches(val.as_ref(), &op, &operand)
+                    })
+                    .collect();
+                for (i, r) in (start..=bottom).enumerate() {
+                    v.pkg.workbook.sheets[s].set_row_hidden(r, !keep[i]);
+                }
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Route a keystroke into the AutoFilter criteria bar (Enter applies, Esc cancels).
+    fn sheet_filter_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_filter_edit.clone() else { return };
+        match key {
+            "escape" => {
+                self.sheet_filter_edit = None;
+                cx.notify();
+            }
+            "enter" => {
+                self.sheet_filter_edit = None;
+                self.sheet_apply_filter(&buf, cx);
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_filter_edit = Some(buf);
+                cx.notify();
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_filter_edit = Some(buf);
+                cx.notify();
+            }
+        }
     }
 
     /// Route a keystroke into the data-validation entry bar; Enter creates a list
@@ -2413,6 +2491,10 @@ impl Docxy {
                 self.sheet_dv_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::Filter => {
+                self.sheet_filter_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -2436,6 +2518,10 @@ impl Docxy {
         // The data-validation entry bar swallows typing too.
         if self.sheet_dv_edit.is_some() {
             return self.sheet_dv_edit_key(ev, key, cx);
+        }
+        // The AutoFilter criteria bar swallows typing too.
+        if self.sheet_filter_edit.is_some() {
+            return self.sheet_filter_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6195,6 +6281,31 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The AutoFilter criteria bar: type a comparison on the current column.
+    fn sheet_filter_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::col_name;
+        let col = self.active_sheet().map(|v| col_name(v.sel.1)).unwrap_or_default();
+        let ent = cx.entity();
+        let ent_cancel = ent.clone();
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Filter column {col} where value")))
+            .child(
+                div().w(px(180.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { "=Laptop  (or >500, clear)".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().id("filter-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_filter_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
     /// The data-validation entry bar: type comma-separated allowed values to make
     /// the selection a dropdown list.
     fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6572,6 +6683,7 @@ impl Docxy {
                 .child(col(vec![
                     self.sheet_rb(Some("sort"), "Sort A \u{2192} Z", SheetAct::SortAsc, pal, cx),
                     self.sheet_rb(Some("sort"), "Sort Z \u{2192} A", SheetAct::SortDesc, pal, cx),
+                    self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
                 ]))
                 .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
                 .into_any_element()))
@@ -7143,6 +7255,7 @@ impl Render for Docxy {
         let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
         let sheet_cf = self.sheet_cf_edit.clone().map(|buf| self.sheet_cf_bar(&buf, pal, cx));
         let sheet_dv_bar = self.sheet_dv_edit.clone().map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
+        let sheet_filter = self.sheet_filter_edit.clone().map(|buf| self.sheet_filter_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7453,6 +7566,7 @@ impl Render for Docxy {
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(sheet_dv_bar, |d, c| d.child(c))
+            .when_some(sheet_filter, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
@@ -7873,20 +7987,27 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let header = sheet_col_header(view, ent, fc, col0, cend);
     let cc_frozen = comment_cells.clone();
     let cc_list = comment_cells.clone();
+    // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
+    // over these, so a filtered-out row collapses instead of showing blank.
+    let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
-    let fr = (frz_r as usize).min(total_rows).min(30);
+    let fr = (frz_r as usize).min(visible.len()).min(30);
     let mut frozen = v_flex().flex_none();
-    for r in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, r as u32, fc, col0, cend, &cc_frozen));
+    for i in 0..fr {
+        frozen = frozen.child(sheet_row(view, ent, visible[i], fc, col0, cend, &cc_frozen));
     }
     let ent_list = ent.clone();
+    let vis_list = visible.clone();
     let list = uniform_list(
         "sheet-rows",
-        total_rows.saturating_sub(fr),
+        visible.len().saturating_sub(fr),
         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
             let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, fc, col0, cend, &cc_list)).collect::<Vec<_>>()
+            range.map(|i| {
+                let row = vis_list.get(fr + i).copied().unwrap_or(0);
+                sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list)
+            }).collect::<Vec<_>>()
         }),
     )
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
