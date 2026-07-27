@@ -59,6 +59,7 @@ pub enum Act {
     PrevComment,
     NextComment,
     ToggleComments,
+    ProtectSheet,
     /// View toggles.
     FormulaView,
     FreezePanes,
@@ -280,34 +281,44 @@ fn insert_groups() -> Vec<Group> {
 
 fn review_groups() -> Vec<Group> {
     use Act::*;
-    vec![Group {
-        title: "Comments",
-        width: 33,
-        rows: [
-            vec![
-                btn(
-                    "✎ Comment",
-                    NewComment,
-                    "New threaded comment / reply on the current cell",
-                ),
-                Seg::Gap("  "),
-                btn(
-                    "✗ Delete",
-                    DeleteComment,
-                    "Delete the current cell's comment",
-                ),
+    vec![
+        Group {
+            title: "Comments",
+            width: 33,
+            rows: [
+                vec![
+                    btn(
+                        "✎ Comment",
+                        NewComment,
+                        "New threaded comment / reply on the current cell",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "✗ Delete",
+                        DeleteComment,
+                        "Delete the current cell's comment",
+                    ),
+                ],
+                vec![
+                    btn("☰ Note", NewNote, "New legacy note on the current cell"),
+                    Seg::Gap(" "),
+                    btn("‹ Prev", PrevComment, "Previous comment"),
+                    Seg::Gap(" "),
+                    btn("Next ›", NextComment, "Next comment"),
+                    Seg::Gap(" "),
+                    btn("▤", ToggleComments, "Show/hide the comments panel"),
+                ],
             ],
-            vec![
-                btn("☰ Note", NewNote, "New legacy note on the current cell"),
-                Seg::Gap(" "),
-                btn("‹ Prev", PrevComment, "Previous comment"),
-                Seg::Gap(" "),
-                btn("Next ›", NextComment, "Next comment"),
-                Seg::Gap(" "),
-                btn("▤", ToggleComments, "Show/hide the comments panel"),
+        },
+        Group {
+            title: "Protect",
+            width: 15,
+            rows: [
+                vec![btn("🔒 Protect", ProtectSheet, "Protect/unprotect the sheet (make cells read-only)")],
+                vec![],
             ],
-        ],
-    }]
+        },
+    ]
 }
 
 fn view_groups() -> Vec<Group> {

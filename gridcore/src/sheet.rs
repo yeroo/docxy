@@ -226,6 +226,26 @@ pub struct Sheet {
     /// Floating drawings anchored to the grid (`xl/drawings/*`): pictures and
     /// charts. Rendered as an overlay; not editable.
     pub drawings: Vec<Drawing>,
+    /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
+    /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
+    /// serialized verbatim so any existing password hash / flag set round-trips.
+    /// `None` when the sheet is unprotected. Advisory in the viewer; enforced by
+    /// Excel on open.
+    pub protection: Option<String>,
+}
+
+impl Sheet {
+    /// Whether the sheet carries a `<sheetProtection>` element.
+    pub fn is_protected(&self) -> bool {
+        self.protection.is_some()
+    }
+
+    /// Toggle sheet protection. Protecting writes Excel's default flag set
+    /// (lock the sheet, objects, and scenarios; no password); unprotecting drops
+    /// the element entirely.
+    pub fn set_protected(&mut self, on: bool) {
+        self.protection = on.then(|| "sheet=\"1\" objects=\"1\" scenarios=\"1\"".to_string());
+    }
 }
 
 /// A floating drawing anchored over a cell rectangle (a picture or a chart).

@@ -304,6 +304,7 @@ enum SheetAct {
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
+    ProtectSheet,
     Todo,
 }
 
@@ -1212,6 +1213,23 @@ impl Docxy {
             _ => None,
         }
     }
+    /// Whether the active sheet is protected (cells read-only until unprotected).
+    fn sheet_protected(&self) -> bool {
+        self.active_sheet().is_some_and(|v| v.pkg.workbook.sheets[v.active].is_protected())
+    }
+
+    /// Toggle protection on the active sheet (undoable; Excel's default flag set).
+    fn sheet_toggle_protection(&mut self, cx: &mut Context<Self>) {
+        let now = !self.sheet_protected();
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            v.pkg.workbook.sheets[s].set_protected(now);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     fn active_is_sheet(&self) -> bool {
         matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Sheet(_)))
     }
@@ -1224,6 +1242,9 @@ impl Docxy {
     /// Begin editing the selected cell. `initial` seeds the buffer (a freshly
     /// typed character); `None` re-edits the existing content (F2).
     fn sheet_begin_edit(&mut self, initial: Option<String>, cx: &mut Context<Self>) {
+        if self.sheet_protected() {
+            return;
+        }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
@@ -1331,6 +1352,9 @@ impl Docxy {
     /// Clear the whole selected range's content (Delete / Backspace), keeping
     /// each cell's style.
     fn sheet_clear(&mut self, cx: &mut Context<Self>) {
+        if self.sheet_protected() {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r0, c0, r1, c1) = v.range();
@@ -1377,6 +1401,9 @@ impl Docxy {
     /// Paste at the selection: the grid clipboard when present (full-fidelity
     /// cells), else the system clipboard parsed as TSV.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) {
+        if self.sheet_protected() {
+            return;
+        }
         let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = &self.grid_clip {
             clip.cells.clone()
         } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
@@ -2630,6 +2657,7 @@ impl Docxy {
             }
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
+            SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
             SheetAct::TextToColumns => {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
@@ -2751,10 +2779,13 @@ impl Docxy {
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        let protected = self.sheet_protected();
                         if let Some(v) = self.active_sheet_mut() {
                             match v.editing.as_mut() {
                                 Some(buf) => buf.push_str(c),
-                                None => v.editing = Some(c.to_string()),
+                                // Don't start a fresh edit on a protected sheet.
+                                None if !protected => v.editing = Some(c.to_string()),
+                                None => {}
                             }
                         }
                         cx.notify();
@@ -6697,7 +6728,7 @@ impl Docxy {
                 .child(self.sheet_lb(None, "Next", SheetAct::NextComment, pal, cx))
                 .into_any_element()))
             .child(group("Protect", h_flex().h_full().items_center().gap_1()
-                .child(self.sheet_lb(None, "Protect Sheet", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(Some("lock"), if self.sheet_protected() { "Unprotect Sheet" } else { "Protect Sheet" }, SheetAct::ProtectSheet, pal, cx))
                 .child(self.sheet_lb(None, "Protect Workbook", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .into_any_element()

@@ -1038,7 +1038,30 @@ impl App {
 
     // --- editing -----------------------------------------------------------
 
+    /// Whether the active sheet is protected. When true, cell edits and
+    /// content-clearing are blocked (mirroring Excel), with a status hint.
+    fn protected(&self) -> bool {
+        self.sheet().is_protected()
+    }
+
+    /// Toggle protection on the active sheet. Goes through `structural` so it's
+    /// undoable; protecting uses Excel's default flag set.
+    fn toggle_protection(&mut self) {
+        let now = !self.protected();
+        let s = self.sheet;
+        self.structural(|wb| wb.sheets[s].set_protected(now));
+        self.status = Some(if now {
+            "Sheet protected — cells are read-only until unprotected".into()
+        } else {
+            "Sheet protection removed".into()
+        });
+    }
+
     fn start_edit(&mut self, initial: Option<char>) {
+        if self.protected() {
+            self.status = Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let text = match initial {
             Some(ch) => ch.to_string(),
             None => self.current_input_text(),
@@ -2662,6 +2685,7 @@ impl App {
             PrevComment => self.nav_comment(-1),
             NextComment => self.nav_comment(1),
             ToggleComments => self.toggle_comments(),
+            ProtectSheet => self.toggle_protection(),
             FormulaView => self.toggle_formula_view(),
             FreezePanes => self.toggle_freeze(),
             ShowHidden => self.toggle_show_hidden(),
@@ -2984,6 +3008,10 @@ impl App {
     }
 
     fn clear_selection(&mut self) {
+        if self.protected() {
+            self.status = Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         let (r1, c1, r2, c2) = self.iter_selection();
         let mut changes = Vec::new();
         for r in r1..=r2 {
@@ -4578,11 +4606,13 @@ fn draw(app: &mut App, f: &mut Frame) {
     let mut x: u16 = marker_w;
     for (i, s) in app.pkg.workbook.sheets.iter().enumerate() {
         let active = i == app.sheet;
+        // A protected sheet carries a lock glyph in its tab.
+        let lock = if s.is_protected() { "🔒" } else { "" };
         // Same width whether active or not, so tabs stay aligned.
         let label = if active {
-            format!("[ {} ]", s.name)
+            format!("[ {lock}{} ]", s.name)
         } else {
-            format!("  {}  ", s.name)
+            format!("  {lock}{}  ", s.name)
         };
         let w = label.chars().count() as u16;
         let style = if active {
@@ -6412,6 +6442,33 @@ mod tests {
         // Survives a save/reload.
         let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
         assert_eq!(re.workbook.tables.len(), 1);
+    }
+
+    #[test]
+    fn protection_toggles_and_blocks_edits() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("keep"));
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = None;
+        // Protect: editing is now blocked.
+        app.toggle_protection();
+        assert!(app.protected());
+        app.start_edit(Some('x'));
+        assert!(app.edit.is_none(), "edit must be blocked while protected");
+        app.clear_selection();
+        assert_eq!(app.sheet().cell(0, 0).unwrap().value, gridcore::sheet::CellValue::Text("keep".into()));
+        // Unprotect: editing works again.
+        app.toggle_protection();
+        assert!(!app.protected());
+        app.start_edit(Some('y'));
+        assert!(app.edit.is_some());
+        // Protection survives save/reload.
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+        assert!(re.workbook.sheets[0].is_protected());
     }
 
     #[test]

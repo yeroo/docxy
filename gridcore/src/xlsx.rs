@@ -1033,6 +1033,21 @@ fn parse_worksheet(
                         sheet.freeze = (rows, cols);
                     }
                 }
+                // Sheet protection: preserve the whole flag/password attribute set
+                // verbatim so it round-trips untouched.
+                "sheetProtection" => {
+                    let mut attrs = String::new();
+                    for a in p.attrs() {
+                        if !attrs.is_empty() {
+                            attrs.push(' ');
+                        }
+                        attrs.push_str(a.name);
+                        attrs.push_str("=\"");
+                        attrs.push_str(a.value);
+                        attrs.push('"');
+                    }
+                    sheet.protection = Some(attrs);
+                }
                 // A cell hyperlink: `ref` cell/range → external URL (via r:id) or
                 // an in-workbook `location`.
                 "hyperlink" => {
@@ -1805,7 +1820,33 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // Frozen panes: sync the first sheetView's <pane> from the model.
     let out = set_freeze_pane(&out, sheet.freeze);
     // Merged regions: regenerate <mergeCells> from the model.
-    set_merge_cells(&out, &sheet.merges)
+    let out = set_merge_cells(&out, &sheet.merges);
+    // Sheet protection: <sheetProtection> right after </sheetData> (schema order
+    // puts it ahead of mergeCells/conditionalFormatting).
+    set_sheet_protection(&out, sheet.protection.as_deref())
+}
+
+/// Sync the `<sheetProtection>` element from the model: drop any existing one,
+/// then re-insert right after `</sheetData>` when the sheet is protected.
+/// Idempotent.
+fn set_sheet_protection(xml: &str, attrs: Option<&str>) -> String {
+    // Drop any existing self-closing <sheetProtection .../> first.
+    let mut out = if let Some(s) = xml.find("<sheetProtection") {
+        let e = xml[s..].find("/>").map(|i| s + i + 2).unwrap_or(s);
+        format!("{}{}", &xml[..s], &xml[e..])
+    } else {
+        xml.to_string()
+    };
+    if let Some(attrs) = attrs {
+        let block = format!("<sheetProtection {attrs}/>");
+        let pos = out
+            .find("</sheetData>")
+            .map(|i| i + "</sheetData>".len())
+            .or_else(|| out.find("</worksheet>"))
+            .unwrap_or(out.len());
+        out.insert_str(pos, &block);
+    }
+    out
 }
 
 /// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
@@ -3336,6 +3377,38 @@ mod tests {
         let idx2 = pkg.add_table(0, (3, 0, 5, 1), false, "TableStyleLight1").unwrap();
         assert_eq!(pkg.workbook.tables[idx2].columns, vec!["Column1", "Column2"]);
         assert_eq!(pkg.workbook.tables[idx2].name, "Table2");
+    }
+
+    #[test]
+    fn sheet_protection_round_trips() {
+        let mut pkg = new_xlsx();
+        assert!(!pkg.workbook.sheets[0].is_protected());
+        pkg.workbook.sheets[0].set_protected(true);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(re.workbook.sheets[0].is_protected());
+        let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(ws.contains("<sheetProtection sheet=\"1\""), "{ws}");
+        // Unprotect → element gone.
+        let mut re = re;
+        re.workbook.sheets[0].set_protected(false);
+        let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
+        assert!(!re2.workbook.sheets[0].is_protected());
+        let ws2 = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(!ws2.contains("<sheetProtection"));
+    }
+
+    #[test]
+    fn sheet_protection_preserves_existing_attrs_and_order() {
+        // A pre-existing protection element with a password + custom flags must
+        // survive verbatim, and land before <mergeCells>.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].protection = Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\"".into());
+        pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].protection.as_deref(), Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\""));
+        let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        let (pp, mp) = (ws.find("<sheetProtection").unwrap(), ws.find("<mergeCells").unwrap());
+        assert!(pp < mp, "sheetProtection must precede mergeCells: {ws}");
     }
 
     #[test]
