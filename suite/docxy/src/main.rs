@@ -296,6 +296,7 @@ enum SheetAct {
     SortAsc,
     SortDesc,
     AutoSum,
+    FormatCells,
     Todo,
 }
 
@@ -492,6 +493,8 @@ struct Docxy {
     sheet_dv_open: bool,
     // Whether the Number-group format picker strip is open.
     sheet_numfmt_open: bool,
+    // Whether the consolidated Format Cells panel is open.
+    sheet_fmt_open: bool,
 }
 
 /// Common number formats offered by the Number-group dropdown: (label, code).
@@ -875,6 +878,7 @@ impl Docxy {
             sheet_comment_edit: None,
             sheet_dv_open: false,
             sheet_numfmt_open: false,
+            sheet_fmt_open: false,
         }
     }
 
@@ -2247,6 +2251,10 @@ impl Docxy {
             SheetAct::SortAsc => self.sheet_sort(true, cx),
             SheetAct::SortDesc => self.sheet_sort(false, cx),
             SheetAct::AutoSum => self.sheet_autosum(cx),
+            SheetAct::FormatCells => {
+                self.sheet_fmt_open = true;
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -5843,6 +5851,112 @@ impl Docxy {
         row.into_any_element()
     }
 
+    /// The consolidated "Format Cells" modal — one place for Number, Font, Fill,
+    /// Alignment and Border, applied live to the selection via the existing xf
+    /// helpers. A backdrop dismisses it.
+    fn sheet_format_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::Align;
+        let xf = self.active_xf();
+        let cur_fmt = self.active_numfmt_name();
+        let heading = |t: &str| div().text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(pal.dim).child(t.to_string());
+
+        // Number formats.
+        let mut number = h_flex().flex_wrap().gap_1();
+        for (label, code) in NUM_FORMATS {
+            let active = label == cur_fmt;
+            number = number.child(
+                div()
+                    .id(ElementId::Name(format!("fmt-nf-{label}").into()))
+                    .px_2().py(px(3.)).rounded_sm().cursor_pointer().text_size(px(11.))
+                    .bg(if active { hsla_u(BRAND) } else { pal.panel })
+                    .text_color(if active { hsla_u(0xffffff) } else { pal.fg })
+                    .border_1().border_color(pal.border)
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _w, cx| this.sheet_apply_numfmt(code, cx))),
+            );
+        }
+
+        // Toggle button (Bold/Italic/Align/Border).
+        let tbtn = |id: &str, label: &str, active: bool| {
+            div()
+                .id(ElementId::Name(format!("fmt-{id}").into()))
+                .px_2p5().py(px(3.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(if active { hsla_u(BRAND) } else { pal.panel })
+                .text_color(if active { hsla_u(0xffffff) } else { pal.fg })
+                .border_1().border_color(pal.border)
+                .hover(|d| d.border_color(hsla_u(BRAND)))
+                .child(label.to_string())
+        };
+        let font_row = h_flex().gap_1p5()
+            .child(tbtn("bold", "B", xf.bold).on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_bold(cx))))
+            .child(tbtn("italic", "I", xf.italic).on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_italic(cx))));
+        let align_row = h_flex().gap_1p5()
+            .child(tbtn("al", "Left", xf.align == Align::Left).on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Left, cx))))
+            .child(tbtn("ac", "Center", xf.align == Align::Center).on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Center, cx))))
+            .child(tbtn("ar", "Right", xf.align == Align::Right).on_click(cx.listener(|this, _, _w, cx| this.sheet_align(Align::Right, cx))));
+        let border_row = h_flex()
+            .child(tbtn("border", "Box border", xf.border).on_click(cx.listener(|this, _, _w, cx| this.sheet_toggle_border(cx))));
+
+        // Colour swatch row for a given picker (with a leading "None").
+        let swatches = |pick: SheetPick, cur: Option<(u8, u8, u8)>, cx: &mut Context<Self>| {
+            let mut row = h_flex().flex_wrap().gap_1();
+            let none_sel = cur.is_none();
+            row = row.child(
+                div().id(ElementId::Name(format!("fmt-c-none-{}", pick == SheetPick::Fill).into()))
+                    .px_1p5().py(px(1.)).rounded_sm().cursor_pointer().text_size(px(10.))
+                    .border_1().border_color(if none_sel { hsla_u(BRAND) } else { pal.border }).text_color(pal.fg)
+                    .child("None")
+                    .on_click(cx.listener(move |this, _, _w, cx| this.sheet_apply_color(pick, None, cx))),
+            );
+            for &c in COLOR_SWATCHES {
+                let rgb = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
+                let sel = cur == Some(rgb);
+                row = row.child(
+                    div().id(ElementId::Name(format!("fmt-c-{}-{c:06x}", pick == SheetPick::Fill).into()))
+                        .size(px(18.)).rounded_sm().cursor_pointer()
+                        .bg(hsla_u(c))
+                        .border_1().border_color(if sel { hsla_u(BRAND) } else { hsla_u(0x9a9a9a) })
+                        .on_click(cx.listener(move |this, _, _w, cx| this.sheet_apply_color(pick, Some(rgb), cx))),
+                );
+            }
+            row
+        };
+        let font_colors = swatches(SheetPick::Font, xf.color, cx);
+        let fill_colors = swatches(SheetPick::Fill, xf.fill, cx);
+
+        let card = v_flex()
+            .w(px(420.)).gap_3().p_4()
+            .bg(pal.panel).border_1().border_color(pal.border).rounded(px(8.))
+            .shadow_lg()
+            .child(h_flex().items_center().justify_between()
+                .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("Format Cells"))
+                .child(div().id("fmt-close").px_2().rounded_sm().cursor_pointer().text_size(px(15.)).text_color(pal.dim)
+                    .hover(|d| d.text_color(pal.fg)).child("\u{00d7}")
+                    .on_click(cx.listener(|this, _, _w, cx| { this.sheet_fmt_open = false; cx.notify(); }))))
+            .child(v_flex().gap_1().child(heading("NUMBER")).child(number))
+            .child(v_flex().gap_1().child(heading("FONT")).child(h_flex().gap_3().items_center().child(font_row).child(font_colors)))
+            .child(v_flex().gap_1().child(heading("FILL")).child(fill_colors))
+            .child(v_flex().gap_1().child(heading("ALIGNMENT")).child(align_row))
+            .child(v_flex().gap_1().child(heading("BORDER")).child(border_row))
+            .child(h_flex().justify_end()
+                .child(div().id("fmt-done").px_3().py(px(4.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                    .bg(hsla_u(BRAND)).text_color(hsla_u(0xffffff)).child("Done")
+                    .on_click(cx.listener(|this, _, _w, cx| { this.sheet_fmt_open = false; cx.notify(); }))));
+
+        // Backdrop (click to dismiss) + centred card.
+        div()
+            .absolute().inset_0()
+            .flex().items_center().justify_center()
+            .bg(Hsla { h: 0., s: 0., l: 0., a: 0.35 })
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _w, cx| { this.sheet_fmt_open = false; cx.notify(); }))
+            .child(
+                // Stop the card's own clicks from dismissing.
+                div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(card),
+            )
+            .into_any_element()
+    }
+
     /// The swatch strip shown under the ribbon while a sheet colour picker is open;
     /// a swatch sets the fill or font colour of the selection.
     fn sheet_picker_bar(&self, pick: SheetPick, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6186,7 +6300,7 @@ impl Docxy {
                 .child(v_flex().gap_0p5()
                     .child(self.sheet_rb(None, "Delete Row", SheetAct::DeleteRow, pal, cx))
                     .child(self.sheet_rb(None, "Delete Col", SheetAct::DeleteCol, pal, cx)))
-                .child(self.sheet_lb(None, "Format", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Format", SheetAct::FormatCells, pal, cx))
                 .into_any_element()))
             // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
             .child(group("Editing", false, h_flex().h_full().items_center().gap_1()
@@ -6764,6 +6878,7 @@ impl Render for Docxy {
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let sheet_pick_bar = self.active_is_sheet().then_some(self.sheet_pick).flatten().map(|p| self.sheet_picker_bar(p, pal, cx));
         let sheet_numfmt_bar = (self.active_is_sheet() && self.sheet_numfmt_open).then(|| self.sheet_numfmt_bar(pal, cx));
+        let sheet_fmt_panel = (self.active_is_sheet() && self.sheet_fmt_open).then(|| self.sheet_format_panel(pal, cx));
         let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
@@ -7081,6 +7196,7 @@ impl Render for Docxy {
             .child(status)
             .when_some(mini_bar, |d, m| d.child(m))
             .when_some(context_menu, |d, m| d.child(m))
+            .when_some(sheet_fmt_panel, |d, p| d.child(p))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))
