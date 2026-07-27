@@ -289,6 +289,8 @@ enum SheetAct {
     DeleteRow,
     InsertCol,
     DeleteCol,
+    SortAsc,
+    SortDesc,
     Todo,
 }
 
@@ -1515,6 +1517,84 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Sort the used range by the selected column (header-aware). Rows move as
+    /// whole units (all columns + styles); blanks sort last. Formula refs are not
+    /// re-based, so this targets value tables (the common case).
+    fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
+        use gridcore::sheet::{Cell, CellValue};
+        use std::cmp::Ordering;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let sc = v.sel.1 as usize;
+            let (max_r, max_c) = v.extent();
+            let sh = &v.pkg.workbook.sheets[s];
+            // Contiguous region around the selection (Excel's "current region"):
+            // expand over rows with any content, bounded by fully-blank rows.
+            let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            let sr = v.sel.0;
+            if !row_used(sr) {
+                return;
+            }
+            let mut top = sr;
+            while top > 0 && row_used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = sr;
+            while bottom < max_r && row_used(bottom + 1) {
+                bottom += 1;
+            }
+            // A header row exists if the region's top row is text over numeric data.
+            let header = matches!(sh.cell(top, sc as u32).map(|c| &c.value), Some(CellValue::Text(_)))
+                && (top + 1..=bottom).any(|r| matches!(sh.cell(r, sc as u32).map(|c| &c.value), Some(CellValue::Number(_))));
+            let start = if header { top + 1 } else { top };
+            if bottom <= start {
+                return;
+            }
+            // Snapshot each data row as a full-width vector of cells.
+            let mut rows: Vec<Vec<Option<Cell>>> = (start..=bottom)
+                .map(|r| (0..=max_c).map(|c| sh.cell(r, c).cloned()).collect())
+                .collect();
+            let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
+                Some(CellValue::Number(_)) => 0,
+                Some(CellValue::Text(_)) => 1,
+                Some(CellValue::Bool(_)) => 2,
+                _ => 3, // blank / empty
+            };
+            rows.sort_by(|a, b| {
+                let (ka, kb) = (&a[sc], &b[sc]);
+                let (blank_a, blank_b) = (rank(ka) == 3, rank(kb) == 3);
+                if blank_a || blank_b {
+                    return blank_a.cmp(&blank_b); // blanks always last
+                }
+                let ord = match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
+                    (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                    (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
+                    (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
+                    _ => rank(ka).cmp(&rank(kb)), // different types: numbers before text
+                };
+                if ascending { ord } else { ord.reverse() }
+            });
+            let sheet = &mut v.pkg.workbook.sheets[s];
+            for (i, row) in rows.into_iter().enumerate() {
+                let r = start + i as u32;
+                for (c, cell) in row.into_iter().enumerate() {
+                    match cell {
+                        Some(cl) => {
+                            sheet.cells.insert((r, c as u32), cl);
+                        }
+                        None => {
+                            sheet.cells.remove(&(r, c as u32));
+                        }
+                    }
+                }
+            }
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
@@ -2107,6 +2187,8 @@ impl Docxy {
             SheetAct::DeleteRow => self.sheet_structural(StructOp::DeleteRow, cx),
             SheetAct::InsertCol => self.sheet_structural(StructOp::InsertCol, cx),
             SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
+            SheetAct::SortAsc => self.sheet_sort(true, cx),
+            SheetAct::SortDesc => self.sheet_sort(false, cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -6002,7 +6084,10 @@ impl Docxy {
                     self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
                     self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
                 ]))
-                .child(self.sheet_lb(Some("sort"), "Sort & Filter", SheetAct::Todo, pal, cx))
+                .child(col(vec![
+                    self.sheet_rb(Some("sort"), "Sort A \u{2192} Z", SheetAct::SortAsc, pal, cx),
+                    self.sheet_rb(Some("sort"), "Sort Z \u{2192} A", SheetAct::SortDesc, pal, cx),
+                ]))
                 .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .into_any_element()
