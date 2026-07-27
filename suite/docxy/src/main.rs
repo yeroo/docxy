@@ -6915,12 +6915,30 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
             .child(SharedString::from((r + 1).to_string())),
     );
+    // Merged regions: the top-left cell spans its columns' combined width; cells
+    // it covers in the same row are skipped; cells under a vertical merge render
+    // blank (content lives only in the top-left).
+    let mut skip_to: i64 = -1;
     for c in (0..fc).chain(col0..=cend) {
+        if (c as i64) <= skip_to {
+            continue;
+        }
+        let merge = sh.merges.iter().find(|&&(mr1, mc1, mr2, mc2)| r >= mr1 && r <= mr2 && c >= mc1 && c <= mc2).copied();
+        let (cell_w, blank_covered) = match merge {
+            Some((mr1, mc1, _mr2, mc2)) if r == mr1 && c == mc1 => {
+                skip_to = mc2 as i64; // widen; skip the rest of the span in this row
+                ((mc1..=mc2).map(|cc| col_px(sh.col_width(cc))).sum::<f32>(), false)
+            }
+            Some((mr1, _, _, _)) if r == mr1 => continue, // covered in the top row
+            Some(_) => (col_px(sh.col_width(c)), true), // under a vertical merge → blank
+            None => (col_px(sh.col_width(c)), false),
+        };
         let selected = (r, c) == (sr, sc);
         let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
+            _ if blank_covered => (String::new(), None, false),
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
                 (gridcore::sheet::format_with(&xf, &cl.value, d1904), Some(xf), matches!(cl.value, CellValue::Number(_)))
@@ -6959,7 +6977,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         let cell_border = xf.as_ref().is_some_and(|x| x.border);
         let mut cell = div()
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
-            .w(px(col_px(sh.col_width(c))))
+            .w(px(cell_w))
             .h(px(SHEET_ROW_H))
             .px(px(4.))
             .flex()
