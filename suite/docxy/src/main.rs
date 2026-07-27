@@ -196,6 +196,10 @@ struct SheetView {
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
     col0: u32,
+    /// The selection the horizontal scroll last followed. reconcile only re-centres
+    /// on the selection when it differs from this, so manual scrolling (arrows /
+    /// wheel / thumb) can move the view away without being snapped back.
+    follow_sel: (u32, u32),
 }
 
 /// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
@@ -709,7 +713,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new(), col0: 0 };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new(), col0: 0, follow_sel: (0, 0) };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -985,6 +989,12 @@ impl Docxy {
             if v.col0 < fc {
                 v.col0 = fc;
             }
+            // Only re-centre on the selection when it has actually moved; otherwise
+            // leave col0 alone so manual scrolling (arrows/wheel/thumb) sticks.
+            if v.sel == v.follow_sel {
+                return;
+            }
+            v.follow_sel = v.sel;
             let sc = v.sel.1;
             if sc < fc {
                 return; // a frozen column is always visible
@@ -1006,27 +1016,6 @@ impl Docxy {
                 start += 1;
             }
             v.col0 = start.max(fc);
-        }
-    }
-
-    /// Jump the column scroll to the fraction of the horizontal track clicked at
-    /// window x `x` (the track spans SHEET_GUT..grid_w-12).
-    fn sheet_hbar_jump(&mut self, x: f32, cx: &mut Context<Self>) {
-        let w = self.sheet_grid_w;
-        let track = (w - 12.0 - SHEET_GUT).max(1.0);
-        let frac = ((x - SHEET_GUT) / track).clamp(0.0, 1.0);
-        if let Some(v) = self.active_sheet_mut() {
-            let (_, mc) = v.extent();
-            let (_, frz_c) = v.sheet().freeze;
-            let fc = frz_c.min(64);
-            let target = (frac * mc as f32).round() as u32;
-            v.col0 = target.max(fc).min(255);
-            // Keep the selection inside the new window so reconcile doesn't undo it.
-            if v.sel.1 < v.col0 {
-                v.sel.1 = v.col0;
-                v.anchor = v.sel;
-            }
-            cx.notify();
         }
     }
 
@@ -7616,6 +7605,11 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 ent_add.update(cx, |this, cx| this.sheet_add(cx));
             }),
     );
+    // Excel-style: a short horizontal scrollbar shares the tab row, pushed to the
+    // right by a flexible spacer.
+    tabs = tabs
+        .child(div().flex_1().min_w(px(8.)))
+        .child(sheet_hbar(view, ent, max_c, col0, cend));
 
     // Chart cards, positioned from their CELL ANCHOR so they scroll with the grid
     // (Excel behaviour) instead of being pinned to the viewport corner.
@@ -7735,13 +7729,13 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         }
     }
     // The clipping layer: spans the rows viewport (under the column header, above
-    // the h-scroll strip + sheet tabs). Non-interactive, so cell clicks pass through.
+    // the sheet-tab row). Non-interactive, so cell clicks pass through.
     let chart_layer = div()
         .absolute()
         .left_0()
         .right_0()
         .top(px(26. + SHEET_ROW_H))
-        .bottom(px(26. + 11.))
+        .bottom(px(26.))
         .overflow_hidden()
         .children(cards)
         .children(note)
@@ -7783,49 +7777,54 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 .w(px(12.))
                 .child(gpui_component::scroll::Scrollbar::vertical(&view.vscroll)),
         )
-        // ...and the horizontal one along the bottom, left of the sheet tabs. The
-        // columns aren't a pixel scroller (they virtualize by offset), so this is a
-        // proportional indicator + click/drag target driven by col0.
-        .child(sheet_hbar(view, ent, max_c, col0, cend))
+        // (The horizontal scrollbar now lives inside the sheet-tab row, Excel-style.)
         .child(tabs)
         .into_any_element()
 }
 
 /// The horizontal scroll strip under the grid: an Excel-style track whose thumb
-/// spans the visible column window. Dragging or clicking the track scrolls
-/// columns (the grid virtualizes columns by offset, so this maps a fraction of
-/// the used width to a starting column rather than a pixel offset).
+/// A short Excel-style horizontal scrollbar for the sheet-tab row: end arrows
+/// that step one column plus a proportional thumb (columns virtualize by offset,
+/// so the thumb reflects col0 within the used-column extent).
 fn sheet_hbar(_view: &SheetView, ent: &Entity<Docxy>, max_c: u32, col0: u32, cend: u32) -> AnyElement {
     let total = (max_c + 1).max(cend + 1).max(1);
     let shown = (cend + 1).saturating_sub(col0).max(1);
-    let frac = (shown as f32 / total as f32).clamp(0.06, 1.0);
+    let frac = (shown as f32 / total as f32).clamp(0.08, 1.0);
     let pos = if total > shown { col0 as f32 / (total - shown) as f32 } else { 0.0 };
-    let ent_track = ent.clone();
-    div()
-        .absolute()
-        .left(px(SHEET_GUT))
-        .right(px(12.))
-        .bottom(px(26.))
-        .h(px(11.))
-        .bg(hsla_u(0xf1f1f1))
-        .border_t_1()
-        .border_color(hsla_u(0xd9d9d9))
-        // Click anywhere on the track to jump proportionally.
-        .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
-            let x = f32::from(ev.position.x);
-            ent_track.update(cx, |this, cx| this.sheet_hbar_jump(x, cx));
-        })
+    let arrow = |glyph: &'static str, id: &'static str, ent: Entity<Docxy>, delta: i32| {
+        div()
+            .id(id)
+            .w(px(15.)).h(px(15.)).flex().items_center().justify_center().cursor_pointer()
+            .rounded_sm().bg(hsla_u(0xe4e4e4)).text_size(px(8.)).text_color(hsla_u(0x444444))
+            .hover(|d| d.bg(hsla_u(0xd0d0d0)))
+            .child(glyph)
+            .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                ent.update(cx, |this, cx| this.sheet_hscroll(delta, cx));
+            })
+    };
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap(px(2.))
+        .mr(px(4.))
+        .child(arrow("\u{25C0}", "hbar-left", ent.clone(), -1))
         .child(
-            // The thumb: sized to the visible fraction, offset by the scroll position.
+            // Fixed-width track (shorter, like Excel) with a proportional thumb.
             div()
-                .absolute()
-                .top(px(2.))
-                .h(px(7.))
-                .left(relative((pos * (1.0 - frac)).clamp(0.0, 1.0)))
-                .w(relative(frac))
-                .rounded(px(3.))
-                .bg(hsla_u(0xa8a8a8)),
+                .relative()
+                .w(px(160.)).h(px(9.))
+                .rounded(px(3.)).bg(hsla_u(0xe0e0e0)).border_1().border_color(hsla_u(0xcfcfcf))
+                .child(
+                    div()
+                        .absolute().top(px(0.))
+                        .h(px(7.))
+                        .left(relative((pos * (1.0 - frac)).clamp(0.0, 1.0 - frac)))
+                        .w(relative(frac))
+                        .rounded(px(3.))
+                        .bg(hsla_u(0xa8a8a8)),
+                ),
         )
+        .child(arrow("\u{25B6}", "hbar-right", ent.clone(), 1))
         .into_any_element()
 }
 
