@@ -1803,7 +1803,41 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     }
 
     // Frozen panes: sync the first sheetView's <pane> from the model.
-    set_freeze_pane(&out, sheet.freeze)
+    let out = set_freeze_pane(&out, sheet.freeze);
+    // Merged regions: regenerate <mergeCells> from the model.
+    set_merge_cells(&out, &sheet.merges)
+}
+
+/// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
+/// when there are none). Placed right after `</sheetData>` (schema order).
+/// Idempotent.
+fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
+    // Drop any existing <mergeCells>…</mergeCells> (or self-closing) first.
+    let mut out = if let Some(s) = xml.find("<mergeCells") {
+        let e = xml[s..]
+            .find("</mergeCells>")
+            .map(|i| s + i + "</mergeCells>".len())
+            .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
+            .unwrap_or(s);
+        format!("{}{}", &xml[..s], &xml[e..])
+    } else {
+        xml.to_string()
+    };
+    if merges.is_empty() {
+        return out;
+    }
+    let cells: String = merges
+        .iter()
+        .map(|&(r1, c1, r2, c2)| format!("<mergeCell ref=\"{}:{}\"/>", cell_name(r1, c1), cell_name(r2, c2)))
+        .collect();
+    let block = format!("<mergeCells count=\"{}\">{cells}</mergeCells>", merges.len());
+    // After </sheetData>, else before </worksheet>.
+    if let Some(pos) = out.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
+        out.insert_str(pos, &block);
+    } else {
+        out = out.replacen("</worksheet>", &format!("{block}</worksheet>"), 1);
+    }
+    out
 }
 
 /// Rewrite the frozen-pane state of the first `<sheetView>` from the model's
@@ -2897,6 +2931,22 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_added_merges_round_trip() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].merges.push((0, 0, 0, 3)); // A1:D1
+        pkg.workbook.sheets[0].merges.push((2, 1, 4, 1)); // B3:B5
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].merges, vec![(0, 0, 0, 3), (2, 1, 4, 1)]);
+        // Clearing them removes the block.
+        let mut re = re;
+        re.workbook.sheets[0].merges.clear();
+        let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
+        assert!(re2.workbook.sheets[0].merges.is_empty());
+        let ws = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(!ws.contains("<mergeCells"));
+    }
 
     #[test]
     fn freeze_round_trips_through_save() {

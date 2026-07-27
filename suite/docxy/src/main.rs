@@ -297,6 +297,7 @@ enum SheetAct {
     SortDesc,
     AutoSum,
     FormatCells,
+    Merge,
     Todo,
 }
 
@@ -1528,6 +1529,32 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Merge & Center: merge the selected range into one cell (centring the
+    /// anchor's contents), or unmerge if the anchor is already a merge origin.
+    fn sheet_merge_toggle(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::Align;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let (r0, c0, r1, c1) = v.range();
+            let s = v.active;
+            let wb = &mut v.pkg.workbook;
+            if let Some(i) = wb.sheets[s].merges.iter().position(|&(mr1, mc1, _, _)| mr1 == r0 && mc1 == c0) {
+                wb.sheets[s].merges.remove(i);
+            } else if r1 > r0 || c1 > c0 {
+                wb.sheets[s].merges.push((r0, c0, r1, c1));
+                // Centre the anchor cell (interning a Center-aligned xf).
+                let style = wb.sheets[s].cell(r0, c0).map(|x| x.style).unwrap_or(0);
+                let mut xf = wb.styles.xf(style);
+                xf.align = Align::Center;
+                let idx = wb.styles.intern(xf);
+                wb.sheets[s].cells.entry((r0, c0)).or_default().style = idx;
+            }
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// AutoSum (Σ): insert `=SUM(range)` in the selected cell, summing the run of
     /// numeric cells directly above it (else to its left) — Excel's behaviour.
     fn sheet_autosum(&mut self, cx: &mut Context<Self>) {
@@ -2255,6 +2282,7 @@ impl Docxy {
                 self.sheet_fmt_open = true;
                 cx.notify();
             }
+            SheetAct::Merge => self.sheet_merge_toggle(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -6272,7 +6300,7 @@ impl Docxy {
                     self.sheet_ib("align-right", SheetAct::AlignR, matches!(xf.align, gridcore::sheet::Align::Right), pal, cx),
                     self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
                     self.sheet_ib("indent-increase", SheetAct::Todo, false, pal, cx),
-                    self.sheet_rb(None, "Merge", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(None, "Merge", SheetAct::Merge, pal, cx),
                 ]),
             ])))
             // Number: format combo; then currency/percent/comma + decimals.
