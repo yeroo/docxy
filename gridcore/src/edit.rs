@@ -210,6 +210,40 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
     removed
 }
 
+/// Split each text cell in column `col` over rows `r1..=r2` at `delim`, writing
+/// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
+/// Numeric-looking parts become numbers. Rows without the delimiter are left
+/// alone. Returns how many rows were split.
+pub fn text_to_columns(wb: &mut Workbook, sheet: usize, col: u32, r1: u32, r2: u32, delim: char) -> usize {
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    let splits: Vec<(u32, Vec<String>)> = (r1..=r2)
+        .filter_map(|r| {
+            let cell = s.cell(r, col)?;
+            if let crate::sheet::CellValue::Text(t) = &cell.value {
+                let parts: Vec<String> = t.split(delim).map(|p| p.trim().to_string()).collect();
+                if parts.len() > 1 {
+                    return Some((r, parts));
+                }
+            }
+            None
+        })
+        .collect();
+    let n = splits.len();
+    for (r, parts) in splits {
+        for (i, part) in parts.into_iter().enumerate() {
+            let c = col + i as u32;
+            let cell = match part.parse::<f64>() {
+                Ok(num) if !part.is_empty() => crate::sheet::Cell::number(num),
+                _ => crate::sheet::Cell::text(&part),
+            };
+            s.set_cell(r, c, cell);
+        }
+    }
+    n
+}
+
 /// Rename a sheet and rewrite every reference to it (formulas on all sheets
 /// plus defined-name definitions), as Excel does.
 pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
@@ -448,6 +482,24 @@ mod tests {
         assert_eq!(value_at(&w, "A4"), CellValue::Text("C".into()));
         assert_eq!(value_at(&w, "A5"), CellValue::Empty);
         assert_eq!(value_at(&w, "A6"), CellValue::Empty);
+    }
+
+    #[test]
+    fn text_to_columns_splits_and_types() {
+        let mut w = wb(&[
+            ("A1", Cell::text("Laptop,2,1199")),
+            ("A2", Cell::text("Dock,1,179")),
+            ("A3", Cell::text("NoDelimiter")),
+        ]);
+        let n = text_to_columns(&mut w, 0, 0, 0, 2, ',');
+        assert_eq!(n, 2);
+        assert_eq!(value_at(&w, "A1"), CellValue::Text("Laptop".into()));
+        assert_eq!(value_at(&w, "B1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "C1"), CellValue::Number(1199.0));
+        assert_eq!(value_at(&w, "A2"), CellValue::Text("Dock".into()));
+        assert_eq!(value_at(&w, "C2"), CellValue::Number(179.0));
+        // The row without the delimiter is untouched.
+        assert_eq!(value_at(&w, "A3"), CellValue::Text("NoDelimiter".into()));
     }
 
     fn formula_at(wb: &Workbook, name: &str) -> String {

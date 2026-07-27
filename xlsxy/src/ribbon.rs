@@ -50,6 +50,7 @@ pub enum Act {
     DataValidation,
     Filter,
     RemoveDuplicates,
+    TextToColumns,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -266,7 +267,11 @@ fn insert_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Filter ▾", Filter, "AutoFilter the current column"),
                 ],
-                vec![btn("Remove Dup", RemoveDuplicates, "Remove duplicate rows in the region")],
+                vec![
+                    btn("Remove Dup", RemoveDuplicates, "Remove duplicate rows in the region"),
+                    Seg::Gap(" "),
+                    btn("Split", TextToColumns, "Text to Columns: split by a delimiter"),
+                ],
             ],
         },
     ]

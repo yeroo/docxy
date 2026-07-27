@@ -302,6 +302,7 @@ enum SheetAct {
     DataValidation,
     Filter,
     RemoveDuplicates,
+    TextToColumns,
     Todo,
 }
 
@@ -541,6 +542,21 @@ struct Docxy {
     sheet_dv_edit: Option<String>,
     // In-progress AutoFilter criteria entry for the selected column.
     sheet_filter_edit: Option<String>,
+    // In-progress Text-to-Columns delimiter entry.
+    sheet_ttc_edit: Option<String>,
+}
+
+/// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
+/// character (default comma).
+fn parse_delim(s: &str) -> char {
+    match s.trim().to_lowercase().as_str() {
+        "" | "comma" => ',',
+        "tab" => '\t',
+        "space" => ' ',
+        "semicolon" => ';',
+        "pipe" => '|',
+        other => other.chars().next().unwrap_or(','),
+    }
 }
 
 /// Common number formats offered by the Number-group dropdown: (label, code).
@@ -928,6 +944,7 @@ impl Docxy {
             sheet_cf_edit: None,
             sheet_dv_edit: None,
             sheet_filter_edit: None,
+            sheet_ttc_edit: None,
         }
     }
 
@@ -1579,6 +1596,40 @@ impl Docxy {
             }
         }
         self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Route a keystroke into the Text-to-Columns delimiter bar. Enter splits the
+    /// selected column's rows by the delimiter into the columns to the right.
+    fn sheet_ttc_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_ttc_edit.clone() else { return };
+        match key {
+            "escape" => self.sheet_ttc_edit = None,
+            "enter" => {
+                let delim = parse_delim(&buf);
+                self.sheet_snapshot();
+                if let Some(v) = self.active_sheet_mut() {
+                    let s = v.active;
+                    let (r0, c0, r1, _) = v.range();
+                    gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
+                    v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                }
+                self.mark_sheet_dirty();
+                self.sheet_ttc_edit = None;
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_ttc_edit = Some(buf);
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_ttc_edit = Some(buf);
+            }
+        }
         cx.notify();
     }
 
@@ -2528,6 +2579,10 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
+            SheetAct::TextToColumns => {
+                self.sheet_ttc_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -2555,6 +2610,10 @@ impl Docxy {
         // The AutoFilter criteria bar swallows typing too.
         if self.sheet_filter_edit.is_some() {
             return self.sheet_filter_key(ev, key, cx);
+        }
+        // The Text-to-Columns delimiter bar swallows typing too.
+        if self.sheet_ttc_edit.is_some() {
+            return self.sheet_ttc_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6314,6 +6373,28 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The Text-to-Columns delimiter bar.
+    fn sheet_ttc_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ent_cancel = cx.entity();
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Split selected column by delimiter:"))
+            .child(
+                div().w(px(150.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { "comma (or tab, space, ;)".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().id("ttc-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_ttc_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
     /// The AutoFilter criteria bar: type a comparison on the current column.
     fn sheet_filter_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use gridcore::sheet::col_name;
@@ -6517,6 +6598,7 @@ impl Docxy {
                 .child(self.sheet_lb(Some("table"), "PivotTable", SheetAct::InsertPivot, pal, cx))
                 .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
                 .child(self.sheet_lb(None, "Data Validation", SheetAct::DataValidation, pal, cx))
+                .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
@@ -7290,6 +7372,7 @@ impl Render for Docxy {
         let sheet_cf = self.sheet_cf_edit.clone().map(|buf| self.sheet_cf_bar(&buf, pal, cx));
         let sheet_dv_bar = self.sheet_dv_edit.clone().map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
         let sheet_filter = self.sheet_filter_edit.clone().map(|buf| self.sheet_filter_bar(&buf, pal, cx));
+        let sheet_ttc = self.sheet_ttc_edit.clone().map(|buf| self.sheet_ttc_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7601,6 +7684,7 @@ impl Render for Docxy {
             .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(sheet_dv_bar, |d, c| d.child(c))
             .when_some(sheet_filter, |d, c| d.child(c))
+            .when_some(sheet_ttc, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))

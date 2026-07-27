@@ -702,6 +702,8 @@ enum PromptKind {
     DataValidation,
     /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
     Filter,
+    /// Text to Columns: a delimiter to split the selected column by.
+    TextToColumns,
 }
 
 struct Prompt {
@@ -2652,6 +2654,7 @@ impl App {
             DataValidation => self.open_prompt(PromptKind::DataValidation),
             Filter => self.open_prompt(PromptKind::Filter),
             RemoveDuplicates => self.remove_duplicates(),
+            TextToColumns => self.open_prompt(PromptKind::TextToColumns),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3195,6 +3198,26 @@ impl App {
             let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
             wb.sheets[s].set_cell(r, c, cell);
         });
+    }
+
+    /// Split the selected column's rows by a delimiter into the columns to the
+    /// right (Text to Columns).
+    fn commit_text_to_columns(&mut self, text: &str) {
+        let delim = match text.trim().to_lowercase().as_str() {
+            "" | "comma" => ',',
+            "tab" => '\t',
+            "space" => ' ',
+            "semicolon" => ';',
+            "pipe" => '|',
+            other => other.chars().next().unwrap_or(','),
+        };
+        let (r1, c1, r2, _) = self.selection();
+        let s = self.sheet;
+        let mut n = 0;
+        self.structural(|wb| {
+            n = gridcore::edit::text_to_columns(wb, s, c1, r1, r2, delim);
+        });
+        self.status = Some(format!("Text to Columns: split {n} row{}", if n == 1 { "" } else { "s" }));
     }
 
     /// Remove duplicate rows in the contiguous region around the cursor
@@ -3852,6 +3875,7 @@ impl App {
             PromptKind::CondFormat => ("Highlight (>500, =42, 100..500 between, 'clear'): ", String::new()),
             PromptKind::DataValidation => ("Dropdown list (comma-separated values): ", String::new()),
             PromptKind::Filter => ("Filter this column (=Laptop, >500, <>0, 'clear'): ", String::new()),
+            PromptKind::TextToColumns => ("Split column by (comma, tab, space, ;): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -3890,6 +3914,7 @@ impl App {
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::Filter => self.commit_filter(&text),
+            PromptKind::TextToColumns => self.commit_text_to_columns(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -6259,6 +6284,22 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn commit_text_to_columns_splits_column() {
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Dock,2,179"));
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.commit_text_to_columns(",");
+        let sh = app.sheet();
+        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("Dock".into()));
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(2.0));
+        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(179.0));
     }
 
     #[test]
