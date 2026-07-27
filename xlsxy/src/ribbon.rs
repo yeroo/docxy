@@ -30,6 +30,7 @@ pub enum Act {
     DeleteCol,
     SortAsc,
     SortDesc,
+    CustomSort,
     AutoSum,
     InsertChart(&'static str),
     AddSheet,
@@ -219,7 +220,11 @@ fn home_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("↓ Sort", SortDesc, "Sort Z->A by the current column"),
                 ],
-                vec![btn("Σ AutoSum", AutoSum, "Sum the numbers above/left")],
+                vec![
+                    btn("Σ Sum", AutoSum, "Sum the numbers above/left"),
+                    Seg::Gap(" "),
+                    btn("⇅ Sort…", CustomSort, "Multi-level sort (B asc, C desc)"),
+                ],
             ],
         },
         Group {

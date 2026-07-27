@@ -704,6 +704,8 @@ enum PromptKind {
     Filter,
     /// Text to Columns: a delimiter to split the selected column by.
     TextToColumns,
+    /// Multi-level sort: a spec like "B asc, C desc" over the current region.
+    SortKeys,
 }
 
 struct Prompt {
@@ -2658,6 +2660,7 @@ impl App {
             DeleteCol => self.col_op(false),
             SortAsc => self.sort_region(true),
             SortDesc => self.sort_region(false),
+            CustomSort => self.open_prompt(PromptKind::SortKeys),
             AutoSum => self.autosum(),
             InsertChart(kind) => self.insert_chart(kind),
             AddSheet => self.open_prompt(PromptKind::AddSheet),
@@ -3118,78 +3121,68 @@ impl App {
     /// Sort the contiguous region around the cursor by the cursor's column
     /// (header-aware; rows move as whole units; blanks last). Value-table sort —
     /// like the suite; formula refs in moved rows are not re-based.
-    fn sort_region(&mut self, ascending: bool) {
-        use gridcore::sheet::{Cell, CellValue};
-        use std::cmp::Ordering;
-        let s = self.sheet;
-        let sc = self.cur.1 as usize;
+    /// The contiguous region around the cursor to sort, as `(start, bottom)`
+    /// data-row bounds (header excluded). A header is inferred when the top row
+    /// has a text label over numeric data in *any* column. `None` when there's
+    /// nothing to sort.
+    fn sort_bounds(&self) -> Option<(u32, u32)> {
+        use gridcore::sheet::CellValue;
+        let (rc, cc) = self.sheet().used_size();
+        if rc == 0 || cc == 0 {
+            return None;
+        }
+        let (max_r, max_c) = (rc - 1, cc - 1);
         let cur_r = self.cur.0;
+        let sh = self.sheet();
+        let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+        if !used(cur_r) {
+            return None;
+        }
+        let mut top = cur_r;
+        while top > 0 && used(top - 1) {
+            top -= 1;
+        }
+        let mut bottom = cur_r;
+        while bottom < max_r && used(bottom + 1) {
+            bottom += 1;
+        }
+        let header = (0..=max_c).any(|c| {
+            matches!(sh.cell(top, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
+                && (top + 1..=bottom).any(|r| matches!(sh.cell(r, c).map(|cl| &cl.value), Some(CellValue::Number(_))))
+        });
+        let start = if header { top + 1 } else { top };
+        (bottom > start).then_some((start, bottom))
+    }
+
+    fn sort_region(&mut self, ascending: bool) {
+        let sc = self.cur.1;
+        let Some((start, bottom)) = self.sort_bounds() else {
+            return;
+        };
+        let s = self.sheet;
         self.structural(move |wb| {
-            let (start, max_c, mut rows): (u32, u32, Vec<Vec<Option<Cell>>>) = {
-                let sh = &wb.sheets[s];
-                let (rc, cc) = sh.used_size();
-                if rc == 0 || cc == 0 {
-                    return;
-                }
-                let (max_r, max_c) = (rc - 1, cc - 1);
-                let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-                if !used(cur_r) {
-                    return;
-                }
-                let mut top = cur_r;
-                while top > 0 && used(top - 1) {
-                    top -= 1;
-                }
-                let mut bottom = cur_r;
-                while bottom < max_r && used(bottom + 1) {
-                    bottom += 1;
-                }
-                let header = matches!(sh.cell(top, sc as u32).map(|c| &c.value), Some(CellValue::Text(_)))
-                    && (top + 1..=bottom).any(|r| matches!(sh.cell(r, sc as u32).map(|c| &c.value), Some(CellValue::Number(_))));
-                let start = if header { top + 1 } else { top };
-                if bottom <= start {
-                    return;
-                }
-                let rows = (start..=bottom).map(|r| (0..=max_c).map(|c| sh.cell(r, c).cloned()).collect()).collect();
-                (start, max_c, rows)
-            };
-            let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
-                Some(CellValue::Number(_)) => 0,
-                Some(CellValue::Text(_)) => 1,
-                Some(CellValue::Bool(_)) => 2,
-                _ => 3,
-            };
-            rows.sort_by(|a, b| {
-                let (ka, kb) = (&a[sc], &b[sc]);
-                let (ba, bb) = (rank(ka) == 3, rank(kb) == 3);
-                if ba || bb {
-                    return ba.cmp(&bb);
-                }
-                let ord = match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
-                    (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-                    (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
-                    (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
-                    _ => rank(ka).cmp(&rank(kb)),
-                };
-                if ascending { ord } else { ord.reverse() }
-            });
-            let sh = &mut wb.sheets[s];
-            for (i, row) in rows.into_iter().enumerate() {
-                let r = start + i as u32;
-                for (c, cell) in row.into_iter().enumerate() {
-                    match cell {
-                        Some(cl) => {
-                            sh.set_cell(r, c as u32, cl);
-                        }
-                        None => {
-                            sh.cells.remove(&(r, c as u32));
-                        }
-                    }
-                    let _ = max_c;
-                }
-            }
+            gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
         });
         self.status = Some(format!("Sorted {}", if ascending { "A->Z" } else { "Z->A" }));
+    }
+
+    /// Multi-level sort from a typed spec like "B asc, C desc" (column letters,
+    /// optional asc/desc, default ascending). The first key is primary.
+    fn commit_sort(&mut self, text: &str) {
+        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
+            self.status = Some("Sort: enter columns, e.g. \"B asc, C desc\"".into());
+            return;
+        };
+        let Some((start, bottom)) = self.sort_bounds() else {
+            self.status = Some("Sort: put the cursor in the data".into());
+            return;
+        };
+        let s = self.sheet;
+        let keys2 = keys.clone();
+        self.structural(move |wb| {
+            gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
+        });
+        self.status = Some(format!("Sorted by {} key{}", keys.len(), if keys.len() == 1 { "" } else { "s" }));
     }
 
     /// AutoSum: put =SUM(range) in the current cell, summing the run of numbers
@@ -3966,6 +3959,7 @@ impl App {
             PromptKind::DataValidation => ("Dropdown list (comma-separated values): ", String::new()),
             PromptKind::Filter => ("Filter this column (=Laptop, >500, <>0, 'clear'): ", String::new()),
             PromptKind::TextToColumns => ("Split column by (comma, tab, space, ;): ", String::new()),
+            PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -4005,6 +3999,7 @@ impl App {
             PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::Filter => self.commit_filter(&text),
             PromptKind::TextToColumns => self.commit_text_to_columns(&text),
+            PromptKind::SortKeys => self.commit_sort(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -6318,6 +6313,36 @@ mod tests {
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(1, 0), CellValue::Text("B".into()));
         assert_eq!(v(3, 0), CellValue::Text("A".into()));
+    }
+
+    #[test]
+    fn commit_sort_multi_level() {
+        use gridcore::sheet::{Cell, CellValue};
+        assert_eq!(gridcore::edit::parse_sort_spec("A, B desc"), Some(vec![(0, true), (1, false)]));
+        assert_eq!(gridcore::edit::parse_sort_spec("bad3"), None);
+        assert_eq!(gridcore::edit::parse_sort_spec(""), None);
+
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Grp"));
+            sh.set_cell(0, 1, Cell::text("Score"));
+            for (i, (g, sc)) in [("B", 10.0), ("A", 5.0), ("B", 20.0), ("A", 8.0)].iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(g));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*sc));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 0);
+        app.anchor = None;
+        app.commit_sort("A asc, B desc"); // Grp asc, then Score desc
+        let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
+        assert_eq!(v(0, 0), CellValue::Text("Grp".into())); // header kept
+        assert_eq!((v(1, 0), v(1, 1)), (CellValue::Text("A".into()), CellValue::Number(8.0)));
+        assert_eq!((v(2, 0), v(2, 1)), (CellValue::Text("A".into()), CellValue::Number(5.0)));
+        assert_eq!((v(3, 0), v(3, 1)), (CellValue::Text("B".into()), CellValue::Number(20.0)));
+        assert_eq!((v(4, 0), v(4, 1)), (CellValue::Text("B".into()), CellValue::Number(10.0)));
     }
 
     #[test]

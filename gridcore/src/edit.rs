@@ -210,6 +210,113 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
     removed
 }
 
+/// Parse a multi-level sort spec: comma-separated `COL [asc|desc]` terms, where
+/// COL is a column letter (A, B, AA…) and the direction defaults to ascending.
+/// e.g. "B asc, C desc" → `[(1, true), (2, false)]`. Returns `None` on any
+/// malformed term (unknown direction word, trailing junk after the letters, or
+/// an empty spec).
+pub fn parse_sort_spec(s: &str) -> Option<Vec<(u32, bool)>> {
+    let mut keys = Vec::new();
+    for tok in s.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let mut parts = tok.split_whitespace();
+        let col_s = parts.next()?;
+        let (col, used) = crate::sheet::parse_col(col_s)?;
+        if used != col_s.len() {
+            return None;
+        }
+        let asc = match parts.next() {
+            None => true,
+            Some(d) if d.eq_ignore_ascii_case("asc") || d.eq_ignore_ascii_case("a") => true,
+            Some(d) if d.eq_ignore_ascii_case("desc") || d.eq_ignore_ascii_case("d") => false,
+            Some(_) => return None,
+        };
+        if parts.next().is_some() {
+            return None; // more than two words in a term
+        }
+        keys.push((col, asc));
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// Reorder rows `r1..=r2` of `sheet` by one or more sort keys, applied in order
+/// (the first key is primary, later keys break ties). Each key is `(column,
+/// ascending)`. Rows move as whole units — every column and its styles travel
+/// together — so this preserves row integrity but does not re-base formula
+/// references (it targets value tables, the common case). Blanks sort last in
+/// every key column regardless of direction; cross-type order is number < text
+/// < bool. The sort is stable, so rows equal on all keys keep their order.
+/// Returns the number of rows reordered.
+pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32, bool)]) -> usize {
+    use std::cmp::Ordering;
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    if keys.is_empty() || r2 <= r1 {
+        return 0;
+    }
+    let (_, cols) = s.used_size();
+    if cols == 0 {
+        return 0;
+    }
+    let max_c = cols - 1;
+    let mut rows: Vec<Vec<Option<Cell>>> = (r1..=r2)
+        .map(|r| (0..=max_c).map(|c| s.cell(r, c).cloned()).collect())
+        .collect();
+    let is_blank = |cell: &Option<Cell>| cell.as_ref().map_or(true, |c| c.is_blank());
+    // Cross-type rank so values of different kinds order deterministically.
+    let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
+        Some(CellValue::Number(_)) => 0,
+        Some(CellValue::Text(_)) => 1,
+        Some(CellValue::Bool(_)) => 2,
+        _ => 3,
+    };
+    let value_cmp = |ka: &Option<Cell>, kb: &Option<Cell>| match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
+        (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
+        _ => rank(ka).cmp(&rank(kb)),
+    };
+    rows.sort_by(|a, b| {
+        for &(col, asc) in keys {
+            let col = col as usize;
+            if col > max_c as usize {
+                continue;
+            }
+            let (ka, kb) = (&a[col], &b[col]);
+            let (ba, bb) = (is_blank(ka), is_blank(kb));
+            // Blanks always sort last, independent of the direction.
+            if ba || bb {
+                match ba.cmp(&bb) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                }
+            }
+            let ord = value_cmp(ka, kb);
+            let ord = if asc { ord } else { ord.reverse() };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    for (i, row) in rows.into_iter().enumerate() {
+        let r = r1 + i as u32;
+        for (c, cell) in row.into_iter().enumerate() {
+            match cell {
+                Some(cl) => s.set_cell(r, c as u32, cl),
+                None => {
+                    s.cells.remove(&(r, c as u32));
+                }
+            }
+        }
+    }
+    (r2 - r1 + 1) as usize
+}
+
 /// Split each text cell in column `col` over rows `r1..=r2` at `delim`, writing
 /// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
 /// Numeric-looking parts become numbers. Rows without the delimiter are left
@@ -455,6 +562,55 @@ mod tests {
             sheets: vec![sheet],
             ..Workbook::default()
         }
+    }
+
+    #[test]
+    fn sort_rows_multi_key_breaks_ties() {
+        // Group asc, then Score desc within each group. Rows 2..=5 (0-based 1..=4).
+        let mut w = wb(&[
+            ("A1", Cell::text("Group")),
+            ("B1", Cell::text("Score")),
+            ("A2", Cell::text("B")),
+            ("B2", Cell::number(10.0)),
+            ("A3", Cell::text("A")),
+            ("B3", Cell::number(5.0)),
+            ("A4", Cell::text("B")),
+            ("B4", Cell::number(20.0)),
+            ("A5", Cell::text("A")),
+            ("B5", Cell::number(8.0)),
+        ]);
+        let n = sort_rows(&mut w, 0, 1, 4, &[(0, true), (1, false)]);
+        assert_eq!(n, 4);
+        let s = &w.sheets[0];
+        let col = |r: u32, c: u32| s.cell(r, c).map(|cl| cl.value.clone());
+        // A/8, A/5, B/20, B/10
+        assert_eq!(col(1, 0), Some(CellValue::Text("A".into())));
+        assert_eq!(col(1, 1), Some(CellValue::Number(8.0)));
+        assert_eq!(col(2, 0), Some(CellValue::Text("A".into())));
+        assert_eq!(col(2, 1), Some(CellValue::Number(5.0)));
+        assert_eq!(col(3, 0), Some(CellValue::Text("B".into())));
+        assert_eq!(col(3, 1), Some(CellValue::Number(20.0)));
+        assert_eq!(col(4, 1), Some(CellValue::Number(10.0)));
+    }
+
+    #[test]
+    fn sort_rows_puts_blanks_last_both_directions() {
+        let mut w = wb(&[
+            ("A1", Cell::number(3.0)),
+            ("A3", Cell::number(1.0)), // A2 is blank
+            ("A4", Cell::number(2.0)),
+        ]);
+        // Ascending: 1,2,3,blank
+        sort_rows(&mut w, 0, 0, 3, &[(0, true)]);
+        let s = &w.sheets[0];
+        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(1.0)));
+        assert_eq!(s.cell(2, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
+        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
+        // Descending: 3,2,1,blank (blank still last)
+        sort_rows(&mut w, 0, 0, 3, &[(0, false)]);
+        let s = &w.sheets[0];
+        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
+        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
     }
 
     #[test]

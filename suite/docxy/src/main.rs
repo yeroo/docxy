@@ -295,6 +295,7 @@ enum SheetAct {
     DeleteCol,
     SortAsc,
     SortDesc,
+    CustomSort,
     AutoSum,
     FormatCells,
     Merge,
@@ -546,6 +547,8 @@ struct Docxy {
     sheet_filter_edit: Option<String>,
     // In-progress Text-to-Columns delimiter entry.
     sheet_ttc_edit: Option<String>,
+    // In-progress multi-level sort spec entry ("B asc, C desc").
+    sheet_sort_edit: Option<String>,
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -947,6 +950,7 @@ impl Docxy {
             sheet_dv_edit: None,
             sheet_filter_edit: None,
             sheet_ttc_edit: None,
+            sheet_sort_edit: None,
         }
     }
 
@@ -1690,6 +1694,35 @@ impl Docxy {
         }
     }
 
+    /// Route a keystroke into the multi-level sort entry bar; Enter runs the sort.
+    fn sheet_sort_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_sort_edit.clone() else { return };
+        match key {
+            "escape" => {
+                self.sheet_sort_edit = None;
+                cx.notify();
+            }
+            "enter" => {
+                self.sheet_sort_edit = None;
+                self.sheet_commit_sort(&buf, cx);
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_sort_edit = Some(buf);
+                cx.notify();
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_sort_edit = Some(buf);
+                cx.notify();
+            }
+        }
+    }
+
     /// Route a keystroke into the data-validation entry bar; Enter creates a list
     /// validation from the comma-separated values over the selection.
     fn sheet_dv_edit_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
@@ -1949,78 +1982,68 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Sort the used range by the selected column (header-aware). Rows move as
-    /// whole units (all columns + styles); blanks sort last. Formula refs are not
-    /// re-based, so this targets value tables (the common case).
+    /// The contiguous region around the selection to sort, as `(start, bottom)`
+    /// data-row bounds (header excluded). A header is inferred when the top row
+    /// carries a text label over numeric data in *any* column. `None` when
+    /// there's nothing to sort.
+    fn sheet_sort_bounds(&self) -> Option<(u32, u32)> {
+        use gridcore::sheet::CellValue;
+        let v = self.active_sheet()?;
+        let s = v.active;
+        let (max_r, max_c) = v.extent();
+        let sh = &v.pkg.workbook.sheets[s];
+        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+        let sr = v.sel.0;
+        if !row_used(sr) {
+            return None;
+        }
+        let mut top = sr;
+        while top > 0 && row_used(top - 1) {
+            top -= 1;
+        }
+        let mut bottom = sr;
+        while bottom < max_r && row_used(bottom + 1) {
+            bottom += 1;
+        }
+        let header = (0..=max_c).any(|c| {
+            matches!(sh.cell(top, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
+                && (top + 1..=bottom).any(|r| matches!(sh.cell(r, c).map(|cl| &cl.value), Some(CellValue::Number(_))))
+        });
+        let start = if header { top + 1 } else { top };
+        (bottom > start).then_some((start, bottom))
+    }
+
+    /// Sort the current region by the selected column (header-aware). Rows move
+    /// as whole units (all columns + styles); blanks sort last. Formula refs are
+    /// not re-based, so this targets value tables (the common case).
     fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
-        use gridcore::sheet::{Cell, CellValue};
-        use std::cmp::Ordering;
+        let Some((start, bottom)) = self.sheet_sort_bounds() else {
+            return;
+        };
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
-            let sc = v.sel.1 as usize;
-            let (max_r, max_c) = v.extent();
-            let sh = &v.pkg.workbook.sheets[s];
-            // Contiguous region around the selection (Excel's "current region"):
-            // expand over rows with any content, bounded by fully-blank rows.
-            let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            let sr = v.sel.0;
-            if !row_used(sr) {
-                return;
-            }
-            let mut top = sr;
-            while top > 0 && row_used(top - 1) {
-                top -= 1;
-            }
-            let mut bottom = sr;
-            while bottom < max_r && row_used(bottom + 1) {
-                bottom += 1;
-            }
-            // A header row exists if the region's top row is text over numeric data.
-            let header = matches!(sh.cell(top, sc as u32).map(|c| &c.value), Some(CellValue::Text(_)))
-                && (top + 1..=bottom).any(|r| matches!(sh.cell(r, sc as u32).map(|c| &c.value), Some(CellValue::Number(_))));
-            let start = if header { top + 1 } else { top };
-            if bottom <= start {
-                return;
-            }
-            // Snapshot each data row as a full-width vector of cells.
-            let mut rows: Vec<Vec<Option<Cell>>> = (start..=bottom)
-                .map(|r| (0..=max_c).map(|c| sh.cell(r, c).cloned()).collect())
-                .collect();
-            let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
-                Some(CellValue::Number(_)) => 0,
-                Some(CellValue::Text(_)) => 1,
-                Some(CellValue::Bool(_)) => 2,
-                _ => 3, // blank / empty
-            };
-            rows.sort_by(|a, b| {
-                let (ka, kb) = (&a[sc], &b[sc]);
-                let (blank_a, blank_b) = (rank(ka) == 3, rank(kb) == 3);
-                if blank_a || blank_b {
-                    return blank_a.cmp(&blank_b); // blanks always last
-                }
-                let ord = match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
-                    (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-                    (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
-                    (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
-                    _ => rank(ka).cmp(&rank(kb)), // different types: numbers before text
-                };
-                if ascending { ord } else { ord.reverse() }
-            });
-            let sheet = &mut v.pkg.workbook.sheets[s];
-            for (i, row) in rows.into_iter().enumerate() {
-                let r = start + i as u32;
-                for (c, cell) in row.into_iter().enumerate() {
-                    match cell {
-                        Some(cl) => {
-                            sheet.cells.insert((r, c as u32), cl);
-                        }
-                        None => {
-                            sheet.cells.remove(&(r, c as u32));
-                        }
-                    }
-                }
-            }
+            let sc = v.sel.1;
+            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &[(sc, ascending)]);
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Multi-level sort of the current region from a typed spec like
+    /// "B asc, C desc" (column letters, optional asc/desc, default ascending).
+    fn sheet_commit_sort(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
+            return;
+        };
+        let Some((start, bottom)) = self.sheet_sort_bounds() else {
+            return;
+        };
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &keys);
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
         self.mark_sheet_dirty();
@@ -2637,6 +2660,10 @@ impl Docxy {
             SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
             SheetAct::SortAsc => self.sheet_sort(true, cx),
             SheetAct::SortDesc => self.sheet_sort(false, cx),
+            SheetAct::CustomSort => {
+                self.sheet_sort_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::AutoSum => self.sheet_autosum(cx),
             SheetAct::FormatCells => {
                 self.sheet_fmt_open = true;
@@ -2693,6 +2720,10 @@ impl Docxy {
         // The Text-to-Columns delimiter bar swallows typing too.
         if self.sheet_ttc_edit.is_some() {
             return self.sheet_ttc_key(ev, key, cx);
+        }
+        // The multi-level sort spec bar swallows typing too.
+        if self.sheet_sort_edit.is_some() {
+            return self.sheet_sort_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6502,6 +6533,29 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The multi-level sort bar: type a spec like "B asc, C desc".
+    fn sheet_sort_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ent = cx.entity();
+        let ent_cancel = ent.clone();
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort the region by"))
+            .child(
+                div().w(px(220.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { "B asc, C desc".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().id("sort-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_sort_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
     /// The data-validation entry bar: type comma-separated allowed values to make
     /// the selection a dropdown list.
     fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6880,6 +6934,7 @@ impl Docxy {
                 .child(col(vec![
                     self.sheet_rb(Some("sort"), "Sort A \u{2192} Z", SheetAct::SortAsc, pal, cx),
                     self.sheet_rb(Some("sort"), "Sort Z \u{2192} A", SheetAct::SortDesc, pal, cx),
+                    self.sheet_rb(Some("sort"), "Custom Sort\u{2026}", SheetAct::CustomSort, pal, cx),
                     self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
                     self.sheet_rb(None, "Remove Dup", SheetAct::RemoveDuplicates, pal, cx),
                 ]))
@@ -7455,6 +7510,7 @@ impl Render for Docxy {
         let sheet_dv_bar = self.sheet_dv_edit.clone().map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
         let sheet_filter = self.sheet_filter_edit.clone().map(|buf| self.sheet_filter_bar(&buf, pal, cx));
         let sheet_ttc = self.sheet_ttc_edit.clone().map(|buf| self.sheet_ttc_bar(&buf, pal, cx));
+        let sheet_sort = self.sheet_sort_edit.clone().map(|buf| self.sheet_sort_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7767,6 +7823,7 @@ impl Render for Docxy {
             .when_some(sheet_dv_bar, |d, c| d.child(c))
             .when_some(sheet_filter, |d, c| d.child(c))
             .when_some(sheet_ttc, |d, c| d.child(c))
+            .when_some(sheet_sort, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
