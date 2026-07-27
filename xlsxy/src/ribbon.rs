@@ -28,6 +28,9 @@ pub enum Act {
     InsertCol,
     DeleteRow,
     DeleteCol,
+    SortAsc,
+    SortDesc,
+    AutoSum,
     AddSheet,
     RenameSheet,
     Save,
@@ -194,6 +197,18 @@ fn home_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("⌫ Clear", ClearContents, "Clear (Del)"),
                 ],
+            ],
+        },
+        Group {
+            title: "Data",
+            width: 20,
+            rows: [
+                vec![
+                    btn("↑ Sort", SortAsc, "Sort A->Z by the current column"),
+                    Seg::Gap(" "),
+                    btn("↓ Sort", SortDesc, "Sort Z->A by the current column"),
+                ],
+                vec![btn("Σ AutoSum", AutoSum, "Sum the numbers above/left")],
             ],
         },
         Group {

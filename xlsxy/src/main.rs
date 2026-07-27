@@ -2591,6 +2591,9 @@ impl App {
             InsertCol => self.col_op(true),
             DeleteRow => self.row_op(false),
             DeleteCol => self.col_op(false),
+            SortAsc => self.sort_region(true),
+            SortDesc => self.sort_region(false),
+            AutoSum => self.autosum(),
             AddSheet => self.open_prompt(PromptKind::AddSheet),
             RenameSheet => self.open_prompt(PromptKind::RenameSheet),
             Save => self.save(),
@@ -3032,6 +3035,120 @@ impl App {
             if insert { "Inserted" } else { "Deleted" },
             if count == 1 { "" } else { "s" }
         ));
+    }
+
+    /// Sort the contiguous region around the cursor by the cursor's column
+    /// (header-aware; rows move as whole units; blanks last). Value-table sort —
+    /// like the suite; formula refs in moved rows are not re-based.
+    fn sort_region(&mut self, ascending: bool) {
+        use gridcore::sheet::{Cell, CellValue};
+        use std::cmp::Ordering;
+        let s = self.sheet;
+        let sc = self.cur.1 as usize;
+        let cur_r = self.cur.0;
+        self.structural(move |wb| {
+            let (start, max_c, mut rows): (u32, u32, Vec<Vec<Option<Cell>>>) = {
+                let sh = &wb.sheets[s];
+                let (rc, cc) = sh.used_size();
+                if rc == 0 || cc == 0 {
+                    return;
+                }
+                let (max_r, max_c) = (rc - 1, cc - 1);
+                let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                if !used(cur_r) {
+                    return;
+                }
+                let mut top = cur_r;
+                while top > 0 && used(top - 1) {
+                    top -= 1;
+                }
+                let mut bottom = cur_r;
+                while bottom < max_r && used(bottom + 1) {
+                    bottom += 1;
+                }
+                let header = matches!(sh.cell(top, sc as u32).map(|c| &c.value), Some(CellValue::Text(_)))
+                    && (top + 1..=bottom).any(|r| matches!(sh.cell(r, sc as u32).map(|c| &c.value), Some(CellValue::Number(_))));
+                let start = if header { top + 1 } else { top };
+                if bottom <= start {
+                    return;
+                }
+                let rows = (start..=bottom).map(|r| (0..=max_c).map(|c| sh.cell(r, c).cloned()).collect()).collect();
+                (start, max_c, rows)
+            };
+            let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
+                Some(CellValue::Number(_)) => 0,
+                Some(CellValue::Text(_)) => 1,
+                Some(CellValue::Bool(_)) => 2,
+                _ => 3,
+            };
+            rows.sort_by(|a, b| {
+                let (ka, kb) = (&a[sc], &b[sc]);
+                let (ba, bb) = (rank(ka) == 3, rank(kb) == 3);
+                if ba || bb {
+                    return ba.cmp(&bb);
+                }
+                let ord = match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
+                    (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                    (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
+                    (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
+                    _ => rank(ka).cmp(&rank(kb)),
+                };
+                if ascending { ord } else { ord.reverse() }
+            });
+            let sh = &mut wb.sheets[s];
+            for (i, row) in rows.into_iter().enumerate() {
+                let r = start + i as u32;
+                for (c, cell) in row.into_iter().enumerate() {
+                    match cell {
+                        Some(cl) => {
+                            sh.set_cell(r, c as u32, cl);
+                        }
+                        None => {
+                            sh.cells.remove(&(r, c as u32));
+                        }
+                    }
+                    let _ = max_c;
+                }
+            }
+        });
+        self.status = Some(format!("Sorted {}", if ascending { "A->Z" } else { "Z->A" }));
+    }
+
+    /// AutoSum: put =SUM(range) in the current cell, summing the run of numbers
+    /// directly above (else to the left).
+    fn autosum(&mut self) {
+        use gridcore::sheet::{Cell, CellValue, cell_name};
+        let s = self.sheet;
+        let (r, c) = self.cur;
+        let range = {
+            let sh = self.sheet();
+            let is_num = |rr: u32, cc: u32| matches!(sh.cell(rr, cc).map(|x| &x.value), Some(CellValue::Number(_)));
+            if r > 0 && is_num(r - 1, c) {
+                let mut top = r - 1;
+                while top > 0 && is_num(top - 1, c) {
+                    top -= 1;
+                }
+                Some(format!("{}:{}", cell_name(top, c), cell_name(r - 1, c)))
+            } else if c > 0 && is_num(r, c - 1) {
+                let mut left = c - 1;
+                while left > 0 && is_num(r, left - 1) {
+                    left -= 1;
+                }
+                Some(format!("{}:{}", cell_name(r, left), cell_name(r, c - 1)))
+            } else {
+                None
+            }
+        };
+        let Some(range) = range else {
+            self.status = Some("AutoSum: no adjacent numbers".into());
+            return;
+        };
+        let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+        self.status = Some(format!("AutoSum: =SUM({range})"));
+        self.structural(move |wb| {
+            let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
+            wb.sheets[s].set_cell(r, c, cell);
+        });
     }
 
     /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
@@ -5730,6 +5847,60 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         let xf = re.workbook.styles.xf(re.workbook.sheets[0].cell(0, 0).unwrap().style);
         assert!(xf.bold && xf.align == Align::Center && xf.code.as_deref() == Some("0%"));
+    }
+
+    #[test]
+    fn sort_region_orders_by_column() {
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            for (r, (name, qty)) in [("B", 3.0), ("A", 1.0), ("C", 2.0)].iter().enumerate() {
+                sh.set_cell(r as u32 + 1, 0, Cell::text(name));
+                sh.set_cell(r as u32 + 1, 1, Cell::number(*qty));
+            }
+        }
+        app.rebuild_engine();
+        app.cur = (1, 1); // a data cell in the Qty column
+        app.anchor = None;
+        app.sort_region(true); // ascending by Qty
+
+        let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
+        assert_eq!(v(0, 0), CellValue::Text("Item".into())); // header stays put
+        // Qty ascending 1,2,3 => rows A, C, B.
+        assert_eq!(v(1, 0), CellValue::Text("A".into()));
+        assert_eq!(v(1, 1), CellValue::Number(1.0));
+        assert_eq!(v(2, 0), CellValue::Text("C".into()));
+        assert_eq!(v(3, 0), CellValue::Text("B".into()));
+
+        app.sort_region(false); // descending => B, C, A
+        let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
+        assert_eq!(v(1, 0), CellValue::Text("B".into()));
+        assert_eq!(v(3, 0), CellValue::Text("A".into()));
+    }
+
+    #[test]
+    fn autosum_sums_the_run_above() {
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::number(2.0));
+            sh.set_cell(1, 0, Cell::number(4.0));
+            sh.set_cell(2, 0, Cell::number(6.0));
+        }
+        app.rebuild_engine();
+        app.cur = (3, 0); // directly below the numbers
+        app.anchor = None;
+        app.autosum();
+
+        let c = app.sheet().cell(3, 0).unwrap();
+        assert_eq!(c.formula.as_deref(), Some("SUM(A1:A3)"));
+        assert_eq!(c.value, CellValue::Number(12.0));
     }
 
     #[test]
