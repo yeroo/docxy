@@ -485,7 +485,23 @@ struct Docxy {
     sheet_comment_edit: Option<String>,
     // Whether the data-validation list dropdown is open on the selected cell.
     sheet_dv_open: bool,
+    // Whether the Number-group format picker strip is open.
+    sheet_numfmt_open: bool,
 }
+
+/// Common number formats offered by the Number-group dropdown: (label, code).
+/// The `General` code is empty (clears xf.code back to the default).
+const NUM_FORMATS: [(&str, &str); 9] = [
+    ("General", ""),
+    ("Number", "#,##0.00"),
+    ("Currency", "$#,##0.00"),
+    ("Accounting", "_($* #,##0.00_);_($* (#,##0.00);_($* \"-\"??_)"),
+    ("Percentage", "0.00%"),
+    ("Scientific", "0.00E+00"),
+    ("Short Date", "yyyy-mm-dd"),
+    ("Time", "h:mm:ss"),
+    ("Text", "@"),
+];
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
 // on_key_down, so a tab must be inserted through a bound action instead.
@@ -853,6 +869,7 @@ impl Docxy {
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
             sheet_dv_open: false,
+            sheet_numfmt_open: false,
         }
     }
 
@@ -1732,6 +1749,22 @@ impl Docxy {
     /// Apply a number format code to the selection (Excel's %, currency, comma).
     fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
+    }
+
+    /// Apply a number format from the Number dropdown ("" = General/clear) + close.
+    fn sheet_apply_numfmt(&mut self, code: &str, cx: &mut Context<Self>) {
+        let code = code.to_string();
+        self.sheet_format(move |xf| xf.code = if code.is_empty() { None } else { Some(code.clone()) }, cx);
+        self.sheet_numfmt_open = false;
+    }
+
+    /// Friendly name for the selected cell's current number format.
+    fn active_numfmt_name(&self) -> &'static str {
+        let code = self.active_xf().code;
+        match code {
+            None => "General",
+            Some(c) => NUM_FORMATS.iter().find(|(_, fc)| *fc == c.as_str()).map(|(n, _)| *n).unwrap_or("Custom"),
+        }
     }
     /// Set fill or font colour on the selection from a swatch (None = clear), and
     /// close the picker.
@@ -5732,6 +5765,59 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The Number-group format combo: shows the selection's current format name
+    /// and toggles the format-picker strip.
+    fn sheet_numfmt_combo(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let name = self.active_numfmt_name();
+        div()
+            .id("numfmt-combo")
+            .flex().items_center().justify_between().gap_1()
+            .w(px(108.)).h(px(22.)).px_1p5()
+            .rounded(px(3.))
+            .border_1().border_color(pal.border).bg(pal.panel)
+            .cursor_pointer()
+            .hover(|d| d.border_color(hsla_u(BRAND)))
+            .child(div().text_size(px(11.)).text_color(pal.fg).overflow_hidden().child(name))
+            .child(div().text_size(px(8.)).text_color(pal.dim).child("\u{25BE}"))
+            .on_click(cx.listener(|this, _, _w, cx| {
+                this.sheet_numfmt_open = !this.sheet_numfmt_open;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The format-picker strip shown under the ribbon while the Number dropdown is
+    /// open: each option applies its code to the selection and shows a live sample.
+    fn sheet_numfmt_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::{format_with, CellValue, Xf};
+        let d1904 = self.active_sheet().is_some_and(|v| v.pkg.workbook.date1904);
+        let mut row = h_flex().w_full().items_center().flex_wrap().gap_1p5().px_3().py_1().bg(pal.panel).border_b_1().border_color(pal.border);
+        row = row.child(div().text_size(px(11.)).text_color(pal.dim).min_w(px(70.)).child("Number format"));
+        for (label, code) in NUM_FORMATS {
+            // Live sample of 1234.5 in this format (dates/text show a fixed sample).
+            let sample = if code.is_empty() {
+                "1234.5".to_string()
+            } else if code == "@" {
+                "abc".to_string()
+            } else if code.contains('y') || code.contains('h') {
+                format_with(&Xf { code: Some(code.to_string()), ..Xf::default() }, &CellValue::Number(45658.5), d1904)
+            } else {
+                format_with(&Xf { code: Some(code.to_string()), ..Xf::default() }, &CellValue::Number(1234.5), d1904)
+            };
+            row = row.child(
+                div()
+                    .id(ElementId::Name(format!("nf-{label}").into()))
+                    .flex().flex_col().px_2().py_1().rounded(px(3.)).cursor_pointer()
+                    .border_1().border_color(pal.border).bg(hsla_u(0xffffff))
+                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    .child(div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child(label))
+                    .child(div().text_size(px(10.)).text_color(pal.dim).child(SharedString::from(sample)))
+                    .on_click(cx.listener(move |this, _, _w, cx| this.sheet_apply_numfmt(code, cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
     /// The swatch strip shown under the ribbon while a sheet colour picker is open;
     /// a swatch sets the fill or font colour of the selection.
     fn sheet_picker_bar(&self, pick: SheetPick, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6052,7 +6138,7 @@ impl Docxy {
             ])))
             // Number: format combo; then currency/percent/comma + decimals.
             .child(group("Number", true, col(vec![
-                row(vec![self.sheet_combo("General", true, pal, cx)]),
+                row(vec![self.sheet_numfmt_combo(pal, cx)]),
                 row(vec![
                     self.sheet_gb("$", SheetAct::Currency, pal, cx),
                     self.sheet_gb("%", SheetAct::Percent, pal, cx),
@@ -6652,6 +6738,7 @@ impl Render for Docxy {
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let sheet_pick_bar = self.active_is_sheet().then_some(self.sheet_pick).flatten().map(|p| self.sheet_picker_bar(p, pal, cx));
+        let sheet_numfmt_bar = (self.active_is_sheet() && self.sheet_numfmt_open).then(|| self.sheet_numfmt_bar(pal, cx));
         let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
@@ -6959,6 +7046,7 @@ impl Render for Docxy {
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(sheet_pick_bar, |d, p| d.child(p))
+            .when_some(sheet_numfmt_bar, |d, b| d.child(b))
             .when_some(sheet_find, |d, f| d.child(f))
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
