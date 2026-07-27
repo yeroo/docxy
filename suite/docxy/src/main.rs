@@ -5473,6 +5473,7 @@ impl Docxy {
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         match self.ribbon_tab {
             RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
+            RibbonTab::Review => self.sheet_review_ribbon(pal, cx),
             RibbonTab::View => self.sheet_view_ribbon(pal, cx),
             _ => self.sheet_home_ribbon(pal, cx),
         }
@@ -5511,6 +5512,49 @@ impl Docxy {
                 .child(self.sheet_lb(None, "Bar", SheetAct::InsertChart("bar"), pal, cx))
                 .child(self.sheet_lb(None, "Line", SheetAct::InsertChart("line"), pal, cx))
                 .child(self.sheet_lb(None, "Pie", SheetAct::InsertChart("pie"), pal, cx))
+                .into_any_element()))
+            .into_any_element()
+    }
+
+    /// The Review tab, laid out like Excel: Proofing, Comments, Protect. These
+    /// aren't modeled for sheets yet (no cell-comment model), so the buttons are
+    /// inert placeholders — the point is a distinct, Excel-faithful tab identity
+    /// (it used to fall through to the Home ribbon).
+    fn sheet_review_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let group = |title: &str, body: AnyElement| -> AnyElement {
+            v_flex()
+                .h(px(94.))
+                .px_1p5()
+                .py(px(3.))
+                .justify_between()
+                .border_r_1()
+                .border_color(pal.border)
+                .child(div().flex_1().flex().items_center().child(body))
+                .child(div().w_full().text_size(px(10.)).text_color(pal.dim).text_center().child(title.to_string()))
+                .into_any_element()
+        };
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .child(group("Proofing", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, "Spelling", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            .child(group("Comments", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, "New Comment", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Delete", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Previous", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Next", SheetAct::Todo, pal, cx))
+                .into_any_element()))
+            .child(group("Protect", h_flex().h_full().items_center().gap_1()
+                .child(self.sheet_lb(None, "Protect Sheet", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Protect Workbook", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .into_any_element()
     }
