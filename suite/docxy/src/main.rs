@@ -281,6 +281,10 @@ enum SheetAct {
     FontColor,
     ToggleBorder,
     FreezePanes,
+    NewComment,
+    DeleteComment,
+    PrevComment,
+    NextComment,
     Todo,
 }
 
@@ -461,6 +465,9 @@ struct Docxy {
     // Grid width (px) captured each render, so the horizontal scroll track can map
     // a click x back to a column fraction.
     sheet_grid_w: f32,
+    // In-progress cell-comment entry for the selected cell (the input buffer);
+    // None = the comment bar is closed.
+    sheet_comment_edit: Option<String>,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -827,6 +834,7 @@ impl Docxy {
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
+            sheet_comment_edit: None,
         }
     }
 
@@ -1378,6 +1386,117 @@ impl Docxy {
             .unwrap_or_default()
     }
 
+    // ---- cell comments -----------------------------------------------------
+
+    /// The comment author to stamp on new comments (the OS user, else "docxy").
+    fn comment_author() -> String {
+        std::env::var("USERNAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "docxy".to_string())
+    }
+
+    /// The comment text on the active sheet's selected cell, if any.
+    fn selected_comment(&self) -> Option<String> {
+        let v = self.active_sheet()?;
+        let (r, c) = v.sel;
+        v.pkg
+            .comments()
+            .into_iter()
+            .find(|cm| cm.sheet == v.active && cm.row == r && cm.col == c)
+            .map(|cm| cm.text)
+    }
+
+    /// Open the comment entry bar for the selected cell, seeded with its existing
+    /// comment text (so New Comment doubles as Edit).
+    fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
+        if self.active_sheet().is_some() {
+            self.sheet_comment_edit = Some(self.selected_comment().unwrap_or_default());
+            cx.notify();
+        }
+    }
+
+    /// Route a keystroke into the open comment bar (char / backspace / enter / esc).
+    fn sheet_comment_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_comment_edit.clone() else { return };
+        match key {
+            "escape" => {
+                self.sheet_comment_edit = None;
+                cx.notify();
+            }
+            "enter" => self.sheet_commit_comment(cx),
+            "backspace" => {
+                buf.pop();
+                self.sheet_comment_edit = Some(buf);
+                cx.notify();
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_comment_edit = Some(buf);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Commit the comment bar's buffer onto the selected cell (empty = delete).
+    fn sheet_commit_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.sheet_comment_edit.take() else { return };
+        let author = Self::comment_author();
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            let t = text.trim();
+            if t.is_empty() {
+                v.pkg.remove_comment(s, r, c);
+            } else {
+                v.pkg.set_comment(s, r, c, &author, t);
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    fn sheet_delete_comment(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            v.pkg.remove_comment(s, r, c);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Move the selection to the next / previous commented cell (row-major).
+    fn sheet_comment_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(v) = self.active_sheet_mut() {
+            let mut cells: Vec<(u32, u32)> = v
+                .pkg
+                .comments()
+                .into_iter()
+                .filter(|cm| cm.sheet == v.active)
+                .map(|cm| (cm.row, cm.col))
+                .collect();
+            if cells.is_empty() {
+                return;
+            }
+            cells.sort_unstable();
+            cells.dedup();
+            let cur = v.sel;
+            let next = if forward {
+                cells.iter().find(|&&x| x > cur).copied().unwrap_or(cells[0])
+            } else {
+                cells.iter().rev().find(|&&x| x < cur).copied().unwrap_or(*cells.last().unwrap())
+            };
+            v.sel = next;
+            v.anchor = next;
+        }
+        cx.notify();
+    }
+
     fn sheet_toggle_bold(&mut self, cx: &mut Context<Self>) {
         let on = !self.active_xf().bold;
         self.sheet_format(move |xf| xf.bold = on, cx);
@@ -1846,6 +1965,10 @@ impl Docxy {
             }
             SheetAct::ToggleBorder => self.sheet_toggle_border(cx),
             SheetAct::FreezePanes => self.sheet_freeze(cx),
+            SheetAct::NewComment => self.sheet_new_comment(cx),
+            SheetAct::DeleteComment => self.sheet_delete_comment(cx),
+            SheetAct::PrevComment => self.sheet_comment_nav(false, cx),
+            SheetAct::NextComment => self.sheet_comment_nav(true, cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -1857,6 +1980,10 @@ impl Docxy {
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
             return self.sheet_rename_key(ev, key, cx);
+        }
+        // The comment entry bar swallows typing until Enter (commit) / Esc.
+        if self.sheet_comment_edit.is_some() {
+            return self.sheet_comment_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -5419,6 +5546,41 @@ impl Docxy {
     }
 
     /// The sheet Find & Replace bar (Ctrl+F): query + prev/next, replace + all.
+    /// The cell-comment entry bar: a labelled text field (self-managed, keys via
+    /// sheet_comment_key) with the target cell, Save/Cancel. Enter commits.
+    fn sheet_comment_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::cell_name;
+        let cell = self.active_sheet().map(|v| cell_name(v.sel.0, v.sel.1)).unwrap_or_default();
+        let ent = cx.entity();
+        let (ent_save, ent_cancel) = (ent.clone(), ent.clone());
+        let btn = |label: &str, primary: bool| {
+            div()
+                .px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(if primary { hsla_u(BRAND) } else { pal.panel })
+                .text_color(if primary { hsla_u(0xffffff) } else { pal.fg })
+                .border_1().border_color(pal.border)
+                .child(label.to_string())
+        };
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Comment on {cell}:")))
+            .child(
+                div().flex_1().h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(buf.to_string())))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(btn("Save", true).on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                ent_save.update(cx, |this, cx| this.sheet_commit_comment(cx));
+            }))
+            .child(btn("Cancel", false).on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                ent_cancel.update(cx, |this, cx| { this.sheet_comment_edit = None; cx.notify(); });
+            }))
+            .into_any_element()
+    }
+
     fn sheet_find_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let qf = self.find_field == FindField::Query;
         let rf = self.find_field == FindField::Replace;
@@ -5547,10 +5709,10 @@ impl Docxy {
                 .child(self.sheet_lb(None, "Spelling", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             .child(group("Comments", h_flex().h_full().items_center().gap_1()
-                .child(self.sheet_lb(None, "New Comment", SheetAct::Todo, pal, cx))
-                .child(self.sheet_lb(None, "Delete", SheetAct::Todo, pal, cx))
-                .child(self.sheet_lb(None, "Previous", SheetAct::Todo, pal, cx))
-                .child(self.sheet_lb(None, "Next", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "New Comment", SheetAct::NewComment, pal, cx))
+                .child(self.sheet_lb(None, "Delete", SheetAct::DeleteComment, pal, cx))
+                .child(self.sheet_lb(None, "Previous", SheetAct::PrevComment, pal, cx))
+                .child(self.sheet_lb(None, "Next", SheetAct::NextComment, pal, cx))
                 .into_any_element()))
             .child(group("Protect", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(None, "Protect Sheet", SheetAct::Todo, pal, cx))
@@ -6259,6 +6421,7 @@ impl Render for Docxy {
         let picker_bar = (is_doc).then_some(self.picker).flatten().map(|k| self.picker_bar(k, pal, cx));
         let sheet_pick_bar = self.active_is_sheet().then_some(self.sheet_pick).flatten().map(|p| self.sheet_picker_bar(p, pal, cx));
         let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
+        let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -6565,6 +6728,7 @@ impl Render for Docxy {
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(sheet_pick_bar, |d, p| d.child(p))
             .when_some(sheet_find, |d, f| d.child(f))
+            .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
@@ -6649,7 +6813,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
 
 /// One data row: the row-number gutter cell plus the visible cells (frozen
 /// columns `0..fc` pinned, then the scrollable window `col0..=cend`).
-fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, cend: u32) -> AnyElement {
+fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, cend: u32, comment_cells: &std::collections::HashSet<(u32, u32)>) -> AnyElement {
     use gridcore::sheet::{Align, CellValue};
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
@@ -6764,6 +6928,14 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                     this.focus.focus(window, cx);
                 });
             });
+        // Red corner marker for a commented cell (Excel's note indicator).
+        if comment_cells.contains(&(r, c)) {
+            cell = cell.relative().child(
+                div().absolute().top_0().right_0().w(px(0.)).h(px(0.))
+                    .border_t(px(5.)).border_r(px(5.))
+                    .border_color(hsla_u(0xd0322b)),
+            );
+        }
         row = row.child(cell);
     }
     row.into_any_element()
@@ -6887,6 +7059,10 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let (frz_r, frz_c) = sh.freeze;
     let fc = frz_c.min(64);
     let frozen_w: f32 = (0..fc).map(|c| col_px(sh.col_width(c))).sum();
+    // Cells carrying a comment (red corner marker); parsed once per render.
+    let comment_cells: std::rc::Rc<std::collections::HashSet<(u32, u32)>> = std::rc::Rc::new(
+        view.pkg.comments().into_iter().filter(|c| c.sheet == view.active).map(|c| (c.row, c.col)).collect(),
+    );
     // Horizontal column window: frozen cols 0..fc are always drawn; the scrollable
     // window fills the REMAINING width from the scroll offset col0 (kept >= fc).
     // Column virtualization by offset — the counterpart to the row uniform_list.
@@ -6940,12 +7116,14 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
     let header = sheet_col_header(view, ent, fc, col0, cend);
+    let cc_frozen = comment_cells.clone();
+    let cc_list = comment_cells.clone();
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
     let fr = (frz_r as usize).min(total_rows).min(30);
     let mut frozen = v_flex().flex_none();
     for r in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, r as u32, fc, col0, cend));
+        frozen = frozen.child(sheet_row(view, ent, r as u32, fc, col0, cend, &cc_frozen));
     }
     let ent_list = ent.clone();
     let list = uniform_list(
@@ -6953,7 +7131,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         total_rows.saturating_sub(fr),
         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
             let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, fc, col0, cend)).collect::<Vec<_>>()
+            range.map(|i| sheet_row(v, &ent_list, (fr + i) as u32, fc, col0, cend, &cc_list)).collect::<Vec<_>>()
         }),
     )
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
@@ -7154,7 +7332,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
 /// spans the visible column window. Dragging or clicking the track scrolls
 /// columns (the grid virtualizes columns by offset, so this maps a fraction of
 /// the used width to a starting column rather than a pixel offset).
-fn sheet_hbar(view: &SheetView, ent: &Entity<Docxy>, max_c: u32, col0: u32, cend: u32) -> AnyElement {
+fn sheet_hbar(_view: &SheetView, ent: &Entity<Docxy>, max_c: u32, col0: u32, cend: u32) -> AnyElement {
     let total = (max_c + 1).max(cend + 1).max(1);
     let shown = (cend + 1).saturating_sub(col0).max(1);
     let frac = (shown as f32 / total as f32).clamp(0.06, 1.0);
