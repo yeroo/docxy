@@ -2485,6 +2485,113 @@ impl SheetPackage {
         });
     }
 
+    /// Create an Excel Table ("Format as Table") over `range`. Column names come
+    /// from the header row when `has_header` (else "Column1"…). Wires the OPC (a
+    /// `xl/tables/table*.xml` part, its content type, a worksheet `/table` rel +
+    /// `<tableParts>`) and the model, so it round-trips and Excel styles it with
+    /// the given `style` (e.g. "TableStyleMedium2"). Returns the table index.
+    pub fn add_table(&mut self, sheet: usize, range: (u32, u32, u32, u32), has_header: bool, style: &str) -> Option<usize> {
+        if sheet >= self.workbook.sheets.len() {
+            return None;
+        }
+        let (r1, c1, r2, c2) = range;
+        let mut tn = 1;
+        while self.part(&format!("xl/tables/table{tn}.xml")).is_some() {
+            tn += 1;
+        }
+        // Column names: from the header row (deduped), else generated.
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for c in c1..=c2 {
+            let base = if has_header {
+                match self.workbook.sheets[sheet].cell(r1, c).map(|cl| &cl.value) {
+                    Some(crate::sheet::CellValue::Text(t)) if !t.trim().is_empty() => t.clone(),
+                    Some(crate::sheet::CellValue::Number(n)) => n.to_string(),
+                    _ => format!("Column{}", c - c1 + 1),
+                }
+            } else {
+                format!("Column{}", c - c1 + 1)
+            };
+            let (mut nm, mut k) = (base.clone(), 1);
+            while !seen.insert(nm.clone()) {
+                k += 1;
+                nm = format!("{base}{k}");
+            }
+            names.push(nm);
+        }
+        // Unique table display name.
+        let mut k = self.workbook.tables.len() + 1;
+        let name = loop {
+            let cand = format!("Table{k}");
+            if !self.workbook.tables.iter().any(|t| t.name == cand) {
+                break cand;
+            }
+            k += 1;
+        };
+        let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+        let cols_xml: String = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("<tableColumn id=\"{}\" name=\"{}\"/>", i + 1, esc_attr(n)))
+            .collect();
+        let header_attr = if has_header { "" } else { " headerRowCount=\"0\"" };
+        let table_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{SPREADSHEET_NS}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
+            names.len()
+        );
+        let part = format!("xl/tables/table{tn}.xml");
+        self.parts.push((part.clone(), table_xml.into_bytes()));
+        add_content_type_override(&mut self.parts, &format!("/{part}"), "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml");
+
+        // Worksheet rel → table + a <tableParts> entry (Excel needs both).
+        let sheet_part = self.sheet_parts[sheet].clone();
+        let (ws_dir, ws_file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part.as_str()));
+        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+        let rid = add_rel(
+            &mut self.parts,
+            &rels_part,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
+            &format!("../tables/table{tn}.xml"),
+        );
+        if !rid.is_empty() {
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+                let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+                if !xml.contains("xmlns:r=") {
+                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
+                }
+                let entry = format!("<tablePart r:id=\"{rid}\"/>");
+                if let Some(s) = xml.find("<tableParts") {
+                    // Bump count + append before </tableParts>.
+                    if let Some(cs) = xml[s..].find("count=\"").map(|i| s + i + 7) {
+                        if let Some(ce) = xml[cs..].find('"').map(|i| cs + i) {
+                            if let Ok(cnt) = xml[cs..ce].parse::<u32>() {
+                                xml.replace_range(cs..ce, &(cnt + 1).to_string());
+                            }
+                        }
+                    }
+                    if let Some(e) = xml.find("</tableParts>") {
+                        xml.insert_str(e, &entry);
+                    }
+                } else {
+                    let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
+                    let pos = xml.find("<extLst").unwrap_or_else(|| xml.find("</worksheet>").unwrap_or(xml.len()));
+                    xml.insert_str(pos, &block);
+                }
+                p.1 = xml.into_bytes();
+            }
+        }
+        self.workbook.tables.push(crate::sheet::Table {
+            name,
+            sheet,
+            range,
+            header_rows: u32::from(has_header),
+            totals_rows: 0,
+            columns: names,
+            part,
+        });
+        Some(self.workbook.tables.len() - 1)
+    }
+
     /// Remove all conditional-formatting rules from `sheet` (model + the
     /// worksheet's `<conditionalFormatting>` elements). Orphaned `<dxf>`s are left
     /// in styles.xml — harmless and referenced by nothing.
@@ -3188,6 +3295,47 @@ mod tests {
         assert!(re2.workbook.sheets[0].merges.is_empty());
         let ws = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(!ws.contains("<mergeCells"));
+    }
+
+    #[test]
+    fn add_table_round_trips() {
+        use crate::sheet::Cell;
+        let mut pkg = new_xlsx();
+        // Header row + two data rows over A1:B3.
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Item"));
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Qty"));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("Pen"));
+        pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(3.0));
+        let idx = pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2").unwrap();
+        assert_eq!(pkg.workbook.tables[idx].columns, vec!["Item", "Qty"]);
+
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.tables.len(), 1);
+        let t = &re.workbook.tables[0];
+        assert_eq!(t.name, "Table1");
+        assert_eq!(t.range, (0, 0, 2, 1));
+        assert_eq!(t.header_rows, 1);
+        assert_eq!(t.columns, vec!["Item", "Qty"]);
+        // The worksheet references the table via <tableParts>.
+        let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(ws.contains("<tableParts"), "worksheet must list the table part: {ws}");
+        assert!(ws.contains("r:id="), "tablePart needs an r:id");
+    }
+
+    #[test]
+    fn add_table_dedupes_and_generates_column_names() {
+        use crate::sheet::Cell;
+        let mut pkg = new_xlsx();
+        // Duplicate + blank headers must be uniquified / filled.
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Name"));
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Name"));
+        // C1 left blank.
+        let idx = pkg.add_table(0, (0, 0, 1, 2), true, "TableStyleLight1").unwrap();
+        assert_eq!(pkg.workbook.tables[idx].columns, vec!["Name", "Name2", "Column3"]);
+        // Without a header row, all columns are generated.
+        let idx2 = pkg.add_table(0, (3, 0, 5, 1), false, "TableStyleLight1").unwrap();
+        assert_eq!(pkg.workbook.tables[idx2].columns, vec!["Column1", "Column2"]);
+        assert_eq!(pkg.workbook.tables[idx2].name, "Table2");
     }
 
     #[test]

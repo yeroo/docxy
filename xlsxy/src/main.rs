@@ -2655,6 +2655,7 @@ impl App {
             Filter => self.open_prompt(PromptKind::Filter),
             RemoveDuplicates => self.remove_duplicates(),
             TextToColumns => self.open_prompt(PromptKind::TextToColumns),
+            FormatAsTable => self.format_as_table(),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3254,6 +3255,67 @@ impl App {
             removed = gridcore::edit::dedupe_rows(wb, s, top, bottom, header);
         });
         self.status = Some(format!("Removed {removed} duplicate row{}", if removed == 1 { "" } else { "s" }));
+    }
+
+    /// Format as Table: wrap the contiguous region around the cursor (or the
+    /// active multi-cell selection) in an Excel Table — banded, filterable, and
+    /// styled by Excel on open. The first row is treated as headers when it is
+    /// all text.
+    fn format_as_table(&mut self) {
+        use gridcore::sheet::CellValue;
+        let s = self.sheet;
+        // Prefer an explicit multi-cell selection; else grow the region around the cursor.
+        let (r1, c1, r2, c2) = {
+            let (sr1, sc1, sr2, sc2) = self.selection();
+            if sr1 != sr2 || sc1 != sc2 {
+                (sr1, sc1, sr2, sc2)
+            } else {
+                let (rc, cc) = self.sheet().used_size();
+                if rc == 0 || cc == 0 {
+                    self.status = Some("Format as Table: the sheet is empty".into());
+                    return;
+                }
+                let (max_r, max_c) = (rc - 1, cc - 1);
+                let cur_r = self.cur.0;
+                let sh = self.sheet();
+                let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                if !row_used(cur_r) {
+                    self.status = Some("Format as Table: put the cursor in the data".into());
+                    return;
+                }
+                let mut top = cur_r;
+                while top > 0 && row_used(top - 1) {
+                    top -= 1;
+                }
+                let mut bottom = cur_r;
+                while bottom < max_r && row_used(bottom + 1) {
+                    bottom += 1;
+                }
+                // Widen to the used columns spanning that block.
+                let col_used = |c: u32| (top..=bottom).any(|r| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                let mut left = self.cur.1;
+                while left > 0 && col_used(left - 1) {
+                    left -= 1;
+                }
+                let mut right = self.cur.1;
+                while right < max_c && col_used(right + 1) {
+                    right += 1;
+                }
+                (top, left, bottom, right)
+            }
+        };
+        let has_header = (c1..=c2).all(|c| matches!(self.sheet().cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_))));
+        match self.pkg.add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2") {
+            Some(i) => {
+                // add_table rewrites package parts; existing undo snapshots no longer line up.
+                self.undo.clear();
+                self.redo.clear();
+                self.modified = true;
+                let name = self.pkg.workbook.tables[i].name.clone();
+                self.status = Some(format!("Created {name} ({} cols){}", c2 - c1 + 1, if has_header { "" } else { ", generated headers" }));
+            }
+            None => self.status = Some("Format as Table failed".into()),
+        }
     }
 
     /// AutoFilter: hide the rows of the current region whose cursor-column value
@@ -6322,6 +6384,34 @@ mod tests {
         assert_eq!(sh.cell(1, 0).unwrap().value, CellValue::Text("A".into()));
         assert_eq!(sh.cell(2, 0).unwrap().value, CellValue::Text("B".into()));
         assert!(sh.cell(3, 0).map(|c| c.value.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn format_as_table_wraps_region() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            sh.set_cell(1, 0, Cell::text("Pen"));
+            sh.set_cell(1, 1, Cell::number(3.0));
+            sh.set_cell(2, 0, Cell::text("Pad"));
+            sh.set_cell(2, 1, Cell::number(5.0));
+        }
+        app.rebuild_engine();
+        app.cur = (1, 0); // inside the block, no explicit selection
+        app.anchor = None;
+        app.format_as_table();
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+        let t = &app.pkg.workbook.tables[0];
+        assert_eq!(t.range, (0, 0, 2, 1)); // grew to A1:B3
+        assert_eq!(t.header_rows, 1);
+        assert_eq!(t.columns, vec!["Item", "Qty"]);
+        // Survives a save/reload.
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.tables.len(), 1);
     }
 
     #[test]

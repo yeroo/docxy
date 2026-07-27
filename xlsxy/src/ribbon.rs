@@ -51,6 +51,7 @@ pub enum Act {
     Filter,
     RemoveDuplicates,
     TextToColumns,
+    FormatAsTable,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -246,8 +247,8 @@ fn insert_groups() -> Vec<Group> {
             title: "Tables",
             width: 12,
             rows: [
+                vec![btn("▦ Table", FormatAsTable, "Format the region as an Excel Table")],
                 vec![btn("PivotTable", Todo("PivotTable"), "Insert a PivotTable")],
-                vec![btn("Function", Todo("Function"), "Insert a function")],
             ],
         },
         Group {

@@ -303,6 +303,7 @@ enum SheetAct {
     Filter,
     RemoveDuplicates,
     TextToColumns,
+    FormatAsTable,
     Todo,
 }
 
@@ -1872,6 +1873,55 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Format as Table: wrap the active multi-cell selection (or the contiguous
+    /// region grown around the cursor) in an Excel Table — banded, filterable,
+    /// and styled by Excel on open. The first row becomes headers when it is all
+    /// text.
+    fn sheet_format_as_table(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::CellValue;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let (max_r, max_c) = v.extent();
+            let region = if v.has_range() {
+                Some(v.range())
+            } else {
+                let sh = &v.pkg.workbook.sheets[s];
+                let (cur_r, cur_c) = v.sel;
+                let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                if !row_used(cur_r) {
+                    None
+                } else {
+                    let mut top = cur_r;
+                    while top > 0 && row_used(top - 1) {
+                        top -= 1;
+                    }
+                    let mut bottom = cur_r;
+                    while bottom < max_r && row_used(bottom + 1) {
+                        bottom += 1;
+                    }
+                    let col_used = |c: u32| (top..=bottom).any(|r| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                    let mut left = cur_c;
+                    while left > 0 && col_used(left - 1) {
+                        left -= 1;
+                    }
+                    let mut right = cur_c;
+                    while right < max_c && col_used(right + 1) {
+                        right += 1;
+                    }
+                    Some((top, left, bottom, right))
+                }
+            };
+            if let Some((r1, c1, r2, c2)) = region {
+                let sh = &v.pkg.workbook.sheets[s];
+                let has_header = (c1..=c2).all(|c| matches!(sh.cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_))));
+                v.pkg.add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2");
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Sort the used range by the selected column (header-aware). Rows move as
     /// whole units (all columns + styles); blanks sort last. Formula refs are not
     /// re-based, so this targets value tables (the common case).
@@ -2579,6 +2629,7 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
+            SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::TextToColumns => {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
@@ -6596,7 +6647,7 @@ impl Docxy {
             .overflow_x_scroll()
             .child(group("Tables", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(Some("table"), "PivotTable", SheetAct::InsertPivot, pal, cx))
-                .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(Some("table"), "Table", SheetAct::FormatAsTable, pal, cx))
                 .child(self.sheet_lb(None, "Data Validation", SheetAct::DataValidation, pal, cx))
                 .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
                 .into_any_element()))
@@ -6775,7 +6826,7 @@ impl Docxy {
             // Styles: Conditional Formatting, Format as Table, Cell Styles.
             .child(group("Styles", false, h_flex().h_full().items_center().gap_0p5()
                 .child(self.sheet_lb(None, "Conditional Formatting", SheetAct::CondFormat, pal, cx))
-                .child(self.sheet_lb(Some("table"), "Format as Table", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(Some("table"), "Format as Table", SheetAct::FormatAsTable, pal, cx))
                 .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
                 .into_any_element()))
             // Cells: Insert, Delete, Format.
