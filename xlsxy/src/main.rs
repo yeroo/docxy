@@ -706,6 +706,8 @@ enum PromptKind {
     TextToColumns,
     /// Multi-level sort: a spec like "B asc, C desc" over the current region.
     SortKeys,
+    /// Row height in points for the selected rows ("auto" clears it).
+    RowHeight,
 }
 
 struct Prompt {
@@ -925,6 +927,7 @@ struct App {
     gutter_w: u16,
     vis_cols: Vec<(u32, u16, u16)>, // (col, x, width)
     vis_rows: Vec<u32>,             // sheet row per screen line (freeze-aware)
+    vis_subline: Vec<u8>,           // which wrapped sub-line of that row (parallel to vis_rows)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
 }
@@ -1006,6 +1009,7 @@ impl App {
             gutter_w: 4,
             vis_cols: Vec::new(),
             vis_rows: Vec::new(),
+            vis_subline: Vec::new(),
             tab_spans: Vec::new(),
             ribbon_rows: 1,
         }
@@ -2245,6 +2249,42 @@ impl App {
         self.apply_format(move |x| x.align = a);
     }
 
+    /// Toggle Wrap Text on the selection. Wrapped cells render across multiple
+    /// lines (the row grows to fit); Excel auto-fits the row height on open.
+    fn toggle_wrap(&mut self) {
+        self.apply_format(|x| x.wrap = !x.wrap);
+        self.status = Some("Wrap text".to_string());
+    }
+
+    /// Set (or clear) an explicit height in points for every row in the
+    /// selection. "auto"/"0"/empty clears it so the row auto-fits.
+    fn commit_row_height(&mut self, text: &str) {
+        let t = text.trim();
+        let pts = if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            match t.parse::<f64>() {
+                Ok(h) if h > 0.0 => Some(h),
+                Ok(_) => None,
+                Err(_) => {
+                    self.status = Some("Row height: enter a number of points (or 'auto')".into());
+                    return;
+                }
+            }
+        };
+        let (r1, _, r2, _) = self.selection();
+        let s = self.sheet;
+        self.structural(move |wb| {
+            for r in r1..=r2 {
+                wb.sheets[s].set_row_height(r, pts);
+            }
+        });
+        self.status = Some(match pts {
+            Some(h) => format!("Row height {h}"),
+            None => "Row height auto".into(),
+        });
+    }
+
     fn open_picker(&mut self, kind: PickKind) {
         self.format_picker = Some(FormatPicker { kind, sel: 0 });
     }
@@ -2676,6 +2716,8 @@ impl App {
             FontColor => self.open_picker(PickKind::FontColor),
             FillColor => self.open_picker(PickKind::FillColor),
             MergeCenter => self.merge_toggle(),
+            WrapText => self.toggle_wrap(),
+            RowHeight => self.open_prompt(PromptKind::RowHeight),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_prompt(PromptKind::DataValidation),
             Filter => self.open_prompt(PromptKind::Filter),
@@ -4026,6 +4068,7 @@ impl App {
             PromptKind::Filter => ("Filter this column (=Laptop, >500, <>0, 'clear'): ", String::new()),
             PromptKind::TextToColumns => ("Split column by (comma, tab, space, ;): ", String::new()),
             PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
+            PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -4066,6 +4109,7 @@ impl App {
             PromptKind::Filter => self.commit_filter(&text),
             PromptKind::TextToColumns => self.commit_text_to_columns(&text),
             PromptKind::SortKeys => self.commit_sort(&text),
+            PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -4432,22 +4476,37 @@ fn draw(app: &mut App, f: &mut Frame) {
 
     // Visible rows: frozen rows (0..fr) pinned, then scrollable from top.
     // Rows hidden by a filter or manual hide are skipped unless `show_hidden`.
-    app.vis_rows.clear();
-    for row in 0..fr {
-        if app.vis_rows.len() >= grid.height as usize {
-            break;
-        }
-        if app.show_hidden || !app.sheet().row_hidden(row) {
-            app.vis_rows.push(row);
+    // A tall row (wrap / explicit height) occupies several screen lines, so it
+    // is emitted once per line with its sub-line index in `vis_subline`.
+    let cap = grid.height as usize;
+    let (mut vr, mut vs): (Vec<u32>, Vec<u8>) = (Vec::new(), Vec::new());
+    {
+        let sheet = &app.pkg.workbook.sheets[app.sheet];
+        let styles = &app.pkg.workbook.styles;
+        let d1904 = app.pkg.workbook.date1904;
+        let show_hidden = app.show_hidden;
+        let vis_cols = &app.vis_cols;
+        // Rows to consider: frozen (0..fr), then scrollable from the top.
+        let scroll = (app.top.max(fr)..MAX_ROWS).take(cap);
+        for row in (0..fr).chain(scroll) {
+            if vr.len() >= cap {
+                break;
+            }
+            if !(show_hidden || !sheet.row_hidden(row)) {
+                continue;
+            }
+            let h = row_line_count(sheet, styles, row, vis_cols, d1904);
+            for sub in 0..h {
+                if vr.len() >= cap {
+                    break;
+                }
+                vr.push(row);
+                vs.push(sub as u8);
+            }
         }
     }
-    let mut row = app.top.max(fr);
-    while app.vis_rows.len() < grid.height as usize && row < MAX_ROWS {
-        if app.show_hidden || !app.sheet().row_hidden(row) {
-            app.vis_rows.push(row);
-        }
-        row += 1;
-    }
+    app.vis_rows = vr;
+    app.vis_subline = vs;
 
     // --- formula bar --------------------------------------------------------
     let (r, c) = app.cur;
@@ -4509,16 +4568,23 @@ fn draw(app: &mut App, f: &mut Frame) {
     let base = app.base_style();
     let formula_view = app.formula_view;
     let vis_rows = app.vis_rows.clone();
+    let vis_subline = app.vis_subline.clone();
     let sheet = app.sheet();
     let styles = &app.pkg.workbook.styles;
     let date1904 = app.pkg.workbook.date1904;
     let merges = sheet.merges.clone();
     let mut lines: Vec<RLine> = Vec::with_capacity(grid.height as usize);
-    for &row in &vis_rows {
+    for (li, &row) in vis_rows.iter().enumerate() {
+        let sub = vis_subline.get(li).copied().unwrap_or(0) as usize;
         let mut spans: Vec<RSpan> = Vec::with_capacity(app.vis_cols.len() + 1);
         let gut_style = if row == r { HDR_CUR } else { HDR_STYLE };
+        // The row number shows only on the row's first line.
         spans.push(RSpan::styled(
-            format!("{:>w$} ", row + 1, w = app.gutter_w as usize - 1),
+            if sub == 0 {
+                format!("{:>w$} ", row + 1, w = app.gutter_w as usize - 1)
+            } else {
+                " ".repeat(app.gutter_w as usize)
+            },
             gut_style,
         ));
         // Skip columns covered by a horizontal merge whose top-left is to the left.
@@ -4556,15 +4622,25 @@ fn draw(app: &mut App, f: &mut Frame) {
             };
             let numeric = matches!(cell.map(|cl| &cl.value), Some(CellValue::Number(_)))
                 && xf.numfmt != NumFmt::Text;
+            // In a multi-line row, pick this screen line's slice of the cell:
+            // wrapped cells split across lines; other cells sit on line 0 (blank
+            // below). Non-wrap content is never truncated by wrapping.
+            let line_text = if xf.wrap && !formula_view {
+                wrap_text(&text, w as usize).get(sub).cloned().unwrap_or_default()
+            } else if sub == 0 {
+                text.clone()
+            } else {
+                String::new()
+            };
             // Formula view is always left-aligned (Excel shows the raw text).
             let display = if formula_view {
-                fit(&text, w as usize, false)
+                fit(&line_text, w as usize, false)
             } else {
                 match xf.align {
-                    Align::Left => fit(&text, w as usize, false),
-                    Align::Right => fit(&text, w as usize, true),
-                    Align::Center => center(&text, w as usize),
-                    Align::General => fit(&text, w as usize, numeric),
+                    Align::Left => fit(&line_text, w as usize, false),
+                    Align::Right => fit(&line_text, w as usize, true),
+                    Align::Center => center(&line_text, w as usize),
+                    Align::General => fit(&line_text, w as usize, numeric),
                 }
             };
             let mut style = base;
@@ -4816,6 +4892,27 @@ fn center(s: &str, w: usize) -> String {
     }
     let lead = (w - width) / 2;
     format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - width - lead))
+}
+
+/// How many screen lines a row occupies: derived from an explicit row height
+/// (≈15pt per line) and from any wrap-enabled cell's wrapped line count, capped
+/// so a pathological cell can't blow up the layout.
+fn row_line_count(sheet: &Sheet, styles: &gridcore::sheet::Styles, row: u32, vis_cols: &[(u32, u16, u16)], date1904: bool) -> u16 {
+    const CAP: u16 = 12;
+    let mut lines = 1u16;
+    if let Some(ht) = sheet.row_height(row) {
+        lines = lines.max(((ht / 15.0).round() as u16).max(1));
+    }
+    for &(col, _, w) in vis_cols {
+        if let Some(cl) = sheet.cell(row, col) {
+            let xf = styles.xf(cl.style);
+            if xf.wrap && !cl.is_blank() {
+                let text = format_with(&xf, &cl.value, date1904);
+                lines = lines.max(wrap_text(&text, w as usize).len() as u16);
+            }
+        }
+    }
+    lines.min(CAP)
 }
 
 /// The pivot field editor: four panes over a cleared overlay rect.
@@ -6560,6 +6657,35 @@ mod tests {
         app.pkg.workbook.sheets[0].set_protected(true);
         let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
         assert!(re.workbook.sheets[0].is_protected());
+    }
+
+    #[test]
+    fn wrap_text_renders_across_multiple_lines() {
+        use gridcore::sheet::{Cell, Xf};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // A wrapped cell with text longer than its column.
+        let idx = app.pkg.workbook.styles.intern(Xf { wrap: true, ..Default::default() });
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell { value: gridcore::sheet::CellValue::Text("alpha beta gamma delta".into()), style: idx, ..Cell::default() });
+        app.rebuild_engine();
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        // Row 0 now spans several screen lines (sub-line indices 0,1,2…).
+        let n0 = app.vis_rows.iter().filter(|&&r| r == 0).count();
+        assert!(n0 >= 2, "wrapped row should occupy multiple lines, got {n0}");
+        assert_eq!(app.vis_subline[0], 0);
+        assert!(app.vis_subline.iter().any(|&s| s >= 1));
+
+        // An explicit row height also makes a plain row taller.
+        app.toggle_wrap(); // turn wrap back off on A1
+        app.cur = (5, 0);
+        app.anchor = None;
+        app.commit_row_height("45");
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        assert!(app.vis_rows.iter().filter(|&&r| r == 5).count() >= 2);
+        assert_eq!(app.pkg.workbook.sheets[0].row_height(5), Some(45.0));
     }
 
     #[test]

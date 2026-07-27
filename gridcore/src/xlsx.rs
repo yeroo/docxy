@@ -693,11 +693,13 @@ fn parse_styles(xml: &str) -> Styles {
                         font_size: font.size,
                         font_name: font.name.clone(),
                         border: false,
+                        wrap: false,
                     });
                 }
                 "alignment" if in_cellxfs => {
                     if let Some(x) = xfs.last_mut() {
                         x.align = crate::sheet::Align::from_attr(p.attr("horizontal"));
+                        x.wrap = matches!(p.attr("wrapText"), "1" | "true");
                     }
                 }
                 _ => {}
@@ -885,11 +887,18 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         if apply_border {
             x.push_str(" applyBorder=\"1\"");
         }
-        match xf.align.attr() {
-            Some(a) => x.push_str(&format!(
-                " applyAlignment=\"1\"><alignment horizontal=\"{a}\"/></xf>"
-            )),
-            None => x.push_str("/>"),
+        let horiz = xf.align.attr();
+        if horiz.is_some() || xf.wrap {
+            x.push_str(" applyAlignment=\"1\"><alignment");
+            if let Some(a) = horiz {
+                x.push_str(&format!(" horizontal=\"{a}\""));
+            }
+            if xf.wrap {
+                x.push_str(" wrapText=\"1\"");
+            }
+            x.push_str("/></xf>");
+        } else {
+            x.push_str("/>");
         }
         new_xfs.push_str(&x);
     }
@@ -3846,6 +3855,30 @@ mod tests {
         assert_eq!(xf2.fill, Some((0xAB, 0xCD, 0xEF)));
         assert_eq!(xf2.align, Align::Center);
         assert_eq!(xf2.code.as_deref(), Some("0.00"));
+    }
+
+    #[test]
+    fn wrap_text_and_row_height_round_trip() {
+        use crate::sheet::{Align, Cell, CellValue, Xf};
+        let mut pkg = new_xlsx();
+        // A cell with wrapText, and a wrap over an existing horizontal align.
+        let idx = pkg.workbook.styles.intern(Xf { wrap: true, align: Align::Center, ..Default::default() });
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell { value: CellValue::Text("a long wrapped label".into()), style: idx, ..Cell::default() });
+        pkg.workbook.sheets[0].set_row_height(0, Some(42.0));
+        assert_eq!(pkg.workbook.sheets[0].row_height(0), Some(42.0));
+
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let cell = re.workbook.sheets[0].cell(0, 0).unwrap();
+        let xf = re.workbook.styles.xf(cell.style);
+        assert!(xf.wrap, "wrapText must survive");
+        assert_eq!(xf.align, Align::Center, "horizontal align kept alongside wrap");
+        assert_eq!(re.workbook.sheets[0].row_height(0), Some(42.0));
+        let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(ws.contains("ht=\"42\""), "{ws}");
+        // Clearing the height drops the attrs.
+        let mut re = re;
+        re.workbook.sheets[0].set_row_height(0, None);
+        assert_eq!(re.workbook.sheets[0].row_height(0), None);
     }
 
     #[test]

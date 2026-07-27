@@ -274,6 +274,8 @@ enum SheetAct {
     AlignL,
     AlignC,
     AlignR,
+    WrapText,
+    RowHeight,
     GrowFont,
     ShrinkFont,
     Percent,
@@ -551,6 +553,8 @@ struct Docxy {
     sheet_ttc_edit: Option<String>,
     // In-progress multi-level sort spec entry ("B asc, C desc").
     sheet_sort_edit: Option<String>,
+    // In-progress row-height entry (points, or "auto").
+    sheet_rowh_edit: Option<String>,
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -953,6 +957,7 @@ impl Docxy {
             sheet_filter_edit: None,
             sheet_ttc_edit: None,
             sheet_sort_edit: None,
+            sheet_rowh_edit: None,
         }
     }
 
@@ -1725,6 +1730,47 @@ impl Docxy {
         }
     }
 
+    /// Route a keystroke into the row-height entry bar; Enter applies it.
+    fn sheet_rowh_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_rowh_edit.clone() else { return };
+        match key {
+            "escape" => {
+                self.sheet_rowh_edit = None;
+                cx.notify();
+            }
+            "enter" => {
+                self.sheet_rowh_edit = None;
+                let t = buf.trim();
+                let pts = if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    match t.parse::<f64>() {
+                        Ok(h) if h > 0.0 => Some(h),
+                        _ => {
+                            cx.notify();
+                            return;
+                        }
+                    }
+                };
+                self.sheet_set_row_height(pts, cx);
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_rowh_edit = Some(buf);
+                cx.notify();
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_rowh_edit = Some(buf);
+                cx.notify();
+            }
+        }
+    }
+
     /// Route a keystroke into the data-validation entry bar; Enter creates a list
     /// validation from the comma-separated values over the selection.
     fn sheet_dv_edit_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
@@ -2231,6 +2277,27 @@ impl Docxy {
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.align = a, cx);
     }
+    /// Toggle Wrap Text on the selection. Excel auto-fits the row on open;
+    /// the desktop grid renders a single line (variable row heights need the
+    /// list migration off uniform_list).
+    fn sheet_toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        let on = !self.active_xf().wrap;
+        self.sheet_format(move |xf| xf.wrap = on, cx);
+    }
+    /// Set an explicit height (points) on every selected row, or clear it back
+    /// to auto-fit when `pts` is `None`.
+    fn sheet_set_row_height(&mut self, pts: Option<f64>, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let (r0, _, r1, _) = v.range();
+            for r in r0..=r1 {
+                v.pkg.workbook.sheets[s].set_row_height(r, pts);
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
     /// Grow / shrink the font of the selection by one point (default base 11).
     fn sheet_font_step(&mut self, delta: f64, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| {
@@ -2724,6 +2791,11 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::Merge => self.sheet_merge_toggle(cx),
+            SheetAct::WrapText => self.sheet_toggle_wrap(cx),
+            SheetAct::RowHeight => {
+                self.sheet_rowh_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::CondFormat => {
                 self.sheet_cf_edit = Some(String::new());
                 cx.notify();
@@ -2780,6 +2852,10 @@ impl Docxy {
         // The multi-level sort spec bar swallows typing too.
         if self.sheet_sort_edit.is_some() {
             return self.sheet_sort_key(ev, key, cx);
+        }
+        // The row-height entry bar swallows typing too.
+        if self.sheet_rowh_edit.is_some() {
+            return self.sheet_rowh_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6612,6 +6688,29 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The row-height entry bar: type a height in points (or "auto").
+    fn sheet_rowh_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ent = cx.entity();
+        let ent_cancel = ent.clone();
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Row height (points, or 'auto')"))
+            .child(
+                div().w(px(120.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { "30".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().id("rowh-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_rowh_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
     /// The data-validation entry bar: type comma-separated allowed values to make
     /// the selection a dropdown list.
     fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6946,14 +7045,14 @@ impl Docxy {
                     self.sheet_gb("\u{2580}", SheetAct::Todo, pal, cx),
                     self.sheet_gb("\u{25AC}", SheetAct::Todo, pal, cx),
                     self.sheet_gb("\u{2584}", SheetAct::Todo, pal, cx),
-                    self.sheet_rb(None, "Wrap Text", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(None, "Wrap Text", SheetAct::WrapText, pal, cx),
                 ]),
                 row(vec![
                     self.sheet_ib("align-left", SheetAct::AlignL, matches!(xf.align, gridcore::sheet::Align::Left), pal, cx),
                     self.sheet_ib("align-center", SheetAct::AlignC, matches!(xf.align, gridcore::sheet::Align::Center), pal, cx),
                     self.sheet_ib("align-right", SheetAct::AlignR, matches!(xf.align, gridcore::sheet::Align::Right), pal, cx),
                     self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
-                    self.sheet_ib("indent-increase", SheetAct::Todo, false, pal, cx),
+                    self.sheet_rb(None, "Row Height", SheetAct::RowHeight, pal, cx),
                     self.sheet_rb(None, "Merge", SheetAct::Merge, pal, cx),
                 ]),
             ])))
@@ -7571,6 +7670,7 @@ impl Render for Docxy {
         let sheet_filter = self.sheet_filter_edit.clone().map(|buf| self.sheet_filter_bar(&buf, pal, cx));
         let sheet_ttc = self.sheet_ttc_edit.clone().map(|buf| self.sheet_ttc_bar(&buf, pal, cx));
         let sheet_sort = self.sheet_sort_edit.clone().map(|buf| self.sheet_sort_bar(&buf, pal, cx));
+        let sheet_rowh = self.sheet_rowh_edit.clone().map(|buf| self.sheet_rowh_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7884,6 +7984,7 @@ impl Render for Docxy {
             .when_some(sheet_filter, |d, c| d.child(c))
             .when_some(sheet_ttc, |d, c| d.child(c))
             .when_some(sheet_sort, |d, c| d.child(c))
+            .when_some(sheet_rowh, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))

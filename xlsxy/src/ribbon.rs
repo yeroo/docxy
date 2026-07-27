@@ -43,6 +43,8 @@ pub enum Act {
     AlignLeft,
     AlignCenter,
     AlignRight,
+    WrapText,
+    RowHeight,
     NumberFormat,
     FontColor,
     FillColor,
@@ -151,6 +153,8 @@ fn home_groups() -> Vec<Group> {
                     btn("+Col", InsertCol, "Insert columns left of the selection"),
                     Seg::Gap(" "),
                     btn("Fill↓", FillDown, "Fill down (Ctrl+D)"),
+                    Seg::Gap(" "),
+                    btn("Row Ht", RowHeight, "Set the row height in points"),
                 ],
                 vec![
                     btn("−Row", DeleteRow, "Delete the selected rows"),
@@ -163,7 +167,7 @@ fn home_groups() -> Vec<Group> {
         },
         Group {
             title: "Font",
-            width: 23,
+            width: 28,
             rows: [
                 vec![
                     btn("B", Bold, "Bold (Ctrl+B)"),
@@ -182,6 +186,8 @@ fn home_groups() -> Vec<Group> {
                     btn("Right", AlignRight, "Align right"),
                     Seg::Gap(" "),
                     btn("Merge", MergeCenter, "Merge & Center the selection (toggle)"),
+                    Seg::Gap(" "),
+                    btn("Wrap", WrapText, "Wrap text within the cell (toggle)"),
                 ],
             ],
         },

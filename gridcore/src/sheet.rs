@@ -480,6 +480,34 @@ impl Sheet {
         self.row_attrs.keys().map(|&r| self.row_outline(r)).max().unwrap_or(0)
     }
 
+    /// The row's explicit height in points (`<row ht="…">`), or `None` when it
+    /// uses the sheet default.
+    pub fn row_height(&self, row: u32) -> Option<f64> {
+        self.row_attrs.get(&row).and_then(|a| {
+            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| a[s..].find('"').and_then(|e| a[s..s + e].parse::<f64>().ok()))
+        })
+    }
+
+    /// Set (or clear, with `None`) the row's explicit height in points,
+    /// preserving its other `<row>` attributes. A concrete height also stamps
+    /// `customHeight="1"` so Excel honours it rather than auto-fitting.
+    pub fn set_row_height(&mut self, row: u32, pts: Option<f64>) {
+        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
+        let cleaned = strip_xml_attr(&strip_xml_attr(&cur, "ht"), "customHeight");
+        let next = match pts {
+            Some(h) => {
+                let h = format!("ht=\"{h}\" customHeight=\"1\"");
+                if cleaned.is_empty() { h } else { format!("{cleaned} {h}") }
+            }
+            None => cleaned,
+        };
+        if next.is_empty() {
+            self.row_attrs.remove(&row);
+        } else {
+            self.row_attrs.insert(row, next);
+        }
+    }
+
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).
     pub fn col_hidden(&self, col: u32) -> bool {
         self.col_defs
@@ -728,6 +756,9 @@ pub struct Xf {
     pub font_name: Option<String>,
     /// A thin box border around each cell, when set.
     pub border: bool,
+    /// Wrap long text onto multiple lines within the cell (`<alignment
+    /// wrapText="1">`). Rendered as wrapped lines; drives auto-fit row height.
+    pub wrap: bool,
 }
 
 /// A differential format (`<dxf>`) referenced by a conditional-formatting rule.
