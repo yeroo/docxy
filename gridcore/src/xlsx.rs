@@ -1840,6 +1840,50 @@ fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
     out
 }
 
+/// A `<dxf>` (differential format) for conditional formatting.
+fn dxf_to_xml(dxf: &crate::sheet::Dxf) -> String {
+    let mut font = String::new();
+    if dxf.bold == Some(true) {
+        font.push_str("<b/>");
+    }
+    if dxf.italic == Some(true) {
+        font.push_str("<i/>");
+    }
+    if let Some((r, g, b)) = dxf.color {
+        font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
+    }
+    let font = if font.is_empty() { String::new() } else { format!("<font>{font}</font>") };
+    let fill = match dxf.fill {
+        Some((r, g, b)) => format!("<fill><patternFill patternType=\"solid\"><bgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/></patternFill></fill>"),
+        None => String::new(),
+    };
+    format!("<dxf>{font}{fill}</dxf>")
+}
+
+/// Regenerate the `<dxfs>` block of `styles.xml` from the model's dxfs (replacing
+/// any existing block, or inserting one before tableStyles/colors/extLst/end).
+fn set_dxfs(xml: &str, dxfs: &[crate::sheet::Dxf]) -> String {
+    let body: String = dxfs.iter().map(dxf_to_xml).collect();
+    let block = format!("<dxfs count=\"{}\">{body}</dxfs>", dxfs.len());
+    if let Some(s) = xml.find("<dxfs") {
+        let e = xml[s..]
+            .find("</dxfs>")
+            .map(|i| s + i + "</dxfs>".len())
+            .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
+            .unwrap_or(s);
+        return format!("{}{block}{}", &xml[..s], &xml[e..]);
+    }
+    // Insert at the first schema-valid anchor after cellXfs/cellStyles.
+    let anchor = ["<tableStyles", "<colors", "<extLst"]
+        .iter()
+        .find_map(|t| xml.find(t))
+        .or_else(|| xml.find("</styleSheet>"));
+    match anchor {
+        Some(pos) => format!("{}{block}{}", &xml[..pos], &xml[pos..]),
+        None => xml.to_string(),
+    }
+}
+
 /// Rewrite the frozen-pane state of the first `<sheetView>` from the model's
 /// `freeze` (rows, cols): inserts/updates `<pane … state="frozen"/>`, removes it
 /// when unfrozen, and creates a `<sheetViews>` block if the worksheet lacks one.
@@ -2303,6 +2347,76 @@ impl SheetPackage {
     /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
     /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
     /// Also registers it in the model so it round-trips on reload.
+    /// Add a `cellIs` conditional-formatting rule (Excel's "Highlight Cells"):
+    /// the differential format `dxf` applies to `range` when the cell value
+    /// satisfies `op` (greaterThan / lessThan / between / equal / …) against
+    /// `formula1` (and `formula2` for `between`). Wires the OPC (a `<dxf>` in
+    /// styles.xml + a `<conditionalFormatting>` in the worksheet) and the model,
+    /// so it renders via cf::cell_dxf and round-trips.
+    pub fn add_conditional_format(
+        &mut self,
+        sheet: usize,
+        range: (u32, u32, u32, u32),
+        op: &str,
+        formula1: &str,
+        formula2: Option<&str>,
+        dxf: crate::sheet::Dxf,
+    ) {
+        if sheet >= self.workbook.sheets.len() {
+            return;
+        }
+        let dxf_id = self.workbook.styles.dxfs.len();
+        self.workbook.styles.dxfs.push(dxf);
+        // styles.xml: regenerate <dxfs> from the model (splice_styles preserves it).
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = set_dxfs(&xml, &self.workbook.styles.dxfs).into_bytes();
+        }
+        // Next-highest priority across the workbook (lower = higher precedence).
+        let priority = self
+            .workbook
+            .sheets
+            .iter()
+            .flat_map(|s| s.cond_formats.iter())
+            .flat_map(|cf| cf.rules.iter())
+            .map(|r| r.priority)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // Worksheet: inject <conditionalFormatting> after </sheetData> (mergeCells,
+        // if any, is spliced in ahead of it at save time, keeping schema order).
+        let (r1, c1, r2, c2) = range;
+        let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+        let mut fmls = format!("<formula>{}</formula>", esc_text(formula1));
+        if let Some(f2) = formula2 {
+            fmls.push_str(&format!("<formula>{}</formula>", esc_text(f2)));
+        }
+        let cf_xml = format!(
+            "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
+        );
+        let sheet_part = self.sheet_parts[sheet].clone();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some(pos) = xml.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
+                xml.insert_str(pos, &cf_xml);
+            } else {
+                xml = xml.replacen("</worksheet>", &format!("{cf_xml}</worksheet>"), 1);
+            }
+            p.1 = xml.into_bytes();
+        }
+        // Model.
+        let mut formulas = vec![formula1.to_string()];
+        if let Some(f2) = formula2 {
+            formulas.push(f2.to_string());
+        }
+        let rule = crate::sheet::CfRule {
+            kind: crate::sheet::CfKind::CellIs { op: op.to_string(), formulas },
+            dxf_id: Some(dxf_id),
+            priority,
+        };
+        self.workbook.sheets[sheet].cond_formats.push(crate::sheet::CondFormat { ranges: vec![range], rules: vec![rule] });
+    }
+
     pub fn add_chart(&mut self, sheet: usize, from: (u32, u32), to: (u32, u32), data: &crate::sheet::ChartData) {
         if sheet >= self.workbook.sheets.len() {
             return;
@@ -2931,6 +3045,27 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_conditional_format_round_trips_and_evaluates() {
+        use crate::sheet::{Cell, Dxf};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(100.0));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(900.0));
+        // Highlight D-col > 500 with a red fill over A1:A2.
+        let dxf = Dxf { fill: Some((255, 0, 0)), color: None, bold: Some(true), italic: None };
+        pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "500", None, dxf);
+
+        // Reload: the rule + dxf survive and evaluate.
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), 1);
+        assert!(!re.workbook.styles.dxfs.is_empty());
+        // 100 doesn't match; 900 does (fill red + bold).
+        assert!(crate::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+        let d = crate::cf::cell_dxf(&re.workbook, 0, 1, 0).expect("900 > 500 should match");
+        assert_eq!(d.fill, Some((255, 0, 0)));
+        assert_eq!(d.bold, Some(true));
+    }
 
     #[test]
     fn model_added_merges_round_trip() {

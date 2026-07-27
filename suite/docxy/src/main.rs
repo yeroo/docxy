@@ -298,7 +298,36 @@ enum SheetAct {
     AutoSum,
     FormatCells,
     Merge,
+    CondFormat,
     Todo,
+}
+
+/// Parse a conditional-format value like ">500", "<=100", "=42" into an Excel
+/// cellIs operator + operand (defaulting to greaterThan when no operator typed).
+fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
+    let s = s.trim();
+    let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
+        ("greaterThanOrEqual", r)
+    } else if let Some(r) = s.strip_prefix("<=") {
+        ("lessThanOrEqual", r)
+    } else if let Some(r) = s.strip_prefix("<>") {
+        ("notEqual", r)
+    } else if let Some(r) = s.strip_prefix('>') {
+        ("greaterThan", r)
+    } else if let Some(r) = s.strip_prefix('<') {
+        ("lessThan", r)
+    } else if let Some(r) = s.strip_prefix('=') {
+        ("equal", r)
+    } else {
+        ("greaterThan", s)
+    };
+    let rest = rest.trim();
+    if rest.is_empty() { None } else { Some((op, rest.to_string())) }
+}
+
+/// Excel's "Light Red Fill with Dark Red Text" conditional-format preset.
+fn cf_preset_dxf() -> gridcore::sheet::Dxf {
+    gridcore::sheet::Dxf { fill: Some((0xFF, 0xC7, 0xCE)), color: Some((0x9C, 0x00, 0x06)), bold: None, italic: None }
 }
 
 /// Which colour a sheet swatch picker is choosing.
@@ -496,6 +525,8 @@ struct Docxy {
     sheet_numfmt_open: bool,
     // Whether the consolidated Format Cells panel is open.
     sheet_fmt_open: bool,
+    // In-progress conditional-formatting rule entry (the value buffer, e.g. ">500").
+    sheet_cf_edit: Option<String>,
 }
 
 /// Common number formats offered by the Number-group dropdown: (label, code).
@@ -880,6 +911,7 @@ impl Docxy {
             sheet_dv_open: false,
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
+            sheet_cf_edit: None,
         }
     }
 
@@ -1444,6 +1476,41 @@ impl Docxy {
             self.sheet_comment_edit = Some(self.selected_comment().unwrap_or_default());
             cx.notify();
         }
+    }
+
+    /// Route a keystroke into the conditional-format entry bar; Enter applies the
+    /// rule (Light-Red preset) to the selection, Esc cancels.
+    fn sheet_cf_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_cf_edit.clone() else { return };
+        match key {
+            "escape" => self.sheet_cf_edit = None,
+            "enter" => {
+                if let Some((op, val)) = parse_cf_input(&buf) {
+                    self.sheet_snapshot();
+                    if let Some(v) = self.active_sheet_mut() {
+                        let s = v.active;
+                        let (r0, c0, r1, c1) = v.range();
+                        v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, None, cf_preset_dxf());
+                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                    }
+                    self.mark_sheet_dirty();
+                }
+                self.sheet_cf_edit = None;
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_cf_edit = Some(buf);
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_cf_edit = Some(buf);
+            }
+        }
+        cx.notify();
     }
 
     /// Route a keystroke into the open comment bar (char / backspace / enter / esc).
@@ -2283,6 +2350,10 @@ impl Docxy {
                 cx.notify();
             }
             SheetAct::Merge => self.sheet_merge_toggle(cx),
+            SheetAct::CondFormat => {
+                self.sheet_cf_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -2298,6 +2369,10 @@ impl Docxy {
         // The comment entry bar swallows typing until Enter (commit) / Esc.
         if self.sheet_comment_edit.is_some() {
             return self.sheet_comment_key(ev, key, cx);
+        }
+        // The conditional-format entry bar likewise swallows typing.
+        if self.sheet_cf_edit.is_some() {
+            return self.sheet_cf_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6019,6 +6094,62 @@ impl Docxy {
     }
 
     /// The sheet Find & Replace bar (Ctrl+F): query + prev/next, replace + all.
+    /// The conditional-format entry bar: type a comparison like ">500" to apply
+    /// the Light-Red highlight rule to the selection.
+    fn sheet_cf_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::cell_name;
+        let range = self.active_sheet().map(|v| {
+            let (r0, c0, r1, c1) = v.range();
+            format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+        }).unwrap_or_default();
+        let ent = cx.entity();
+        let (ent_ok, ent_cancel) = (ent.clone(), ent.clone());
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Highlight {range} where value")))
+            .child(
+                div().w(px(160.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { ">500".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().text_size(px(11.)).text_color(pal.dim).child("(>, <, >=, <=, =, <>; default >)"))
+            .child(div().id("cf-apply").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(hsla_u(BRAND)).text_color(hsla_u(0xffffff)).border_1().border_color(pal.border).child("Apply")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_ok.update(cx, |this, cx| {
+                        // Reuse the key path's commit by simulating Enter.
+                        this.sheet_cf_commit(cx);
+                    });
+                }))
+            .child(div().id("cf-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_cf_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
+    /// Apply the current CF buffer (used by the Apply button; Enter uses sheet_cf_key).
+    fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
+        let buf = self.sheet_cf_edit.clone().unwrap_or_default();
+        let buf = if buf.trim().is_empty() { ">500".to_string() } else { buf };
+        if let Some((op, val)) = parse_cf_input(&buf) {
+            self.sheet_snapshot();
+            if let Some(v) = self.active_sheet_mut() {
+                let s = v.active;
+                let (r0, c0, r1, c1) = v.range();
+                v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, None, cf_preset_dxf());
+                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            }
+            self.mark_sheet_dirty();
+        }
+        self.sheet_cf_edit = None;
+        cx.notify();
+    }
+
     /// The cell-comment entry bar: a labelled text field (self-managed, keys via
     /// sheet_comment_key) with the target cell, Save/Cancel. Enter commits.
     fn sheet_comment_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -6316,7 +6447,7 @@ impl Docxy {
             ])))
             // Styles: Conditional Formatting, Format as Table, Cell Styles.
             .child(group("Styles", false, h_flex().h_full().items_center().gap_0p5()
-                .child(self.sheet_lb(None, "Conditional Formatting", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Conditional Formatting", SheetAct::CondFormat, pal, cx))
                 .child(self.sheet_lb(Some("table"), "Format as Table", SheetAct::Todo, pal, cx))
                 .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
                 .into_any_element()))
@@ -6909,6 +7040,7 @@ impl Render for Docxy {
         let sheet_fmt_panel = (self.active_is_sheet() && self.sheet_fmt_open).then(|| self.sheet_format_panel(pal, cx));
         let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
+        let sheet_cf = self.sheet_cf_edit.clone().map(|buf| self.sheet_cf_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7217,6 +7349,7 @@ impl Render for Docxy {
             .when_some(sheet_numfmt_bar, |d, b| d.child(b))
             .when_some(sheet_find, |d, f| d.child(f))
             .when_some(sheet_comment, |d, c| d.child(c))
+            .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
