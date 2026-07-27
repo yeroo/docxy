@@ -2417,6 +2417,74 @@ impl SheetPackage {
         self.workbook.sheets[sheet].cond_formats.push(crate::sheet::CondFormat { ranges: vec![range], rules: vec![rule] });
     }
 
+    /// Add a data-validation rule to `sheet` over `range`. For a list, pass
+    /// kind="list" and formula1 as an inline `"a,b,c"` list or a range ref;
+    /// numeric/date kinds use an operator (between/greaterThan/…) + operand(s).
+    /// Appends a `<dataValidation>` to the worksheet (preserving existing ones)
+    /// and the model, so it round-trips and drives the dropdown / cell check.
+    pub fn add_data_validation(
+        &mut self,
+        sheet: usize,
+        range: (u32, u32, u32, u32),
+        kind: &str,
+        operator: &str,
+        formula1: &str,
+        formula2: Option<&str>,
+    ) {
+        if sheet >= self.workbook.sheets.len() {
+            return;
+        }
+        let (r1, c1, r2, c2) = range;
+        let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+        let op_attr = if operator.is_empty() { String::new() } else { format!(" operator=\"{operator}\"") };
+        let mut fmls = format!("<formula1>{}</formula1>", esc_text(formula1));
+        if let Some(f2) = formula2 {
+            fmls.push_str(&format!("<formula2>{}</formula2>", esc_text(f2)));
+        }
+        let dv_xml = format!(
+            "<dataValidation type=\"{kind}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>"
+        );
+        let sheet_part = self.sheet_parts[sheet].clone();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some(s) = xml.find("<dataValidations") {
+                // Bump the count attribute, then append before </dataValidations>.
+                if let Some(cs) = xml[s..].find("count=\"").map(|i| s + i + 7) {
+                    if let Some(ce) = xml[cs..].find('"').map(|i| cs + i) {
+                        if let Ok(n) = xml[cs..ce].parse::<u32>() {
+                            xml.replace_range(cs..ce, &(n + 1).to_string());
+                        }
+                    }
+                }
+                if let Some(e) = xml.find("</dataValidations>") {
+                    xml.insert_str(e, &dv_xml);
+                }
+            } else {
+                let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
+                // dataValidations follows sheetData/mergeCells/conditionalFormatting;
+                // insert before the first following element (hyperlinks/pageMargins/…).
+                let anchor = ["<hyperlinks", "<pageMargins", "<drawing", "<legacyDrawing"]
+                    .iter()
+                    .filter_map(|t| xml.find(t))
+                    .min()
+                    .or_else(|| xml.find("</worksheet>"));
+                match anchor {
+                    Some(pos) => xml.insert_str(pos, &block),
+                    None => {}
+                }
+            }
+            p.1 = xml.into_bytes();
+        }
+        self.workbook.sheets[sheet].validations.push(crate::sheet::DataValidation {
+            ranges: vec![range],
+            kind: kind.to_string(),
+            operator: operator.to_string(),
+            formula1: formula1.to_string(),
+            formula2: formula2.unwrap_or("").to_string(),
+            prompt: None,
+        });
+    }
+
     /// Remove all conditional-formatting rules from `sheet` (model + the
     /// worksheet's `<conditionalFormatting>` elements). Orphaned `<dxf>`s are left
     /// in styles.xml — harmless and referenced by nothing.
@@ -3068,6 +3136,22 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_data_validation_round_trips() {
+        let mut pkg = new_xlsx();
+        pkg.add_data_validation(0, (0, 0, 4, 0), "list", "", "\"Laptop,Monitor,Dock\"", None);
+        pkg.add_data_validation(0, (0, 1, 4, 1), "whole", "between", "1", Some("10"));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let dvs = &re.workbook.sheets[0].validations;
+        assert_eq!(dvs.len(), 2);
+        let list = dvs.iter().find(|d| d.kind == "list").unwrap();
+        assert!(list.covers(2, 0));
+        assert_eq!(list.formula1, "\"Laptop,Monitor,Dock\"");
+        let whole = dvs.iter().find(|d| d.kind == "whole").unwrap();
+        assert_eq!(whole.operator, "between");
+        assert_eq!((whole.formula1.as_str(), whole.formula2.as_str()), ("1", "10"));
+    }
 
     #[test]
     fn add_conditional_format_round_trips_and_evaluates() {

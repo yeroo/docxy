@@ -698,6 +698,8 @@ enum PromptKind {
     GoTo,
     /// Conditional formatting: a comparison like ">500" applied to the selection.
     CondFormat,
+    /// Data validation: comma-separated allowed values → a dropdown list.
+    DataValidation,
 }
 
 struct Prompt {
@@ -2645,6 +2647,7 @@ impl App {
             FillColor => self.open_picker(PickKind::FillColor),
             MergeCenter => self.merge_toggle(),
             CondFormat => self.open_prompt(PromptKind::CondFormat),
+            DataValidation => self.open_prompt(PromptKind::DataValidation),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3190,6 +3193,24 @@ impl App {
         });
     }
 
+    /// Create a list data-validation (dropdown) over the selection from a
+    /// comma-separated list of allowed values.
+    fn commit_data_validation(&mut self, text: &str) {
+        let items: Vec<&str> = text.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if items.is_empty() {
+            self.status = Some("Data validation: enter comma-separated values".into());
+            return;
+        }
+        let f1 = format!("\"{}\"", items.join(","));
+        let (r1, c1, r2, c2) = self.selection();
+        let s = self.sheet;
+        self.pkg.add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None);
+        self.undo.clear();
+        self.redo.clear();
+        self.modified = true;
+        self.status = Some(format!("Dropdown list: {} values", items.len()));
+    }
+
     /// Apply a "Highlight Cells" conditional-format rule to the selection from a
     /// typed comparison (">500", "<=100", "=42"; leading operator parsed, default
     /// greaterThan) using Excel's Light-Red-Fill / Dark-Red-Text preset.
@@ -3726,6 +3747,7 @@ impl App {
             PromptKind::ReplaceWith => ("Replace with: ", String::new()),
             PromptKind::GoTo => ("Go to: ", String::new()),
             PromptKind::CondFormat => ("Highlight (>500, =42, 100..500 between, 'clear'): ", String::new()),
+            PromptKind::DataValidation => ("Dropdown list (comma-separated values): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -3762,6 +3784,7 @@ impl App {
             }
             PromptKind::GoTo => self.goto(&text),
             PromptKind::CondFormat => self.commit_cond_format(&text),
+            PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.path = text;
@@ -6131,6 +6154,23 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn commit_data_validation_creates_list() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        app.anchor = Some((4, 0)); // A1:A5
+        app.commit_data_validation("Laptop, Monitor , Dock");
+        let dvs = &app.pkg.workbook.sheets[0].validations;
+        assert_eq!(dvs.len(), 1);
+        assert_eq!(dvs[0].kind, "list");
+        assert_eq!(dvs[0].formula1, "\"Laptop,Monitor,Dock\"");
+        assert!(dvs[0].covers(2, 0));
+        // Round-trips + the dropdown resolves the values.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
     }
 
     #[test]

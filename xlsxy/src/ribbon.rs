@@ -47,6 +47,7 @@ pub enum Act {
     FillColor,
     MergeCenter,
     CondFormat,
+    DataValidation,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -252,6 +253,14 @@ fn insert_groups() -> Vec<Group> {
             rows: [
                 vec![btn("▊ Column", InsertChart("column"), "Insert a column chart from the selection")],
                 vec![btn("▬ Bar", InsertChart("bar"), "Insert a bar chart from the selection")],
+            ],
+        },
+        Group {
+            title: "Data",
+            width: 14,
+            rows: [
+                vec![btn("Validation", DataValidation, "Data validation (dropdown list)")],
+                vec![],
             ],
         },
     ]

@@ -299,6 +299,7 @@ enum SheetAct {
     FormatCells,
     Merge,
     CondFormat,
+    DataValidation,
     Todo,
 }
 
@@ -534,6 +535,8 @@ struct Docxy {
     sheet_fmt_open: bool,
     // In-progress conditional-formatting rule entry (the value buffer, e.g. ">500").
     sheet_cf_edit: Option<String>,
+    // In-progress data-validation list entry (comma-separated allowed values).
+    sheet_dv_edit: Option<String>,
 }
 
 /// Common number formats offered by the Number-group dropdown: (label, code).
@@ -919,6 +922,7 @@ impl Docxy {
             sheet_numfmt_open: false,
             sheet_fmt_open: false,
             sheet_cf_edit: None,
+            sheet_dv_edit: None,
         }
     }
 
@@ -1523,6 +1527,42 @@ impl Docxy {
                     }
                 }
                 self.sheet_cf_edit = Some(buf);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Route a keystroke into the data-validation entry bar; Enter creates a list
+    /// validation from the comma-separated values over the selection.
+    fn sheet_dv_edit_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some(mut buf) = self.sheet_dv_edit.clone() else { return };
+        match key {
+            "escape" => self.sheet_dv_edit = None,
+            "enter" => {
+                let items: Vec<&str> = buf.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                if !items.is_empty() {
+                    let f1 = format!("\"{}\"", items.join(","));
+                    self.sheet_snapshot();
+                    if let Some(v) = self.active_sheet_mut() {
+                        let s = v.active;
+                        let (r0, c0, r1, c1) = v.range();
+                        v.pkg.add_data_validation(s, (r0, c0, r1, c1), "list", "", &f1, None);
+                    }
+                    self.mark_sheet_dirty();
+                }
+                self.sheet_dv_edit = None;
+            }
+            "backspace" => {
+                buf.pop();
+                self.sheet_dv_edit = Some(buf);
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.sheet_dv_edit = Some(buf);
             }
         }
         cx.notify();
@@ -2369,6 +2409,10 @@ impl Docxy {
                 self.sheet_cf_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::DataValidation => {
+                self.sheet_dv_edit = Some(String::new());
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -2388,6 +2432,10 @@ impl Docxy {
         // The conditional-format entry bar likewise swallows typing.
         if self.sheet_cf_edit.is_some() {
             return self.sheet_cf_key(ev, key, cx);
+        }
+        // The data-validation entry bar swallows typing too.
+        if self.sheet_dv_edit.is_some() {
+            return self.sheet_dv_edit_key(ev, key, cx);
         }
         // While the find bar is open, keystrokes edit it (Ctrl+S/F still work).
         if self.find_open && !(ctrl && matches!(key, "s")) {
@@ -6147,6 +6195,35 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The data-validation entry bar: type comma-separated allowed values to make
+    /// the selection a dropdown list.
+    fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use gridcore::sheet::cell_name;
+        let range = self.active_sheet().map(|v| {
+            let (r0, c0, r1, c1) = v.range();
+            format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+        }).unwrap_or_default();
+        let ent = cx.entity();
+        let ent_cancel = ent.clone();
+        h_flex()
+            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .bg(pal.panel).border_b_1().border_color(pal.border)
+            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Dropdown list for {range} (comma-separated):")))
+            .child(
+                div().flex_1().h(px(22.)).px_2().flex().items_center().rounded_sm()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
+                    .text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                    .child(div().child(SharedString::from(if buf.is_empty() { "Yes, No, Maybe".to_string() } else { buf.to_string() })))
+                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
+            )
+            .child(div().id("dv-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
+                .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    ent_cancel.update(cx, |this, cx| { this.sheet_dv_edit = None; cx.notify(); });
+                }))
+            .into_any_element()
+    }
+
     /// Apply the current CF buffer (used by the Apply button; Enter uses sheet_cf_key).
     fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
         let buf = self.sheet_cf_edit.clone().unwrap_or_default();
@@ -6295,6 +6372,7 @@ impl Docxy {
             .child(group("Tables", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(Some("table"), "PivotTable", SheetAct::InsertPivot, pal, cx))
                 .child(self.sheet_lb(Some("table"), "Table", SheetAct::Todo, pal, cx))
+                .child(self.sheet_lb(None, "Data Validation", SheetAct::DataValidation, pal, cx))
                 .into_any_element()))
             .child(group("Charts", h_flex().h_full().items_center().gap_1()
                 .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
@@ -7064,6 +7142,7 @@ impl Render for Docxy {
         let sheet_find = (self.active_is_sheet() && self.find_open).then(|| self.sheet_find_bar(pal, cx));
         let sheet_comment = self.sheet_comment_edit.clone().map(|buf| self.sheet_comment_bar(&buf, pal, cx));
         let sheet_cf = self.sheet_cf_edit.clone().map(|buf| self.sheet_cf_bar(&buf, pal, cx));
+        let sheet_dv_bar = self.sheet_dv_edit.clone().map(|buf| self.sheet_dv_edit_bar(&buf, pal, cx));
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let hf_bar = self.hf_active().then(|| self.hf_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
@@ -7373,6 +7452,7 @@ impl Render for Docxy {
             .when_some(sheet_find, |d, f| d.child(f))
             .when_some(sheet_comment, |d, c| d.child(c))
             .when_some(sheet_cf, |d, c| d.child(c))
+            .when_some(sheet_dv_bar, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))
