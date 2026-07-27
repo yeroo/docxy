@@ -735,6 +735,16 @@ struct FormatPicker {
     sel: usize,
 }
 
+/// The consolidated "Format Cells" dialog (Ctrl+1): sectioned tabs (Number /
+/// Font / Fill / Align / Border) with a highlighted option per section.
+struct FormatDialog {
+    section: usize,
+    sel: usize,
+}
+
+/// The Format Cells section tabs.
+const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
+
 /// Number-format options offered by the picker: (label, format code).
 const NUMFMT_OPTIONS: &[(&str, Option<&str>)] = &[
     ("General", None),
@@ -843,6 +853,7 @@ struct App {
     start: backstage::Start,
     // The formatting popup (number format / font & fill color).
     format_picker: Option<FormatPicker>,
+    format_dialog: Option<FormatDialog>,
     // View preferences (persisted to a config file).
     formula_view: bool,
     light_theme: bool,
@@ -935,6 +946,7 @@ impl App {
                 Color::Green,
             ),
             format_picker: None,
+            format_dialog: None,
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
@@ -2219,6 +2231,95 @@ impl App {
                 self.apply_format(move |x| x.fill = rgb);
                 self.status = Some(format!("Fill color: {label}"));
             }
+        }
+    }
+
+    // --- Format Cells dialog (Ctrl+1) ---------------------------------------
+
+    fn open_format_dialog(&mut self) {
+        self.format_dialog = Some(FormatDialog { section: 0, sel: 0 });
+    }
+
+    /// Number of options in a Format Cells section: Number=formats, Font=Bold/
+    /// Italic + font colours, Fill=colours, Align=L/C/R, Border=box toggle.
+    fn fmt_section_len(section: usize) -> usize {
+        match section {
+            0 => NUMFMT_OPTIONS.len(),
+            1 => 2 + COLOR_OPTIONS.len(),
+            2 => COLOR_OPTIONS.len(),
+            3 => 3,
+            4 => 1,
+            _ => 0,
+        }
+    }
+
+    fn format_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = &mut self.format_dialog else {
+            return;
+        };
+        let n = FMT_SECTIONS.len();
+        match code {
+            KeyCode::Esc => self.format_dialog = None,
+            KeyCode::Left | KeyCode::BackTab => {
+                d.section = (d.section + n - 1) % n;
+                d.sel = 0;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                d.section = (d.section + 1) % n;
+                d.sel = 0;
+            }
+            KeyCode::Up => d.sel = d.sel.saturating_sub(1),
+            KeyCode::Down => {
+                let len = Self::fmt_section_len(d.section);
+                d.sel = (d.sel + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Enter => self.apply_format_dialog(),
+            _ => {}
+        }
+    }
+
+    /// Apply the highlighted option; the dialog stays open so several attributes
+    /// can be set in one visit (Esc closes it).
+    fn apply_format_dialog(&mut self) {
+        let Some((section, sel)) = self.format_dialog.as_ref().map(|d| (d.section, d.sel)) else {
+            return;
+        };
+        match section {
+            0 => {
+                let (label, code) = NUMFMT_OPTIONS[sel];
+                let code = code.map(str::to_string);
+                self.apply_format(move |x| {
+                    x.code = code.clone();
+                    x.numfmt = code
+                        .as_deref()
+                        .map(gridcore::sheet::classify_format_code)
+                        .unwrap_or(NumFmt::General);
+                });
+                self.status = Some(format!("Number format: {label}"));
+            }
+            1 => match sel {
+                0 => self.toggle_bold(),
+                1 => self.toggle_italic(),
+                _ => {
+                    let (label, rgb) = COLOR_OPTIONS[sel - 2];
+                    self.apply_format(move |x| x.color = rgb);
+                    self.status = Some(format!("Font color: {label}"));
+                }
+            },
+            2 => {
+                let (label, rgb) = COLOR_OPTIONS[sel];
+                self.apply_format(move |x| x.fill = rgb);
+                self.status = Some(format!("Fill: {label}"));
+            }
+            3 => {
+                let a = [Align::Left, Align::Center, Align::Right][sel];
+                self.set_align(a);
+            }
+            4 => {
+                self.apply_format(|x| x.border = !x.border);
+                self.status = Some("Toggled box border".into());
+            }
+            _ => {}
         }
     }
 
@@ -3925,6 +4026,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     if let Some(p) = &app.format_picker {
         draw_format_picker(p, f, grid);
     }
+    if let Some(d) = &app.format_dialog {
+        draw_format_dialog(app, d, f, grid);
+    }
 
     // --- sheet picker -----------------------------------------------------------
     if let Some(sel) = app.sheet_picker {
@@ -4489,6 +4593,95 @@ fn draw_format_picker(p: &FormatPicker, f: &mut Frame, grid: Rect) {
     );
 }
 
+/// The consolidated Format Cells dialog: section tabs across the top, the active
+/// section's options below (a ● marks the selection's current value), and a hint.
+fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
+    // The selected cell's effective style, to mark which options are already set.
+    let (cr, cc) = app.cur;
+    let xf = app
+        .sheet()
+        .cell(cr, cc)
+        .map(|cl| app.pkg.workbook.styles.xf(cl.style))
+        .unwrap_or_default();
+    let rows: Vec<(String, Option<Rgb>, bool)> = match d.section {
+        0 => NUMFMT_OPTIONS
+            .iter()
+            .map(|(l, code)| (l.to_string(), None, code.map(str::to_string) == xf.code))
+            .collect(),
+        1 => {
+            let mut v = vec![
+                ("Bold".to_string(), None, xf.bold),
+                ("Italic".to_string(), None, xf.italic),
+            ];
+            for (l, c) in COLOR_OPTIONS {
+                v.push((format!("Text {l}"), *c, xf.color == *c));
+            }
+            v
+        }
+        2 => COLOR_OPTIONS.iter().map(|(l, c)| (l.to_string(), *c, xf.fill == *c)).collect(),
+        3 => vec![
+            ("Left".to_string(), None, xf.align == Align::Left),
+            ("Center".to_string(), None, xf.align == Align::Center),
+            ("Right".to_string(), None, xf.align == Align::Right),
+        ],
+        4 => vec![("Box border".to_string(), None, xf.border)],
+        _ => vec![],
+    };
+
+    let w = 42u16.min(grid.width.saturating_sub(2));
+    let h = ((rows.len() as u16) + 6).clamp(9, grid.height.min(22));
+    if w < 22 || h < 8 {
+        return;
+    }
+    let x = grid.x + (grid.width - w) / 2;
+    let y = grid.y + (grid.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+    let iw = w.saturating_sub(2) as usize; // inside the border
+
+    let mut tabs: Vec<RSpan> = Vec::new();
+    for (i, name) in FMT_SECTIONS.iter().enumerate() {
+        let st = if i == d.section {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        tabs.push(RSpan::styled(format!(" {name} "), st));
+    }
+    let mut lines: Vec<RLine> = vec![RLine::from(tabs), RLine::from("")];
+
+    let list_h = (h as usize).saturating_sub(5).max(1);
+    let start = d
+        .sel
+        .saturating_sub(list_h - 1)
+        .min(rows.len().saturating_sub(list_h).max(0));
+    for (i, (label, color, active)) in rows.iter().enumerate().skip(start).take(list_h) {
+        let mut spans: Vec<RSpan> = vec![RSpan::raw(if *active { "● " } else { "  " }.to_string())];
+        if let Some((r, g, b)) = color {
+            spans.push(RSpan::styled("██ ", Style::new().fg(Color::Rgb(*r, *g, *b))));
+        }
+        let base = if i == d.sel {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        spans.push(RSpan::styled(fit(label, iw.saturating_sub(6), false), base));
+        lines.push(RLine::from(spans));
+    }
+    while lines.len() < (h as usize).saturating_sub(3) {
+        lines.push(RLine::from(""));
+    }
+    lines.push(RLine::from(RSpan::styled(
+        fit("<-/-> section  up/down  Enter  Esc", iw, false),
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Format Cells (Ctrl+1) ")),
+        area,
+    );
+}
+
 /// The data-model view: tables summary plus relationship/measure panes.
 fn draw_model_view(app: &App, pane: usize, sel: usize, f: &mut Frame, grid: Rect) {
     let w = grid.width.min(76);
@@ -4695,6 +4888,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.prompt.is_some()
         || app.edit.is_some()
         || app.format_picker.is_some()
+        || app.format_dialog.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
@@ -4714,6 +4908,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // --- formatting popup -----------------------------------------------------
     if app.format_picker.is_some() {
         app.picker_key(key.code);
+        return false;
+    }
+    if app.format_dialog.is_some() {
+        app.format_dialog_key(key.code);
         return false;
     }
 
@@ -4904,6 +5102,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('b') | KeyCode::Char('B') if ctrl => app.toggle_bold(),
+        KeyCode::Char('1') if ctrl => app.open_format_dialog(),
         KeyCode::Char('i') | KeyCode::Char('I') if ctrl => app.toggle_italic(),
         KeyCode::Char('`') if ctrl => app.toggle_formula_view(),
         KeyCode::Char('f') | KeyCode::Char('F') if ctrl => app.open_prompt(PromptKind::Find),
@@ -5480,6 +5679,57 @@ mod tests {
         assert!(xf.bold);
         assert_eq!(xf.align, Align::Right);
         assert_eq!(xf.code.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn format_dialog_applies_each_section() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        app.start_edit(Some('5'));
+        assert!(app.commit_edit());
+        app.cur = (0, 0);
+        app.anchor = None;
+
+        app.open_format_dialog();
+        assert!(app.format_dialog.is_some());
+
+        // Apply one option from each of four sections; the dialog stays open.
+        let set = |app: &mut App, section: usize, sel: usize| {
+            let d = app.format_dialog.as_mut().unwrap();
+            d.section = section;
+            d.sel = sel;
+            app.apply_format_dialog();
+        };
+        let pct = NUMFMT_OPTIONS.iter().position(|(l, _)| *l == "Percent  0%").unwrap();
+        set(&mut app, 0, pct); // Number: Percent 0%
+        set(&mut app, 1, 0); // Font: Bold
+        set(&mut app, 3, 1); // Align: Center
+        set(&mut app, 4, 0); // Border: box
+
+        let xf = {
+            let c = app.sheet().cell(0, 0).unwrap();
+            app.pkg.workbook.styles.xf(c.style)
+        };
+        assert_eq!(xf.code.as_deref(), Some("0%"));
+        assert!(xf.bold);
+        assert_eq!(xf.align, Align::Center);
+        assert!(xf.border);
+
+        // Section navigation wraps; Esc closes.
+        app.format_dialog.as_mut().unwrap().section = 0;
+        app.format_dialog_key(KeyCode::Right);
+        assert_eq!(app.format_dialog.as_ref().unwrap().section, 1);
+        app.format_dialog_key(KeyCode::Left);
+        app.format_dialog_key(KeyCode::Left);
+        assert_eq!(app.format_dialog.as_ref().unwrap().section, FMT_SECTIONS.len() - 1);
+        app.format_dialog_key(KeyCode::Esc);
+        assert!(app.format_dialog.is_none());
+
+        // Formatting persists across save/reload.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let xf = re.workbook.styles.xf(re.workbook.sheets[0].cell(0, 0).unwrap().style);
+        assert!(xf.bold && xf.align == Align::Center && xf.code.as_deref() == Some("0%"));
     }
 
     #[test]
@@ -6401,6 +6651,29 @@ mod tests {
         let text = format!("{:?}", term.backend().buffer());
         assert!(text.contains("Relationships"));
         assert!(text.contains("Measures"));
+    }
+
+    #[test]
+    fn format_dialog_renders() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.open_format_dialog();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Format Cells"), "title missing");
+        assert!(text.contains("Number") && text.contains("Border"), "section tabs missing");
+        assert!(text.contains("General"), "number options missing");
+
+        // Move to the Align section; its options render.
+        app.format_dialog_key(KeyCode::Right); // Font
+        app.format_dialog_key(KeyCode::Right); // Fill
+        app.format_dialog_key(KeyCode::Right); // Align
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Center"), "align options missing");
     }
 
     #[test]
