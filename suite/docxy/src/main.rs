@@ -468,6 +468,8 @@ struct Docxy {
     // In-progress cell-comment entry for the selected cell (the input buffer);
     // None = the comment bar is closed.
     sheet_comment_edit: Option<String>,
+    // Whether the data-validation list dropdown is open on the selected cell.
+    sheet_dv_open: bool,
 }
 
 // gpui reserves Tab / Shift-Tab for focus traversal and never delivers them to
@@ -835,6 +837,7 @@ impl Docxy {
             sheet_rename: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
+            sheet_dv_open: false,
         }
     }
 
@@ -1496,6 +1499,73 @@ impl Docxy {
             // Bring the target row into view (columns follow via reconcile).
             v.vscroll.scroll_to_item(next.0 as usize, ScrollStrategy::Center);
         }
+        cx.notify();
+    }
+
+    // ---- data-validation list dropdown -------------------------------------
+
+    /// If the selected cell has a `list` data validation, the allowed values —
+    /// an inline `"a,b,c"` list or the contents of a referenced range.
+    fn dv_list_values(&self) -> Option<Vec<String>> {
+        use gridcore::sheet::CellValue;
+        let v = self.active_sheet()?;
+        let (r, c) = v.sel;
+        let sh = v.sheet();
+        let dv = sh.validations.iter().find(|d| d.kind == "list" && d.covers(r, c))?;
+        let f = dv.formula1.trim();
+        // Inline list: "Yes,No,Maybe".
+        if f.len() >= 2 && f.starts_with('"') && f.ends_with('"') {
+            return Some(
+                f[1..f.len() - 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
+        }
+        // Range reference, optionally sheet-qualified.
+        let (sheet_idx, rref) = match f.split_once('!') {
+            Some((sname, rest)) => {
+                let sname = sname.trim_matches('\'');
+                (v.pkg.workbook.sheets.iter().position(|s| s.name == sname)?, rest)
+            }
+            None => (v.active, f),
+        };
+        let (r1, c1, r2, c2) = gridcore::sheet::parse_range_name(&rref.replace('$', ""))?;
+        let src = v.pkg.workbook.sheets.get(sheet_idx)?;
+        let mut out = Vec::new();
+        for rr in r1..=r2 {
+            for cc in c1..=c2 {
+                let t = match src.cell(rr, cc).map(|cl| &cl.value) {
+                    Some(CellValue::Text(s)) => s.clone(),
+                    Some(CellValue::Number(n)) => n.to_string(),
+                    Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+                    _ => String::new(),
+                };
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn sheet_dv_toggle(&mut self, cx: &mut Context<Self>) {
+        self.sheet_dv_open = !self.sheet_dv_open;
+        cx.notify();
+    }
+
+    /// Set the selected cell to `value` (a picked validation option).
+    fn sheet_dv_pick(&mut self, value: String, cx: &mut Context<Self>) {
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let (r, c) = v.sel;
+            let s = v.active;
+            let style = v.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), parse_cell_input(&value, style));
+        }
+        self.sheet_dv_open = false;
+        self.mark_sheet_dirty();
         cx.notify();
     }
 
@@ -6311,6 +6381,11 @@ impl Render for Docxy {
         } else {
             0.0
         };
+        // List data-validation options for the selected cell (dropdown), if any.
+        let sheet_dv = self.active_is_sheet().then(|| self.dv_list_values()).flatten();
+        if sheet_dv.is_none() {
+            self.sheet_dv_open = false;
+        }
 
         let t = cx.theme();
         let bg = t.background;
@@ -6603,7 +6678,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_grid_w, cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -7052,7 +7127,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -7303,6 +7378,53 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 })
         }
     };
+    // Data-validation list dropdown: an arrow on the selected cell + (when open)
+    // a value popup, both cell-anchored in the same layer.
+    let mut dv_overlay: Vec<AnyElement> = Vec::new();
+    if let Some(vals) = &dv_values {
+        let (sr, sc) = view.sel;
+        if let Some(cx0) = col_x(sc) {
+            let cw = col_px(sh.col_width(sc));
+            let y = row_y(sr);
+            let ent_arrow = ent.clone();
+            dv_overlay.push(
+                div()
+                    .id("dv-arrow")
+                    .absolute().left(px(cx0 + cw - 17.0)).top(px(y + 1.0))
+                    .w(px(16.)).h(px(SHEET_ROW_H - 2.0))
+                    .flex().items_center().justify_center().cursor_pointer()
+                    .bg(hsla_u(0xf1f1f1)).border_1().border_color(hsla_u(0x9a9a9a)).rounded_sm()
+                    .text_size(px(8.)).text_color(hsla_u(0x333333))
+                    .child("\u{25bc}")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        ent_arrow.update(cx, |this, cx| this.sheet_dv_toggle(cx));
+                    })
+                    .into_any_element(),
+            );
+            if dv_open {
+                let mut list = v_flex()
+                    .id("dv-list")
+                    .absolute().left(px(cx0)).top(px(y + SHEET_ROW_H))
+                    .min_w(px(cw.max(90.0))).max_h(px(220.)).overflow_y_scroll()
+                    .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(0x9a9a9a)).rounded_sm();
+                for val in vals {
+                    let ent_pick = ent.clone();
+                    let v2 = val.clone();
+                    list = list.child(
+                        div()
+                            .id(ElementId::Name(format!("dv-{val}").into()))
+                            .px_2().py(px(2.)).cursor_pointer().text_size(px(12.)).text_color(hsla_u(0x1a1a1a))
+                            .hover(|d| d.bg(hsla_u(0xe8f0fe)))
+                            .child(SharedString::from(val.clone()))
+                            .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                ent_pick.update(cx, |this, cx| this.sheet_dv_pick(v2.clone(), cx));
+                            }),
+                    );
+                }
+                dv_overlay.push(list.into_any_element());
+            }
+        }
+    }
     // The clipping layer: spans the rows viewport (under the column header, above
     // the h-scroll strip + sheet tabs). Non-interactive, so cell clicks pass through.
     let chart_layer = div()
@@ -7313,7 +7435,8 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .bottom(px(26. + 11.))
         .overflow_hidden()
         .children(cards)
-        .children(note);
+        .children(note)
+        .children(dv_overlay);
 
     let ent_move = ent.clone();
     let ent_up = ent.clone();
