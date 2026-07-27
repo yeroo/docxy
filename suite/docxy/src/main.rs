@@ -1493,6 +1493,8 @@ impl Docxy {
             };
             v.sel = next;
             v.anchor = next;
+            // Bring the target row into view (columns follow via reconcile).
+            v.vscroll.scroll_to_item(next.0 as usize, ScrollStrategy::Center);
         }
         cx.notify();
     }
@@ -6601,7 +6603,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), sheet_grid_w, cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_grid_w, cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -7050,7 +7052,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -7273,6 +7275,34 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             Some(div().absolute().left(px(x)).top(px(y)).child(chart_card(data)).into_any_element())
         })
         .collect();
+    // A yellow note box for the selected commented cell (hidden while its entry
+    // bar is open), anchored just off the cell's top-right like Excel.
+    let note: Option<AnyElement> = if comment_editing {
+        None
+    } else {
+        let (sr, sc) = view.sel;
+        if !comment_cells.contains(&(sr, sc)) {
+            None
+        } else {
+            view.pkg
+                .comments()
+                .into_iter()
+                .find(|c| c.sheet == view.active && c.row == sr && c.col == sc)
+                .and_then(|c| {
+                    let x = col_x(sc)? + col_px(sh.col_width(sc)) + 6.0;
+                    let y = row_y(sr);
+                    Some(
+                        v_flex()
+                            .absolute().left(px(x)).top(px(y))
+                            .w(px(200.)).px_2().py_1p5().gap_1()
+                            .bg(hsla_u(0xffffe1)).border_1().border_color(hsla_u(0xc9b458)).rounded_sm()
+                            .child(div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(hsla_u(0x333333)).child(SharedString::from(c.author.clone())))
+                            .child(div().text_size(px(11.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(c.text.clone())))
+                            .into_any_element(),
+                    )
+                })
+        }
+    };
     // The clipping layer: spans the rows viewport (under the column header, above
     // the h-scroll strip + sheet tabs). Non-interactive, so cell clicks pass through.
     let chart_layer = div()
@@ -7282,7 +7312,8 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .top(px(26. + SHEET_ROW_H))
         .bottom(px(26. + 11.))
         .overflow_hidden()
-        .children(cards);
+        .children(cards)
+        .children(note);
 
     let ent_move = ent.clone();
     let ent_up = ent.clone();
