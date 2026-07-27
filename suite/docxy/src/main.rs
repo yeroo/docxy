@@ -1502,6 +1502,34 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Follow the hyperlink on cell (r,c) of the active sheet, if any: jump for an
+    /// in-workbook `#Sheet!A1` target, else open the URL externally.
+    fn sheet_follow_hyperlink(&mut self, r: u32, c: u32, cx: &mut Context<Self>) {
+        let link = self.active_sheet().and_then(|v| v.sheet().hyperlinks.get(&(r, c)).cloned());
+        let Some(link) = link else { return };
+        if let Some(loc) = link.strip_prefix('#') {
+            let (sheet_name, cellref) = match loc.rsplit_once('!') {
+                Some((s, cr)) => (Some(s.trim_matches('\'').to_string()), cr.to_string()),
+                None => (None, loc.to_string()),
+            };
+            if let Some(v) = self.active_sheet_mut() {
+                if let Some(sn) = sheet_name {
+                    if let Some(idx) = v.pkg.workbook.sheets.iter().position(|s| s.name == sn) {
+                        v.active = idx;
+                    }
+                }
+                if let Some((rr, cc)) = gridcore::sheet::parse_cell_name(&cellref.replace('$', "")) {
+                    v.sel = (rr, cc);
+                    v.anchor = (rr, cc);
+                    v.vscroll.scroll_to_item(rr as usize, ScrollStrategy::Center);
+                }
+            }
+            cx.notify();
+        } else {
+            cx.open_url(&link);
+        }
+    }
+
     // ---- data-validation list dropdown -------------------------------------
 
     /// If the selected cell has a `list` data validation, the allowed values —
@@ -7003,11 +7031,20 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 _ => cell.justify_start(),
             };
             if !text.is_empty() {
+                // Hyperlinked cells render as underlined blue and follow on click.
+                let is_link = sh.hyperlinks.contains_key(&(r, c));
                 cell = cell.child(
-                    div().text_size(px(12.)).text_color(color).when(bold, |d| d.font_weight(FontWeight::BOLD)).when(italic, |d| d.italic()).child(SharedString::from(text)),
+                    div()
+                        .text_size(px(12.))
+                        .text_color(if is_link { rgb(0x0563c1) } else { color })
+                        .when(is_link, |d| d.underline())
+                        .when(bold, |d| d.font_weight(FontWeight::BOLD))
+                        .when(italic, |d| d.italic())
+                        .child(SharedString::from(text)),
                 );
             }
         }
+        let has_link = sh.hyperlinks.contains_key(&(r, c));
         let ent2 = ent.clone();
         cell = cell
             .on_click(move |ev, window, cx| {
@@ -7016,7 +7053,10 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                     if shift {
                         this.extend_to(r, c, cx)
                     } else {
-                        this.select_cell(r, c, cx)
+                        this.select_cell(r, c, cx);
+                        if has_link {
+                            this.sheet_follow_hyperlink(r, c, cx);
+                        }
                     }
                     // Keep keyboard focus on the grid after a click inside the
                     // virtualized list (which would otherwise capture it).
