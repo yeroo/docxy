@@ -2417,6 +2417,29 @@ impl SheetPackage {
         self.workbook.sheets[sheet].cond_formats.push(crate::sheet::CondFormat { ranges: vec![range], rules: vec![rule] });
     }
 
+    /// Remove all conditional-formatting rules from `sheet` (model + the
+    /// worksheet's `<conditionalFormatting>` elements). Orphaned `<dxf>`s are left
+    /// in styles.xml — harmless and referenced by nothing.
+    pub fn clear_conditional_formats(&mut self, sheet: usize) {
+        if sheet >= self.workbook.sheets.len() {
+            return;
+        }
+        self.workbook.sheets[sheet].cond_formats.clear();
+        let sheet_part = self.sheet_parts[sheet].clone();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            while let Some(s) = xml.find("<conditionalFormatting") {
+                let e = xml[s..]
+                    .find("</conditionalFormatting>")
+                    .map(|i| s + i + "</conditionalFormatting>".len())
+                    .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
+                    .unwrap_or(xml.len());
+                xml.replace_range(s..e, "");
+            }
+            p.1 = xml.into_bytes();
+        }
+    }
+
     pub fn add_chart(&mut self, sheet: usize, from: (u32, u32), to: (u32, u32), data: &crate::sheet::ChartData) {
         if sheet >= self.workbook.sheets.len() {
             return;

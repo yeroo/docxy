@@ -747,10 +747,17 @@ struct FormatDialog {
 /// The Format Cells section tabs.
 const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
 
-/// Parse a conditional-format comparison like ">500", "<=100", "=42" into an
-/// Excel cellIs operator + operand (defaulting to greaterThan when no operator).
-fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
+/// Parse a conditional-format comparison into an Excel cellIs operator plus one
+/// or two operands: ">500", "<=100", "=42" (default greaterThan), or a between
+/// range "100..500".
+fn parse_cf_input(s: &str) -> Option<(&'static str, String, Option<String>)> {
     let s = s.trim();
+    if let Some((a, b)) = s.split_once("..") {
+        let (a, b) = (a.trim(), b.trim());
+        if !a.is_empty() && !b.is_empty() {
+            return Some(("between", a.to_string(), Some(b.to_string())));
+        }
+    }
     let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
         ("greaterThanOrEqual", r)
     } else if let Some(r) = s.strip_prefix("<=") {
@@ -770,7 +777,7 @@ fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
     if rest.is_empty() {
         None
     } else {
-        Some((op, rest.to_string()))
+        Some((op, rest.to_string(), None))
     }
 }
 
@@ -3187,19 +3194,29 @@ impl App {
     /// typed comparison (">500", "<=100", "=42"; leading operator parsed, default
     /// greaterThan) using Excel's Light-Red-Fill / Dark-Red-Text preset.
     fn commit_cond_format(&mut self, text: &str) {
-        let Some((op, val)) = parse_cf_input(text) else {
+        let s = self.sheet;
+        // "clear" removes all rules on the sheet.
+        if text.trim().eq_ignore_ascii_case("clear") {
+            self.pkg.clear_conditional_formats(s);
+            self.undo.clear();
+            self.redo.clear();
+            self.rebuild_engine();
+            self.modified = true;
+            self.status = Some("Cleared conditional formatting".into());
+            return;
+        }
+        let Some((op, val, val2)) = parse_cf_input(text) else {
             self.status = Some("Conditional format: enter a value, e.g. >500".into());
             return;
         };
         let (r1, c1, r2, c2) = self.selection();
-        let s = self.sheet;
         let dxf = gridcore::sheet::Dxf {
             fill: Some((0xFF, 0xC7, 0xCE)),
             color: Some((0x9C, 0x00, 0x06)),
             bold: None,
             italic: None,
         };
-        self.pkg.add_conditional_format(s, (r1, c1, r2, c2), op, &val, None, dxf);
+        self.pkg.add_conditional_format(s, (r1, c1, r2, c2), op, &val, val2.as_deref(), dxf);
         // add_conditional_format rewrites package parts; drop stale undo snapshots.
         self.undo.clear();
         self.redo.clear();
@@ -3708,7 +3725,7 @@ impl App {
             ),
             PromptKind::ReplaceWith => ("Replace with: ", String::new()),
             PromptKind::GoTo => ("Go to: ", String::new()),
-            PromptKind::CondFormat => ("Highlight where value (>500, <=100, =42): ", String::new()),
+            PromptKind::CondFormat => ("Highlight (>500, =42, 100..500 between, 'clear'): ", String::new()),
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -6081,11 +6098,12 @@ mod tests {
 
     #[test]
     fn parse_cf_input_operators() {
-        assert_eq!(parse_cf_input(">500"), Some(("greaterThan", "500".into())));
-        assert_eq!(parse_cf_input("<=100"), Some(("lessThanOrEqual", "100".into())));
-        assert_eq!(parse_cf_input("<>0"), Some(("notEqual", "0".into())));
-        assert_eq!(parse_cf_input("=42"), Some(("equal", "42".into())));
-        assert_eq!(parse_cf_input("42"), Some(("greaterThan", "42".into())));
+        assert_eq!(parse_cf_input(">500"), Some(("greaterThan", "500".into(), None)));
+        assert_eq!(parse_cf_input("<=100"), Some(("lessThanOrEqual", "100".into(), None)));
+        assert_eq!(parse_cf_input("<>0"), Some(("notEqual", "0".into(), None)));
+        assert_eq!(parse_cf_input("=42"), Some(("equal", "42".into(), None)));
+        assert_eq!(parse_cf_input("42"), Some(("greaterThan", "42".into(), None)));
+        assert_eq!(parse_cf_input("100..500"), Some(("between", "100".into(), Some("500".into()))));
         assert_eq!(parse_cf_input("   "), None);
     }
 
@@ -6113,6 +6131,31 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn cond_format_between_and_clear() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::number(50.0));
+            sh.set_cell(1, 0, Cell::number(300.0));
+            sh.set_cell(2, 0, Cell::number(900.0));
+        }
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0)); // A1:A3
+        app.commit_cond_format("100..500");
+        // 300 is within [100,500]; 50 and 900 are not.
+        assert!(gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 0, 0).is_none());
+        assert!(gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 1, 0).is_some());
+        assert!(gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 2, 0).is_none());
+
+        app.commit_cond_format("clear");
+        assert!(app.pkg.workbook.sheets[0].cond_formats.is_empty());
+        assert!(gridcore::cf::cell_dxf(&app.pkg.workbook, 0, 1, 0).is_none());
     }
 
     #[test]

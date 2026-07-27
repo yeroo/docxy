@@ -302,10 +302,17 @@ enum SheetAct {
     Todo,
 }
 
-/// Parse a conditional-format value like ">500", "<=100", "=42" into an Excel
-/// cellIs operator + operand (defaulting to greaterThan when no operator typed).
-fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
+/// Parse a conditional-format comparison into an Excel cellIs operator plus one
+/// or two operands: ">500", "<=100", "=42" (default greaterThan), or a between
+/// range "100..500".
+fn parse_cf_input(s: &str) -> Option<(&'static str, String, Option<String>)> {
     let s = s.trim();
+    if let Some((a, b)) = s.split_once("..") {
+        let (a, b) = (a.trim(), b.trim());
+        if !a.is_empty() && !b.is_empty() {
+            return Some(("between", a.to_string(), Some(b.to_string())));
+        }
+    }
     let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
         ("greaterThanOrEqual", r)
     } else if let Some(r) = s.strip_prefix("<=") {
@@ -322,7 +329,7 @@ fn parse_cf_input(s: &str) -> Option<(&'static str, String)> {
         ("greaterThan", s)
     };
     let rest = rest.trim();
-    if rest.is_empty() { None } else { Some((op, rest.to_string())) }
+    if rest.is_empty() { None } else { Some((op, rest.to_string(), None)) }
 }
 
 /// Excel's "Light Red Fill with Dark Red Text" conditional-format preset.
@@ -1485,12 +1492,20 @@ impl Docxy {
         match key {
             "escape" => self.sheet_cf_edit = None,
             "enter" => {
-                if let Some((op, val)) = parse_cf_input(&buf) {
+                if buf.trim().eq_ignore_ascii_case("clear") {
+                    self.sheet_snapshot();
+                    if let Some(v) = self.active_sheet_mut() {
+                        let s = v.active;
+                        v.pkg.clear_conditional_formats(s);
+                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                    }
+                    self.mark_sheet_dirty();
+                } else if let Some((op, val, val2)) = parse_cf_input(&buf) {
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
                         let s = v.active;
                         let (r0, c0, r1, c1) = v.range();
-                        v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, None, cf_preset_dxf());
+                        v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, val2.as_deref(), cf_preset_dxf());
                         v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
@@ -6115,7 +6130,7 @@ impl Docxy {
                     .child(div().child(SharedString::from(if buf.is_empty() { ">500".to_string() } else { buf.to_string() })))
                     .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
             )
-            .child(div().text_size(px(11.)).text_color(pal.dim).child("(>, <, >=, <=, =, <>; default >)"))
+            .child(div().text_size(px(11.)).text_color(pal.dim).child("(>, <, =, <>; 100..500 between; 'clear')"))
             .child(div().id("cf-apply").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
                 .bg(hsla_u(BRAND)).text_color(hsla_u(0xffffff)).border_1().border_color(pal.border).child("Apply")
                 .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
@@ -6136,12 +6151,20 @@ impl Docxy {
     fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
         let buf = self.sheet_cf_edit.clone().unwrap_or_default();
         let buf = if buf.trim().is_empty() { ">500".to_string() } else { buf };
-        if let Some((op, val)) = parse_cf_input(&buf) {
+        if buf.trim().eq_ignore_ascii_case("clear") {
+            self.sheet_snapshot();
+            if let Some(v) = self.active_sheet_mut() {
+                let s = v.active;
+                v.pkg.clear_conditional_formats(s);
+                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            }
+            self.mark_sheet_dirty();
+        } else if let Some((op, val, val2)) = parse_cf_input(&buf) {
             self.sheet_snapshot();
             if let Some(v) = self.active_sheet_mut() {
                 let s = v.active;
                 let (r0, c0, r1, c1) = v.range();
-                v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, None, cf_preset_dxf());
+                v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, val2.as_deref(), cf_preset_dxf());
                 v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
             }
             self.mark_sheet_dirty();
