@@ -291,6 +291,7 @@ enum SheetAct {
     DeleteCol,
     SortAsc,
     SortDesc,
+    AutoSum,
     Todo,
 }
 
@@ -1534,6 +1535,40 @@ impl Docxy {
         cx.notify();
     }
 
+    /// AutoSum (Σ): insert `=SUM(range)` in the selected cell, summing the run of
+    /// numeric cells directly above it (else to its left) — Excel's behaviour.
+    fn sheet_autosum(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::{cell_name, Cell, CellValue};
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let (r, c) = v.sel;
+            let sh = &v.pkg.workbook.sheets[s];
+            let is_num = |rr: u32, cc: u32| matches!(sh.cell(rr, cc).map(|x| &x.value), Some(CellValue::Number(_)));
+            let range = if r > 0 && is_num(r - 1, c) {
+                let mut top = r - 1;
+                while top > 0 && is_num(top - 1, c) {
+                    top -= 1;
+                }
+                Some(format!("{}:{}", cell_name(top, c), cell_name(r - 1, c)))
+            } else if c > 0 && is_num(r, c - 1) {
+                let mut left = c - 1;
+                while left > 0 && is_num(r, left - 1) {
+                    left -= 1;
+                }
+                Some(format!("{}:{}", cell_name(r, left), cell_name(r, c - 1)))
+            } else {
+                None
+            };
+            let Some(range) = range else { return };
+            let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
+            let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
+            v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Sort the used range by the selected column (header-aware). Rows move as
     /// whole units (all columns + styles); blanks sort last. Formula refs are not
     /// re-based, so this targets value tables (the common case).
@@ -2222,6 +2257,7 @@ impl Docxy {
             SheetAct::DeleteCol => self.sheet_structural(StructOp::DeleteCol, cx),
             SheetAct::SortAsc => self.sheet_sort(true, cx),
             SheetAct::SortDesc => self.sheet_sort(false, cx),
+            SheetAct::AutoSum => self.sheet_autosum(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -6166,7 +6202,7 @@ impl Docxy {
             // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
             .child(group("Editing", false, h_flex().h_full().items_center().gap_1()
                 .child(col(vec![
-                    self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::Todo, pal, cx),
+                    self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::AutoSum, pal, cx),
                     self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
                     self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
                 ]))
