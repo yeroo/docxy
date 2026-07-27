@@ -2594,6 +2594,7 @@ impl App {
             SortAsc => self.sort_region(true),
             SortDesc => self.sort_region(false),
             AutoSum => self.autosum(),
+            InsertChart(kind) => self.insert_chart(kind),
             AddSheet => self.open_prompt(PromptKind::AddSheet),
             RenameSheet => self.open_prompt(PromptKind::RenameSheet),
             Save => self.save(),
@@ -3149,6 +3150,78 @@ impl App {
             let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
             wb.sheets[s].set_cell(r, c, cell);
         });
+    }
+
+    /// Insert a chart from the selection: the first non-numeric column is the
+    /// category axis, each numeric column a series. Anchored just right of the
+    /// selection and wired via SheetPackage::add_chart (renders + persists).
+    fn insert_chart(&mut self, kind: &str) {
+        use gridcore::sheet::{CellValue, ChartData, ChartSeries};
+        let (r1, c1, r2, c2) = self.iter_selection();
+        let text_of = |v: Option<&CellValue>| -> String {
+            match v {
+                Some(CellValue::Text(s)) => s.clone(),
+                Some(CellValue::Number(n)) => n.to_string(),
+                Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.into(),
+                _ => String::new(),
+            }
+        };
+        let (categories, title, series) = {
+            let sh = self.sheet();
+            let mut cat_col: Option<u32> = None;
+            let mut num_cols: Vec<u32> = Vec::new();
+            for c in c1..=c2 {
+                let (mut nums, mut txts) = (0u32, 0u32);
+                for r in (r1 + 1)..=r2 {
+                    match sh.cell(r, c).map(|cl| &cl.value) {
+                        Some(CellValue::Number(_)) => nums += 1,
+                        Some(CellValue::Text(_)) => txts += 1,
+                        _ => {}
+                    }
+                }
+                if nums > 0 && nums >= txts {
+                    num_cols.push(c);
+                } else if cat_col.is_none() {
+                    cat_col = Some(c);
+                }
+            }
+            let cat_col = cat_col.unwrap_or(c1);
+            let data_rows: Vec<u32> = (r1 + 1..=r2).collect();
+            let categories: Vec<String> = data_rows.iter().map(|&r| text_of(sh.cell(r, cat_col).map(|cl| &cl.value))).collect();
+            let title = text_of(sh.cell(r1, cat_col).map(|cl| &cl.value));
+            let series: Vec<ChartSeries> = num_cols
+                .iter()
+                .map(|&c| {
+                    let name = text_of(sh.cell(r1, c).map(|cl| &cl.value));
+                    let values = data_rows
+                        .iter()
+                        .map(|&r| match sh.cell(r, c).map(|cl| &cl.value) {
+                            Some(CellValue::Number(n)) => *n,
+                            _ => 0.0,
+                        })
+                        .collect();
+                    ChartSeries { name, values }
+                })
+                .collect();
+            (categories, title, series)
+        };
+        if series.is_empty() {
+            self.status = Some("Insert chart: no numeric columns in the selection".into());
+            return;
+        }
+        let data = ChartData {
+            title: if title.is_empty() { "Chart".into() } else { title },
+            kind: kind.to_string(),
+            categories,
+            series,
+        };
+        let sheet = self.sheet;
+        self.pkg.add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data);
+        // add_chart rewrites package parts; existing undo snapshots no longer line up.
+        self.undo.clear();
+        self.redo.clear();
+        self.modified = true;
+        self.status = Some(format!("Inserted {kind} chart"));
     }
 
     /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
@@ -5901,6 +5974,46 @@ mod tests {
         let c = app.sheet().cell(3, 0).unwrap();
         assert_eq!(c.formula.as_deref(), Some("SUM(A1:A3)"));
         assert_eq!(c.value, CellValue::Number(12.0));
+    }
+
+    #[test]
+    fn insert_chart_from_selection() {
+        use gridcore::sheet::{Cell, DrawingKind};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            sh.set_cell(1, 0, Cell::text("A"));
+            sh.set_cell(1, 1, Cell::number(3.0));
+            sh.set_cell(2, 0, Cell::text("B"));
+            sh.set_cell(2, 1, Cell::number(5.0));
+        }
+        app.rebuild_engine();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 1)); // select A1:B3
+        app.insert_chart("column");
+
+        let drawings = &app.pkg.workbook.sheets[0].drawings;
+        assert_eq!(drawings.len(), 1);
+        match &drawings[0].kind {
+            DrawingKind::Chart(cd) => {
+                assert_eq!(cd.categories, vec!["A", "B"]);
+                assert_eq!(cd.series.len(), 1);
+                assert_eq!(cd.series[0].name, "Qty");
+                assert_eq!(cd.series[0].values, vec![3.0, 5.0]);
+            }
+            _ => panic!("expected a chart drawing"),
+        }
+        // Round-trips: reload sees the chart with the column orientation.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let dl = &re.workbook.sheets[0].drawings;
+        assert_eq!(dl.len(), 1);
+        match &dl[0].kind {
+            DrawingKind::Chart(cd) => assert_eq!(cd.kind, "column"),
+            _ => panic!("expected a chart drawing"),
+        }
     }
 
     #[test]

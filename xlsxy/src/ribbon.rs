@@ -31,6 +31,7 @@ pub enum Act {
     SortAsc,
     SortDesc,
     AutoSum,
+    InsertChart(&'static str),
     AddSheet,
     RenameSheet,
     Save,
@@ -239,6 +240,14 @@ fn insert_groups() -> Vec<Group> {
             rows: [
                 vec![btn("PivotTable", Todo("PivotTable"), "Insert a PivotTable")],
                 vec![btn("Function", Todo("Function"), "Insert a function")],
+            ],
+        },
+        Group {
+            title: "Charts",
+            width: 18,
+            rows: [
+                vec![btn("▊ Column", InsertChart("column"), "Insert a column chart from the selection")],
+                vec![btn("▬ Bar", InsertChart("bar"), "Insert a bar chart from the selection")],
             ],
         },
     ]
