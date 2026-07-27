@@ -301,6 +301,7 @@ enum SheetAct {
     CondFormat,
     DataValidation,
     Filter,
+    RemoveDuplicates,
     Todo,
 }
 
@@ -1789,6 +1790,37 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Remove duplicate rows in the contiguous region around the selection
+    /// (header-aware), keeping the first occurrence.
+    fn sheet_remove_duplicates(&mut self, cx: &mut Context<Self>) {
+        use gridcore::sheet::CellValue;
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            let sc = v.sel.1;
+            let cur_r = v.sel.0;
+            let (max_r, max_c) = v.extent();
+            let sh = &v.pkg.workbook.sheets[s];
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            gridcore::edit::dedupe_rows(&mut v.pkg.workbook, s, top, bottom, header);
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
     /// Sort the used range by the selected column (header-aware). Rows move as
     /// whole units (all columns + styles); blanks sort last. Formula refs are not
     /// re-based, so this targets value tables (the common case).
@@ -2495,6 +2527,7 @@ impl Docxy {
                 self.sheet_filter_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -6684,6 +6717,7 @@ impl Docxy {
                     self.sheet_rb(Some("sort"), "Sort A \u{2192} Z", SheetAct::SortAsc, pal, cx),
                     self.sheet_rb(Some("sort"), "Sort Z \u{2192} A", SheetAct::SortDesc, pal, cx),
                     self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
+                    self.sheet_rb(None, "Remove Dup", SheetAct::RemoveDuplicates, pal, cx),
                 ]))
                 .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
                 .into_any_element()))

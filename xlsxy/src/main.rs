@@ -2651,6 +2651,7 @@ impl App {
             CondFormat => self.open_prompt(PromptKind::CondFormat),
             DataValidation => self.open_prompt(PromptKind::DataValidation),
             Filter => self.open_prompt(PromptKind::Filter),
+            RemoveDuplicates => self.remove_duplicates(),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -3194,6 +3195,42 @@ impl App {
             let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
             wb.sheets[s].set_cell(r, c, cell);
         });
+    }
+
+    /// Remove duplicate rows in the contiguous region around the cursor
+    /// (header-aware), keeping the first occurrence.
+    fn remove_duplicates(&mut self) {
+        use gridcore::sheet::CellValue;
+        let s = self.sheet;
+        let sc = self.cur.1;
+        let cur_r = self.cur.0;
+        let (rc, cc) = self.sheet().used_size();
+        if rc == 0 || cc == 0 {
+            return;
+        }
+        let (max_r, max_c) = (rc - 1, cc - 1);
+        let (top, bottom, header) = {
+            let sh = self.sheet();
+            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+            if !used(cur_r) {
+                return;
+            }
+            let mut top = cur_r;
+            while top > 0 && used(top - 1) {
+                top -= 1;
+            }
+            let mut bottom = cur_r;
+            while bottom < max_r && used(bottom + 1) {
+                bottom += 1;
+            }
+            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+            (top, bottom, header)
+        };
+        let mut removed = 0;
+        self.structural(|wb| {
+            removed = gridcore::edit::dedupe_rows(wb, s, top, bottom, header);
+        });
+        self.status = Some(format!("Removed {removed} duplicate row{}", if removed == 1 { "" } else { "s" }));
     }
 
     /// AutoFilter: hide the rows of the current region whose cursor-column value
@@ -6222,6 +6259,28 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 1, 0).is_some());
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn remove_duplicates_dedupes_region() {
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(1, 0, Cell::text("A"));
+            sh.set_cell(2, 0, Cell::text("B"));
+            sh.set_cell(3, 0, Cell::text("A")); // duplicate of row 2
+        }
+        app.rebuild_engine();
+        app.cur = (1, 0);
+        app.anchor = None;
+        app.remove_duplicates();
+        let sh = app.sheet();
+        assert_eq!(sh.cell(1, 0).unwrap().value, CellValue::Text("A".into()));
+        assert_eq!(sh.cell(2, 0).unwrap().value, CellValue::Text("B".into()));
+        assert!(sh.cell(3, 0).map(|c| c.value.is_empty()).unwrap_or(true));
     }
 
     #[test]

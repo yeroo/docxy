@@ -49,6 +49,7 @@ pub enum Act {
     CondFormat,
     DataValidation,
     Filter,
+    RemoveDuplicates,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -258,10 +259,14 @@ fn insert_groups() -> Vec<Group> {
         },
         Group {
             title: "Data",
-            width: 14,
+            width: 20,
             rows: [
-                vec![btn("Validation", DataValidation, "Data validation (dropdown list)")],
-                vec![btn("Filter ▾", Filter, "AutoFilter the current column")],
+                vec![
+                    btn("Validation", DataValidation, "Data validation (dropdown list)"),
+                    Seg::Gap(" "),
+                    btn("Filter ▾", Filter, "AutoFilter the current column"),
+                ],
+                vec![btn("Remove Dup", RemoveDuplicates, "Remove duplicate rows in the region")],
             ],
         },
     ]

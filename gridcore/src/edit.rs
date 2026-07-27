@@ -155,6 +155,61 @@ pub fn delete_cols(wb: &mut Workbook, idx: usize, at: u32, count: u32) {
     );
 }
 
+/// Remove duplicate rows in `sheet` over the row range `r1..=r2` (keeping the
+/// first occurrence), comparing all used columns. When `has_header`, the first
+/// row is treated as a header and never removed. Rows shift up to fill the gaps;
+/// the freed tail rows are cleared. Returns how many rows were removed.
+pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header: bool) -> usize {
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    let (_, cols) = s.used_size();
+    if cols == 0 {
+        return 0;
+    }
+    let max_c = cols - 1;
+    let start = if has_header { r1 + 1 } else { r1 };
+    if r2 < start {
+        return 0;
+    }
+    let total = (r2 - start + 1) as usize;
+    let mut seen = std::collections::HashSet::new();
+    let mut uniques: Vec<Vec<Option<crate::sheet::Cell>>> = Vec::new();
+    for r in start..=r2 {
+        let row: Vec<Option<crate::sheet::Cell>> = (0..=max_c).map(|c| s.cell(r, c).cloned()).collect();
+        // Signature over the cells' values (formatting doesn't count for dedup).
+        let key: Vec<String> = row
+            .iter()
+            .map(|c| c.as_ref().map(|cl| format!("{:?}", cl.value)).unwrap_or_default())
+            .collect();
+        if seen.insert(key) {
+            uniques.push(row);
+        }
+    }
+    let removed = total - uniques.len();
+    if removed == 0 {
+        return 0;
+    }
+    let kept = uniques.len() as u32;
+    for (i, row) in uniques.into_iter().enumerate() {
+        let dest = start + i as u32;
+        for (c, cell) in row.into_iter().enumerate() {
+            match cell {
+                Some(cl) => s.set_cell(dest, c as u32, cl),
+                None => {
+                    s.cells.remove(&(dest, c as u32));
+                }
+            }
+        }
+    }
+    for r in (start + kept)..=r2 {
+        for c in 0..=max_c {
+            s.cells.remove(&(r, c));
+        }
+    }
+    removed
+}
+
 /// Rename a sheet and rewrite every reference to it (formulas on all sheets
 /// plus defined-name definitions), as Excel does.
 pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
@@ -366,6 +421,33 @@ mod tests {
             sheets: vec![sheet],
             ..Workbook::default()
         }
+    }
+
+    #[test]
+    fn dedupe_rows_keeps_first_and_shifts_up() {
+        // Header + rows: A, B, A(dup), C, B(dup) in cols A(name) & B(qty).
+        let mut w = wb(&[
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("A2", Cell::text("A")),
+            ("B2", Cell::number(1.0)),
+            ("A3", Cell::text("B")),
+            ("B3", Cell::number(2.0)),
+            ("A4", Cell::text("A")),
+            ("B4", Cell::number(1.0)), // dup of row 2
+            ("A5", Cell::text("C")),
+            ("B5", Cell::number(3.0)),
+            ("A6", Cell::text("B")),
+            ("B6", Cell::number(2.0)), // dup of row 3
+        ]);
+        let removed = dedupe_rows(&mut w, 0, 0, 5, true);
+        assert_eq!(removed, 2);
+        // Uniques A,B,C shifted to rows 2,3,4; rows 5,6 cleared.
+        assert_eq!(value_at(&w, "A2"), CellValue::Text("A".into()));
+        assert_eq!(value_at(&w, "A3"), CellValue::Text("B".into()));
+        assert_eq!(value_at(&w, "A4"), CellValue::Text("C".into()));
+        assert_eq!(value_at(&w, "A5"), CellValue::Empty);
+        assert_eq!(value_at(&w, "A6"), CellValue::Empty);
     }
 
     fn formula_at(wb: &Workbook, name: &str) -> String {
