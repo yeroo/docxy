@@ -267,14 +267,20 @@ jobs:
       - name: Compile installers
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $ver = "${{ steps.ver.outputs.version }}"
           $out = Join-Path $PWD 'out'
           New-Item -ItemType Directory -Force $out | Out-Null
           & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\suite\target\release" "/DIcoDir=$PWD\suite\docxy\assets" "/O$out" "packaging\inno\suite.iss"
+          if ($LASTEXITCODE -ne 0) { throw "suite.iss compile failed ($LASTEXITCODE)" }
           & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\target\release" "/O$out" "packaging\inno\tui.iss"
+          if ($LASTEXITCODE -ne 0) { throw "tui.iss compile failed ($LASTEXITCODE)" }
           & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\dist\office-shims" "/O$out" "packaging\inno\comshim.iss"
-          Get-ChildItem $out
+          if ($LASTEXITCODE -ne 0) { throw "comshim.iss compile failed ($LASTEXITCODE)" }
+          $exes = @(Get-ChildItem "$out\*.exe")
+          if ($exes.Count -ne 3) { throw "expected 3 installers, got $($exes.Count)" }
+          $exes | ForEach-Object { $_.Name }
 
       - name: Upload installers
         uses: actions/upload-artifact@v7

@@ -54,7 +54,7 @@ begin
     Result := True;
     exit;
   end;
-  { case-insensitive, boundary-aware check so we never add a duplicate }
+  // case-insensitive, boundary-aware check so we never add a duplicate
   Result := Pos(';' + Lowercase(Dir) + ';', ';' + Lowercase(OrigPath) + ';') = 0;
 end;
 
@@ -66,13 +66,13 @@ begin
   if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) then
     exit;
   NewPath := ';' + OrigPath + ';';
-  { strip ';{app};' (any case) then tidy the wrapping separators }
+  // strip the app dir (any case), then tidy the wrapping separators below
   repeat
     P := Pos(';' + Lowercase(Dir) + ';', Lowercase(NewPath));
     if P > 0 then
       Delete(NewPath, P, Length(Dir) + 1);
   until P = 0;
-  { drop the sentinel separators we added }
+  // drop the sentinel separators we added
   if (Length(NewPath) > 0) and (NewPath[1] = ';') then Delete(NewPath, 1, 1);
   if (Length(NewPath) > 0) and (NewPath[Length(NewPath)] = ';') then Delete(NewPath, Length(NewPath), 1);
   RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
