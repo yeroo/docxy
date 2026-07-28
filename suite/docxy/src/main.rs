@@ -8050,7 +8050,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
     let (_, c0, _, c1) = view.range();
-    let mut header = h_flex().child(div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
+    let mut header = h_flex().child(div().w(px(SHEET_GUT)).flex_shrink_0().h(px(SHEET_ROW_H)).bg(head_bg).border_r_1().border_b_1().border_color(gridline));
     // Frozen columns 0..fc pinned, then the scrollable window col0..=cend.
     for c in (0..fc).chain(col0..=cend) {
         let hl = c >= c0 && c <= c1;
@@ -8068,7 +8068,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
                 ent_h.update(cx, |this, cx| this.col_resize_start(c, x, cx));
             });
         header = header.child(
-            div().relative().w(px(col_px(sh.col_width(c)))).h(px(SHEET_ROW_H)).flex().items_center().justify_center()
+            div().relative().w(px(col_px(sh.col_width(c)))).flex_shrink_0().h(px(SHEET_ROW_H)).flex().items_center().justify_center()
                 .bg(if hl { brand } else { head_bg })
                 .border_r_1().border_b_1().border_color(if on_freeze { freeze_line } else { gridline })
                 .text_size(px(11.)).text_color(if hl { hsla_u(0xffffff) } else { head_fg })
@@ -8104,7 +8104,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
     // natural (min-content) height. items_stretch makes every cell fill it.
     let min_row_h = sh.row_height(r).map(|ht| (ht as f32) * (SHEET_ROW_H / 15.0)).unwrap_or(SHEET_ROW_H);
     let mut row = h_flex().items_stretch().min_h(px(min_row_h)).child(
-        div().w(px(SHEET_GUT)).flex().items_center().justify_center()
+        div().w(px(SHEET_GUT)).flex_shrink_0().flex().items_center().justify_center()
             .bg(if hl_row { brand } else { head_bg })
             .border_r_1().border_b_1().border_color(gridline)
             .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
@@ -8174,6 +8174,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         let mut cell = div()
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
             .w(px(cell_w))
+            .flex_shrink_0()
             .px(px(4.))
             .py(px(2.))
             .flex()
