@@ -8691,8 +8691,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             }
         });
         // (The auto-fill handle is drawn in the overlay layer — see sheet_el —
-        // so it can sit OUTSIDE the cell's bottom-right corner without being
-        // clipped by the cell's overflow.)
+        // so it can hang OUTSIDE the cell's bottom-right corner unclipped.)
         // Red corner marker for a commented cell (Excel's note indicator).
         if comment_cells.contains(&(r, c)) {
             cell = cell.relative().child(
@@ -9033,8 +9032,12 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // Approximate the pixel scroll offset from the list's logical position
     // (exact when rows are uniform height; a tall row scrolled above the anchor
     // shifts it slightly — acceptable for chart cards).
+    // The RENDERED row height: SHEET_ROW_H is the cell's min-height, but each row
+    // also carries a 1px bottom gridline, so a row occupies SHEET_ROW_H + 1 px.
+    // The overlay's y math must use this or the anchor drifts ~1px per row.
+    let row_h = SHEET_ROW_H + 1.0;
     let top = view.vlist.logical_scroll_top();
-    let scrolled_px = -(top.item_ix as f32 * SHEET_ROW_H + f32::from(top.offset_in_item));
+    let scrolled_px = -(top.item_ix as f32 * row_h + f32::from(top.offset_in_item));
     let col_x = |ac: u32| -> Option<f32> {
         if ac < fc {
             // Anchored inside the frozen region: always visible at its fixed x.
@@ -9050,9 +9053,9 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // slides under the header instead of drawing over it.
     let row_y = |ar: u32| -> f32 {
         if (ar as usize) < fr {
-            return ar as f32 * SHEET_ROW_H; // pinned frozen row
+            return ar as f32 * row_h; // pinned frozen row
         }
-        fr as f32 * SHEET_ROW_H + (ar - fr as u32) as f32 * SHEET_ROW_H + scrolled_px
+        fr as f32 * row_h + (ar - fr as u32) as f32 * row_h + scrolled_px
     };
     let loaded = sh.drawings.iter().filter_map(|d| match &d.kind {
         gridcore::sheet::DrawingKind::Chart(cd) => Some((d.from, cd)),
@@ -9147,24 +9150,23 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             }
         }
     }
-    // Auto-fill handle: an angular corner grip drawn in the overlay so it can
-    // straddle the selection's bottom-right corner (protruding OUTSIDE the cell)
-    // without being clipped by the cell's overflow. Dragging it fills.
+    // Auto-fill handle: an angular corner grip hanging just outside the
+    // selection's bottom-right corner (in the overlay so it isn't clipped or
+    // occluded by neighbouring cells). Cursor → crosshair, grip brightens on
+    // hover (Excel's fill handle + cursor).
     let fill_handle: Option<AnyElement> = if view.editing.is_some() {
         None
     } else {
         col_x(c1).map(|x| {
-            let cx = x + col_px(sh.col_width(c1)); // right edge of the corner column
-            let cy = row_y(r1) + SHEET_ROW_H; // bottom edge of the corner row (approx)
+            let hx = x + col_px(sh.col_width(c1)); // right edge of the corner column
+            let hy = row_y(r1) + row_h; // bottom edge of the corner row
             let ent_fill = ent.clone();
             div()
                 .absolute()
-                .left(px(cx - 7.0))
-                // Sit just below the corner (Excel's handle hangs slightly under
-                // the bottom edge), not centred on it.
-                .top(px(cy - 3.0))
-                .w(px(14.))
-                .h(px(14.))
+                .left(px(hx - 6.0))
+                .top(px(hy - 6.0))
+                .w(px(13.))
+                .h(px(13.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -9174,16 +9176,21 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                         ent_fill.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
                     }
                 })
-                // Darker-teal L with a thin white gap so it reads against the
-                // selection border.
                 .child(
                     div()
-                        .w(px(10.))
-                        .h(px(10.))
+                        .w(px(9.))
+                        .h(px(9.))
                         .border_b(px(1.))
                         .border_r(px(1.))
                         .border_color(hsla_u(0xffffff))
-                        .child(div().size_full().border_b(px(3.)).border_r(px(3.)).border_color(hsla_u(0x147A6F))),
+                        .child(
+                            div()
+                                .size_full()
+                                .border_b(px(3.))
+                                .border_r(px(3.))
+                                .border_color(hsla_u(0x147A6F))
+                                .hover(|d| d.border_color(hsla_u(BRAND))),
+                        ),
                 )
                 .into_any_element()
         })
