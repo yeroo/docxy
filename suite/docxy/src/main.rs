@@ -569,6 +569,9 @@ struct Docxy {
     ruler_x0: std::rc::Rc<std::cell::Cell<f32>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
+    // A spreadsheet drag-select is in progress (left button held over cells).
+    // The first dragged-over cell plants the anchor; later ones extend the range.
+    sheet_dragging: bool,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1144,6 +1147,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             selecting: false,
+            sheet_dragging: false,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1247,6 +1251,26 @@ impl Docxy {
             v.editing = None;
         }
         cx.notify();
+    }
+
+    /// End an in-progress auto-fill drag (implemented below); no-op otherwise.
+    fn sheet_fill_end(&mut self, _cx: &mut Context<Self>) {}
+
+    /// Left-drag over a cell: the first cell of the drag plants the anchor (and
+    /// commits any in-progress edit); subsequent cells extend the selection.
+    /// Driven by cell `on_mouse_move` while the left button is held (the
+    /// virtualized list swallows child `on_mouse_down`, so the drag start is
+    /// inferred from the first move rather than a press).
+    fn sheet_drag_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if !self.sheet_dragging {
+            self.sheet_dragging = true;
+            self.select_cell(row, col, cx); // anchor + sel at the drag origin
+        } else {
+            // Only re-render when the target cell actually changed.
+            if self.active_sheet().is_some_and(|v| v.sel != (row, col)) {
+                self.extend_to(row, col, cx);
+            }
+        }
     }
 
     /// Extend the selection to a cell (Shift+click), keeping the anchor.
@@ -8581,6 +8605,15 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                     this.focus.focus(window, cx);
                 });
             });
+        // Drag-select: while the left button is held, extend the selection to
+        // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
+        // one fires per cell crossed).
+        let ent_drag = ent.clone();
+        cell = cell.on_mouse_move(move |ev, _window, cx| {
+            if ev.pressed_button == Some(MouseButton::Left) {
+                ent_drag.update(cx, |this, cx| this.sheet_drag_over(r, c, cx));
+            }
+        });
         // Red corner marker for a commented cell (Excel's note indicator).
         if comment_cells.contains(&(r, c)) {
             cell = cell.relative().child(
@@ -9066,7 +9099,11 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             ent_move.update(cx, |this, cx| this.col_resize_move(x, cx));
         })
         .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
-            ent_up.update(cx, |this, cx| this.col_resize_end(cx));
+            ent_up.update(cx, |this, cx| {
+                this.col_resize_end(cx);
+                this.sheet_dragging = false; // end any drag-select
+                this.sheet_fill_end(cx); // commit an auto-fill drag, if any
+            });
         })
         .child(bar)
         .child(grid_area)
