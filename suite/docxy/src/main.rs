@@ -137,6 +137,8 @@ struct Session {
     active: usize,
     #[serde(default)]
     theme: ThemePref,
+    #[serde(default)]
+    ask_on_close: bool,
 }
 
 fn session_path() -> PathBuf {
@@ -489,6 +491,10 @@ struct Docxy {
     bs_new: bool,
     clip: Option<Clip>,
     theme_pref: ThemePref,
+    /// When set, closing the window with unsaved tabs shows a confirm dialog.
+    /// Off by default: work is hot-persisted and restored regardless, so closing
+    /// is normally silent.
+    ask_on_close: bool,
     applied: Option<ThemeMode>,
     // Find & replace bar (Ctrl+F). Self-managed text fields (no gpui-component
     // InputState entity) — keystrokes route here while `find_open`.
@@ -795,6 +801,34 @@ fn sample_doc() -> Loaded {
 }
 
 /// Load a `.xlsx` into a spreadsheet surface (or a placeholder + error status).
+/// Serialize a live spreadsheet view to `.xlsx` bytes, folding in any
+/// UI-authored charts via a throwaway package clone (so the live package isn't
+/// mutated / charts aren't re-added on each call). Shared by Save and hot-exit.
+fn sheet_bytes(v: &SheetView) -> Vec<u8> {
+    if v.charts.is_empty() {
+        gridcore::xlsx::save_xlsx(&v.pkg)
+    } else {
+        let mut pkg = v.pkg.clone();
+        for cv in &v.charts {
+            pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
+        }
+        gridcore::xlsx::save_xlsx(&pkg)
+    }
+}
+
+/// Build a tab by loading `path` from disk — an .xlsx spreadsheet or a
+/// Word/Markdown document, dispatched on the extension. Shared by the Open
+/// dialog and command-line file arguments.
+fn tab_from_path(path: &PathBuf) -> DocTab {
+    let title: SharedString = file_name(path).into();
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx")) {
+        let (surface, status) = sheet_from_path(path);
+        DocTab { kind: Kind::Xlsx, title, path: Some(path.clone()), surface, dirty: false, status, comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None }
+    } else {
+        doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
+    }
+}
+
 /// A fresh, empty single-sheet workbook surface — the "New spreadsheet" path
 /// (a real editable grid, not a placeholder).
 fn new_sheet_surface() -> Surface {
@@ -920,6 +954,14 @@ impl Docxy {
                     l.status = if t.dirty { "unsaved — restored".into() } else { "loaded".into() };
                     l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
                 }
+                // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
+                // keep the original on-disk `path` (so Save still targets the real
+                // file; a never-saved sheet keeps path=None → Save prompts Save As).
+                (Kind::Xlsx, Some(hp)) => {
+                    let (surface, _) = sheet_from_path(hp);
+                    let status = if t.dirty { "unsaved — restored" } else { "loaded" };
+                    DocTab { kind: Kind::Xlsx, title: t.title.clone().into(), path, surface, dirty: t.dirty, status: status.into(), comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None }
+                }
                 _ => {
                     let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
                     let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
@@ -934,7 +976,7 @@ impl Docxy {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
-        let this = Self::build(tabs, active, session.theme, cx);
+        let this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         this.persist();
         this
     }
@@ -942,7 +984,7 @@ impl Docxy {
     /// Assemble the app state from ready tabs, with everything else at defaults.
     /// The disk-free half of `new`, so tests can seed a known document without
     /// touching the user's session.
-    fn build(tabs: Vec<DocTab>, active: usize, theme_pref: ThemePref, cx: &mut Context<Self>) -> Self {
+    fn build(tabs: Vec<DocTab>, active: usize, theme_pref: ThemePref, ask_on_close: bool, cx: &mut Context<Self>) -> Self {
         Self {
             tabs,
             active,
@@ -954,6 +996,7 @@ impl Docxy {
             bs_new: false,
             clip: None,
             theme_pref,
+            ask_on_close,
             applied: None,
             find_open: false,
             find_query: String::new(),
@@ -1006,12 +1049,18 @@ impl Docxy {
             .enumerate()
             .map(|(i, t)| {
                 // Write the tab's live content to a sidecar so unsaved edits are
-                // held across a restart (closing never prompts to save).
-                let hot = if let Surface::Doc(ed) = &t.surface {
-                    let p = hd.join(format!("tab-{i}.docx"));
-                    std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref())).ok().map(|_| p.display().to_string())
-                } else {
-                    None
+                // held across a restart (closing never loses work). Docs → .docx,
+                // spreadsheets → .xlsx; both are restored in preference to `path`.
+                let hot = match &t.surface {
+                    Surface::Doc(ed) => {
+                        let p = hd.join(format!("tab-{i}.docx"));
+                        std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref())).ok().map(|_| p.display().to_string())
+                    }
+                    Surface::Sheet(v) => {
+                        let p = hd.join(format!("tab-{i}.xlsx"));
+                        std::fs::write(&p, sheet_bytes(v)).ok().map(|_| p.display().to_string())
+                    }
+                    Surface::Placeholder => None,
                 };
                 PersistTab {
                     kind: t.kind,
@@ -1023,7 +1072,7 @@ impl Docxy {
                 }
             })
             .collect();
-        let session = Session { tabs, active: self.active, theme: self.theme_pref };
+        let session = Session { tabs, active: self.active, theme: self.theme_pref, ask_on_close: self.ask_on_close };
         if let Ok(json) = serde_json::to_string_pretty(&session) {
             let p = session_path();
             if let Some(dir) = p.parent() {
@@ -3257,18 +3306,7 @@ impl Docxy {
         let (bytes, existing_path, title) = {
             let Some(tab) = self.tabs.get(self.active) else { return };
             let Surface::Sheet(v) = &tab.surface else { return };
-            // Persist UI-authored charts via a throwaway package clone (the live
-            // package isn't mutated, so charts aren't re-added on every save).
-            let bytes = if v.charts.is_empty() {
-                gridcore::xlsx::save_xlsx(&v.pkg)
-            } else {
-                let mut pkg = v.pkg.clone();
-                for cv in &v.charts {
-                    pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
-                }
-                gridcore::xlsx::save_xlsx(&pkg)
-            };
-            (bytes, tab.path.clone(), tab.title.to_string())
+            (sheet_bytes(v), tab.path.clone(), tab.title.to_string())
         };
         // A never-saved workbook asks where to go (Excel-style), instead of
         // silently dumping into the working directory.
@@ -3328,21 +3366,56 @@ impl Docxy {
             .add_filter("Excel workbook", &["xlsx"])
             .pick_file()
         {
-            let title: SharedString = file_name(&path).into();
-            let is_xlsx = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
-            let tab = if is_xlsx {
-                let (surface, status) = sheet_from_path(&path);
-                DocTab { kind: Kind::Xlsx, title, path: Some(path), surface, dirty: false, status, comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None }
-            } else {
-                doc_from_path(&path).into_tab(Kind::Docx, title, Some(path), false)
-            };
-            self.tabs.push(tab);
+            self.tabs.push(tab_from_path(&path));
             self.active = self.tabs.len() - 1;
         }
         self.backstage = false;
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
+    /// in Explorer) on top of the restored session. A file already open is
+    /// focused rather than duplicated; if that tab has unsaved changes, ask
+    /// before reloading it from disk.
+    fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut changed = false;
+        for path in paths {
+            let key = canon(&path);
+            match self.tabs.iter().position(|t| t.path.as_deref().map(canon) == Some(key.clone())) {
+                Some(i) => {
+                    if self.tabs[i].dirty {
+                        let reload = matches!(
+                            rfd::MessageDialog::new()
+                                .set_title("docxy")
+                                .set_description(format!(
+                                    "\"{}\" is already open with unsaved changes.\n\nReload it from disk? Your unsaved changes will be lost.\nChoose No to keep your current version.",
+                                    file_name(&path)
+                                ))
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show(),
+                            rfd::MessageDialogResult::Yes
+                        );
+                        if reload {
+                            self.tabs[i] = tab_from_path(&path);
+                        }
+                    }
+                    self.active = i;
+                }
+                None => {
+                    self.tabs.push(tab_from_path(&path));
+                    self.active = self.tabs.len() - 1;
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.backstage = false;
+            self.persist();
+            cx.notify();
+        }
     }
 
     /// Scroll the document so the caret's top-level block is in view (keyboard
@@ -7550,6 +7623,37 @@ impl Docxy {
                 .child(div().text_size(px(12.)).text_color(dim).child(cur_path))
                 .child(div().text_size(px(13.)).text_color(rgb(BRAND)).mt_4().child("Open"))
                 .child(v_flex().gap_0p5().children(recents))
+                .child(div().text_size(px(13.)).text_color(rgb(BRAND)).mt_4().child("Settings"))
+                .child(
+                    div()
+                        .id("bs-ask-toggle")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(
+                            div()
+                                .size(px(16.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if self.ask_on_close { hsla_u(BRAND) } else { dim })
+                                .bg(if self.ask_on_close { hsla_u(BRAND) } else { Hsla { a: 0., ..fg } })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(self.ask_on_close, |d| d.child(div().text_size(px(11.)).text_color(rgb(FILE_FG)).child("\u{2713}"))),
+                        )
+                        .child(div().text_color(fg).child("Ask before closing with unsaved changes"))
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.ask_on_close = !this.ask_on_close;
+                            this.persist();
+                            cx.notify();
+                        })),
+                )
+                .child(div().text_size(px(11.)).text_color(dim).child("Off: closing is silent — your work is always kept and reopened next launch."))
                 .into_any_element()
         };
 
@@ -8859,6 +8963,9 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
 }
 
 fn main() {
+    // Files passed on the command line (e.g. double-clicking a document in
+    // Explorer) — opened on top of the restored hot-exit session.
+    let cli_files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
@@ -8875,15 +8982,34 @@ fn main() {
             kind: WindowKind::Normal,
             ..Default::default()
         };
-        cx.open_window(options, |window, cx| {
+        let startup_files = cli_files.clone();
+        cx.open_window(options, move |window, cx| {
             let view = cx.new(|cx| Docxy::new(cx));
+            // Open any command-line files on top of the restored session.
+            if !startup_files.is_empty() {
+                view.update(cx, move |this, cx| this.open_args(startup_files, cx));
+            }
             // Hot-exit: capture the latest (possibly unsaved) content when the
-            // window is closed, so a restart restores exactly what was open — no
-            // save prompt.
+            // window is closed, so a restart restores exactly what was open. By
+            // default closing is silent; with "ask before closing" on, confirm
+            // when there are unsaved tabs.
             let on_close = view.clone();
             window.on_window_should_close(cx, move |_window, cx| {
-                on_close.update(cx, |this, _| this.persist());
-                true
+                on_close.update(cx, |this, _| {
+                    this.persist();
+                    if this.ask_on_close && this.tabs.iter().any(|t| t.dirty) {
+                        matches!(
+                            rfd::MessageDialog::new()
+                                .set_title("docxy")
+                                .set_description("You have unsaved changes.\n\nClose anyway? Your work is kept and reopened next launch.")
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show(),
+                            rfd::MessageDialogResult::Yes
+                        )
+                    } else {
+                        true
+                    }
+                })
             });
             cx.new(|cx| Root::new(view, window, cx))
         })
