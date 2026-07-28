@@ -28,3 +28,7 @@ serde_json = "1"
 dirs = "5"
 rfd = "0.15"
 rust-embed = "8"
+
+# Embeds the Windows app icon (assets/docxy.ico) into suite.exe via docxy.rc.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

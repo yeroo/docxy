@@ -1544,6 +1544,7 @@ version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
  "docxcore",
+ "embed-resource",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
