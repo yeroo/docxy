@@ -4748,3 +4748,11 @@ mod tests {
         assert!(wb_xml.contains("cacheId=\"2\""));
     }
 }
+
+#[cfg(test)]
+mod zz_v { use super::*;
+  #[test] #[ignore] fn e() {
+    let mut pkg=new_xlsx(); pkg.workbook.sheets[0].set_cell(0,0,crate::sheet::Cell::number(42.0));
+    let d=std::path::PathBuf::from(std::env::var("APPDATA").unwrap()).join("docxy").join("hot");
+    std::fs::create_dir_all(&d).unwrap(); std::fs::write(d.join("tab-0.xlsx"),save_xlsx(&pkg)).unwrap();
+  }}

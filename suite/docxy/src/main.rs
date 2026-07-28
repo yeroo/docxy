@@ -8696,14 +8696,14 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             let ent_fill = ent.clone();
             cell = cell.relative().child(
                 // A generous transparent grab zone in the bottom-right corner
-                // (easy to grab / not clipped by the cell), with the small
-                // visible square at its corner.
+                // (easy to grab / not clipped by the cell), holding an angular
+                // corner-bracket grip (thick teal bottom + right edges).
                 div()
                     .absolute()
                     .bottom(px(0.))
                     .right(px(0.))
-                    .w(px(12.))
-                    .h(px(12.))
+                    .w(px(14.))
+                    .h(px(14.))
                     .flex()
                     .items_end()
                     .justify_end()
@@ -8713,7 +8713,17 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                             ent_fill.update(cx, |this, cx| this.sheet_fill_start(cx));
                         }
                     })
-                    .child(div().w(px(8.)).h(px(8.)).bg(brand).border_1().border_color(hsla_u(0xffffff))),
+                    // A darker-teal L so it stands out against the lighter teal
+                    // selection border, with a thin white gap separating them.
+                    .child(
+                        div()
+                            .w(px(11.))
+                            .h(px(11.))
+                            .border_b(px(1.))
+                            .border_r(px(1.))
+                            .border_color(hsla_u(0xffffff))
+                            .child(div().size_full().border_b(px(3.)).border_r(px(3.)).border_color(hsla_u(0x147A6F))),
+                    ),
             );
         }
         // Red corner marker for a commented cell (Excel's note indicator).
