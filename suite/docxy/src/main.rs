@@ -8690,42 +8690,9 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 });
             }
         });
-        // Auto-fill handle: the small square at the selection's bottom-right
-        // corner. Dragging it fills the source pattern into the dragged region.
-        if !cell_editing && r == r1 && c == c1 {
-            let ent_fill = ent.clone();
-            cell = cell.relative().child(
-                // A generous transparent grab zone in the bottom-right corner
-                // (easy to grab / not clipped by the cell), holding an angular
-                // corner-bracket grip (thick teal bottom + right edges).
-                div()
-                    .absolute()
-                    .bottom(px(0.))
-                    .right(px(0.))
-                    .w(px(14.))
-                    .h(px(14.))
-                    .flex()
-                    .items_end()
-                    .justify_end()
-                    .cursor(CursorStyle::Crosshair)
-                    .on_mouse_move(move |ev, _w, cx| {
-                        if ev.pressed_button == Some(MouseButton::Left) {
-                            ent_fill.update(cx, |this, cx| this.sheet_fill_start(cx));
-                        }
-                    })
-                    // A darker-teal L so it stands out against the lighter teal
-                    // selection border, with a thin white gap separating them.
-                    .child(
-                        div()
-                            .w(px(11.))
-                            .h(px(11.))
-                            .border_b(px(1.))
-                            .border_r(px(1.))
-                            .border_color(hsla_u(0xffffff))
-                            .child(div().size_full().border_b(px(3.)).border_r(px(3.)).border_color(hsla_u(0x147A6F))),
-                    ),
-            );
-        }
+        // (The auto-fill handle is drawn in the overlay layer — see sheet_el —
+        // so it can sit OUTSIDE the cell's bottom-right corner without being
+        // clipped by the cell's overflow.)
         // Red corner marker for a commented cell (Excel's note indicator).
         if comment_cells.contains(&(r, c)) {
             cell = cell.relative().child(
@@ -9180,6 +9147,46 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             }
         }
     }
+    // Auto-fill handle: an angular corner grip drawn in the overlay so it can
+    // straddle the selection's bottom-right corner (protruding OUTSIDE the cell)
+    // without being clipped by the cell's overflow. Dragging it fills.
+    let fill_handle: Option<AnyElement> = if view.editing.is_some() {
+        None
+    } else {
+        col_x(c1).map(|x| {
+            let cx = x + col_px(sh.col_width(c1)); // right edge of the corner column
+            let cy = row_y(r1) + SHEET_ROW_H; // bottom edge of the corner row (approx)
+            let ent_fill = ent.clone();
+            div()
+                .absolute()
+                .left(px(cx - 7.0))
+                .top(px(cy - 7.0))
+                .w(px(14.))
+                .h(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::Crosshair)
+                .on_mouse_move(move |ev, _w, cx2| {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        ent_fill.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
+                    }
+                })
+                // Darker-teal L with a thin white gap so it reads against the
+                // selection border.
+                .child(
+                    div()
+                        .w(px(10.))
+                        .h(px(10.))
+                        .border_b(px(1.))
+                        .border_r(px(1.))
+                        .border_color(hsla_u(0xffffff))
+                        .child(div().size_full().border_b(px(3.)).border_r(px(3.)).border_color(hsla_u(0x147A6F))),
+                )
+                .into_any_element()
+        })
+    };
+
     // The clipping layer: spans the rows viewport (under the column header, above
     // the sheet-tab row). Non-interactive, so cell clicks pass through.
     let chart_layer = div()
@@ -9191,6 +9198,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .overflow_hidden()
         .children(cards)
         .children(note)
+        .children(fill_handle)
         .children(dv_overlay);
 
     let ent_move = ent.clone();
