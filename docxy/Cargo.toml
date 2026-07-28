@@ -25,7 +25,7 @@ docxcore = { version = "0.4.0", path = "../docxcore" }
 # live document from a sibling agwinterm pane.
 ctlcore = { version = "0.4.0", path = "../ctlcore" }
 # ratatui re-exports crossterm, so we don't depend on crossterm separately.
-ratatui = "0.29"
+ratatui = "0.30"
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
 backstagecore = { version = "0.1.0", path = "../backstagecore" }
 # OS clipboard bridge (copy/paste across applications).
