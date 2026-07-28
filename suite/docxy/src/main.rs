@@ -913,6 +913,48 @@ fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> A
         .into_any_element()
 }
 
+/// One click-to-caret text segment for the formula bar: a StyledText whose
+/// TextLayout maps the click position to a char index (`base_off` is the char
+/// offset of this segment within the whole buffer). Used for the before/after
+/// halves around the caret so clicking places the caret under the pointer.
+fn fx_segment(s: String, base_off: usize, ent: Entity<Docxy>) -> AnyElement {
+    let styled = StyledText::new(SharedString::from(s.clone()));
+    let layout = styled.layout().clone();
+    div()
+        .child(styled)
+        .text_size(px(12.))
+        .text_color(hsla_u(0x1a1a1a))
+        .cursor_text()
+        .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+            let byte = layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(s.len());
+            let idx = base_off + s[..byte].chars().count();
+            ent.update(cx, |this, cx| {
+                if let Some(v) = this.active_sheet_mut() {
+                    v.edit_caret = idx;
+                }
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+/// The formula bar's editing content: the text split before/after the caret
+/// (each a click-to-caret segment) with the caret bar between them.
+fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
+    let chars: Vec<char> = text.chars().collect();
+    let cc = caret.min(chars.len());
+    let before: String = chars[..cc].iter().collect();
+    let after: String = chars[cc..].iter().collect();
+    h_flex()
+        .flex_1()
+        .h_full()
+        .items_center()
+        .child(fx_segment(before, 0, ent.clone()))
+        .child(div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none())
+        .child(fx_segment(after, cc, ent.clone()))
+        .into_any_element()
+}
+
 /// A fresh, empty single-sheet workbook surface — the "New spreadsheet" path
 /// (a real editable grid, not a placeholder).
 fn new_sheet_surface() -> Surface {
@@ -8521,12 +8563,16 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         cell = cell
             .on_click(move |ev, window, cx| {
                 let shift = ev.modifiers().shift;
+                let dbl = ev.click_count() >= 2;
                 ent2.update(cx, |this, cx| {
                     if shift {
                         this.extend_to(r, c, cx)
                     } else {
                         this.select_cell(r, c, cx);
-                        if has_link {
+                        if dbl {
+                            // Double-click enters inline edit mode (Excel-style).
+                            this.sheet_begin_edit(None, cx);
+                        } else if has_link {
                             this.sheet_follow_hyperlink(r, c, cx);
                         }
                     }
@@ -8708,9 +8754,10 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .child(div().min_w(px(64.)).px_2().py(px(2.)).rounded_sm().bg(hsla_u(0xffffff)).border_1().border_color(gridline).text_size(px(12.)).text_color(hsla_u(0x333333)).child(SharedString::from(sel_ref)))
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
         .child(if let Some(buf) = &editing {
-            // Editing: show the live buffer with the caret (edits via the grid's
-            // keyboard focus — arrows/typing/backspace all land in this buffer).
-            div().flex_1().h_full().flex().items_center().child(edit_caret_row(buf, view.edit_caret, hsla_u(0x1a1a1a), hsla_u(BRAND))).into_any_element()
+            // Editing: the live buffer with the caret; clicking places the caret
+            // under the pointer (typing/arrows/backspace land in this buffer via
+            // the grid's keyboard focus).
+            fx_edit_row(buf, view.edit_caret, ent)
         } else {
             // Not editing: clicking the bar starts editing the selected cell.
             let ent_fx = ent.clone();
