@@ -190,8 +190,12 @@ struct SheetView {
     pivot_views: Vec<PivotDef>,
     /// Charts authored in the UI, rendered as floating cards over their sheet.
     charts: Vec<ChartView>,
-    /// Vertical scroll of the virtualized row list.
-    vscroll: UniformListScrollHandle,
+    /// Vertical scroll + item state of the virtualized row list. A gpui `list`
+    /// (not `uniform_list`) so rows can have individual heights (wrap text /
+    /// explicit row height). Its item count is re-synced to the visible-row
+    /// count each render; visible rows are re-measured every layout, so height
+    /// changes take effect without an explicit reset.
+    vlist: ListState,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
@@ -414,6 +418,14 @@ impl SheetView {
     /// Whether more than one cell is selected.
     fn has_range(&self) -> bool {
         self.sel != self.anchor
+    }
+    /// The index of `row` within the virtualized list (non-hidden scrollable
+    /// rows, past the frozen ones) — for `ListState::scroll_to_reveal_item`.
+    fn row_list_index(&self, row: u32) -> usize {
+        let sh = self.sheet();
+        let vis_before = (0..row).filter(|&r| !sh.row_hidden(r)).count();
+        let fr = (sh.freeze.0 as usize).min(30);
+        vis_before.saturating_sub(fr)
     }
     /// The used extent (max row, max col) over the active sheet's cells + merges.
     fn extent(&self) -> (u32, u32) {
@@ -789,7 +801,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vscroll: UniformListScrollHandle::new(), col0: 0, follow_sel: (0, 0) };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vlist: ListState::new(0, ListAlignment::Top, px(400.)), col0: 0, follow_sel: (0, 0) };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -1885,7 +1897,7 @@ impl Docxy {
             v.sel = next;
             v.anchor = next;
             // Bring the target row into view (columns follow via reconcile).
-            v.vscroll.scroll_to_item(next.0 as usize, ScrollStrategy::Center);
+            v.vlist.scroll_to_reveal_item(v.row_list_index(next.0));
         }
         cx.notify();
     }
@@ -2190,7 +2202,7 @@ impl Docxy {
                 if let Some((rr, cc)) = gridcore::sheet::parse_cell_name(&cellref.replace('$', "")) {
                     v.sel = (rr, cc);
                     v.anchor = (rr, cc);
-                    v.vscroll.scroll_to_item(rr as usize, ScrollStrategy::Center);
+                    v.vlist.scroll_to_reveal_item(v.row_list_index(rr));
                 }
             }
             cx.notify();
@@ -2277,9 +2289,8 @@ impl Docxy {
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.align = a, cx);
     }
-    /// Toggle Wrap Text on the selection. Excel auto-fits the row on open;
-    /// the desktop grid renders a single line (variable row heights need the
-    /// list migration off uniform_list).
+    /// Toggle Wrap Text on the selection. Wrapped cells render across multiple
+    /// lines and grow their row (the grid uses a variable-height gpui `list`).
     fn sheet_toggle_wrap(&mut self, cx: &mut Context<Self>) {
         let on = !self.active_xf().wrap;
         self.sheet_format(move |xf| xf.wrap = on, cx);
@@ -2406,7 +2417,7 @@ impl Docxy {
                 if !t.is_empty() && t.contains(&q) {
                     v.sel = (r, c);
                     v.anchor = (r, c);
-                    v.vscroll.scroll_to_item(r as usize, ScrollStrategy::Center);
+                    v.vlist.scroll_to_reveal_item(v.row_list_index(r));
                     break;
                 }
             }
@@ -8088,8 +8099,12 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
     let brand = hsla_u(BRAND);
     let range_tint = Hsla { a: 0.14, ..brand };
     let hl_row = r >= r0 && r <= r1;
-    let mut row = h_flex().child(
-        div().w(px(SHEET_GUT)).h(px(SHEET_ROW_H)).flex().items_center().justify_center()
+    // Variable row height: an explicit <row ht> sets a floor (points → px at the
+    // app's 15pt≈21px scale); wrapped cells grow the row past it via their
+    // natural (min-content) height. items_stretch makes every cell fill it.
+    let min_row_h = sh.row_height(r).map(|ht| (ht as f32) * (SHEET_ROW_H / 15.0)).unwrap_or(SHEET_ROW_H);
+    let mut row = h_flex().items_stretch().min_h(px(min_row_h)).child(
+        div().w(px(SHEET_GUT)).flex().items_center().justify_center()
             .bg(if hl_row { brand } else { head_bg })
             .border_r_1().border_b_1().border_color(gridline)
             .text_size(px(11.)).text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
@@ -8155,14 +8170,16 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         let color = color_rgb.map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32)).unwrap_or(rgb(0x1a1a1a));
         let bg = if let Some((r, g, b)) = fill { rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into() } else { hsla_u(0xffffff) };
         let cell_border = xf.as_ref().is_some_and(|x| x.border);
+        let wrap = xf.as_ref().is_some_and(|x| x.wrap);
         let mut cell = div()
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
             .w(px(cell_w))
-            .h(px(SHEET_ROW_H))
             .px(px(4.))
+            .py(px(2.))
             .flex()
-            .items_center()
-            .overflow_hidden()
+            // Wrapped cells top-align and let text flow onto multiple lines
+            // (growing the row); plain cells stay single-line and clip.
+            .map(|d| if wrap { d.items_start() } else { d.items_center().overflow_hidden() })
             .bg(if cell_editing { hsla_u(0xffffff) } else { bg })
             .border_r_1()
             .border_b_1()
@@ -8192,6 +8209,9 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                         .when(is_link, |d| d.underline())
                         .when(bold, |d| d.font_weight(FontWeight::BOLD))
                         .when(italic, |d| d.italic())
+                        // Wrap onto multiple lines (bounded to the cell width so
+                        // it actually breaks), or clip to one line.
+                        .map(|d| if wrap { d.whitespace_normal().w_full() } else { d.whitespace_nowrap() })
                         .child(SharedString::from(text)),
                 );
             }
@@ -8417,19 +8437,20 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     }
     let ent_list = ent.clone();
     let vis_list = visible.clone();
-    let list = uniform_list(
-        "sheet-rows",
-        visible.len().saturating_sub(fr),
-        cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
-            let Some(v) = this.active_sheet() else { return Vec::new() };
-            range.map(|i| {
-                let row = vis_list.get(fr + i).copied().unwrap_or(0);
-                sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list)
-            }).collect::<Vec<_>>()
-        }),
-    )
-    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-    .track_scroll(&view.vscroll)
+    // Keep the list's item count in sync with the scrollable-row count. Only a
+    // count change forces a reset (which drops scroll); height changes to
+    // visible rows are re-measured automatically each layout.
+    let scrollable = visible.len().saturating_sub(fr);
+    if view.vlist.item_count() != scrollable {
+        view.vlist.reset(scrollable);
+    }
+    let list = list(view.vlist.clone(), move |ix, _w, app| {
+        let this = ent_list.read(app);
+        let Some(v) = this.active_sheet() else { return div().into_any_element() };
+        let row = vis_list.get(fr + ix).copied().unwrap_or(0);
+        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list)
+    })
+    .with_sizing_behavior(ListSizingBehavior::Auto)
     .flex_1()
     .min_h(px(0.));
     let grid_area = v_flex()
@@ -8534,7 +8555,11 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // (Excel behaviour) instead of being pinned to the viewport corner.
     // x: gutter + frozen columns + the anchor column's distance from col0.
     // y: formula bar + column header + frozen rows + (anchor row - scrolled rows).
-    let scrolled_px = f32::from(view.vscroll.0.borrow().base_handle.offset().y);
+    // Approximate the pixel scroll offset from the list's logical position
+    // (exact when rows are uniform height; a tall row scrolled above the anchor
+    // shifts it slightly — acceptable for chart cards).
+    let top = view.vlist.logical_scroll_top();
+    let scrolled_px = -(top.item_ix as f32 * SHEET_ROW_H + f32::from(top.offset_in_item));
     let col_x = |ac: u32| -> Option<f32> {
         if ac < fc {
             // Anchored inside the frozen region: always visible at its fixed x.
@@ -8694,7 +8719,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 .right_0()
                 .bottom(px(26.))
                 .w(px(12.))
-                .child(gpui_component::scroll::Scrollbar::vertical(&view.vscroll)),
+                .child(gpui_component::scroll::Scrollbar::vertical(&view.vlist)),
         )
         // (The horizontal scrollbar now lives inside the sheet-tab row, Excel-style.)
         .child(tabs)
