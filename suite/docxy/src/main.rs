@@ -179,6 +179,9 @@ struct SheetView {
     /// When `Some`, the selected cell is being edited and this is the in-progress
     /// input buffer (a leading `=` marks a formula).
     editing: Option<String>,
+    /// Caret position within `editing`, as a char index (0..=len). Only
+    /// meaningful while `editing` is `Some`.
+    edit_caret: usize,
     /// The recalc engine, indexed over the workbook's formulas, so an edit
     /// re-evaluates only the affected cells.
     engine: gridcore::engine::Engine,
@@ -391,6 +394,41 @@ impl SheetView {
             None => String::new(),
         }
     }
+
+    // ---- in-cell edit caret (char-indexed into `editing`) ----
+    /// Number of chars in the edit buffer.
+    fn edit_len(&self) -> usize {
+        self.editing.as_deref().map(|s| s.chars().count()).unwrap_or(0)
+    }
+    /// Put the caret at the end of the current buffer (called when editing starts).
+    fn edit_caret_to_end(&mut self) {
+        self.edit_caret = self.edit_len();
+    }
+    /// Insert text at the caret, advancing it.
+    fn edit_insert(&mut self, s: &str) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf_insert(buf, &mut self.edit_caret, s);
+        }
+    }
+    /// Delete the char before the caret (Backspace).
+    fn edit_backspace(&mut self) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf_backspace(buf, &mut self.edit_caret);
+        }
+    }
+    /// Delete the char at the caret (Delete).
+    fn edit_delete(&mut self) {
+        let caret = self.edit_caret;
+        if let Some(buf) = self.editing.as_mut() {
+            buf_delete(buf, caret);
+        }
+    }
+    /// Move the caret by `delta` chars, clamped to the buffer.
+    fn edit_move(&mut self, delta: i32) {
+        let n = self.edit_len() as i32;
+        self.edit_caret = (self.edit_caret as i32 + delta).clamp(0, n) as usize;
+    }
+
     /// The display text for a cell (number-formatted via its style).
     fn cell_text(&self, row: u32, col: u32) -> String {
         let sh = self.sheet();
@@ -829,6 +867,52 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
     }
 }
 
+/// Char index → byte offset in `s` (clamped to the string length).
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+// Pure text-buffer + caret edits (char-indexed). Kept as free functions so they
+// are unit-testable without constructing a gpui-heavy SheetView.
+fn buf_insert(text: &mut String, caret: &mut usize, s: &str) {
+    let at = char_to_byte(text, *caret);
+    text.insert_str(at, s);
+    *caret += s.chars().count();
+}
+fn buf_backspace(text: &mut String, caret: &mut usize) {
+    if *caret == 0 {
+        return;
+    }
+    let start = char_to_byte(text, *caret - 1);
+    let end = char_to_byte(text, *caret);
+    text.replace_range(start..end, "");
+    *caret -= 1;
+}
+fn buf_delete(text: &mut String, caret: usize) {
+    if caret >= text.chars().count() {
+        return;
+    }
+    let start = char_to_byte(text, caret);
+    let end = char_to_byte(text, caret + 1);
+    text.replace_range(start..end, "");
+}
+
+/// Render an in-progress edit buffer with a blinking-style caret bar at `caret`
+/// (a char index): the text before the caret, the caret, then the text after.
+/// Shared by the in-cell editor and the formula bar.
+fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> AnyElement {
+    let chars: Vec<char> = text.chars().collect();
+    let c = caret.min(chars.len());
+    let before: String = chars[..c].iter().collect();
+    let after: String = chars[c..].iter().collect();
+    h_flex()
+        .items_center()
+        .child(div().text_size(px(12.)).text_color(color).child(SharedString::from(before)))
+        .child(div().w(px(1.5)).h(px(13.)).bg(caret_color).flex_none())
+        .child(div().text_size(px(12.)).text_color(color).child(SharedString::from(after)))
+        .into_any_element()
+}
+
 /// A fresh, empty single-sheet workbook surface — the "New spreadsheet" path
 /// (a real editable grid, not a placeholder).
 fn new_sheet_surface() -> Surface {
@@ -840,6 +924,7 @@ fn new_sheet_surface() -> Surface {
         sel: (0, 0),
         anchor: (0, 0),
         editing: None,
+        edit_caret: 0,
         engine,
         undo: vec![],
         redo: vec![],
@@ -858,7 +943,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
             Ok(pkg) => {
                 let n = pkg.workbook.sheets.len();
                 let engine = gridcore::engine::Engine::new(&pkg.workbook);
-                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vlist: ListState::new(0, ListAlignment::Top, px(400.)), col0: 0, follow_sel: (0, 0) };
+                let view = SheetView { pkg, active: 0, sel: (0, 0), anchor: (0, 0), editing: None, edit_caret: 0, engine, undo: vec![], redo: vec![], col_drag: None, pivot_views: vec![], charts: vec![], vlist: ListState::new(0, ListAlignment::Top, px(400.)), col0: 0, follow_sel: (0, 0) };
                 (Surface::Sheet(view), format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into())
             }
             Err(e) => (Surface::Placeholder, format!("xlsx load error: {e:?}").into()),
@@ -1331,6 +1416,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
+            v.edit_caret_to_end();
         }
         cx.notify();
     }
@@ -2988,9 +3074,7 @@ impl Docxy {
             "backspace" => {
                 if editing {
                     if let Some(v) = self.active_sheet_mut() {
-                        if let Some(b) = v.editing.as_mut() {
-                            b.pop();
-                        }
+                        v.edit_backspace();
                     }
                     cx.notify();
                 } else {
@@ -2998,10 +3082,43 @@ impl Docxy {
                 }
             }
             "delete" => {
-                if !editing {
+                if editing {
+                    if let Some(v) = self.active_sheet_mut() {
+                        v.edit_delete();
+                    }
+                    cx.notify();
+                } else {
                     self.sheet_clear(cx);
                 }
             }
+            // While editing, Left/Right/Home/End move the caret WITHIN the cell
+            // (Excel's edit mode) instead of switching cells.
+            "left" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_move(-1);
+                }
+                cx.notify();
+            }
+            "right" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_move(1);
+                }
+                cx.notify();
+            }
+            "home" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_caret = 0;
+                }
+                cx.notify();
+            }
+            "end" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_caret_to_end();
+                }
+                cx.notify();
+            }
+            // Not editing: arrows move / extend the selection. Up/Down while
+            // editing still commit and move (single-line cells).
             "left" if shift => self.sheet_extend(0, -1, editing, cx),
             "right" if shift => self.sheet_extend(0, 1, editing, cx),
             "up" if shift => self.sheet_extend(-1, 0, editing, cx),
@@ -3015,11 +3132,13 @@ impl Docxy {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
                         let protected = self.sheet_protected();
                         if let Some(v) = self.active_sheet_mut() {
-                            match v.editing.as_mut() {
-                                Some(buf) => buf.push_str(c),
-                                // Don't start a fresh edit on a protected sheet.
-                                None if !protected => v.editing = Some(c.to_string()),
-                                None => {}
+                            if v.editing.is_some() {
+                                v.edit_insert(c);
+                            } else if !protected {
+                                // Start a fresh edit with the typed char.
+                                v.editing = Some(String::new());
+                                v.edit_caret = 0;
+                                v.edit_insert(c);
                             }
                         }
                         cx.notify();
@@ -8373,8 +8492,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         if cell_editing {
             cell = cell
                 .justify_start()
-                .child(div().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(editing.clone().unwrap_or_default())))
-                .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(brand));
+                .child(edit_caret_row(&editing.clone().unwrap_or_default(), view.edit_caret, hsla_u(0x1a1a1a), brand));
         } else {
             cell = match halign {
                 1 => cell.justify_center(),
@@ -8589,7 +8707,31 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .border_color(gridline)
         .child(div().min_w(px(64.)).px_2().py(px(2.)).rounded_sm().bg(hsla_u(0xffffff)).border_1().border_color(gridline).text_size(px(12.)).text_color(hsla_u(0x333333)).child(SharedString::from(sel_ref)))
         .child(div().text_size(px(13.)).text_color(hsla_u(0x888888)).child("fx"))
-        .child(div().flex_1().text_size(px(12.)).text_color(hsla_u(0x1a1a1a)).child(SharedString::from(sel_content)));
+        .child(if let Some(buf) = &editing {
+            // Editing: show the live buffer with the caret (edits via the grid's
+            // keyboard focus — arrows/typing/backspace all land in this buffer).
+            div().flex_1().h_full().flex().items_center().child(edit_caret_row(buf, view.edit_caret, hsla_u(0x1a1a1a), hsla_u(BRAND))).into_any_element()
+        } else {
+            // Not editing: clicking the bar starts editing the selected cell.
+            let ent_fx = ent.clone();
+            div()
+                .id("fx-edit")
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .cursor_text()
+                .text_size(px(12.))
+                .text_color(hsla_u(0x1a1a1a))
+                .child(SharedString::from(sel_content))
+                .on_click(move |_ev, window, cx| {
+                    ent_fx.update(cx, |this, cx| {
+                        this.sheet_begin_edit(None, cx);
+                        this.focus.focus(window, cx);
+                    });
+                })
+                .into_any_element()
+        });
 
     // ---- frozen column header + frozen rows + vertically-virtualized rows ----
     // The rows go straight into a `uniform_list` (no horizontal-scroll wrapper —
@@ -9077,5 +9219,57 @@ mod grid_geom_tests {
         assert_eq!(row_height_px(None, 21.0), 21.0); // default
         assert_eq!(row_height_px(Some(15.0), 21.0), 21.0); // 15pt == the base
         assert_eq!(row_height_px(Some(30.0), 21.0), 42.0); // double height
+    }
+}
+
+#[cfg(test)]
+mod edit_caret_tests {
+    use super::{buf_backspace, buf_delete, buf_insert, char_to_byte};
+
+    #[test]
+    fn insert_backspace_delete_at_caret() {
+        let mut t = String::new();
+        let mut c = 0usize;
+        for s in ["h", "e", "llo"] {
+            buf_insert(&mut t, &mut c, s);
+        }
+        assert_eq!(t, "hello");
+        assert_eq!(c, 5);
+
+        // Insert in the MIDDLE (the whole point — not just append).
+        c = 3; // "hel|lo"
+        buf_insert(&mut t, &mut c, "X"); // "helX|lo"
+        assert_eq!(t, "helXlo");
+        assert_eq!(c, 4);
+
+        // Backspace removes the char BEFORE the caret.
+        buf_backspace(&mut t, &mut c); // "hel|lo"
+        assert_eq!(t, "hello");
+        assert_eq!(c, 3);
+
+        // Delete removes the char AT the caret.
+        buf_delete(&mut t, c); // "hel|o"
+        assert_eq!(t, "helo");
+
+        // Backspace at position 0 is a no-op.
+        let mut c0 = 0usize;
+        buf_backspace(&mut t, &mut c0);
+        assert_eq!(t, "helo");
+        assert_eq!(c0, 0);
+    }
+
+    #[test]
+    fn char_to_byte_is_utf8_aware() {
+        // "café" — é is 2 bytes; char index 4 maps past the 'é'.
+        let s = "café";
+        assert_eq!(char_to_byte(s, 0), 0);
+        assert_eq!(char_to_byte(s, 3), 3); // start of é
+        assert_eq!(char_to_byte(s, 4), 5); // end of string (é took 2 bytes)
+        assert_eq!(char_to_byte(s, 99), s.len()); // clamps
+        // Inserting after a multibyte char lands on a char boundary (no panic).
+        let mut t = s.to_string();
+        let mut c = 4usize;
+        buf_insert(&mut t, &mut c, "!");
+        assert_eq!(t, "café!");
     }
 }
