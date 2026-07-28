@@ -1094,23 +1094,11 @@ impl Docxy {
             if sc < fc {
                 return; // a frozen column is always visible
             }
-            if sc < v.col0 {
-                v.col0 = sc.max(fc);
-                return;
-            }
             // Available width for the scrollable region excludes the pinned columns.
             let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
             let avail = (avail_w - frozen_w).max(80.0);
-            // Shrink the window from the left until [col0..=sc] fits (sc at the
-            // right edge), so moving right past the last visible column scrolls.
-            let widths: Vec<f32> = (fc..=sc).map(|c| col_px(v.sheet().col_width(c))).collect();
-            let mut start = v.col0;
-            let mut sum: f32 = (start..=sc).map(|c| widths[(c - fc) as usize]).sum();
-            while sum > avail && start < sc {
-                sum -= widths[(start - fc) as usize];
-                start += 1;
-            }
-            v.col0 = start.max(fc);
+            let col0 = v.col0;
+            v.col0 = scroll_col0_for_sel(|c| col_px(v.sheet().col_width(c)), col0, fc, sc, avail);
         }
     }
 
@@ -8017,6 +8005,54 @@ fn col_px(units: f64) -> f32 {
     ((units * 7.0 + 6.0) as f32).clamp(28.0, 320.0)
 }
 
+// ---- grid geometry (pure; unit-tested in `grid_geom_tests`) --------------
+// These mirror the exact math the row/header renderers and the h-scroll
+// reconciler use, extracted so they can be regression-tested without a gpui
+// window (the gpui TestAppContext render path is infeasible here). The
+// renderers below CALL these — they are the single source of truth, so a test
+// failure means the on-screen grid geometry changed.
+
+/// The last column that renders (inclusive) in the scrollable window: starting
+/// at `col0`, keep adding columns until their pixel widths exceed `avail` (the
+/// overflowing column is still included, so it clips at the edge like Excel),
+/// bounded by `maxcol`. Always returns at least `col0`.
+fn last_visible_col(col_w_px: impl Fn(u32) -> f32, col0: u32, avail: f32, maxcol: u32) -> u32 {
+    let mut cend = col0;
+    let mut wsum = 0.0f32;
+    loop {
+        wsum += col_w_px(cend);
+        if (wsum > avail && cend > col0) || cend >= maxcol {
+            break;
+        }
+        cend += 1;
+    }
+    cend
+}
+
+/// The new leftmost-visible column so the selected column `sc` stays on screen:
+/// if it's left of the window, snap to it; if right, shrink the window from the
+/// left until `[col0..=sc]` fits `avail`. `fc` = frozen column count (never
+/// scrolled past). Caller handles `sc < fc` (a frozen column is always visible).
+fn scroll_col0_for_sel(col_w_px: impl Fn(u32) -> f32, col0: u32, fc: u32, sc: u32, avail: f32) -> u32 {
+    if sc < col0 {
+        return sc.max(fc);
+    }
+    let mut start = col0;
+    let mut sum: f32 = (start..=sc).map(&col_w_px).sum();
+    while sum > avail && start < sc {
+        sum -= col_w_px(start);
+        start += 1;
+    }
+    start.max(fc)
+}
+
+/// A row's pixel height: an explicit `<row ht>` (points) scaled at the app's
+/// 15pt≈`base`px, else `base`. Wrapped cells grow the row beyond this at layout
+/// time; this is the min-height floor.
+fn row_height_px(explicit_pt: Option<f64>, base: f32) -> f32 {
+    explicit_pt.map(|ht| (ht as f32) * (base / 15.0)).unwrap_or(base)
+}
+
 /// Split a ribbon button label into at most two lines at a word boundary, so a
 /// large button wraps like Word/Excel ("Conditional" / "Formatting") instead of
 /// breaking mid-word. Short or single-word labels stay on one line.
@@ -8102,7 +8138,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
     // Variable row height: an explicit <row ht> sets a floor (points → px at the
     // app's 15pt≈21px scale); wrapped cells grow the row past it via their
     // natural (min-content) height. items_stretch makes every cell fill it.
-    let min_row_h = sh.row_height(r).map(|ht| (ht as f32) * (SHEET_ROW_H / 15.0)).unwrap_or(SHEET_ROW_H);
+    let min_row_h = row_height_px(sh.row_height(r), SHEET_ROW_H);
     let mut row = h_flex().items_stretch().min_h(px(min_row_h)).child(
         div().w(px(SHEET_GUT)).flex_shrink_0().flex().items_center().justify_center()
             .bg(if hl_row { brand } else { head_bg })
@@ -8376,15 +8412,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     // Column virtualization by offset — the counterpart to the row uniform_list.
     let col0 = view.col0.max(fc).min(255);
     let avail = (grid_w - SHEET_GUT - frozen_w).max(80.0);
-    let mut cend = col0;
-    let mut wsum = 0.0f32;
-    loop {
-        wsum += col_px(sh.col_width(cend));
-        if (wsum > avail && cend > col0) || cend >= 255 {
-            break;
-        }
-        cend += 1;
-    }
+    let cend = last_visible_col(|c| col_px(sh.col_width(c)), col0, avail, 255);
     // Total rows to virtualize over: the used range plus generous headroom.
     let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
@@ -8820,4 +8848,67 @@ fn main() {
         })
         .expect("failed to open docxy window");
     });
+}
+
+#[cfg(test)]
+mod grid_geom_tests {
+    use super::{col_px, last_visible_col, row_height_px, scroll_col0_for_sel};
+
+    // A uniform-width sheet: every column is `w` px.
+    fn uniform(w: f32) -> impl Fn(u32) -> f32 {
+        move |_c| w
+    }
+
+    #[test]
+    fn col_px_scales_and_clamps() {
+        assert_eq!(col_px(10.0), 76.0); // 10*7+6
+        assert_eq!(col_px(0.5), 28.0); // clamped up to the 28 floor
+        assert_eq!(col_px(1000.0), 320.0); // clamped to the 320 ceiling
+    }
+
+    #[test]
+    fn last_visible_col_fills_and_overshoots_by_one() {
+        // 100px cols, 350px available: cols 0,1,2 = 300 fit, col 3 overshoots to
+        // 400 > 350 and is the last (included, clips at edge).
+        assert_eq!(last_visible_col(uniform(100.0), 0, 350.0, 255), 3);
+        // Exactly fits three: still stops one past when the 4th overflows.
+        assert_eq!(last_visible_col(uniform(100.0), 0, 300.0, 255), 3);
+        // The anchor column always renders (window never collapses below col0),
+        // even with no room.
+        assert!(last_visible_col(uniform(100.0), 5, 0.0, 255) >= 5);
+        // Respects the max-column bound.
+        assert_eq!(last_visible_col(uniform(10.0), 250, 100.0, 255), 255);
+    }
+
+    #[test]
+    fn scroll_col0_keeps_selection_visible() {
+        let w = uniform(100.0); // 4 cols fit in 400px
+        // Selection left of the window snaps col0 to it (but not past frozen).
+        assert_eq!(scroll_col0_for_sel(&w, 5, 1, 3, 400.0), 3);
+        assert_eq!(scroll_col0_for_sel(&w, 5, 4, 2, 400.0), 4); // clamps to fc
+        // Selection already inside the window: col0 unchanged.
+        assert_eq!(scroll_col0_for_sel(&w, 2, 0, 4, 400.0), 2); // cols 2..=4 = 300 ≤ 400
+        // Selection past the right edge: window shrinks from the left so sc fits.
+        // col0=0, sc=6 → need [start..=6] ≤ 400px (4 cols) → start=3.
+        assert_eq!(scroll_col0_for_sel(&w, 0, 0, 6, 400.0), 3);
+    }
+
+    #[test]
+    fn scroll_col0_then_last_visible_makes_selection_visible() {
+        // The end-to-end invariant that guards arrow-key navigation: after
+        // reconcile, the selected column lies within [col0, cend].
+        let w = uniform(90.0);
+        for sc in 0..40u32 {
+            let col0 = scroll_col0_for_sel(&w, 0, 0, sc, 500.0);
+            let cend = last_visible_col(&w, col0, 500.0, 255);
+            assert!(col0 <= sc && sc <= cend, "sc={sc} not in [{col0},{cend}]");
+        }
+    }
+
+    #[test]
+    fn row_height_px_maps_points_and_defaults() {
+        assert_eq!(row_height_px(None, 21.0), 21.0); // default
+        assert_eq!(row_height_px(Some(15.0), 21.0), 21.0); // 15pt == the base
+        assert_eq!(row_height_px(Some(30.0), 21.0), 42.0); // double height
+    }
 }
