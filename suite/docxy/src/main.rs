@@ -795,6 +795,29 @@ fn sample_doc() -> Loaded {
 }
 
 /// Load a `.xlsx` into a spreadsheet surface (or a placeholder + error status).
+/// A fresh, empty single-sheet workbook surface — the "New spreadsheet" path
+/// (a real editable grid, not a placeholder).
+fn new_sheet_surface() -> Surface {
+    let pkg = gridcore::xlsx::new_xlsx();
+    let engine = gridcore::engine::Engine::new(&pkg.workbook);
+    Surface::Sheet(SheetView {
+        pkg,
+        active: 0,
+        sel: (0, 0),
+        anchor: (0, 0),
+        editing: None,
+        engine,
+        undo: vec![],
+        redo: vec![],
+        col_drag: None,
+        pivot_views: vec![],
+        charts: vec![],
+        vlist: ListState::new(0, ListAlignment::Top, px(400.)),
+        col0: 0,
+        follow_sel: (0, 0),
+    })
+}
+
 fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
     match std::fs::read(path) {
         Ok(bytes) => match gridcore::xlsx::load_xlsx(&bytes) {
@@ -824,7 +847,7 @@ fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, 
                 let (surface, status) = sheet_from_path(p);
                 (surface, vec![], vec![], None, status)
             }
-            None => (Surface::Placeholder, vec![], vec![], None, "new workbook — open an .xlsx".into()),
+            None => (new_sheet_surface(), vec![], vec![], None, "new spreadsheet".into()),
         },
         _ => (Surface::Placeholder, vec![], vec![], None, "".into()),
     }
@@ -1025,7 +1048,7 @@ impl Docxy {
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         let (title, surface): (SharedString, Surface) = match kind {
             Kind::Docx => ("Untitled.docx".into(), Surface::Doc(Editor::new(empty_doc()))),
-            Kind::Xlsx => ("Untitled.xlsx".into(), Surface::Placeholder),
+            Kind::Xlsx => ("Untitled.xlsx".into(), new_sheet_surface()),
             Kind::Look => ("Inbox".into(), Surface::Placeholder),
         };
         self.tabs.push(DocTab { kind, title, path: None, surface, dirty: false, status: "new".into(), comments: vec![], pkg: None, notes: vec![], markdown: false, hf_edit: None });
@@ -3229,31 +3252,49 @@ impl Docxy {
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
     /// re-writes into the loaded package), preserving styles and formulas.
     fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let Surface::Sheet(v) = &tab.surface else { return };
-        // Persist UI-authored charts by adding them to a throwaway package clone
-        // (so the live package isn't mutated and charts aren't re-added each save).
-        let bytes = if v.charts.is_empty() {
-            gridcore::xlsx::save_xlsx(&v.pkg)
-        } else {
-            let mut pkg = v.pkg.clone();
-            for cv in &v.charts {
-                pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
-            }
-            gridcore::xlsx::save_xlsx(&pkg)
+        // Serialize first (borrows the sheet), then decide the path so a native
+        // Save-As dialog for a new workbook doesn't clash with the borrow.
+        let (bytes, existing_path, title) = {
+            let Some(tab) = self.tabs.get(self.active) else { return };
+            let Surface::Sheet(v) = &tab.surface else { return };
+            // Persist UI-authored charts via a throwaway package clone (the live
+            // package isn't mutated, so charts aren't re-added on every save).
+            let bytes = if v.charts.is_empty() {
+                gridcore::xlsx::save_xlsx(&v.pkg)
+            } else {
+                let mut pkg = v.pkg.clone();
+                for cv in &v.charts {
+                    pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
+                }
+                gridcore::xlsx::save_xlsx(&pkg)
+            };
+            (bytes, tab.path.clone(), tab.title.to_string())
         };
-        let path = tab
-            .path
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(tab.title.to_string()));
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                tab.title = file_name(&path).into();
-                tab.path = Some(path.clone());
-                tab.dirty = false;
-                tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+        // A never-saved workbook asks where to go (Excel-style), instead of
+        // silently dumping into the working directory.
+        let path = match existing_path {
+            Some(p) => p,
+            None => match rfd::FileDialog::new().add_filter("Excel workbook", &["xlsx"]).set_file_name(title).save_file() {
+                Some(p) => p,
+                None => {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.status = "save cancelled".into();
+                    }
+                    return self.refocus(window, cx);
+                }
+            },
+        };
+        let written = std::fs::write(&path, &bytes);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            match written {
+                Ok(()) => {
+                    tab.title = file_name(&path).into();
+                    tab.path = Some(path.clone());
+                    tab.dirty = false;
+                    tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+                }
+                Err(e) => tab.status = format!("save failed: {e}").into(),
             }
-            Err(e) => tab.status = format!("save failed: {e}").into(),
         }
         self.backstage = false;
         self.bs_new = false;
