@@ -263,6 +263,29 @@ struct ColDrag {
     start_w: f64,
 }
 
+/// An in-progress auto-fill drag from the selection's fill handle: the source
+/// range and the cell the handle has reached.
+#[derive(Clone, Copy)]
+struct FillDrag {
+    src: (u32, u32, u32, u32),
+    to: (u32, u32),
+}
+
+/// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
+/// columns (right), whichever the handle was pulled furthest along. Returns the
+/// full box (source + filled cells), 0-based inclusive.
+fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
+    let (sr0, sc0, sr1, sc1) = src;
+    let (tr, tc) = to;
+    let dr = tr.saturating_sub(sr1);
+    let dc = tc.saturating_sub(sc1);
+    if dr >= dc {
+        (sr0, sc0, sr1.max(tr), sc1)
+    } else {
+        (sr0, sc0, sr1, sc1.max(tc))
+    }
+}
+
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
 #[derive(Clone)]
 struct GridClip {
@@ -572,6 +595,8 @@ struct Docxy {
     // A spreadsheet drag-select is in progress (left button held over cells).
     // The first dragged-over cell plants the anchor; later ones extend the range.
     sheet_dragging: bool,
+    // An in-progress auto-fill drag from the selection's fill handle.
+    sheet_fill: Option<FillDrag>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1148,6 +1173,7 @@ impl Docxy {
             ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             selecting: false,
             sheet_dragging: false,
+            sheet_fill: None,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1253,8 +1279,52 @@ impl Docxy {
         cx.notify();
     }
 
-    /// End an in-progress auto-fill drag (implemented below); no-op otherwise.
-    fn sheet_fill_end(&mut self, _cx: &mut Context<Self>) {}
+    /// Begin an auto-fill drag from the selection's fill handle (the small
+    /// square at the range's bottom-right). Captures the source range.
+    fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
+        if self.sheet_fill.is_some() {
+            return;
+        }
+        if let Some(v) = self.active_sheet() {
+            let src = v.range();
+            self.sheet_fill = Some(FillDrag { src, to: (src.2, src.3) });
+        }
+        cx.notify();
+    }
+
+    /// Update the auto-fill target as the handle is dragged; the selection
+    /// highlight extends to preview the fill box (dominant axis).
+    fn sheet_fill_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        let Some(mut f) = self.sheet_fill else { return };
+        if f.to == (row, col) {
+            return;
+        }
+        f.to = (row, col);
+        self.sheet_fill = Some(f);
+        let (r0, c0, r1, c1) = fill_box(f.src, (row, col));
+        if let Some(v) = self.active_sheet_mut() {
+            v.anchor = (r0, c0);
+            v.sel = (r1, c1);
+        }
+        cx.notify();
+    }
+
+    /// Finish an auto-fill drag: fill the source pattern into the dragged region
+    /// (numeric series or copy), leaving the filled box selected.
+    fn sheet_fill_end(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.sheet_fill.take() else { return };
+        if f.to == (f.src.2, f.src.3) {
+            return; // never dragged off the source
+        }
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
+            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
 
     /// Left-drag over a cell: the first cell of the drag plants the anchor (and
     /// commits any in-progress edit); subsequent cells extend the selection.
@@ -8611,9 +8681,41 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         let ent_drag = ent.clone();
         cell = cell.on_mouse_move(move |ev, _window, cx| {
             if ev.pressed_button == Some(MouseButton::Left) {
-                ent_drag.update(cx, |this, cx| this.sheet_drag_over(r, c, cx));
+                ent_drag.update(cx, |this, cx| {
+                    if this.sheet_fill.is_some() {
+                        this.sheet_fill_over(r, c, cx);
+                    } else {
+                        this.sheet_drag_over(r, c, cx);
+                    }
+                });
             }
         });
+        // Auto-fill handle: the small square at the selection's bottom-right
+        // corner. Dragging it fills the source pattern into the dragged region.
+        if !cell_editing && r == r1 && c == c1 {
+            let ent_fill = ent.clone();
+            cell = cell.relative().child(
+                // A generous transparent grab zone in the bottom-right corner
+                // (easy to grab / not clipped by the cell), with the small
+                // visible square at its corner.
+                div()
+                    .absolute()
+                    .bottom(px(0.))
+                    .right(px(0.))
+                    .w(px(12.))
+                    .h(px(12.))
+                    .flex()
+                    .items_end()
+                    .justify_end()
+                    .cursor(CursorStyle::Crosshair)
+                    .on_mouse_move(move |ev, _w, cx| {
+                        if ev.pressed_button == Some(MouseButton::Left) {
+                            ent_fill.update(cx, |this, cx| this.sheet_fill_start(cx));
+                        }
+                    })
+                    .child(div().w(px(8.)).h(px(8.)).bg(brand).border_1().border_color(hsla_u(0xffffff))),
+            );
+        }
         // Red corner marker for a commented cell (Excel's note indicator).
         if comment_cells.contains(&(r, c)) {
             cell = cell.relative().child(

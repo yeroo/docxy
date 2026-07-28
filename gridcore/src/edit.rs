@@ -317,6 +317,76 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
     (r2 - r1 + 1) as usize
 }
 
+/// Auto-fill from a source range by dragging its fill handle. `to` is the far
+/// corner the handle reached; the dominant axis (down or right) decides the
+/// direction. A source line of ≥2 numbers extends as a linear series (step =
+/// difference of the last two); otherwise the source cells are copied/cycled.
+/// Formulas are copied verbatim (not yet re-based). Returns the count of filled
+/// cells.
+pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: (u32, u32)) -> usize {
+    let (sr0, sc0, sr1, sc1) = src;
+    let (tr, tc) = to;
+    let dr = tr.saturating_sub(sr1);
+    let dc = tc.saturating_sub(sc1);
+    if dr == 0 && dc == 0 {
+        return 0;
+    }
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    let mut filled = 0;
+    if dr >= dc {
+        // Fill DOWN: extend each column into rows sr1+1..=tr.
+        let count = (tr - sr1) as usize;
+        for c in sc0..=sc1 {
+            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| s.cell(r, c).cloned()).collect();
+            for (k, cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                s.set_cell(sr1 + 1 + k as u32, c, cell);
+                filled += 1;
+            }
+        }
+    } else {
+        // Fill RIGHT: extend each row into columns sc1+1..=tc.
+        let count = (tc - sc1) as usize;
+        for r in sr0..=sr1 {
+            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| s.cell(r, c).cloned()).collect();
+            for (k, cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                s.set_cell(r, sc1 + 1 + k as u32, cell);
+                filled += 1;
+            }
+        }
+    }
+    filled
+}
+
+/// Produce `count` cells continuing a source line: a numeric series when every
+/// source cell is a number (≥2 of them), else the source pattern copied/cycled.
+fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
+    let nums: Option<Vec<f64>> = src
+        .iter()
+        .map(|c| match c.as_ref().map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if let Some(nums) = nums {
+        if nums.len() >= 2 {
+            let step = nums[nums.len() - 1] - nums[nums.len() - 2];
+            let last = nums[nums.len() - 1];
+            let style = src.last().and_then(|c| c.as_ref()).map(|c| c.style).unwrap_or(0);
+            return (0..count)
+                .map(|k| {
+                    let mut cell = Cell::number(last + step * (k as f64 + 1.0));
+                    cell.style = style; // carry the source formatting
+                    cell
+                })
+                .collect();
+        }
+    }
+    // Copy / cycle the source cells (single value → repeat it).
+    (0..count).map(|k| src[k % src.len()].clone().unwrap_or_default()).collect()
+}
+
 /// Insert subtotal rows into a region already grouped by `group_col`: at each
 /// change in that column's value, add a `SUBTOTAL(9, …)` row over the numeric
 /// `sum_cols` (inferred from the data when the slice is empty), then a grand
@@ -696,6 +766,40 @@ mod tests {
         assert_eq!(col(3, 0), Some(CellValue::Text("B".into())));
         assert_eq!(col(3, 1), Some(CellValue::Number(20.0)));
         assert_eq!(col(4, 1), Some(CellValue::Number(10.0)));
+    }
+
+    #[test]
+    fn autofill_series_down_and_copy_right() {
+        // A1=1, A2=2  → fill down to A5 should give the series 3,4,5.
+        let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
+        let n = autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        assert_eq!(n, 3);
+        let s = &w.sheets[0];
+        let num = |r: u32| match s.cell(r, 0).map(|c| c.value.clone()) {
+            Some(CellValue::Number(x)) => x,
+            v => panic!("A{} not number: {v:?}", r + 1),
+        };
+        assert_eq!((num(2), num(3), num(4)), (3.0, 4.0, 5.0));
+
+        // A single text cell copied to the right (B1..D1 = "x").
+        let mut w2 = wb(&[("A1", Cell::text("x"))]);
+        let n2 = autofill(&mut w2, 0, (0, 0, 0, 0), (0, 3));
+        assert_eq!(n2, 3);
+        let s2 = &w2.sheets[0];
+        for c in 1..=3 {
+            assert_eq!(s2.cell(0, c).map(|x| x.value.clone()), Some(CellValue::Text("x".into())));
+        }
+    }
+
+    #[test]
+    fn autofill_step_of_five_and_no_op() {
+        // 0,5 → 10,15,20 (step 5).
+        let mut w = wb(&[("A1", Cell::number(0.0)), ("A2", Cell::number(5.0))]);
+        autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        let s = &w.sheets[0];
+        assert_eq!(s.cell(4, 0).map(|c| c.value.clone()), Some(CellValue::Number(20.0)));
+        // Dragging back onto the source (no extension) fills nothing.
+        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (1, 0)), 0);
     }
 
     #[test]
