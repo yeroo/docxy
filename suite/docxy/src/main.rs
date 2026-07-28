@@ -9160,7 +9160,9 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             div()
                 .absolute()
                 .left(px(cx - 7.0))
-                .top(px(cy - 7.0))
+                // Sit just below the corner (Excel's handle hangs slightly under
+                // the bottom edge), not centred on it.
+                .top(px(cy - 3.0))
                 .w(px(14.))
                 .h(px(14.))
                 .flex()
