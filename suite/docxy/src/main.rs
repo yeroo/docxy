@@ -1292,8 +1292,9 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Update the auto-fill target as the handle is dragged; the selection
-    /// highlight extends to preview the fill box (dominant axis).
+    /// Update the auto-fill target as the handle is dragged. Nothing is
+    /// committed here — neither the cells nor the selection move until the
+    /// button comes up; the drag only outlines the box it would fill.
     fn sheet_fill_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
         let Some(mut f) = self.sheet_fill else { return };
         if f.to == (row, col) {
@@ -1301,12 +1302,16 @@ impl Docxy {
         }
         f.to = (row, col);
         self.sheet_fill = Some(f);
-        let (r0, c0, r1, c1) = fill_box(f.src, (row, col));
-        if let Some(v) = self.active_sheet_mut() {
-            v.anchor = (r0, c0);
-            v.sel = (r1, c1);
-        }
         cx.notify();
+    }
+
+    /// The box the in-progress fill drag would cover, for the preview outline.
+    fn sheet_fill_preview(&self) -> Option<(u32, u32, u32, u32)> {
+        let f = self.sheet_fill?;
+        if f.to == (f.src.2, f.src.3) {
+            return None; // still on the source — nothing to outline
+        }
+        Some(fill_box(f.src, f.to))
     }
 
     /// Finish an auto-fill drag: fill the source pattern into the dragged region
@@ -1317,8 +1322,13 @@ impl Docxy {
             return; // never dragged off the source
         }
         self.sheet_snapshot();
+        let (br0, bc0, br1, bc1) = fill_box(f.src, f.to);
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
+            // Only now does anything move: the cells fill and the selection grows
+            // to cover them (during the drag it was just an outline).
+            v.anchor = (br0, bc0);
+            v.sel = (br1, bc1);
             gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
             // Filled formulas were re-based, so their copied results are stale.
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
@@ -8251,7 +8261,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -8476,6 +8486,11 @@ fn label_lines(label: &str) -> Vec<String> {
 
 const SHEET_ROW_H: f32 = 21.0;
 const SHEET_GUT: f32 = 46.0;
+/// A chart card's footprint (see `chart_card`): its width is fixed, its height
+/// varies a little with the legend, so this is a representative value used only
+/// to tell which cells a card covers.
+const CHART_CARD_W: f32 = 360.0;
+const CHART_CARD_H: f32 = 215.0;
 
 /// The frozen column-letter header row (with drag-to-resize handles). Rendered
 /// once above the virtualized rows so it stays put while they scroll vertically.
@@ -8517,9 +8532,19 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
     header.into_any_element()
 }
 
+/// Grid state that lives on `Docxy` rather than the sheet view, threaded into
+/// the row renderer (which only sees the view).
+#[derive(Clone, Copy, Default)]
+struct GridOverlay {
+    /// Box an in-progress fill drag would cover — outlined, not yet applied.
+    fill_preview: Option<(u32, u32, u32, u32)>,
+    /// The selection's corner is under a chart card, which owns those pixels.
+    handle_hidden: bool,
+}
+
 /// One data row: the row-number gutter cell plus the visible cells (frozen
 /// columns `0..fc` pinned, then the scrollable window `col0..=cend`).
-fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, cend: u32, comment_cells: &std::collections::HashSet<(u32, u32)>) -> AnyElement {
+fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, cend: u32, comment_cells: &std::collections::HashSet<(u32, u32)>, ov: GridOverlay) -> AnyElement {
     use gridcore::sheet::{Align, CellValue};
     let sh = view.sheet();
     let styles = &view.pkg.workbook.styles;
@@ -8568,6 +8593,10 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         };
         let selected = (r, c) == (sr, sc);
         let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
+        // Cells the fill drag would reach: shaded while the button is down, so
+        // the drag reads as a preview and nothing has actually moved yet.
+        let in_preview = !in_range
+            && ov.fill_preview.is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
@@ -8613,8 +8642,17 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             .id(ElementId::Name(format!("cell-{r}-{c}").into()))
             .w(px(cell_w))
             .flex_shrink_0()
-            .px(px(4.))
-            .py(px(2.))
+            // The selected cell trades 1px of padding per side for its thicker
+            // ring, so its box — and therefore the row's height and the text's
+            // position — is byte-identical to an unselected cell's. Without
+            // this, selecting a cell grows its row by 3px and shoves the grid.
+            .map(|d| {
+                if selected {
+                    d.pt(px(0.)).pb(px(1.)).pl(px(2.)).pr(px(3.))
+                } else {
+                    d.px(px(4.)).py(px(2.))
+                }
+            })
             .flex()
             // Wrapped cells top-align and let text flow onto multiple lines
             // (growing the row); plain cells stay single-line and clip.
@@ -8626,6 +8664,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             // A thin box border (xf border) darkens all four sides.
             .when(cell_border, |d| d.border_1().border_color(hsla_u(0x7a7a7a)))
             .when(in_range && !selected, |d| d.bg(range_tint))
+            .when(in_preview, |d| d.bg(Hsla { h: 0., s: 0., l: 0.45, a: 0.16 }))
             .when(selected, |d| d.border_2().border_color(brand));
         if cell_editing {
             cell = cell
@@ -8692,27 +8731,28 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 });
             }
         });
-        // Auto-fill handle: an angular corner grip hanging OUTSIDE the selection's
-        // bottom-right corner. It lives inside that cell (so its position is exact
-        // — no scroll/row-height math to drift) and is `deferred` so it paints
-        // after every other row/cell instead of being occluded by its neighbours.
-        if editing.is_none() && r == r1 && c == c1 {
+        // Auto-fill handle: a small square centred ON the selection's bottom-right
+        // corner point. It lives inside that cell, so layout places it exactly (no
+        // scroll/row-height math to drift); it is absolutely positioned, so it adds
+        // nothing to the cell's size; and it is `deferred`, so it paints after the
+        // neighbouring cells that would otherwise clip its outer half.
+        if editing.is_none() && !ov.handle_hidden && r == r1 && c == c1 {
             let ent_fill = ent.clone();
             let ent_fill_dn = ent.clone();
+            // Insets are measured from the PADDING box, so back out the cell's
+            // border to reach the corner point, then half the box to centre on it.
+            let edge = if selected { 2.0 } else { 1.0 } + 6.0;
             cell = cell.relative().child(deferred(
                 div()
                     .id("fill-handle")
-                    // Insets are measured from the cell's PADDING box (inside its
-                    // border), and the grip is flush to this box's bottom-right —
-                    // so the bracket's outer corner lands ~4px past the cell's.
                     .absolute()
-                    .right(px(-7.))
-                    .bottom(px(-7.))
-                    .w(px(13.))
-                    .h(px(13.))
+                    .right(px(-edge))
+                    .bottom(px(-edge))
+                    .w(px(12.))
+                    .h(px(12.))
                     .flex()
-                    .items_end()
-                    .justify_end()
+                    .items_center()
+                    .justify_center()
                     .cursor(CursorStyle::Crosshair)
                     // The press arms the fill (the deferred hitbox sits above the
                     // list, so unlike a cell it does see mouse-down); the move is a
@@ -8727,20 +8767,16 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                         }
                     })
                     .child(
+                        // A 6px square in a 1px white surround, so it reads against
+                        // the selection ring and the cell behind it alike.
                         div()
-                            .w(px(9.))
-                            .h(px(9.))
-                            .border_b(px(1.))
-                            .border_r(px(1.))
-                            .border_color(hsla_u(0xffffff))
-                            .child(
-                                div()
-                                    .size_full()
-                                    .border_b(px(3.))
-                                    .border_r(px(3.))
-                                    .border_color(hsla_u(0x147A6F))
-                                    .hover(|d| d.border_color(hsla_u(BRAND))),
-                            ),
+                            .w(px(8.))
+                            .h(px(8.))
+                            .bg(hsla_u(0xffffff))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().w(px(6.)).h(px(6.)).bg(hsla_u(0x147A6F)).hover(|d| d.bg(hsla_u(BRAND)))),
                     ),
             ));
         }
@@ -8866,7 +8902,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -8951,6 +8987,37 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let header = sheet_col_header(view, ent, fc, col0, cend);
     let cc_frozen = comment_cells.clone();
     let cc_list = comment_cells.clone();
+    // A chart card floating over the selection's corner owns those pixels, so
+    // the fill handle (which paints above every cell) stands down there. The
+    // card's cell span is derived from its fixed size, which is enough to know
+    // whether it covers the corner.
+    let corner_under_chart = {
+        let anchors = view
+            .charts
+            .iter()
+            .filter(|c| c.sheet == view.active)
+            .map(|cv| cv.from)
+            .chain(sh.drawings.iter().filter(|d| matches!(d.kind, gridcore::sheet::DrawingKind::Chart(_))).map(|d| d.from));
+        // Hidden rows/columns measure zero, so both walks are bounded by a cell
+        // count as well as by the card's extent.
+        anchors.into_iter().any(|(ar, ac)| {
+            let mut w = 0.0f32;
+            let mut cc = ac;
+            while w < CHART_CARD_W && cc < ac + 64 {
+                w += col_px(sh.col_width(cc));
+                cc += 1;
+            }
+            let mut h = 0.0f32;
+            let mut rr = ar;
+            while h < CHART_CARD_H && rr < ar + 64 {
+                h += row_height_px(sh.row_height(rr), SHEET_ROW_H) + 1.0;
+                rr += 1;
+            }
+            let (br, bc) = (view.range().2, view.range().3);
+            br >= ar && br < rr && bc >= ac && bc < cc
+        })
+    };
+    let ov = GridOverlay { fill_preview, handle_hidden: corner_under_chart };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
@@ -8959,7 +9026,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let fr = (frz_r as usize).min(visible.len()).min(30);
     let mut frozen = v_flex().flex_none();
     for i in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, visible[i], fc, col0, cend, &cc_frozen));
+        frozen = frozen.child(sheet_row(view, ent, visible[i], fc, col0, cend, &cc_frozen, ov));
     }
     let ent_list = ent.clone();
     let vis_list = visible.clone();
@@ -8974,7 +9041,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         let this = ent_list.read(app);
         let Some(v) = this.active_sheet() else { return div().into_any_element() };
         let row = vis_list.get(fr + ix).copied().unwrap_or(0);
-        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list)
+        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list, ov)
     })
     .with_sizing_behavior(ListSizingBehavior::Auto)
     .flex_1()
