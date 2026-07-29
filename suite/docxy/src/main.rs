@@ -1320,7 +1320,9 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
+            // Filled formulas were re-based, so their copied results are stale.
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine.recalc_all(&mut v.pkg.workbook);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -8690,8 +8692,58 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 });
             }
         });
-        // (The auto-fill handle is drawn in the overlay layer — see sheet_el —
-        // so it can hang OUTSIDE the cell's bottom-right corner unclipped.)
+        // Auto-fill handle: an angular corner grip hanging OUTSIDE the selection's
+        // bottom-right corner. It lives inside that cell (so its position is exact
+        // — no scroll/row-height math to drift) and is `deferred` so it paints
+        // after every other row/cell instead of being occluded by its neighbours.
+        if editing.is_none() && r == r1 && c == c1 {
+            let ent_fill = ent.clone();
+            let ent_fill_dn = ent.clone();
+            cell = cell.relative().child(deferred(
+                div()
+                    .id("fill-handle")
+                    // Insets are measured from the cell's PADDING box (inside its
+                    // border), and the grip is flush to this box's bottom-right —
+                    // so the bracket's outer corner lands ~4px past the cell's.
+                    .absolute()
+                    .right(px(-7.))
+                    .bottom(px(-7.))
+                    .w(px(13.))
+                    .h(px(13.))
+                    .flex()
+                    .items_end()
+                    .justify_end()
+                    .cursor(CursorStyle::Crosshair)
+                    // The press arms the fill (the deferred hitbox sits above the
+                    // list, so unlike a cell it does see mouse-down); the move is a
+                    // fallback for a drag that leaves the grip before it fires.
+                    .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
+                    })
+                    .on_mouse_move(move |ev, _w, cx2| {
+                        if ev.pressed_button == Some(MouseButton::Left) {
+                            ent_fill.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
+                        }
+                    })
+                    .child(
+                        div()
+                            .w(px(9.))
+                            .h(px(9.))
+                            .border_b(px(1.))
+                            .border_r(px(1.))
+                            .border_color(hsla_u(0xffffff))
+                            .child(
+                                div()
+                                    .size_full()
+                                    .border_b(px(3.))
+                                    .border_r(px(3.))
+                                    .border_color(hsla_u(0x147A6F))
+                                    .hover(|d| d.border_color(hsla_u(BRAND))),
+                            ),
+                    ),
+            ));
+        }
         // Red corner marker for a commented cell (Excel's note indicator).
         if comment_cells.contains(&(r, c)) {
             cell = cell.relative().child(
@@ -9150,51 +9202,8 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             }
         }
     }
-    // Auto-fill handle: an angular corner grip hanging just outside the
-    // selection's bottom-right corner (in the overlay so it isn't clipped or
-    // occluded by neighbouring cells). Cursor → crosshair, grip brightens on
-    // hover (Excel's fill handle + cursor).
-    let fill_handle: Option<AnyElement> = if view.editing.is_some() {
-        None
-    } else {
-        col_x(c1).map(|x| {
-            let hx = x + col_px(sh.col_width(c1)); // right edge of the corner column
-            let hy = row_y(r1) + row_h; // bottom edge of the corner row
-            let ent_fill = ent.clone();
-            div()
-                .absolute()
-                .left(px(hx - 6.0))
-                .top(px(hy - 6.0))
-                .w(px(13.))
-                .h(px(13.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor(CursorStyle::Crosshair)
-                .on_mouse_move(move |ev, _w, cx2| {
-                    if ev.pressed_button == Some(MouseButton::Left) {
-                        ent_fill.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
-                    }
-                })
-                .child(
-                    div()
-                        .w(px(9.))
-                        .h(px(9.))
-                        .border_b(px(1.))
-                        .border_r(px(1.))
-                        .border_color(hsla_u(0xffffff))
-                        .child(
-                            div()
-                                .size_full()
-                                .border_b(px(3.))
-                                .border_r(px(3.))
-                                .border_color(hsla_u(0x147A6F))
-                                .hover(|d| d.border_color(hsla_u(BRAND))),
-                        ),
-                )
-                .into_any_element()
-        })
-    };
+    // (The auto-fill handle is drawn inside its own cell — see sheet_row — where
+    // its position is exact; it uses `deferred` to escape occlusion.)
 
     // The clipping layer: spans the rows viewport (under the column header, above
     // the sheet-tab row). Non-interactive, so cell clicks pass through.
@@ -9207,7 +9216,6 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .overflow_hidden()
         .children(cards)
         .children(note)
-        .children(fill_handle)
         .children(dv_overlay);
 
     let ent_move = ent.clone();

@@ -321,8 +321,9 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
 /// corner the handle reached; the dominant axis (down or right) decides the
 /// direction. A source line of ≥2 numbers extends as a linear series (step =
 /// difference of the last two); otherwise the source cells are copied/cycled.
-/// Formulas are copied verbatim (not yet re-based). Returns the count of filled
-/// cells.
+/// Copied formulas are re-based like Excel's: relative references shift by the
+/// copy's row/column distance, absolute (`$`) ones stay put. Returns the count
+/// of filled cells.
 pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: (u32, u32)) -> usize {
     let (sr0, sc0, sr1, sc1) = src;
     let (tr, tc) = to;
@@ -340,8 +341,13 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: 
         let count = (tr - sr1) as usize;
         for c in sc0..=sc1 {
             let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| s.cell(r, c).cloned()).collect();
-            for (k, cell) in extend_series(&srcvals, count).into_iter().enumerate() {
-                s.set_cell(sr1 + 1 + k as u32, c, cell);
+            let len = srcvals.len();
+            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                let dst = sr1 + 1 + k as u32;
+                // A copied cell came from src[k % len]; shift its formula by the
+                // distance it travelled.
+                rebase(&mut cell, i64::from(dst) - i64::from(sr0 + (k % len) as u32), 0);
+                s.set_cell(dst, c, cell);
                 filled += 1;
             }
         }
@@ -350,8 +356,11 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: 
         let count = (tc - sc1) as usize;
         for r in sr0..=sr1 {
             let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| s.cell(r, c).cloned()).collect();
-            for (k, cell) in extend_series(&srcvals, count).into_iter().enumerate() {
-                s.set_cell(r, sc1 + 1 + k as u32, cell);
+            let len = srcvals.len();
+            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                let dst = sc1 + 1 + k as u32;
+                rebase(&mut cell, 0, i64::from(dst) - i64::from(sc0 + (k % len) as u32));
+                s.set_cell(r, dst, cell);
                 filled += 1;
             }
         }
@@ -359,9 +368,27 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: 
     filled
 }
 
+/// Shift a filled cell's formula by (`dr`, `dc`). Verbatim `<f>` cells (shared
+/// groups, data tables) are left alone — their source is not ours to rewrite.
+fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
+    if (dr, dc) == (0, 0) || cell.f_attrs.is_some() {
+        return;
+    }
+    if let Some(f) = &cell.formula {
+        if let Some(shifted) = crate::formula::translate_formula(f, dr, dc) {
+            cell.formula = Some(shifted);
+        }
+    }
+}
+
 /// Produce `count` cells continuing a source line: a numeric series when every
 /// source cell is a number (≥2 of them), else the source pattern copied/cycled.
 fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
+    // Formulas carry a cached numeric result; extending them as a linear series
+    // would silently replace the formulas with numbers, so copy them instead.
+    if src.iter().flatten().any(|c| c.formula.is_some() || c.f_attrs.is_some()) {
+        return (0..count).map(|k| src[k % src.len()].clone().unwrap_or_default()).collect();
+    }
     let nums: Option<Vec<f64>> = src
         .iter()
         .map(|c| match c.as_ref().map(|x| &x.value) {
@@ -800,6 +827,43 @@ mod tests {
         assert_eq!(s.cell(4, 0).map(|c| c.value.clone()), Some(CellValue::Number(20.0)));
         // Dragging back onto the source (no extension) fills nothing.
         assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (1, 0)), 0);
+    }
+
+    #[test]
+    fn autofill_rebases_relative_refs_but_not_absolute() {
+        // D1 = B1*C1 over three rows of data; drag D1's handle down to D3.
+        let mut w = wb(&[
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::number(3.0)),
+            ("B2", Cell::number(4.0)),
+            ("C2", Cell::number(5.0)),
+            ("B3", Cell::number(6.0)),
+            ("C3", Cell::number(7.0)),
+            ("A1", Cell::number(10.0)), // the fixed rate $A$1
+        ]);
+        w.sheets[0].set_cell(0, 3, Cell { formula: Some("B1*C1*$A$1".into()), ..Default::default() });
+        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 3), (2, 3)), 2);
+        let f = |r: u32| w.sheets[0].cell(r, 3).and_then(|c| c.formula.clone());
+        assert_eq!(f(1).as_deref(), Some("B2*C2*$A$1"));
+        assert_eq!(f(2).as_deref(), Some("B3*C3*$A$1"));
+
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(200.0));
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(420.0));
+    }
+
+    #[test]
+    fn autofill_copies_formulas_instead_of_extending_their_values() {
+        // Two formula cells whose RESULTS look like a series (1, 2) must still
+        // fill as copied formulas, not as the numbers 3, 4.
+        let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
+        w.sheets[0].set_cell(0, 1, Cell { formula: Some("A1".into()), ..Default::default() });
+        w.sheets[0].set_cell(1, 1, Cell { formula: Some("A2".into()), ..Default::default() });
+        autofill(&mut w, 0, (0, 1, 1, 1), (3, 1));
+        let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
+        assert_eq!(f(2).as_deref(), Some("A3"));
+        assert_eq!(f(3).as_deref(), Some("A4"));
     }
 
     #[test]
