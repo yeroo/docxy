@@ -299,12 +299,40 @@ enum ChartField {
     Title,
 }
 
-/// The Chart panel's live text field: which one, its buffer and the caret.
+/// The Chart panel's live text field: which one, its buffer, the caret and the
+/// selection anchor (equal to the caret when nothing is selected).
 #[derive(Clone)]
 struct ChartFieldEdit {
     which: ChartField,
     buf: String,
     caret: usize,
+    anchor: usize,
+    /// A drag is in progress, so pointer moves extend the selection.
+    dragging: bool,
+}
+
+impl ChartFieldEdit {
+    /// The selected char range, ordered; `None` when the caret is collapsed.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let n = self.buf.chars().count();
+        let (a, c) = (self.anchor.min(n), self.caret.min(n));
+        (a != c).then(|| (a.min(c), a.max(c)))
+    }
+    /// Drop the selected text, leaving the caret where it was.
+    fn delete_selection(&mut self) -> bool {
+        let Some((s0, s1)) = self.selection() else { return false };
+        let (b0, b1) = (char_to_byte(&self.buf, s0), char_to_byte(&self.buf, s1));
+        self.buf.replace_range(b0..b1, "");
+        self.caret = s0;
+        self.anchor = s0;
+        true
+    }
+    fn set_caret(&mut self, idx: usize, extend: bool) {
+        self.caret = idx.min(self.buf.chars().count());
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
 }
 
 /// Where the idx-th chart of the active sheet lives: authored this session, or
@@ -760,6 +788,8 @@ struct Docxy {
     // The Chart panel field being typed into: which one, its buffer, and the
     // caret's char offset in it.
     chart_field: Option<ChartFieldEdit>,
+    // What the last Chart-panel action said, shown under the range field.
+    chart_msg: Option<(bool, String)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1146,45 +1176,80 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
         .into_any_element()
 }
 
-/// One half of a Chart-panel field's text: clicking it moves the caret to the
-/// character under the pointer (`base_off` is this half's char offset).
-fn chart_field_segment(s: String, base_off: usize, which: ChartField, ent: &Entity<Docxy>) -> AnyElement {
+/// One run of a Chart-panel field's text (`base_off` is its char offset in the
+/// buffer). Pressing puts the caret under the pointer — extending the selection
+/// on Shift, taking the whole field on a double click — and dragging over any
+/// run extends it, so the three runs together behave like one selectable line.
+fn chart_field_segment(s: String, base_off: usize, which: ChartField, selected: bool, ent: &Entity<Docxy>) -> AnyElement {
     let styled = StyledText::new(SharedString::from(s.clone()));
     let layout = styled.layout().clone();
-    let ent = ent.clone();
+    let (ent_dn, ent_mv) = (ent.clone(), ent.clone());
+    let (s_dn, l_dn) = (s.clone(), layout.clone());
+    let at = move |pos, text: &str, layout: &gpui::TextLayout| {
+        let byte = layout.index_for_position(pos).unwrap_or_else(|e| e).min(text.len());
+        base_off + text[..byte].chars().count()
+    };
+    let at_mv = at;
     div()
         .child(styled)
+        .when(selected, |d| d.bg(Hsla { a: 0.30, ..hsla_u(BRAND) }))
         .cursor_text()
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
             cx.stop_propagation();
-            let byte = layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(s.len());
-            let idx = base_off + s[..byte].chars().count();
-            ent.update(cx, |this, cx| {
+            let idx = at(ev.position, &s_dn, &l_dn);
+            let dbl = ev.click_count >= 2;
+            ent_dn.update(cx, |this, cx| {
                 if let Some(f) = &mut this.chart_field {
                     if f.which == which {
-                        f.caret = idx;
+                        if dbl {
+                            // Double click takes the whole field, so retyping a
+                            // title doesn't mean backspacing over it.
+                            f.anchor = 0;
+                            f.caret = f.buf.chars().count();
+                        } else {
+                            f.set_caret(idx, ev.modifiers.shift);
+                            f.dragging = true;
+                        }
                     }
                 }
                 cx.notify();
             });
         })
+        .on_mouse_move(move |ev, _window, cx| {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            let idx = at_mv(ev.position, &s, &layout);
+            ent_mv.update(cx, |this, cx| {
+                if let Some(f) = &mut this.chart_field {
+                    if f.which == which && f.dragging && f.caret != idx {
+                        f.set_caret(idx, true);
+                        cx.notify();
+                    }
+                }
+            });
+        })
         .into_any_element()
 }
 
-/// A Chart-panel field's content while it has the keyboard: the buffer split
-/// around the caret, both halves click-to-caret.
-fn chart_field_row(text: &str, caret: usize, which: ChartField, ent: &Entity<Docxy>) -> AnyElement {
-    let chars: Vec<char> = text.chars().collect();
-    let cc = caret.min(chars.len());
-    let before: String = chars[..cc].iter().collect();
-    let after: String = chars[cc..].iter().collect();
+/// A Chart-panel field's content while it has the keyboard: the buffer cut into
+/// before / selected / after, with the caret bar at whichever end it sits.
+fn chart_field_row(f: &ChartFieldEdit, ent: &Entity<Docxy>) -> AnyElement {
+    let chars: Vec<char> = f.buf.chars().collect();
+    let n = chars.len();
+    let caret = f.caret.min(n);
+    let (s0, s1) = f.selection().unwrap_or((caret, caret));
+    let take = |a: usize, b: usize| -> String { chars[a.min(n)..b.min(n)].iter().collect() };
+    let bar = || div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none();
     h_flex()
         .flex_1()
         .items_center()
         .overflow_hidden()
-        .child(chart_field_segment(before, 0, which, ent))
-        .child(div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none())
-        .child(chart_field_segment(after, cc, which, ent))
+        .child(chart_field_segment(take(0, s0), 0, f.which, false, ent))
+        .when(caret == s0, |d| d.child(bar()))
+        .child(chart_field_segment(take(s0, s1), s0, f.which, true, ent))
+        .when(caret == s1 && s1 != s0, |d| d.child(bar()))
+        .child(chart_field_segment(take(s1, n), s1, f.which, false, ent))
         .into_any_element()
 }
 
@@ -1382,6 +1447,7 @@ impl Docxy {
             chart_sel: None,
             chart_drag: None,
             chart_field: None,
+            chart_msg: None,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1481,6 +1547,7 @@ impl Docxy {
         }
         self.chart_sel = None; // going back to the grid drops any chart selection
         self.chart_field = None;
+        self.chart_msg = None;
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
@@ -1590,10 +1657,13 @@ impl Docxy {
 
     /// Re-point the selected chart at another range, replotting its categories
     /// and series from those cells while keeping its type, title and colours.
+    /// A `Sheet!A1:D5` form is accepted too — the sheet part is ignored, since a
+    /// chart plots the sheet it floats over.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
-        let Some(range) = gridcore::sheet::parse_range_name(text.trim()) else {
-            self.set_status("Chart range: expected something like A1:D5");
+        let cells = text.trim().rsplit_once('!').map(|(_, r)| r).unwrap_or(text.trim());
+        let Some(range) = gridcore::sheet::parse_range_name(cells) else {
+            self.chart_msg = Some((false, format!("\"{}\" isn't a range like A1:D5", text.trim())));
             cx.notify();
             return;
         };
@@ -1601,7 +1671,15 @@ impl Docxy {
             let sh = v.sheet();
             gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
         }) else {
-            self.set_status("Chart range: no numeric column in that range");
+            let (r1, c1, r2, c2) = range;
+            self.chart_msg = Some((
+                false,
+                format!(
+                    "{}:{} has no column of numbers under a header row",
+                    gridcore::sheet::cell_name(r1, c1),
+                    gridcore::sheet::cell_name(r2, c2)
+                ),
+            ));
             cx.notify();
             return;
         };
@@ -1611,7 +1689,9 @@ impl Docxy {
         for (i, s) in data.series.iter_mut().enumerate() {
             s.color = old.series.get(i).and_then(|o| o.color);
         }
-        self.set_status(format!("Chart plots {}", text.trim().to_uppercase()));
+        let msg = format!("Plotting {} series over {} categories", data.series.len(), data.categories.len());
+        self.set_status(format!("Chart plots {}", cells.to_uppercase()));
+        self.chart_msg = Some((true, msg));
         self.chart_set_data(data, cx);
     }
 
@@ -1636,10 +1716,23 @@ impl Docxy {
     }
 
     /// Typing in one of the Chart panel's text fields. Arrows, Home/End and
-    /// Delete move and edit around the caret, the same way the formula bar does.
-    fn chart_field_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+    /// Delete move and edit around the caret; holding Shift extends the
+    /// selection, and anything typed over one replaces it.
+    fn chart_field_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, cx: &mut Context<Self>) {
         let Some(mut f) = self.chart_field.clone() else { return };
         let len = f.buf.chars().count();
+        if ctrl {
+            match key {
+                "a" => {
+                    f.anchor = 0;
+                    f.caret = len;
+                    self.chart_field = Some(f);
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
         match key {
             "escape" => self.chart_field = None,
             "enter" => {
@@ -1654,34 +1747,50 @@ impl Docxy {
                     }
                 }
             }
+            // A plain arrow past a selection lands on the end it points at.
             "left" => {
-                f.caret = f.caret.saturating_sub(1);
+                let to = match f.selection() {
+                    Some((s0, _)) if !shift => s0,
+                    _ => f.caret.saturating_sub(1),
+                };
+                f.set_caret(to, shift);
                 self.chart_field = Some(f);
             }
             "right" => {
-                f.caret = (f.caret + 1).min(len);
+                let to = match f.selection() {
+                    Some((_, s1)) if !shift => s1,
+                    _ => (f.caret + 1).min(len),
+                };
+                f.set_caret(to, shift);
                 self.chart_field = Some(f);
             }
             "home" => {
-                f.caret = 0;
+                f.set_caret(0, shift);
                 self.chart_field = Some(f);
             }
             "end" => {
-                f.caret = len;
+                f.set_caret(len, shift);
                 self.chart_field = Some(f);
             }
             "backspace" => {
-                buf_backspace(&mut f.buf, &mut f.caret);
+                if !f.delete_selection() {
+                    buf_backspace(&mut f.buf, &mut f.caret);
+                    f.anchor = f.caret;
+                }
                 self.chart_field = Some(f);
             }
             "delete" => {
-                buf_delete(&mut f.buf, f.caret);
+                if !f.delete_selection() {
+                    buf_delete(&mut f.buf, f.caret);
+                }
                 self.chart_field = Some(f);
             }
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        f.delete_selection(); // typing replaces what's selected
                         buf_insert(&mut f.buf, &mut f.caret, c);
+                        f.anchor = f.caret;
                     }
                 }
                 self.chart_field = Some(f);
@@ -3524,7 +3633,7 @@ impl Docxy {
         // Clicking an idle field focuses it with the caret under the pointer.
         let field = |id: &'static str, which: ChartField, value: String, hint: &'static str| {
             let editing = match &self.chart_field {
-                Some(f) if f.which == which => Some((f.buf.clone(), f.caret)),
+                Some(f) if f.which == which => Some(f.clone()),
                 _ => None,
             };
             let ent_f = ent.clone();
@@ -3535,7 +3644,6 @@ impl Docxy {
                 None => value.clone(),
             };
             let idle_text = StyledText::new(SharedString::from(shown));
-            let idle_layout = idle_text.layout().clone();
             let seed_for_click = seed.clone();
             div()
                 .id(id)
@@ -3552,20 +3660,21 @@ impl Docxy {
                 .text_size(px(12.))
                 .text_color(if editing.is_some() || !value.is_empty() { hsla_u(0x1a1a1a) } else { hsla_u(0x999999) })
                 .map(|d| match &editing {
-                    Some((buf, caret)) => d.child(chart_field_row(buf, *caret, which, &ent_f)),
+                    Some(f) => d.child(chart_field_row(f, &ent_f)),
                     None => d.child(div().overflow_hidden().child(idle_text)),
                 })
-                // Clicking an idle field takes the keyboard and puts the caret
-                // where the pointer landed rather than at the end.
+                // The click that FOCUSES a field selects all of it, so typing a
+                // new value replaces the old one instead of appending to it (the
+                // caret-at-click behaviour turned every retyped range into
+                // "A1:B5A1:D5"). Clicks once focused place the caret normally.
                 .when(editing.is_none(), |d| {
                     let ent_c = ent_f.clone();
-                    d.on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                    d.on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
-                        let byte = idle_layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(seed_for_click.len());
-                        let caret = seed_for_click[..byte].chars().count();
                         let seed = seed_for_click.clone();
                         ent_c.update(cx2, |this, cx2| {
-                            this.chart_field = Some(ChartFieldEdit { which, buf: seed, caret });
+                            let n = seed.chars().count();
+                            this.chart_field = Some(ChartFieldEdit { which, buf: seed, caret: n, anchor: 0, dragging: false });
                             cx2.notify();
                         });
                     })
@@ -3644,7 +3753,17 @@ impl Docxy {
             // the gaps between its controls) must not reach the grid behind and
             // move the cell selection out from under the chart being edited.
             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, {
+                let ent_up = ent.clone();
+                move |_ev, _w, cx| {
+                    cx.stop_propagation();
+                    ent_up.update(cx, |this, _| {
+                        if let Some(f) = &mut this.chart_field {
+                            f.dragging = false;
+                        }
+                    });
+                }
+            })
             .on_mouse_move(|_ev, _w, cx| cx.stop_propagation())
             .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("Chart"))
             .child(
@@ -3657,7 +3776,16 @@ impl Docxy {
                     .pb_2()
                     .child(heading("DATA RANGE"))
                     .child(field("chart-range", ChartField::Range, range_text, "e.g. A1:D5"))
-                    .child(div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("Include the header row: it names the series. Enter to replot."))
+                    // What the last replot did — or why it couldn't, which the
+                    // status bar alone makes far too easy to miss.
+                    .child(match &self.chart_msg {
+                        Some((ok, msg)) => div()
+                            .pt(px(2.))
+                            .text_size(px(10.))
+                            .text_color(if *ok { hsla_u(BRAND) } else { hsla_u(0xd0322b) })
+                            .child(SharedString::from(msg.clone())),
+                        None => div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("Include the header row: it names the series. Enter to replot."),
+                    })
                     .child(heading("TYPE"))
                     .child(types)
                     .child(heading("TITLE"))
@@ -3832,7 +3960,7 @@ impl Docxy {
         }
         // A Chart-panel text field swallows typing until Enter/Esc.
         if self.chart_field.is_some() {
-            return self.chart_field_key(ev, key, cx);
+            return self.chart_field_key(ev, ctrl, shift, key, cx);
         }
         // A selected chart takes the object keys (Escape drops it, Delete removes
         // it) before they reach the grid.
