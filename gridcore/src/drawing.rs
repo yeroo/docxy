@@ -83,7 +83,11 @@ pub fn parse_drawings(
                     if let Some(rid) = rel_attr(&p, "id") {
                         if let Some((_, part)) = resolve_rid(&rid) {
                             if let Some(cxml) = get_part(&part) {
-                                kind = Some(DrawingKind::Chart(parse_chart(&cxml)));
+                                let mut cd = parse_chart(&cxml);
+                                // Remember where it came from, so an edit can be
+                                // written back into that part.
+                                cd.part = Some(part);
+                                kind = Some(DrawingKind::Chart(cd));
                             }
                         }
                     }
@@ -284,6 +288,12 @@ fn parse_chart(xml: &str) -> ChartData {
     // Inside a <c:barChart> — its <c:barDir> refines "column" vs "bar".
     let mut in_bar = false;
     let mut mode = 0u8; // 1 = series name (tx), 2 = category (cat), 3 = value (val)
+    // <c:f> holds the range a cat/val block reads from; their union is the
+    // chart's source range. Only fills directly on a <c:ser> count as the
+    // series colour (a fill nested in the data points or the plot area is a
+    // different thing).
+    let mut in_f = false;
+    let mut ser_depth = 0i32;
     loop {
         match p.next() {
             Event::Start => {
@@ -307,12 +317,23 @@ fn parse_chart(xml: &str) -> ChartData {
                         cd.kind = if p.attr("val") == "bar" { "bar" } else { "column" }.to_string();
                     }
                     "title" => in_title = true,
-                    "ser" => cd.series.push(ChartSeries::default()),
+                    "ser" => {
+                        cd.series.push(ChartSeries::default());
+                        ser_depth += 1;
+                    }
                     "tx" => mode = 1,
                     "cat" => mode = 2,
                     "val" => mode = 3,
                     "v" => in_v = true,
+                    "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
+                    "srgbClr" if ser_depth == 1 && mode == 0 => {
+                        if let Some(rgb) = u32::from_str_radix(p.attr("val").trim(), 16).ok().filter(|_| p.attr("val").len() == 6) {
+                            if let Some(sr) = cd.series.last_mut() {
+                                sr.color.get_or_insert(rgb);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -340,6 +361,14 @@ fn parse_chart(xml: &str) -> ChartData {
                         }
                         _ => {}
                     }
+                } else if in_f {
+                    if let Some(src) = crate::sheet::ChartSource::parse_f_ref(p.text().trim()) {
+                        match &mut cd.source {
+                            Some(cur) if cur.sheet == src.sheet => cur.union(&src),
+                            Some(_) => {}
+                            slot => *slot = Some(src),
+                        }
+                    }
                 } else if in_title_text {
                     cd.title.push_str(p.text());
                 }
@@ -348,6 +377,8 @@ fn parse_chart(xml: &str) -> ChartData {
                 "title" => in_title = false,
                 "t" => in_title_text = false,
                 "v" => in_v = false,
+                "f" => in_f = false,
+                "ser" => ser_depth -= 1,
                 "tx" | "cat" | "val" => mode = 0,
                 _ => {}
             },
@@ -428,6 +459,42 @@ mod tests {
         assert!(culled.contains("<xdr:sp/>"));
         assert!(!culled.contains("Logo"));
         assert_eq!(culled.matches("<xdr:twoCellAnchor>").count(), 1);
+    }
+
+    #[test]
+    fn chart_refs_and_series_colours_round_trip() {
+        // A range-backed chart: the refs give the source box, the caches give
+        // the values, and one series carries an explicit fill.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:spPr><a:solidFill><a:srgbClr val="C0705A"/></a:solidFill></c:spPr>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt><c:pt idx="1"><c:v>Dock</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.kind, "column");
+        assert_eq!(cd.categories, vec!["Laptop", "Dock"]);
+        assert_eq!(cd.series[0].values, vec![2.0, 5.0]);
+        assert_eq!(cd.series[0].color, Some(0xC0705A));
+        // The refs union into the whole box, header row and labels included.
+        let src = cd.source.expect("source range");
+        assert_eq!(src.sheet, "Budget");
+        assert_eq!(src.range, (0, 0, 2, 1));
+    }
+
+    #[test]
+    fn chart_source_refs_are_absolute_and_skip_the_header() {
+        use crate::sheet::ChartSource;
+        let src = ChartSource { sheet: "Budget".into(), range: (0, 0, 4, 3), cat_col: 0 };
+        assert_eq!(src.f_ref(0, 0, true), "Budget!$A$2:$A$5");
+        assert_eq!(src.f_ref(2, 2, true), "Budget!$C$2:$C$5");
+        assert_eq!(src.header_ref(2), "Budget!$C$1");
+        // A sheet name with a space has to be quoted for Excel to accept it.
+        let spaced = ChartSource { sheet: "My Sheet".into(), range: (0, 0, 2, 1), cat_col: 0 };
+        assert_eq!(spaced.f_ref(1, 1, true), "'My Sheet'!$B$2:$B$3");
+        // Parsing is the inverse.
+        assert_eq!(ChartSource::parse_f_ref("Budget!$A$2:$A$5").unwrap().range, (1, 0, 4, 0));
     }
 
     #[test]

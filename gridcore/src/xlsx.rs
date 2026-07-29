@@ -1493,6 +1493,17 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         }
         // Drawings round-trip as their original part, so a moved anchor has to
         // be written back into it.
+        // An edited chart's part is regenerated from the model; untouched ones
+        // round-trip verbatim, keeping whatever formatting we don't model.
+        for dw in &sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &dw.kind {
+                if let (true, Some(cpart)) = (cd.edited, cd.part.as_deref()) {
+                    if let Some(p) = parts.iter_mut().find(|(n, _)| n == cpart) {
+                        p.1 = chart_space_xml(cd).into_bytes();
+                    }
+                }
+            }
+        }
         if let Some(dpart) = sheet.drawing_part.as_deref() {
             let moves: Vec<(usize, (u32, u32), (u32, u32))> = sheet.drawings.iter().map(|d| (d.anchor_ix, d.from, d.to)).collect();
             if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
@@ -2071,12 +2082,37 @@ fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
         let val_pts: String = (0..ncat)
             .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", s.values.get(i).copied().unwrap_or(0.0)))
             .collect();
-        format!(
-            "<c:ser><c:idx val=\"{si}\"/><c:order val=\"{si}\"/><c:tx><c:v>{}</c:v></c:tx>\
-<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>\
-<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val></c:ser>",
-            esc_attr(&s.name)
-        )
+        // A range-backed chart writes the cells it reads alongside the cached
+        // values, so Excel keeps it live; a snapshot writes the caches alone as
+        // literals. The numbers are the same either way.
+        let src = data.source.as_ref();
+        let name = match (src, s.col) {
+            (Some(sc), Some(col)) => format!(
+                "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
+                esc_attr(&sc.header_ref(col)),
+                esc_attr(&s.name)
+            ),
+            _ => format!("<c:tx><c:v>{}</c:v></c:tx>", esc_attr(&s.name)),
+        };
+        let cat = match src {
+            Some(sc) => format!(
+                "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strCache></c:strRef></c:cat>",
+                esc_attr(&sc.f_ref(sc.cat_col, sc.cat_col, true))
+            ),
+            None => format!("<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>"),
+        };
+        let val = match (src, s.col) {
+            (Some(sc), Some(col)) => format!(
+                "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numCache></c:numRef></c:val>",
+                esc_attr(&sc.f_ref(col, col, true))
+            ),
+            _ => format!("<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"),
+        };
+        let fill = match s.color {
+            Some(rgb) => format!("<c:spPr><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></c:spPr>"),
+            None => String::new(),
+        };
+        format!("<c:ser><c:idx val=\"{si}\"/><c:order val=\"{si}\"/>{name}{fill}{cat}{val}</c:ser>")
     };
     let sers: String = data.series.iter().enumerate().map(|(si, s)| ser_xml(si, s)).collect();
 
@@ -3496,9 +3532,10 @@ mod tests {
             kind: kind.into(),
             categories: vec!["Q1".into(), "Q2".into(), "Q3".into()],
             series: vec![
-                ChartSeries { name: "East".into(), values: vec![1.0, 2.0, 3.0] },
-                ChartSeries { name: "West".into(), values: vec![4.0, 5.0, 6.0] },
+                ChartSeries { name: "East".into(), values: vec![1.0, 2.0, 3.0], ..Default::default() },
+                ChartSeries { name: "West".into(), values: vec![4.0, 5.0, 6.0], ..Default::default() },
             ],
+            ..Default::default()
         };
         // Well-formedness proxy: equal open/close angle brackets and matched
         // <c:chartSpace>…</c:chartSpace>, plus the expected plot element per kind.

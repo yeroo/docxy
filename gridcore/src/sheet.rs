@@ -288,6 +288,131 @@ pub struct ChartData {
     pub kind: String,
     pub categories: Vec<String>,
     pub series: Vec<ChartSeries>,
+    /// The cells the chart plots, when it is range-backed rather than a frozen
+    /// snapshot. Read from the `<c:f>` refs on load; written back on save, so
+    /// Excel sees a live chart too.
+    pub source: Option<ChartSource>,
+    /// The chart part this came from (`xl/charts/chartN.xml`), so an edit can be
+    /// written back into it.
+    pub part: Option<String>,
+    /// Set once the user changes something here. The part round-trips verbatim
+    /// otherwise; only an edited chart is regenerated (and so loses whatever
+    /// formatting we don't model).
+    pub edited: bool,
+}
+
+/// The worksheet range a chart plots: the sheet by name (as the `<c:f>` refs
+/// spell it) and the 0-based inclusive cell box, header row and label column
+/// included.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartSource {
+    pub sheet: String,
+    pub range: (u32, u32, u32, u32),
+    /// The column inside `range` holding the category labels.
+    pub cat_col: u32,
+}
+
+impl ChartSource {
+    /// The `Sheet1!$A$1:$D$5` form a chart's `<c:f>` refs use. `rows` narrows it
+    /// to one column of the box (a series), leaving the header row out.
+    pub fn f_ref(&self, c1: u32, c2: u32, skip_header: bool) -> String {
+        let (r1, _, r2, _) = self.range;
+        let top = if skip_header { r1.saturating_add(1).min(r2) } else { r1 };
+        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
+        format!("{name}!${}${}:${}${}", col_name(c1), top + 1, col_name(c2), r2 + 1)
+    }
+
+    /// The single header cell above `col` — a series' name ref.
+    pub fn header_ref(&self, col: u32) -> String {
+        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
+        format!("{name}!${}${}", col_name(col), self.range.0 + 1)
+    }
+
+    /// Parse a `Sheet1!$A$1:$D$5` ref (the sheet part optional).
+    pub fn parse_f_ref(s: &str) -> Option<ChartSource> {
+        let (sheet, cells) = match s.rsplit_once('!') {
+            Some((a, b)) => (a.trim_matches('\'').to_string(), b),
+            None => (String::new(), s),
+        };
+        let range = parse_range_name(cells)?;
+        Some(ChartSource { sheet, range, cat_col: range.1 })
+    }
+
+    /// Grow to also cover `other`'s cells (same sheet assumed — a chart drawing
+    /// from two sheets keeps only the first).
+    pub fn union(&mut self, other: &ChartSource) {
+        let (r1, c1, r2, c2) = self.range;
+        let (or1, oc1, or2, oc2) = other.range;
+        self.range = (r1.min(or1), c1.min(oc1), r2.max(or2), c2.max(oc2));
+    }
+}
+
+/// Read a chart's data out of a worksheet range: the first row names the
+/// series, one column of labels becomes the categories, and every column that
+/// holds numbers becomes a series. This is what the Insert button plots and
+/// what re-pointing a chart at a new range replots.
+pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, u32), kind: &str) -> Option<ChartData> {
+    let (r0, c0, r1, c1) = range;
+    if r1 <= r0 {
+        return None; // header row only — nothing to plot
+    }
+    let text_of = |r: u32, c: u32| -> String {
+        match sheet.cell(r, c).map(|cl| &cl.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            Some(CellValue::Number(n)) => format_with(&Xf::default(), &CellValue::Number(*n), false),
+            Some(CellValue::Bool(b)) => b.to_string(),
+            Some(CellValue::Error(e)) => e.clone(),
+            _ => String::new(),
+        }
+    };
+    // A column is a series if it is mostly numbers; the first that isn't
+    // supplies the category labels.
+    let (mut cat_col, mut num_cols) = (None, Vec::new());
+    for c in c0..=c1 {
+        let (mut nums, mut txts) = (0u32, 0u32);
+        for r in (r0 + 1)..=r1 {
+            match sheet.cell(r, c).map(|cl| &cl.value) {
+                Some(CellValue::Number(_)) => nums += 1,
+                Some(CellValue::Text(_)) => txts += 1,
+                _ => {}
+            }
+        }
+        if nums > 0 && nums >= txts {
+            num_cols.push(c);
+        } else if cat_col.is_none() {
+            cat_col = Some(c);
+        }
+    }
+    if num_cols.is_empty() {
+        return None;
+    }
+    let cat_col = cat_col.unwrap_or(c0);
+    let rows: Vec<u32> = (r0 + 1..=r1).collect();
+    let title = text_of(r0, cat_col);
+    let series = num_cols
+        .iter()
+        .map(|&c| ChartSeries {
+            name: text_of(r0, c),
+            col: Some(c),
+            values: rows
+                .iter()
+                .map(|&r| match sheet.cell(r, c).map(|cl| &cl.value) {
+                    Some(CellValue::Number(n)) => *n,
+                    _ => 0.0,
+                })
+                .collect(),
+            color: None,
+        })
+        .collect();
+    Some(ChartData {
+        title: if title.is_empty() { "Chart".into() } else { title },
+        kind: kind.to_string(),
+        categories: rows.iter().map(|&r| text_of(r, cat_col)).collect(),
+        series,
+        source: Some(ChartSource { sheet: sheet_name.to_string(), range, cat_col }),
+        part: None,
+        edited: true,
+    })
 }
 
 /// One data series of a [`ChartData`].
@@ -295,6 +420,11 @@ pub struct ChartData {
 pub struct ChartSeries {
     pub name: String,
     pub values: Vec<f64>,
+    /// Explicit series colour (`0xRRGGBB`) from its `<c:spPr>` solid fill;
+    /// `None` leaves it to the renderer's palette.
+    pub color: Option<u32>,
+    /// The worksheet column this series reads, when the chart is range-backed.
+    pub col: Option<u32>,
 }
 
 /// One data-validation rule over a set of cell ranges.
@@ -1196,6 +1326,42 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_from_range_picks_labels_and_numeric_series() {
+        // A1:C3 — a label column and two numeric columns under a header row.
+        let mut sh = Sheet { name: "Budget".into(), ..Sheet::default() };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("A3", Cell::text("Dock")),
+            ("B3", Cell::number(5.0)),
+            ("C3", Cell::number(179.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 2, 2), "column").expect("chart");
+        assert_eq!(cd.title, "Item"); // the label column's header names the chart
+        assert_eq!(cd.categories, vec!["Laptop", "Dock"]);
+        assert_eq!(cd.series.len(), 2);
+        assert_eq!(cd.series[0].name, "Qty");
+        assert_eq!(cd.series[0].values, vec![2.0, 5.0]);
+        assert_eq!(cd.series[1].values, vec![1199.0, 179.0]);
+        // Each series remembers its column, so a save can write live refs.
+        assert_eq!((cd.series[0].col, cd.series[1].col), (Some(1), Some(2)));
+        let src = cd.source.expect("source");
+        assert_eq!((src.sheet.as_str(), src.range, src.cat_col), ("Budget", (0, 0, 2, 2), 0));
+
+        // A range with nothing numeric in it can't be plotted.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column").is_none());
+        // Neither can a header row on its own.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 2), "column").is_none());
+    }
 
     #[test]
     fn col_names_round_trip() {

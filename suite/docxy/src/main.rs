@@ -292,6 +292,25 @@ struct ChartUi {
     drag: Option<(usize, f32, f32, (i8, i8))>,
 }
 
+/// Which Chart-panel text field has the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChartField {
+    Range,
+    Title,
+}
+
+/// Where the idx-th chart of the active sheet lives: authored this session, or
+/// loaded from the file as a drawing.
+#[derive(Clone, Copy)]
+enum ChartRef {
+    Ui(usize),
+    Drawing(usize),
+}
+
+/// The colours offered per series in the Chart panel (the renderer's own
+/// palette, so the swatches match what an unstyled chart already draws).
+const CHART_COLORS: [u32; 8] = [0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A, 0xD06C9E, 0x707880];
+
 /// A chart card never shrinks below this, however far its grip is dragged.
 const MIN_CHART_W: f32 = 150.0;
 const MIN_CHART_H: f32 = 110.0;
@@ -726,6 +745,8 @@ struct Docxy {
     // An in-progress chart move: which chart, and how far the pointer has
     // travelled since the press. The anchor only moves on release.
     chart_drag: Option<ChartDrag>,
+    // The Chart panel field being typed into, and its buffer.
+    chart_field: Option<(ChartField, String)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1305,6 +1326,7 @@ impl Docxy {
             sheet_fill: None,
             chart_sel: None,
             chart_drag: None,
+            chart_field: None,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1403,6 +1425,7 @@ impl Docxy {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
         self.chart_sel = None; // going back to the grid drops any chart selection
+        self.chart_field = None;
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
@@ -1451,6 +1474,142 @@ impl Docxy {
     fn chart_press(&mut self, idx: usize, edge: (i8, i8), at: (f32, f32), cx: &mut Context<Self>) {
         self.chart_sel = Some(idx);
         self.chart_drag = Some(ChartDrag { idx, edge, origin: at, delta: (0.0, 0.0) });
+        cx.notify();
+    }
+
+    /// Put a message on the active tab's status line.
+    fn set_status(&mut self, msg: impl Into<SharedString>) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status = msg.into();
+        }
+    }
+
+    /// Where the idx-th chart of the active sheet lives. The overlay lays the
+    /// cards out in this order too: authored charts first, then the drawings.
+    fn chart_locate(&self, idx: usize) -> Option<ChartRef> {
+        let v = self.active_sheet()?;
+        let sidx = v.active;
+        let ui: Vec<usize> = v.charts.iter().enumerate().filter(|(_, c)| c.sheet == sidx).map(|(i, _)| i).collect();
+        if let Some(&pos) = ui.get(idx) {
+            return Some(ChartRef::Ui(pos));
+        }
+        v.pkg.workbook.sheets[sidx]
+            .drawings
+            .iter()
+            .enumerate()
+            .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
+            .map(|(i, _)| i)
+            .nth(idx - ui.len())
+            .map(ChartRef::Drawing)
+    }
+
+    /// The selected chart's data.
+    fn chart_data(&self) -> Option<gridcore::sheet::ChartData> {
+        let v = self.active_sheet()?;
+        match self.chart_locate(self.chart_sel?)? {
+            ChartRef::Ui(i) => Some(v.charts[i].data.clone()),
+            ChartRef::Drawing(i) => match &v.pkg.workbook.sheets[v.active].drawings[i].kind {
+                gridcore::sheet::DrawingKind::Chart(cd) => Some(cd.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    /// Write the selected chart's data back, marking it edited so a save
+    /// regenerates its chart part.
+    fn chart_set_data(&mut self, mut data: gridcore::sheet::ChartData, cx: &mut Context<Self>) {
+        let Some(sel) = self.chart_sel else { return };
+        let Some(loc) = self.chart_locate(sel) else { return };
+        self.sheet_snapshot();
+        data.edited = true;
+        if let Some(v) = self.active_sheet_mut() {
+            let sidx = v.active;
+            match loc {
+                ChartRef::Ui(i) => v.charts[i].data = data,
+                ChartRef::Drawing(i) => v.pkg.workbook.sheets[sidx].drawings[i].kind = gridcore::sheet::DrawingKind::Chart(data),
+            }
+        }
+        self.mark_sheet_dirty();
+        cx.notify();
+    }
+
+    /// Re-point the selected chart at another range, replotting its categories
+    /// and series from those cells while keeping its type, title and colours.
+    fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(old) = self.chart_data() else { return };
+        let Some(range) = gridcore::sheet::parse_range_name(text.trim()) else {
+            self.set_status("Chart range: expected something like A1:D5");
+            cx.notify();
+            return;
+        };
+        let Some(mut data) = self.active_sheet().and_then(|v| {
+            let sh = v.sheet();
+            gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
+        }) else {
+            self.set_status("Chart range: no numeric column in that range");
+            cx.notify();
+            return;
+        };
+        // The new plot keeps the look of the old one.
+        data.title = old.title.clone();
+        data.part = old.part.clone();
+        for (i, s) in data.series.iter_mut().enumerate() {
+            s.color = old.series.get(i).and_then(|o| o.color);
+        }
+        self.set_status(format!("Chart plots {}", text.trim().to_uppercase()));
+        self.chart_set_data(data, cx);
+    }
+
+    /// Switch the selected chart between column / bar / line / pie.
+    fn chart_set_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        if data.kind == kind {
+            return;
+        }
+        data.kind = kind.to_string();
+        self.chart_set_data(data, cx);
+    }
+
+    /// Colour one series of the selected chart.
+    fn chart_set_color(&mut self, series: usize, rgb: u32, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        let Some(s) = data.series.get_mut(series) else { return };
+        // Clicking the colour a series already has clears it back to the
+        // palette default.
+        s.color = if s.color == Some(rgb) { None } else { Some(rgb) };
+        self.chart_set_data(data, cx);
+    }
+
+    /// Typing in one of the Chart panel's text fields.
+    fn chart_field_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
+        let Some((field, mut buf)) = self.chart_field.clone() else { return };
+        match key {
+            "escape" => self.chart_field = None,
+            "enter" => {
+                self.chart_field = None;
+                match field {
+                    ChartField::Range => return self.chart_apply_range(&buf.clone(), cx),
+                    ChartField::Title => {
+                        if let Some(mut data) = self.chart_data() {
+                            data.title = buf.trim().to_string();
+                            return self.chart_set_data(data, cx);
+                        }
+                    }
+                }
+            }
+            "backspace" => {
+                buf.pop();
+                self.chart_field = Some((field, buf));
+            }
+            _ => {
+                if let Some(c) = ev.keystroke.key_char.as_deref() {
+                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
+                        buf.push_str(c);
+                    }
+                }
+                self.chart_field = Some((field, buf));
+            }
+        }
         cx.notify();
     }
 
@@ -3180,56 +3339,20 @@ impl Docxy {
     /// Build a clustered column chart from the selected range (categories = first
     /// text column, one series per numeric column) and float it over the sheet.
     fn sheet_insert_chart(&mut self, kind: &str, cx: &mut Context<Self>) {
-        use gridcore::sheet::{CellValue, ChartData, ChartSeries};
         if let Some(v) = self.active_sheet_mut() {
-            let (r0, c0, r1, c1) = if v.has_range() {
+            let range = if v.has_range() {
                 v.range()
             } else {
                 let (mr, mc) = v.extent();
                 (0, 0, mr, mc)
             };
             let sh = v.sheet();
-            let mut cat_col: Option<u32> = None;
-            let mut num_cols: Vec<u32> = Vec::new();
-            for c in c0..=c1 {
-                let (mut nums, mut txts) = (0u32, 0u32);
-                for r in (r0 + 1)..=r1 {
-                    match sh.cell(r, c).map(|cl| &cl.value) {
-                        Some(CellValue::Number(_)) => nums += 1,
-                        Some(CellValue::Text(_)) => txts += 1,
-                        _ => {}
-                    }
-                }
-                if nums > 0 && nums >= txts {
-                    num_cols.push(c);
-                } else if cat_col.is_none() {
-                    cat_col = Some(c);
-                }
-            }
-            let cat_col = cat_col.unwrap_or(c0);
-            let data_rows: Vec<u32> = (r0 + 1..=r1).collect();
-            let categories: Vec<String> = data_rows.iter().map(|&r| v.cell_text(r, cat_col)).collect();
-            let title = v.cell_text(r0, cat_col);
-            let series: Vec<ChartSeries> = num_cols
-                .iter()
-                .map(|&c| {
-                    let name = v.cell_text(r0, c);
-                    let values = data_rows
-                        .iter()
-                        .map(|&r| match v.sheet().cell(r, c).map(|cl| &cl.value) {
-                            Some(CellValue::Number(n)) => *n,
-                            _ => 0.0,
-                        })
-                        .collect();
-                    ChartSeries { name, values }
-                })
-                .collect();
-            if !series.is_empty() {
-                let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: kind.to_string(), categories, series };
+            if let Some(data) = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind) {
                 let s = v.active;
                 // Anchor the saved chart just right of the selected range. The
                 // span is the card's size now, so pick one that reads well and
                 // let the user drag it from there.
+                let (r0, _, _, c1) = range;
                 let from = (r0, c1 + 2);
                 let to = (r0 + 10, c1 + 8);
                 v.charts.push(ChartView { sheet: s, from, to, data });
@@ -3307,6 +3430,140 @@ impl Docxy {
             .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("PivotTable Fields"))
             .child(div().px_3().pb_1().text_size(px(10.)).text_color(pal.dim).child("Field: Rows \u{2192} Columns \u{2192} \u{03A3} Values \u{2192} off. On a Values field, click the chip to change Sum/Count/Avg/Max/Min."))
             .child(div().id("pivot-fields").flex_1().min_h(px(0.)).overflow_y_scroll().px_2().child(fields))
+            .into_any_element()
+    }
+
+    /// The "Chart" side panel, shown while a chart is selected: what it plots,
+    /// how it is drawn, its title, and a colour per series. Every control acts
+    /// on the selection immediately.
+    fn chart_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let Some(data) = self.chart_data() else { return div().into_any_element() };
+        let ent = cx.entity();
+        let heading = |t: &'static str| div().px_1().pt_2().pb(px(2.)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(pal.dim).child(t);
+
+        // A text field: shows the live buffer with a caret while it has the
+        // keyboard, the committed value otherwise. Clicking focuses it.
+        let field = |id: &'static str, which: ChartField, value: String, hint: &'static str| {
+            let editing = match &self.chart_field {
+                Some((f, buf)) if *f == which => Some(buf.clone()),
+                _ => None,
+            };
+            let ent_f = ent.clone();
+            let seed = value.clone();
+            div()
+                .id(id)
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap(px(1.))
+                .rounded(px(4.))
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(if editing.is_some() { hsla_u(BRAND) } else { pal.border })
+                .cursor_text()
+                .text_size(px(12.))
+                .text_color(if editing.is_some() || !value.is_empty() { hsla_u(0x1a1a1a) } else { hsla_u(0x999999) })
+                .child(div().overflow_hidden().child(SharedString::from(match &editing {
+                    Some(b) => b.clone(),
+                    None if value.is_empty() => hint.to_string(),
+                    None => value,
+                })))
+                .when(editing.is_some(), |d| d.child(div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none()))
+                .on_click(move |_ev, _w, cx2| {
+                    ent_f.update(cx2, |this, cx2| {
+                        this.chart_field = Some((which, seed.clone()));
+                        cx2.notify();
+                    });
+                })
+        };
+
+        // Chart type: the four kinds we draw, current one filled in.
+        let mut types = h_flex().gap(px(4.)).flex_wrap();
+        for (kind, label) in [("column", "Column"), ("bar", "Bar"), ("line", "Line"), ("pie", "Pie")] {
+            let on = data.kind == kind;
+            let ent_k = ent.clone();
+            types = types.child(
+                div()
+                    .id(ElementId::Name(format!("charttype-{kind}").into()))
+                    .px_2()
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .border_1()
+                    .border_color(if on { hsla_u(BRAND) } else { pal.border })
+                    .bg(if on { hsla_u(BRAND) } else { pal.hover })
+                    .text_color(if on { hsla_u(0xffffff) } else { pal.fg })
+                    .hover(|d| if on { d } else { d.bg(pal.panel) })
+                    .child(label)
+                    .on_click(move |_ev, _w, cx2| {
+                        ent_k.update(cx2, |this, cx2| this.chart_set_kind(kind, cx2));
+                    }),
+            );
+        }
+
+        // One swatch row per series; the series' own colour is ringed.
+        let mut colors = v_flex().gap(px(4.));
+        for (si, s) in data.series.iter().enumerate() {
+            let mut row = v_flex().gap(px(2.));
+            row = row.child(div().text_size(px(11.)).text_color(pal.fg).overflow_hidden().child(SharedString::from(if s.name.is_empty() { format!("Series {}", si + 1) } else { s.name.clone() })));
+            let mut swatches = h_flex().gap(px(3.));
+            for swatch in CHART_COLORS {
+                let on = s.color == Some(swatch);
+                let ent_c = ent.clone();
+                swatches = swatches.child(
+                    div()
+                        .id(ElementId::Name(format!("chartcol-{si}-{swatch:06x}").into()))
+                        .w(px(18.))
+                        .h(px(14.))
+                        .rounded(px(3.))
+                        .bg(rgb(swatch))
+                        .border_2()
+                        .border_color(if on { hsla_u(0x1a1a1a) } else { hsla_u(0xffffff) })
+                        .cursor_pointer()
+                        .on_click(move |_ev, _w, cx2| {
+                            ent_c.update(cx2, |this, cx2| this.chart_set_color(si, swatch, cx2));
+                        }),
+                );
+            }
+            colors = colors.child(row.child(swatches));
+        }
+
+        let range_text = data
+            .source
+            .as_ref()
+            .map(|s| {
+                let (r1, c1, r2, c2) = s.range;
+                format!("{}:{}", gridcore::sheet::cell_name(r1, c1), gridcore::sheet::cell_name(r2, c2))
+            })
+            .unwrap_or_default();
+        v_flex()
+            .w(px(232.))
+            .h_full()
+            .flex_none()
+            .bg(pal.panel)
+            .border_l_1()
+            .border_color(pal.border)
+            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("Chart"))
+            .child(
+                v_flex()
+                    .id("chart-panel-body")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px_3()
+                    .pb_2()
+                    .child(heading("DATA RANGE"))
+                    .child(field("chart-range", ChartField::Range, range_text, "e.g. A1:D5"))
+                    .child(div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("Include the header row: it names the series. Enter to replot."))
+                    .child(heading("TYPE"))
+                    .child(types)
+                    .child(heading("TITLE"))
+                    .child(field("chart-title", ChartField::Title, data.title.clone(), "Chart title"))
+                    .child(heading("SERIES COLOURS"))
+                    .child(colors),
+            )
             .into_any_element()
     }
 
@@ -3471,6 +3728,10 @@ impl Docxy {
                 _ => {}
             }
             return;
+        }
+        // A Chart-panel text field swallows typing until Enter/Esc.
+        if self.chart_field.is_some() {
+            return self.chart_field_key(ev, key, cx);
         }
         // A selected chart takes the object keys (Escape drops it, Delete removes
         // it) before they reach the grid.
@@ -8611,6 +8872,8 @@ impl Render for Docxy {
         let notes_panel = (is_doc && self.show_notes).then(|| self.notes_panel(pal, cx));
         // The PivotTable Fields panel, shown when a pivot output sheet is active.
         let pivot_panel = self.active_pivot().map(|i| self.pivot_panel(i, pal, cx));
+        // The Chart panel takes the same slot while a chart is selected.
+        let chart_panel = (!is_doc && self.chart_sel.is_some()).then(|| self.chart_panel(pal, cx));
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
@@ -8624,7 +8887,8 @@ impl Render for Docxy {
             .child(content)
             .when_some(comments_panel, |d, p| d.child(p))
             .when_some(notes_panel, |d, p| d.child(p))
-            .when_some(pivot_panel, |d, p| d.child(p));
+            .when_some(pivot_panel, |d, p| d.child(p))
+            .when_some(chart_panel, |d, p| d.child(p));
         let context_menu = self.context_menu.map(|at| self.context_menu_el(at, pal, cx));
         let mini_bar = (is_doc && self.context_menu.is_none()).then_some(self.mini_bar).flatten().map(|at| self.mini_bar_el(at, pal, cx));
 
@@ -9124,6 +9388,8 @@ fn chart_grips(idx: usize, w: f32, h: f32, ent: &Entity<Docxy>) -> Vec<AnyElemen
 /// A floating chart card drawn at `w` × `h` (its anchor's cell extent).
 fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
     const PALETTE: [u32; 6] = [0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A];
+    // A series' own colour wins over its slot in the palette.
+    let ser_color = |si: usize| data.series.get(si).and_then(|s| s.color).unwrap_or(PALETTE[si % PALETTE.len()]);
     let maxv = data.series.iter().flat_map(|s| s.values.iter().copied()).fold(0.0f64, f64::max).max(1.0);
     let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
     // The title strip and the legend take fixed bites out of the card; the plot
@@ -9150,7 +9416,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                 for (si, s) in data.series.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let frac = (val.max(0.0) / maxv) as f32;
-                    bars = bars.child(div().h(px(6.)).w(relative(frac.clamp(0.02, 1.0))).rounded_r(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                    bars = bars.child(div().h(px(6.)).w(relative(frac.clamp(0.02, 1.0))).rounded_r(px(1.)).bg(rgb(ser_color(si))));
                 }
                 row = row.child(bars);
                 col = col.child(row);
@@ -9165,7 +9431,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                 for (si, s) in data.series.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
-                    stack = stack.child(div().absolute().bottom(px(h - 3.5)).left(px(3.5)).size(px(7.)).rounded(px(4.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                    stack = stack.child(div().absolute().bottom(px(h - 3.5)).left(px(3.5)).size(px(7.)).rounded(px(4.)).bg(rgb(ser_color(si))));
                 }
                 plot = plot.child(v_flex().flex_1().items_center().justify_end().gap(px(2.)).h(px(area_h - 2.)).child(stack).child(cat_label(ci)));
             }
@@ -9196,7 +9462,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                 for (si, s) in data.series.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
-                    cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
+                    cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(ser_color(si))));
                 }
                 plot = plot.child(v_flex().flex_1().items_center().justify_end().gap(px(2.)).h(px(area_h - 2.)).child(cluster).child(cat_label(ci)));
             }
@@ -9211,7 +9477,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                 h_flex()
                     .items_center()
                     .gap_1()
-                    .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(PALETTE[si % PALETTE.len()])))
+                    .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(ser_color(si))))
                     .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(s.name.clone()))),
             );
         }
