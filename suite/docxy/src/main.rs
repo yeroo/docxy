@@ -271,6 +271,94 @@ struct FillDrag {
     to: (u32, u32),
 }
 
+/// An in-progress chart move: which chart on the active sheet, where the press
+/// landed (window coords) and how far the pointer has travelled since.
+#[derive(Clone, Copy)]
+struct ChartDrag {
+    idx: usize,
+    origin: (f32, f32),
+    delta: (f32, f32),
+}
+
+/// Chart state the overlay renderer needs, which lives on `Docxy` rather than
+/// on the sheet view.
+#[derive(Clone, Copy, Default)]
+struct ChartUi {
+    sel: Option<usize>,
+    /// (index, dx, dy) of the card the pointer is currently dragging.
+    drag: Option<(usize, f32, f32)>,
+}
+
+/// The column an anchor lands on after being dragged `dx` px sideways: walk
+/// cell by cell from `ac`, stopping at whichever boundary the drag ended
+/// nearest. Bounded, so a run of zero-width (hidden) columns can't spin.
+fn shift_col(sh: &gridcore::sheet::Sheet, ac: u32, dx: f32) -> u32 {
+    let mut c = ac as i64;
+    let mut acc = 0.0f32;
+    for _ in 0..512 {
+        if dx >= 0.0 {
+            let w = col_px(sh.col_width(c as u32));
+            if acc + w > dx {
+                if dx - acc > w / 2.0 {
+                    c += 1;
+                }
+                break;
+            }
+            acc += w;
+            c += 1;
+        } else {
+            if c == 0 {
+                break;
+            }
+            let w = col_px(sh.col_width((c - 1) as u32));
+            if acc - w < dx {
+                if acc - dx > w / 2.0 {
+                    c -= 1;
+                }
+                break;
+            }
+            acc -= w;
+            c -= 1;
+        }
+    }
+    c.max(0) as u32
+}
+
+/// `shift_col`'s counterpart down the rows (each row is its height plus the
+/// 1px gridline under it).
+fn shift_row(sh: &gridcore::sheet::Sheet, ar: u32, dy: f32) -> u32 {
+    let h = |r: u32| row_height_px(sh.row_height(r), SHEET_ROW_H) + 1.0;
+    let mut rr = ar as i64;
+    let mut acc = 0.0f32;
+    for _ in 0..2048 {
+        if dy >= 0.0 {
+            let rh = h(rr as u32);
+            if acc + rh > dy {
+                if dy - acc > rh / 2.0 {
+                    rr += 1;
+                }
+                break;
+            }
+            acc += rh;
+            rr += 1;
+        } else {
+            if rr == 0 {
+                break;
+            }
+            let rh = h((rr - 1) as u32);
+            if acc - rh < dy {
+                if acc - dy > rh / 2.0 {
+                    rr -= 1;
+                }
+                break;
+            }
+            acc -= rh;
+            rr -= 1;
+        }
+    }
+    rr.max(0) as u32
+}
+
 /// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
 /// columns (right), whichever the handle was pulled furthest along. Returns the
 /// full box (source + filled cells), 0-based inclusive.
@@ -597,6 +685,12 @@ struct Docxy {
     sheet_dragging: bool,
     // An in-progress auto-fill drag from the selection's fill handle.
     sheet_fill: Option<FillDrag>,
+    // The selected chart on the active sheet, as an index into that sheet's
+    // chart list (UI-authored charts first, then the ones loaded from the file).
+    chart_sel: Option<usize>,
+    // An in-progress chart move: which chart, and how far the pointer has
+    // travelled since the press. The anchor only moves on release.
+    chart_drag: Option<ChartDrag>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1174,6 +1268,8 @@ impl Docxy {
             selecting: false,
             sheet_dragging: false,
             sheet_fill: None,
+            chart_sel: None,
+            chart_drag: None,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1271,6 +1367,7 @@ impl Docxy {
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
+        self.chart_sel = None; // going back to the grid drops any chart selection
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
@@ -1302,6 +1399,117 @@ impl Docxy {
         }
         f.to = (row, col);
         self.sheet_fill = Some(f);
+        cx.notify();
+    }
+
+    /// Chart selection + in-progress move, for the overlay renderer.
+    fn chart_ui(&self) -> ChartUi {
+        ChartUi {
+            sel: self.chart_sel,
+            drag: self.chart_drag.map(|d| (d.idx, d.delta.0, d.delta.1)),
+        }
+    }
+
+    /// Press on a chart card: select it (Excel selects on mouse-down, not on
+    /// click) and arm a move from where the pointer went down.
+    fn chart_press(&mut self, idx: usize, at: (f32, f32), cx: &mut Context<Self>) {
+        self.chart_sel = Some(idx);
+        self.chart_drag = Some(ChartDrag { idx, origin: at, delta: (0.0, 0.0) });
+        cx.notify();
+    }
+
+    /// Track a chart move. The card follows the pointer, but its anchor cell
+    /// isn't touched until the button comes up.
+    fn chart_drag_move(&mut self, at: (f32, f32), cx: &mut Context<Self>) {
+        let Some(mut d) = self.chart_drag else { return };
+        let delta = (at.0 - d.origin.0, at.1 - d.origin.1);
+        if delta == d.delta {
+            return;
+        }
+        d.delta = delta;
+        self.chart_drag = Some(d);
+        cx.notify();
+    }
+
+    /// Finish a chart move: re-anchor it to the cell the drag landed on.
+    fn chart_drag_end(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.chart_drag.take() else { return };
+        if d.delta == (0.0, 0.0) {
+            return; // a plain click — selection only
+        }
+        self.sheet_snapshot();
+        let mut moved = false;
+        if let Some(v) = self.active_sheet_mut() {
+            let sidx = v.active;
+            // Resolve the index the same way the overlay lays the cards out:
+            // this sheet's UI-authored charts first, then the loaded drawings.
+            let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
+            // Where the anchor lands, and how far that is in whole cells (the
+            // opposite corner rides along so the card keeps its cell span).
+            let landed = |from: (u32, u32), sh: &gridcore::sheet::Sheet| {
+                let nr = shift_row(sh, from.0, d.delta.1);
+                let nc = shift_col(sh, from.1, d.delta.0);
+                (nr, nc, nr as i64 - from.0 as i64, nc as i64 - from.1 as i64)
+            };
+            let ui_target = if d.idx < ui_n {
+                v.charts.iter().enumerate().filter(|(_, c)| c.sheet == sidx).map(|(i, _)| i).nth(d.idx)
+            } else {
+                None
+            };
+            if let Some(pos) = ui_target {
+                let (nr, nc, dr, dc) = landed(v.charts[pos].from, &v.pkg.workbook.sheets[sidx]);
+                let cv = &mut v.charts[pos];
+                cv.from = (nr, nc);
+                cv.to = ((cv.to.0 as i64 + dr).max(0) as u32, (cv.to.1 as i64 + dc).max(0) as u32);
+                moved = true;
+            } else if let Some(i) = v.pkg.workbook.sheets[sidx]
+                .drawings
+                .iter()
+                .enumerate()
+                .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
+                .map(|(i, _)| i)
+                .nth(d.idx.saturating_sub(ui_n))
+            {
+                let from = v.pkg.workbook.sheets[sidx].drawings[i].from;
+                let (nr, nc, dr, dc) = landed(from, &v.pkg.workbook.sheets[sidx]);
+                let dw = &mut v.pkg.workbook.sheets[sidx].drawings[i];
+                dw.from = (nr, nc);
+                dw.to = ((dw.to.0 as i64 + dr).max(0) as u32, (dw.to.1 as i64 + dc).max(0) as u32);
+                moved = true;
+            }
+        }
+        if moved {
+            self.mark_sheet_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Remove the selected chart (Delete on a selected object, Excel-style).
+    fn chart_delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(idx) = self.chart_sel.take() else { return };
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let sidx = v.active;
+            let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
+            if idx < ui_n {
+                if let Some(pos) = v.charts.iter().enumerate().filter(|(_, c)| c.sheet == sidx).map(|(i, _)| i).nth(idx) {
+                    v.charts.remove(pos);
+                }
+            } else if let Some(i) = v.pkg.workbook.sheets[sidx]
+                .drawings
+                .iter()
+                .enumerate()
+                .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
+                .map(|(i, _)| i)
+                .nth(idx - ui_n)
+            {
+                // The drawing part round-trips verbatim, so record the anchor a
+                // save has to strike from it as well.
+                let gone = v.pkg.workbook.sheets[sidx].drawings.remove(i);
+                v.pkg.workbook.sheets[sidx].drawings_removed.push(gone.anchor_ix);
+            }
+        }
+        self.mark_sheet_dirty();
         cx.notify();
     }
 
@@ -1344,6 +1552,9 @@ impl Docxy {
     /// virtualized list swallows child `on_mouse_down`, so the drag start is
     /// inferred from the first move rather than a press).
     fn sheet_drag_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.chart_drag.is_some() {
+            return; // the pointer is carrying a chart, not sweeping cells
+        }
         if !self.sheet_dragging {
             self.sheet_dragging = true;
             self.select_cell(row, col, cx); // anchor + sel at the drag origin
@@ -3209,9 +3420,23 @@ impl Docxy {
             }
             return;
         }
+        // A selected chart takes the object keys (Escape drops it, Delete removes
+        // it) before they reach the grid.
+        if self.chart_sel.is_some() && !editing {
+            match key {
+                "escape" => {
+                    self.chart_sel = None;
+                    cx.notify();
+                    return;
+                }
+                "delete" | "backspace" => return self.chart_delete_selected(cx),
+                _ => {}
+            }
+        }
         match key {
             "escape" => {
                 self.sheet_pick = None;
+                self.chart_sel = None;
                 if let Some(v) = self.active_sheet_mut() {
                     v.editing = None;
                 }
@@ -8261,7 +8486,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.chart_ui(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -8902,7 +9127,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -9186,12 +9411,62 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .filter(|c| c.sheet == view.active)
         .map(|cv| (cv.from, &cv.data))
         .chain(loaded)
-        .filter_map(|(from, data)| {
+        .enumerate()
+        .filter_map(|(i, (from, data))| {
             // `from` is (row, col) for UI charts and gridcore drawings alike.
             let (ar, ac) = from;
             let x = col_x(ac)?;
             let y = row_y(ar);
-            Some(div().absolute().left(px(x)).top(px(y)).child(chart_card(data)).into_any_element())
+            // A card being dragged follows the pointer; its anchor only moves
+            // when the button comes up.
+            let (dx, dy) = match chart_ui.drag {
+                Some((di, dx, dy)) if di == i => (dx, dy),
+                _ => (0.0, 0.0),
+            };
+            let selected = chart_ui.sel == Some(i);
+            let ent_c = ent.clone();
+            let ent_m = ent.clone();
+            Some(
+                div()
+                    .id(ElementId::Name(format!("chart-{i}").into()))
+                    .absolute()
+                    .left(px(x + dx))
+                    .top(px(y + dy))
+                    .cursor(if selected { CursorStyle::OpenHand } else { CursorStyle::Arrow })
+                    // Excel selects an object on press, and the same press begins
+                    // the move; the cell underneath must not also react.
+                    .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                        cx2.stop_propagation();
+                        let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        ent_c.update(cx2, |this, cx2| this.chart_press(i, at, cx2));
+                    })
+                    // The card follows the pointer, so it sits under it for most
+                    // of the drag — and a hovered hitbox is the only one that gets
+                    // move events. Without this the drag stalls the moment the
+                    // card catches up; the grid's own handler covers the rest.
+                    .on_mouse_move(move |ev, _w, cx2| {
+                        if ev.pressed_button == Some(MouseButton::Left) {
+                            let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                            ent_m.update(cx2, |this, cx2| this.chart_drag_move(at, cx2));
+                        }
+                    })
+                    .child(chart_card(data))
+                    // The selection frame sits just outside the card, like Excel's.
+                    .when(selected, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(-3.))
+                                .top(px(-3.))
+                                .right(px(-3.))
+                                .bottom(px(-3.))
+                                .border_1()
+                                .border_color(hsla_u(BRAND))
+                                .rounded(px(4.)),
+                        )
+                    })
+                    .into_any_element(),
+            )
         })
         .collect();
     // A yellow note box for the selected commented cell (hidden while its entry
@@ -9299,14 +9574,22 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .bg(hsla_u(0xffffff))
         // Column-resize drag: track the pointer and release anywhere in the grid.
         .on_mouse_move(move |ev, _w, cx| {
-            let x = f32::from(ev.position.x);
-            ent_move.update(cx, |this, cx| this.col_resize_move(x, cx));
+            let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+            ent_move.update(cx, |this, cx| {
+                this.col_resize_move(at.0, cx);
+                // A chart move is tracked here rather than on the card, so the
+                // pointer can outrun it without dropping the drag.
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    this.chart_drag_move(at, cx);
+                }
+            });
         })
         .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
             ent_up.update(cx, |this, cx| {
                 this.col_resize_end(cx);
                 this.sheet_dragging = false; // end any drag-select
                 this.sheet_fill_end(cx); // commit an auto-fill drag, if any
+                this.chart_drag_end(cx); // commit a chart move, if any
             });
         })
         .child(bar)

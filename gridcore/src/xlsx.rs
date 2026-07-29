@@ -255,6 +255,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
                             .map(|(_, ty, t)| (ty.to_ascii_lowercase(), resolve_relative(ddir, t)))
                     };
                     sheet.drawings = crate::drawing::parse_drawings(&dxml, &resolve_rid, &get_str);
+                    sheet.drawing_part = Some(dpart.clone());
                 }
             }
         }
@@ -1489,6 +1490,15 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         let updated = splice_worksheet(&source, sheet, &sheet_data);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == part_name) {
             p.1 = updated.into_bytes();
+        }
+        // Drawings round-trip as their original part, so a moved anchor has to
+        // be written back into it.
+        if let Some(dpart) = sheet.drawing_part.as_deref() {
+            let moves: Vec<(usize, (u32, u32), (u32, u32))> = sheet.drawings.iter().map(|d| (d.anchor_ix, d.from, d.to)).collect();
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
+                p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed).into_bytes();
+            }
         }
     }
 
@@ -2733,7 +2743,7 @@ impl SheetPackage {
             }
         }
 
-        self.workbook.sheets[sheet].drawings.push(crate::sheet::Drawing { from, to, kind: crate::sheet::DrawingKind::Chart(data.clone()) });
+        self.workbook.sheets[sheet].drawings.push(crate::sheet::Drawing { anchor_ix: 0, from, to, kind: crate::sheet::DrawingKind::Chart(data.clone()) });
     }
 
     /// Create a pivot table from scratch: writes a pivotCacheDefinition and

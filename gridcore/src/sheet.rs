@@ -224,8 +224,14 @@ pub struct Sheet {
     /// enforced on edit.
     pub validations: Vec<DataValidation>,
     /// Floating drawings anchored to the grid (`xl/drawings/*`): pictures and
-    /// charts. Rendered as an overlay; not editable.
+    /// charts. Rendered as an overlay; only their anchors are editable.
     pub drawings: Vec<Drawing>,
+    /// The part path these `drawings` were read from, so a save can write their
+    /// anchors back into it (the part itself round-trips verbatim otherwise).
+    pub drawing_part: Option<String>,
+    /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
+    /// the same round-trip means a save has to strike them from the part too.
+    pub drawings_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -251,6 +257,10 @@ impl Sheet {
 /// A floating drawing anchored over a cell rectangle (a picture or a chart).
 #[derive(Clone, Debug)]
 pub struct Drawing {
+    /// This drawing's position among ALL anchors in its part — anchors we can't
+    /// render (shapes, text boxes) are skipped here but still occupy a slot, so
+    /// a save needs this to rewrite the right element.
+    pub anchor_ix: usize,
     /// Top-left anchor cell `(row, col)`, 0-based.
     pub from: (u32, u32),
     /// Bottom-right extent `(row, col)`, 0-based, inclusive-ish. For a

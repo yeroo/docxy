@@ -32,10 +32,16 @@ pub fn parse_drawings(
     let mut ext: Option<(i64, i64)> = None;
     let mut name = String::new();
     let mut kind: Option<DrawingKind> = None;
+    // Counts every anchor, including the ones we skip, so each Drawing can point
+    // back at the element it came from.
+    let mut anchor_ix = 0usize;
+    let mut seen = 0usize;
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
                 "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor" => {
+                    anchor_ix = seen;
+                    seen += 1;
                     from = None;
                     to = None;
                     ext = None;
@@ -92,6 +98,7 @@ pub fn parse_drawings(
                     if let (Some(f), Some(k)) = (from, kind.take()) {
                         let t = to.or_else(|| ext.map(|e| estimate_to(f, e))).unwrap_or(f);
                         out.push(Drawing {
+                            anchor_ix,
                             from: f,
                             to: t,
                             kind: k,
@@ -140,6 +147,124 @@ fn parse_anchor_cell(p: &mut XmlParser) -> (u32, u32) {
         }
     }
     (row, col)
+}
+
+/// Edit a drawing part in place: move the `<from>`/`<to>` cells of the anchors
+/// in `moves`, drop the anchor elements listed in `drop`, and leave everything
+/// else — other anchors, offsets, artwork — byte for byte as it was. Both are
+/// keyed by [`Drawing::anchor_ix`], which counts every anchor in the part
+/// (including the ones we don't model). A `oneCellAnchor` has no `<to>`; only
+/// its `<from>` moves, and its extent rides along.
+pub fn rewrite_anchors(xml: &str, moves: &[(usize, (u32, u32), (u32, u32))], drop: &[usize]) -> String {
+    if moves.is_empty() && drop.is_empty() {
+        return xml.to_string();
+    }
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    let mut ix = 0usize;
+    while let Some((cut, tag)) = next_anchor(rest) {
+        out.push_str(&rest[..cut]);
+        rest = &rest[cut..];
+        let Some(end) = find_close(rest, tag) else { break };
+        let (element, after) = rest.split_at(end);
+        if !drop.contains(&ix) {
+            match moves.iter().find(|(i, _, _)| *i == ix) {
+                Some((_, from, to)) => out.push_str(&move_anchor(element, *from, *to)),
+                None => out.push_str(element),
+            }
+        }
+        ix += 1;
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The next anchor element start in `xml`: its offset and its full tag name.
+fn next_anchor(xml: &str) -> Option<(usize, &str)> {
+    let mut at = 0usize;
+    while let Some(rel) = xml[at..].find('<') {
+        let start = at + rel;
+        let name_end = xml[start + 1..].find(['>', ' ', '/'])? + start + 1;
+        let name = &xml[start + 1..name_end];
+        // Closing tags share the local name, so only openers count.
+        let l = if name.starts_with(['/', '!', '?']) { "" } else { local(name) };
+        if matches!(l, "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor") {
+            return Some((start, name));
+        }
+        at = name_end;
+    }
+    None
+}
+
+/// Rewrite one anchor element's `<from>`/`<to>` cells.
+fn move_anchor(element: &str, from: (u32, u32), to: (u32, u32)) -> String {
+    let mut out = String::with_capacity(element.len());
+    let mut rest = element;
+    let mut at = 0usize;
+    while let Some(rel) = rest[at..].find('<') {
+        let start = at + rel;
+        let Some(name_end) = rest[start + 1..].find(['>', ' ', '/']).map(|i| i + start + 1) else { break };
+        let name = &rest[start + 1..name_end];
+        let side = if name.starts_with(['/', '!', '?']) {
+            None
+        } else {
+            match local(name) {
+                "from" => Some(from),
+                "to" => Some(to),
+                _ => None,
+            }
+        };
+        match side.and_then(|cell| find_close(&rest[start..], name).map(|e| (cell, start + e))) {
+            Some(((row, col), end)) => {
+                out.push_str(&rest[..start]);
+                out.push_str(&set_cell_fields(&rest[start..end], row, col));
+                rest = &rest[end..];
+                at = 0;
+            }
+            None => at = name_end,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The offset just past `</tag>` in `xml`, which must start at `<tag…`.
+fn find_close(xml: &str, tag: &str) -> Option<usize> {
+    let close = format!("</{tag}>");
+    xml.find(&close).map(|i| i + close.len())
+}
+
+/// Replace the `<col>`/`<row>` values inside one anchor-cell block.
+fn set_cell_fields(block: &str, row: u32, col: u32) -> String {
+    let mut out = String::with_capacity(block.len());
+    let mut rest = block;
+    while let Some(rel) = rest.find('<') {
+        let (head, tail) = rest.split_at(rel);
+        out.push_str(head);
+        let Some(name_end) = tail[1..].find(['>', ' ', '/']).map(|i| i + 1) else {
+            out.push_str(tail);
+            return out;
+        };
+        let name = &tail[1..name_end];
+        let value = match local(name) {
+            "col" => Some(col),
+            "row" => Some(row),
+            _ => None,
+        };
+        match value.and_then(|v| find_close(tail, name).map(|e| (v, e))) {
+            Some((v, end)) => {
+                out.push_str(&format!("<{name}>{v}</{name}>"));
+                rest = &tail[end..];
+            }
+            None => {
+                out.push_str(&tail[..name_end]);
+                rest = &tail[name_end..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Estimate a bottom-right cell from a top-left anchor plus an EMU extent.
@@ -260,6 +385,49 @@ mod tests {
             }
             _ => panic!("expected image"),
         }
+    }
+
+    #[test]
+    fn rewrite_anchors_moves_one_and_leaves_the_rest_alone() {
+        // Two anchors; the first holds a shape we don't model, so the picture's
+        // `anchor_ix` is 1 even though it is the only Drawing parsed.
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>0</xdr:col><xdr:colOff>7</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>9</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>2</xdr:col><xdr:row>2</xdr:row></xdr:to>
+              <xdr:sp/>
+            </xdr:twoCellAnchor>
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let resolve = |rid: &str| (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()));
+        let get = |_: &str| None;
+        let ds = parse_drawings(xml, &resolve, &get);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].anchor_ix, 1, "the unmodelled shape still occupies anchor 0");
+
+        // Move it three rows down and one column right.
+        let out = rewrite_anchors(xml, &[(1, (5, 2), (13, 6))], &[]);
+        let moved = parse_drawings(&out, &resolve, &get);
+        assert_eq!(moved[0].from, (5, 2));
+        assert_eq!(moved[0].to, (13, 6));
+        // The untouched anchor and the offsets inside the moved one survive.
+        assert!(out.contains("<xdr:col>0</xdr:col><xdr:colOff>7</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>9</xdr:rowOff>"));
+        assert!(out.contains("<xdr:sp/>"));
+        assert!(out.contains(r#"<xdr:cNvPr id="2" name="Logo"/>"#));
+        assert!(out.contains("<xdr:colOff>0</xdr:colOff>"), "the moved anchor keeps its offsets");
+        // Rewriting nothing is a byte-for-byte no-op.
+        assert_eq!(rewrite_anchors(xml, &[], &[]), xml);
+
+        // Dropping the picture's anchor leaves the shape's anchor behind.
+        let culled = rewrite_anchors(xml, &[], &[1]);
+        assert!(parse_drawings(&culled, &resolve, &get).is_empty());
+        assert!(culled.contains("<xdr:sp/>"));
+        assert!(!culled.contains("Logo"));
+        assert_eq!(culled.matches("<xdr:twoCellAnchor>").count(), 1);
     }
 
     #[test]
