@@ -790,6 +790,9 @@ struct Docxy {
     chart_field: Option<ChartFieldEdit>,
     // What the last Chart-panel action said, shown under the range field.
     chart_msg: Option<(bool, String)>,
+    // Anchor cell of a range being picked off the grid while a range field has
+    // the keyboard (Excel's point mode).
+    range_pick: Option<(u32, u32)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1176,6 +1179,14 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
         .into_any_element()
 }
 
+/// The A1 text for a range dragged from `anchor` to `to`, in either direction.
+fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
+    use gridcore::sheet::cell_name;
+    let (r0, c0) = (anchor.0.min(to.0), anchor.1.min(to.1));
+    let (r1, c1) = (anchor.0.max(to.0), anchor.1.max(to.1));
+    format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+}
+
 /// One run of a Chart-panel field's text (`base_off` is its char offset in the
 /// buffer). Pressing puts the caret under the pointer — extending the selection
 /// on Shift, taking the whole field on a double click — and dragging over any
@@ -1448,6 +1459,7 @@ impl Docxy {
             chart_drag: None,
             chart_field: None,
             chart_msg: None,
+            range_pick: None,
             keytips: KeyTip::Off,
             context_menu: None,
             mini_bar: None,
@@ -1542,6 +1554,9 @@ impl Docxy {
     /// Move the spreadsheet selection to a cell (from a grid click), collapsing
     /// the range and committing any in-progress edit first.
     fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.range_field_active() {
+            return self.range_pick_to(row, col, true, cx);
+        }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
@@ -1713,6 +1728,42 @@ impl Docxy {
         // palette default.
         s.color = if s.color == Some(rgb) { None } else { Some(rgb) };
         self.chart_set_data(data, cx);
+    }
+
+    /// Is a range field holding the keyboard? Then the grid is in point mode:
+    /// clicking and dragging over cells writes the range into that field rather
+    /// than moving the cell selection.
+    fn range_field_active(&self) -> bool {
+        matches!(&self.chart_field, Some(f) if f.which == ChartField::Range)
+    }
+
+    /// Point at `(row, col)`: `start` plants the anchor (a press), otherwise the
+    /// pick extends from wherever the anchor already is (a drag or Shift-click).
+    fn range_pick_to(&mut self, row: u32, col: u32, start: bool, cx: &mut Context<Self>) {
+        let anchor = match self.range_pick {
+            Some(a) if !start => a,
+            _ => {
+                self.range_pick = Some((row, col));
+                (row, col)
+            }
+        };
+        let text = range_text(anchor, (row, col));
+        if let Some(f) = &mut self.chart_field {
+            f.caret = text.chars().count();
+            f.anchor = f.caret;
+            f.buf = text;
+        }
+        cx.notify();
+    }
+
+    /// The pointer came up: a picked range replots straight away, the way
+    /// dragging a new source range does in Excel.
+    fn range_pick_end(&mut self, cx: &mut Context<Self>) {
+        if self.range_pick.take().is_none() {
+            return;
+        }
+        let Some(buf) = self.chart_field.as_ref().map(|f| f.buf.clone()) else { return };
+        self.chart_apply_range(&buf, cx);
     }
 
     /// Bring a referenced range into view, so pointing a chart at cells that are
@@ -1979,6 +2030,9 @@ impl Docxy {
     /// virtualized list swallows child `on_mouse_down`, so the drag start is
     /// inferred from the first move rather than a press).
     fn sheet_drag_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.range_field_active() {
+            return self.range_pick_to(row, col, false, cx);
+        }
         if self.chart_drag.is_some() {
             return; // the pointer is carrying a chart, not sweeping cells
         }
@@ -1995,6 +2049,9 @@ impl Docxy {
 
     /// Extend the selection to a cell (Shift+click), keeping the anchor.
     fn extend_to(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.range_field_active() {
+            return self.range_pick_to(row, col, false, cx);
+        }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx);
         }
@@ -3765,7 +3822,7 @@ impl Docxy {
             colors = colors.child(row.child(swatches));
         }
 
-        let range_text = data
+        let range_shown = data
             .source
             .as_ref()
             .map(|s| {
@@ -3807,7 +3864,7 @@ impl Docxy {
                     .px_3()
                     .pb_2()
                     .child(heading("DATA RANGE"))
-                    .child(field("chart-range", ChartField::Range, range_text, "e.g. A1:D5"))
+                    .child(field("chart-range", ChartField::Range, range_shown, "e.g. A1:D5"))
                     // What the last replot did — or why it couldn't, which the
                     // status bar alone makes far too easy to miss.
                     .child(match &self.chart_msg {
@@ -9068,7 +9125,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.chart_ui(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.range_field_active(), self.chart_ui(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -9350,6 +9407,9 @@ struct GridOverlay {
     fill_preview: Option<(u32, u32, u32, u32)>,
     /// Cells a focused range field points at, washed so they stand out.
     range_preview: Option<(u32, u32, u32, u32)>,
+    /// A range field has the keyboard: the active cell drops its ring so it
+    /// can't be mistaken for the range being picked, and wears a wash instead.
+    picking: bool,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
 }
@@ -9404,6 +9464,9 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             None => (col_px(sh.col_width(c)), false),
         };
         let selected = (r, c) == (sr, sc);
+        // While a range is being picked the active cell keeps its place with a
+        // wash instead of the ring, so only the picked range reads as an outline.
+        let ring = selected && !ov.picking;
         let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
         // Cells the fill drag would reach: shaded while the button is down, so
         // the drag reads as a preview and nothing has actually moved yet.
@@ -9461,7 +9524,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             // position — is byte-identical to an unselected cell's. Without
             // this, selecting a cell grows its row by 3px and shoves the grid.
             .map(|d| {
-                if selected {
+                if ring {
                     d.pt(px(0.)).pb(px(1.)).pl(px(2.)).pr(px(3.))
                 } else {
                     d.px(px(4.)).py(px(2.))
@@ -9480,7 +9543,8 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             .when(in_range && !selected, |d| d.bg(range_tint))
             .when(in_preview, |d| d.bg(Hsla { h: 0., s: 0., l: 0.45, a: 0.16 }))
             .when(in_ref, |d| d.bg(Hsla { a: 0.18, ..brand }))
-            .when(selected, |d| d.border_2().border_color(brand));
+            .when(selected && ov.picking, |d| d.bg(Hsla { a: 0.38, ..brand }))
+            .when(ring, |d| d.border_2().border_color(brand));
         if cell_editing {
             cell = cell
                 .justify_start()
@@ -9580,7 +9644,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             let ent_fill_dn = ent.clone();
             // Insets are measured from the PADDING box, so back out the cell's
             // border to reach the corner point, then half the box to centre on it.
-            let edge = if selected { 2.0 } else { 1.0 } + 6.0;
+            let edge = if ring { 2.0 } else { 1.0 } + 6.0;
             cell = cell.relative().child(deferred(
                 div()
                     .id("fill-handle")
@@ -9798,7 +9862,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, picking: bool, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -9913,7 +9977,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             br >= ar && br < rr && bc >= ac && bc < cc
         })
     };
-    let ov = GridOverlay { fill_preview, range_preview, handle_hidden: corner_under_chart };
+    let ov = GridOverlay { fill_preview, range_preview, picking: range_preview.is_some() || picking, handle_hidden: corner_under_chart };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
@@ -10278,6 +10342,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 this.sheet_dragging = false; // end any drag-select
                 this.sheet_fill_end(cx); // commit an auto-fill drag, if any
                 this.chart_drag_end(cx); // commit a chart move, if any
+                this.range_pick_end(cx); // replot a range picked off the grid
             });
         })
         .child(bar)
@@ -10420,7 +10485,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_px, last_visible_col, row_height_px, scroll_col0_for_sel};
+    use super::{col_px, last_visible_col, range_text, row_height_px, scroll_col0_for_sel};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -10471,6 +10536,17 @@ mod grid_geom_tests {
             let cend = last_visible_col(&w, col0, 500.0, 255);
             assert!(col0 <= sc && sc <= cend, "sc={sc} not in [{col0},{cend}]");
         }
+    }
+
+    #[test]
+    fn range_text_normalises_a_drag_in_any_direction() {
+        // A1 -> D5 and the same drag backwards both name A1:D5.
+        assert_eq!(range_text((0, 0), (4, 3)), "A1:D5");
+        assert_eq!(range_text((4, 3), (0, 0)), "A1:D5");
+        // Mixed directions still order both axes.
+        assert_eq!(range_text((4, 0), (0, 3)), "A1:D5");
+        // A single cell picks itself.
+        assert_eq!(range_text((2, 2), (2, 2)), "C3:C3");
     }
 
     #[test]
