@@ -271,11 +271,14 @@ struct FillDrag {
     to: (u32, u32),
 }
 
-/// An in-progress chart move: which chart on the active sheet, where the press
-/// landed (window coords) and how far the pointer has travelled since.
+/// An in-progress chart drag: which chart on the active sheet, where the press
+/// landed (window coords) and how far the pointer has travelled since. `edge`
+/// is which side the grip owns — `(0, 0)` is the card itself, i.e. a move;
+/// anything else is a resize from that corner or edge.
 #[derive(Clone, Copy)]
 struct ChartDrag {
     idx: usize,
+    edge: (i8, i8),
     origin: (f32, f32),
     delta: (f32, f32),
 }
@@ -285,8 +288,40 @@ struct ChartDrag {
 #[derive(Clone, Copy, Default)]
 struct ChartUi {
     sel: Option<usize>,
-    /// (index, dx, dy) of the card the pointer is currently dragging.
-    drag: Option<(usize, f32, f32)>,
+    /// (index, dx, dy, edge) of the card the pointer is currently dragging.
+    drag: Option<(usize, f32, f32, (i8, i8))>,
+}
+
+/// A chart card never shrinks below this, however far its grip is dragged.
+const MIN_CHART_W: f32 = 150.0;
+const MIN_CHART_H: f32 = 110.0;
+
+/// A chart card's pixel size: the extent of the cells its anchor spans, which
+/// is how Excel sizes a `twoCellAnchor` object. Bounded so a wild `to` (or a
+/// run of hidden cells) can't blow up the walk.
+fn chart_span_px(sh: &gridcore::sheet::Sheet, from: (u32, u32), to: (u32, u32)) -> (f32, f32) {
+    let c_end = to.1.max(from.1 + 1).min(from.1 + 256);
+    let r_end = to.0.max(from.0 + 1).min(from.0 + 1024);
+    let w: f32 = (from.1..c_end).map(|c| col_px(sh.col_width(c))).sum();
+    let h: f32 = (from.0..r_end).map(|r| row_height_px(sh.row_height(r), SHEET_ROW_H) + 1.0).sum();
+    (w.max(MIN_CHART_W), h.max(MIN_CHART_H))
+}
+
+/// How one axis of a resize drag splits into (edge offset, size change) for a
+/// grip on `edge` (-1 near side, +1 far side, 0 not on this axis) dragged `d`
+/// pixels. Shared by the live preview and the commit so they can't disagree.
+fn resize_axis(edge: i8, d: f32, size: f32, min: f32) -> (f32, f32) {
+    match edge {
+        -1 => {
+            let n = (size - d).max(min);
+            (size - n, n - size)
+        }
+        1 => {
+            let n = (size + d).max(min);
+            (0.0, n - size)
+        }
+        _ => (0.0, 0.0),
+    }
 }
 
 /// The column an anchor lands on after being dragged `dx` px sideways: walk
@@ -1402,20 +1437,56 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Chart selection + in-progress move, for the overlay renderer.
+    /// Chart selection + in-progress drag, for the overlay renderer.
     fn chart_ui(&self) -> ChartUi {
         ChartUi {
             sel: self.chart_sel,
-            drag: self.chart_drag.map(|d| (d.idx, d.delta.0, d.delta.1)),
+            drag: self.chart_drag.map(|d| (d.idx, d.delta.0, d.delta.1, d.edge)),
         }
     }
 
     /// Press on a chart card: select it (Excel selects on mouse-down, not on
-    /// click) and arm a move from where the pointer went down.
-    fn chart_press(&mut self, idx: usize, at: (f32, f32), cx: &mut Context<Self>) {
+    /// click) and arm a drag from where the pointer went down. `edge` is
+    /// `(0, 0)` for the card itself (a move) or the side a resize grip owns.
+    fn chart_press(&mut self, idx: usize, edge: (i8, i8), at: (f32, f32), cx: &mut Context<Self>) {
         self.chart_sel = Some(idx);
-        self.chart_drag = Some(ChartDrag { idx, origin: at, delta: (0.0, 0.0) });
+        self.chart_drag = Some(ChartDrag { idx, edge, origin: at, delta: (0.0, 0.0) });
         cx.notify();
+    }
+
+    /// Apply `f` to the anchor of the idx-th chart on the active sheet, whether
+    /// it is one of this session's or one loaded from the file. Returns whether
+    /// it found one.
+    fn chart_edit_anchor(&mut self, idx: usize, f: impl Fn(&gridcore::sheet::Sheet, (u32, u32), (u32, u32)) -> ((u32, u32), (u32, u32))) -> bool {
+        let Some(v) = self.active_sheet_mut() else { return false };
+        let sidx = v.active;
+        // Resolve the index the same way the overlay lays the cards out: this
+        // sheet's UI-authored charts first, then the loaded drawings.
+        let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
+        if idx < ui_n {
+            let Some(pos) = v.charts.iter().enumerate().filter(|(_, c)| c.sheet == sidx).map(|(i, _)| i).nth(idx) else { return false };
+            let (nf, nt) = f(&v.pkg.workbook.sheets[sidx], v.charts[pos].from, v.charts[pos].to);
+            v.charts[pos].from = nf;
+            v.charts[pos].to = nt;
+            true
+        } else {
+            let Some(i) = v.pkg.workbook.sheets[sidx]
+                .drawings
+                .iter()
+                .enumerate()
+                .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
+                .map(|(i, _)| i)
+                .nth(idx - ui_n)
+            else {
+                return false;
+            };
+            let dw = &v.pkg.workbook.sheets[sidx].drawings[i];
+            let (nf, nt) = f(&v.pkg.workbook.sheets[sidx], dw.from, dw.to);
+            let dw = &mut v.pkg.workbook.sheets[sidx].drawings[i];
+            dw.from = nf;
+            dw.to = nt;
+            true
+        }
     }
 
     /// Track a chart move. The card follows the pointer, but its anchor cell
@@ -1431,54 +1502,33 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Finish a chart move: re-anchor it to the cell the drag landed on.
+    /// Finish a chart drag: re-anchor the card to the cells it landed on. A move
+    /// carries the whole anchor; a resize moves only the dragged edges.
     fn chart_drag_end(&mut self, cx: &mut Context<Self>) {
         let Some(d) = self.chart_drag.take() else { return };
         if d.delta == (0.0, 0.0) {
             return; // a plain click — selection only
         }
         self.sheet_snapshot();
-        let mut moved = false;
-        if let Some(v) = self.active_sheet_mut() {
-            let sidx = v.active;
-            // Resolve the index the same way the overlay lays the cards out:
-            // this sheet's UI-authored charts first, then the loaded drawings.
-            let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
-            // Where the anchor lands, and how far that is in whole cells (the
-            // opposite corner rides along so the card keeps its cell span).
-            let landed = |from: (u32, u32), sh: &gridcore::sheet::Sheet| {
-                let nr = shift_row(sh, from.0, d.delta.1);
-                let nc = shift_col(sh, from.1, d.delta.0);
-                (nr, nc, nr as i64 - from.0 as i64, nc as i64 - from.1 as i64)
-            };
-            let ui_target = if d.idx < ui_n {
-                v.charts.iter().enumerate().filter(|(_, c)| c.sheet == sidx).map(|(i, _)| i).nth(d.idx)
-            } else {
-                None
-            };
-            if let Some(pos) = ui_target {
-                let (nr, nc, dr, dc) = landed(v.charts[pos].from, &v.pkg.workbook.sheets[sidx]);
-                let cv = &mut v.charts[pos];
-                cv.from = (nr, nc);
-                cv.to = ((cv.to.0 as i64 + dr).max(0) as u32, (cv.to.1 as i64 + dc).max(0) as u32);
-                moved = true;
-            } else if let Some(i) = v.pkg.workbook.sheets[sidx]
-                .drawings
-                .iter()
-                .enumerate()
-                .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
-                .map(|(i, _)| i)
-                .nth(d.idx.saturating_sub(ui_n))
-            {
-                let from = v.pkg.workbook.sheets[sidx].drawings[i].from;
-                let (nr, nc, dr, dc) = landed(from, &v.pkg.workbook.sheets[sidx]);
-                let dw = &mut v.pkg.workbook.sheets[sidx].drawings[i];
-                dw.from = (nr, nc);
-                dw.to = ((dw.to.0 as i64 + dr).max(0) as u32, (dw.to.1 as i64 + dc).max(0) as u32);
-                moved = true;
-            }
-        }
-        if moved {
+        let changed = if d.edge == (0, 0) {
+            self.chart_edit_anchor(d.idx, |sh, from, to| {
+                // The far corner rides along, so the card keeps its cell span.
+                let nf = (shift_row(sh, from.0, d.delta.1), shift_col(sh, from.1, d.delta.0));
+                let (dr, dc) = (nf.0 as i64 - from.0 as i64, nf.1 as i64 - from.1 as i64);
+                (nf, ((to.0 as i64 + dr).max(0) as u32, (to.1 as i64 + dc).max(0) as u32))
+            })
+        } else {
+            self.chart_edit_anchor(d.idx, |sh, from, to| {
+                let (w, h) = chart_span_px(sh, from, to);
+                let (x_off, w_delta) = resize_axis(d.edge.0, d.delta.0, w, MIN_CHART_W);
+                let (y_off, h_delta) = resize_axis(d.edge.1, d.delta.1, h, MIN_CHART_H);
+                let nf = (shift_row(sh, from.0, y_off), shift_col(sh, from.1, x_off));
+                let nt = (shift_row(sh, to.0, y_off + h_delta), shift_col(sh, to.1, x_off + w_delta));
+                // Keep at least one cell of span in each axis.
+                (nf, (nt.0.max(nf.0 + 1), nt.1.max(nf.1 + 1)))
+            })
+        };
+        if changed {
             self.mark_sheet_dirty();
         }
         cx.notify();
@@ -3177,9 +3227,11 @@ impl Docxy {
             if !series.is_empty() {
                 let data = ChartData { title: if title.is_empty() { "Chart".into() } else { title }, kind: kind.to_string(), categories, series };
                 let s = v.active;
-                // Anchor the saved chart just right of the selected range.
+                // Anchor the saved chart just right of the selected range. The
+                // span is the card's size now, so pick one that reads well and
+                // let the user drag it from there.
                 let from = (r0, c1 + 2);
-                let to = (r0 + 16, c1 + 10);
+                let to = (r0 + 10, c1 + 8);
                 v.charts.push(ChartView { sheet: s, from, to, data });
             }
         }
@@ -9020,11 +9072,64 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
 
 /// A floating chart card: a clustered column chart drawn with div bars, plus a
 /// title and legend. Handles bar/column data (the common case) for any kind.
-fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
+/// The eight resize grips of a selected chart: one per corner and edge, each
+/// centred on the selection frame and carrying the sides it drags.
+fn chart_grips(idx: usize, w: f32, h: f32, ent: &Entity<Docxy>) -> Vec<AnyElement> {
+    const EDGES: [(i8, i8); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+    EDGES
+        .iter()
+        .map(|&(ex, ey)| {
+            let along = |e: i8, extent: f32| match e {
+                -1 => -3.0,
+                1 => extent + 3.0,
+                _ => extent / 2.0,
+            } - 4.0;
+            let cursor = match (ex, ey) {
+                (0, _) => CursorStyle::ResizeUpDown,
+                (_, 0) => CursorStyle::ResizeLeftRight,
+                (a, b) if a == b => CursorStyle::ResizeUpLeftDownRight,
+                _ => CursorStyle::ResizeUpRightDownLeft,
+            };
+            let ent_dn = ent.clone();
+            let ent_mv = ent.clone();
+            div()
+                .id(ElementId::Name(format!("grip-{idx}-{ex}-{ey}").into()))
+                .absolute()
+                .left(px(along(ex, w)))
+                .top(px(along(ey, h)))
+                .w(px(8.))
+                .h(px(8.))
+                .bg(hsla_u(0xffffff))
+                .border_1()
+                .border_color(hsla_u(BRAND))
+                .rounded(px(1.))
+                .cursor(cursor)
+                .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
+                    // Beat the card's own press, which would start a move.
+                    cx2.stop_propagation();
+                    let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    ent_dn.update(cx2, |this, cx2| this.chart_press(idx, (ex, ey), at, cx2));
+                })
+                .on_mouse_move(move |ev, _w, cx2| {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        ent_mv.update(cx2, |this, cx2| this.chart_drag_move(at, cx2));
+                    }
+                })
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// A floating chart card drawn at `w` × `h` (its anchor's cell extent).
+fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
     const PALETTE: [u32; 6] = [0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A];
     let maxv = data.series.iter().flat_map(|s| s.values.iter().copied()).fold(0.0f64, f64::max).max(1.0);
     let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
-    let plot_h = 148.0f32;
+    // The title strip and the legend take fixed bites out of the card; the plot
+    // area gets the rest, and the bars scale to it.
+    let area_h = (h - 46.0).max(40.0);
+    let plot_h = (area_h - 20.0).max(20.0);
     let cat_label = |ci: usize| {
         let label = data.categories.get(ci).cloned().unwrap_or_default();
         div().text_size(px(8.)).text_color(hsla_u(0x666666)).max_w(px(52.)).overflow_hidden().child(SharedString::from(label))
@@ -9050,11 +9155,11 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
                 row = row.child(bars);
                 col = col.child(row);
             }
-            col.h(px(plot_h + 20.)).into_any_element()
+            col.h(px(area_h)).into_any_element()
         }
         "line" => {
             // Point/line preview: each series' value plotted as a dot at its height.
-            let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
+            let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut stack = div().relative().w(px(14.)).h(px(plot_h));
                 for (si, s) in data.series.iter().enumerate() {
@@ -9062,7 +9167,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     stack = stack.child(div().absolute().bottom(px(h - 3.5)).left(px(3.5)).size(px(7.)).rounded(px(4.)).bg(rgb(PALETTE[si % PALETTE.len()])));
                 }
-                plot = plot.child(v_flex().items_center().justify_end().gap(px(2.)).h(px(plot_h + 18.)).child(stack).child(cat_label(ci)));
+                plot = plot.child(v_flex().flex_1().items_center().justify_end().gap(px(2.)).h(px(area_h - 2.)).child(stack).child(cat_label(ci)));
             }
             plot.into_any_element()
         }
@@ -9081,11 +9186,11 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
                     .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(SharedString::from(data.categories.get(ci).cloned().unwrap_or_default()))));
             }
             pie_legend = Some(leg.into_any_element());
-            v_flex().flex_1().justify_center().gap(px(6.)).px_3().py_2().h(px(plot_h + 20.)).child(bar).into_any_element()
+            v_flex().flex_1().justify_center().gap(px(6.)).px_3().py_2().h(px(area_h)).child(bar).into_any_element()
         }
         _ => {
             // Column (default): vertical clustered bars.
-            let mut plot = h_flex().h(px(plot_h + 20.)).items_end().gap(px(6.)).px_2().pt_2();
+            let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut cluster = h_flex().items_end().gap(px(1.));
                 for (si, s) in data.series.iter().enumerate() {
@@ -9093,7 +9198,7 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     cluster = cluster.child(div().w(px(11.)).h(px(h)).rounded_t(px(1.)).bg(rgb(PALETTE[si % PALETTE.len()])));
                 }
-                plot = plot.child(v_flex().items_center().justify_end().gap(px(2.)).h(px(plot_h + 18.)).child(cluster).child(cat_label(ci)));
+                plot = plot.child(v_flex().flex_1().items_center().justify_end().gap(px(2.)).h(px(area_h - 2.)).child(cluster).child(cat_label(ci)));
             }
             plot.into_any_element()
         }
@@ -9113,7 +9218,9 @@ fn chart_card(data: &gridcore::sheet::ChartData) -> AnyElement {
         legend.into_any_element()
     });
     v_flex()
-        .w(px(360.))
+        .w(px(w))
+        .h(px(h))
+        .overflow_hidden()
         .bg(hsla_u(0xffffff))
         .border_1()
         .border_color(hsla_u(0xcccccc))
@@ -9402,27 +9509,42 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         fr as f32 * row_h + (ar - fr as u32) as f32 * row_h + scrolled_px
     };
     let loaded = sh.drawings.iter().filter_map(|d| match &d.kind {
-        gridcore::sheet::DrawingKind::Chart(cd) => Some((d.from, cd)),
+        gridcore::sheet::DrawingKind::Chart(cd) => Some((d.from, d.to, cd)),
         _ => None,
     });
     let cards: Vec<AnyElement> = view
         .charts
         .iter()
         .filter(|c| c.sheet == view.active)
-        .map(|cv| (cv.from, &cv.data))
+        .map(|cv| (cv.from, cv.to, &cv.data))
         .chain(loaded)
         .enumerate()
-        .filter_map(|(i, (from, data))| {
+        .filter_map(|(i, (from, to, data))| {
             // `from` is (row, col) for UI charts and gridcore drawings alike.
             let (ar, ac) = from;
             let x = col_x(ac)?;
             let y = row_y(ar);
             // A card being dragged follows the pointer; its anchor only moves
             // when the button comes up.
-            let (dx, dy) = match chart_ui.drag {
-                Some((di, dx, dy)) if di == i => (dx, dy),
-                _ => (0.0, 0.0),
-            };
+            // The card's size is the extent of the cells it spans; a resize drag
+            // previews by moving the dragged edges only.
+            let (mut cw, mut ch) = chart_span_px(sh, from, to);
+            let (mut cx0, mut cy0) = (x, y);
+            if let Some((di, dx, dy, edge)) = chart_ui.drag {
+                if di == i {
+                    if edge == (0, 0) {
+                        cx0 += dx;
+                        cy0 += dy;
+                    } else {
+                        let (x_off, w_delta) = resize_axis(edge.0, dx, cw, MIN_CHART_W);
+                        let (y_off, h_delta) = resize_axis(edge.1, dy, ch, MIN_CHART_H);
+                        cx0 += x_off;
+                        cy0 += y_off;
+                        cw += w_delta;
+                        ch += h_delta;
+                    }
+                }
+            }
             let selected = chart_ui.sel == Some(i);
             let ent_c = ent.clone();
             let ent_m = ent.clone();
@@ -9430,15 +9552,15 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 div()
                     .id(ElementId::Name(format!("chart-{i}").into()))
                     .absolute()
-                    .left(px(x + dx))
-                    .top(px(y + dy))
+                    .left(px(cx0))
+                    .top(px(cy0))
                     .cursor(if selected { CursorStyle::OpenHand } else { CursorStyle::Arrow })
                     // Excel selects an object on press, and the same press begins
                     // the move; the cell underneath must not also react.
                     .on_mouse_down(MouseButton::Left, move |ev, _w, cx2| {
                         cx2.stop_propagation();
                         let at = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        ent_c.update(cx2, |this, cx2| this.chart_press(i, at, cx2));
+                        ent_c.update(cx2, |this, cx2| this.chart_press(i, (0, 0), at, cx2));
                     })
                     // The card follows the pointer, so it sits under it for most
                     // of the drag — and a hovered hitbox is the only one that gets
@@ -9450,8 +9572,9 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                             ent_m.update(cx2, |this, cx2| this.chart_drag_move(at, cx2));
                         }
                     })
-                    .child(chart_card(data))
-                    // The selection frame sits just outside the card, like Excel's.
+                    .child(chart_card(data, cw, ch))
+                    // The selection frame sits just outside the card, like Excel's,
+                    // with a grip on each corner and edge.
                     .when(selected, |d| {
                         d.child(
                             div()
@@ -9464,6 +9587,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                                 .border_color(hsla_u(BRAND))
                                 .rounded(px(4.)),
                         )
+                        .children(chart_grips(i, cw, ch, ent))
                     })
                     .into_any_element(),
             )
