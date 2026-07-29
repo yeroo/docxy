@@ -790,9 +790,10 @@ struct Docxy {
     chart_field: Option<ChartFieldEdit>,
     // What the last Chart-panel action said, shown under the range field.
     chart_msg: Option<(bool, String)>,
-    // Anchor cell of a range being picked off the grid while a range field has
-    // the keyboard (Excel's point mode).
-    range_pick: Option<(u32, u32)>,
+    // A range being picked off the grid while a range field has the keyboard
+    // (Excel's point mode): the anchor cell, and whether the pointer has moved
+    // since the press — a press that never moves is a plain click, not a pick.
+    range_pick: Option<((u32, u32), bool)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
     // Right-click context menu position (window coords), if open.
@@ -1555,7 +1556,16 @@ impl Docxy {
     /// the range and committing any in-progress edit first.
     fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
         if self.range_field_active() {
-            return self.range_pick_to(row, col, true, cx);
+            // Mid-drag: the pick already has this cell, and its release applies.
+            if matches!(self.range_pick, Some((_, true))) {
+                return;
+            }
+            // A click that didn't drag ends point mode, and then does what any
+            // click does — including dropping the chart selection, which is the
+            // only way out of the panel otherwise.
+            self.chart_field = None;
+            self.chart_msg = None;
+            self.range_pick = None;
         }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
@@ -1741,9 +1751,12 @@ impl Docxy {
     /// pick extends from wherever the anchor already is (a drag or Shift-click).
     fn range_pick_to(&mut self, row: u32, col: u32, start: bool, cx: &mut Context<Self>) {
         let anchor = match self.range_pick {
-            Some(a) if !start => a,
+            Some((a, _)) if !start => {
+                self.range_pick = Some((a, true));
+                a
+            }
             _ => {
-                self.range_pick = Some((row, col));
+                self.range_pick = Some(((row, col), !start));
                 (row, col)
             }
         };
@@ -1759,7 +1772,8 @@ impl Docxy {
     /// The pointer came up: a picked range replots straight away, the way
     /// dragging a new source range does in Excel.
     fn range_pick_end(&mut self, cx: &mut Context<Self>) {
-        if self.range_pick.take().is_none() {
+        // Only a real drag sets the range; a plain click means "done pointing".
+        if !matches!(self.range_pick.take(), Some((_, true))) {
             return;
         }
         let Some(buf) = self.chart_field.as_ref().map(|f| f.buf.clone()) else { return };
@@ -3854,7 +3868,40 @@ impl Docxy {
                 }
             })
             .on_mouse_move(|_ev, _w, cx| cx.stop_propagation())
-            .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("Chart"))
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("Chart"))
+                    .child({
+                        let ent_x = ent.clone();
+                        div()
+                            .id("chart-panel-close")
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(pal.dim)
+                            .hover(|d| d.bg(pal.hover).text_color(pal.fg))
+                            .tooltip(|w, cx2| gpui_component::tooltip::Tooltip::new("Close \u{2014} deselects the chart").build(w, cx2))
+                            .child("\u{00d7}")
+                            .on_click(move |_ev, _w, cx2| {
+                                ent_x.update(cx2, |this, cx2| {
+                                    this.chart_sel = None;
+                                    this.chart_field = None;
+                                    this.chart_msg = None;
+                                    this.range_pick = None;
+                                    cx2.notify();
+                                });
+                            })
+                    }),
+            )
             .child(
                 v_flex()
                     .id("chart-panel-body")
