@@ -1715,10 +1715,29 @@ impl Docxy {
         self.chart_set_data(data, cx);
     }
 
+    /// Bring a referenced range into view, so pointing a chart at cells that are
+    /// scrolled away still shows you what you picked.
+    fn reveal_range(&mut self, before: Option<(u32, u32, u32, u32)>) {
+        let after = self.range_preview();
+        if after == before {
+            return;
+        }
+        let Some((r0, c0, r1, _)) = after else { return };
+        if let Some(v) = self.active_sheet_mut() {
+            // Reveal the far end first, then the near one: a range that fits
+            // ends up wholly in view, and one that doesn't shows its start.
+            let (near, far) = (v.row_list_index(r0), v.row_list_index(r1));
+            v.vlist.scroll_to_reveal_item(far);
+            v.vlist.scroll_to_reveal_item(near);
+            v.col0 = v.col0.min(c0);
+        }
+    }
+
     /// Typing in one of the Chart panel's text fields. Arrows, Home/End and
     /// Delete move and edit around the caret; holding Shift extends the
     /// selection, and anything typed over one replaces it.
     fn chart_field_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, cx: &mut Context<Self>) {
+        let was = self.range_preview();
         let Some(mut f) = self.chart_field.clone() else { return };
         let len = f.buf.chars().count();
         if ctrl {
@@ -1796,6 +1815,7 @@ impl Docxy {
                 self.chart_field = Some(f);
             }
         }
+        self.reveal_range(was);
         cx.notify();
     }
 
@@ -1906,6 +1926,18 @@ impl Docxy {
         }
         self.mark_sheet_dirty();
         cx.notify();
+    }
+
+    /// The cells a focused range field refers to, live as it is typed — the
+    /// grid outlines them so you can see what you are pointing the chart at.
+    fn range_preview(&self) -> Option<(u32, u32, u32, u32)> {
+        let f = self.chart_field.as_ref()?;
+        if f.which != ChartField::Range {
+            return None;
+        }
+        let text = f.buf.trim();
+        let cells = text.rsplit_once('!').map(|(_, r)| r).unwrap_or(text);
+        gridcore::sheet::parse_range_name(cells)
     }
 
     /// The box the in-progress fill drag would cover, for the preview outline.
@@ -9036,7 +9068,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.chart_ui(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.chart_ui(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -9316,6 +9348,8 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
 struct GridOverlay {
     /// Box an in-progress fill drag would cover — outlined, not yet applied.
     fill_preview: Option<(u32, u32, u32, u32)>,
+    /// Cells a focused range field points at, washed so they stand out.
+    range_preview: Option<(u32, u32, u32, u32)>,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
 }
@@ -9375,6 +9409,8 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
         // the drag reads as a preview and nothing has actually moved yet.
         let in_preview = !in_range
             && ov.fill_preview.is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
+        // Cells the focused range field names.
+        let in_ref = ov.range_preview.is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
@@ -9443,6 +9479,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             .when(cell_border, |d| d.border_1().border_color(hsla_u(0x7a7a7a)))
             .when(in_range && !selected, |d| d.bg(range_tint))
             .when(in_preview, |d| d.bg(Hsla { h: 0., s: 0., l: 0.45, a: 0.16 }))
+            .when(in_ref, |d| d.bg(Hsla { a: 0.18, ..brand }))
             .when(selected, |d| d.border_2().border_color(brand));
         if cell_editing {
             cell = cell
@@ -9509,6 +9546,30 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 });
             }
         });
+        // The referenced range's border: each edge cell draws its own outer side,
+        // which the cell's own layout places exactly (the overlay's uniform-row
+        // arithmetic drifts on content-tall rows). `deferred` keeps the cell's
+        // overflow clip from eating the line.
+        if in_ref {
+            if let Some((pr0, pc0, pr1, pc1)) = ov.range_preview {
+                let (top, bot, lft, rgt) = (r == pr0, r == pr1, c == pc0, c == pc1);
+                if top || bot || lft || rgt {
+                    cell = cell.relative().child(deferred(
+                        div()
+                            .absolute()
+                            .left(px(-1.))
+                            .top(px(-1.))
+                            .right(px(-1.))
+                            .bottom(px(-1.))
+                            .border_color(hsla_u(BRAND))
+                            .when(top, |d| d.border_t(px(2.)))
+                            .when(bot, |d| d.border_b(px(2.)))
+                            .when(lft, |d| d.border_l(px(2.)))
+                            .when(rgt, |d| d.border_r(px(2.))),
+                    ));
+                }
+            }
+        }
         // Auto-fill handle: a small square centred ON the selection's bottom-right
         // corner point. It lives inside that cell, so layout places it exactly (no
         // scroll/row-height math to drift); it is absolutely positioned, so it adds
@@ -9737,7 +9798,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -9852,7 +9913,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             br >= ar && br < rr && bc >= ac && bc < cc
         })
     };
-    let ov = GridOverlay { fill_preview, handle_hidden: corner_under_chart };
+    let ov = GridOverlay { fill_preview, range_preview, handle_hidden: corner_under_chart };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
