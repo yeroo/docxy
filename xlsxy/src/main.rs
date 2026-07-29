@@ -3588,64 +3588,16 @@ impl App {
     /// category axis, each numeric column a series. Anchored just right of the
     /// selection and wired via SheetPackage::add_chart (renders + persists).
     fn insert_chart(&mut self, kind: &str) {
-        use gridcore::sheet::{CellValue, ChartData, ChartSeries};
         let (r1, c1, r2, c2) = self.iter_selection();
-        let text_of = |v: Option<&CellValue>| -> String {
-            match v {
-                Some(CellValue::Text(s)) => s.clone(),
-                Some(CellValue::Number(n)) => n.to_string(),
-                Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.into(),
-                _ => String::new(),
-            }
-        };
-        let (categories, title, series) = {
+        // Same reader the desktop suite uses: header row names the series, the
+        // first non-numeric column supplies the labels.
+        let data = {
             let sh = self.sheet();
-            let mut cat_col: Option<u32> = None;
-            let mut num_cols: Vec<u32> = Vec::new();
-            for c in c1..=c2 {
-                let (mut nums, mut txts) = (0u32, 0u32);
-                for r in (r1 + 1)..=r2 {
-                    match sh.cell(r, c).map(|cl| &cl.value) {
-                        Some(CellValue::Number(_)) => nums += 1,
-                        Some(CellValue::Text(_)) => txts += 1,
-                        _ => {}
-                    }
-                }
-                if nums > 0 && nums >= txts {
-                    num_cols.push(c);
-                } else if cat_col.is_none() {
-                    cat_col = Some(c);
-                }
-            }
-            let cat_col = cat_col.unwrap_or(c1);
-            let data_rows: Vec<u32> = (r1 + 1..=r2).collect();
-            let categories: Vec<String> = data_rows.iter().map(|&r| text_of(sh.cell(r, cat_col).map(|cl| &cl.value))).collect();
-            let title = text_of(sh.cell(r1, cat_col).map(|cl| &cl.value));
-            let series: Vec<ChartSeries> = num_cols
-                .iter()
-                .map(|&c| {
-                    let name = text_of(sh.cell(r1, c).map(|cl| &cl.value));
-                    let values = data_rows
-                        .iter()
-                        .map(|&r| match sh.cell(r, c).map(|cl| &cl.value) {
-                            Some(CellValue::Number(n)) => *n,
-                            _ => 0.0,
-                        })
-                        .collect();
-                    ChartSeries { name, values }
-                })
-                .collect();
-            (categories, title, series)
+            gridcore::sheet::chart_from_range(sh, &sh.name, (r1, c1, r2, c2), kind)
         };
-        if series.is_empty() {
+        let Some(data) = data else {
             self.status = Some("Insert chart: no numeric columns in the selection".into());
             return;
-        }
-        let data = ChartData {
-            title: if title.is_empty() { "Chart".into() } else { title },
-            kind: kind.to_string(),
-            categories,
-            series,
         };
         let sheet = self.sheet;
         self.pkg.add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data);
@@ -7841,7 +7793,9 @@ mod tests {
             series: vec![ChartSeries {
                 name: "s".into(),
                 values: vec![5.0, 10.0],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let lines = chart_bar_lines(&cd, 40, 6);
         assert_eq!(lines.len(), 2);
@@ -7874,6 +7828,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
             from: (1, 1),
             to: (14, 8),
             kind: DrawingKind::Chart(ChartData {
@@ -7883,7 +7838,9 @@ mod tests {
                 series: vec![ChartSeries {
                     name: "y".into(),
                     values: vec![10.0],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }),
         });
         let mut app = App::new(pkg, "t.xlsx");
@@ -7909,6 +7866,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
             from: (1, 1),
             to: (6, 5),
             kind: DrawingKind::Image {

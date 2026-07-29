@@ -3625,6 +3625,7 @@ mod tests {
         use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind as DK};
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
             from: (0, 0),
             to: (10, 5),
             kind: DK::Chart(ChartData {
@@ -3634,7 +3635,9 @@ mod tests {
                 series: vec![ChartSeries {
                     name: "Q1".into(),
                     values: vec![10.0, 20.0],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }),
         });
         let out = s.ctl(r#"{"verb":"chart.list","args":{}}"#);
