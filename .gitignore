@@ -25,3 +25,6 @@
 
 .idea/
 ~$*
+
+# ralphex progress logs
+.ralphex/progress/
