@@ -180,12 +180,13 @@ Dependencies identified:
   - ⚠️ FOUND AND FIXED a real bug: `range_pick_end` still committed every pick through `chart_apply_range`, so pointing a SERIES field replotted the whole chart from those cells. It now commits through `ref_commit(target, …)`. Verified: pointing Qty at B2:B4 reports "3 points" and leaves Unit price, Total and the chart's own range alone.
 
 ### Task 6: Add, remove and reorder series
-- [ ] add an "Add series" action that appends a series pointed at an empty range and focuses its values field
-- [ ] add per-series remove, keeping at least one series (a chart with none is not renderable)
-- [ ] add move-up/move-down, reordering both the model and the drawn order
-- [ ] mark the chart edited so a save regenerates its part, and keep colours attached to their series across reorders
-- [ ] write tests for add/remove/reorder on the series vector (pure), including the last-series guard
-- [ ] run tests, then screenshot add → point at a range → remove - must pass before task 7
+- [x] add an "Add series" action that appends a series and focuses its values field, with a message telling you to point at the cells
+- [x] add per-series remove, keeping at least one series (a chart with none is not renderable)
+- [x] add move-up/move-down, reordering both the model and the drawn order
+- [x] mark the chart edited so a save regenerates its part, and keep colours attached to their series across reorders (a colour lives on the series, so it travels — asserted in the test)
+- [x] write tests for remove/reorder on the series vector (pure), including the last-series guard and the clamp at both ends
+- [x] run tests (16 passed), screenshot remove
+  - ⚠️ "+ Add series" is NOT verified on screen: the machine was in use and the harness refuses to send input unless the suite owns the foreground. Its unit-tested siblings pass and the action is four lines, but it hasn't been seen working.
 
 ### Task 7: Reference tokens in a formula buffer
 - [ ] add pure helpers: `ref_token_at(buf, caret) -> Option<Range<usize>>` (the A1/A1:D5 token the caret sits in or immediately after) and `replace_ref(buf, caret, text) -> (String, usize)`

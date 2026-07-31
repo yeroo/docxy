@@ -1241,6 +1241,32 @@ fn parse_ref_text(text: &str) -> Option<(u32, u32, u32, u32)> {
     gridcore::sheet::parse_range_name(cells)
 }
 
+/// Drop series `i`, unless it is the last one — a chart with no series has
+/// nothing to draw, and Excel won't let you get there either. Reports whether
+/// it removed one.
+fn series_remove(list: &mut Vec<gridcore::sheet::ChartSeries>, i: usize) -> bool {
+    if list.len() <= 1 || i >= list.len() {
+        return false;
+    }
+    list.remove(i);
+    true
+}
+
+/// Move series `i` by `delta` places, clamped to the ends. Returns where it
+/// landed, or `None` if it couldn't move. Colours ride along, since they live
+/// on the series rather than on its position.
+fn series_move(list: &mut [gridcore::sheet::ChartSeries], i: usize, delta: i32) -> Option<usize> {
+    if i >= list.len() {
+        return None;
+    }
+    let to = (i as i32 + delta).clamp(0, list.len() as i32 - 1) as usize;
+    if to == i {
+        return None;
+    }
+    list.swap(i, to);
+    Some(to)
+}
+
 /// A range as the A1 text a field shows.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -1865,6 +1891,44 @@ impl Docxy {
         let Some(s) = data.series.get_mut(i) else { return };
         s.name = name;
         s.name_ref = name_ref;
+        self.chart_set_data(data, cx);
+    }
+
+    /// Add an empty series and put the keyboard in its values field, so the
+    /// next thing you do is say what it plots.
+    fn series_add(&mut self, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        let n = data.series.len();
+        data.series.push(gridcore::sheet::ChartSeries {
+            name: format!("Series {}", n + 1),
+            values: vec![0.0; data.categories.len()],
+            ..Default::default()
+        });
+        self.chart_set_data(data, cx);
+        self.range_edit = Some(RangeEdit { target: RefTarget::SeriesValues(n), buf: String::new(), caret: 0, anchor: 0, dragging: false });
+        self.ref_msg = Some((RefTarget::SeriesValues(n), true, "Point at the cells this series plots".into()));
+        cx.notify();
+    }
+
+    /// Remove a series, unless it is the only one.
+    fn series_delete(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        if !series_remove(&mut data.series, i) {
+            self.ref_msg = Some((RefTarget::SeriesValues(i), false, "A chart needs at least one series".into()));
+            cx.notify();
+            return;
+        }
+        self.range_edit = None;
+        self.chart_set_data(data, cx);
+    }
+
+    /// Reorder a series, which is also the order it is drawn and listed in.
+    fn series_reorder(&mut self, i: usize, delta: i32, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        if series_move(&mut data.series, i, delta).is_none() {
+            return;
+        }
+        self.range_edit = None;
         self.chart_set_data(data, cx);
     }
 
@@ -4046,13 +4110,48 @@ impl Docxy {
                         }),
                 );
             }
+            // Reorder / remove, one small button each.
+            let btn = |id: String, glyph: &'static str, tip: &'static str, on: bool, f: Box<dyn Fn(&mut Docxy, &mut Context<Docxy>)>| {
+                let ent_b = ent.clone();
+                div()
+                    .id(ElementId::Name(id.into()))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .text_size(px(10.))
+                    .text_color(if on { pal.fg } else { pal.dim })
+                    .when(on, |d| d.cursor_pointer().hover(|d| d.bg(pal.panel)))
+                    .tooltip(move |w, cx2| gpui_component::tooltip::Tooltip::new(tip).build(w, cx2))
+                    .child(glyph)
+                    .when(on, |d| {
+                        d.on_click(move |_ev, _w, cx2| {
+                            ent_b.update(cx2, |this, cx2| f(this, cx2));
+                        })
+                    })
+            };
+            let n_series = data.series.len();
             series_list = series_list.child(
                 v_flex()
                     .gap(px(3.))
                     .p(px(6.))
                     .rounded(px(4.))
                     .bg(pal.hover)
-                    .child(div().text_size(px(10.)).text_color(pal.dim).child("NAME"))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_size(px(10.)).text_color(pal.dim).child("NAME"))
+                            .child(
+                                h_flex()
+                                    .gap(px(2.))
+                                    .child(btn(format!("series-up-{si}"), "\u{25b2}", "Move up", si > 0, Box::new(move |t, cx2| t.series_reorder(si, -1, cx2))))
+                                    .child(btn(format!("series-dn-{si}"), "\u{25bc}", "Move down", si + 1 < n_series, Box::new(move |t, cx2| t.series_reorder(si, 1, cx2))))
+                                    .child(btn(format!("series-rm-{si}"), "\u{00d7}", "Remove series", n_series > 1, Box::new(move |t, cx2| t.series_delete(si, cx2)))),
+                            ),
+                    )
                     .child(self.ref_field_dyn(format!("series-name-{si}"), RefTarget::SeriesName(si), sr.name.clone(), "e.g. B1 or a name", "", pal, cx))
                     .child(div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("VALUES"))
                     .child(self.ref_field_dyn(format!("series-vals-{si}"), RefTarget::SeriesValues(si), vals, "e.g. B2:B5", "", pal, cx))
@@ -4150,6 +4249,25 @@ impl Docxy {
                     .child(self.ref_field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title", "", pal, cx))
                     .child(heading("SERIES"))
                     .child(series_list)
+                    .child({
+                        let ent_add = ent.clone();
+                        div()
+                            .id("series-add")
+                            .mt(px(4.))
+                            .px_2()
+                            .py(px(3.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .border_1()
+                            .border_color(pal.border)
+                            .text_color(pal.fg)
+                            .hover(|d| d.bg(pal.hover))
+                            .child("+ Add series")
+                            .on_click(move |_ev, _w, cx2| {
+                                ent_add.update(cx2, |this, cx2| this.series_add(cx2));
+                            })
+                    })
                     .child(heading("CATEGORY LABELS"))
                     .child(self.ref_field(
                         "chart-cats",
@@ -10775,7 +10893,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, scroll_col0_for_sel};
+    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, scroll_col0_for_sel, series_move, series_remove};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -10887,6 +11005,38 @@ mod grid_geom_tests {
         assert!(RefTarget::Categories.is_range());
         // Targets are per series, so two series never share a field.
         assert_ne!(RefTarget::SeriesValues(0), RefTarget::SeriesValues(1));
+    }
+
+    #[test]
+    fn series_remove_keeps_the_last_one() {
+        use gridcore::sheet::ChartSeries;
+        let named = |n: &str| ChartSeries { name: n.into(), ..Default::default() };
+        let mut list = vec![named("Qty"), named("Price"), named("Total")];
+        assert!(series_remove(&mut list, 1));
+        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Qty", "Total"]);
+        // Out of range does nothing.
+        assert!(!series_remove(&mut list, 9));
+        assert_eq!(list.len(), 2);
+        // The last one stays: a chart with no series has nothing to draw.
+        assert!(series_remove(&mut list, 0));
+        assert!(!series_remove(&mut list, 0));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn series_move_reorders_and_clamps_at_the_ends() {
+        use gridcore::sheet::ChartSeries;
+        let named = |n: &str, colour: u32| ChartSeries { name: n.into(), color: Some(colour), ..Default::default() };
+        let mut list = vec![named("Qty", 1), named("Price", 2), named("Total", 3)];
+        assert_eq!(series_move(&mut list, 2, -1), Some(1));
+        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Qty", "Total", "Price"]);
+        // A colour belongs to its series, so it travels with it.
+        assert_eq!(list[1].color, Some(3));
+        // Already at an end: nothing to do, reported as None.
+        assert_eq!(series_move(&mut list, 0, -1), None);
+        assert_eq!(series_move(&mut list, 2, 1), None);
+        assert_eq!(series_move(&mut list, 9, 1), None);
+        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Qty", "Total", "Price"]);
     }
 
     #[test]
