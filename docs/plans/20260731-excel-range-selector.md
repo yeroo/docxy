@@ -210,12 +210,14 @@ Dependencies identified:
   - ⚠️ first attempt anchored on the first cell the pointer MOVED into (`=SUM(B3:B5` for a drag starting on row 2) — the same defect Task 3 fixed for the other paths. The press now plants the formula anchor through `cell_at` too. Verified: the drag writes `=SUM(B2:B5`, and committing gives 14.
 
 ### Task 9: Colour the ranges a formula mentions
-- [ ] thread `refs_in(buf)` for the live edit buffer into `GridOverlay` alongside the existing range preview
-- [ ] give each ref an index-keyed colour from a small palette and draw its border with the per-cell edge technique (`deferred`, exact placement)
-- [ ] tint the referenced cells lightly in the same colour, keeping the picked-range wash distinguishable
+- [x] thread the live edit buffer's references into `GridOverlay` alongside the existing range preview
+  - ➕ REPLACED Task 7's `refs_in` with `formula_ref_tokens`: the AST can say WHICH ranges a formula reads but not WHERE they sit in the text, and the text colouring needs spans. One scan now feeds both, so grid and text can't disagree. It skips function names, other sheets' cells and anything inside a string literal.
+- [x] give each ref an index-keyed colour from a small palette and draw its border with the per-cell edge technique (`deferred`, exact placement)
+- [x] tint the referenced cells lightly in the same colour, keeping the picked-range wash distinguishable
 - [ ] show the same colour on the reference inside the formula text (fx bar and in-cell), so text and grid agree
-- [ ] write tests for the colour assignment (stable per ref index, wraps past the palette length)
-- [ ] run tests, then screenshot `=B2*C2+SUM(D2:D5)` mid-edit showing three coloured ranges - must pass before task 10
+  - ⚠️ DEFERRED. The spans are available (`formula_ref_tokens` returns them), but the fx bar and in-cell editor currently split their text at the caret only; colouring means splitting at token boundaries as well while keeping click-to-caret per run. Worth doing on its own rather than bolted onto this task.
+- [x] write tests for the colour assignment (stable per ref index, wraps past the palette length) and for the token scan
+- [x] run tests (21 passed), then screenshot `=B2*C2+SUM(D2:D5)` mid-edit - three ranges outlined in blue, terracotta and purple, each tinted to match
 
 ### Task 10: Retrofit the other range inputs
 - [ ] add `CondFormat`, `Validation`, `Sort` and `TextToColumns` targets, each seeded from the current selection when its bar opens

@@ -1312,51 +1312,61 @@ fn replace_ref(buf: &str, caret_chars: usize, text: &str) -> (String, usize) {
     (out, caret)
 }
 
-/// Every range a formula mentions, for outlining them on the grid. A buffer
-/// that doesn't parse yet — which is most of them, mid-typing — yields nothing
-/// rather than an error.
-fn refs_in(buf: &str) -> Vec<(u32, u32, u32, u32)> {
-    use gridcore::formula::Expr;
-    let src = buf.strip_prefix('=').unwrap_or(buf);
-    let Ok(ast) = gridcore::formula::parse(src) else { return Vec::new() };
+/// Every cell reference in a formula, in the order it is written: where it sits
+/// in the text and which cells it names. One scan feeds both the outlines on the
+/// grid and the colouring of the text, so the two can't disagree.
+///
+/// Skips what only looks like a reference: function names (`LOG10(`), the cell
+/// part of another sheet's ref (`Sheet2!A1`, which this grid can't outline), and
+/// anything inside a string literal.
+fn formula_ref_tokens(buf: &str) -> Vec<(std::ops::Range<usize>, (u32, u32, u32, u32))> {
     let mut out = Vec::new();
-    // Walk the tree, keeping only same-sheet rectangles: those are the ones
-    // this grid can outline.
-    fn walk(e: &Expr, out: &mut Vec<(u32, u32, u32, u32)>) {
-        let cell = |r: &gridcore::formula::CellRef| -> Option<(u32, u32)> {
-            (r.sheet.is_none() && r.row >= 0 && r.col >= 0).then_some((r.row as u32, r.col as u32))
-        };
-        match e {
-            Expr::Ref(r) => {
-                if let Some((row, col)) = cell(r) {
-                    out.push((row, col, row, col));
-                }
+    let mut i = 0usize;
+    while i < buf.len() {
+        let c = buf[i..].chars().next().unwrap_or(' ');
+        if c == '"' {
+            // Step over a string literal whole; "A1" in there is text.
+            i += 1;
+            while i < buf.len() && !buf[i..].starts_with('"') {
+                i += buf[i..].chars().next().map(char::len_utf8).unwrap_or(1);
             }
-            Expr::Range(a, b) => {
-                if let (Some((r1, c1)), Some((r2, c2))) = (cell(a), cell(b)) {
-                    out.push((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)));
-                }
-            }
-            Expr::Func(_, args) => args.iter().for_each(|a| walk(a, out)),
-            Expr::Call(f, args) => {
-                walk(f, out);
-                args.iter().for_each(|a| walk(a, out));
-            }
-            Expr::ArrayLit(rows) => rows.iter().flatten().for_each(|a| walk(a, out)),
-            Expr::Un(_, a) => walk(a, out),
-            Expr::Bin(_, a, b) => {
-                walk(a, out);
-                walk(b, out);
-            }
-            _ => {}
+            i += 1;
+            continue;
         }
+        if !(c.is_ascii_alphanumeric() || c == '$') {
+            i += c.len_utf8();
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end < buf.len() {
+            let ch = buf[end..].chars().next().unwrap_or(' ');
+            if ch.is_ascii_alphanumeric() || ch == '$' || ch == ':' {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let is_call = buf[end..].starts_with('(');
+        let qualified = buf[..start].ends_with('!');
+        if !is_call && !qualified {
+            if let Some(r) = gridcore::sheet::parse_range_name(&buf[start..end]) {
+                out.push((start..end, r));
+            }
+        }
+        i = end.max(start + 1);
     }
-    walk(&ast, &mut out);
-    out.dedup();
     out
 }
 
-/// A range as the A1 text a field shows.
+/// The colour a formula's `i`-th reference is drawn in, on the grid and in the
+/// text alike.
+fn ref_color(i: usize) -> u32 {
+    const REF_COLORS: [u32; 6] = [0x2F6FDB, 0xC0705A, 0x7A5EA8, 0x2AA79B, 0xD8A44A, 0xD06C9E];
+    REF_COLORS[i % REF_COLORS.len()]
+}
+
+/// A range as the A1 text a field shows./// A range as the A1 text a field shows.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
@@ -2096,6 +2106,15 @@ impl Docxy {
             }
         }
         None
+    }
+
+    /// The ranges the formula being typed mentions, for the grid to outline.
+    fn formula_refs(&self) -> std::rc::Rc<Vec<(u32, u32, u32, u32)>> {
+        let refs = match self.active_sheet().and_then(|v| v.editing.as_deref()) {
+            Some(buf) if buf.starts_with('=') => formula_ref_tokens(buf).into_iter().map(|(_, r)| r).collect(),
+            _ => Vec::new(),
+        };
+        std::rc::Rc::new(refs)
     }
 
     /// Is a formula being typed? Then a click or drag on the grid writes its
@@ -9659,7 +9678,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.range_field_active(), self.chart_ui(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.range_field_active(), self.formula_refs(), self.chart_ui(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -9935,7 +9954,7 @@ fn sheet_col_header(view: &SheetView, ent: &Entity<Docxy>, fc: u32, col0: u32, c
 
 /// Grid state that lives on `Docxy` rather than the sheet view, threaded into
 /// the row renderer (which only sees the view).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct GridOverlay {
     /// Box an in-progress fill drag would cover — outlined, not yet applied.
     fill_preview: Option<(u32, u32, u32, u32)>,
@@ -9944,6 +9963,9 @@ struct GridOverlay {
     /// A range field has the keyboard: the active cell drops its ring so it
     /// can't be mistaken for the range being picked, and wears a wash instead.
     picking: bool,
+    /// The ranges the formula being typed mentions, in writing order — each
+    /// outlined in its own colour so you can see what it reads.
+    formula_refs: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
 }
@@ -10008,6 +10030,13 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             && ov.fill_preview.is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
         // Cells the focused range field names.
         let in_ref = ov.range_preview.is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
+        // Cells the formula being typed reads: the first reference covering
+        // this cell gives it its colour.
+        let formula_ref = ov
+            .formula_refs
+            .iter()
+            .position(|&(fr0, fc0, fr1, fc1)| r >= fr0 && r <= fr1 && c >= fc0 && c <= fc1)
+            .map(|i| (i, ov.formula_refs[i]));
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
@@ -10077,6 +10106,7 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
             .when(in_range && !selected, |d| d.bg(range_tint))
             .when(in_preview, |d| d.bg(Hsla { h: 0., s: 0., l: 0.45, a: 0.16 }))
             .when(in_ref, |d| d.bg(Hsla { a: 0.18, ..brand }))
+            .when_some(formula_ref, |d, (i, _)| d.bg(Hsla { a: 0.14, ..hsla_u(ref_color(i)) }))
             .when(selected && ov.picking, |d| d.bg(Hsla { a: 0.38, ..brand }))
             .when(ring, |d| d.border_2().border_color(brand));
         if cell_editing {
@@ -10144,6 +10174,26 @@ fn sheet_row(view: &SheetView, ent: &Entity<Docxy>, r: u32, fc: u32, col0: u32, 
                 });
             }
         });
+        // A formula's references, each in its own colour — drawn per edge cell
+        // for the same reason as the range outline below.
+        if let Some((i, (fr0, fc0, fr1, fc1))) = formula_ref {
+            let (top, bot, lft, rgt) = (r == fr0, r == fr1, c == fc0, c == fc1);
+            if top || bot || lft || rgt {
+                cell = cell.relative().child(deferred(
+                    div()
+                        .absolute()
+                        .left(px(-1.))
+                        .top(px(-1.))
+                        .right(px(-1.))
+                        .bottom(px(-1.))
+                        .border_color(hsla_u(ref_color(i)))
+                        .when(top, |d| d.border_t(px(2.)))
+                        .when(bot, |d| d.border_b(px(2.)))
+                        .when(lft, |d| d.border_l(px(2.)))
+                        .when(rgt, |d| d.border_r(px(2.))),
+                ));
+            }
+        }
         // The referenced range's border: each edge cell draws its own outer side,
         // which the cell's own layout places exactly (the overlay's uniform-row
         // arithmetic drifts on content-tall rows). `deferred` keeps the cell's
@@ -10396,7 +10446,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, picking: bool, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, picking: bool, formula_refs: std::rc::Rc<Vec<(u32, u32, u32, u32)>>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -10511,7 +10561,13 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             br >= ar && br < rr && bc >= ac && bc < cc
         })
     };
-    let ov = GridOverlay { fill_preview, range_preview, picking: range_preview.is_some() || picking, handle_hidden: corner_under_chart };
+    let ov = GridOverlay {
+        fill_preview,
+        range_preview,
+        picking: range_preview.is_some() || picking,
+        formula_refs: formula_refs.clone(),
+        handle_hidden: corner_under_chart,
+    };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
@@ -10520,7 +10576,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
     let fr = (frz_r as usize).min(visible.len()).min(30);
     let mut frozen = v_flex().flex_none();
     for i in 0..fr {
-        frozen = frozen.child(sheet_row(view, ent, visible[i], fc, col0, cend, &cc_frozen, ov));
+        frozen = frozen.child(sheet_row(view, ent, visible[i], fc, col0, cend, &cc_frozen, ov.clone()));
     }
     let ent_list = ent.clone();
     let vis_list = visible.clone();
@@ -10535,7 +10591,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         let this = ent_list.read(app);
         let Some(v) = this.active_sheet() else { return div().into_any_element() };
         let row = vis_list.get(fr + ix).copied().unwrap_or(0);
-        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list, ov)
+        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list, ov.clone())
     })
     .with_sizing_behavior(ListSizingBehavior::Auto)
     .flex_1()
@@ -11031,7 +11087,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, refs_in, ref_token_at, replace_ref, scroll_col0_for_sel, series_move, series_remove};
+    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, formula_ref_tokens, ref_color, ref_token_at, replace_ref, scroll_col0_for_sel, series_move, series_remove};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -11208,24 +11264,37 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn refs_in_lists_every_range_a_formula_mentions() {
-        // Single cells and ranges, nested inside calls and arithmetic.
-        assert_eq!(refs_in("=B2*C2"), vec![(1, 1, 1, 1), (1, 2, 1, 2)]);
-        assert_eq!(refs_in("=SUM(D2:D5)"), vec![(1, 3, 4, 3)]);
-        assert_eq!(
-            refs_in("=B2*C2+SUM(D2:D5)"),
-            vec![(1, 1, 1, 1), (1, 2, 1, 2), (1, 3, 4, 3)]
-        );
-        // A backwards range still names the same box.
-        assert_eq!(refs_in("=SUM(D5:D2)"), vec![(1, 3, 4, 3)]);
-        // Half-typed formulas are the normal case mid-edit: nothing, not an error.
-        assert!(refs_in("=SUM(").is_empty());
-        assert!(refs_in("=").is_empty());
-        // Plain values mention no cells.
-        assert!(refs_in("=1+2").is_empty());
-        assert!(refs_in("hello").is_empty());
-        // Another sheet's cells can't be outlined on this grid, so they're skipped.
-        assert!(refs_in("=Sheet2!A1").is_empty());
+    fn formula_ref_tokens_finds_every_reference_and_where_it_sits() {
+        let ranges = |f: &str| formula_ref_tokens(f).into_iter().map(|(_, r)| r).collect::<Vec<_>>();
+        // Single cells and ranges, in the order they are written.
+        assert_eq!(ranges("=B2*C2"), vec![(1, 1, 1, 1), (1, 2, 1, 2)]);
+        assert_eq!(ranges("=SUM(D2:D5)"), vec![(1, 3, 4, 3)]);
+        assert_eq!(ranges("=B2*C2+SUM(D2:D5)"), vec![(1, 1, 1, 1), (1, 2, 1, 2), (1, 3, 4, 3)]);
+        // The span is where the text can be coloured.
+        assert_eq!(formula_ref_tokens("=SUM(D2:D5)")[0].0, 5..10);
+        assert_eq!(formula_ref_tokens("=B2*C2")[1].0, 4..6);
+        // Function names are not references, even when they read like cells.
+        assert!(ranges("=LOG10(A1)").len() == 1, "only A1 counts");
+        assert_eq!(ranges("=SUM(A1)"), vec![(0, 0, 0, 0)]);
+        // Another sheet's cells can't be outlined here, so they're skipped.
+        assert!(ranges("=Sheet2!A1").is_empty());
+        assert_eq!(ranges("=Sheet2!A1+B2"), vec![(1, 1, 1, 1)], "the local one still counts");
+        // Nor is anything inside a string.
+        assert!(ranges("=\"A1 is here\"").is_empty());
+        assert_eq!(ranges("=\"A1\"&C3"), vec![(2, 2, 2, 2)]);
+        // Half-typed formulas are the normal case mid-edit.
+        assert!(ranges("=SUM(").is_empty());
+        assert!(ranges("=1+2").is_empty());
+    }
+
+    #[test]
+    fn ref_color_is_stable_per_reference_and_wraps() {
+        // The same index always draws the same colour, on the grid and in the
+        // text; past the palette it wraps rather than running out.
+        assert_eq!(ref_color(0), ref_color(0));
+        assert_ne!(ref_color(0), ref_color(1));
+        assert_eq!(ref_color(0), ref_color(6));
+        assert_eq!(ref_color(2), ref_color(8));
     }
 
     #[test]
