@@ -1267,6 +1267,90 @@ fn series_move(list: &mut [gridcore::sheet::ChartSeries], i: usize, delta: i32) 
     Some(to)
 }
 
+/// The byte range of the cell reference the caret sits in or immediately after,
+/// so pointing at the grid REPLACES the reference you are standing on rather
+/// than appending a second one. `None` when the caret isn't on a reference —
+/// after an operator, a comma or an open bracket — where a pick inserts instead.
+///
+/// A token followed by `(` is a function name, not a reference: `LOG10(` reads
+/// as a cell otherwise, exactly as it does in Excel.
+fn ref_token_at(buf: &str, caret_chars: usize) -> Option<std::ops::Range<usize>> {
+    let caret = char_to_byte(buf, caret_chars);
+    let is_ref_char = |c: char| c.is_ascii_alphanumeric() || c == '$' || c == ':';
+    let start = buf[..caret].char_indices().rev().take_while(|(_, c)| is_ref_char(*c)).map(|(i, _)| i).last()?;
+    let end = buf[caret..]
+        .char_indices()
+        .take_while(|(_, c)| is_ref_char(*c))
+        .map(|(i, c)| caret + i + c.len_utf8())
+        .last()
+        .unwrap_or(caret);
+    if buf[end..].starts_with('(') {
+        return None; // a function name
+    }
+    let token = &buf[start..end];
+    gridcore::sheet::parse_range_name(token).map(|_| start..end)
+}
+
+/// Write `text` into a formula buffer at the caret: over the reference the
+/// caret is on, or inserted where it stands. Returns the new buffer and where
+/// the caret lands (after what was written).
+fn replace_ref(buf: &str, caret_chars: usize, text: &str) -> (String, usize) {
+    let span = ref_token_at(buf, caret_chars).unwrap_or_else(|| {
+        let at = char_to_byte(buf, caret_chars);
+        at..at
+    });
+    let mut out = String::with_capacity(buf.len() + text.len());
+    out.push_str(&buf[..span.start]);
+    out.push_str(text);
+    out.push_str(&buf[span.end..]);
+    let caret = out[..span.start + text.len()].chars().count();
+    (out, caret)
+}
+
+/// Every range a formula mentions, for outlining them on the grid. A buffer
+/// that doesn't parse yet — which is most of them, mid-typing — yields nothing
+/// rather than an error.
+fn refs_in(buf: &str) -> Vec<(u32, u32, u32, u32)> {
+    use gridcore::formula::Expr;
+    let src = buf.strip_prefix('=').unwrap_or(buf);
+    let Ok(ast) = gridcore::formula::parse(src) else { return Vec::new() };
+    let mut out = Vec::new();
+    // Walk the tree, keeping only same-sheet rectangles: those are the ones
+    // this grid can outline.
+    fn walk(e: &Expr, out: &mut Vec<(u32, u32, u32, u32)>) {
+        let cell = |r: &gridcore::formula::CellRef| -> Option<(u32, u32)> {
+            (r.sheet.is_none() && r.row >= 0 && r.col >= 0).then_some((r.row as u32, r.col as u32))
+        };
+        match e {
+            Expr::Ref(r) => {
+                if let Some((row, col)) = cell(r) {
+                    out.push((row, col, row, col));
+                }
+            }
+            Expr::Range(a, b) => {
+                if let (Some((r1, c1)), Some((r2, c2))) = (cell(a), cell(b)) {
+                    out.push((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)));
+                }
+            }
+            Expr::Func(_, args) => args.iter().for_each(|a| walk(a, out)),
+            Expr::Call(f, args) => {
+                walk(f, out);
+                args.iter().for_each(|a| walk(a, out));
+            }
+            Expr::ArrayLit(rows) => rows.iter().flatten().for_each(|a| walk(a, out)),
+            Expr::Un(_, a) => walk(a, out),
+            Expr::Bin(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            _ => {}
+        }
+    }
+    walk(&ast, &mut out);
+    out.dedup();
+    out
+}
+
 /// A range as the A1 text a field shows.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -10893,7 +10977,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, scroll_col0_for_sel, series_move, series_remove};
+    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, refs_in, ref_token_at, replace_ref, scroll_col0_for_sel, series_move, series_remove};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -11005,6 +11089,68 @@ mod grid_geom_tests {
         assert!(RefTarget::Categories.is_range());
         // Targets are per series, so two series never share a field.
         assert_ne!(RefTarget::SeriesValues(0), RefTarget::SeriesValues(1));
+    }
+
+    #[test]
+    fn ref_token_at_finds_the_reference_under_the_caret() {
+        // Caret inside, at either edge of, or just after a reference finds it.
+        let buf = "=B2*C2";
+        assert_eq!(ref_token_at(buf, 2), Some(1..3), "inside B2");
+        assert_eq!(ref_token_at(buf, 3), Some(1..3), "just after B2");
+        assert_eq!(ref_token_at(buf, 6), Some(4..6), "end of the buffer");
+        // A range counts as one token, colon and all.
+        assert_eq!(ref_token_at("=SUM(D2:D5)", 9), Some(5..10), "D2:D5 spans bytes 5..10");
+        // Right after an operator or an open bracket there is nothing to
+        // replace — a pick inserts there instead.
+        assert_eq!(ref_token_at("=SUM(", 5), None);
+        assert_eq!(ref_token_at("=B2*", 4), None);
+        assert_eq!(ref_token_at("=B2,", 4), None);
+        // A function name is not a reference, even when it reads like a cell:
+        // LOG10 parses as column LOG row 10 unless the bracket is noticed.
+        assert_eq!(ref_token_at("=LOG10(A1)", 6), None);
+        assert_eq!(ref_token_at("=SUM(A1)", 4), None);
+        // Nor is anything that simply doesn't name cells.
+        assert_eq!(ref_token_at("=total", 6), None);
+        assert_eq!(ref_token_at("", 0), None);
+    }
+
+    #[test]
+    fn replace_ref_writes_over_the_reference_or_inserts() {
+        // Inserting after an open bracket leaves the rest alone.
+        assert_eq!(replace_ref("=SUM(", 5, "A2:A5"), ("=SUM(A2:A5".to_string(), 10));
+        // Standing on a reference replaces exactly it.
+        assert_eq!(replace_ref("=B2*C2", 3, "D9"), ("=D9*C2".to_string(), 3));
+        assert_eq!(replace_ref("=SUM(D2:D5)", 9, "B2:B4"), ("=SUM(B2:B4)".to_string(), 10));
+        // The caret always lands after what was written, ready for the next
+        // character.
+        let (buf, caret) = replace_ref("=", 1, "A1");
+        assert_eq!((buf.as_str(), caret), ("=A1", 3));
+        // Multibyte text before the caret doesn't shift the splice.
+        let (buf, caret) = replace_ref("=\"café\"&B2", 9, "C3");
+        assert_eq!(buf, "=\"café\"&C3");
+        // 10 CHARS, not the 11 bytes é costs — the caret is counted in chars.
+        assert_eq!(caret, 10);
+    }
+
+    #[test]
+    fn refs_in_lists_every_range_a_formula_mentions() {
+        // Single cells and ranges, nested inside calls and arithmetic.
+        assert_eq!(refs_in("=B2*C2"), vec![(1, 1, 1, 1), (1, 2, 1, 2)]);
+        assert_eq!(refs_in("=SUM(D2:D5)"), vec![(1, 3, 4, 3)]);
+        assert_eq!(
+            refs_in("=B2*C2+SUM(D2:D5)"),
+            vec![(1, 1, 1, 1), (1, 2, 1, 2), (1, 3, 4, 3)]
+        );
+        // A backwards range still names the same box.
+        assert_eq!(refs_in("=SUM(D5:D2)"), vec![(1, 3, 4, 3)]);
+        // Half-typed formulas are the normal case mid-edit: nothing, not an error.
+        assert!(refs_in("=SUM(").is_empty());
+        assert!(refs_in("=").is_empty());
+        // Plain values mention no cells.
+        assert!(refs_in("=1+2").is_empty());
+        assert!(refs_in("hello").is_empty());
+        // Another sheet's cells can't be outlined on this grid, so they're skipped.
+        assert!(refs_in("=Sheet2!A1").is_empty());
     }
 
     #[test]

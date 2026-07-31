@@ -189,12 +189,15 @@ Dependencies identified:
   - ⚠️ "+ Add series" is NOT verified on screen: the machine was in use and the harness refuses to send input unless the suite owns the foreground. Its unit-tested siblings pass and the action is four lines, but it hasn't been seen working.
 
 ### Task 7: Reference tokens in a formula buffer
-- [ ] add pure helpers: `ref_token_at(buf, caret) -> Option<Range<usize>>` (the A1/A1:D5 token the caret sits in or immediately after) and `replace_ref(buf, caret, text) -> (String, usize)`
-- [ ] decide insert-vs-replace: after an operator, `(` or `,` insert; inside or right after a reference, replace it
-- [ ] add `refs_in(buf) -> Vec<(u32,u32,u32,u32)>` over `gridcore::formula::parse`, ignoring text that doesn't parse yet (a half-typed formula is the normal case)
-- [ ] write tests for `ref_token_at` (caret before/inside/after a ref, no ref, multiple refs)
-- [ ] write tests for `replace_ref` (insert after `(`, replace an existing ref, caret lands after the written ref) and for `refs_in` (nested calls, ranges and single cells, unparseable input → empty)
-- [ ] run tests - must pass before task 8
+- [x] add pure helpers: `ref_token_at(buf, caret) -> Option<Range<usize>>` and `replace_ref(buf, caret, text) -> (String, usize)`
+- [x] decide insert-vs-replace: after an operator, `(` or `,` insert; inside or right after a reference, replace it
+  - ➕ a token followed by `(` is a function name, not a reference — `LOG10(` parses as column LOG row 10 otherwise, the same ambiguity Excel resolves this way
+- [x] add `refs_in(buf) -> Vec<(u32,u32,u32,u32)>` over `gridcore::formula::parse`, ignoring text that doesn't parse yet, and skipping other sheets' cells (this grid can't outline them)
+- [x] write tests for `ref_token_at` (caret inside/after a ref, at the buffer end, after an operator or bracket, function names, non-references)
+- [x] write tests for `replace_ref` (insert after `(`, replace an existing ref, caret lands after what was written, multibyte text before the caret) and for `refs_in` (nested calls, arithmetic, backwards ranges, half-typed input, other sheets)
+- [x] run tests - 19 passed
+  - ⚠️ the helpers are unused until Task 8 wires them, so this commit carries two dead-code warnings. The tests caught two off-by-ones in my own expectations, not in the code.
+- ⚠️ `refs_in` keeps only same-sheet rectangles; whole-column (`A:C`), whole-row, 3D and structured references parse but aren't outlined.
 
 ### Task 8: Point mode while editing a formula
 - [ ] route grid clicks and drags to `replace_ref` when the active cell edit holds a formula, instead of committing the edit and moving the selection
