@@ -1598,6 +1598,14 @@ fn ref_token_at(buf: &str, caret_chars: usize) -> Option<std::ops::Range<usize>>
         // reason: we can only outline the sheet we are looking at.)
         return None;
     }
+    if buf[end..].starts_with('!') {
+        // The SHEET half, unquoted. A cell-shaped sheet name — `Q1`, `H1`, `FY1`
+        // — parses as a reference, and `translate_formula` writes exactly that
+        // form (`sheet_prefix` quotes only names with non-identifier
+        // characters). Replacing it would turn `=Q1!B2` into `=D7!B2`: a
+        // reference to a sheet that doesn't exist.
+        return None;
+    }
     let token = &buf[start..end];
     // `D2:` is half a range — typed, not finished. It counts as the reference
     // under the caret, so a pick completes it instead of appending and leaving
@@ -1679,8 +1687,13 @@ fn formula_ref_tokens(buf: &str) -> Vec<RefToken> {
         }
         let is_call = buf[end..].starts_with('(');
         let qualified = buf[..start].ends_with('!');
+        // The sheet half of an unquoted qualified ref (`=Q1!B2` — a sheet named
+        // `Q1`). Cell-shaped, so `parse_range_name` takes it and we'd outline
+        // cell Q1 of the sheet in view while the real ref went uncoloured.
+        let is_sheet_name = buf[end..].starts_with('!');
         if !is_call
             && !qualified
+            && !is_sheet_name
             && let Some(r) = gridcore::sheet::parse_range_name(&buf[start..end])
         {
             out.push((start..end, r));
@@ -2549,10 +2562,14 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        if data.kind == kind {
+        if data.kind == kind && !data.complex {
             return;
         }
         data.kind = kind.to_string();
+        // Picking a type is the explicit "author this one afresh" the panel's
+        // note asks for: a stacked or combo plot area held the part back, and
+        // the user has now said what to replace it with.
+        data.complex = false;
         self.chart_set_data(data, cx);
     }
 
@@ -2686,6 +2703,20 @@ impl Docxy {
         if matches!(&self.ref_msg, Some((t, _, _)) if t.is_bar()) {
             self.ref_msg = None;
         }
+    }
+
+    /// Every bar that swallows typing. `sheet_key` asks them BEFORE it asks a
+    /// range field that isn't one of theirs, so a field outside them taking
+    /// focus has to close them: the Chart panel renders off `chart_sel` alone,
+    /// so its fields stay clickable while a bar is open, and clicking one would
+    /// draw a focused border and a caret while every keystroke went to the bar
+    /// — and a drag on the grid rewrote (and committed) the CHART's range.
+    fn typing_bars_close(&mut self) {
+        self.bar_close();
+        self.sheet_comment_edit = None;
+        self.sheet_filter_edit = None;
+        self.sheet_rowh_edit = None;
+        self.find_open = false;
     }
 
     /// Re-point one series at another range, re-reading just its numbers. The
@@ -3250,9 +3281,14 @@ impl Docxy {
 
     /// Remove the selected chart (Delete on a selected object, Excel-style).
     fn chart_delete_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(idx) = self.chart_sel.take() else {
+        let Some(idx) = self.chart_sel else {
             return;
         };
+        // The list is about to shift under every chart-keyed index, the panel's
+        // focused field included — taking `chart_sel` alone would leave a
+        // `SeriesValues(i)` field pointing into whichever chart slid into the
+        // gap.
+        self.chart_drop_selection();
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let sidx = v.active;
@@ -3378,6 +3414,13 @@ impl Docxy {
         }
         if self.sheet_fill.is_some() {
             return; // an auto-fill drag owns the pointer too
+        }
+        if self.active_sheet().is_some_and(|v| v.col_drag.is_some()) {
+            // A column-resize drag is armed from the HEADER, but the cells' own
+            // `on_mouse_move` keeps firing as the pointer drifts down into the
+            // rows — and each one would sweep the focused range field, with
+            // `grid_release` committing whatever it swept.
+            return;
         }
         if self.formula_pick_active() {
             return self.formula_pick_to(row, col, false, cx);
@@ -4721,8 +4764,12 @@ impl Docxy {
                 at: shift.1,
                 delta: shift.2,
             };
-            for ch in v.charts.iter_mut().filter(|ch| ch.sheet == s) {
-                edit::shift_chart_refs(&mut ch.data, &name, &shift);
+            // Every authored chart, not just the ones ON the edited sheet: a
+            // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)
+            // and has to follow them. `home` is what keeps the UNqualified refs
+            // — which mean the chart's own sheet — out of it.
+            for ch in v.charts.iter_mut() {
+                edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
             }
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
@@ -5299,6 +5346,12 @@ impl Docxy {
         // without this Ctrl+Z would undo the edit BEFORE the insert and leave
         // the chart standing.
         self.sheet_snapshot();
+        // A UI-authored chart goes in FRONT of the file's drawings in
+        // `chart_locate`'s order, so pushing one shifts every drawing-backed
+        // index by one. A selection or a focused panel field left over from
+        // before would then name — and, on the next pick, repoint — a different
+        // chart than the one on screen.
+        self.chart_drop_selection();
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             // Anchor the saved chart just right of the selected range. The span
@@ -5479,6 +5532,12 @@ impl Docxy {
                     cx2.stop_propagation();
                     let seed = seed.clone();
                     ent_c.update(cx2, |this, cx2| {
+                        // A bar's own field is routed to first and must leave
+                        // its bar standing; anything else has to take the
+                        // keyboard away from whatever bar is open.
+                        if !target.is_bar() {
+                            this.typing_bars_close();
+                        }
                         let n = seed.chars().count();
                         this.range_edit = Some(RangeEdit {
                             target,
@@ -5786,12 +5845,13 @@ impl Docxy {
                     ))
                     .child(heading("TYPE"))
                     .child(types)
-                    // The four buttons above are the only kinds we can WRITE.
-                    // A scatter/area/doughnut/radar chart round-trips as its
-                    // original part rather than being flattened into a column
-                    // chart on save — so edits here show on screen but don't
+                    // The four buttons above are the only kinds we can WRITE,
+                    // and only as a single clustered/standard plot group. A
+                    // scatter/area/doughnut/radar chart — or a stacked or combo
+                    // one — round-trips as its original part rather than being
+                    // flattened on save, so edits here show on screen but don't
                     // reach the file until a type is picked. Say so.
-                    .when(!gridcore::xlsx::chart_kind_is_writable(&data.kind), |d| {
+                    .when(!gridcore::xlsx::chart_is_writable(&data), |d| {
                         d.child(
                             div()
                                 .px_1()
@@ -5801,7 +5861,10 @@ impl Docxy {
                                 .child(format!(
                                     "This {}chart is kept as Excel wrote it. Edits below show \
                                      here but are not saved until you pick a type above.",
-                                    if data.kind.is_empty() {
+                                    // Name the kind only when the KIND is what
+                                    // holds it back; "This stacked chart" would
+                                    // read as a kind we don't have a word for.
+                                    if data.complex || data.kind.is_empty() {
                                         String::new()
                                     } else {
                                         format!("{} ", data.kind)
@@ -16141,6 +16204,13 @@ mod grid_geom_tests {
         assert_eq!(ref_token_at("=SUM(Sheet2!A1:A5)", 17), None);
         // The local reference alongside one is still replaceable.
         assert_eq!(ref_token_at("=Sheet2!A1+B2", 13), Some(11..13));
+        // The SHEET half of a cell-shaped, unquoted name is not a reference
+        // either: a pick there would turn `=Q1!B2` into `=D7!B2`, naming a sheet
+        // that doesn't exist.
+        assert_eq!(ref_token_at("=Q1!B2", 3), None, "caret just after Q1");
+        assert_eq!(ref_token_at("=Q1!B2", 2), None, "caret inside Q1");
+        assert_eq!(ref_token_at("=Q1!B2", 6), None, "the cell half, as above");
+        assert_eq!(ref_token_at("=Q1!B2+C3", 9), Some(7..9), "the local one");
     }
 
     #[test]
@@ -16323,6 +16393,13 @@ mod grid_geom_tests {
         assert_eq!(ranges("='Q1'!A1+B2"), vec![(1, 1, 1, 1)]);
         assert_eq!(ranges("='Bob''s data'!A1+B2"), vec![(1, 1, 1, 1)]);
         assert!(ranges("='H1").is_empty(), "half-typed, still no cell");
+        // UNquoted and cell-shaped is the same sheet, and it is the form
+        // `translate_formula` writes: `sheet_prefix` quotes only names with
+        // non-identifier characters, so a fill or a row insert turns `'Q1'!B2`
+        // into `Q1!B2`. Both halves have to come out the same as above.
+        assert!(ranges("=Q1!A1").is_empty());
+        assert_eq!(ranges("=Q1!B2+C3"), vec![(2, 2, 2, 2)]);
+        assert_eq!(ranges("=FY1!A1+D4"), vec![(3, 3, 3, 3)]);
         // Half-typed formulas are the normal case mid-edit.
         assert!(ranges("=SUM(").is_empty());
         assert!(ranges("=1+2").is_empty());

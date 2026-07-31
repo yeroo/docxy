@@ -308,6 +308,14 @@ pub struct ChartData {
     /// otherwise; only an edited chart is regenerated (and so loses whatever
     /// formatting we don't model).
     pub edited: bool,
+    /// The plot area holds something the writer cannot reproduce: a grouping it
+    /// doesn't emit (stacked, percentStacked), or more than one plot group (a
+    /// combo chart — bars and a line sharing one plot area, often on two axes).
+    /// `kind` records only the FIRST group, so regenerating such a part would
+    /// silently turn a stacked chart into a clustered one, or fold every series
+    /// of a combo onto one axis pair as bars. Those parts round-trip verbatim
+    /// instead, the same escape hatch scatter and area use.
+    pub complex: bool,
 }
 
 /// The worksheet range a chart plots: the sheet by name (as the `<c:f>` refs
@@ -554,6 +562,8 @@ pub fn chart_from_range(
         categories_ref: label_col.map(|c| src(c, c)),
         part: None,
         edited: true,
+        // Authored here, so it is exactly what the writer emits.
+        complex: false,
     })
 }
 

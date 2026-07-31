@@ -1511,11 +1511,9 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         // round-trip verbatim, keeping whatever formatting we don't model.
         for dw in &sheet.drawings {
             if let crate::sheet::DrawingKind::Chart(cd) = &dw.kind {
-                if let (true, true, Some(cpart)) = (
-                    cd.edited,
-                    chart_kind_is_writable(&cd.kind),
-                    cd.part.as_deref(),
-                ) {
+                if let (true, true, Some(cpart)) =
+                    (cd.edited, chart_is_writable(cd), cd.part.as_deref())
+                {
                     if let Some(p) = parts.iter_mut().find(|(n, _)| n == cpart) {
                         p.1 = chart_space_xml(cd).into_bytes();
                     }
@@ -1532,10 +1530,18 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
                 .filter(|d| d.anchor_ix != crate::sheet::ANCHOR_AUTHORED)
                 .map(|d| (d.anchor_ix, d.from, d.to))
                 .collect();
-            if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
-                let xml = String::from_utf8_lossy(&p.1).into_owned();
-                p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed)
-                    .into_bytes();
+            // Nothing to write means the part is left EXACTLY as it came in.
+            // Decoding it first would be lossy for a drawing part that isn't
+            // UTF-8 (UTF-16 is legal XML): every stray sequence would come back
+            // as U+FFFD, so merely opening and saving would destroy artwork we
+            // never touched.
+            if !(moves.is_empty() && sheet.drawings_removed.is_empty()) {
+                if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
+                    if let Ok(xml) = std::str::from_utf8(&p.1) {
+                        p.1 = crate::drawing::rewrite_anchors(xml, &moves, &sheet.drawings_removed)
+                            .into_bytes();
+                    }
+                }
             }
         }
     }
@@ -2128,6 +2134,13 @@ pub fn chart_kind_is_writable(kind: &str) -> bool {
     matches!(kind, "bar" | "column" | "line" | "pie")
 }
 
+/// Whether an edit to this chart can be written back into its part at all: a
+/// kind the writer can author, and a plot area it can reproduce. See
+/// [`crate::sheet::ChartData::complex`] for the second half.
+pub fn chart_is_writable(cd: &crate::sheet::ChartData) -> bool {
+    chart_kind_is_writable(&cd.kind) && !cd.complex
+}
+
 /// A self-contained `chartSpace` for a clustered column chart, with categories
 /// and per-series values cached as literals (`strLit`/`numLit`) so it renders
 /// without the source range. `pub(crate)` so sibling modules' tests can
@@ -2410,6 +2423,25 @@ fn ensure_full_calc(xml: &str) -> String {
             1,
         )
     }
+}
+
+/// A self-closed root element (`<xdr:wsDr …/>`) reopened: everything up to and
+/// including its `>`, with the `/` dropped, ready for children and a close tag.
+/// `None` when `xml` holds no such element at all.
+fn open_self_closed_root(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}");
+    let at = xml.find(&open)?;
+    let after = at + open.len();
+    // `<xdr:wsDrSomething` merely starts the same way.
+    if !xml[after..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+    {
+        return None;
+    }
+    let gt = xml[after..].find('>')? + after;
+    xml[..gt].strip_suffix('/').map(|b| format!("{b}>"))
 }
 
 pub(crate) fn add_content_type_override(
@@ -2938,16 +2970,7 @@ impl SheetPackage {
         }
         let chart_part = format!("xl/charts/chart{cn}.xml");
 
-        // 1) chart part + content type.
-        self.parts
-            .push((chart_part.clone(), chart_space_xml(data).into_bytes()));
-        add_content_type_override(
-            &mut self.parts,
-            &format!("/{chart_part}"),
-            "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
-        );
-
-        // 2) where the anchor goes. A worksheet may carry only ONE `<drawing>`,
+        // 1) where the anchor goes. A worksheet may carry only ONE `<drawing>`,
         // so a fresh part for a sheet that already has one would be orphaned:
         // we'd still read it back, Excel would show only the part the worksheet
         // names. A second chart — or the first on a sheet that already holds a
@@ -2968,12 +2991,35 @@ impl SheetPackage {
             .unwrap_or(("", drawing_part.as_str()));
         let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
 
-        // 3) drawing rels → chart (its rId names the chart from the anchor).
-        let c_rid = add_rel(
+        // 2) drawing rels → chart (its rId names the chart from the anchor).
+        // Minted BEFORE the chart part is written, so a failure here leaves no
+        // orphan behind.
+        let d_rels = format!("{d_dir}/_rels/{d_file}.rels");
+        let c_target = relative_target(&d_dir, &chart_part);
+        let c_rid = match add_rel(
             &mut self.parts,
-            &format!("{d_dir}/_rels/{d_file}.rels"),
+            &d_rels,
             "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-            &relative_target(&d_dir, &chart_part),
+            &c_target,
+        ) {
+            // "" means the rel was already there — a dangling one naming a chart
+            // part the zip doesn't hold, so `cn` picked its name. Reuse its id;
+            // an anchor written with `r:id=""` makes Excel call the whole
+            // workbook unreadable.
+            id if id.is_empty() => rel_id_for(&self.parts, &d_rels, &c_target).unwrap_or_default(),
+            id => id,
+        };
+        if c_rid.is_empty() {
+            return; // no id to point the graphic frame at; leave the file alone
+        }
+
+        // 3) chart part + content type.
+        self.parts
+            .push((chart_part.clone(), chart_space_xml(data).into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{chart_part}"),
+            "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
         );
 
         // 4) the anchor itself, in whatever prefix the host part uses (`xdr:`
@@ -3009,7 +3055,10 @@ impl SheetPackage {
                         max = max.max(n);
                     }
                 }
-                max + 1
+                // A part is free to spell an id right up at the ceiling; `+ 1`
+                // would panic in debug and wrap to 0 in release, minting exactly
+                // the duplicate id this scan exists to avoid.
+                max.saturating_add(1)
             })
             .unwrap_or(cn + 1);
         let (fr, fc) = from;
@@ -3030,11 +3079,27 @@ impl SheetPackage {
             Some(xml) => {
                 let close = format!("</{px}wsDr>");
                 let spliced = match xml.rfind(&close) {
-                    Some(at) => format!("{}{anchor}{}", &xml[..at], &xml[at..]),
-                    None => format!("{xml}{anchor}"),
+                    Some(at) => Some(format!("{}{anchor}{}", &xml[..at], &xml[at..])),
+                    // No close tag. A part whose last shape was deleted can be
+                    // written as a self-closed empty root — `<xdr:wsDr …/>` —
+                    // which is legal; open it up and put the anchor inside.
+                    // Appending after it instead would give the part TWO
+                    // top-level elements, and Excel calls that unreadable.
+                    None => open_self_closed_root(&xml, &format!("{px}wsDr"))
+                        .map(|opened| format!("{opened}{anchor}</{px}wsDr>")),
                 };
-                if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == drawing_part) {
-                    p.1 = spliced.into_bytes();
+                match spliced {
+                    Some(spliced) => {
+                        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == drawing_part) {
+                            p.1 = spliced.into_bytes();
+                        }
+                    }
+                    // Neither form of root found: the part is truncated or isn't
+                    // a drawing at all. A bare anchor appended to it would be a
+                    // fragment with an undeclared prefix, so leave it be. The
+                    // chart part written above is then simply unreferenced,
+                    // which is valid OPC and which Excel ignores.
+                    None => return,
                 }
             }
             None => {
@@ -3105,6 +3170,28 @@ impl SheetPackage {
                     .min()
                     .unwrap_or(xml.len());
                     xml.insert_str(pos, &format!("<drawing r:id=\"{rid}\"/>"));
+                } else if host.is_none() {
+                    // The worksheet names a drawing the LOADER rejected — a rel
+                    // that resolves to nothing, or a part missing from the zip —
+                    // so the model had none and we just minted a fresh one. A
+                    // worksheet may carry only one `<drawing>`, so leaving the
+                    // stale element in place orphans the part we wrote: the
+                    // chart the user inserted would be silently absent from the
+                    // saved file. Point the element at the new part instead.
+                    if let Some(at) = xml.find("<drawing ") {
+                        let gt = xml[at..].find('>').map(|i| at + i + 1).unwrap_or(xml.len());
+                        let end = if xml[at..gt].ends_with("/>") {
+                            gt
+                        } else {
+                            // `<drawing …></drawing>`: take the close tag too,
+                            // or it would be left dangling.
+                            xml[gt..]
+                                .find("</drawing>")
+                                .map(|i| gt + i + "</drawing>".len())
+                                .unwrap_or(gt)
+                        };
+                        xml.replace_range(at..end, &format!("<drawing r:id=\"{rid}\"/>"));
+                    }
                 }
                 p.1 = xml.into_bytes();
             }
@@ -5562,6 +5649,138 @@ mod tests {
             saved.contains("<c:scatterChart>") && saved.contains("<c:xVal>"),
             "a scatter chart must not be rewritten as a column chart: {saved}"
         );
+    }
+
+    #[test]
+    fn an_edited_stacked_chart_is_kept_verbatim_rather_than_unstacked() {
+        use crate::sheet::DrawingKind;
+        // A stacked column chart loads as kind "column" — writable by kind — but
+        // `chart_space_xml` emits `<c:grouping val="clustered"/>` and no
+        // `<c:overlap>`, so regenerating it silently unstacks the plot. That is
+        // what `ChartData::complex` is for.
+        let mut pkg = new_xlsx();
+        pkg.add_chart(
+            0,
+            (1, 1),
+            (10, 6),
+            &crate::sheet::ChartData {
+                title: "Placeholder".into(),
+                kind: "column".into(),
+                ..Default::default()
+            },
+        );
+        let stacked = "<?xml version=\"1.0\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<c:chart><c:plotArea><c:layout/>\
+<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"stacked\"/><c:overlap val=\"100\"/>\
+<c:ser><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser>\
+</c:barChart></c:plotArea></c:chart></c:chartSpace>";
+        if let Some(p) = pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/charts/chart1.xml")
+        {
+            p.1 = stacked.as_bytes().to_vec();
+        }
+        let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        if let DrawingKind::Chart(cd) = &mut re.workbook.sheets[0].drawings[0].kind {
+            assert_eq!(cd.kind, "column", "kind alone would call this writable");
+            assert!(cd.complex);
+            assert!(!chart_is_writable(cd));
+            cd.title = "Renamed".into(); // what the panel does
+            cd.edited = true;
+        }
+        let saved = String::from_utf8(
+            load_xlsx(&save_xlsx(&re))
+                .unwrap()
+                .part("xl/charts/chart1.xml")
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            saved.contains("val=\"stacked\"") && saved.contains("<c:overlap val=\"100\"/>"),
+            "a stacked chart must not come back clustered: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_chart_joins_a_drawing_part_whose_root_closes_itself() {
+        // A drawing part whose last shape was deleted can be written as a
+        // self-closed empty root. Appending the anchor after it would give the
+        // part TWO top-level elements — not well-formed, and Excel calls the
+        // whole workbook unreadable.
+        let mut pkg = new_xlsx();
+        pkg.add_chart(0, (1, 1), (10, 6), &crate::sheet::ChartData::default());
+        let empty = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"/>";
+        if let Some(p) = pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/drawings/drawing1.xml")
+        {
+            p.1 = empty.as_bytes().to_vec();
+        }
+        pkg.add_chart(0, (12, 1), (20, 6), &crate::sheet::ChartData::default());
+        let part = String::from_utf8(pkg.part("xl/drawings/drawing1.xml").unwrap().to_vec())
+            .expect("still utf-8");
+        assert!(
+            part.trim_end().ends_with("</xdr:wsDr>"),
+            "the anchor must land INSIDE the root: {part}"
+        );
+        assert_eq!(
+            part.matches("twoCellAnchor").count(),
+            2,
+            "one open, one close: {part}"
+        );
+        // And it reloads as one chart on the sheet.
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].drawings.len(), 1);
+    }
+
+    #[test]
+    fn a_self_closed_root_is_reopened_only_when_it_is_the_named_one() {
+        assert_eq!(
+            open_self_closed_root("<a/><xdr:wsDr x=\"1\"/>", "xdr:wsDr").as_deref(),
+            Some("<a/><xdr:wsDr x=\"1\">")
+        );
+        assert_eq!(
+            open_self_closed_root("<xdr:wsDr/>", "xdr:wsDr").as_deref(),
+            Some("<xdr:wsDr>")
+        );
+        // Already open: the caller's `rfind` of the close tag handles that.
+        assert_eq!(
+            open_self_closed_root("<xdr:wsDr></xdr:wsDr>", "xdr:wsDr"),
+            None
+        );
+        // A longer name that merely starts the same way.
+        assert_eq!(open_self_closed_root("<xdr:wsDrX/>", "xdr:wsDr"), None);
+        assert_eq!(open_self_closed_root("", "xdr:wsDr"), None);
+    }
+
+    #[test]
+    fn a_worksheet_naming_an_unreadable_drawing_is_repointed_at_the_new_one() {
+        // The loader sets `drawing_part` only when the rel resolves AND the part
+        // reads. When it doesn't, the model has none while the worksheet still
+        // carries a `<drawing r:id="…"/>` — and a worksheet may carry only one.
+        // Minting a fresh part without repointing that element orphans it: the
+        // chart is silently absent from the saved file.
+        let mut pkg = new_xlsx();
+        let sheet_part = pkg.sheet_parts[0].clone();
+        if let Some(p) = pkg.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+            let mut xml = String::from_utf8(p.1.clone()).unwrap();
+            let at = xml.find("</worksheet>").unwrap();
+            xml.insert_str(at, "<drawing r:id=\"rIdGone\"/>");
+            p.1 = xml.into_bytes();
+        }
+        assert!(pkg.workbook.sheets[0].drawing_part.is_none());
+        pkg.add_chart(0, (1, 1), (10, 6), &crate::sheet::ChartData::default());
+
+        let ws = String::from_utf8(pkg.part(&sheet_part).unwrap().to_vec()).unwrap();
+        assert_eq!(ws.matches("<drawing ").count(), 1, "still only one: {ws}");
+        assert!(!ws.contains("rIdGone"), "the dead rel is gone: {ws}");
+        // And the chart survives a round-trip through the file.
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].drawings.len(), 1);
     }
 
     #[test]

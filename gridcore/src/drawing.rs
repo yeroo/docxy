@@ -11,6 +11,16 @@ fn local(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
+/// Where an element name stops, by the same rule [`XmlParser`] uses. The raw
+/// scanners below index anchors that `parse_drawings` numbered with the parser,
+/// so the two have to agree: a name this stopped at `>`/` `/`/` alone would run
+/// past `<xdr:twoCellAnchor\neditAs="oneCell">` and skip an anchor the parser
+/// counted, shifting every later index — a move or a delete would then land on
+/// someone else's picture.
+fn is_name_end(c: char) -> bool {
+    c.is_whitespace() || c == '>' || c == '/' || c == '='
+}
+
 /// `XmlParser::text()` hands back the RAW source slice, entities and all. Chart
 /// strings used to be cosmetic (the part round-tripped verbatim), but an edited
 /// chart is now regenerated through `esc_attr`, so an undecoded `&amp;` would
@@ -237,7 +247,7 @@ fn next_anchor(xml: &str) -> Option<(usize, &str)> {
             at = past;
             continue;
         }
-        let name_end = xml[start + 1..].find(['>', ' ', '/'])? + start + 1;
+        let name_end = xml[start + 1..].find(is_name_end)? + start + 1;
         let name = &xml[start + 1..name_end];
         // Closing tags share the local name, so only openers count.
         let l = if name.starts_with('/') {
@@ -260,10 +270,7 @@ fn move_anchor(element: &str, from: (u32, u32), to: (u32, u32)) -> String {
     let mut at = 0usize;
     while let Some(rel) = rest[at..].find('<') {
         let start = at + rel;
-        let Some(name_end) = rest[start + 1..]
-            .find(['>', ' ', '/'])
-            .map(|i| i + start + 1)
-        else {
+        let Some(name_end) = rest[start + 1..].find(is_name_end).map(|i| i + start + 1) else {
             break;
         };
         let name = &rest[start + 1..name_end];
@@ -311,7 +318,7 @@ fn set_cell_fields(block: &str, row: u32, col: u32) -> String {
     while let Some(rel) = rest.find('<') {
         let (head, tail) = rest.split_at(rel);
         out.push_str(head);
-        let Some(name_end) = tail[1..].find(['>', ' ', '/']).map(|i| i + 1) else {
+        let Some(name_end) = tail[1..].find(is_name_end).map(|i| i + 1) else {
             out.push_str(tail);
             return out;
         };
@@ -367,22 +374,53 @@ fn parse_chart(xml: &str) -> ChartData {
     // Inside an axis (<c:catAx>/<c:valAx>/…). Every axis may carry a <c:title>
     // of its own, and its text is not the chart's.
     let mut in_axis = false;
+    // How many `*Chart` plot groups the plot area holds, and the first group's
+    // `<c:grouping val="…"/>`. Together they decide `cd.complex`.
+    let mut groups = 0usize;
+    let mut grouping = String::new();
+    // Element depth, and the depth of the open `<c:ser>` (-1 outside one). What
+    // a series PLOTS is named by its direct children; `<c:dLbls>`, `<c:errBars>`
+    // and `<c:trendline>` sit at that same level with refs of their own, and
+    // the first and last wrap a `<c:tx>` that would otherwise read as the
+    // series' name.
+    let mut depth = 0i32;
+    let mut ser_at = -1i32;
+    // Inside the point arrays a scatter or bubble chart plots instead of
+    // `<c:cat>`/`<c:val>`.
+    let mut in_pts = false;
     loop {
         match p.next() {
             Event::Start => {
+                depth += 1;
                 let name = local(p.name());
+                // A direct child of the open `<c:ser>`.
+                let plotted = depth == ser_at + 1;
                 match name {
-                    n if n.ends_with("Chart") && cd.kind.is_empty() => {
-                        // `barChart` covers BOTH orientations — the following
-                        // <c:barDir val="col|bar"/> decides. Default to "column"
-                        // (OOXML's own default is col) and refine on barDir.
-                        cd.kind = match n.trim_end_matches("Chart") {
-                            "bar" => {
-                                in_bar = true;
-                                "column".to_string()
-                            }
-                            other => other.to_string(),
-                        };
+                    n if n.ends_with("Chart") => {
+                        // One plot area may hold SEVERAL of these — a combo
+                        // chart, bars and a line together. `kind` records the
+                        // first; the count is what tells the writer to keep its
+                        // hands off (see `ChartData::complex`).
+                        groups += 1;
+                        if cd.kind.is_empty() {
+                            // `barChart` covers BOTH orientations — the
+                            // following <c:barDir val="col|bar"/> decides.
+                            // Default to "column" (OOXML's own default is col)
+                            // and refine on barDir.
+                            cd.kind = match n.trim_end_matches("Chart") {
+                                "bar" => {
+                                    in_bar = true;
+                                    "column".to_string()
+                                }
+                                other => other.to_string(),
+                            };
+                        }
+                    }
+                    // How the series sit against each other. The writer emits
+                    // `clustered` (bar/column) or `standard` (line) and nothing
+                    // else, so anything stacked has to round-trip verbatim.
+                    "grouping" if grouping.is_empty() => {
+                        grouping = p.attr("val").trim().to_string();
                     }
                     // Orientation of the enclosing barChart: col = vertical
                     // columns, bar = horizontal bars.
@@ -401,10 +439,14 @@ fn parse_chart(xml: &str) -> ChartData {
                     "ser" => {
                         cd.series.push(ChartSeries::default());
                         ser_depth += 1;
+                        ser_at = depth;
                     }
-                    "tx" => mode = 1,
-                    "cat" => mode = 2,
-                    "val" => mode = 3,
+                    "tx" if plotted => mode = 1,
+                    "cat" if plotted => mode = 2,
+                    "val" if plotted => mode = 3,
+                    // A scatter's/bubble's points: plotted cells, but under
+                    // names `mode` doesn't cover.
+                    "xVal" | "yVal" | "bubbleSize" if plotted => in_pts = true,
                     "v" => in_v = true,
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
@@ -466,7 +508,12 @@ fn parse_chart(xml: &str) -> ChartData {
                         match mode {
                             1 => {
                                 if let Some(sr) = cd.series.last_mut() {
-                                    sr.name_ref = Some(raw);
+                                    // First wins, like the cached name above: a
+                                    // cell-linked data label (`<c:dLbl><c:tx>`)
+                                    // opens `<c:tx>` inside the series too, and
+                                    // last-wins would let it overwrite the
+                                    // series' own name ref.
+                                    sr.name_ref.get_or_insert(raw);
                                 }
                             }
                             // Pair the ref with the cache we actually captured
@@ -485,29 +532,48 @@ fn parse_chart(xml: &str) -> ChartData {
                             }
                             _ => {}
                         }
-                        match &mut cd.source {
-                            Some(cur) if cur.sheet == src.sheet => cur.union(&src),
-                            Some(_) => {}
-                            slot => *slot = Some(src),
+                        // Only what is PLOTTED belongs in the chart's box: the
+                        // name cell, the categories, the values, and a
+                        // scatter's/bubble's points. A `<c:ser>` also holds
+                        // `<c:errBars>` and `<c:trendline>`, each with a `<c:f>`
+                        // of its own and neither carrying a mode — folding those
+                        // in widens the DATA RANGE the panel shows, and
+                        // `chart_space_xml` derives a ref-less series' cells
+                        // from `source`, so an edited chart would be written
+                        // back plotting them.
+                        if mode != 0 || in_pts {
+                            match &mut cd.source {
+                                Some(cur) if cur.sheet == src.sheet => cur.union(&src),
+                                Some(_) => {}
+                                slot => *slot = Some(src),
+                            }
                         }
                     }
                 } else if in_title_text {
                     cd.title.push_str(&decoded(p.text()));
                 }
             }
-            Event::End => match local(p.name()) {
-                n if n.ends_with("Ax") && n.len() > 2 => in_axis = false,
-                "title" => in_title = false,
-                "t" => in_title_text = false,
-                "v" => in_v = false,
-                "f" => in_f = false,
-                "ser" => ser_depth -= 1,
-                "tx" | "cat" | "val" => mode = 0,
-                _ => {}
-            },
+            Event::End => {
+                match local(p.name()) {
+                    n if n.ends_with("Ax") && n.len() > 2 => in_axis = false,
+                    "title" => in_title = false,
+                    "t" => in_title_text = false,
+                    "v" => in_v = false,
+                    "f" => in_f = false,
+                    "ser" => {
+                        ser_depth -= 1;
+                        ser_at = -1;
+                    }
+                    "tx" | "cat" | "val" => mode = 0,
+                    "xVal" | "yVal" | "bubbleSize" => in_pts = false,
+                    _ => {}
+                }
+                depth -= 1;
+            }
             Event::Eof => break,
         }
     }
+    cd.complex = groups > 1 || !matches!(grouping.as_str(), "" | "clustered" | "standard");
     cd
 }
 
@@ -1008,6 +1074,101 @@ mod tests {
         );
         // The box covers the data only — H20/H21 are nowhere near it.
         assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 1)));
+    }
+
+    #[test]
+    fn a_series_trimmings_are_not_the_cells_it_plots() {
+        // Error bars, a trendline and a cell-linked data label all sit INSIDE
+        // <c:ser> with a <c:f> of their own. Folded into the box they widen the
+        // DATA RANGE the panel shows, and `chart_space_xml` derives a ref-less
+        // series' cells from it — so an edited chart would be written back
+        // plotting error-bar cells. The label's <c:tx> is worse: last-wins on
+        // `name_ref` repointed the series' name at it.
+        let xml = "<c:chartSpace><c:chart><c:plotArea><c:barChart>\
+<c:ser><c:tx><c:strRef><c:f>Data!$B$1</c:f></c:strRef></c:tx>\
+<c:dLbls><c:dLbl><c:tx><c:strRef><c:f>Data!$Y$9</c:f></c:strRef></c:tx></c:dLbl></c:dLbls>\
+<c:errBars><c:plus><c:numRef><c:f>Data!$Z$1:$Z$50</c:f></c:numRef></c:plus></c:errBars>\
+<c:trendline><c:trendlineLbl><c:tx><c:strRef><c:f>Data!$W$1</c:f></c:strRef></c:tx></c:trendlineLbl></c:trendline>\
+<c:cat><c:strRef><c:f>Data!$A$2:$A$3</c:f></c:strRef></c:cat>\
+<c:val><c:numRef><c:f>Data!$B$2:$B$3</c:f></c:numRef></c:val>\
+</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>";
+        let cd = parse_chart(xml);
+        assert_eq!(cd.series.len(), 1);
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Data!$B$1"));
+        // A1:B3 — the header row, the labels and the numbers. Nothing in W, Y
+        // or Z, and nothing down at row 50.
+        assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 1)));
+    }
+
+    #[test]
+    fn a_stacked_or_combo_plot_area_is_not_ours_to_rewrite() {
+        // `kind` records the FIRST plot group and the writer emits one
+        // clustered/standard group. So a stacked chart would come back
+        // clustered, and a combo chart would fold its line series onto the bar
+        // axis. Both are irreversible; both round-trip verbatim instead.
+        let ser = "<c:ser><c:val><c:numRef><c:f>Data!$B$2:$B$3</c:f></c:numRef></c:val></c:ser>";
+        let plot = |body: &str| {
+            format!(
+                "<c:chartSpace><c:chart><c:plotArea>{body}</c:plotArea></c:chart></c:chartSpace>"
+            )
+        };
+
+        let clustered = parse_chart(&plot(&format!(
+            "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/>{ser}</c:barChart>"
+        )));
+        assert_eq!(clustered.kind, "column");
+        assert!(!clustered.complex, "what the writer itself emits");
+
+        let stacked = parse_chart(&plot(&format!(
+            "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"stacked\"/>{ser}</c:barChart>"
+        )));
+        assert_eq!(stacked.kind, "column");
+        assert!(stacked.complex);
+
+        let combo = parse_chart(&plot(&format!(
+            "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/>{ser}</c:barChart>\
+<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>"
+        )));
+        assert_eq!(combo.kind, "column", "the first group still names it");
+        assert!(combo.complex);
+        assert_eq!(combo.series.len(), 2, "both groups' series are still read");
+
+        // A line chart's own grouping is `standard`, and pie has none at all.
+        let line = parse_chart(&plot(&format!(
+            "<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>"
+        )));
+        assert!(!line.complex);
+        let pie = parse_chart(&plot(&format!("<c:pieChart>{ser}</c:pieChart>")));
+        assert!(!pie.complex);
+    }
+
+    #[test]
+    fn an_anchor_whose_attributes_start_on_the_next_line_still_counts() {
+        // `parse_drawings` numbers anchors with `XmlParser`, which ends a name
+        // at ANY whitespace; the raw rewrite scanners index into that numbering.
+        // A scanner stopping only at `>`/` `/`/` skipped this anchor, shifting
+        // every later index — a move or a delete then landed on the wrong
+        // picture.
+        let xml = "<xdr:wsDr xmlns:xdr=\"a\" xmlns:r=\"b\">\
+<xdr:twoCellAnchor\neditAs=\"oneCell\">\
+<xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+<xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
+<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\" name=\"Logo\"/></xdr:nvPicPr>\
+<xdr:blipFill><a:blip r:embed=\"rId1\"/></xdr:blipFill></xdr:pic>\
+</xdr:twoCellAnchor></xdr:wsDr>";
+        let resolve = |rid: &str| {
+            (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()))
+        };
+        let ds = parse_drawings(xml, &resolve, &|_: &str| None);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].anchor_ix, 0);
+        // The move lands on THIS anchor, not past it.
+        let out = rewrite_anchors(xml, &[(0, (7, 3), (15, 7))], &[]);
+        assert!(out.contains("<xdr:row>7</xdr:row>"), "from moved: {out}");
+        assert!(out.contains("<xdr:col>7</xdr:col>"), "to moved: {out}");
+        assert!(out.contains("editAs=\"oneCell\""), "attributes kept: {out}");
+        // And a delete removes it rather than something else.
+        assert!(!rewrite_anchors(xml, &[], &[0]).contains("twoCellAnchor"));
     }
 
     #[test]

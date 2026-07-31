@@ -170,6 +170,15 @@ true, so the first drag meant for the bar would be committed by `range_pick_end`
 → `ref_commit` to the **chart** — replotting it — while the bar's own range
 stayed unpinned and its rule landed on the untouched selection.
 
+⚠️ And the other direction, which is not symmetric: the Chart panel renders off
+`chart_sel` alone, so its fields stay clickable while a bar is open. `sheet_key`
+asks the bars *before* a field that isn't one of theirs, so focusing a panel
+field would draw a focused border and a caret while every keystroke went to the
+bar — and a drag on the grid still rewrote and committed the chart's field. So
+`ref_field`'s focus handler calls `typing_bars_close` for any non-bar target:
+whatever swallows typing (the four bars, the comment/filter/row-height bars, the
+find bar) loses it to the field the user just clicked.
+
 ## Pointing while typing a formula
 
 Formula pointing shares the pointing service but not the field: the cell edit
@@ -255,7 +264,10 @@ indices into *one sheet's* charts, resolved lazily by `chart_locate`. A sheet
 switch, a tab switch or an undo re-points them at a different chart, so all of
 them go through `chart_drop_selection`. Without it, selecting a chart on Sheet1
 and clicking Sheet2's tab leaves the panel open and bound to Sheet2's chart 0 —
-and Delete removes *that* one.
+and Delete removes *that* one. The list itself moving counts too: `chart_locate`
+resolves UI-authored charts *before* the file's drawings, so `sheet_insert_chart`
+shifts every drawing-backed index by one and `chart_delete_selected` closes a
+gap. Both call `chart_drop_selection` before they touch `v.charts`.
 
 The same holds for everything else keyed to one grid — the open entry bar
 (`bar_field`/`bar_range`), a fill drag, a formula's pick — so `drop_grid_state`
@@ -272,17 +284,26 @@ save — which is how a new `<c:f>` reaches the file at all. `chart_space_xml`
 authors bar, column, line and pie; a scatter, area, doughnut, radar or bubble
 chart run through it would come back as a clustered column chart, and (since
 `parse_chart` reads `<c:cat>`/`<c:val>` but never `<c:xVal>`/`<c:yVal>`) an
-empty one. So `chart_kind_is_writable` gates the regeneration: those parts
-round-trip verbatim instead, and the panel says so under the type buttons. The
-cost is that a rename or a row insert can't follow their refs either — a stale
-ref beats a destroyed chart, and picking a type we can author fixes both.
+empty one. The *plot area* has the same limit: `chart_space_xml` writes one
+group, clustered (bar/column) or standard (line), so a stacked chart would come
+back clustered and a combo chart — bars and a line sharing a plot area — would
+fold every series onto the bar axis. `parse_chart` records that as
+`ChartData::complex`, and `chart_is_writable` gates the regeneration on both:
+those parts round-trip verbatim instead, and the panel says so under the type
+buttons. The cost is that a rename or a row insert can't follow their refs
+either — a stale ref beats a destroyed chart, and picking a type we can author
+(which clears `complex`) fixes both.
 
 Chart refs are now real refs in the file, so **they have to follow the grid**:
 `structural_edit` runs every `ChartSource` through the same `span`/`point`
 helpers as formulas and tables (`shift_chart_refs`), and the suite applies it to
 the charts it authored, which live outside the workbook until they're saved. A
 range whose rows or columns are wholly deleted loses its ref rather than keeping
-a dangling one.
+a dangling one. Which refs are *ours* to shift takes two facts, not one: a
+sheet-qualified ref matches by name, but an unqualified one means the chart's
+own sheet — so `shift_chart_refs` takes a `home` flag saying whether the drawing
+lives on the edited sheet. Without it, deleting rows on `Data` walked the refs
+of a chart sitting on `Report`.
 
 A structural one: the suite is a **separate cargo workspace**. `gridcore`
 types are also built as literals by `xlsxy`, `gridwasm` and the TUIs in the root

@@ -743,18 +743,19 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
 /// A range whose rows (or columns) are wholly deleted loses its ref rather than
 /// keeping a dangling one — the cached values still draw the card, and a chart
 /// that plots nothing beats one plotting a stranger's numbers.
-pub fn shift_chart_refs(cd: &mut crate::sheet::ChartData, target: &str, shift: &EditShift) -> bool {
-    // A ref with no sheet name means the chart's own sheet. Charts are per-sheet
-    // and `structural_edit` is told which one it edited, so an unqualified ref
-    // belongs to the target exactly when the drawing does — which is how it got
-    // here.
-    // A ref with no sheet name means the chart's own sheet. Charts are per-sheet
-    // and `structural_edit` is told which one it edited, so an unqualified ref
-    // belongs to the target exactly when the drawing does — which is how it got
-    // here.
-    fn mine(s: &crate::sheet::ChartSource, target: &str) -> bool {
-        s.sheet.is_empty() || s.sheet.eq_ignore_ascii_case(target)
-    }
+pub fn shift_chart_refs(
+    cd: &mut crate::sheet::ChartData,
+    target: &str,
+    home: bool,
+    shift: &EditShift,
+) -> bool {
+    // A ref with no sheet name means the chart's OWN sheet — which is the edited
+    // one only when the drawing itself lives there. `home` says so: a chart
+    // sitting on "Report" whose refs read `$B$2:$B$10` plots Report's cells, and
+    // deleting rows on "Data" must leave it alone.
+    let mine = |s: &crate::sheet::ChartSource| -> bool {
+        (home && s.sheet.is_empty()) || s.sheet.eq_ignore_ascii_case(target)
+    };
     /// `Some(src)` shifted in place, `None` = the ref's cells are all gone.
     fn moved(
         src: &crate::sheet::ChartSource,
@@ -776,24 +777,20 @@ pub fn shift_chart_refs(cd: &mut crate::sheet::ChartData, target: &str, shift: &
         }
         Some(out)
     }
-    /// Shift one slot; `true` if it came out different (gone included).
-    fn shift_slot(
-        slot: &mut Option<crate::sheet::ChartSource>,
-        target: &str,
-        shift: &EditShift,
-    ) -> bool {
-        let Some(s) = slot.as_ref().filter(|s| mine(s, target)) else {
+    // Shift one slot; `true` if it came out different (gone included).
+    let shift_slot = |slot: &mut Option<crate::sheet::ChartSource>| -> bool {
+        let Some(s) = slot.as_ref().filter(|s| mine(s)) else {
             return false;
         };
         let next = moved(s, shift);
         let hit = next.as_ref() != Some(s);
         *slot = next;
         hit
-    }
-    let mut changed = shift_slot(&mut cd.source, target, shift);
-    changed |= shift_slot(&mut cd.categories_ref, target, shift);
+    };
+    let mut changed = shift_slot(&mut cd.source);
+    changed |= shift_slot(&mut cd.categories_ref);
     for ser in &mut cd.series {
-        changed |= shift_slot(&mut ser.values_ref, target, shift);
+        changed |= shift_slot(&mut ser.values_ref);
         // The column a series plots is an index into the grid like any other.
         if !shift.rows {
             if let Some(c) = ser.col {
@@ -808,7 +805,7 @@ pub fn shift_chart_refs(cd: &mut crate::sheet::ChartData, target: &str, shift: &
             .name_ref
             .as_deref()
             .and_then(crate::sheet::ChartSource::parse_f_ref)
-            .filter(|p| mine(p, target))
+            .filter(|p| mine(p))
         {
             let next = moved(&p, shift);
             if next.as_ref() != Some(&p) {
@@ -867,10 +864,11 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     // so a stale one doesn't just mis-draw our card: Excel re-reads it and plots
     // whatever moved into those cells. A delete is the worse half — the ref can
     // end up naming cells that hold something else entirely.
-    for sheet in &mut wb.sheets {
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        let home_is_target = s == idx;
         for dw in &mut sheet.drawings {
             if let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind {
-                shift_chart_refs(cd, &target_name, &shift);
+                shift_chart_refs(cd, &target_name, home_is_target, &shift);
             }
         }
     }
@@ -1552,6 +1550,42 @@ mod tests {
         let cd = chart_of(&w);
         assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 2)));
         assert!(!cd.edited);
+    }
+
+    #[test]
+    fn an_unqualified_ref_belongs_to_the_charts_own_sheet() {
+        use crate::sheet::{ChartData, ChartSource, Drawing, DrawingKind};
+        // A `<c:f>` with no `!` means the sheet the CHART sits on. Put such a
+        // chart on "Report" and edit "Data": nothing about Report moved, so
+        // Report's chart must not move either — and must not be marked edited,
+        // which would regenerate a part the user never touched.
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Report".into(),
+            drawings: vec![Drawing {
+                anchor_ix: 0,
+                from: (0, 0),
+                to: (5, 5),
+                kind: DrawingKind::Chart(ChartData {
+                    source: Some(ChartSource {
+                        sheet: String::new(),
+                        range: (1, 1, 9, 1),
+                        cat_col: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        });
+        delete_rows(&mut w, 0, 1, 5); // five rows off "Data"
+        let far = match &w.sheets[1].drawings[0].kind {
+            DrawingKind::Chart(cd) => cd,
+            other => panic!("expected a chart, got {other:?}"),
+        };
+        assert_eq!(far.source.as_ref().map(|s| s.range), Some((1, 1, 9, 1)));
+        assert!(!far.edited);
+        // The chart that IS on "Data" still follows the grid.
+        assert!(chart_of(&w).edited);
     }
 
     #[test]
