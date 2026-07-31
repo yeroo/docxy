@@ -214,7 +214,10 @@ fn typelib_matches_word_oracle() {
                     }
                 }
                 if e.ret != o.ret {
-                    fails.push(format!("{name} method#{i}: return '{}' != '{}'", o.ret, e.ret));
+                    fails.push(format!(
+                        "{name} method#{i}: return '{}' != '{}'",
+                        o.ret, e.ret
+                    ));
                 }
             }
         }

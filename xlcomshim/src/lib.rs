@@ -16,7 +16,6 @@
 //! `HKCU\Software\Classes`, a brand-new shim CLSID, guarded so it never clobbers
 //! an installed Excel).
 
-
 #[cfg(windows)]
 pub use win::run;
 
@@ -69,14 +68,46 @@ mod win {
     // dual `wanted` interfaces in the same typelib (a typelib requires unique type
     // names); the name is cosmetic for the dispatch path (clients read members).
     pub const DISP_IFACES: &[(&str, u128, u128)] = &[
-        ("DocxyApplication", 0x000208d5_0000_0000_c000_000000000046, 0xd0c9a001_0208_d500_a2d6_9f5c1e0b7a31),
-        ("DocxyWorkbooks", 0x000208db_0000_0000_c000_000000000046, 0xd0c9a002_0208_db00_a2d6_9f5c1e0b7a31),
-        ("DocxyWorkbook", 0x000208da_0000_0000_c000_000000000046, 0xd0c9a003_0208_da00_a2d6_9f5c1e0b7a31),
-        ("DocxyWorksheets", 0x000208b1_0000_0000_c000_000000000046, 0xd0c9a004_0208_b100_a2d6_9f5c1e0b7a31),
-        ("DocxyWorksheet", 0x000208d8_0000_0000_c000_000000000046, 0xd0c9a005_0208_d800_a2d6_9f5c1e0b7a31),
-        ("DocxyRange", 0x00020846_0000_0000_c000_000000000046, 0xd0c9a006_0002_0846_a2d6_9f5c1e0b7a31),
-        ("DocxyFont", 0x0002084d_0000_0000_c000_000000000046, 0xd0c9a007_0002_084d_a2d6_9f5c1e0b7a31),
-        ("DocxyInterior", 0x00020870_0000_0000_c000_000000000046, 0xd0c9a008_0002_0870_a2d6_9f5c1e0b7a31),
+        (
+            "DocxyApplication",
+            0x000208d5_0000_0000_c000_000000000046,
+            0xd0c9a001_0208_d500_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyWorkbooks",
+            0x000208db_0000_0000_c000_000000000046,
+            0xd0c9a002_0208_db00_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyWorkbook",
+            0x000208da_0000_0000_c000_000000000046,
+            0xd0c9a003_0208_da00_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyWorksheets",
+            0x000208b1_0000_0000_c000_000000000046,
+            0xd0c9a004_0208_b100_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyWorksheet",
+            0x000208d8_0000_0000_c000_000000000046,
+            0xd0c9a005_0208_d800_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyRange",
+            0x00020846_0000_0000_c000_000000000046,
+            0xd0c9a006_0002_0846_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyFont",
+            0x0002084d_0000_0000_c000_000000000046,
+            0xd0c9a007_0002_084d_a2d6_9f5c1e0b7a31,
+        ),
+        (
+            "DocxyInterior",
+            0x00020870_0000_0000_c000_000000000046,
+            0xd0c9a008_0002_0870_a2d6_9f5c1e0b7a31,
+        ),
     ];
 
     /// Return the ITypeInfo for one of OUR dispinterface IIDs from our registered
@@ -165,7 +196,6 @@ mod win {
     // Range covering the whole sheet.
     const MAX_ROW: u32 = 1_048_575;
     const MAX_COL: u32 = 16_383;
-
 
     // -----------------------------------------------------------------------
     // Shared workbook state (thread-local: the server is single-apartment STA,
@@ -292,8 +322,6 @@ mod win {
     fn app_name() -> String {
         std::env::var("XLCOMSHIM_APP_NAME").unwrap_or_else(|_| "Docxy".to_string())
     }
-
-
 
     /// Each child object now implements its own dual interface (not bare
     /// `IDispatch`), so to hand it back as a VT_DISPATCH VARIANT we convert to
@@ -456,7 +484,11 @@ mod win {
     unsafe fn vt_wbs_count(_t: &Workbooks_Impl, ret: *mut i32) -> HRESULT {
         unsafe { out_i4(ret, reg(|r| r.books.len() as i32)) }
     }
-    unsafe fn vt_wbs_item(_t: &Workbooks_Impl, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+    unsafe fn vt_wbs_item(
+        _t: &Workbooks_Impl,
+        index: *const VARIANT,
+        ret: *mut *mut c_void,
+    ) -> HRESULT {
         let idx = (vi32(index).unwrap_or(1).max(1) as usize) - 1;
         if !reg(|r| idx < r.books.len()) {
             return DISP_E_BADINDEX;
@@ -478,7 +510,12 @@ mod win {
         unsafe { out_bstr(ret, &name) }
     }
     unsafe fn vt_wb_saved_get(t: &Workbook_Impl, ret: *mut i16) -> HRESULT {
-        unsafe { out_bool(ret, reg(|r| r.books.get(t.book).map(|b| b.saved).unwrap_or(true))) }
+        unsafe {
+            out_bool(
+                ret,
+                reg(|r| r.books.get(t.book).map(|b| b.saved).unwrap_or(true)),
+            )
+        }
     }
     unsafe fn vt_wb_saved_put(t: &Workbook_Impl, v: i16) -> HRESULT {
         reg(|r| {
@@ -491,7 +528,11 @@ mod win {
     unsafe fn vt_wb_close(_t: &Workbook_Impl) -> HRESULT {
         S_OK
     }
-    unsafe fn vt_wb_saveas(t: &Workbook_Impl, filename: *const VARIANT, _fmt: *const VARIANT) -> HRESULT {
+    unsafe fn vt_wb_saveas(
+        t: &Workbook_Impl,
+        filename: *const VARIANT,
+        _fmt: *const VARIANT,
+    ) -> HRESULT {
         let Some(path) = (unsafe { filename.as_ref() }).and_then(variant_to_string) else {
             log("SaveAs(early): missing Filename");
             return E_FAIL;
@@ -511,9 +552,18 @@ mod win {
 
     // ---- Sheets (collection) ----
     unsafe fn vt_sheets_count(t: &Worksheets_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, reg(|r| r.books.get(t.book).map(|b| b.sheet_count()).unwrap_or(0)) as i32) }
+        unsafe {
+            out_i4(
+                ret,
+                reg(|r| r.books.get(t.book).map(|b| b.sheet_count()).unwrap_or(0)) as i32,
+            )
+        }
     }
-    unsafe fn vt_sheets_item(t: &Worksheets_Impl, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+    unsafe fn vt_sheets_item(
+        t: &Worksheets_Impl,
+        index: *const VARIANT,
+        ret: *mut *mut c_void,
+    ) -> HRESULT {
         let book = t.book;
         let sheet = match unsafe { sheet_sel_idx(book, index) } {
             SheetSelV::Sheet(s) => s,
@@ -525,7 +575,12 @@ mod win {
 
     // ---- Worksheet ----
     unsafe fn vt_ws_name_get(t: &Worksheet_Impl, ret: *mut BSTR) -> HRESULT {
-        let name = reg(|r| r.books.get(t.book).map(|b| b.sheet_name(t.sheet)).unwrap_or_default());
+        let name = reg(|r| {
+            r.books
+                .get(t.book)
+                .map(|b| b.sheet_name(t.sheet))
+                .unwrap_or_default()
+        });
         unsafe { out_bstr(ret, &name) }
     }
     unsafe fn vt_ws_name_put(t: &Worksheet_Impl, v: *const u16) -> HRESULT {
@@ -554,7 +609,12 @@ mod win {
         .into();
         unsafe { out_iface(ret, rng) }
     }
-    unsafe fn vt_ws_range(t: &Worksheet_Impl, cell1: *const VARIANT, _cell2: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+    unsafe fn vt_ws_range(
+        t: &Worksheet_Impl,
+        cell1: *const VARIANT,
+        _cell2: *const VARIANT,
+        ret: *mut *mut c_void,
+    ) -> HRESULT {
         let Some(a) = (unsafe { cell1.as_ref() }).and_then(variant_to_string) else {
             return E_FAIL;
         };
@@ -577,7 +637,12 @@ mod win {
     }
 
     // ---- Range ----
-    unsafe fn vt_rng_child(t: &Range_Impl, row: *const VARIANT, col: *const VARIANT, ret: *mut VARIANT) -> HRESULT {
+    unsafe fn vt_rng_child(
+        t: &Range_Impl,
+        row: *const VARIANT,
+        col: *const VARIANT,
+        ret: *mut VARIANT,
+    ) -> HRESULT {
         let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
         let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
         let (r, c) = (t.r1 + rr, t.c1 + cc);
@@ -638,7 +703,12 @@ mod win {
         t.write_fill(cell);
         S_OK
     }
-    unsafe fn vt_rng_item_put(t: &Range_Impl, row: *const VARIANT, col: *const VARIANT, val: *const VARIANT) -> HRESULT {
+    unsafe fn vt_rng_item_put(
+        t: &Range_Impl,
+        row: *const VARIANT,
+        col: *const VARIANT,
+        val: *const VARIANT,
+    ) -> HRESULT {
         let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
         let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
         let (r, c) = (t.r1 + rr, t.c1 + cc);
@@ -677,7 +747,12 @@ mod win {
             }
         } else {
             let i = (vi32(index).unwrap_or(1).max(1) as usize) - 1;
-            if reg(|r| r.books.get(book).map(|b| i < b.sheet_count()).unwrap_or(false)) {
+            if reg(|r| {
+                r.books
+                    .get(book)
+                    .map(|b| i < b.sheet_count())
+                    .unwrap_or(false)
+            }) {
                 SheetSelV::Sheet(i)
             } else {
                 SheetSelV::Invalid
@@ -724,8 +799,6 @@ mod win {
             }
         }
     }
-
-
 
     // -----------------------------------------------------------------------
     // Application
@@ -1656,9 +1729,9 @@ mod win {
                             }
                         } else {
                             let w = reg(|r| {
-                                r.books
-                                    .get(book)
-                                    .and_then(|b| b.pkg.workbook.sheets.get(sheet).map(|s| s.col_width(c1)))
+                                r.books.get(book).and_then(|b| {
+                                    b.pkg.workbook.sheets.get(sheet).map(|s| s.col_width(c1))
+                                })
                             })
                             .unwrap_or(8.43);
                             put(result, VARIANT::from(w));
@@ -1808,9 +1881,7 @@ mod win {
                             CellValue::Empty => String::new(),
                             CellValue::Number(n) => format!("{n}"),
                             CellValue::Text(t) => t.clone(),
-                            CellValue::Bool(b) => {
-                                if *b { "TRUE" } else { "FALSE" }.to_string()
-                            }
+                            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
                             CellValue::Error(e) => e.clone(),
                         };
                         put(result, VARIANT::from(BSTR::from(s.as_str())));
@@ -1865,7 +1936,12 @@ mod win {
     /// Apply a formatting delta to every cell of a rect: read the cell's current
     /// Xf, mutate it, intern the result, and repoint the cell at it (creating a
     /// blank cell when needed — Excel formats empty cells too).
-    fn apply_style(book: usize, sheet: usize, rect: (u32, u32, u32, u32), modify: impl Fn(&mut Xf)) {
+    fn apply_style(
+        book: usize,
+        sheet: usize,
+        rect: (u32, u32, u32, u32),
+        modify: impl Fn(&mut Xf),
+    ) {
         let (r1, c1, r2, c2) = rect;
         let cells = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
         if cells > 1_000_000 {
@@ -1902,7 +1978,13 @@ mod win {
         reg(|reg| {
             reg.books.get(book).and_then(|b| {
                 let wb = &b.pkg.workbook;
-                let idx = wb.sheets.get(sheet)?.cells.get(&(r, c)).map(|c| c.style).unwrap_or(0);
+                let idx = wb
+                    .sheets
+                    .get(sheet)?
+                    .cells
+                    .get(&(r, c))
+                    .map(|c| c.style)
+                    .unwrap_or(0);
                 wb.styles.xfs.get(idx as usize).cloned()
             })
         })
@@ -1912,7 +1994,11 @@ mod win {
     /// Excel's Color is a packed BGR long: R + G*256 + B*65536.
     fn excel_color(c: i32) -> (u8, u8, u8) {
         let c = c as u32;
-        ((c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8)
+        (
+            (c & 0xFF) as u8,
+            ((c >> 8) & 0xFF) as u8,
+            ((c >> 16) & 0xFF) as u8,
+        )
     }
     fn rgb_to_excel(rgb: (u8, u8, u8)) -> i32 {
         (rgb.0 as i32) | ((rgb.1 as i32) << 8) | ((rgb.2 as i32) << 16)
@@ -2015,7 +2101,10 @@ mod win {
                             let on = arg_bool(params, 0, true);
                             apply_style(book, sheet, rect, move |xf| xf.bold = on);
                         } else {
-                            put(result, VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).bold));
+                            put(
+                                result,
+                                VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).bold),
+                            );
                         }
                     }
                     2 => {
@@ -2023,7 +2112,10 @@ mod win {
                             let on = arg_bool(params, 0, true);
                             apply_style(book, sheet, rect, move |xf| xf.italic = on);
                         } else {
-                            put(result, VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).italic));
+                            put(
+                                result,
+                                VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).italic),
+                            );
                         }
                     }
                     3 => {
@@ -2052,7 +2144,11 @@ mod win {
                         } else {
                             put(
                                 result,
-                                VARIANT::from(cell_xf(book, sheet, rect.0, rect.1).font_size.unwrap_or(11.0)),
+                                VARIANT::from(
+                                    cell_xf(book, sheet, rect.0, rect.1)
+                                        .font_size
+                                        .unwrap_or(11.0),
+                                ),
                             );
                         }
                     }

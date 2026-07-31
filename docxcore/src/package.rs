@@ -290,7 +290,9 @@ impl Package {
             let xml = String::from_utf8_lossy(b).into_owned();
             let has = xml.contains(&tag);
             if on && !has {
-                let gt = xml.find("<w:settings").and_then(|s| xml[s..].find('>').map(|e| s + e + 1));
+                let gt = xml
+                    .find("<w:settings")
+                    .and_then(|s| xml[s..].find('>').map(|e| s + e + 1));
                 if let Some(pos) = gt {
                     let new = format!("{}<{elem}/>{}", &xml[..pos], &xml[pos..]);
                     self.set_part(name, new.into_bytes());
@@ -312,7 +314,11 @@ impl Package {
             let ct = String::from_utf8_lossy(b).into_owned();
             if !ct.contains("settings+xml") {
                 let ov = "<Override PartName=\"/word/settings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>";
-                self.set_part("[Content_Types].xml", ct.replacen("</Types>", &format!("{ov}</Types>"), 1).into_bytes());
+                self.set_part(
+                    "[Content_Types].xml",
+                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                        .into_bytes(),
+                );
             }
         }
         let rels_name = "word/_rels/document.xml.rels";
@@ -320,8 +326,14 @@ impl Package {
             let rels = String::from_utf8_lossy(b).into_owned();
             if !rels.contains("settings.xml") {
                 let rid = next_rid(&rels);
-                let rel = format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/settings\" Target=\"settings.xml\"/>");
-                self.set_part(rels_name, rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1).into_bytes());
+                let rel = format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{R_NS}/settings\" Target=\"settings.xml\"/>"
+                );
+                self.set_part(
+                    rels_name,
+                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                        .into_bytes(),
+                );
             }
         }
     }
@@ -428,10 +440,17 @@ impl Package {
     pub fn set_page_margins(&mut self, top: i32, right: i32, bottom: i32, left: i32) {
         let mut s = std::mem::take(&mut self.sect_pr);
         if !s.contains("<w:pgMar") {
-            let mar = format!("<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>");
+            let mar = format!(
+                "<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
+            );
             s = inject_sect_child(&s, &mar);
         } else {
-            for (k, v) in [("w:top", top), ("w:right", right), ("w:bottom", bottom), ("w:left", left)] {
+            for (k, v) in [
+                ("w:top", top),
+                ("w:right", right),
+                ("w:bottom", bottom),
+                ("w:left", left),
+            ] {
                 s = set_pgmar_attr(&s, k, v);
             }
         }
@@ -746,7 +765,11 @@ fn set_pgmar_attr(sect: &str, key: &str, val: i32) -> String {
         format!("{}{}{}", &el[..vs], val, &el[ve..])
     } else {
         let trimmed = el.trim_end_matches('/').trim_end();
-        let slash = if el.trim_end().ends_with('/') { "/" } else { "" };
+        let slash = if el.trim_end().ends_with('/') {
+            "/"
+        } else {
+            ""
+        };
         format!("{trimmed} {key}=\"{val}\"{slash}")
     };
     format!("{}{}{}", &sect[..ts], new_el, &sect[end..])
@@ -1383,10 +1406,16 @@ mod tests {
         assert_eq!(pkg.sect_pr().matches("<w:titlePg").count(), 1);
         let first = pkg.create_hf(true, "first").expect("first header");
         assert!(pkg.sect_pr().contains("w:type=\"first\""));
-        assert_eq!(crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some(), true);
+        assert_eq!(
+            crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some(),
+            true
+        );
         pkg.set_title_pg(false);
         assert!(!pkg.has_title_pg() && !pkg.sect_pr().contains("titlePg"));
-        assert!(pkg.part(&first).is_some(), "first part kept when toggled off");
+        assert!(
+            pkg.part(&first).is_some(),
+            "first part kept when toggled off"
+        );
 
         // Even/odd headers (creates settings.xml from scratch here).
         assert!(!pkg.has_even_odd());

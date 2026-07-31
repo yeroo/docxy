@@ -1505,10 +1505,15 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             }
         }
         if let Some(dpart) = sheet.drawing_part.as_deref() {
-            let moves: Vec<crate::drawing::AnchorMove> = sheet.drawings.iter().map(|d| (d.anchor_ix, d.from, d.to)).collect();
+            let moves: Vec<crate::drawing::AnchorMove> = sheet
+                .drawings
+                .iter()
+                .map(|d| (d.anchor_ix, d.from, d.to))
+                .collect();
             if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
-                p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed).into_bytes();
+                p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed)
+                    .into_bytes();
             }
         }
     }
@@ -1899,9 +1904,18 @@ fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
     }
     let cells: String = merges
         .iter()
-        .map(|&(r1, c1, r2, c2)| format!("<mergeCell ref=\"{}:{}\"/>", cell_name(r1, c1), cell_name(r2, c2)))
+        .map(|&(r1, c1, r2, c2)| {
+            format!(
+                "<mergeCell ref=\"{}:{}\"/>",
+                cell_name(r1, c1),
+                cell_name(r2, c2)
+            )
+        })
         .collect();
-    let block = format!("<mergeCells count=\"{}\">{cells}</mergeCells>", merges.len());
+    let block = format!(
+        "<mergeCells count=\"{}\">{cells}</mergeCells>",
+        merges.len()
+    );
     // After </sheetData>, else before </worksheet>.
     if let Some(pos) = out.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
         out.insert_str(pos, &block);
@@ -1923,9 +1937,15 @@ fn dxf_to_xml(dxf: &crate::sheet::Dxf) -> String {
     if let Some((r, g, b)) = dxf.color {
         font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
     }
-    let font = if font.is_empty() { String::new() } else { format!("<font>{font}</font>") };
+    let font = if font.is_empty() {
+        String::new()
+    } else {
+        format!("<font>{font}</font>")
+    };
     let fill = match dxf.fill {
-        Some((r, g, b)) => format!("<fill><patternFill patternType=\"solid\"><bgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/></patternFill></fill>"),
+        Some((r, g, b)) => format!(
+            "<fill><patternFill patternType=\"solid\"><bgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/></patternFill></fill>"
+        ),
         None => String::new(),
     };
     format!("<dxf>{font}{fill}</dxf>")
@@ -2003,7 +2023,8 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
     }
     // No <sheetView>: insert a full block after <dimension …>, else after the
     // <worksheet …> opening tag (both keep the schema's element order).
-    let block = format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
+    let block =
+        format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
     let anchor = find_element(&out, "dimension")
         .and_then(|d| {
             out[d..]
@@ -2011,7 +2032,10 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
                 .map(|i| d + i + 2)
                 .or_else(|| out[d..].find('>').map(|i| d + i + 1))
         })
-        .or_else(|| out.find("<worksheet").and_then(|w| out[w..].find('>').map(|i| w + i + 1)));
+        .or_else(|| {
+            out.find("<worksheet")
+                .and_then(|w| out[w..].find('>').map(|i| w + i + 1))
+        });
     if let Some(pos) = anchor {
         out.insert_str(pos, &block);
     }
@@ -2081,13 +2105,29 @@ pub(crate) fn chart_space_xml_for_test(data: &crate::sheet::ChartData) -> String
 }
 
 fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
-    let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
+    let ncat = data.categories.len().max(
+        data.series
+            .iter()
+            .map(|s| s.values.len())
+            .max()
+            .unwrap_or(0),
+    );
     let cat_pts: String = (0..ncat)
-        .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", esc_attr(data.categories.get(i).map(|s| s.as_str()).unwrap_or(""))))
+        .map(|i| {
+            format!(
+                "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
+                esc_attr(data.categories.get(i).map(|s| s.as_str()).unwrap_or(""))
+            )
+        })
         .collect();
     let ser_xml = |si: usize, s: &crate::sheet::ChartSeries| -> String {
         let val_pts: String = (0..ncat)
-            .map(|i| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", s.values.get(i).copied().unwrap_or(0.0)))
+            .map(|i| {
+                format!(
+                    "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
+                    s.values.get(i).copied().unwrap_or(0.0)
+                )
+            })
             .collect();
         // A range-backed chart writes the cells it reads alongside the cached
         // values, so Excel keeps it live; a snapshot writes the caches alone as
@@ -2119,22 +2159,33 @@ fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
                 "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strCache></c:strRef></c:cat>",
                 esc_attr(&r)
             ),
-            None => format!("<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>"),
+            None => {
+                format!("<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>")
+            }
         };
         let val = match val_ref {
             Some(r) => format!(
                 "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numCache></c:numRef></c:val>",
                 esc_attr(&r)
             ),
-            None => format!("<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"),
+            None => format!(
+                "<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"
+            ),
         };
         let fill = match s.color {
-            Some(rgb) => format!("<c:spPr><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></c:spPr>"),
+            Some(rgb) => format!(
+                "<c:spPr><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></c:spPr>"
+            ),
             None => String::new(),
         };
         format!("<c:ser><c:idx val=\"{si}\"/><c:order val=\"{si}\"/>{name}{fill}{cat}{val}</c:ser>")
     };
-    let sers: String = data.series.iter().enumerate().map(|(si, s)| ser_xml(si, s)).collect();
+    let sers: String = data
+        .series
+        .iter()
+        .enumerate()
+        .map(|(si, s)| ser_xml(si, s))
+        .collect();
 
     // catAx + valAx, shared by the axed chart types (bar/column/line). Pie omits them.
     const AXES: &str = "<c:catAx><c:axId val=\"111111111\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"222222222\"/></c:catAx>\
@@ -2143,23 +2194,35 @@ fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
 
     let (plot_body, axes): (String, &str) = match data.kind.as_str() {
         "bar" => (
-            format!("<c:barChart><c:barDir val=\"bar\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"),
+            format!(
+                "<c:barChart><c:barDir val=\"bar\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"
+            ),
             AXES,
         ),
         "line" => (
-            format!("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>{sers}<c:marker val=\"1\"/>{AX_IDS}</c:lineChart>"),
+            format!(
+                "<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>{sers}<c:marker val=\"1\"/>{AX_IDS}</c:lineChart>"
+            ),
             AXES,
         ),
         "pie" => {
             // Pie takes a single series; extra series are invalid (that's doughnut).
-            let pie_ser = data.series.first().map(|s| ser_xml(0, s)).unwrap_or_default();
+            let pie_ser = data
+                .series
+                .first()
+                .map(|s| ser_xml(0, s))
+                .unwrap_or_default();
             (
-                format!("<c:pieChart><c:varyColors val=\"1\"/>{pie_ser}<c:firstSliceAng val=\"0\"/></c:pieChart>"),
+                format!(
+                    "<c:pieChart><c:varyColors val=\"1\"/>{pie_ser}<c:firstSliceAng val=\"0\"/></c:pieChart>"
+                ),
                 "",
             )
         }
         _ => (
-            format!("<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"),
+            format!(
+                "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{sers}{AX_IDS}</c:barChart>"
+            ),
             AXES,
         ),
     };
@@ -2526,11 +2589,19 @@ impl SheetPackage {
             formulas.push(f2.to_string());
         }
         let rule = crate::sheet::CfRule {
-            kind: crate::sheet::CfKind::CellIs { op: op.to_string(), formulas },
+            kind: crate::sheet::CfKind::CellIs {
+                op: op.to_string(),
+                formulas,
+            },
             dxf_id: Some(dxf_id),
             priority,
         };
-        self.workbook.sheets[sheet].cond_formats.push(crate::sheet::CondFormat { ranges: vec![range], rules: vec![rule] });
+        self.workbook.sheets[sheet]
+            .cond_formats
+            .push(crate::sheet::CondFormat {
+                ranges: vec![range],
+                rules: vec![rule],
+            });
     }
 
     /// Add a data-validation rule to `sheet` over `range`. For a list, pass
@@ -2552,7 +2623,11 @@ impl SheetPackage {
         }
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let op_attr = if operator.is_empty() { String::new() } else { format!(" operator=\"{operator}\"") };
+        let op_attr = if operator.is_empty() {
+            String::new()
+        } else {
+            format!(" operator=\"{operator}\"")
+        };
         let mut fmls = format!("<formula1>{}</formula1>", esc_text(formula1));
         if let Some(f2) = formula2 {
             fmls.push_str(&format!("<formula2>{}</formula2>", esc_text(f2)));
@@ -2584,18 +2659,22 @@ impl SheetPackage {
                     .filter_map(|t| xml.find(t))
                     .min()
                     .or_else(|| xml.find("</worksheet>"));
-                if let Some(pos) = anchor { xml.insert_str(pos, &block) }
+                if let Some(pos) = anchor {
+                    xml.insert_str(pos, &block)
+                }
             }
             p.1 = xml.into_bytes();
         }
-        self.workbook.sheets[sheet].validations.push(crate::sheet::DataValidation {
-            ranges: vec![range],
-            kind: kind.to_string(),
-            operator: operator.to_string(),
-            formula1: formula1.to_string(),
-            formula2: formula2.unwrap_or("").to_string(),
-            prompt: None,
-        });
+        self.workbook.sheets[sheet]
+            .validations
+            .push(crate::sheet::DataValidation {
+                ranges: vec![range],
+                kind: kind.to_string(),
+                operator: operator.to_string(),
+                formula1: formula1.to_string(),
+                formula2: formula2.unwrap_or("").to_string(),
+                prompt: None,
+            });
     }
 
     /// Create an Excel Table ("Format as Table") over `range`. Column names come
@@ -2603,7 +2682,13 @@ impl SheetPackage {
     /// `xl/tables/table*.xml` part, its content type, a worksheet `/table` rel +
     /// `<tableParts>`) and the model, so it round-trips and Excel styles it with
     /// the given `style` (e.g. "TableStyleMedium2"). Returns the table index.
-    pub fn add_table(&mut self, sheet: usize, range: (u32, u32, u32, u32), has_header: bool, style: &str) -> Option<usize> {
+    pub fn add_table(
+        &mut self,
+        sheet: usize,
+        range: (u32, u32, u32, u32),
+        has_header: bool,
+        style: &str,
+    ) -> Option<usize> {
         if sheet >= self.workbook.sheets.len() {
             return None;
         }
@@ -2647,18 +2732,28 @@ impl SheetPackage {
             .enumerate()
             .map(|(i, n)| format!("<tableColumn id=\"{}\" name=\"{}\"/>", i + 1, esc_attr(n)))
             .collect();
-        let header_attr = if has_header { "" } else { " headerRowCount=\"0\"" };
+        let header_attr = if has_header {
+            ""
+        } else {
+            " headerRowCount=\"0\""
+        };
         let table_xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{SPREADSHEET_NS}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
             names.len()
         );
         let part = format!("xl/tables/table{tn}.xml");
         self.parts.push((part.clone(), table_xml.into_bytes()));
-        add_content_type_override(&mut self.parts, &format!("/{part}"), "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml");
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        );
 
         // Worksheet rel → table + a <tableParts> entry (Excel needs both).
         let sheet_part = self.sheet_parts[sheet].clone();
-        let (ws_dir, ws_file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part.as_str()));
+        let (ws_dir, ws_file) = sheet_part
+            .rsplit_once('/')
+            .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
         let rid = add_rel(
             &mut self.parts,
@@ -2687,7 +2782,9 @@ impl SheetPackage {
                     }
                 } else {
                     let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
-                    let pos = xml.find("<extLst").unwrap_or_else(|| xml.find("</worksheet>").unwrap_or(xml.len()));
+                    let pos = xml
+                        .find("<extLst")
+                        .unwrap_or_else(|| xml.find("</worksheet>").unwrap_or(xml.len()));
                     xml.insert_str(pos, &block);
                 }
                 p.1 = xml.into_bytes();
@@ -2728,7 +2825,13 @@ impl SheetPackage {
         }
     }
 
-    pub fn add_chart(&mut self, sheet: usize, from: (u32, u32), to: (u32, u32), data: &crate::sheet::ChartData) {
+    pub fn add_chart(
+        &mut self,
+        sheet: usize,
+        from: (u32, u32),
+        to: (u32, u32),
+        data: &crate::sheet::ChartData,
+    ) {
         if sheet >= self.workbook.sheets.len() {
             return;
         }
@@ -2744,8 +2847,13 @@ impl SheetPackage {
         let drawing_part = format!("xl/drawings/drawing{dn}.xml");
 
         // 1) chart part + content type.
-        self.parts.push((chart_part.clone(), chart_space_xml(data).into_bytes()));
-        add_content_type_override(&mut self.parts, &format!("/{chart_part}"), "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
+        self.parts
+            .push((chart_part.clone(), chart_space_xml(data).into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{chart_part}"),
+            "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+        );
 
         // 2) drawing part (anchor → chart via rId1) + content type.
         let (fr, fc) = from;
@@ -2760,8 +2868,13 @@ impl SheetPackage {
 <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
 <xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"
         );
-        self.parts.push((drawing_part.clone(), drawing_xml.into_bytes()));
-        add_content_type_override(&mut self.parts, &format!("/{drawing_part}"), "application/vnd.openxmlformats-officedocument.drawing+xml");
+        self.parts
+            .push((drawing_part.clone(), drawing_xml.into_bytes()));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{drawing_part}"),
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+        );
 
         // 3) drawing rels → chart.
         add_rel(
@@ -2773,7 +2886,9 @@ impl SheetPackage {
 
         // 4) worksheet rels → drawing (returns the rId to reference).
         let sheet_part = self.sheet_parts[sheet].clone();
-        let (ws_dir, ws_file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part.as_str()));
+        let (ws_dir, ws_file) = sheet_part
+            .rsplit_once('/')
+            .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
         let rid = add_rel(
             &mut self.parts,
@@ -2790,13 +2905,24 @@ impl SheetPackage {
                     xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
                 }
                 if !xml.contains("<drawing ") {
-                    xml = xml.replacen("</worksheet>", &format!("<drawing r:id=\"{rid}\"/></worksheet>"), 1);
+                    xml = xml.replacen(
+                        "</worksheet>",
+                        &format!("<drawing r:id=\"{rid}\"/></worksheet>"),
+                        1,
+                    );
                 }
                 p.1 = xml.into_bytes();
             }
         }
 
-        self.workbook.sheets[sheet].drawings.push(crate::sheet::Drawing { anchor_ix: 0, from, to, kind: crate::sheet::DrawingKind::Chart(data.clone()) });
+        self.workbook.sheets[sheet]
+            .drawings
+            .push(crate::sheet::Drawing {
+                anchor_ix: 0,
+                from,
+                to,
+                kind: crate::sheet::DrawingKind::Chart(data.clone()),
+            });
     }
 
     /// Create a pivot table from scratch: writes a pivotCacheDefinition and
@@ -3370,7 +3496,10 @@ mod tests {
         assert_eq!(list.formula1, "\"Laptop,Monitor,Dock\"");
         let whole = dvs.iter().find(|d| d.kind == "whole").unwrap();
         assert_eq!(whole.operator, "between");
-        assert_eq!((whole.formula1.as_str(), whole.formula2.as_str()), ("1", "10"));
+        assert_eq!(
+            (whole.formula1.as_str(), whole.formula2.as_str()),
+            ("1", "10")
+        );
     }
 
     #[test]
@@ -3380,7 +3509,12 @@ mod tests {
         pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(100.0));
         pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(900.0));
         // Highlight D-col > 500 with a red fill over A1:A2.
-        let dxf = Dxf { fill: Some((255, 0, 0)), color: None, bold: Some(true), italic: None };
+        let dxf = Dxf {
+            fill: Some((255, 0, 0)),
+            color: None,
+            bold: Some(true),
+            italic: None,
+        };
         pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "500", None, dxf);
 
         // Reload: the rule + dxf survive and evaluate.
@@ -3400,13 +3534,17 @@ mod tests {
         pkg.workbook.sheets[0].merges.push((0, 0, 0, 3)); // A1:D1
         pkg.workbook.sheets[0].merges.push((2, 1, 4, 1)); // B3:B5
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
-        assert_eq!(re.workbook.sheets[0].merges, vec![(0, 0, 0, 3), (2, 1, 4, 1)]);
+        assert_eq!(
+            re.workbook.sheets[0].merges,
+            vec![(0, 0, 0, 3), (2, 1, 4, 1)]
+        );
         // Clearing them removes the block.
         let mut re = re;
         re.workbook.sheets[0].merges.clear();
         let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
         assert!(re2.workbook.sheets[0].merges.is_empty());
-        let ws = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        let ws =
+            String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(!ws.contains("<mergeCells"));
     }
 
@@ -3419,7 +3557,9 @@ mod tests {
         pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Qty"));
         pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("Pen"));
         pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(3.0));
-        let idx = pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2").unwrap();
+        let idx = pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
         assert_eq!(pkg.workbook.tables[idx].columns, vec!["Item", "Qty"]);
 
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
@@ -3431,7 +3571,10 @@ mod tests {
         assert_eq!(t.columns, vec!["Item", "Qty"]);
         // The worksheet references the table via <tableParts>.
         let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
-        assert!(ws.contains("<tableParts"), "worksheet must list the table part: {ws}");
+        assert!(
+            ws.contains("<tableParts"),
+            "worksheet must list the table part: {ws}"
+        );
         assert!(ws.contains("r:id="), "tablePart needs an r:id");
     }
 
@@ -3443,11 +3586,21 @@ mod tests {
         pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Name"));
         pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Name"));
         // C1 left blank.
-        let idx = pkg.add_table(0, (0, 0, 1, 2), true, "TableStyleLight1").unwrap();
-        assert_eq!(pkg.workbook.tables[idx].columns, vec!["Name", "Name2", "Column3"]);
+        let idx = pkg
+            .add_table(0, (0, 0, 1, 2), true, "TableStyleLight1")
+            .unwrap();
+        assert_eq!(
+            pkg.workbook.tables[idx].columns,
+            vec!["Name", "Name2", "Column3"]
+        );
         // Without a header row, all columns are generated.
-        let idx2 = pkg.add_table(0, (3, 0, 5, 1), false, "TableStyleLight1").unwrap();
-        assert_eq!(pkg.workbook.tables[idx2].columns, vec!["Column1", "Column2"]);
+        let idx2 = pkg
+            .add_table(0, (3, 0, 5, 1), false, "TableStyleLight1")
+            .unwrap();
+        assert_eq!(
+            pkg.workbook.tables[idx2].columns,
+            vec!["Column1", "Column2"]
+        );
         assert_eq!(pkg.workbook.tables[idx2].name, "Table2");
     }
 
@@ -3480,7 +3633,8 @@ mod tests {
         re.workbook.sheets[0].set_protected(false);
         let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
         assert!(!re2.workbook.sheets[0].is_protected());
-        let ws2 = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        let ws2 =
+            String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(!ws2.contains("<sheetProtection"));
     }
 
@@ -3489,12 +3643,19 @@ mod tests {
         // A pre-existing protection element with a password + custom flags must
         // survive verbatim, and land before <mergeCells>.
         let mut pkg = new_xlsx();
-        pkg.workbook.sheets[0].protection = Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\"".into());
+        pkg.workbook.sheets[0].protection =
+            Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\"".into());
         pkg.workbook.sheets[0].merges.push((0, 0, 0, 2));
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
-        assert_eq!(re.workbook.sheets[0].protection.as_deref(), Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\""));
+        assert_eq!(
+            re.workbook.sheets[0].protection.as_deref(),
+            Some("sheet=\"1\" password=\"CC3D\" formatCells=\"0\"")
+        );
         let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
-        let (pp, mp) = (ws.find("<sheetProtection").unwrap(), ws.find("<mergeCells").unwrap());
+        let (pp, mp) = (
+            ws.find("<sheetProtection").unwrap(),
+            ws.find("<mergeCells").unwrap(),
+        );
         assert!(pp < mp, "sheetProtection must precede mergeCells: {ws}");
     }
 
@@ -3515,8 +3676,12 @@ mod tests {
         re.workbook.sheets[0].freeze = (0, 0);
         let re2 = load_xlsx(&save_xlsx(&re)).unwrap();
         assert_eq!(re2.workbook.sheets[0].freeze, (0, 0));
-        let ws0 = String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
-        assert!(!ws0.contains("<pane"), "unfreeze should remove the pane: {ws0}");
+        let ws0 =
+            String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(
+            !ws0.contains("<pane"),
+            "unfreeze should remove the pane: {ws0}"
+        );
     }
 
     #[test]
@@ -3528,7 +3693,10 @@ mod tests {
         assert!(pkg.rename_sheet(s2, "Budget"));
         assert_eq!(pkg.workbook.sheets[s2].name, "Budget");
         let wbxml = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
-        assert!(wbxml.contains("name=\"Budget\""), "workbook.xml not updated: {wbxml}");
+        assert!(
+            wbxml.contains("name=\"Budget\""),
+            "workbook.xml not updated: {wbxml}"
+        );
         assert!(!wbxml.contains("name=\"Data\""));
         // Duplicate (case-insensitive) and empty names are rejected.
         let first = pkg.workbook.sheets[0].name.clone();
@@ -3544,7 +3712,11 @@ mod tests {
     #[test]
     fn edited_chart_series_refs_round_trip_through_save_and_load() {
         use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
-        let src = |range| ChartSource { sheet: "Sheet1".into(), range, cat_col: 0 };
+        let src = |range| ChartSource {
+            sheet: "Sheet1".into(),
+            range,
+            cat_col: 0,
+        };
         let mut pkg = new_xlsx();
         // Two series reading different columns, plus their own category labels.
         let data = ChartData {
@@ -3577,17 +3749,31 @@ mod tests {
 
         // Save the package and read it back the way opening the file would.
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
-        let chart = |p: &SheetPackage| match &p.workbook.sheets[0].drawings.first().expect("chart drawing").kind {
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0]
+            .drawings
+            .first()
+            .expect("chart drawing")
+            .kind
+        {
             DrawingKind::Chart(c) => c.clone(),
             other => panic!("expected a chart drawing, got {other:?}"),
         };
         let got = chart(&re);
         assert_eq!(got.series.len(), 2);
-        assert_eq!(got.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
-        assert_eq!(got.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
+        assert_eq!(
+            got.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 2, 1))
+        );
+        assert_eq!(
+            got.series[1].values_ref.as_ref().map(|v| v.range),
+            Some((1, 3, 2, 3))
+        );
         assert_eq!(got.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
         assert_eq!(got.series[1].name_ref.as_deref(), Some("Sheet1!$D$1"));
-        assert_eq!(got.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        assert_eq!(
+            got.categories_ref.as_ref().map(|v| v.range),
+            Some((1, 0, 2, 0))
+        );
         assert_eq!(got.series[1].values, vec![2398.0, 358.0]);
         assert_eq!(got.categories, vec!["Laptop", "Dock"]);
         // The loader knows which part to write an edit back into.
@@ -3609,13 +3795,22 @@ mod tests {
 
         let reopened = chart(&load_xlsx(&save_xlsx(&edited)).unwrap());
         // The edit survived the trip to disk…
-        assert_eq!(reopened.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 2, 2, 2)));
+        assert_eq!(
+            reopened.series[1].values_ref.as_ref().map(|v| v.range),
+            Some((1, 2, 2, 2))
+        );
         assert_eq!(reopened.series[1].name_ref.as_deref(), Some("Sheet1!$C$1"));
         assert_eq!(reopened.series[1].name, "Unit price");
         assert_eq!(reopened.series[1].values, vec![1199.0, 179.0]);
-        assert_eq!(reopened.categories_ref.as_ref().map(|v| v.range), Some((1, 4, 2, 4)));
+        assert_eq!(
+            reopened.categories_ref.as_ref().map(|v| v.range),
+            Some((1, 4, 2, 4))
+        );
         // …and the series that was left alone came back untouched.
-        assert_eq!(reopened.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
+        assert_eq!(
+            reopened.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 2, 1))
+        );
         assert_eq!(reopened.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
         assert_eq!(reopened.series[0].values, vec![2.0, 5.0]);
     }
@@ -3628,8 +3823,16 @@ mod tests {
             kind: kind.into(),
             categories: vec!["Q1".into(), "Q2".into(), "Q3".into()],
             series: vec![
-                ChartSeries { name: "East".into(), values: vec![1.0, 2.0, 3.0], ..Default::default() },
-                ChartSeries { name: "West".into(), values: vec![4.0, 5.0, 6.0], ..Default::default() },
+                ChartSeries {
+                    name: "East".into(),
+                    values: vec![1.0, 2.0, 3.0],
+                    ..Default::default()
+                },
+                ChartSeries {
+                    name: "West".into(),
+                    values: vec![4.0, 5.0, 6.0],
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
@@ -3643,15 +3846,29 @@ mod tests {
         ] {
             let xml = chart_space_xml(&data(kind));
             assert!(xml.contains(needle), "{kind}: missing {needle}");
-            assert!(xml.matches('<').count() == xml.matches('>').count(), "{kind}: unbalanced angle brackets");
-            assert!(xml.matches("<c:chartSpace").count() == 1 && xml.contains("</c:chartSpace>"), "{kind}: chartSpace not closed");
+            assert!(
+                xml.matches('<').count() == xml.matches('>').count(),
+                "{kind}: unbalanced angle brackets"
+            );
+            assert!(
+                xml.matches("<c:chartSpace").count() == 1 && xml.contains("</c:chartSpace>"),
+                "{kind}: chartSpace not closed"
+            );
             // Pie carries no axes; the axed kinds must include the shared catAx.
             if kind == "pie" {
                 assert!(!xml.contains(forbidden), "pie must not emit axes");
-                assert_eq!(xml.matches("<c:ser>").count(), 1, "pie takes a single series");
+                assert_eq!(
+                    xml.matches("<c:ser>").count(),
+                    1,
+                    "pie takes a single series"
+                );
             } else {
                 assert!(xml.contains(forbidden), "{kind}: missing axes");
-                assert_eq!(xml.matches("<c:ser>").count(), 2, "{kind}: both series expected");
+                assert_eq!(
+                    xml.matches("<c:ser>").count(),
+                    2,
+                    "{kind}: both series expected"
+                );
             }
         }
     }
@@ -4005,8 +4222,20 @@ mod tests {
         use crate::sheet::{Align, Cell, CellValue, Xf};
         let mut pkg = new_xlsx();
         // A cell with wrapText, and a wrap over an existing horizontal align.
-        let idx = pkg.workbook.styles.intern(Xf { wrap: true, align: Align::Center, ..Default::default() });
-        pkg.workbook.sheets[0].set_cell(0, 0, Cell { value: CellValue::Text("a long wrapped label".into()), style: idx, ..Cell::default() });
+        let idx = pkg.workbook.styles.intern(Xf {
+            wrap: true,
+            align: Align::Center,
+            ..Default::default()
+        });
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                value: CellValue::Text("a long wrapped label".into()),
+                style: idx,
+                ..Cell::default()
+            },
+        );
         pkg.workbook.sheets[0].set_row_height(0, Some(42.0));
         assert_eq!(pkg.workbook.sheets[0].row_height(0), Some(42.0));
 
@@ -4014,7 +4243,11 @@ mod tests {
         let cell = re.workbook.sheets[0].cell(0, 0).unwrap();
         let xf = re.workbook.styles.xf(cell.style);
         assert!(xf.wrap, "wrapText must survive");
-        assert_eq!(xf.align, Align::Center, "horizontal align kept alongside wrap");
+        assert_eq!(
+            xf.align,
+            Align::Center,
+            "horizontal align kept alongside wrap"
+        );
         assert_eq!(re.workbook.sheets[0].row_height(0), Some(42.0));
         let ws = String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(ws.contains("ht=\"42\""), "{ws}");

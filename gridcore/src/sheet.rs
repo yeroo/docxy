@@ -320,22 +320,50 @@ impl ChartSource {
     /// to one column of the box (a series), leaving the header row out.
     pub fn f_ref(&self, c1: u32, c2: u32, skip_header: bool) -> String {
         let (r1, _, r2, _) = self.range;
-        let top = if skip_header { r1.saturating_add(1).min(r2) } else { r1 };
-        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
-        format!("{name}!${}${}:${}${}", col_name(c1), top + 1, col_name(c2), r2 + 1)
+        let top = if skip_header {
+            r1.saturating_add(1).min(r2)
+        } else {
+            r1
+        };
+        let name = if self.sheet.contains(' ') {
+            format!("'{}'", self.sheet)
+        } else {
+            self.sheet.clone()
+        };
+        format!(
+            "{name}!${}${}:${}${}",
+            col_name(c1),
+            top + 1,
+            col_name(c2),
+            r2 + 1
+        )
     }
 
     /// This source's own cells as an absolute ref — for a per-series range,
     /// which already excludes the header row.
     pub fn to_ref(&self) -> String {
         let (r1, c1, r2, c2) = self.range;
-        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
-        format!("{name}!${}${}:${}${}", col_name(c1), r1 + 1, col_name(c2), r2 + 1)
+        let name = if self.sheet.contains(' ') {
+            format!("'{}'", self.sheet)
+        } else {
+            self.sheet.clone()
+        };
+        format!(
+            "{name}!${}${}:${}${}",
+            col_name(c1),
+            r1 + 1,
+            col_name(c2),
+            r2 + 1
+        )
     }
 
     /// The single header cell above `col` — a series' name ref.
     pub fn header_ref(&self, col: u32) -> String {
-        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
+        let name = if self.sheet.contains(' ') {
+            format!("'{}'", self.sheet)
+        } else {
+            self.sheet.clone()
+        };
         format!("{name}!${}${}", col_name(col), self.range.0 + 1)
     }
 
@@ -346,7 +374,11 @@ impl ChartSource {
             None => (String::new(), s),
         };
         let range = parse_range_name(cells)?;
-        Some(ChartSource { sheet, range, cat_col: range.1 })
+        Some(ChartSource {
+            sheet,
+            range,
+            cat_col: range.1,
+        })
     }
 
     /// Grow to also cover `other`'s cells (same sheet assumed — a chart drawing
@@ -378,7 +410,9 @@ pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
         .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
         .map(|(r, c)| match sheet.cell(r, c).map(|cl| &cl.value) {
             Some(CellValue::Text(t)) => t.clone(),
-            Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => format_with(&Xf::default(), v, false),
+            Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => {
+                format_with(&Xf::default(), v, false)
+            }
             _ => String::new(),
         })
         .collect()
@@ -388,7 +422,12 @@ pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
 /// series, one column of labels becomes the categories, and every column that
 /// holds numbers becomes a series. This is what the Insert button plots and
 /// what re-pointing a chart at a new range replots.
-pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, u32), kind: &str) -> Option<ChartData> {
+pub fn chart_from_range(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+) -> Option<ChartData> {
     let (r0, c0, r1, c1) = range;
     if r1 <= r0 {
         return None; // header row only — nothing to plot
@@ -396,7 +435,9 @@ pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, 
     let text_of = |r: u32, c: u32| -> String {
         match sheet.cell(r, c).map(|cl| &cl.value) {
             Some(CellValue::Text(t)) => t.clone(),
-            Some(CellValue::Number(n)) => format_with(&Xf::default(), &CellValue::Number(*n), false),
+            Some(CellValue::Number(n)) => {
+                format_with(&Xf::default(), &CellValue::Number(*n), false)
+            }
             Some(CellValue::Bool(b)) => b.to_string(),
             Some(CellValue::Error(e)) => e.clone(),
             _ => String::new(),
@@ -426,14 +467,25 @@ pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, 
     let cat_col = cat_col.unwrap_or(c0);
     let rows: Vec<u32> = (r0 + 1..=r1).collect();
     let title = text_of(r0, cat_col);
-    let src = |c1: u32, c2: u32| ChartSource { sheet: sheet_name.to_string(), range: (r0 + 1, c1, r1, c2), cat_col };
+    let src = |c1: u32, c2: u32| ChartSource {
+        sheet: sheet_name.to_string(),
+        range: (r0 + 1, c1, r1, c2),
+        cat_col,
+    };
     let series = num_cols
         .iter()
         .map(|&c| ChartSeries {
             name: text_of(r0, c),
             col: Some(c),
             values_ref: Some(src(c, c)),
-            name_ref: Some(ChartSource { sheet: sheet_name.to_string(), range, cat_col }.header_ref(c)),
+            name_ref: Some(
+                ChartSource {
+                    sheet: sheet_name.to_string(),
+                    range,
+                    cat_col,
+                }
+                .header_ref(c),
+            ),
             values: rows
                 .iter()
                 .map(|&r| match sheet.cell(r, c).map(|cl| &cl.value) {
@@ -445,11 +497,19 @@ pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, 
         })
         .collect();
     Some(ChartData {
-        title: if title.is_empty() { "Chart".into() } else { title },
+        title: if title.is_empty() {
+            "Chart".into()
+        } else {
+            title
+        },
         kind: kind.to_string(),
         categories: rows.iter().map(|&r| text_of(r, cat_col)).collect(),
         series,
-        source: Some(ChartSource { sheet: sheet_name.to_string(), range, cat_col }),
+        source: Some(ChartSource {
+            sheet: sheet_name.to_string(),
+            range,
+            cat_col,
+        }),
         categories_ref: Some(src(cat_col, cat_col)),
         part: None,
         edited: true,
@@ -619,7 +679,11 @@ impl Sheet {
         let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
         let cleaned = strip_xml_attr(&cur, "hidden");
         let next = if hidden {
-            if cleaned.is_empty() { "hidden=\"1\"".to_string() } else { format!("{cleaned} hidden=\"1\"") }
+            if cleaned.is_empty() {
+                "hidden=\"1\"".to_string()
+            } else {
+                format!("{cleaned} hidden=\"1\"")
+            }
         } else {
             cleaned
         };
@@ -636,9 +700,13 @@ impl Sheet {
         self.row_attrs
             .get(&row)
             .and_then(|a| {
-                a.find("outlineLevel=\"").map(|i| i + "outlineLevel=\"".len()).and_then(|s| {
-                    a[s..].find('"').and_then(|e| a[s..s + e].parse::<u8>().ok())
-                })
+                a.find("outlineLevel=\"")
+                    .map(|i| i + "outlineLevel=\"".len())
+                    .and_then(|s| {
+                        a[s..]
+                            .find('"')
+                            .and_then(|e| a[s..s + e].parse::<u8>().ok())
+                    })
             })
             .unwrap_or(0)
     }
@@ -649,7 +717,11 @@ impl Sheet {
         let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
         let cleaned = strip_xml_attr(&cur, "outlineLevel");
         let next = if level > 0 {
-            if cleaned.is_empty() { format!("outlineLevel=\"{level}\"") } else { format!("{cleaned} outlineLevel=\"{level}\"") }
+            if cleaned.is_empty() {
+                format!("outlineLevel=\"{level}\"")
+            } else {
+                format!("{cleaned} outlineLevel=\"{level}\"")
+            }
         } else {
             cleaned
         };
@@ -663,14 +735,22 @@ impl Sheet {
     /// The deepest outline level used by any row (for `<sheetFormatPr
     /// outlineLevelRow>` and collapse controls). 0 when the sheet is flat.
     pub fn max_row_outline(&self) -> u8 {
-        self.row_attrs.keys().map(|&r| self.row_outline(r)).max().unwrap_or(0)
+        self.row_attrs
+            .keys()
+            .map(|&r| self.row_outline(r))
+            .max()
+            .unwrap_or(0)
     }
 
     /// The row's explicit height in points (`<row ht="…">`), or `None` when it
     /// uses the sheet default.
     pub fn row_height(&self, row: u32) -> Option<f64> {
         self.row_attrs.get(&row).and_then(|a| {
-            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| a[s..].find('"').and_then(|e| a[s..s + e].parse::<f64>().ok()))
+            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| {
+                a[s..]
+                    .find('"')
+                    .and_then(|e| a[s..s + e].parse::<f64>().ok())
+            })
         })
     }
 
@@ -683,7 +763,11 @@ impl Sheet {
         let next = match pts {
             Some(h) => {
                 let h = format!("ht=\"{h}\" customHeight=\"1\"");
-                if cleaned.is_empty() { h } else { format!("{cleaned} {h}") }
+                if cleaned.is_empty() {
+                    h
+                } else {
+                    format!("{cleaned} {h}")
+                }
             }
             None => cleaned,
         };
@@ -1375,7 +1459,10 @@ mod tests {
 
     #[test]
     fn range_readers_take_a_column_of_cells_as_numbers_or_labels() {
-        let mut sh = Sheet { name: "Budget".into(), ..Sheet::default() };
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
         for (addr, cell) in [
             ("B1", Cell::text("Qty")),
             ("B2", Cell::number(2.0)),
@@ -1399,7 +1486,10 @@ mod tests {
     #[test]
     fn chart_from_range_picks_labels_and_numeric_series() {
         // A1:C3 — a label column and two numeric columns under a header row.
-        let mut sh = Sheet { name: "Budget".into(), ..Sheet::default() };
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
         for (addr, cell) in [
             ("A1", Cell::text("Item")),
             ("B1", Cell::text("Qty")),
@@ -1424,7 +1514,10 @@ mod tests {
         // Each series remembers its column, so a save can write live refs.
         assert_eq!((cd.series[0].col, cd.series[1].col), (Some(1), Some(2)));
         let src = cd.source.expect("source");
-        assert_eq!((src.sheet.as_str(), src.range, src.cat_col), ("Budget", (0, 0, 2, 2), 0));
+        assert_eq!(
+            (src.sheet.as_str(), src.range, src.cat_col),
+            ("Budget", (0, 0, 2, 2), 0)
+        );
 
         // A range with nothing numeric in it can't be plotted.
         assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column").is_none());

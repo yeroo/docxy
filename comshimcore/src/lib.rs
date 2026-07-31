@@ -16,14 +16,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX,
-    DISP_E_MEMBERNOTFOUND, E_POINTER, S_FALSE, S_OK,
+    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
+    E_POINTER, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
-    CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS, DISPATCH_PROPERTYPUT,
-    DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory, IClassFactory_Impl, IDispatch,
-    IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
+    CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
+    DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
+    IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
@@ -121,7 +121,11 @@ pub unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
 
 /// Argument `i` as a bool, `default` when omitted/uncoercible.
 pub unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
-    unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
+    unsafe {
+        arg(p, i)
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(default)
+    }
 }
 
 pub fn variant_to_string(v: &VARIANT) -> Option<String> {
@@ -171,7 +175,8 @@ pub fn synth_id(name: &str) -> i32 {
     })
 }
 pub fn synth_name(id: i32) -> Option<String> {
-    (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
+    (id >= SYNTH_BASE)
+        .then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
 }
 
 /// The default arm for any dispid an object doesn't handle: log the member and
@@ -193,7 +198,11 @@ pub unsafe fn unhandled(
     // `coll(1)` call), so the arg count is the only reliable discriminator — a
     // real default-indexed get like `unknownColl(1)` has cArgs>=1 and must keep
     // degrading gracefully (return the do-nothing object so the chain flows).
-    let cargs = if params.is_null() { 0 } else { unsafe { (*params).cArgs } };
+    let cargs = if params.is_null() {
+        0
+    } else {
+        unsafe { (*params).cArgs }
+    };
     if id == 0 && cargs == 0 && !is_put(wflags) {
         log("  -> default-value probe on an object with no default -> DISP_E_MEMBERNOTFOUND");
         return Err(DISP_E_MEMBERNOTFOUND.into());
@@ -385,13 +394,20 @@ impl IClassFactory_Impl for ShimFactory_Impl {
 
 /// Whether COM launched us as a server (`-Embedding` / `/automation` / `--serve`).
 pub fn should_serve() -> bool {
-    let joined = std::env::args().collect::<Vec<_>>().join(" ").to_lowercase();
+    let joined = std::env::args()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     joined.contains("-embedding") || joined.contains("/automation") || joined.contains("--serve")
 }
 
 /// Run the out-of-process (LocalServer32) message loop: register a class object
 /// for both CLSIDs, pump messages until the last Application drops, then revoke.
-pub fn run_local_server(shim_clsid: GUID, app_clsid: GUID, create: fn() -> IDispatch) -> Result<()> {
+pub fn run_local_server(
+    shim_clsid: GUID,
+    app_clsid: GUID,
+    create: fn() -> IDispatch,
+) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         log("server starting; registering class object");

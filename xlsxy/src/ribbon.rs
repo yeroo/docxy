@@ -185,7 +185,11 @@ fn home_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("Right", AlignRight, "Align right"),
                     Seg::Gap(" "),
-                    btn("Merge", MergeCenter, "Merge & Center the selection (toggle)"),
+                    btn(
+                        "Merge",
+                        MergeCenter,
+                        "Merge & Center the selection (toggle)",
+                    ),
                     Seg::Gap(" "),
                     btn("Wrap", WrapText, "Wrap text within the cell (toggle)"),
                 ],
@@ -196,7 +200,11 @@ fn home_groups() -> Vec<Group> {
             width: 8,
             rows: [
                 vec![btn("Format ▾", NumberFormat, "Number format…")],
-                vec![btn("Cond Fmt", CondFormat, "Conditional formatting (highlight cells)")],
+                vec![btn(
+                    "Cond Fmt",
+                    CondFormat,
+                    "Conditional formatting (highlight cells)",
+                )],
             ],
         },
         Group {
@@ -261,7 +269,11 @@ fn insert_groups() -> Vec<Group> {
             title: "Tables",
             width: 12,
             rows: [
-                vec![btn("▦ Table", FormatAsTable, "Format the region as an Excel Table")],
+                vec![btn(
+                    "▦ Table",
+                    FormatAsTable,
+                    "Format the region as an Excel Table",
+                )],
                 vec![btn("PivotTable", Todo("PivotTable"), "Insert a PivotTable")],
             ],
         },
@@ -269,8 +281,16 @@ fn insert_groups() -> Vec<Group> {
             title: "Charts",
             width: 18,
             rows: [
-                vec![btn("▊ Column", InsertChart("column"), "Insert a column chart from the selection")],
-                vec![btn("▬ Bar", InsertChart("bar"), "Insert a bar chart from the selection")],
+                vec![btn(
+                    "▊ Column",
+                    InsertChart("column"),
+                    "Insert a column chart from the selection",
+                )],
+                vec![btn(
+                    "▬ Bar",
+                    InsertChart("bar"),
+                    "Insert a bar chart from the selection",
+                )],
             ],
         },
         Group {
@@ -278,14 +298,26 @@ fn insert_groups() -> Vec<Group> {
             width: 20,
             rows: [
                 vec![
-                    btn("Validation", DataValidation, "Data validation (dropdown list)"),
+                    btn(
+                        "Validation",
+                        DataValidation,
+                        "Data validation (dropdown list)",
+                    ),
                     Seg::Gap(" "),
                     btn("Filter ▾", Filter, "AutoFilter the current column"),
                 ],
                 vec![
-                    btn("Remove Dup", RemoveDuplicates, "Remove duplicate rows in the region"),
+                    btn(
+                        "Remove Dup",
+                        RemoveDuplicates,
+                        "Remove duplicate rows in the region",
+                    ),
                     Seg::Gap(" "),
-                    btn("Split", TextToColumns, "Text to Columns: split by a delimiter"),
+                    btn(
+                        "Split",
+                        TextToColumns,
+                        "Text to Columns: split by a delimiter",
+                    ),
                 ],
             ],
         },
@@ -293,8 +325,16 @@ fn insert_groups() -> Vec<Group> {
             title: "Outline",
             width: 18,
             rows: [
-                vec![btn("Σ Subtotal", Subtotal, "Insert subtotals at each change in the current column")],
-                vec![btn("⊟ Group ▾", Outline, "Collapse/expand the grouped detail rows")],
+                vec![btn(
+                    "Σ Subtotal",
+                    Subtotal,
+                    "Insert subtotals at each change in the current column",
+                )],
+                vec![btn(
+                    "⊟ Group ▾",
+                    Outline,
+                    "Collapse/expand the grouped detail rows",
+                )],
             ],
         },
     ]
@@ -335,7 +375,11 @@ fn review_groups() -> Vec<Group> {
             title: "Protect",
             width: 15,
             rows: [
-                vec![btn("🔒 Protect", ProtectSheet, "Protect/unprotect the sheet (make cells read-only)")],
+                vec![btn(
+                    "🔒 Protect",
+                    ProtectSheet,
+                    "Protect/unprotect the sheet (make cells read-only)",
+                )],
                 vec![],
             ],
         },

@@ -173,7 +173,9 @@ pub fn rewrite_anchors(xml: &str, moves: &[AnchorMove], drop: &[usize]) -> Strin
     while let Some((cut, tag)) = next_anchor(rest) {
         out.push_str(&rest[..cut]);
         rest = &rest[cut..];
-        let Some(end) = find_close(rest, tag) else { break };
+        let Some(end) = find_close(rest, tag) else {
+            break;
+        };
         let (element, after) = rest.split_at(end);
         if !drop.contains(&ix) {
             match moves.iter().find(|(i, _, _)| *i == ix) {
@@ -196,7 +198,11 @@ fn next_anchor(xml: &str) -> Option<(usize, &str)> {
         let name_end = xml[start + 1..].find(['>', ' ', '/'])? + start + 1;
         let name = &xml[start + 1..name_end];
         // Closing tags share the local name, so only openers count.
-        let l = if name.starts_with(['/', '!', '?']) { "" } else { local(name) };
+        let l = if name.starts_with(['/', '!', '?']) {
+            ""
+        } else {
+            local(name)
+        };
         if matches!(l, "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor") {
             return Some((start, name));
         }
@@ -212,7 +218,12 @@ fn move_anchor(element: &str, from: (u32, u32), to: (u32, u32)) -> String {
     let mut at = 0usize;
     while let Some(rel) = rest[at..].find('<') {
         let start = at + rel;
-        let Some(name_end) = rest[start + 1..].find(['>', ' ', '/']).map(|i| i + start + 1) else { break };
+        let Some(name_end) = rest[start + 1..]
+            .find(['>', ' ', '/'])
+            .map(|i| i + start + 1)
+        else {
+            break;
+        };
         let name = &rest[start + 1..name_end];
         let side = if name.starts_with(['/', '!', '?']) {
             None
@@ -318,7 +329,12 @@ fn parse_chart(xml: &str) -> ChartData {
                     // Orientation of the enclosing barChart: col = vertical
                     // columns, bar = horizontal bars.
                     "barDir" if in_bar => {
-                        cd.kind = if p.attr("val") == "bar" { "bar" } else { "column" }.to_string();
+                        cd.kind = if p.attr("val") == "bar" {
+                            "bar"
+                        } else {
+                            "column"
+                        }
+                        .to_string();
                     }
                     "title" => in_title = true,
                     "ser" => {
@@ -332,7 +348,10 @@ fn parse_chart(xml: &str) -> ChartData {
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
                     "srgbClr" if ser_depth == 1 && mode == 0 => {
-                        if let Some(rgb) = u32::from_str_radix(p.attr("val").trim(), 16).ok().filter(|_| p.attr("val").len() == 6) {
+                        if let Some(rgb) = u32::from_str_radix(p.attr("val").trim(), 16)
+                            .ok()
+                            .filter(|_| p.attr("val").len() == 6)
+                        {
                             if let Some(sr) = cd.series.last_mut() {
                                 sr.color.get_or_insert(rgb);
                             }
@@ -456,11 +475,16 @@ mod tests {
               <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
                 <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
             </xdr:twoCellAnchor></xdr:wsDr>"#;
-        let resolve = |rid: &str| (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()));
+        let resolve = |rid: &str| {
+            (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()))
+        };
         let get = |_: &str| None;
         let ds = parse_drawings(xml, &resolve, &get);
         assert_eq!(ds.len(), 1);
-        assert_eq!(ds[0].anchor_ix, 1, "the unmodelled shape still occupies anchor 0");
+        assert_eq!(
+            ds[0].anchor_ix, 1,
+            "the unmodelled shape still occupies anchor 0"
+        );
 
         // Move it three rows down and one column right.
         let out = rewrite_anchors(xml, &[(1, (5, 2), (13, 6))], &[]);
@@ -471,7 +495,10 @@ mod tests {
         assert!(out.contains("<xdr:col>0</xdr:col><xdr:colOff>7</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>9</xdr:rowOff>"));
         assert!(out.contains("<xdr:sp/>"));
         assert!(out.contains(r#"<xdr:cNvPr id="2" name="Logo"/>"#));
-        assert!(out.contains("<xdr:colOff>0</xdr:colOff>"), "the moved anchor keeps its offsets");
+        assert!(
+            out.contains("<xdr:colOff>0</xdr:colOff>"),
+            "the moved anchor keeps its offsets"
+        );
         // Rewriting nothing is a byte-for-byte no-op.
         assert_eq!(rewrite_anchors(xml, &[], &[]), xml);
 
@@ -523,46 +550,90 @@ mod tests {
         let cd = parse_chart(xml);
         assert_eq!(cd.series.len(), 2);
         // Each series kept its OWN values range, not the chart's overall box.
-        assert_eq!(cd.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
-        assert_eq!(cd.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 2, 1))
+        );
+        assert_eq!(
+            cd.series[1].values_ref.as_ref().map(|v| v.range),
+            Some((1, 3, 2, 3))
+        );
         assert_eq!(cd.series[0].name_ref.as_deref(), Some("Budget!$B$1"));
         assert_eq!(cd.series[1].name_ref.as_deref(), Some("Budget!$D$1"));
-        assert_eq!(cd.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|v| v.range),
+            Some((1, 0, 2, 0))
+        );
         // Their union is still the whole box the panel shows.
         assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 3)));
 
         // Writing and re-reading keeps every one of them.
         let again = parse_chart(&crate::xlsx::chart_space_xml_for_test(&cd));
-        assert_eq!(again.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
-        assert_eq!(again.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
-        assert_eq!(again.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        assert_eq!(
+            again.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 2, 1))
+        );
+        assert_eq!(
+            again.series[1].values_ref.as_ref().map(|v| v.range),
+            Some((1, 3, 2, 3))
+        );
+        assert_eq!(
+            again.categories_ref.as_ref().map(|v| v.range),
+            Some((1, 0, 2, 0))
+        );
         assert_eq!(again.series[1].name_ref.as_deref(), Some("Budget!$D$1"));
         assert_eq!(again.series[1].values, vec![2398.0, 358.0]);
 
         // A series with no ref of its own still falls back to the chart's box.
         let derived = ChartData {
-            series: vec![ChartSeries { name: "Qty".into(), values: vec![1.0], col: Some(1), ..Default::default() }],
+            series: vec![ChartSeries {
+                name: "Qty".into(),
+                values: vec![1.0],
+                col: Some(1),
+                ..Default::default()
+            }],
             categories: vec!["Laptop".into()],
-            source: Some(ChartSource { sheet: "Budget".into(), range: (0, 0, 1, 1), cat_col: 0 }),
+            source: Some(ChartSource {
+                sheet: "Budget".into(),
+                range: (0, 0, 1, 1),
+                cat_col: 0,
+            }),
             ..Default::default()
         };
         let out = crate::xlsx::chart_space_xml_for_test(&derived);
-        assert!(out.contains("<c:f>Budget!$B$2:$B$2</c:f>"), "derived value ref: {out}");
-        assert!(out.contains("<c:f>Budget!$A$2:$A$2</c:f>"), "derived category ref: {out}");
+        assert!(
+            out.contains("<c:f>Budget!$B$2:$B$2</c:f>"),
+            "derived value ref: {out}"
+        );
+        assert!(
+            out.contains("<c:f>Budget!$A$2:$A$2</c:f>"),
+            "derived category ref: {out}"
+        );
     }
 
     #[test]
     fn chart_source_refs_are_absolute_and_skip_the_header() {
         use crate::sheet::ChartSource;
-        let src = ChartSource { sheet: "Budget".into(), range: (0, 0, 4, 3), cat_col: 0 };
+        let src = ChartSource {
+            sheet: "Budget".into(),
+            range: (0, 0, 4, 3),
+            cat_col: 0,
+        };
         assert_eq!(src.f_ref(0, 0, true), "Budget!$A$2:$A$5");
         assert_eq!(src.f_ref(2, 2, true), "Budget!$C$2:$C$5");
         assert_eq!(src.header_ref(2), "Budget!$C$1");
         // A sheet name with a space has to be quoted for Excel to accept it.
-        let spaced = ChartSource { sheet: "My Sheet".into(), range: (0, 0, 2, 1), cat_col: 0 };
+        let spaced = ChartSource {
+            sheet: "My Sheet".into(),
+            range: (0, 0, 2, 1),
+            cat_col: 0,
+        };
         assert_eq!(spaced.f_ref(1, 1, true), "'My Sheet'!$B$2:$B$3");
         // Parsing is the inverse.
-        assert_eq!(ChartSource::parse_f_ref("Budget!$A$2:$A$5").unwrap().range, (1, 0, 4, 0));
+        assert_eq!(
+            ChartSource::parse_f_ref("Budget!$A$2:$A$5").unwrap().range,
+            (1, 0, 4, 0)
+        );
     }
 
     #[test]

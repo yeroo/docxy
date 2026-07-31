@@ -35,7 +35,11 @@ pub struct Ribbon<A> {
 
 impl<A> Ribbon<A> {
     pub fn new(tabs: Vec<Tab<A>>) -> Self {
-        Ribbon { qat: Vec::new(), tabs, contextual: Vec::new() }
+        Ribbon {
+            qat: Vec::new(),
+            tabs,
+            contextual: Vec::new(),
+        }
     }
     pub fn qat(mut self, qat: Vec<Cmd<A>>) -> Self {
         self.qat = qat;
@@ -174,13 +178,24 @@ pub struct Icon(pub &'static str);
 
 /// A command with just an icon id + label + action (no tip/keytip).
 pub fn cmd<A>(id: &'static str, icon: &'static str, label: &'static str, act: A) -> Cmd<A> {
-    Cmd { id, label, icon: Icon(icon), tip: ScreenTip::default(), key_tip: "", act }
+    Cmd {
+        id,
+        label,
+        icon: Icon(icon),
+        tip: ScreenTip::default(),
+        key_tip: "",
+        act,
+    }
 }
 
 impl<A> Cmd<A> {
     /// Attach a rich ScreenTip.
     pub fn tip(mut self, title: &'static str, body: &'static str, shortcut: &'static str) -> Self {
-        self.tip = ScreenTip { title, body, shortcut };
+        self.tip = ScreenTip {
+            title,
+            body,
+            shortcut,
+        };
         self
     }
     /// Attach an Alt-access KeyTip badge.
@@ -198,7 +213,12 @@ impl<A> Cmd<A> {
 
 /// A group: `group(title, priority, controls)`.
 pub fn group<A>(title: &'static str, priority: u8, items: Vec<Control<A>>) -> Group<A> {
-    Group { title, launcher: None, priority, items }
+    Group {
+        title,
+        launcher: None,
+        priority,
+        items,
+    }
 }
 
 impl<A> Group<A> {
@@ -231,5 +251,9 @@ pub fn combo<A>(cmd: Cmd<A>, wide: bool) -> Cell<A> {
 
 /// A tab: `tab(name, key_tip, groups)`.
 pub fn tab<A>(name: &'static str, key_tip: &'static str, groups: Vec<Group<A>>) -> Tab<A> {
-    Tab { name, key_tip, groups }
+    Tab {
+        name,
+        key_tip,
+        groups,
+    }
 }

@@ -1065,7 +1065,8 @@ impl App {
 
     fn start_edit(&mut self, initial: Option<char>) {
         if self.protected() {
-            self.status = Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return;
         }
         let text = match initial {
@@ -3056,7 +3057,8 @@ impl App {
 
     fn clear_selection(&mut self) {
         if self.protected() {
-            self.status = Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return;
         }
         let (r1, c1, r2, c2) = self.iter_selection();
@@ -3191,8 +3193,15 @@ impl App {
             bottom += 1;
         }
         let header = (0..=max_c).any(|c| {
-            matches!(sh.cell(top, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
-                && (top + 1..=bottom).any(|r| matches!(sh.cell(r, c).map(|cl| &cl.value), Some(CellValue::Number(_))))
+            matches!(
+                sh.cell(top, c).map(|cl| &cl.value),
+                Some(CellValue::Text(_))
+            ) && (top + 1..=bottom).any(|r| {
+                matches!(
+                    sh.cell(r, c).map(|cl| &cl.value),
+                    Some(CellValue::Number(_))
+                )
+            })
         });
         let start = if header { top + 1 } else { top };
         (bottom > start).then_some((start, bottom))
@@ -3207,7 +3216,10 @@ impl App {
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
         });
-        self.status = Some(format!("Sorted {}", if ascending { "A->Z" } else { "Z->A" }));
+        self.status = Some(format!(
+            "Sorted {}",
+            if ascending { "A->Z" } else { "Z->A" }
+        ));
     }
 
     /// Multi-level sort from a typed spec like "B asc, C desc" (column letters,
@@ -3226,7 +3238,11 @@ impl App {
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
         });
-        self.status = Some(format!("Sorted by {} key{}", keys.len(), if keys.len() == 1 { "" } else { "s" }));
+        self.status = Some(format!(
+            "Sorted by {} key{}",
+            keys.len(),
+            if keys.len() == 1 { "" } else { "s" }
+        ));
     }
 
     /// AutoSum: put =SUM(range) in the current cell, summing the run of numbers
@@ -3237,7 +3253,12 @@ impl App {
         let (r, c) = self.cur;
         let range = {
             let sh = self.sheet();
-            let is_num = |rr: u32, cc: u32| matches!(sh.cell(rr, cc).map(|x| &x.value), Some(CellValue::Number(_)));
+            let is_num = |rr: u32, cc: u32| {
+                matches!(
+                    sh.cell(rr, cc).map(|x| &x.value),
+                    Some(CellValue::Number(_))
+                )
+            };
             if r > 0 && is_num(r - 1, c) {
                 let mut top = r - 1;
                 while top > 0 && is_num(top - 1, c) {
@@ -3261,7 +3282,10 @@ impl App {
         let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
         self.status = Some(format!("AutoSum: =SUM({range})"));
         self.structural(move |wb| {
-            let cell = Cell { style, ..Cell::formula(&format!("SUM({range})")) };
+            let cell = Cell {
+                style,
+                ..Cell::formula(&format!("SUM({range})"))
+            };
             wb.sheets[s].set_cell(r, c, cell);
         });
     }
@@ -3283,7 +3307,10 @@ impl App {
         self.structural(|wb| {
             n = gridcore::edit::text_to_columns(wb, s, c1, r1, r2, delim);
         });
-        self.status = Some(format!("Text to Columns: split {n} row{}", if n == 1 { "" } else { "s" }));
+        self.status = Some(format!(
+            "Text to Columns: split {n} row{}",
+            if n == 1 { "" } else { "s" }
+        ));
     }
 
     /// Remove duplicate rows in the contiguous region around the cursor
@@ -3319,7 +3346,10 @@ impl App {
         self.structural(|wb| {
             removed = gridcore::edit::dedupe_rows(wb, s, top, bottom, header);
         });
-        self.status = Some(format!("Removed {removed} duplicate row{}", if removed == 1 { "" } else { "s" }));
+        self.status = Some(format!(
+            "Removed {removed} duplicate row{}",
+            if removed == 1 { "" } else { "s" }
+        ));
     }
 
     /// Subtotal: at each change in the cursor column's value, insert a
@@ -3362,7 +3392,10 @@ impl App {
         self.status = Some(if added == 0 {
             "Subtotal: nothing to total".into()
         } else {
-            format!("Inserted {added} subtotal row{} — use Group to collapse", if added == 1 { "" } else { "s" })
+            format!(
+                "Inserted {added} subtotal row{} — use Group to collapse",
+                if added == 1 { "" } else { "s" }
+            )
         });
     }
 
@@ -3372,7 +3405,12 @@ impl App {
     fn toggle_outline(&mut self) {
         let s = self.sheet;
         let sh = &self.pkg.workbook.sheets[s];
-        let outlined: Vec<u32> = sh.row_attrs.keys().copied().filter(|&r| sh.row_outline(r) >= 1).collect();
+        let outlined: Vec<u32> = sh
+            .row_attrs
+            .keys()
+            .copied()
+            .filter(|&r| sh.row_outline(r) >= 1)
+            .collect();
         if outlined.is_empty() {
             self.status = Some("No grouped rows — run Subtotal first".into());
             return;
@@ -3383,7 +3421,11 @@ impl App {
         }
         self.clamp_cursor();
         self.modified = true;
-        self.status = Some(if any_visible { "Outline collapsed".into() } else { "Outline expanded".into() });
+        self.status = Some(if any_visible {
+            "Outline collapsed".into()
+        } else {
+            "Outline expanded".into()
+        });
     }
 
     /// Format as Table: wrap the contiguous region around the cursor (or the
@@ -3407,7 +3449,8 @@ impl App {
                 let (max_r, max_c) = (rc - 1, cc - 1);
                 let cur_r = self.cur.0;
                 let sh = self.sheet();
-                let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                let row_used =
+                    |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
                 if !row_used(cur_r) {
                     self.status = Some("Format as Table: put the cursor in the data".into());
                     return;
@@ -3421,7 +3464,8 @@ impl App {
                     bottom += 1;
                 }
                 // Widen to the used columns spanning that block.
-                let col_used = |c: u32| (top..=bottom).any(|r| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+                let col_used =
+                    |c: u32| (top..=bottom).any(|r| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
                 let mut left = self.cur.1;
                 while left > 0 && col_used(left - 1) {
                     left -= 1;
@@ -3433,15 +3477,31 @@ impl App {
                 (top, left, bottom, right)
             }
         };
-        let has_header = (c1..=c2).all(|c| matches!(self.sheet().cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_))));
-        match self.pkg.add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2") {
+        let has_header = (c1..=c2).all(|c| {
+            matches!(
+                self.sheet().cell(r1, c).map(|cl| &cl.value),
+                Some(CellValue::Text(_))
+            )
+        });
+        match self
+            .pkg
+            .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2")
+        {
             Some(i) => {
                 // add_table rewrites package parts; existing undo snapshots no longer line up.
                 self.undo.clear();
                 self.redo.clear();
                 self.modified = true;
                 let name = self.pkg.workbook.tables[i].name.clone();
-                self.status = Some(format!("Created {name} ({} cols){}", c2 - c1 + 1, if has_header { "" } else { ", generated headers" }));
+                self.status = Some(format!(
+                    "Created {name} ({} cols){}",
+                    c2 - c1 + 1,
+                    if has_header {
+                        ""
+                    } else {
+                        ", generated headers"
+                    }
+                ));
             }
             None => self.status = Some("Format as Table failed".into()),
         }
@@ -3513,7 +3573,11 @@ impl App {
     /// Create a list data-validation (dropdown) over the selection from a
     /// comma-separated list of allowed values.
     fn commit_data_validation(&mut self, text: &str) {
-        let items: Vec<&str> = text.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let items: Vec<&str> = text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         if items.is_empty() {
             self.status = Some("Data validation: enter comma-separated values".into());
             return;
@@ -3521,7 +3585,8 @@ impl App {
         let f1 = format!("\"{}\"", items.join(","));
         let (r1, c1, r2, c2) = self.selection();
         let s = self.sheet;
-        self.pkg.add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None);
+        self.pkg
+            .add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None);
         self.undo.clear();
         self.redo.clear();
         self.modified = true;
@@ -3554,7 +3619,8 @@ impl App {
             bold: None,
             italic: None,
         };
-        self.pkg.add_conditional_format(s, (r1, c1, r2, c2), op, &val, val2.as_deref(), dxf);
+        self.pkg
+            .add_conditional_format(s, (r1, c1, r2, c2), op, &val, val2.as_deref(), dxf);
         // add_conditional_format rewrites package parts; drop stale undo snapshots.
         self.undo.clear();
         self.redo.clear();
@@ -3570,7 +3636,11 @@ impl App {
         let (r1, c1, r2, c2) = self.selection(); // raw: merging blank cells is valid
         let s = self.sheet;
         self.structural(move |wb| {
-            if let Some(i) = wb.sheets[s].merges.iter().position(|&(a, b, _, _)| a == r1 && b == c1) {
+            if let Some(i) = wb.sheets[s]
+                .merges
+                .iter()
+                .position(|&(a, b, _, _)| a == r1 && b == c1)
+            {
                 wb.sheets[s].merges.remove(i);
             } else if r2 > r1 || c2 > c1 {
                 wb.sheets[s].merges.push((r1, c1, r2, c2));
@@ -3600,7 +3670,8 @@ impl App {
             return;
         };
         let sheet = self.sheet;
-        self.pkg.add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data);
+        self.pkg
+            .add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data);
         // add_chart rewrites package parts; existing undo snapshots no longer line up.
         self.undo.clear();
         self.redo.clear();
@@ -4015,10 +4086,20 @@ impl App {
             ),
             PromptKind::ReplaceWith => ("Replace with: ", String::new()),
             PromptKind::GoTo => ("Go to: ", String::new()),
-            PromptKind::CondFormat => ("Highlight (>500, =42, 100..500 between, 'clear'): ", String::new()),
-            PromptKind::DataValidation => ("Dropdown list (comma-separated values): ", String::new()),
-            PromptKind::Filter => ("Filter this column (=Laptop, >500, <>0, 'clear'): ", String::new()),
-            PromptKind::TextToColumns => ("Split column by (comma, tab, space, ;): ", String::new()),
+            PromptKind::CondFormat => (
+                "Highlight (>500, =42, 100..500 between, 'clear'): ",
+                String::new(),
+            ),
+            PromptKind::DataValidation => {
+                ("Dropdown list (comma-separated values): ", String::new())
+            }
+            PromptKind::Filter => (
+                "Filter this column (=Laptop, >500, <>0, 'clear'): ",
+                String::new(),
+            ),
+            PromptKind::TextToColumns => {
+                ("Split column by (comma, tab, space, ;): ", String::new())
+            }
             PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
         };
@@ -4548,15 +4629,23 @@ fn draw(app: &mut App, f: &mut Frame) {
             // Merged regions: the top-left cell spans its columns' combined visible
             // width; covered cells in the same row are skipped; cells under a
             // vertical merge render blank (content lives only in the top-left).
-            let merge = merges.iter().find(|&&(mr1, mc1, mr2, mc2)| row >= mr1 && row <= mr2 && col >= mc1 && col <= mc2).copied();
+            let merge = merges
+                .iter()
+                .find(|&&(mr1, mc1, mr2, mc2)| row >= mr1 && row <= mr2 && col >= mc1 && col <= mc2)
+                .copied();
             let (w, blank_covered) = match merge {
                 Some((mr1, mc1, _mr2, mc2)) if row == mr1 && col == mc1 => {
                     skip_to = mc2 as i64;
-                    let cw: u16 = app.vis_cols.iter().filter(|&&(cc, _, _)| cc >= col && cc <= mc2).map(|&(_, _, ww)| ww).sum();
+                    let cw: u16 = app
+                        .vis_cols
+                        .iter()
+                        .filter(|&&(cc, _, _)| cc >= col && cc <= mc2)
+                        .map(|&(_, _, ww)| ww)
+                        .sum();
                     (cw.max(1), false)
                 }
                 Some((mr1, _, _, _)) if row == mr1 => continue, // covered in the top row
-                Some(_) => (w, true),                            // under a vertical merge
+                Some(_) => (w, true),                           // under a vertical merge
                 None => (w, false),
             };
             let cell = sheet.cell(row, col);
@@ -4578,7 +4667,10 @@ fn draw(app: &mut App, f: &mut Frame) {
             // wrapped cells split across lines; other cells sit on line 0 (blank
             // below). Non-wrap content is never truncated by wrapping.
             let line_text = if xf.wrap && !formula_view {
-                wrap_text(&text, w as usize).get(sub).cloned().unwrap_or_default()
+                wrap_text(&text, w as usize)
+                    .get(sub)
+                    .cloned()
+                    .unwrap_or_default()
             } else if sub == 0 {
                 text.clone()
             } else {
@@ -4849,7 +4941,13 @@ fn center(s: &str, w: usize) -> String {
 /// How many screen lines a row occupies: derived from an explicit row height
 /// (≈15pt per line) and from any wrap-enabled cell's wrapped line count, capped
 /// so a pathological cell can't blow up the layout.
-fn row_line_count(sheet: &Sheet, styles: &gridcore::sheet::Styles, row: u32, vis_cols: &[(u32, u16, u16)], date1904: bool) -> u16 {
+fn row_line_count(
+    sheet: &Sheet,
+    styles: &gridcore::sheet::Styles,
+    row: u32,
+    vis_cols: &[(u32, u16, u16)],
+    date1904: bool,
+) -> u16 {
     const CAP: u16 = 12;
     let mut lines = 1u16;
     if let Some(ht) = sheet.row_height(row) {
@@ -5283,7 +5381,10 @@ fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
             }
             v
         }
-        2 => COLOR_OPTIONS.iter().map(|(l, c)| (l.to_string(), *c, xf.fill == *c)).collect(),
+        2 => COLOR_OPTIONS
+            .iter()
+            .map(|(l, c)| (l.to_string(), *c, xf.fill == *c))
+            .collect(),
         3 => vec![
             ("Left".to_string(), None, xf.align == Align::Left),
             ("Center".to_string(), None, xf.align == Align::Center),
@@ -5323,7 +5424,10 @@ fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
     for (i, (label, color, active)) in rows.iter().enumerate().skip(start).take(list_h) {
         let mut spans: Vec<RSpan> = vec![RSpan::raw(if *active { "● " } else { "  " }.to_string())];
         if let Some((r, g, b)) = color {
-            spans.push(RSpan::styled("██ ", Style::new().fg(Color::Rgb(*r, *g, *b))));
+            spans.push(RSpan::styled(
+                "██ ",
+                Style::new().fg(Color::Rgb(*r, *g, *b)),
+            ));
         }
         let base = if i == d.sel {
             Style::new().add_modifier(Modifier::REVERSED)
@@ -5342,7 +5446,11 @@ fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
     )));
 
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Format Cells (Ctrl+1) ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Format Cells (Ctrl+1) "),
+        ),
         area,
     );
 }
@@ -6366,7 +6474,10 @@ mod tests {
             d.sel = sel;
             app.apply_format_dialog();
         };
-        let pct = NUMFMT_OPTIONS.iter().position(|(l, _)| *l == "Percent  0%").unwrap();
+        let pct = NUMFMT_OPTIONS
+            .iter()
+            .position(|(l, _)| *l == "Percent  0%")
+            .unwrap();
         set(&mut app, 0, pct); // Number: Percent 0%
         set(&mut app, 1, 0); // Font: Bold
         set(&mut app, 3, 1); // Align: Center
@@ -6387,13 +6498,19 @@ mod tests {
         assert_eq!(app.format_dialog.as_ref().unwrap().section, 1);
         app.format_dialog_key(KeyCode::Left);
         app.format_dialog_key(KeyCode::Left);
-        assert_eq!(app.format_dialog.as_ref().unwrap().section, FMT_SECTIONS.len() - 1);
+        assert_eq!(
+            app.format_dialog.as_ref().unwrap().section,
+            FMT_SECTIONS.len() - 1
+        );
         app.format_dialog_key(KeyCode::Esc);
         assert!(app.format_dialog.is_none());
 
         // Formatting persists across save/reload.
         let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
-        let xf = re.workbook.styles.xf(re.workbook.sheets[0].cell(0, 0).unwrap().style);
+        let xf = re
+            .workbook
+            .styles
+            .xf(re.workbook.sheets[0].cell(0, 0).unwrap().style);
         assert!(xf.bold && xf.align == Align::Center && xf.code.as_deref() == Some("0%"));
     }
 
@@ -6433,7 +6550,10 @@ mod tests {
     #[test]
     fn commit_sort_multi_level() {
         use gridcore::sheet::{Cell, CellValue};
-        assert_eq!(gridcore::edit::parse_sort_spec("A, B desc"), Some(vec![(0, true), (1, false)]));
+        assert_eq!(
+            gridcore::edit::parse_sort_spec("A, B desc"),
+            Some(vec![(0, true), (1, false)])
+        );
         assert_eq!(gridcore::edit::parse_sort_spec("bad3"), None);
         assert_eq!(gridcore::edit::parse_sort_spec(""), None);
 
@@ -6443,7 +6563,10 @@ mod tests {
             let sh = &mut app.pkg.workbook.sheets[0];
             sh.set_cell(0, 0, Cell::text("Grp"));
             sh.set_cell(0, 1, Cell::text("Score"));
-            for (i, (g, sc)) in [("B", 10.0), ("A", 5.0), ("B", 20.0), ("A", 8.0)].iter().enumerate() {
+            for (i, (g, sc)) in [("B", 10.0), ("A", 5.0), ("B", 20.0), ("A", 8.0)]
+                .iter()
+                .enumerate()
+            {
                 sh.set_cell(i as u32 + 1, 0, Cell::text(g));
                 sh.set_cell(i as u32 + 1, 1, Cell::number(*sc));
             }
@@ -6454,10 +6577,22 @@ mod tests {
         app.commit_sort("A asc, B desc"); // Grp asc, then Score desc
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(0, 0), CellValue::Text("Grp".into())); // header kept
-        assert_eq!((v(1, 0), v(1, 1)), (CellValue::Text("A".into()), CellValue::Number(8.0)));
-        assert_eq!((v(2, 0), v(2, 1)), (CellValue::Text("A".into()), CellValue::Number(5.0)));
-        assert_eq!((v(3, 0), v(3, 1)), (CellValue::Text("B".into()), CellValue::Number(20.0)));
-        assert_eq!((v(4, 0), v(4, 1)), (CellValue::Text("B".into()), CellValue::Number(10.0)));
+        assert_eq!(
+            (v(1, 0), v(1, 1)),
+            (CellValue::Text("A".into()), CellValue::Number(8.0))
+        );
+        assert_eq!(
+            (v(2, 0), v(2, 1)),
+            (CellValue::Text("A".into()), CellValue::Number(5.0))
+        );
+        assert_eq!(
+            (v(3, 0), v(3, 1)),
+            (CellValue::Text("B".into()), CellValue::Number(20.0))
+        );
+        assert_eq!(
+            (v(4, 0), v(4, 1)),
+            (CellValue::Text("B".into()), CellValue::Number(10.0))
+        );
     }
 
     #[test]
@@ -6483,12 +6618,24 @@ mod tests {
 
     #[test]
     fn parse_cf_input_operators() {
-        assert_eq!(parse_cf_input(">500"), Some(("greaterThan", "500".into(), None)));
-        assert_eq!(parse_cf_input("<=100"), Some(("lessThanOrEqual", "100".into(), None)));
+        assert_eq!(
+            parse_cf_input(">500"),
+            Some(("greaterThan", "500".into(), None))
+        );
+        assert_eq!(
+            parse_cf_input("<=100"),
+            Some(("lessThanOrEqual", "100".into(), None))
+        );
         assert_eq!(parse_cf_input("<>0"), Some(("notEqual", "0".into(), None)));
         assert_eq!(parse_cf_input("=42"), Some(("equal", "42".into(), None)));
-        assert_eq!(parse_cf_input("42"), Some(("greaterThan", "42".into(), None)));
-        assert_eq!(parse_cf_input("100..500"), Some(("between", "100".into(), Some("500".into()))));
+        assert_eq!(
+            parse_cf_input("42"),
+            Some(("greaterThan", "42".into(), None))
+        );
+        assert_eq!(
+            parse_cf_input("100..500"),
+            Some(("between", "100".into(), Some("500".into())))
+        );
         assert_eq!(parse_cf_input("   "), None);
     }
 
@@ -6599,7 +6746,10 @@ mod tests {
         app.start_edit(Some('x'));
         assert!(app.edit.is_none(), "edit must be blocked while protected");
         app.clear_selection();
-        assert_eq!(app.sheet().cell(0, 0).unwrap().value, gridcore::sheet::CellValue::Text("keep".into()));
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            gridcore::sheet::CellValue::Text("keep".into())
+        );
         // Unprotect: editing works again.
         app.toggle_protection();
         assert!(!app.protected());
@@ -6618,15 +6768,29 @@ mod tests {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         // A wrapped cell with text longer than its column.
-        let idx = app.pkg.workbook.styles.intern(Xf { wrap: true, ..Default::default() });
-        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell { value: gridcore::sheet::CellValue::Text("alpha beta gamma delta".into()), style: idx, ..Cell::default() });
+        let idx = app.pkg.workbook.styles.intern(Xf {
+            wrap: true,
+            ..Default::default()
+        });
+        app.pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                value: gridcore::sheet::CellValue::Text("alpha beta gamma delta".into()),
+                style: idx,
+                ..Cell::default()
+            },
+        );
         app.rebuild_engine();
 
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| draw(&mut app, f)).unwrap();
         // Row 0 now spans several screen lines (sub-line indices 0,1,2…).
         let n0 = app.vis_rows.iter().filter(|&&r| r == 0).count();
-        assert!(n0 >= 2, "wrapped row should occupy multiple lines, got {n0}");
+        assert!(
+            n0 >= 2,
+            "wrapped row should occupy multiple lines, got {n0}"
+        );
         assert_eq!(app.vis_subline[0], 0);
         assert!(app.vis_subline.iter().any(|&s| s >= 1));
 
@@ -7456,8 +7620,16 @@ mod tests {
         app.commit_prompt();
 
         let reloaded = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
-        let names: Vec<&str> = reloaded.workbook.sheets.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"Budget"), "rename lost on reload: {names:?}");
+        let names: Vec<&str> = reloaded
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Budget"),
+            "rename lost on reload: {names:?}"
+        );
         assert!(!names.contains(&"Data"), "stale name survived: {names:?}");
     }
 
@@ -7771,7 +7943,10 @@ mod tests {
         term.draw(|f| draw(&mut app, f)).unwrap();
         let text = format!("{:?}", term.backend().buffer());
         assert!(text.contains("Format Cells"), "title missing");
-        assert!(text.contains("Number") && text.contains("Border"), "section tabs missing");
+        assert!(
+            text.contains("Number") && text.contains("Border"),
+            "section tabs missing"
+        );
         assert!(text.contains("General"), "number options missing");
 
         // Move to the Align section; its options render.

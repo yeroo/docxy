@@ -176,11 +176,16 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
     let mut seen = std::collections::HashSet::new();
     let mut uniques: Vec<Vec<Option<crate::sheet::Cell>>> = Vec::new();
     for r in start..=r2 {
-        let row: Vec<Option<crate::sheet::Cell>> = (0..=max_c).map(|c| s.cell(r, c).cloned()).collect();
+        let row: Vec<Option<crate::sheet::Cell>> =
+            (0..=max_c).map(|c| s.cell(r, c).cloned()).collect();
         // Signature over the cells' values (formatting doesn't count for dedup).
         let key: Vec<String> = row
             .iter()
-            .map(|c| c.as_ref().map(|cl| format!("{:?}", cl.value)).unwrap_or_default())
+            .map(|c| {
+                c.as_ref()
+                    .map(|cl| format!("{:?}", cl.value))
+                    .unwrap_or_default()
+            })
             .collect();
         if seen.insert(key) {
             uniques.push(row);
@@ -274,9 +279,16 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         Some(CellValue::Bool(_)) => 2,
         _ => 3,
     };
-    let value_cmp = |ka: &Option<Cell>, kb: &Option<Cell>| match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
-        (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
+    let value_cmp = |ka: &Option<Cell>, kb: &Option<Cell>| match (
+        ka.as_ref().map(|c| &c.value),
+        kb.as_ref().map(|c| &c.value),
+    ) {
+        (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => {
+            x.partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => {
+            x.to_lowercase().cmp(&y.to_lowercase())
+        }
         (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
         _ => rank(ka).cmp(&rank(kb)),
     };
@@ -324,7 +336,12 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
 /// Copied formulas are re-based like Excel's: relative references shift by the
 /// copy's row/column distance, absolute (`$`) ones stay put. Returns the count
 /// of filled cells.
-pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: (u32, u32)) -> usize {
+pub fn autofill(
+    wb: &mut Workbook,
+    sheet: usize,
+    src: (u32, u32, u32, u32),
+    to: (u32, u32),
+) -> usize {
     let (sr0, sc0, sr1, sc1) = src;
     let (tr, tc) = to;
     let dr = tr.saturating_sub(sr1);
@@ -346,7 +363,11 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: 
                 let dst = sr1 + 1 + k as u32;
                 // A copied cell came from src[k % len]; shift its formula by the
                 // distance it travelled.
-                rebase(&mut cell, i64::from(dst) - i64::from(sr0 + (k % len) as u32), 0);
+                rebase(
+                    &mut cell,
+                    i64::from(dst) - i64::from(sr0 + (k % len) as u32),
+                    0,
+                );
                 s.set_cell(dst, c, cell);
                 filled += 1;
             }
@@ -359,7 +380,11 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, src: (u32, u32, u32, u32), to: 
             let len = srcvals.len();
             for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
                 let dst = sc1 + 1 + k as u32;
-                rebase(&mut cell, 0, i64::from(dst) - i64::from(sc0 + (k % len) as u32));
+                rebase(
+                    &mut cell,
+                    0,
+                    i64::from(dst) - i64::from(sc0 + (k % len) as u32),
+                );
                 s.set_cell(r, dst, cell);
                 filled += 1;
             }
@@ -386,8 +411,14 @@ fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
 fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
     // Formulas carry a cached numeric result; extending them as a linear series
     // would silently replace the formulas with numbers, so copy them instead.
-    if src.iter().flatten().any(|c| c.formula.is_some() || c.f_attrs.is_some()) {
-        return (0..count).map(|k| src[k % src.len()].clone().unwrap_or_default()).collect();
+    if src
+        .iter()
+        .flatten()
+        .any(|c| c.formula.is_some() || c.f_attrs.is_some())
+    {
+        return (0..count)
+            .map(|k| src[k % src.len()].clone().unwrap_or_default())
+            .collect();
     }
     let nums: Option<Vec<f64>> = src
         .iter()
@@ -400,7 +431,11 @@ fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
         if nums.len() >= 2 {
             let step = nums[nums.len() - 1] - nums[nums.len() - 2];
             let last = nums[nums.len() - 1];
-            let style = src.last().and_then(|c| c.as_ref()).map(|c| c.style).unwrap_or(0);
+            let style = src
+                .last()
+                .and_then(|c| c.as_ref())
+                .map(|c| c.style)
+                .unwrap_or(0);
             return (0..count)
                 .map(|k| {
                     let mut cell = Cell::number(last + step * (k as f64 + 1.0));
@@ -411,7 +446,9 @@ fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
         }
     }
     // Copy / cycle the source cells (single value → repeat it).
-    (0..count).map(|k| src[k % src.len()].clone().unwrap_or_default()).collect()
+    (0..count)
+        .map(|k| src[k % src.len()].clone().unwrap_or_default())
+        .collect()
 }
 
 /// Insert subtotal rows into a region already grouped by `group_col`: at each
@@ -422,7 +459,15 @@ fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
 /// first (Excel requires this too). Grand totals use `SUBTOTAL` precisely
 /// because it skips the nested per-group subtotals. Returns the number of rows
 /// added (groups + 1), or 0 when there's nothing to total.
-pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u32, sum_cols: &[u32], has_header: bool) -> usize {
+pub fn subtotal(
+    wb: &mut Workbook,
+    sheet: usize,
+    r1: u32,
+    r2: u32,
+    group_col: u32,
+    sum_cols: &[u32],
+    has_header: bool,
+) -> usize {
     use crate::sheet::cell_name;
     let start = if has_header { r1 + 1 } else { r1 };
     if r2 < start {
@@ -444,13 +489,19 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
         (max_c, detail)
     };
     let gc = group_col as usize;
-    let key_of = |row: &[Option<Cell>]| row.get(gc).and_then(|c| c.as_ref()).map(|c| format!("{:?}", c.value)).unwrap_or_default();
-    let label_of = |row: &[Option<Cell>]| match row.get(gc).and_then(|c| c.as_ref()).map(|c| &c.value) {
-        Some(CellValue::Text(t)) => t.clone(),
-        Some(CellValue::Number(n)) => n.to_string(),
-        Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        _ => String::new(),
+    let key_of = |row: &[Option<Cell>]| {
+        row.get(gc)
+            .and_then(|c| c.as_ref())
+            .map(|c| format!("{:?}", c.value))
+            .unwrap_or_default()
     };
+    let label_of =
+        |row: &[Option<Cell>]| match row.get(gc).and_then(|c| c.as_ref()).map(|c| &c.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            Some(CellValue::Number(n)) => n.to_string(),
+            Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            _ => String::new(),
+        };
     // Runs of consecutive equal group values: (label, start_idx, end_idx).
     let mut runs: Vec<(String, usize, usize)> = Vec::new();
     let mut i = 0;
@@ -472,7 +523,17 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
         sum_cols.to_vec()
     } else {
         (0..=max_c)
-            .filter(|&c| c != group_col && detail.iter().any(|row| matches!(row.get(c as usize).and_then(|x| x.as_ref()).map(|x| &x.value), Some(CellValue::Number(_)))))
+            .filter(|&c| {
+                c != group_col
+                    && detail.iter().any(|row| {
+                        matches!(
+                            row.get(c as usize)
+                                .and_then(|x| x.as_ref())
+                                .map(|x| &x.value),
+                            Some(CellValue::Number(_))
+                        )
+                    })
+            })
             .collect()
     };
     let added = runs.len() + 1;
@@ -510,7 +571,11 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
             s.set_row_outline(out, 1);
             out += 1;
         }
-        let text = if label.is_empty() { "Total".to_string() } else { format!("{label} Total") };
+        let text = if label.is_empty() {
+            "Total".to_string()
+        } else {
+            format!("{label} Total")
+        };
         subtotal_row(s, out, &text, first, out - 1);
         out += 1;
     }
@@ -523,7 +588,14 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
 /// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
 /// Numeric-looking parts become numbers. Rows without the delimiter are left
 /// alone. Returns how many rows were split.
-pub fn text_to_columns(wb: &mut Workbook, sheet: usize, col: u32, r1: u32, r2: u32, delim: char) -> usize {
+pub fn text_to_columns(
+    wb: &mut Workbook,
+    sheet: usize,
+    col: u32,
+    r1: u32,
+    r2: u32,
+    delim: char,
+) -> usize {
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
@@ -814,7 +886,10 @@ mod tests {
         assert_eq!(n2, 3);
         let s2 = &w2.sheets[0];
         for c in 1..=3 {
-            assert_eq!(s2.cell(0, c).map(|x| x.value.clone()), Some(CellValue::Text("x".into())));
+            assert_eq!(
+                s2.cell(0, c).map(|x| x.value.clone()),
+                Some(CellValue::Text("x".into()))
+            );
         }
     }
 
@@ -824,7 +899,10 @@ mod tests {
         let mut w = wb(&[("A1", Cell::number(0.0)), ("A2", Cell::number(5.0))]);
         autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
         let s = &w.sheets[0];
-        assert_eq!(s.cell(4, 0).map(|c| c.value.clone()), Some(CellValue::Number(20.0)));
+        assert_eq!(
+            s.cell(4, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(20.0))
+        );
         // Dragging back onto the source (no extension) fills nothing.
         assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (1, 0)), 0);
     }
@@ -841,7 +919,14 @@ mod tests {
             ("C3", Cell::number(7.0)),
             ("A1", Cell::number(10.0)), // the fixed rate $A$1
         ]);
-        w.sheets[0].set_cell(0, 3, Cell { formula: Some("B1*C1*$A$1".into()), ..Default::default() });
+        w.sheets[0].set_cell(
+            0,
+            3,
+            Cell {
+                formula: Some("B1*C1*$A$1".into()),
+                ..Default::default()
+            },
+        );
         assert_eq!(autofill(&mut w, 0, (0, 3, 0, 3), (2, 3)), 2);
         let f = |r: u32| w.sheets[0].cell(r, 3).and_then(|c| c.formula.clone());
         assert_eq!(f(1).as_deref(), Some("B2*C2*$A$1"));
@@ -858,8 +943,22 @@ mod tests {
         // Two formula cells whose RESULTS look like a series (1, 2) must still
         // fill as copied formulas, not as the numbers 3, 4.
         let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
-        w.sheets[0].set_cell(0, 1, Cell { formula: Some("A1".into()), ..Default::default() });
-        w.sheets[0].set_cell(1, 1, Cell { formula: Some("A2".into()), ..Default::default() });
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("A1".into()),
+                ..Default::default()
+            },
+        );
+        w.sheets[0].set_cell(
+            1,
+            1,
+            Cell {
+                formula: Some("A2".into()),
+                ..Default::default()
+            },
+        );
         autofill(&mut w, 0, (0, 1, 1, 1), (3, 1));
         let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
         assert_eq!(f(2).as_deref(), Some("A3"));
@@ -911,13 +1010,22 @@ mod tests {
         // Ascending: 1,2,3,blank
         sort_rows(&mut w, 0, 0, 3, &[(0, true)]);
         let s = &w.sheets[0];
-        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(1.0)));
-        assert_eq!(s.cell(2, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
+        assert_eq!(
+            s.cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(1.0))
+        );
+        assert_eq!(
+            s.cell(2, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(3.0))
+        );
         assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
         // Descending: 3,2,1,blank (blank still last)
         sort_rows(&mut w, 0, 0, 3, &[(0, false)]);
         let s = &w.sheets[0];
-        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
+        assert_eq!(
+            s.cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(3.0))
+        );
         assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
     }
 

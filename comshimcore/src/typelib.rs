@@ -81,7 +81,9 @@ pub unsafe fn author(spec: &Spec, out: &str) -> Result<()> {
             let sti = match vtable_iface(&src, &iid) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("{name}: no vtable interface ({e:?}); skipping (IDispatch-marshaled)");
+                    eprintln!(
+                        "{name}: no vtable interface ({e:?}); skipping (IDispatch-marshaled)"
+                    );
                     continue;
                 }
             };
@@ -166,7 +168,10 @@ unsafe fn copy_dispinterface(
             if let Err(e) = cti.AddFuncDesc(added, fd) {
                 // Non-fatal: a member LayOut rejects (e.g. a get/put pair the
                 // flattening perturbs) is skipped, not fatal to the whole iface.
-                eprintln!("  {name} (disp) member#{f} memid={:#x}: {e:?}; skip", (*fd).memid);
+                eprintln!(
+                    "  {name} (disp) member#{f} memid={:#x}: {e:?}; skip",
+                    (*fd).memid
+                );
                 sti.ReleaseFuncDesc(fd);
                 continue;
             }
@@ -178,8 +183,10 @@ unsafe fn copy_dispinterface(
             if sti.GetNames((*fd).memid, &mut names, &mut cnames).is_ok() && cnames > 0 {
                 // A property-put's value parameter shares the member name in some
                 // typelibs; SetFuncAndParamNames only needs the leading names.
-                let ptrs: Vec<PCWSTR> =
-                    names[..cnames as usize].iter().map(|b| PCWSTR(b.as_ptr())).collect();
+                let ptrs: Vec<PCWSTR> = names[..cnames as usize]
+                    .iter()
+                    .map(|b| PCWSTR(b.as_ptr()))
+                    .collect();
                 if let Err(e) = cti.SetFuncAndParamNames(added, &ptrs) {
                     // A duplicate name (rare, from flattening) is non-fatal.
                     eprintln!("  {name} (disp) member#{f} names: {e:?}; unnamed");
@@ -323,7 +330,9 @@ unsafe fn ref_kind(sti: &ITypeInfo, href: u32) -> Option<TYPEKIND> {
 }
 
 fn arg2_path(spec: &Spec) -> String {
-    std::env::args().nth(2).unwrap_or_else(|| default_out_path(spec))
+    std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| default_out_path(spec))
 }
 
 /// Register (or unregister) our typelib per-user: TypeLib\{our LIBID} -> the
