@@ -358,6 +358,32 @@ impl ChartSource {
     }
 }
 
+/// The numbers in a range, row-major, with blanks and text as 0 — what a chart
+/// series plots when it is pointed at those cells.
+pub fn range_numbers(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<f64> {
+    let (r1, c1, r2, c2) = range;
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .map(|(r, c)| match sheet.cell(r, c).map(|cl| &cl.value) {
+            Some(CellValue::Number(n)) => *n,
+            _ => 0.0,
+        })
+        .collect()
+}
+
+/// The text in a range, row-major — category labels, or a series name.
+pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
+    let (r1, c1, r2, c2) = range;
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .map(|(r, c)| match sheet.cell(r, c).map(|cl| &cl.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => format_with(&Xf::default(), v, false),
+            _ => String::new(),
+        })
+        .collect()
+}
+
 /// Read a chart's data out of a worksheet range: the first row names the
 /// series, one column of labels becomes the categories, and every column that
 /// holds numbers becomes a series. This is what the Insert button plots and
@@ -1346,6 +1372,29 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_readers_take_a_column_of_cells_as_numbers_or_labels() {
+        let mut sh = Sheet { name: "Budget".into(), ..Sheet::default() };
+        for (addr, cell) in [
+            ("B1", Cell::text("Qty")),
+            ("B2", Cell::number(2.0)),
+            ("B3", Cell::text("n/a")),
+            ("B4", Cell::number(5.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // B2:B4 as a series: text and blanks plot as zero, in row order.
+        assert_eq!(range_numbers(&sh, (1, 1, 3, 1)), vec![2.0, 0.0, 5.0]);
+        // The same cells as labels: numbers render the way the grid shows them.
+        assert_eq!(range_labels(&sh, (1, 1, 3, 1)), vec!["2", "n/a", "5"]);
+        // A single cell is the usual case for a series name.
+        assert_eq!(range_labels(&sh, (0, 1, 0, 1)), vec!["Qty"]);
+        // Cells that were never set read as empty rather than panicking.
+        assert_eq!(range_numbers(&sh, (10, 10, 10, 11)), vec![0.0, 0.0]);
+        assert_eq!(range_labels(&sh, (10, 10, 10, 10)), vec![""]);
+    }
 
     #[test]
     fn chart_from_range_picks_labels_and_numeric_series() {

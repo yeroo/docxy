@@ -168,12 +168,16 @@ Dependencies identified:
 - [x] run `cargo test -p gridcore` (273 passed), then `cargo build --all-targets` at the root and the suite build — both green (the fixtures broken by the last model change already use `..Default::default()`)
 
 ### Task 5: Series list in the Chart panel
-- [ ] render the series as a list: name, values range, colour swatch row, with the selected series highlighted
-- [ ] make each series' name and values editable through `ref_field` (`SeriesName(i)` / `SeriesValues(i)`)
-- [ ] apply an edited series range by re-reading those cells into that series only, leaving the others alone
-- [ ] show the category-axis labels range as its own `Categories` field
-- [ ] write tests for the "re-read one series" operation (pure: sheet + range + index → new series values)
-- [ ] run tests and screenshot the panel with a two-series chart - must pass before task 6
+- [x] render the series as a list: a card per series with its name, values range and colour swatch row
+  - ➕ `ref_field_dyn` alongside `ref_field`: repeated fields need ids built per series, not `&'static str`
+  - ➕ `range_a1` — a range as the text a field shows, tested to round-trip through `parse_ref_text`
+- [x] make each series' name and values editable through `ref_field` (`SeriesName(i)` / `SeriesValues(i)`)
+  - a name field takes a ref OR literal text, as Excel's does: a ref reads the cell and keeps `name_ref`, anything else is the name
+- [x] apply an edited series range by re-reading those cells into that series only, leaving the others alone
+- [x] show the category-axis labels range as its own `Categories` field
+- [x] write tests for the "re-read one series" operation — `gridcore::sheet::range_numbers`/`range_labels` (pure), plus target identity and `range_a1` round-trip in the suite
+- [x] run tests and screenshot the panel with a three-series chart - 14 suite + 274 gridcore passed
+  - ⚠️ FOUND AND FIXED a real bug: `range_pick_end` still committed every pick through `chart_apply_range`, so pointing a SERIES field replotted the whole chart from those cells. It now commits through `ref_commit(target, …)`. Verified: pointing Qty at B2:B4 reports "3 points" and leaves Unit price, Total and the chart's own range alone.
 
 ### Task 6: Add, remove and reorder series
 - [ ] add an "Add series" action that appends a series pointed at an empty range and focuses its values field

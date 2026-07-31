@@ -295,16 +295,23 @@ struct ChartUi {
 /// Which field has the keyboard. A range target puts the grid in point mode and
 /// outlines the cells it names; a plain-text one behaves like any text box.
 /// Variants arrive with their consumers (series refs, the other range bars).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RefTarget {
     ChartRange,
     ChartTitle,
+    /// The cell naming series `i` — a ref, but plain text is accepted too.
+    SeriesName(usize),
+    /// The cells series `i` plots.
+    SeriesValues(usize),
+    /// The cells holding the category labels.
+    Categories,
 }
 
 impl RefTarget {
-    /// Does this field hold a cell range?
+    /// Does this field hold a cell range? A range target puts the grid in point
+    /// mode while it has the keyboard.
     fn is_range(self) -> bool {
-        matches!(self, RefTarget::ChartRange)
+        !matches!(self, RefTarget::ChartTitle)
     }
 }
 
@@ -1234,6 +1241,12 @@ fn parse_ref_text(text: &str) -> Option<(u32, u32, u32, u32)> {
     gridcore::sheet::parse_range_name(cells)
 }
 
+/// A range as the A1 text a field shows.
+fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
+    use gridcore::sheet::cell_name;
+    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+}
+
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
 fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -1807,7 +1820,68 @@ impl Docxy {
                     self.chart_set_data(data, cx);
                 }
             }
+            RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
+            RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
+            RefTarget::Categories => self.categories_apply(text, cx),
         }
+    }
+
+    /// Re-point one series at another range, re-reading just its numbers. The
+    /// other series and the categories are left exactly as they were.
+    fn series_apply_values(&mut self, i: usize, text: &str, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        let Some(range) = parse_ref_text(text) else {
+            self.ref_msg = Some((RefTarget::SeriesValues(i), false, format!("\"{}\" isn't a range like B2:B5", text.trim())));
+            cx.notify();
+            return;
+        };
+        let Some(v) = self.active_sheet() else { return };
+        let sh = v.sheet();
+        let name = sh.name.clone();
+        let values = gridcore::sheet::range_numbers(sh, range);
+        let Some(s) = data.series.get_mut(i) else { return };
+        let n = values.len();
+        s.values = values;
+        s.col = (range.1 == range.3).then_some(range.1);
+        s.values_ref = Some(gridcore::sheet::ChartSource { sheet: name, range, cat_col: range.1 });
+        self.ref_msg = Some((RefTarget::SeriesValues(i), true, format!("{n} points")));
+        self.chart_set_data(data, cx);
+    }
+
+    /// Name a series: from a cell if the text is a reference, else literally.
+    fn series_apply_name(&mut self, i: usize, text: &str, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        let (name, name_ref) = match parse_ref_text(text) {
+            Some(range) => {
+                let Some(v) = self.active_sheet() else { return };
+                let sh = v.sheet();
+                let label = gridcore::sheet::range_labels(sh, range).first().cloned().unwrap_or_default();
+                let src = gridcore::sheet::ChartSource { sheet: sh.name.clone(), range, cat_col: range.1 };
+                (label, Some(src.to_ref()))
+            }
+            // Not a reference — Excel takes a typed name as the name.
+            None => (text.trim().to_string(), None),
+        };
+        let Some(s) = data.series.get_mut(i) else { return };
+        s.name = name;
+        s.name_ref = name_ref;
+        self.chart_set_data(data, cx);
+    }
+
+    /// Re-point the category labels.
+    fn categories_apply(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(mut data) = self.chart_data() else { return };
+        let Some(range) = parse_ref_text(text) else {
+            self.ref_msg = Some((RefTarget::Categories, false, format!("\"{}\" isn't a range like A2:A5", text.trim())));
+            cx.notify();
+            return;
+        };
+        let Some(v) = self.active_sheet() else { return };
+        let sh = v.sheet();
+        data.categories = gridcore::sheet::range_labels(sh, range);
+        data.categories_ref = Some(gridcore::sheet::ChartSource { sheet: sh.name.clone(), range, cat_col: range.1 });
+        self.ref_msg = Some((RefTarget::Categories, true, format!("{} labels", data.categories.len())));
+        self.chart_set_data(data, cx);
     }
 
     /// A press landed on the grid: remember which cell, so the drag that may
@@ -1895,8 +1969,10 @@ impl Docxy {
         if !matches!(self.range_pick.take(), Some((_, true))) {
             return;
         }
-        let Some(buf) = self.range_edit.as_ref().map(|f| f.buf.clone()) else { return };
-        self.chart_apply_range(&buf, cx);
+        // Commit to whatever field is being pointed — not always the chart's own
+        // range, now that a series' values and the labels are pointable too.
+        let Some((target, buf)) = self.range_edit.as_ref().map(|f| (f.target, f.buf.clone())) else { return };
+        self.ref_commit(target, &buf, cx);
     }
 
     /// Bring a referenced range into view, so pointing a chart at cells that are
@@ -3843,6 +3919,11 @@ impl Docxy {
     /// that is empty. Under it sits whatever the last commit said about this
     /// field, or `help` when there is nothing to report.
     fn ref_field(&self, id: &'static str, target: RefTarget, value: String, hint: &'static str, help: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        self.ref_field_dyn(id.to_string(), target, value, hint, help, pal, cx)
+    }
+
+    /// `ref_field` for the repeated ones, whose ids are built per series.
+    fn ref_field_dyn(&self, id: String, target: RefTarget, value: String, hint: &'static str, help: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let ent = cx.entity();
         let editing = match &self.range_edit {
             Some(f) if f.target == target => Some(f.clone()),
@@ -3860,7 +3941,7 @@ impl Docxy {
             _ => None,
         };
         let boxed = div()
-            .id(id)
+            .id(ElementId::Name(id.into()))
             .h(px(24.))
             .px_2()
             .flex()
@@ -3941,14 +4022,14 @@ impl Docxy {
             );
         }
 
-        // One swatch row per series; the series' own colour is ringed.
-        let mut colors = v_flex().gap(px(4.));
-        for (si, s) in data.series.iter().enumerate() {
-            let mut row = v_flex().gap(px(2.));
-            row = row.child(div().text_size(px(11.)).text_color(pal.fg).overflow_hidden().child(SharedString::from(if s.name.is_empty() { format!("Series {}", si + 1) } else { s.name.clone() })));
+        // One card per series: what names it, what it plots, and its colour.
+        // Everything here is a field, so a series can be pointed at the grid.
+        let mut series_list = v_flex().gap(px(6.));
+        for (si, sr) in data.series.iter().enumerate() {
+            let vals = sr.values_ref.as_ref().map(|v| range_a1(v.range)).unwrap_or_default();
             let mut swatches = h_flex().gap(px(3.));
             for swatch in CHART_COLORS {
-                let on = s.color == Some(swatch);
+                let on = sr.color == Some(swatch);
                 let ent_c = ent.clone();
                 swatches = swatches.child(
                     div()
@@ -3965,7 +4046,18 @@ impl Docxy {
                         }),
                 );
             }
-            colors = colors.child(row.child(swatches));
+            series_list = series_list.child(
+                v_flex()
+                    .gap(px(3.))
+                    .p(px(6.))
+                    .rounded(px(4.))
+                    .bg(pal.hover)
+                    .child(div().text_size(px(10.)).text_color(pal.dim).child("NAME"))
+                    .child(self.ref_field_dyn(format!("series-name-{si}"), RefTarget::SeriesName(si), sr.name.clone(), "e.g. B1 or a name", "", pal, cx))
+                    .child(div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("VALUES"))
+                    .child(self.ref_field_dyn(format!("series-vals-{si}"), RefTarget::SeriesValues(si), vals, "e.g. B2:B5", "", pal, cx))
+                    .child(swatches),
+            );
         }
 
         let range_shown = data
@@ -4056,8 +4148,18 @@ impl Docxy {
                     .child(types)
                     .child(heading("TITLE"))
                     .child(self.ref_field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title", "", pal, cx))
-                    .child(heading("SERIES COLOURS"))
-                    .child(colors),
+                    .child(heading("SERIES"))
+                    .child(series_list)
+                    .child(heading("CATEGORY LABELS"))
+                    .child(self.ref_field(
+                        "chart-cats",
+                        RefTarget::Categories,
+                        data.categories_ref.as_ref().map(|v| range_a1(v.range)).unwrap_or_default(),
+                        "e.g. A2:A5",
+                        "The cells labelling each point along the axis.",
+                        pal,
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -10673,7 +10775,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_text, row_height_px, scroll_col0_for_sel};
+    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, scroll_col0_for_sel};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -10779,6 +10881,21 @@ mod grid_geom_tests {
         // clicking a cell while renaming a chart would rewrite the title.
         assert!(RefTarget::ChartRange.is_range());
         assert!(!RefTarget::ChartTitle.is_range());
+        // A series' cells, its name cell and the labels can all be pointed at.
+        assert!(RefTarget::SeriesValues(0).is_range());
+        assert!(RefTarget::SeriesName(2).is_range());
+        assert!(RefTarget::Categories.is_range());
+        // Targets are per series, so two series never share a field.
+        assert_ne!(RefTarget::SeriesValues(0), RefTarget::SeriesValues(1));
+    }
+
+    #[test]
+    fn range_a1_round_trips_through_parse_ref_text() {
+        // What a field shows for a range is what it parses back to.
+        for range in [(0, 0, 4, 3), (1, 1, 1, 1), (9, 25, 20, 27)] {
+            assert_eq!(parse_ref_text(&range_a1(range)), Some(range));
+        }
+        assert_eq!(range_a1((1, 1, 4, 1)), "B2:B5");
     }
 
     #[test]
