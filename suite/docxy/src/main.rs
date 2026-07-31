@@ -292,18 +292,27 @@ struct ChartUi {
     drag: Option<(usize, f32, f32, (i8, i8))>,
 }
 
-/// Which Chart-panel text field has the keyboard.
+/// Which field has the keyboard. A range target puts the grid in point mode and
+/// outlines the cells it names; a plain-text one behaves like any text box.
+/// Variants arrive with their consumers (series refs, the other range bars).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChartField {
-    Range,
-    Title,
+enum RefTarget {
+    ChartRange,
+    ChartTitle,
 }
 
-/// The Chart panel's live text field: which one, its buffer, the caret and the
+impl RefTarget {
+    /// Does this field hold a cell range?
+    fn is_range(self) -> bool {
+        matches!(self, RefTarget::ChartRange)
+    }
+}
+
+/// A live text field: which target it edits, its buffer, the caret and the
 /// selection anchor (equal to the caret when nothing is selected).
 #[derive(Clone)]
-struct ChartFieldEdit {
-    which: ChartField,
+struct RangeEdit {
+    target: RefTarget,
     buf: String,
     caret: usize,
     anchor: usize,
@@ -311,7 +320,7 @@ struct ChartFieldEdit {
     dragging: bool,
 }
 
-impl ChartFieldEdit {
+impl RangeEdit {
     /// The selected char range, ordered; `None` when the caret is collapsed.
     fn selection(&self) -> Option<(usize, usize)> {
         let n = self.buf.chars().count();
@@ -787,7 +796,7 @@ struct Docxy {
     chart_drag: Option<ChartDrag>,
     // The Chart panel field being typed into: which one, its buffer, and the
     // caret's char offset in it.
-    chart_field: Option<ChartFieldEdit>,
+    range_edit: Option<RangeEdit>,
     // What the last Chart-panel action said, shown under the range field.
     chart_msg: Option<(bool, String)>,
     // A range being picked off the grid while a range field has the keyboard
@@ -1192,7 +1201,7 @@ fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
 /// buffer). Pressing puts the caret under the pointer — extending the selection
 /// on Shift, taking the whole field on a double click — and dragging over any
 /// run extends it, so the three runs together behave like one selectable line.
-fn chart_field_segment(s: String, base_off: usize, which: ChartField, selected: bool, ent: &Entity<Docxy>) -> AnyElement {
+fn ref_field_segment(s: String, base_off: usize, target: RefTarget, selected: bool, ent: &Entity<Docxy>) -> AnyElement {
     let styled = StyledText::new(SharedString::from(s.clone()));
     let layout = styled.layout().clone();
     let (ent_dn, ent_mv) = (ent.clone(), ent.clone());
@@ -1211,8 +1220,8 @@ fn chart_field_segment(s: String, base_off: usize, which: ChartField, selected: 
             let idx = at(ev.position, &s_dn, &l_dn);
             let dbl = ev.click_count >= 2;
             ent_dn.update(cx, |this, cx| {
-                if let Some(f) = &mut this.chart_field {
-                    if f.which == which {
+                if let Some(f) = &mut this.range_edit {
+                    if f.target == target {
                         if dbl {
                             // Double click takes the whole field, so retyping a
                             // title doesn't mean backspacing over it.
@@ -1233,8 +1242,8 @@ fn chart_field_segment(s: String, base_off: usize, which: ChartField, selected: 
             }
             let idx = at_mv(ev.position, &s, &layout);
             ent_mv.update(cx, |this, cx| {
-                if let Some(f) = &mut this.chart_field {
-                    if f.which == which && f.dragging && f.caret != idx {
+                if let Some(f) = &mut this.range_edit {
+                    if f.target == target && f.dragging && f.caret != idx {
                         f.set_caret(idx, true);
                         cx.notify();
                     }
@@ -1246,7 +1255,7 @@ fn chart_field_segment(s: String, base_off: usize, which: ChartField, selected: 
 
 /// A Chart-panel field's content while it has the keyboard: the buffer cut into
 /// before / selected / after, with the caret bar at whichever end it sits.
-fn chart_field_row(f: &ChartFieldEdit, ent: &Entity<Docxy>) -> AnyElement {
+fn ref_field_row(f: &RangeEdit, ent: &Entity<Docxy>) -> AnyElement {
     let chars: Vec<char> = f.buf.chars().collect();
     let n = chars.len();
     let caret = f.caret.min(n);
@@ -1257,11 +1266,11 @@ fn chart_field_row(f: &ChartFieldEdit, ent: &Entity<Docxy>) -> AnyElement {
         .flex_1()
         .items_center()
         .overflow_hidden()
-        .child(chart_field_segment(take(0, s0), 0, f.which, false, ent))
+        .child(ref_field_segment(take(0, s0), 0, f.target, false, ent))
         .when(caret == s0, |d| d.child(bar()))
-        .child(chart_field_segment(take(s0, s1), s0, f.which, true, ent))
+        .child(ref_field_segment(take(s0, s1), s0, f.target, true, ent))
         .when(caret == s1 && s1 != s0, |d| d.child(bar()))
-        .child(chart_field_segment(take(s1, n), s1, f.which, false, ent))
+        .child(ref_field_segment(take(s1, n), s1, f.target, false, ent))
         .into_any_element()
 }
 
@@ -1458,7 +1467,7 @@ impl Docxy {
             sheet_fill: None,
             chart_sel: None,
             chart_drag: None,
-            chart_field: None,
+            range_edit: None,
             chart_msg: None,
             range_pick: None,
             keytips: KeyTip::Off,
@@ -1563,7 +1572,7 @@ impl Docxy {
             // A click that didn't drag ends point mode, and then does what any
             // click does — including dropping the chart selection, which is the
             // only way out of the panel otherwise.
-            self.chart_field = None;
+            self.range_edit = None;
             self.chart_msg = None;
             self.range_pick = None;
         }
@@ -1571,7 +1580,7 @@ impl Docxy {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
         self.chart_sel = None; // going back to the grid drops any chart selection
-        self.chart_field = None;
+        self.range_edit = None;
         self.chart_msg = None;
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
@@ -1744,7 +1753,7 @@ impl Docxy {
     /// clicking and dragging over cells writes the range into that field rather
     /// than moving the cell selection.
     fn range_field_active(&self) -> bool {
-        matches!(&self.chart_field, Some(f) if f.which == ChartField::Range)
+        matches!(&self.range_edit, Some(f) if f.target.is_range())
     }
 
     /// Point at `(row, col)`: `start` plants the anchor (a press), otherwise the
@@ -1761,7 +1770,7 @@ impl Docxy {
             }
         };
         let text = range_text(anchor, (row, col));
-        if let Some(f) = &mut self.chart_field {
+        if let Some(f) = &mut self.range_edit {
             f.caret = text.chars().count();
             f.anchor = f.caret;
             f.buf = text;
@@ -1776,7 +1785,7 @@ impl Docxy {
         if !matches!(self.range_pick.take(), Some((_, true))) {
             return;
         }
-        let Some(buf) = self.chart_field.as_ref().map(|f| f.buf.clone()) else { return };
+        let Some(buf) = self.range_edit.as_ref().map(|f| f.buf.clone()) else { return };
         self.chart_apply_range(&buf, cx);
     }
 
@@ -1801,16 +1810,16 @@ impl Docxy {
     /// Typing in one of the Chart panel's text fields. Arrows, Home/End and
     /// Delete move and edit around the caret; holding Shift extends the
     /// selection, and anything typed over one replaces it.
-    fn chart_field_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, cx: &mut Context<Self>) {
+    fn range_edit_key(&mut self, ev: &KeyDownEvent, ctrl: bool, shift: bool, key: &str, cx: &mut Context<Self>) {
         let was = self.range_preview();
-        let Some(mut f) = self.chart_field.clone() else { return };
+        let Some(mut f) = self.range_edit.clone() else { return };
         let len = f.buf.chars().count();
         if ctrl {
             match key {
                 "a" => {
                     f.anchor = 0;
                     f.caret = len;
-                    self.chart_field = Some(f);
+                    self.range_edit = Some(f);
                     cx.notify();
                 }
                 _ => {}
@@ -1818,12 +1827,12 @@ impl Docxy {
             return;
         }
         match key {
-            "escape" => self.chart_field = None,
+            "escape" => self.range_edit = None,
             "enter" => {
-                self.chart_field = None;
-                match f.which {
-                    ChartField::Range => return self.chart_apply_range(&f.buf, cx),
-                    ChartField::Title => {
+                self.range_edit = None;
+                match f.target {
+                    RefTarget::ChartRange => return self.chart_apply_range(&f.buf, cx),
+                    RefTarget::ChartTitle => {
                         if let Some(mut data) = self.chart_data() {
                             data.title = f.buf.trim().to_string();
                             return self.chart_set_data(data, cx);
@@ -1838,7 +1847,7 @@ impl Docxy {
                     _ => f.caret.saturating_sub(1),
                 };
                 f.set_caret(to, shift);
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             "right" => {
                 let to = match f.selection() {
@@ -1846,28 +1855,28 @@ impl Docxy {
                     _ => (f.caret + 1).min(len),
                 };
                 f.set_caret(to, shift);
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             "home" => {
                 f.set_caret(0, shift);
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             "end" => {
                 f.set_caret(len, shift);
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             "backspace" => {
                 if !f.delete_selection() {
                     buf_backspace(&mut f.buf, &mut f.caret);
                     f.anchor = f.caret;
                 }
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             "delete" => {
                 if !f.delete_selection() {
                     buf_delete(&mut f.buf, f.caret);
                 }
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
@@ -1877,7 +1886,7 @@ impl Docxy {
                         f.anchor = f.caret;
                     }
                 }
-                self.chart_field = Some(f);
+                self.range_edit = Some(f);
             }
         }
         self.reveal_range(was);
@@ -1996,8 +2005,8 @@ impl Docxy {
     /// The cells a focused range field refers to, live as it is typed — the
     /// grid outlines them so you can see what you are pointing the chart at.
     fn range_preview(&self) -> Option<(u32, u32, u32, u32)> {
-        let f = self.chart_field.as_ref()?;
-        if f.which != ChartField::Range {
+        let f = self.range_edit.as_ref()?;
+        if f.target != RefTarget::ChartRange {
             return None;
         }
         let text = f.buf.trim();
@@ -3734,9 +3743,9 @@ impl Docxy {
         // around a caret, each half a click-to-caret segment (the formula bar's
         // trick); otherwise the committed value, or a hint when that is empty.
         // Clicking an idle field focuses it with the caret under the pointer.
-        let field = |id: &'static str, which: ChartField, value: String, hint: &'static str| {
-            let editing = match &self.chart_field {
-                Some(f) if f.which == which => Some(f.clone()),
+        let field = |id: &'static str, target: RefTarget, value: String, hint: &'static str| {
+            let editing = match &self.range_edit {
+                Some(f) if f.target == target => Some(f.clone()),
                 _ => None,
             };
             let ent_f = ent.clone();
@@ -3763,7 +3772,7 @@ impl Docxy {
                 .text_size(px(12.))
                 .text_color(if editing.is_some() || !value.is_empty() { hsla_u(0x1a1a1a) } else { hsla_u(0x999999) })
                 .map(|d| match &editing {
-                    Some(f) => d.child(chart_field_row(f, &ent_f)),
+                    Some(f) => d.child(ref_field_row(f, &ent_f)),
                     None => d.child(div().overflow_hidden().child(idle_text)),
                 })
                 // The click that FOCUSES a field selects all of it, so typing a
@@ -3777,7 +3786,7 @@ impl Docxy {
                         let seed = seed_for_click.clone();
                         ent_c.update(cx2, |this, cx2| {
                             let n = seed.chars().count();
-                            this.chart_field = Some(ChartFieldEdit { which, buf: seed, caret: n, anchor: 0, dragging: false });
+                            this.range_edit = Some(RangeEdit { target, buf: seed, caret: n, anchor: 0, dragging: false });
                             cx2.notify();
                         });
                     })
@@ -3861,7 +3870,7 @@ impl Docxy {
                 move |_ev, _w, cx| {
                     cx.stop_propagation();
                     ent_up.update(cx, |this, _| {
-                        if let Some(f) = &mut this.chart_field {
+                        if let Some(f) = &mut this.range_edit {
                             f.dragging = false;
                         }
                     });
@@ -3894,7 +3903,7 @@ impl Docxy {
                             .on_click(move |_ev, _w, cx2| {
                                 ent_x.update(cx2, |this, cx2| {
                                     this.chart_sel = None;
-                                    this.chart_field = None;
+                                    this.range_edit = None;
                                     this.chart_msg = None;
                                     this.range_pick = None;
                                     cx2.notify();
@@ -3911,7 +3920,7 @@ impl Docxy {
                     .px_3()
                     .pb_2()
                     .child(heading("DATA RANGE"))
-                    .child(field("chart-range", ChartField::Range, range_shown, "e.g. A1:D5"))
+                    .child(field("chart-range", RefTarget::ChartRange, range_shown, "e.g. A1:D5"))
                     // What the last replot did — or why it couldn't, which the
                     // status bar alone makes far too easy to miss.
                     .child(match &self.chart_msg {
@@ -3925,7 +3934,7 @@ impl Docxy {
                     .child(heading("TYPE"))
                     .child(types)
                     .child(heading("TITLE"))
-                    .child(field("chart-title", ChartField::Title, data.title.clone(), "Chart title"))
+                    .child(field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title"))
                     .child(heading("SERIES COLOURS"))
                     .child(colors),
             )
@@ -4095,8 +4104,8 @@ impl Docxy {
             return;
         }
         // A Chart-panel text field swallows typing until Enter/Esc.
-        if self.chart_field.is_some() {
-            return self.chart_field_key(ev, ctrl, shift, key, cx);
+        if self.range_edit.is_some() {
+            return self.range_edit_key(ev, ctrl, shift, key, cx);
         }
         // A selected chart takes the object keys (Escape drops it, Delete removes
         // it) before they reach the grid.
@@ -10583,6 +10592,56 @@ mod grid_geom_tests {
             let cend = last_visible_col(&w, col0, 500.0, 255);
             assert!(col0 <= sc && sc <= cend, "sc={sc} not in [{col0},{cend}]");
         }
+    }
+
+    #[test]
+    fn range_targets_know_whether_they_hold_a_range() {
+        use super::RefTarget;
+        // A range target puts the grid in point mode; a text one must not, or
+        // clicking a cell while renaming a chart would rewrite the title.
+        assert!(RefTarget::ChartRange.is_range());
+        assert!(!RefTarget::ChartTitle.is_range());
+    }
+
+    #[test]
+    fn range_edit_selection_tracks_the_anchor() {
+        use super::{RangeEdit, RefTarget};
+        let edit = |caret: usize, anchor: usize| RangeEdit {
+            target: RefTarget::ChartRange,
+            buf: "A1:D5".to_string(),
+            caret,
+            anchor,
+            dragging: false,
+        };
+        // Collapsed caret selects nothing, in either order.
+        assert_eq!(edit(2, 2).selection(), None);
+        // Ordered whichever way the drag went.
+        assert_eq!(edit(4, 1).selection(), Some((1, 4)));
+        assert_eq!(edit(1, 4).selection(), Some((1, 4)));
+        // Out-of-range indices clamp to the buffer rather than panicking.
+        assert_eq!(edit(99, 0).selection(), Some((0, 5)));
+
+        // set_caret extends from the anchor or collapses onto the caret.
+        let mut e = edit(0, 0);
+        e.set_caret(3, false);
+        assert_eq!((e.caret, e.anchor), (3, 3));
+        e.set_caret(5, true);
+        assert_eq!(e.selection(), Some((3, 5)));
+        e.set_caret(99, false);
+        assert_eq!((e.caret, e.anchor), (5, 5), "the caret clamps to the buffer length");
+    }
+
+    #[test]
+    fn range_edit_delete_selection_removes_exactly_the_selected_chars() {
+        use super::{RangeEdit, RefTarget};
+        let mut e = RangeEdit { target: RefTarget::ChartTitle, buf: "café latte".to_string(), caret: 5, anchor: 0, dragging: false };
+        assert!(e.delete_selection(), "a live selection is deleted");
+        // Multibyte-safe: "café " is 5 chars but 6 bytes.
+        assert_eq!(e.buf, "latte");
+        assert_eq!((e.caret, e.anchor), (0, 0));
+        // With nothing selected it reports so and leaves the buffer alone.
+        assert!(!e.delete_selection());
+        assert_eq!(e.buf, "latte");
     }
 
     #[test]
