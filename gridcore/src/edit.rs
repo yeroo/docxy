@@ -398,10 +398,20 @@ pub fn autofill(
     filled
 }
 
-/// Shift a filled cell's formula by (`dr`, `dc`). Verbatim `<f>` cells (shared
-/// groups, data tables) are left alone — their source is not ours to rewrite.
+/// Shift a filled cell's formula by (`dr`, `dc`).
+///
+/// A copy never inherits the source's `<f>` attributes: `t="array" ref="A1:A3"`
+/// or a shared group's `si` names cells this copy does not own, and writing the
+/// same `ref`/`si` out from several cells is what makes Excel offer to repair
+/// the file. Dropped, the copy is an ordinary formula computing the same thing
+/// — which is also what makes it safe to shift.
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
-    if (dr, dc) == (0, 0) || cell.f_attrs.is_some() {
+    if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
+        // A shared-group follower whose master wouldn't parse carries no text of
+        // its own; without the group marker there is no formula left to write.
+        cell.formula = None;
+    }
+    if (dr, dc) == (0, 0) {
         return;
     }
     if let Some(f) = &cell.formula {
@@ -669,7 +679,60 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             }
         }
     }
+    // A chart's refs name their sheet the same way, and a save writes them back
+    // out as `<c:f>` — left behind, they'd point at a sheet that no longer
+    // exists and Excel would drop the chart's data.
+    for sheet in &mut wb.sheets {
+        for dw in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind {
+                rename_sheet_in_chart(cd, &old, new_name);
+            }
+        }
+    }
     wb.sheets[idx].name = new_name.to_string();
+}
+
+/// Point every ref a chart holds at `new_name` where it named `old`. Public so
+/// the UI can do the same for charts it authored, which live outside the
+/// workbook until they are saved.
+pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_name: &str) {
+    fn retarget(src: &mut crate::sheet::ChartSource, old: &str, new_name: &str) -> bool {
+        let hit = src.sheet.eq_ignore_ascii_case(old);
+        if hit {
+            src.sheet = new_name.to_string();
+        }
+        hit
+    }
+    let mut changed = false;
+    for s in cd.source.iter_mut().chain(cd.categories_ref.iter_mut()) {
+        changed |= retarget(s, old, new_name);
+    }
+    for ser in &mut cd.series {
+        if let Some(s) = ser.values_ref.as_mut() {
+            changed |= retarget(s, old, new_name);
+        }
+        // The name ref is kept verbatim as its `<c:f>` text, so it has to go
+        // back through the same spelling rules (quoting included). A single cell
+        // stays a single cell rather than becoming `$B$1:$B$1`.
+        if let Some(mut p) = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+        {
+            if retarget(&mut p, old, new_name) {
+                let (r1, c1, r2, c2) = p.range;
+                ser.name_ref = Some(if (r1, c1) == (r2, c2) {
+                    p.header_ref(c1)
+                } else {
+                    p.to_ref()
+                });
+                changed = true;
+            }
+        }
+    }
+    // Only a chart whose refs actually moved is regenerated on save; the rest
+    // round-trip verbatim, formatting and all.
+    cd.edited |= changed;
 }
 
 /// The shared core: move the grid on the target sheet, then rewrite every
@@ -978,10 +1041,12 @@ mod tests {
     }
 
     #[test]
-    fn autofill_leaves_a_verbatim_formula_cell_unrebased() {
-        // `f_attrs` means a shared formula / data table whose `<f>` we serialize
-        // verbatim — rewriting its refs would produce something the loader can't
-        // round-trip, so the copy keeps the source text exactly.
+    fn autofill_drops_the_group_marker_from_a_copied_formula() {
+        // `f_attrs` names cells the SOURCE owns — a shared group's `si`, an array
+        // formula's `ref`. Copied along, several cells would claim the same
+        // group and Excel would offer to repair the file; and while the marker
+        // stayed on, the copy went unshifted and quietly recomputed the source's
+        // own formula. The copy is a plain formula of its own instead.
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         w.sheets[0].set_cell(
             0,
@@ -993,13 +1058,37 @@ mod tests {
             },
         );
         assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (2, 1)), 2);
-        let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
+        let cell = |r: u32| w.sheets[0].cell(r, 1).cloned().unwrap();
         assert_eq!(
-            f(1).as_deref(),
-            Some("A1*2"),
-            "verbatim formulas are copied, not shifted"
+            cell(1).formula.as_deref(),
+            Some("A2*2"),
+            "the copy shifts like any other formula"
         );
-        assert_eq!(f(2).as_deref(), Some("A1*2"));
+        assert_eq!(cell(2).formula.as_deref(), Some("A3*2"));
+        assert!(cell(1).f_attrs.is_none() && cell(2).f_attrs.is_none());
+        // The source keeps its own group intact.
+        assert_eq!(cell(0).formula.as_deref(), Some("A1*2"));
+        assert!(cell(0).f_attrs.is_some());
+    }
+
+    #[test]
+    fn autofill_of_an_unparseable_shared_follower_leaves_no_empty_formula() {
+        // A follower whose master didn't parse carries the marker and no text;
+        // dropping the marker must drop the empty `<f>` with it.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some(String::new()),
+                f_attrs: Some(" t=\"shared\" si=\"3\"".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (1, 1)), 1);
+        // Nothing left to write: a blank copy isn't stored at all.
+        let copy = w.sheets[0].cell(1, 1).cloned().unwrap_or_default();
+        assert!(copy.formula.is_none() && copy.f_attrs.is_none());
     }
 
     #[test]
@@ -1207,6 +1296,54 @@ mod tests {
         eng.recalc_all(&mut w);
         assert_eq!(value_at(&w, "B1"), CellValue::Number(8.0));
         assert_eq!(value_at(&w, "B3"), CellValue::Error("#REF!".into()));
+    }
+
+    #[test]
+    fn rename_sheet_follows_a_charts_refs() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                source: Some(src((0, 0, 3, 2))),
+                categories_ref: Some(src((1, 0, 3, 0))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    values_ref: Some(src((1, 1, 3, 1))),
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        rename_sheet(&mut w, 0, "Numbers Etc");
+        let DrawingKind::Chart(cd) = &w.sheets[0].drawings[0].kind else {
+            panic!("still a chart")
+        };
+        assert_eq!(
+            cd.source.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        // The name ref is text, and comes back quoted — a single cell still.
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("'Numbers Etc'!$B$1"));
+        // Its refs moved, so the part has to be regenerated on save.
+        assert!(cd.edited);
     }
 
     #[test]

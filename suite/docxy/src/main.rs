@@ -271,6 +271,10 @@ struct SheetSnapshot {
     /// UI-authored charts live outside the workbook, so undoing a chart move,
     /// delete or re-point needs them snapshotted alongside it.
     charts: Vec<ChartView>,
+    /// So do the pivot definitions — and they carry sheet indices that a sheet
+    /// delete rewrites, so an undo that restored only the workbook would leave
+    /// a pivot writing its table over whatever sheet took that index.
+    pivots: Vec<PivotDef>,
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
@@ -741,10 +745,24 @@ impl SheetView {
             _ => String::new(),
         }
     }
+    /// Capture this view's undoable state — the workbook plus everything the UI
+    /// keeps beside it that a mutation can move.
+    fn snapshot(&self) -> SheetSnapshot {
+        SheetSnapshot {
+            wb: self.pkg.workbook.clone(),
+            charts: self.charts.clone(),
+            pivots: self.pivot_views.clone(),
+            active: self.active,
+            sel: self.sel,
+            anchor: self.anchor,
+        }
+    }
+
     /// Restore this view from an undo/redo snapshot, rebuilding the recalc engine.
     fn restore(&mut self, snap: SheetSnapshot) {
         self.pkg.workbook = snap.wb;
         self.charts = snap.charts;
+        self.pivot_views = snap.pivots;
         self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
         self.active = snap
             .active
@@ -1633,6 +1651,18 @@ fn formula_ref_tokens(buf: &str) -> Vec<RefToken> {
             i += 1;
             continue;
         }
+        if c == '\'' {
+            // A quoted SHEET name, and never a cell: `='Q1'!A1` names a cell on
+            // the sheet Q1, not the cell Q1 here. Stepping over it also keeps
+            // the `!` in front of the cell part, which is what tells the scan
+            // below that the cell belongs to another sheet.
+            i += 1;
+            while i < buf.len() && !buf[i..].starts_with('\'') {
+                i += buf[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            }
+            i += 1;
+            continue;
+        }
         if !(c.is_ascii_alphanumeric() || c == '$') {
             i += c.len_utf8();
             continue;
@@ -2218,6 +2248,7 @@ impl Docxy {
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
+        self.drop_grid_state();
         self.persist();
         self.refocus(window, cx);
     }
@@ -2300,6 +2331,15 @@ impl Docxy {
     /// click) and arm a drag from where the pointer went down. `edge` is
     /// `(0, 0)` for the card itself (a move) or the side a resize grip owns.
     fn chart_press(&mut self, idx: usize, edge: (i8, i8), at: (f32, f32), cx: &mut Context<Self>) {
+        // The panel's focused field is keyed by series position within the
+        // SELECTED chart, so it means something else on another one: it would
+        // point the new chart's series at the old one's buffer, or stay focused
+        // (and swallow the keyboard) on a series the new chart doesn't have.
+        if self.chart_sel != Some(idx) {
+            self.range_edit = None;
+            self.ref_msg = None;
+            self.range_pick = None;
+        }
         self.chart_sel = Some(idx);
         self.chart_drag = Some(ChartDrag {
             idx,
@@ -2353,6 +2393,18 @@ impl Docxy {
         self.range_pick = None;
     }
 
+    /// Everything the UI holds that points INTO one grid: the chart selection
+    /// and panel field, the open entry bar, a fill drag, a formula's pick. The
+    /// moment the grid under them changes — another sheet, another tab, a sheet
+    /// added or deleted — they name something else, so every such transition
+    /// goes through here.
+    fn drop_grid_state(&mut self) {
+        self.chart_drop_selection();
+        self.bar_close();
+        self.sheet_fill = None;
+        self.formula_pick = None;
+    }
+
     /// Where the idx-th chart of the active sheet lives. The overlay lays the
     /// cards out in this order too: authored charts first, then the drawings.
     fn chart_locate(&self, idx: usize) -> Option<ChartRef> {
@@ -2397,8 +2449,18 @@ impl Docxy {
         let Some(loc) = self.chart_locate(sel) else {
             return;
         };
-        self.sheet_snapshot();
         data.edited = true;
+        // Committing a field without having changed anything (Enter on the
+        // seeded title, say) must not mark the chart edited: an edited chart is
+        // REGENERATED from this model on save, losing every bit of its part we
+        // don't model — gradients, data labels, trendlines.
+        if self.chart_data().is_some_and(|mut cur| {
+            cur.edited = true;
+            cur == data
+        }) {
+            return;
+        }
+        self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let sidx = v.active;
             match loc {
@@ -2558,17 +2620,20 @@ impl Docxy {
 
     /// Commit whatever is typed in a focused bar range field, for the commit
     /// paths that don't come through the field's own Enter (the Apply button).
-    fn bar_flush(&mut self, cx: &mut Context<Self>) {
+    /// `false` means the text isn't a range: the field keeps its old cells, so
+    /// applying anyway would act on cells the user isn't looking at.
+    fn bar_flush(&mut self, cx: &mut Context<Self>) -> bool {
         let Some((target, buf)) = self
             .range_edit
             .as_ref()
             .filter(|f| f.target.is_bar())
             .map(|f| (f.target, f.buf.clone()))
         else {
-            return;
+            return true;
         };
         self.range_edit = None;
         self.ref_commit(target, &buf, cx);
+        !matches!(&self.ref_msg, Some((t, false, _)) if *t == target)
     }
 
     /// A bar closed: drop its range field along with it.
@@ -3039,57 +3104,49 @@ impl Docxy {
     }
 
     /// Apply `f` to the anchor of the idx-th chart on the active sheet, whether
-    /// it is one of this session's or one loaded from the file. Returns whether
-    /// it found one.
+    /// it is one of this session's or one loaded from the file. Takes the undo
+    /// snapshot itself, and only when the anchor really moves: a drag of a few
+    /// pixels resolves back to the cells it started on, and pushing a snapshot
+    /// for that would spend an undo step, clear the redo stack and mark a
+    /// pristine file dirty. Returns whether anything changed.
     fn chart_edit_anchor(
         &mut self,
         idx: usize,
         f: impl Fn(&gridcore::sheet::Sheet, (u32, u32), (u32, u32)) -> ((u32, u32), (u32, u32)),
     ) -> bool {
-        let Some(v) = self.active_sheet_mut() else {
+        let Some(loc) = self.chart_locate(idx) else {
+            return false;
+        };
+        let Some(v) = self.active_sheet() else {
             return false;
         };
         let sidx = v.active;
-        // Resolve the index the same way the overlay lays the cards out: this
-        // sheet's UI-authored charts first, then the loaded drawings.
-        let ui_n = v.charts.iter().filter(|c| c.sheet == sidx).count();
-        if idx < ui_n {
-            let Some(pos) = v
-                .charts
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.sheet == sidx)
-                .map(|(i, _)| i)
-                .nth(idx)
-            else {
-                return false;
-            };
-            let (nf, nt) = f(
-                &v.pkg.workbook.sheets[sidx],
-                v.charts[pos].from,
-                v.charts[pos].to,
-            );
-            v.charts[pos].from = nf;
-            v.charts[pos].to = nt;
-            true
-        } else {
-            let Some(i) = v.pkg.workbook.sheets[sidx]
-                .drawings
-                .iter()
-                .enumerate()
-                .filter(|(_, dw)| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
-                .map(|(i, _)| i)
-                .nth(idx - ui_n)
-            else {
-                return false;
-            };
-            let dw = &v.pkg.workbook.sheets[sidx].drawings[i];
-            let (nf, nt) = f(&v.pkg.workbook.sheets[sidx], dw.from, dw.to);
-            let dw = &mut v.pkg.workbook.sheets[sidx].drawings[i];
-            dw.from = nf;
-            dw.to = nt;
-            true
+        let (from, to) = match loc {
+            ChartRef::Ui(i) => (v.charts[i].from, v.charts[i].to),
+            ChartRef::Drawing(i) => {
+                let dw = &v.pkg.workbook.sheets[sidx].drawings[i];
+                (dw.from, dw.to)
+            }
+        };
+        let (nf, nt) = f(&v.pkg.workbook.sheets[sidx], from, to);
+        if (nf, nt) == (from, to) {
+            return false;
         }
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            match loc {
+                ChartRef::Ui(i) => {
+                    v.charts[i].from = nf;
+                    v.charts[i].to = nt;
+                }
+                ChartRef::Drawing(i) => {
+                    let dw = &mut v.pkg.workbook.sheets[sidx].drawings[i];
+                    dw.from = nf;
+                    dw.to = nt;
+                }
+            }
+        }
+        true
     }
 
     /// Track a chart move. The card follows the pointer, but its anchor cell
@@ -3114,7 +3171,7 @@ impl Docxy {
         if d.delta == (0.0, 0.0) {
             return; // a plain click — selection only
         }
-        self.sheet_snapshot();
+        // `chart_edit_anchor` takes the snapshot, and only if the cells change.
         let changed = if d.edge == (0, 0) {
             self.chart_edit_anchor(d.idx, |sh, from, to| {
                 // The far corner rides along, so the card keeps its cell span.
@@ -3322,10 +3379,7 @@ impl Docxy {
             return;
         }
         // Everything below points into the sheet we just left.
-        self.chart_drop_selection();
-        self.bar_close();
-        self.sheet_fill = None;
-        self.formula_pick = None;
+        self.drop_grid_state();
         cx.notify();
     }
 
@@ -3407,6 +3461,8 @@ impl Docxy {
             v.editing = None;
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
+        // We just switched sheets, same as `select_sheet`.
+        self.drop_grid_state();
         self.mark_sheet_dirty();
         cx.notify();
     }
@@ -3414,9 +3470,17 @@ impl Docxy {
     /// Delete sheet `idx` (guarded: never the last sheet). Fixes up the active
     /// index and any pivot/chart views that referenced shifted sheet indices.
     fn sheet_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
+        // Clicking × on a lone sheet does nothing — and must not spend an undo
+        // step doing it, which would also throw away the redo stack.
+        if self
+            .active_sheet()
+            .is_none_or(|v| v.pkg.workbook.sheets.len() <= 1 || idx >= v.pkg.workbook.sheets.len())
+        {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            if v.pkg.workbook.sheets.len() <= 1 || !v.pkg.remove_sheet(idx) {
+            if !v.pkg.remove_sheet(idx) {
                 return;
             }
             // Drop views on the removed sheet; shift indices above it down one.
@@ -3435,6 +3499,11 @@ impl Docxy {
                     c.sheet -= 1;
                 }
             }
+            // Deleting a sheet BELOW the active one shifts it down by one;
+            // clamping alone would silently leave the view on its neighbour.
+            if idx < v.active {
+                v.active -= 1;
+            }
             if v.active >= v.pkg.workbook.sheets.len() {
                 v.active = v.pkg.workbook.sheets.len() - 1;
             }
@@ -3443,6 +3512,8 @@ impl Docxy {
             v.editing = None;
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
+        // The chart list was just re-indexed and the view may have moved.
+        self.drop_grid_state();
         self.mark_sheet_dirty();
         cx.notify();
     }
@@ -3467,7 +3538,17 @@ impl Docxy {
             "escape" => self.sheet_rename = None,
             "enter" => {
                 if let Some(v) = self.active_sheet_mut() {
-                    v.pkg.rename_sheet(idx, &buf);
+                    let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
+                    // `rename_sheet` follows the refs inside the workbook (and
+                    // declines a name already taken); a chart this session
+                    // authored isn't in there yet, and would save pointing at a
+                    // sheet name that no longer exists.
+                    if let (true, Some(old)) = (v.pkg.rename_sheet(idx, &buf), old) {
+                        let new = buf.trim().to_string();
+                        for c in &mut v.charts {
+                            gridcore::edit::rename_sheet_in_chart(&mut c.data, &old, &new);
+                        }
+                    }
                 }
                 self.sheet_rename = None;
                 self.mark_sheet_dirty();
@@ -3550,13 +3631,8 @@ impl Docxy {
     /// each mutating grid operation.
     fn sheet_snapshot(&mut self) {
         if let Some(v) = self.active_sheet_mut() {
-            v.undo.push(SheetSnapshot {
-                wb: v.pkg.workbook.clone(),
-                charts: v.charts.clone(),
-                active: v.active,
-                sel: v.sel,
-                anchor: v.anchor,
-            });
+            let snap = v.snapshot();
+            v.undo.push(snap);
             if v.undo.len() > 100 {
                 v.undo.remove(0);
             }
@@ -3568,13 +3644,8 @@ impl Docxy {
         let mut done = false;
         if let Some(v) = self.active_sheet_mut() {
             if let Some(snap) = v.undo.pop() {
-                v.redo.push(SheetSnapshot {
-                    wb: v.pkg.workbook.clone(),
-                    charts: v.charts.clone(),
-                    active: v.active,
-                    sel: v.sel,
-                    anchor: v.anchor,
-                });
+                let now = v.snapshot();
+                v.redo.push(now);
                 v.restore(snap);
                 done = true;
             }
@@ -3592,13 +3663,8 @@ impl Docxy {
         let mut done = false;
         if let Some(v) = self.active_sheet_mut() {
             if let Some(snap) = v.redo.pop() {
-                v.undo.push(SheetSnapshot {
-                    wb: v.pkg.workbook.clone(),
-                    charts: v.charts.clone(),
-                    active: v.active,
-                    sel: v.sel,
-                    anchor: v.anchor,
-                });
+                let now = v.snapshot();
+                v.undo.push(now);
                 v.restore(snap);
                 done = true;
             }
@@ -5005,6 +5071,9 @@ impl Docxy {
                 v.anchor = (0, 0);
                 v.editing = None;
             }
+            // A brand-new sheet, so the chart selection and any open field are
+            // pointing at the one we came from.
+            self.drop_grid_state();
             let idx = self
                 .active_sheet()
                 .map(|v| v.pivot_views.len() - 1)
@@ -5130,8 +5199,14 @@ impl Docxy {
             let range = if v.has_range() {
                 v.range()
             } else {
+                // Nothing selected: plot the used cells — but a big sheet has
+                // far more of those than a card can draw, and this path doesn't
+                // go through `chart_range_of`'s cap.
                 let (mr, mc) = v.extent();
-                (0, 0, mr, mc)
+                let mc = mc.min(MAX_CHART_CELLS as u32 - 1);
+                let cols = u64::from(mc) + 1;
+                let rows = (MAX_CHART_CELLS / cols).saturating_sub(1) as u32;
+                (0, 0, mr.min(rows), mc)
             };
             let sh = v.sheet();
             let data = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind)?;
@@ -5976,10 +6051,7 @@ impl Docxy {
             self.active = i;
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
-            self.chart_drop_selection();
-            self.bar_close();
-            self.sheet_fill = None;
-            self.formula_pick = None;
+            self.drop_grid_state();
             self.persist();
             self.refocus(window, cx);
         }
@@ -5995,6 +6067,8 @@ impl Docxy {
         } else if i < self.active {
             self.active -= 1;
         }
+        // Whatever tab we land on, the state below belonged to another one.
+        self.drop_grid_state();
         self.persist();
         self.refocus(window, cx);
     }
@@ -6421,6 +6495,7 @@ impl Docxy {
         {
             self.tabs.push(tab_from_path(&path));
             self.active = self.tabs.len() - 1;
+            self.drop_grid_state();
         }
         self.backstage = false;
         self.bs_new = false;
@@ -6471,6 +6546,8 @@ impl Docxy {
         }
         if changed {
             self.backstage = false;
+            // The tab under the panel/bar state just changed (or was replaced).
+            self.drop_grid_state();
             self.persist();
             cx.notify();
         }
@@ -11877,8 +11954,13 @@ impl Docxy {
             buf
         };
         // The Apply button doesn't go through the field's Enter, so a range
-        // typed but not yet committed would be silently ignored.
-        self.bar_flush(cx);
+        // typed but not yet committed would be silently ignored. And when that
+        // text isn't a range at all, the bar stays open showing why rather than
+        // quietly applying the rule to the old cells.
+        if !self.bar_flush(cx) {
+            cx.notify();
+            return;
+        }
         let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
             self.sheet_snapshot();
@@ -14439,12 +14521,13 @@ fn sheet_row(
                 if shift {
                     this.extend_to(r, c, cx)
                 } else {
-                    // While a formula is being typed, a click POINTS at this
-                    // cell — the selection never moves, so neither opening an
-                    // editor on it (which would replace the half-typed
-                    // formula with this cell's contents) nor following its
-                    // link is what was asked for.
-                    let pointing = this.formula_pick_active();
+                    // While a formula is being typed — or a range field has the
+                    // keyboard — a click POINTS at this cell: the selection
+                    // never moves, so neither opening an editor on it (which
+                    // would replace the half-typed formula with this cell's
+                    // contents, or edit a cell nobody selected) nor following
+                    // its link is what was asked for.
+                    let pointing = this.formula_pick_active() || this.range_field_active();
                     this.select_cell(r, c, cx);
                     if pointing {
                         // the reference is written; nothing else to do
@@ -14669,13 +14752,22 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
         .flat_map(|s| s.values.iter().copied())
         .fold(0.0f64, f64::max)
         .max(1.0);
-    let ncat = data.categories.len().max(
-        data.series
-            .iter()
-            .map(|s| s.values.len())
-            .max()
-            .unwrap_or(0),
-    );
+    // One element per point per series, every frame. A chart the UI authored is
+    // capped at MAX_CHART_CELLS when it is pointed, but one read from a file can
+    // cache as many points as Excel cared to write, and a card a few hundred
+    // pixels wide can't show them anyway.
+    const MAX_CARD_POINTS: usize = 512;
+    let ncat = data
+        .categories
+        .len()
+        .max(
+            data.series
+                .iter()
+                .map(|s| s.values.len())
+                .max()
+                .unwrap_or(0),
+        )
+        .min(MAX_CARD_POINTS);
     // The title strip and the legend take fixed bites out of the card; the plot
     // area gets the rest, and the bars scale to it.
     let area_h = (h - 46.0).max(40.0);
@@ -16062,6 +16154,14 @@ mod grid_geom_tests {
         // Nor is anything inside a string.
         assert!(ranges("=\"A1 is here\"").is_empty());
         assert_eq!(ranges("=\"A1\"&C3"), vec![(2, 2, 2, 2)]);
+        // A QUOTED sheet name is a sheet, never a cell: `'Q1'!A1` names a cell
+        // on the sheet Q1. Read as a cell it would outline Q1 here, steal the
+        // first reference colour, and a pick with the caret after the name would
+        // rewrite the sheet's name to a cell reference.
+        assert!(ranges("='Q1'!A1").is_empty());
+        assert_eq!(ranges("='Q1'!A1+B2"), vec![(1, 1, 1, 1)]);
+        assert_eq!(ranges("='Bob''s data'!A1+B2"), vec![(1, 1, 1, 1)]);
+        assert!(ranges("='H1").is_empty(), "half-typed, still no cell");
         // Half-typed formulas are the normal case mid-edit.
         assert!(ranges("=SUM(").is_empty());
         assert!(ranges("=1+2").is_empty());

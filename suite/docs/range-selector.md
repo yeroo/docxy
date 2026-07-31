@@ -27,7 +27,10 @@ starts pointing:
   focused the grid points, full stop. Escape gives the field up. (Ending point
   mode on a click instead would make the whole interaction depend on whether the
   pointer twitched between press and release: a one-pixel move inside the cell
-  you pressed already goes through `sheet_drag_over` and picks.)
+  you pressed already goes through `sheet_drag_over` and picks.) That covers
+  what a click would *otherwise* have done, too: a double-click doesn't open an
+  in-cell editor and a hyperlinked cell isn't followed, both of which would act
+  on a selection the click deliberately didn't move.
 
 Every field that names cells **washes and outlines** them while you type
 (`range_preview`) — a series' values and the category labels above all, since
@@ -213,6 +216,15 @@ switch, a tab switch or an undo re-points them at a different chart, so all of
 them go through `chart_drop_selection`. Without it, selecting a chart on Sheet1
 and clicking Sheet2's tab leaves the panel open and bound to Sheet2's chart 0 —
 and Delete removes *that* one.
+
+The same holds for everything else keyed to one grid — the open entry bar
+(`bar_field`/`bar_range`), a fill drag, a formula's pick — so `drop_grid_state`
+bundles the lot, and **every** path that changes the grid underneath them calls
+it: `select_sheet`, `select_tab`, `sheet_add`, `sheet_delete`,
+`sheet_insert_pivot`, `add_tab`, `close_tab`, `open_file`, `open_args`. Picking
+a chart card is the narrower case of the same rule: `chart_press` drops the
+panel's focused field when the selection moves to a *different* chart, since
+`RefTarget::SeriesValues(i)` counts series within the selected one.
 
 A structural one: the suite is a **separate cargo workspace**. `gridcore`
 types are also built as literals by `xlsxy`, `gridwasm` and the TUIs in the root

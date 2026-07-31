@@ -228,8 +228,13 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         let sheet_idx = sheets.len();
         orig_to_model.push(Some(sheet_idx));
 
+        // A worksheet names exactly ONE drawing part, through the `r:id` on its
+        // `<drawing/>` element. Its rels can list more (an orphan left behind by
+        // another writer); taking whichever came last would show artwork Excel
+        // itself doesn't, and hang the anchor rewrite off the wrong part.
+        let drawing_rid = attr_of_tag(&xml, "<drawing ", "r:id");
         // Excel Tables and pivot tables attached to this worksheet.
-        for (_, ty, target) in &ws_rels {
+        for (rel_id, ty, target) in &ws_rels {
             if ty.ends_with("/table") {
                 let table_part = resolve_relative(ws_dir, target);
                 if let Some(txml) = get_str(&table_part) {
@@ -239,7 +244,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
                 }
             } else if ty.ends_with("/pivotTable") {
                 pending_pivots.push((sheet_idx, resolve_relative(ws_dir, target)));
-            } else if ty.ends_with("/drawing") {
+            } else if ty.ends_with("/drawing")
+                && drawing_rid.as_deref().is_none_or(|want| want == rel_id)
+            {
                 // Floating pictures/charts anchored to this worksheet.
                 let dpart = resolve_relative(ws_dir, target);
                 if let Some(dxml) = get_str(&dpart) {
@@ -2145,15 +2152,24 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             .map(|v| v.to_ref())
             .or_else(|| Some(src?.f_ref(s.col?, s.col?, true)));
         // Derive the category ref only from a box that HAS a label column to
-        // spare. Re-pointing one series of a chart that had no refs at all makes
-        // the box that series' single column, and `cat_col` is then the series'
-        // own numbers — `<c:cat>` would name them as the labels.
+        // spare, and only when no series plots that column. `cat_col` comes from
+        // whichever ref was read first — for a chart whose categories are
+        // literals that is a series' own name or values column, and `<c:cat>`
+        // would then name the plotted numbers as their own labels.
+        let plots_col = |c: u32| {
+            data.series.iter().any(|s| {
+                s.col == Some(c)
+                    || s.values_ref
+                        .as_ref()
+                        .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
+            })
+        };
         let cat_ref = data
             .categories_ref
             .as_ref()
             .map(|v| v.to_ref())
             .or_else(|| {
-                src.filter(|sc| sc.range.1 != sc.range.3)
+                src.filter(|sc| sc.range.1 != sc.range.3 && !plots_col(sc.cat_col))
                     .map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true))
             });
         let name = match name_ref {
@@ -2386,6 +2402,52 @@ pub(crate) fn add_content_type_override(
             .replacen("</Types>", &format!("{ov}</Types>"), 1)
             .into_bytes();
     }
+}
+
+/// One attribute of the first `open`-prefixed element in `xml`, read without a
+/// full parse: `attr_of_tag(ws, "<drawing ", "r:id")`. Only looks inside that
+/// one element, so a later tag carrying the same attribute can't answer for it.
+fn attr_of_tag(xml: &str, open: &str, attr: &str) -> Option<String> {
+    let start = xml.find(open)? + open.len();
+    let tag = &xml[start..start + xml[start..].find('>')?];
+    let at = tag.find(&format!("{attr}=\""))? + attr.len() + 2;
+    let end = tag[at..].find('"')? + at;
+    Some(tag[at..end].to_string())
+}
+
+/// The `Target` a relationship stored in `dir` needs in order to name `part`,
+/// both given as package-root paths: `("xl/drawings", "xl/charts/chart1.xml")`
+/// → `../charts/chart1.xml`. The inverse of [`resolve_relative`].
+fn relative_target(dir: &str, part: &str) -> String {
+    let d: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    let p: Vec<&str> = part.split('/').filter(|s| !s.is_empty()).collect();
+    let common = d.iter().zip(p.iter()).take_while(|(a, b)| a == b).count();
+    let mut out = "../".repeat(d.len() - common);
+    out.push_str(&p[common..].join("/"));
+    out
+}
+
+/// The namespace prefix a drawing part's root element carries (`xdr:` for
+/// anything Excel wrote; empty when the part declares the spreadsheet-drawing
+/// namespace as its default), so an anchor spliced in matches it.
+fn wsdr_prefix(xml: &str) -> &str {
+    let Some(at) = xml.find("wsDr") else {
+        return "xdr:";
+    };
+    let open = xml[..at].rfind('<').map(|i| i + 1).unwrap_or(at);
+    &xml[open..at]
+}
+
+/// The rId a rels part already gives `target`, if any — what [`add_rel`]
+/// declines to assign a second time.
+fn rel_id_for(parts: &[(String, Vec<u8>)], rels_part: &str, target: &str) -> Option<String> {
+    let xml = parts
+        .iter()
+        .find(|(n, _)| n == rels_part)
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())?;
+    let at = xml.find(&format!("Target=\"{target}\""))?;
+    let open = xml[..at].rfind("<Relationship")?;
+    attr_of_tag(&xml[open..], "<Relationship", "Id")
 }
 
 /// Add a relationship to any rels part (created when missing). Returns the
@@ -2849,12 +2911,7 @@ impl SheetPackage {
         while self.part(&format!("xl/charts/chart{cn}.xml")).is_some() {
             cn += 1;
         }
-        let mut dn = 1;
-        while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
-            dn += 1;
-        }
         let chart_part = format!("xl/charts/chart{cn}.xml");
-        let drawing_part = format!("xl/drawings/drawing{dn}.xml");
 
         // 1) chart part + content type.
         self.parts
@@ -2865,49 +2922,111 @@ impl SheetPackage {
             "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
         );
 
-        // 2) drawing part (anchor → chart via rId1) + content type.
+        // 2) where the anchor goes. A worksheet may carry only ONE `<drawing>`,
+        // so a fresh part for a sheet that already has one would be orphaned:
+        // we'd still read it back, Excel would show only the part the worksheet
+        // names. A second chart — or the first on a sheet that already holds a
+        // picture — therefore joins the part that is already there.
+        let host = self.workbook.sheets[sheet]
+            .drawing_part
+            .clone()
+            .filter(|p| self.part(p).is_some());
+        let drawing_part = host.clone().unwrap_or_else(|| {
+            let mut dn = 1;
+            while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
+                dn += 1;
+            }
+            format!("xl/drawings/drawing{dn}.xml")
+        });
+        let (d_dir, d_file) = drawing_part
+            .rsplit_once('/')
+            .unwrap_or(("", drawing_part.as_str()));
+        let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
+
+        // 3) drawing rels → chart (its rId names the chart from the anchor).
+        let c_rid = add_rel(
+            &mut self.parts,
+            &format!("{d_dir}/_rels/{d_file}.rels"),
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+            &relative_target(&d_dir, &chart_part),
+        );
+
+        // 4) the anchor itself, in whatever prefix the host part uses (`xdr:`
+        // for anything Excel wrote, but a part with a default namespace has
+        // none). `a` and `r` are declared on the anchor, so it stands alone
+        // whatever the root does or doesn't declare.
+        let host_xml = host
+            .as_deref()
+            .and_then(|p| self.part(p))
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let px = host_xml
+            .as_deref()
+            .map(wsdr_prefix)
+            .unwrap_or("xdr:")
+            .to_string();
         let (fr, fc) = from;
         let (tr, tc) = to;
-        let drawing_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+        let anchor = format!(
+            "<{px}twoCellAnchor xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<{px}from><{px}col>{fc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{fr}</{px}row><{px}rowOff>0</{px}rowOff></{px}from>\
+<{px}to><{px}col>{tc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{tr}</{px}row><{px}rowOff>0</{px}rowOff></{px}to>\
+<{px}graphicFrame macro=\"\"><{px}nvGraphicFramePr><{px}cNvPr id=\"{id}\" name=\"Chart {cn}\"/><{px}cNvGraphicFramePr/></{px}nvGraphicFramePr>\
+<{px}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{px}xfrm>\
+<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
+<{px}clientData/></{px}twoCellAnchor>",
+            id = cn + 1
+        );
+        match host_xml {
+            // Splice before the root's close tag, so the anchors already there
+            // keep their indices (the save-side rewrite is keyed by them).
+            Some(xml) => {
+                let close = format!("</{px}wsDr>");
+                let spliced = match xml.rfind(&close) {
+                    Some(at) => format!("{}{anchor}{}", &xml[..at], &xml[at..]),
+                    None => format!("{xml}{anchor}"),
+                };
+                if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == drawing_part) {
+                    p.1 = spliced.into_bytes();
+                }
+            }
+            None => {
+                let drawing_xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-<xdr:twoCellAnchor><xdr:from><xdr:col>{fc}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{fr}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
-<xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
-<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart 1\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\
-<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\
-<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
-<xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"
-        );
-        self.parts
-            .push((drawing_part.clone(), drawing_xml.into_bytes()));
-        add_content_type_override(
-            &mut self.parts,
-            &format!("/{drawing_part}"),
-            "application/vnd.openxmlformats-officedocument.drawing+xml",
-        );
+{anchor}</xdr:wsDr>"
+                );
+                self.parts
+                    .push((drawing_part.clone(), drawing_xml.into_bytes()));
+                add_content_type_override(
+                    &mut self.parts,
+                    &format!("/{drawing_part}"),
+                    "application/vnd.openxmlformats-officedocument.drawing+xml",
+                );
+                // The next chart on this sheet joins the part we just wrote
+                // rather than minting another one the worksheet can't name.
+                self.workbook.sheets[sheet].drawing_part = Some(drawing_part.clone());
+            }
+        }
 
-        // 3) drawing rels → chart.
-        add_rel(
-            &mut self.parts,
-            &format!("xl/drawings/_rels/drawing{dn}.xml.rels"),
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-            &format!("../charts/chart{cn}.xml"),
-        );
-
-        // 4) worksheet rels → drawing (returns the rId to reference).
+        // 5) the worksheet points at that part — normally already true for a
+        // host part, but a model that named one the worksheet never referenced
+        // would otherwise save a drawing nothing can reach.
         let sheet_part = self.sheet_parts[sheet].clone();
         let (ws_dir, ws_file) = sheet_part
             .rsplit_once('/')
             .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
-        let rid = add_rel(
+        let target = relative_target(ws_dir, &drawing_part);
+        let rid = match add_rel(
             &mut self.parts,
             &rels_part,
             "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-            &format!("../drawings/drawing{dn}.xml"),
-        );
-
-        // 5) worksheet: ensure the `r` namespace, then add `<drawing r:id=…/>`.
+            &target,
+        ) {
+            // "" means the rel was already there; reuse its id.
+            id if id.is_empty() => rel_id_for(&self.parts, &rels_part, &target).unwrap_or_default(),
+            id => id,
+        };
         if !rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
                 let mut xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -2925,9 +3044,10 @@ impl SheetPackage {
             }
         }
 
-        // Its anchor lives in the part we just wrote, not in whatever drawing
-        // part the sheet was loaded with, so the save-side anchor rewrite has to
-        // leave it (and every index in the old part) alone.
+        // We wrote this anchor's cells ourselves, and it sits after every anchor
+        // the part was loaded with, so it owns no index in the map the save-side
+        // rewrite works from — which must leave it (and every borrowed index)
+        // alone.
         self.workbook.sheets[sheet]
             .drawings
             .push(crate::sheet::Drawing {
@@ -3857,18 +3977,41 @@ mod tests {
             }],
             ..Default::default()
         };
-        // The chart lands far from the shape, on a part of its own.
+        // The chart lands far from the shape, and joins the part the sheet
+        // already has — a worksheet can name only one, so a part of its own
+        // would be orphaned the moment Excel opened the file.
         pkg.add_chart(0, (20, 5), (35, 12), &data);
         let saved = save_xlsx(&pkg);
         let re = load_xlsx(&saved).unwrap();
         let out =
             String::from_utf8(re.part(dpart).expect("the old drawing part").to_vec()).unwrap();
-        assert_eq!(
-            out, shape,
-            "the shape's anchor must come back byte for byte"
+        let head = shape.trim_end_matches("</xdr:wsDr>");
+        assert!(
+            out.starts_with(head),
+            "the shape's anchor must come back byte for byte, got:\n{out}"
         );
+        assert!(
+            out[head.len()..].contains("<xdr:row>20</xdr:row>"),
+            "the chart's anchor is appended after it"
+        );
+        assert!(
+            re.part("xl/drawings/drawing2.xml").is_none(),
+            "no second drawing part — the worksheet could not reference it"
+        );
+        let ws = String::from_utf8(re.part("xl/worksheets/sheet1.xml").unwrap().to_vec()).unwrap();
+        assert_eq!(ws.matches("<drawing ").count(), 1);
 
-        // And deleting the authored chart must not strike the shape's anchor either.
+        // And it comes back as a chart on that sheet.
+        assert_eq!(re.workbook.sheets[0].drawings.len(), 1);
+        assert!(matches!(
+            re.workbook.sheets[0].drawings[0].kind,
+            DrawingKind::Chart(_)
+        ));
+        assert_eq!(re.workbook.sheets[0].drawings[0].from, (20, 5));
+
+        // Striking an anchor the sheet was loaded with must not disturb the
+        // shape either (an authored chart owns no index in the part, so its
+        // `drawings_removed` entry can't name a stranger's anchor).
         let mut deleted = pkg.clone();
         let gone = deleted.workbook.sheets[0]
             .drawings
@@ -3881,7 +4024,46 @@ mod tests {
         let re = load_xlsx(&save_xlsx(&deleted)).unwrap();
         let out =
             String::from_utf8(re.part(dpart).expect("the old drawing part").to_vec()).unwrap();
-        assert_eq!(out, shape, "the shape survives an authored chart's delete");
+        assert!(
+            out.starts_with(head),
+            "the shape survives a delete, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn two_authored_charts_on_a_sheet_both_survive_a_save() {
+        use crate::sheet::{ChartData, ChartSeries, DrawingKind};
+        // Each chart used to mint a drawing part of its own, but a worksheet may
+        // reference only ONE — so every chart after the first was orphaned in
+        // the saved file (Excel showed the first, we showed the last).
+        let mut pkg = new_xlsx();
+        let data = |title: &str| ChartData {
+            title: title.into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into()],
+            series: vec![ChartSeries {
+                name: "East".into(),
+                values: vec![1.0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        pkg.add_chart(0, (1, 1), (10, 6), &data("First"));
+        pkg.add_chart(0, (20, 1), (30, 6), &data("Second"));
+
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let titles: Vec<String> = re.workbook.sheets[0]
+            .drawings
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DrawingKind::Chart(cd) => Some(cd.title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["First".to_string(), "Second".to_string()]);
+        assert!(re.part("xl/drawings/drawing2.xml").is_none());
+        let ws = String::from_utf8(re.part("xl/worksheets/sheet1.xml").unwrap().to_vec()).unwrap();
+        assert_eq!(ws.matches("<drawing ").count(), 1);
     }
 
     #[test]

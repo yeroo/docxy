@@ -294,7 +294,12 @@ fn set_cell_fields(block: &str, row: u32, col: u32) -> String {
 fn estimate_to(from: (u32, u32), ext: (i64, i64)) -> (u32, u32) {
     let cols = (ext.0 / (DEFAULT_COL_PX * EMU_PER_PX)).max(0) as u32;
     let rows = (ext.1 / (DEFAULT_ROW_PX * EMU_PER_PX)).max(0) as u32;
-    (from.0 + rows.max(1), from.1 + cols.max(1))
+    // A crafted `<a:ext>` can push either past u32 — a debug build would panic
+    // on the add, a release build would wrap the card to the top-left.
+    (
+        from.0.saturating_add(rows.max(1)),
+        from.1.saturating_add(cols.max(1)),
+    )
 }
 
 /// Parse the cached data of a chart part (`c:chartSpace`).
@@ -313,6 +318,9 @@ fn parse_chart(xml: &str) -> ChartData {
     // different thing).
     let mut in_f = false;
     let mut ser_depth = 0i32;
+    // Inside an axis (<c:catAx>/<c:valAx>/…). Every axis may carry a <c:title>
+    // of its own, and its text is not the chart's.
+    let mut in_axis = false;
     loop {
         match p.next() {
             Event::Start => {
@@ -340,7 +348,10 @@ fn parse_chart(xml: &str) -> ChartData {
                         }
                         .to_string();
                     }
-                    "title" => in_title = true,
+                    n if n.ends_with("Ax") && n.len() > 2 => in_axis = true,
+                    // Only the chart's own title names the chart: an axis title
+                    // would otherwise be appended to it ("Sales" + "Quarter").
+                    "title" => in_title = !in_axis,
                     "ser" => {
                         cd.series.push(ChartSeries::default());
                         ser_depth += 1;
@@ -366,7 +377,13 @@ fn parse_chart(xml: &str) -> ChartData {
                 }
             }
             Event::Text => {
-                if in_v {
+                // A cached value only says something about a series when it sits
+                // INSIDE one. A chart or axis title linked to a cell caches its
+                // text in a <c:v> under <c:tx> too, and would otherwise be read
+                // as the last series' name.
+                // (`in_f` and `in_title_text` need their own elements open, so
+                // neither can be true here — dropping through costs nothing.)
+                if in_v && ser_depth == 1 {
                     let t = p.text().trim();
                     match mode {
                         1 => {
@@ -424,6 +441,7 @@ fn parse_chart(xml: &str) -> ChartData {
                 }
             }
             Event::End => match local(p.name()) {
+                n if n.ends_with("Ax") && n.len() > 2 => in_axis = false,
                 "title" => in_title = false,
                 "t" => in_title_text = false,
                 "v" => in_v = false,
@@ -800,6 +818,51 @@ mod tests {
     }
 
     #[test]
+    fn a_column_a_series_plots_is_never_named_as_the_categories() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // `cat_col` comes from whichever ref was read first. For a chart whose
+        // categories are literals, no ref names the label column at all — the
+        // first is a series' own values — so a derived <c:cat> would tell Excel
+        // to label each bar with the number it plots.
+        let col = |c: u32| ChartSource {
+            sheet: "Budget".into(),
+            range: (1, c, 3, c),
+            cat_col: c,
+        };
+        let cd = ChartData {
+            series: vec![
+                ChartSeries {
+                    name: "Qty".into(),
+                    values: vec![1.0, 2.0, 3.0],
+                    values_ref: Some(col(1)),
+                    ..Default::default()
+                },
+                ChartSeries {
+                    name: "Price".into(),
+                    values: vec![4.0, 5.0, 6.0],
+                    values_ref: Some(col(2)),
+                    ..Default::default()
+                },
+            ],
+            categories: vec!["a".into(), "b".into(), "c".into()],
+            // The union of the two series' refs: two columns wide, and `cat_col`
+            // still the first ref's column — which series 1 plots.
+            source: Some(ChartSource {
+                sheet: "Budget".into(),
+                range: (1, 1, 3, 2),
+                cat_col: 1,
+            }),
+            ..Default::default()
+        };
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(
+            out.contains("<c:cat><c:strLit") && !out.contains("<c:cat><c:strRef"),
+            "categories stay literal: {out}"
+        );
+        assert_eq!(parse_chart(&out).categories, vec!["a", "b", "c"]);
+    }
+
+    #[test]
     fn a_linked_chart_title_is_not_read_as_series_data() {
         // A title (chart or axis) linked to a cell is a <c:tx> too, and axis
         // titles come AFTER the series in the part. Attributing its <c:f> would
@@ -823,6 +886,30 @@ mod tests {
         );
         // The box covers the data only — H20/H21 are nowhere near it.
         assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 1)));
+    }
+
+    #[test]
+    fn axis_titles_belong_to_neither_the_chart_title_nor_a_series() {
+        // Excel omits <c:tx> on a series it has no name for, and writes each
+        // axis its own <c:title>. Both used to land on the chart: the axis
+        // title's cached <c:v> named the last series, and its rich text was
+        // appended to the chart's own title ("SalesQuarterUnits").
+        let xml = "<c:chartSpace><c:chart>\
+<c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title>\
+<c:plotArea><c:barChart>\
+<c:ser>\
+<c:cat><c:strRef><c:strCache><c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt></c:strCache></c:strRef></c:cat>\
+<c:val><c:numRef><c:numCache><c:pt idx=\"0\"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val>\
+</c:ser></c:barChart>\
+<c:catAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>\
+<c:valAx><c:title><c:tx><c:strRef><c:strCache><c:pt idx=\"0\"><c:v>Units</c:v></c:pt></c:strCache></c:strRef></c:tx></c:title></c:valAx>\
+</c:plotArea></c:chart></c:chartSpace>";
+        let cd = parse_chart(xml);
+        assert_eq!(cd.title, "Sales");
+        assert_eq!(cd.series.len(), 1);
+        assert_eq!(cd.series[0].name, "");
+        assert_eq!(cd.series[0].values, vec![3.0]);
+        assert_eq!(cd.categories, vec!["Laptop".to_string()]);
     }
 
     #[test]

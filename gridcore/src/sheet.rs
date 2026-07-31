@@ -287,7 +287,7 @@ pub enum DrawingKind {
 
 /// The cached data of a chart (`xl/charts/chartN.xml`), enough to draw a simple
 /// bar/pie/line representation without re-running the plot area.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChartData {
     pub title: String,
     /// `bar` / `pie` / `line` / `area` / `scatter` … (the plot element's local name).
@@ -345,6 +345,16 @@ pub fn quote_sheet_name(name: &str) -> String {
 }
 
 impl ChartSource {
+    /// The `Sheet1!` a ref carries in front of its cells — nothing at all when
+    /// the source names no sheet, since a bare `!$A$1` is not a reference Excel
+    /// will read.
+    fn prefix(&self) -> String {
+        match quote_sheet_name(&self.sheet) {
+            n if n.is_empty() => String::new(),
+            n => format!("{n}!"),
+        }
+    }
+
     /// The `Sheet1!$A$1:$D$5` form a chart's `<c:f>` refs use. `rows` narrows it
     /// to one column of the box (a series), leaving the header row out.
     pub fn f_ref(&self, c1: u32, c2: u32, skip_header: bool) -> String {
@@ -354,9 +364,9 @@ impl ChartSource {
         } else {
             r1
         };
-        let name = quote_sheet_name(&self.sheet);
+        let name = self.prefix();
         format!(
-            "{name}!${}${}:${}${}",
+            "{name}${}${}:${}${}",
             col_name(c1),
             top + 1,
             col_name(c2),
@@ -368,9 +378,9 @@ impl ChartSource {
     /// which already excludes the header row.
     pub fn to_ref(&self) -> String {
         let (r1, c1, r2, c2) = self.range;
-        let name = quote_sheet_name(&self.sheet);
+        let name = self.prefix();
         format!(
-            "{name}!${}${}:${}${}",
+            "{name}${}${}:${}${}",
             col_name(c1),
             r1 + 1,
             col_name(c2),
@@ -380,8 +390,8 @@ impl ChartSource {
 
     /// The single header cell above `col` — a series' name ref.
     pub fn header_ref(&self, col: u32) -> String {
-        let name = quote_sheet_name(&self.sheet);
-        format!("{name}!${}${}", col_name(col), self.range.0 + 1)
+        let name = self.prefix();
+        format!("{name}${}${}", col_name(col), self.range.0 + 1)
     }
 
     /// Parse a `Sheet1!$A$1:$D$5` ref (the sheet part optional).
@@ -543,7 +553,7 @@ pub fn chart_from_range(
 }
 
 /// One data series of a [`ChartData`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChartSeries {
     pub name: String,
     pub values: Vec<f64>,
