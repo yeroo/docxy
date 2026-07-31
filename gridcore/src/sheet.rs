@@ -500,6 +500,11 @@ pub fn chart_from_range(
     if num_cols.is_empty() {
         return None;
     }
+    // Keep "we found a label column" apart from "we had to pick one". Every
+    // column being numeric (`Year | Sales`) falls back to the first, which is
+    // itself plotted — naming it in `<c:cat>` would label the numbers with
+    // themselves. Excel writes literal categories in that case, so we do too.
+    let label_col = cat_col;
     let cat_col = cat_col.unwrap_or(c0);
     let rows: Vec<u32> = (r0 + 1..=r1).collect();
     let title = text_of(r0, cat_col);
@@ -546,7 +551,7 @@ pub fn chart_from_range(
             range,
             cat_col,
         }),
-        categories_ref: Some(src(cat_col, cat_col)),
+        categories_ref: label_col.map(|c| src(c, c)),
         part: None,
         edited: true,
     })
@@ -1559,6 +1564,41 @@ mod tests {
         assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column").is_none());
         // Neither can a header row on its own.
         assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 2), "column").is_none());
+        // The label column was found, so its cells name the categories.
+        assert_eq!(
+            cd.categories_ref.map(|s| s.range),
+            Some((1, 0, 2, 0)),
+            "categories come from the label column"
+        );
+    }
+
+    #[test]
+    fn an_all_numeric_table_writes_literal_categories_not_a_plotted_column() {
+        // `Year | Sales` has no label column, so `cat_col` falls back to the
+        // first — which is itself plotted. Naming it in `<c:cat>` would label
+        // the numbers with themselves, on top of the bogus Year series.
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Year")),
+            ("B1", Cell::text("Sales")),
+            ("A2", Cell::number(2024.0)),
+            ("B2", Cell::number(10.0)),
+            ("A3", Cell::number(2025.0)),
+            ("B3", Cell::number(20.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column").expect("chart");
+        assert_eq!(cd.categories_ref, None);
+        // The labels are still there, as literals — the writer emits `<c:strLit>`.
+        assert_eq!(cd.categories, vec!["2024", "2025"]);
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(out.contains("<c:cat><c:strLit"), "{out}");
+        assert!(!out.contains("<c:cat><c:strRef"), "{out}");
     }
 
     #[test]

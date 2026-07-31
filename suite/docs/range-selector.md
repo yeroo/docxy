@@ -40,6 +40,15 @@ directly, rightwards on the next render, which is the first point that knows how
 wide the grid is. The chart title isn't a range (`RefTarget::is_range`), so its
 text is never parsed as one.
 
+A gesture that has already claimed the pointer wins over point mode, and
+`sheet_drag_over` tests for one first. A chart's resize grips straddle the
+card's edge, so a resize drag is over ordinary cells from its very first move —
+checked the other way round, that drag would rewrite the focused field with
+whatever cells the pointer swept and `grid_release` would then commit it. For
+the same reason the **auto-fill handle is hidden** while a field is pointable
+(`GridOverlay::handle_hidden`): on the selection's bottom-right corner a drag
+means "sweep a range", not "fill these cells".
+
 ⚠️ `cell_at` returns `None` on sheets with **frozen rows**: they render outside
 the virtualized list, so the list's measured bounds can't locate a press there.
 Those sheets fall back to the older behaviour — the drag anchors on the first
@@ -116,11 +125,21 @@ skips them. Pointing next to one *inserts* rather than replaces
 (`ref_token_at` declines a token preceded by `!`), so a click can never swing
 `=Sheet2!A1` onto this sheet's cell behind your back.
 
+`ref_token_at` is a *caret-local* scan and, unlike `formula_ref_tokens`, knows
+nothing about string literals: with the caret after `="A1`, pointing replaces
+the `A1` inside the string. Half-typed formulas are the common case here and a
+literal that looks like a reference is not, so the simpler scan wins.
+
 A chart field additionally caps what it will read at `MAX_CHART_CELLS`
 (`chart_range_of`). `A1:A1048576` parses perfectly well and would ask the
 renderer for a million elements every frame, so the field declines it with a
 count instead of hanging the window. The entry bars have no such cap — a
-conditional format over a whole column is a normal thing to want.
+conditional format over a whole column is a normal thing to want. What *is*
+capped is where the reveal can leave the grid: `reconcile_sheet_hscroll` clamps
+`col0` to `MAX_VISIBLE_COL`, the same bound `sheet_el` renders to and `cell_at`
+hit-tests to. Past it the grid would draw a window nothing could click, and —
+since the wheel and the thumb move `col0` one column at a time from wherever it
+is — appear frozen.
 
 ### The entry bars follow the selection until you pin them
 
@@ -135,7 +154,15 @@ A sort's seed is not the selection but the region it would find on its own
 (`sheet_sort_bounds`), and only a *pinned* range overrides that.
 
 The Apply button flushes the focused field first (`bar_flush`), so a range typed
-but not yet Entered still counts.
+but not yet Entered still counts. After a pick with the mouse the field keeps
+the keyboard, so the next thing typed goes into the *range* — Enter or Escape
+hands it back to the bar's own buffer.
+
+⚠️ The four bars share **one** `bar_field`/`bar_range` pair, so only one may be
+open at a time: `bar_open` closes the others (and `bar_close` closes the bars,
+not just their fields). Two on screen would aim the first at cells pinned for
+the second — `sheet_key` routes to whichever opened first, while `bar_seed` and
+`bar_cells` read the slot the second one overwrote.
 
 ## Pointing while typing a formula
 
@@ -225,6 +252,24 @@ it: `select_sheet`, `select_tab`, `sheet_add`, `sheet_delete`,
 a chart card is the narrower case of the same rule: `chart_press` drops the
 panel's focused field when the selection moves to a *different* chart, since
 `RefTarget::SeriesValues(i)` counts series within the selected one.
+
+**Only four chart kinds can be written back.** Re-pointing a range marks the
+chart `edited`, and an edited chart's part is *regenerated* from our model on
+save — which is how a new `<c:f>` reaches the file at all. `chart_space_xml`
+authors bar, column, line and pie; a scatter, area, doughnut, radar or bubble
+chart run through it would come back as a clustered column chart, and (since
+`parse_chart` reads `<c:cat>`/`<c:val>` but never `<c:xVal>`/`<c:yVal>`) an
+empty one. So `chart_kind_is_writable` gates the regeneration: those parts
+round-trip verbatim instead, and the panel says so under the type buttons. The
+cost is that a rename or a row insert can't follow their refs either — a stale
+ref beats a destroyed chart, and picking a type we can author fixes both.
+
+Chart refs are now real refs in the file, so **they have to follow the grid**:
+`structural_edit` runs every `ChartSource` through the same `span`/`point`
+helpers as formulas and tables (`shift_chart_refs`), and the suite applies it to
+the charts it authored, which live outside the workbook until they're saved. A
+range whose rows or columns are wholly deleted loses its ref rather than keeping
+a dangling one.
 
 A structural one: the suite is a **separate cargo workspace**. `gridcore`
 types are also built as literals by `xlsxy`, `gridwasm` and the TUIs in the root

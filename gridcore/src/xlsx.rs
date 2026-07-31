@@ -1454,6 +1454,13 @@ pub(crate) fn esc_text(s: &str) -> String {
 /// Full-precision float for `<v>` (must round-trip; display formatting is a
 /// separate concern).
 fn num_repr(n: f64) -> String {
+    // `NaN`/`inf` are not `xsd:double` lexical forms, and Rust's `{}` prints
+    // exactly those. A load can carry one in: `parse::<f64>()` accepts them, so
+    // a hand-written (or foreign-tool) `<v>NaN</v>` would round-trip out again
+    // and make Excel reject the part.
+    if !n.is_finite() {
+        return "0".to_string();
+    }
     if n == n.trunc() && n.abs() < 1e16 {
         format!("{}", n as i64)
     } else {
@@ -1504,7 +1511,11 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         // round-trip verbatim, keeping whatever formatting we don't model.
         for dw in &sheet.drawings {
             if let crate::sheet::DrawingKind::Chart(cd) = &dw.kind {
-                if let (true, Some(cpart)) = (cd.edited, cd.part.as_deref()) {
+                if let (true, true, Some(cpart)) = (
+                    cd.edited,
+                    chart_kind_is_writable(&cd.kind),
+                    cd.part.as_deref(),
+                ) {
                     if let Some(p) = parts.iter_mut().find(|(n, _)| n == cpart) {
                         p.1 = chart_space_xml(cd).into_bytes();
                     }
@@ -2105,6 +2116,18 @@ pub(crate) fn esc_attr(s: &str) -> String {
     out
 }
 
+/// The chart kinds [`chart_space_xml`] can author. Everything else — scatter,
+/// area, doughnut, radar, bubble, surface — falls into its `_` arm and would be
+/// written back out as a clustered COLUMN chart. Worse, `parse_chart` reads data
+/// from `<c:cat>`/`<c:val>` only, never `<c:xVal>`/`<c:yVal>`, so a scatter or
+/// bubble chart's series carry no values at all: regenerating one turns it into
+/// an empty column chart, irreversibly. Those parts round-trip verbatim instead,
+/// which is what they did before charts became editable — a stale ref beats a
+/// destroyed chart.
+pub fn chart_kind_is_writable(kind: &str) -> bool {
+    matches!(kind, "bar" | "column" | "line" | "pie")
+}
+
 /// A self-contained `chartSpace` for a clustered column chart, with categories
 /// and per-series values cached as literals (`strLit`/`numLit`) so it renders
 /// without the source range. `pub(crate)` so sibling modules' tests can
@@ -2128,9 +2151,11 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
     let ser_xml = |si: usize, s: &crate::sheet::ChartSeries| -> String {
         let val_pts: String = (0..ncat)
             .map(|i| {
+                // `<c:v>` is an xsd:double too — same `NaN`/`inf` hazard as a
+                // worksheet cell's `<v>`, and the same answer.
                 format!(
                     "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
-                    s.values.get(i).copied().unwrap_or(0.0)
+                    num_repr(s.values.get(i).copied().unwrap_or(0.0))
                 )
             })
             .collect();
@@ -2964,6 +2989,29 @@ impl SheetPackage {
             .map(wsdr_prefix)
             .unwrap_or("xdr:")
             .to_string();
+        // `cNvPr/@id` is unique WITHIN a drawing part, and now that we splice
+        // into an existing one the chart's part number says nothing about the
+        // ids already in it (Excel numbers its first picture `2`). A duplicate
+        // is a known repair trigger, so take one past the highest there.
+        let shape_id = host_xml
+            .as_deref()
+            .map(|xml| {
+                let mut max = 1u32;
+                let mut at = 0usize;
+                while let Some(i) = xml[at..].find("cNvPr ").map(|i| at + i + 6) {
+                    at = i;
+                    if let Some(v) = xml[i..].find("id=\"").map(|j| i + j + 4) {
+                        let n: u32 = xml[v..]
+                            .split('"')
+                            .next()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        max = max.max(n);
+                    }
+                }
+                max + 1
+            })
+            .unwrap_or(cn + 1);
         let (fr, fc) = from;
         let (tr, tc) = to;
         let anchor = format!(
@@ -2974,7 +3022,7 @@ impl SheetPackage {
 <{px}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{px}xfrm>\
 <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
 <{px}clientData/></{px}twoCellAnchor>",
-            id = cn + 1
+            id = shape_id
         );
         match host_xml {
             // Splice before the root's close tag, so the anchors already there
@@ -3034,11 +3082,29 @@ impl SheetPackage {
                     xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
                 }
                 if !xml.contains("<drawing ") {
-                    xml = xml.replacen(
+                    // CT_Worksheet is a SEQUENCE: `drawing` comes before
+                    // `legacyDrawing`, `picture`, `oleObjects`, `controls`,
+                    // `tableParts` and `extLst`. Appending at `</worksheet>`
+                    // puts it after any of those, and Excel treats an
+                    // out-of-order child as unreadable content — it "repairs"
+                    // the file by dropping the drawing or the table.
+                    let pos = [
+                        "<legacyDrawingHF",
+                        "<legacyDrawing",
+                        "<drawingHF",
+                        "<picture",
+                        "<oleObjects",
+                        "<controls",
+                        "<webPublishItems",
+                        "<tableParts",
+                        "<extLst",
                         "</worksheet>",
-                        &format!("<drawing r:id=\"{rid}\"/></worksheet>"),
-                        1,
-                    );
+                    ]
+                    .iter()
+                    .filter_map(|t| xml.find(t))
+                    .min()
+                    .unwrap_or(xml.len());
+                    xml.insert_str(pos, &format!("<drawing r:id=\"{rid}\"/>"));
                 }
                 p.1 = xml.into_bytes();
             }
@@ -5373,5 +5439,186 @@ mod tests {
         );
         let wb_xml = String::from_utf8_lossy(pkg2.part("xl/workbook.xml").unwrap()).into_owned();
         assert!(wb_xml.contains("cacheId=\"2\""));
+    }
+
+    #[test]
+    fn chart_strings_survive_a_round_trip_with_xml_entities() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        // Chart strings used to be stored as the RAW source slice, which was
+        // harmless while the part round-tripped verbatim. Now an edited chart is
+        // regenerated through `esc_attr`, so an undecoded `&amp;` would gain a
+        // level of escaping per save — and a sheet name inside a `<c:f>` would
+        // stop naming a real sheet.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].name = "R&D".into();
+        let src = |range| ChartSource {
+            sheet: "R&D".into(),
+            range,
+            cat_col: 0,
+        };
+        let data = ChartData {
+            title: "R&D spend <2026>".into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into()],
+            series: vec![ChartSeries {
+                name: "Q&A".into(),
+                values: vec![1.0],
+                col: Some(1),
+                values_ref: Some(src((1, 1, 1, 1))),
+                name_ref: Some("'R&D'!$B$1".into()),
+                ..Default::default()
+            }],
+            source: Some(src((0, 0, 1, 1))),
+            categories_ref: Some(src((1, 0, 1, 0))),
+            ..Default::default()
+        };
+        pkg.add_chart(0, (5, 0), (20, 8), &data);
+
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0]
+            .drawings
+            .first()
+            .expect("chart drawing")
+            .kind
+        {
+            DrawingKind::Chart(c) => c.clone(),
+            other => panic!("expected a chart drawing, got {other:?}"),
+        };
+        // One save/load is the fixed point: nothing gains an `amp;`, and the
+        // refs still name the sheet they came from.
+        let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let got = chart(&re);
+        assert_eq!(got.title, "R&D spend <2026>");
+        assert_eq!(got.series[0].name, "Q&A");
+        assert_eq!(got.series[0].name_ref.as_deref(), Some("'R&D'!$B$1"));
+        assert_eq!(got.source.as_ref().map(|s| s.sheet.as_str()), Some("R&D"));
+
+        // And again, through the regeneration path an edit takes.
+        let mut cd = got;
+        cd.edited = true;
+        if let DrawingKind::Chart(slot) = &mut re.workbook.sheets[0].drawings[0].kind {
+            *slot = cd;
+        }
+        let again = chart(&load_xlsx(&save_xlsx(&re)).unwrap());
+        assert_eq!(again.title, "R&D spend <2026>");
+        assert_eq!(again.series[0].name, "Q&A");
+        assert_eq!(again.series[0].name_ref.as_deref(), Some("'R&D'!$B$1"));
+        assert_eq!(
+            again.series[0].values_ref.as_ref().map(|s| s.sheet.clone()),
+            Some("R&D".to_string())
+        );
+    }
+
+    #[test]
+    fn an_edited_scatter_chart_is_kept_verbatim_rather_than_flattened() {
+        use crate::sheet::DrawingKind;
+        // `chart_space_xml` can only author bar/column/line/pie. A scatter chart
+        // regenerated through it becomes a clustered COLUMN chart — and, since
+        // `parse_chart` never reads `<c:xVal>`/`<c:yVal>`, one with no data at
+        // all. Round-tripping the part beats destroying it.
+        assert!(!chart_kind_is_writable("scatter"));
+        assert!(!chart_kind_is_writable("doughnut"));
+        assert!(chart_kind_is_writable("column"));
+
+        let mut pkg = new_xlsx();
+        pkg.add_chart(
+            0,
+            (1, 1),
+            (10, 6),
+            &crate::sheet::ChartData {
+                title: "Placeholder".into(),
+                kind: "column".into(),
+                ..Default::default()
+            },
+        );
+        // Stand in for what Excel writes: a scatter plot with xVal/yVal.
+        let scatter = "<?xml version=\"1.0\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Scatter</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:layout/>\
+<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:ser><c:idx val=\"0\"/><c:tx><c:v>S</c:v></c:tx>\
+<c:xVal><c:numRef><c:f>Sheet1!$A$2:$A$3</c:f></c:numRef></c:xVal>\
+<c:yVal><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:yVal></c:ser></c:scatterChart>\
+</c:plotArea></c:chart></c:chartSpace>";
+        if let Some(p) = pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/charts/chart1.xml")
+        {
+            p.1 = scatter.as_bytes().to_vec();
+        }
+        let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        if let DrawingKind::Chart(cd) = &mut re.workbook.sheets[0].drawings[0].kind {
+            assert_eq!(cd.kind, "scatter");
+            cd.title = "Renamed".into(); // what the panel does
+            cd.edited = true;
+        }
+        let saved = String::from_utf8(
+            load_xlsx(&save_xlsx(&re))
+                .unwrap()
+                .part("xl/charts/chart1.xml")
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            saved.contains("<c:scatterChart>") && saved.contains("<c:xVal>"),
+            "a scatter chart must not be rewritten as a column chart: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_spliced_chart_anchor_takes_a_free_shape_id_and_orders_the_worksheet() {
+        use crate::sheet::ChartData;
+        // `cNvPr/@id` is unique within a drawing part, and Excel's first picture
+        // is `id="2"` — the chart part number says nothing about it. And
+        // CT_Worksheet is a sequence: `<drawing>` precedes `<tableParts>`.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("Item"));
+        pkg.workbook.sheets[0].set_cell(1, 0, crate::sheet::Cell::text("Nut"));
+        pkg.add_table(0, (0, 0, 1, 0), true, "TableStyleLight1")
+            .unwrap();
+        // A drawing part already holding a picture at id 2.
+        let existing = "<?xml version=\"1.0\"?>\n<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+<xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
+<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\" name=\"Picture 1\"/><xdr:cNvPicPr/></xdr:nvPicPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>";
+        pkg.parts
+            .push(("xl/drawings/drawing1.xml".into(), existing.into()));
+        pkg.workbook.sheets[0].drawing_part = Some("xl/drawings/drawing1.xml".into());
+
+        pkg.add_chart(0, (5, 0), (12, 5), &ChartData::default());
+
+        let dx = String::from_utf8(pkg.part("xl/drawings/drawing1.xml").unwrap().to_vec()).unwrap();
+        assert_eq!(
+            dx.matches("cNvPr id=\"2\"").count(),
+            1,
+            "the chart must not reuse the picture's shape id: {dx}"
+        );
+        assert!(dx.contains("cNvPr id=\"3\""), "{dx}");
+
+        let ws = String::from_utf8(pkg.part("xl/worksheets/sheet1.xml").unwrap().to_vec()).unwrap();
+        let (d, t) = (
+            ws.find("<drawing ").expect("a drawing element"),
+            ws.find("<tableParts").expect("a tableParts element"),
+        );
+        assert!(d < t, "<drawing> must precede <tableParts>: {ws}");
+    }
+
+    #[test]
+    fn non_finite_numbers_never_reach_the_file() {
+        // `{}` prints `NaN`/`inf`, neither of which is an xsd:double. A load can
+        // carry one in, since `parse::<f64>()` accepts both.
+        assert_eq!(num_repr(f64::NAN), "0");
+        assert_eq!(num_repr(f64::INFINITY), "0");
+        assert_eq!(num_repr(f64::NEG_INFINITY), "0");
+        let xml = chart_space_xml(&crate::sheet::ChartData {
+            kind: "column".into(),
+            categories: vec!["a".into(), "b".into()],
+            series: vec![crate::sheet::ChartSeries {
+                name: "S".into(),
+                values: vec![f64::NAN, f64::INFINITY],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(!xml.contains("NaN") && !xml.contains("inf"), "{xml}");
     }
 }

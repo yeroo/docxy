@@ -735,6 +735,100 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
     cd.edited |= changed;
 }
 
+/// Move every ref a chart holds on `target` through a row/column insert or
+/// delete. Public alongside [`rename_sheet_in_chart`] and for the same reason:
+/// a chart the UI authored lives outside the workbook until it is saved, and has
+/// to be shifted by the same rules.
+///
+/// A range whose rows (or columns) are wholly deleted loses its ref rather than
+/// keeping a dangling one — the cached values still draw the card, and a chart
+/// that plots nothing beats one plotting a stranger's numbers.
+pub fn shift_chart_refs(cd: &mut crate::sheet::ChartData, target: &str, shift: &EditShift) -> bool {
+    // A ref with no sheet name means the chart's own sheet. Charts are per-sheet
+    // and `structural_edit` is told which one it edited, so an unqualified ref
+    // belongs to the target exactly when the drawing does — which is how it got
+    // here.
+    // A ref with no sheet name means the chart's own sheet. Charts are per-sheet
+    // and `structural_edit` is told which one it edited, so an unqualified ref
+    // belongs to the target exactly when the drawing does — which is how it got
+    // here.
+    fn mine(s: &crate::sheet::ChartSource, target: &str) -> bool {
+        s.sheet.is_empty() || s.sheet.eq_ignore_ascii_case(target)
+    }
+    /// `Some(src)` shifted in place, `None` = the ref's cells are all gone.
+    fn moved(
+        src: &crate::sheet::ChartSource,
+        shift: &EditShift,
+    ) -> Option<crate::sheet::ChartSource> {
+        let (r1, c1, r2, c2) = src.range;
+        let (r1, c1, r2, c2) = if shift.rows {
+            let (a, b) = span(r1, r2, shift)?;
+            (a, c1, b, c2)
+        } else {
+            let (a, b) = span(c1, c2, shift)?;
+            (r1, a, r2, b)
+        };
+        let mut out = src.clone();
+        out.range = (r1, c1, r2, c2);
+        // The label column rides along with the box it names.
+        if !shift.rows {
+            out.cat_col = point(src.cat_col, shift).unwrap_or(c1);
+        }
+        Some(out)
+    }
+    /// Shift one slot; `true` if it came out different (gone included).
+    fn shift_slot(
+        slot: &mut Option<crate::sheet::ChartSource>,
+        target: &str,
+        shift: &EditShift,
+    ) -> bool {
+        let Some(s) = slot.as_ref().filter(|s| mine(s, target)) else {
+            return false;
+        };
+        let next = moved(s, shift);
+        let hit = next.as_ref() != Some(s);
+        *slot = next;
+        hit
+    }
+    let mut changed = shift_slot(&mut cd.source, target, shift);
+    changed |= shift_slot(&mut cd.categories_ref, target, shift);
+    for ser in &mut cd.series {
+        changed |= shift_slot(&mut ser.values_ref, target, shift);
+        // The column a series plots is an index into the grid like any other.
+        if !shift.rows {
+            if let Some(c) = ser.col {
+                let next = point(c, shift);
+                changed |= next != Some(c);
+                ser.col = next;
+            }
+        }
+        // `name_ref` is kept as its `<c:f>` text, so it round-trips through the
+        // same spelling rules `rename_sheet_in_chart` uses.
+        if let Some(p) = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+            .filter(|p| mine(p, target))
+        {
+            let next = moved(&p, shift);
+            if next.as_ref() != Some(&p) {
+                changed = true;
+                ser.name_ref = next.map(|p| {
+                    let (r1, c1, r2, c2) = p.range;
+                    if (r1, c1) == (r2, c2) {
+                        p.header_ref(c1)
+                    } else {
+                        p.to_ref()
+                    }
+                });
+            }
+        }
+    }
+    // Only a chart whose refs actually moved is regenerated on save.
+    cd.edited |= changed;
+    changed
+}
+
 /// The shared core: move the grid on the target sheet, then rewrite every
 /// formula and defined name in the workbook.
 fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
@@ -766,6 +860,18 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         // Defined names have no home sheet; only sheet-qualified refs shift.
         if let Some(updated) = adjust_formula_for_edit(&dn.formula, false, &target_name, &shift) {
             dn.formula = updated;
+        }
+    }
+
+    // Chart refs follow the grid too. They are WRITTEN back out as `<c:f>` now,
+    // so a stale one doesn't just mis-draw our card: Excel re-reads it and plots
+    // whatever moved into those cells. A delete is the worse half — the ref can
+    // end up naming cells that hold something else entirely.
+    for sheet in &mut wb.sheets {
+        for dw in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind {
+                shift_chart_refs(cd, &target_name, &shift);
+            }
         }
     }
 
@@ -1344,6 +1450,108 @@ mod tests {
         assert_eq!(cd.series[0].name_ref.as_deref(), Some("'Numbers Etc'!$B$1"));
         // Its refs moved, so the part has to be regenerated on save.
         assert!(cd.edited);
+    }
+
+    /// A chart on "Data" plotting `A1:C4`, categories in A, one series in B.
+    fn chart_wb() -> Workbook {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                source: Some(src((0, 0, 3, 2))),
+                categories_ref: Some(src((1, 0, 3, 0))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    col: Some(1),
+                    values_ref: Some(src((1, 1, 3, 1))),
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        w
+    }
+
+    fn chart_of(w: &Workbook) -> &crate::sheet::ChartData {
+        match &w.sheets[0].drawings[0].kind {
+            crate::sheet::DrawingKind::Chart(cd) => cd,
+            other => panic!("expected a chart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_row_insert_moves_a_charts_refs_with_the_grid() {
+        // Chart refs are WRITTEN back out as `<c:f>` now, so a stale one isn't
+        // just a mis-drawn card: Excel re-reads it and plots whatever moved into
+        // those cells.
+        let mut w = chart_wb();
+        insert_rows(&mut w, 0, 1, 2); // two rows above the data body
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 5, 2)));
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.range),
+            Some((3, 0, 5, 0))
+        );
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((3, 1, 5, 1))
+        );
+        // The header row didn't move, so neither did the name ref.
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Data!$B$1"));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_column_insert_moves_a_charts_columns_and_its_name_ref() {
+        let mut w = chart_wb();
+        insert_cols(&mut w, 0, 0, 1); // one column to the left of everything
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 1, 3, 3)));
+        assert_eq!(cd.source.as_ref().map(|s| s.cat_col), Some(1));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 2, 3, 2))
+        );
+        assert_eq!(cd.series[0].col, Some(2));
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Data!$C$1"));
+    }
+
+    #[test]
+    fn deleting_a_charts_only_column_drops_the_ref_instead_of_dangling() {
+        // A ref that survives a full delete names cells that now hold something
+        // else entirely — worse than a chart that plots nothing.
+        let mut w = chart_wb();
+        delete_cols(&mut w, 0, 1, 1); // column B, the series' own column
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].values_ref, None);
+        assert_eq!(cd.series[0].name_ref, None);
+        assert_eq!(cd.series[0].col, None);
+        // The box shrank rather than vanishing: A and C are still in it.
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 1)));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_chart_on_another_sheet_is_left_alone() {
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_rows(&mut w, 1, 0, 5); // edit the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 2)));
+        assert!(!cd.edited);
     }
 
     #[test]

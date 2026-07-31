@@ -11,6 +11,17 @@ fn local(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
+/// `XmlParser::text()` hands back the RAW source slice, entities and all. Chart
+/// strings used to be cosmetic (the part round-tripped verbatim), but an edited
+/// chart is now regenerated through `esc_attr`, so an undecoded `&amp;` would
+/// gain a level of escaping per save — and a sheet name inside a `<c:f>` would
+/// stop resolving, in Excel and in our own `rename_sheet` matching alike.
+fn decoded(raw: &str) -> String {
+    let mut s = String::new();
+    XmlParser::append_decoded(raw, &mut s);
+    s
+}
+
 /// Office's fixed EMU-per-pixel, plus rough default cell pixel sizes — used only
 /// to estimate a `oneCellAnchor`/`absoluteAnchor` extent in whole cells.
 const EMU_PER_PX: i64 = 9525;
@@ -199,10 +210,30 @@ fn next_anchor(xml: &str) -> Option<(usize, &str)> {
     let mut at = 0usize;
     while let Some(rel) = xml[at..].find('<') {
         let start = at + rel;
+        // Non-element markup is skipped WHOLE. Scanning only past its opening
+        // token would let `<!-- <xdr:twoCellAnchor> -->` count as an anchor
+        // here but not in `parse_drawings`, and every index after it — which is
+        // how a move or a delete finds its element — would be off by one.
+        let skip = |tok: &str, end: &str| {
+            xml[start..].starts_with(tok).then(|| {
+                xml[start + tok.len()..]
+                    .find(end)
+                    .map(|i| start + tok.len() + i + end.len())
+                    .unwrap_or(xml.len())
+            })
+        };
+        if let Some(past) = skip("<!--", "-->")
+            .or_else(|| skip("<![CDATA[", "]]>"))
+            .or_else(|| skip("<?", "?>"))
+            .or_else(|| skip("<!", ">"))
+        {
+            at = past;
+            continue;
+        }
         let name_end = xml[start + 1..].find(['>', ' ', '/'])? + start + 1;
         let name = &xml[start + 1..name_end];
         // Closing tags share the local name, so only openers count.
-        let l = if name.starts_with(['/', '!', '?']) {
+        let l = if name.starts_with('/') {
             ""
         } else {
             local(name)
@@ -254,6 +285,14 @@ fn move_anchor(element: &str, from: (u32, u32), to: (u32, u32)) -> String {
 
 /// The offset just past `</tag>` in `xml`, which must start at `<tag…`.
 fn find_close(xml: &str, tag: &str) -> Option<usize> {
+    // `<xdr:twoCellAnchor/>` closes itself, and `parse_drawings` counts it like
+    // any other. Looking for `</…>` here would swallow everything up to the NEXT
+    // anchor's close and merge two elements into one index — a later move or
+    // delete would then land on the wrong artwork.
+    let gt = xml.find('>')?;
+    if xml[..gt].ends_with('/') {
+        return Some(gt + 1);
+    }
     let close = format!("</{tag}>");
     xml.find(&close).map(|i| i + close.len())
 }
@@ -384,7 +423,8 @@ fn parse_chart(xml: &str) -> ChartData {
                 // (`in_f` and `in_title_text` need their own elements open, so
                 // neither can be true here — dropping through costs nothing.)
                 if in_v && ser_depth == 1 {
-                    let t = p.text().trim();
+                    let t = decoded(p.text());
+                    let t = t.trim();
                     match mode {
                         1 => {
                             if let Some(s) = cd.series.last_mut() {
@@ -411,7 +451,7 @@ fn parse_chart(xml: &str) -> ChartData {
                 // one linked to a cell would otherwise land on the last series'
                 // name and widen the chart's box to cover the title cell.
                 } else if in_f && ser_depth == 1 {
-                    let raw = p.text().trim().to_string();
+                    let raw = decoded(p.text()).trim().to_string();
                     if let Some(src) = crate::sheet::ChartSource::parse_f_ref(&raw) {
                         // Each ref belongs to whatever block it sits in, so a
                         // series can later be re-pointed on its own; their union
@@ -422,7 +462,15 @@ fn parse_chart(xml: &str) -> ChartData {
                                     sr.name_ref = Some(raw);
                                 }
                             }
-                            2 => cd.categories_ref = Some(src.clone()),
+                            // Pair the ref with the cache we actually captured
+                            // (the FIRST series' categories, above). Last-wins
+                            // here would hand every series the last series'
+                            // `<c:f>` alongside the first series' `<c:strCache>`
+                            // — a silent re-point, and a cache contradicting its
+                            // own ref.
+                            2 => {
+                                cd.categories_ref.get_or_insert_with(|| src.clone());
+                            }
                             3 => {
                                 if let Some(sr) = cd.series.last_mut() {
                                     sr.values_ref = Some(src.clone());
@@ -437,7 +485,7 @@ fn parse_chart(xml: &str) -> ChartData {
                         }
                     }
                 } else if in_title_text {
-                    cd.title.push_str(p.text());
+                    cd.title.push_str(&decoded(p.text()));
                 }
             }
             Event::End => match local(p.name()) {
@@ -528,6 +576,45 @@ mod tests {
             out.contains("<xdr:colOff>0</xdr:colOff>"),
             "the moved anchor keeps its offsets"
         );
+    }
+
+    #[test]
+    fn the_anchor_scanner_and_the_parser_agree_on_comments_and_self_closed_anchors() {
+        // `rewrite_anchors` finds its element by counting anchors; `parse_drawings`
+        // hands it the index. The two must count the same things, or a move (or a
+        // chart delete) lands on somebody else's artwork.
+        let get = |_: &str| None;
+        // A comment mentioning an anchor is not an anchor.
+        let commented = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
+            <!-- <xdr:twoCellAnchor> was here -->
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from>
+              <xdr:to><xdr:col>5</xdr:col><xdr:row>10</xdr:row></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let ds = parse_drawings(commented, &png_resolve, &get);
+        assert_eq!(ds[0].anchor_ix, 0, "the comment is not an anchor");
+        let out = rewrite_anchors(commented, &[(0, (4, 3), (12, 7))], &[]);
+        let moved = parse_drawings(&out, &png_resolve, &get);
+        assert_eq!((moved[0].from, moved[0].to), ((4, 3), (12, 7)));
+
+        // A self-closed anchor still occupies an index of its own.
+        let selfclosed = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b"><xdr:twoCellAnchor/>
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from>
+              <xdr:to><xdr:col>5</xdr:col><xdr:row>10</xdr:row></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let ds = parse_drawings(selfclosed, &png_resolve, &get);
+        assert_eq!(ds[0].anchor_ix, 1);
+        let out = rewrite_anchors(selfclosed, &[(1, (4, 3), (12, 7))], &[]);
+        let moved = parse_drawings(&out, &png_resolve, &get);
+        assert_eq!((moved[0].from, moved[0].to), ((4, 3), (12, 7)));
+        // Dropping the empty one leaves the picture behind.
+        let out = rewrite_anchors(selfclosed, &[], &[0]);
+        assert_eq!(parse_drawings(&out, &png_resolve, &get).len(), 1);
     }
 
     #[test]

@@ -2613,8 +2613,13 @@ impl Docxy {
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
+        // The four bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // routes to whichever is open first. Leaving a second one on screen
+        // therefore aims the first at cells pinned for the other — Text to
+        // Columns splitting the Sort bar's whole region, say. Only one at a
+        // time, which is also what the keyboard already assumed.
+        self.bar_close();
         self.bar_field = Some(target);
-        self.bar_range = None;
         self.ref_msg = None;
     }
 
@@ -2636,8 +2641,15 @@ impl Docxy {
         !matches!(&self.ref_msg, Some((t, false, _)) if *t == target)
     }
 
-    /// A bar closed: drop its range field along with it.
+    /// A bar closed: drop the bar itself along with its range field. Closing the
+    /// field alone would leave a bar on screen whose seeding (`bar_seed` keys
+    /// off `bar_field`) had gone with it — a Sort bar still showing, now acting
+    /// on the selection rather than the region it found.
     fn bar_close(&mut self) {
+        self.sheet_cf_edit = None;
+        self.sheet_dv_edit = None;
+        self.sheet_ttc_edit = None;
+        self.sheet_sort_edit = None;
         self.bar_field = None;
         self.bar_range = None;
         if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
@@ -2864,8 +2876,8 @@ impl Docxy {
             |c| col_px(sh.col_width(c)),
             x,
             fc,
-            v.col0.max(fc).min(255),
-            255,
+            v.col0.max(fc).min(MAX_VISIBLE_COL),
+            MAX_VISIBLE_COL,
         )?;
         // Walk the rendered rows from the scroll position until one contains y.
         let top = v.vlist.logical_scroll_top().item_ix;
@@ -3275,7 +3287,11 @@ impl Docxy {
             // exactly what `range_field_active` asks.
             picking: self.range_field_active(),
             formula_refs: self.formula_refs(),
-            handle_hidden: false,
+            // In point mode a drag off the selection's corner means "sweep a
+            // range", not "auto-fill". The handle's own guard only covers an
+            // in-cell edit, so without this a drag that starts on those few
+            // pixels writes cells instead of picking them.
+            handle_hidden: self.range_field_active() || self.formula_pick_active(),
         }
     }
 
@@ -3324,14 +3340,22 @@ impl Docxy {
     /// virtualized list swallows child `on_mouse_down`, so the drag start is
     /// inferred from the first move rather than a press).
     fn sheet_drag_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        // A gesture that has already claimed the pointer wins, whatever mode the
+        // grid is in. A chart's resize grips straddle the card's edge, so a
+        // resize drag is over ORDINARY CELLS from its first move; testing point
+        // mode first let that drag rewrite (and, at `grid_release`, commit) the
+        // focused range field with whatever cells the pointer swept.
+        if self.chart_drag.is_some() {
+            return; // the pointer is carrying a chart, not sweeping cells
+        }
+        if self.sheet_fill.is_some() {
+            return; // an auto-fill drag owns the pointer too
+        }
         if self.formula_pick_active() {
             return self.formula_pick_to(row, col, false, cx);
         }
         if self.range_field_active() {
             return self.range_pick_to(row, col, false, cx);
-        }
-        if self.chart_drag.is_some() {
-            return; // the pointer is carrying a chart, not sweeping cells
         }
         if !self.sheet_dragging {
             self.sheet_dragging = true;
@@ -3387,43 +3411,48 @@ impl Docxy {
     /// `avail_w` px of grid width. Called each render before drawing the grid, so
     /// arrow-key navigation past the right edge scrolls columns into view.
     fn reconcile_sheet_hscroll(&mut self, avail_w: f32) {
-        if let Some(v) = self.active_sheet_mut() {
-            let (_, frz_c) = v.sheet().freeze;
-            let fc = frz_c.min(64);
-            // The scroll offset never enters the frozen region.
-            if v.col0 < fc {
-                v.col0 = fc;
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let (_, frz_c) = v.sheet().freeze;
+        let fc = frz_c.min(64);
+        // The scroll offset never enters the frozen region.
+        if v.col0 < fc {
+            v.col0 = fc;
+        }
+        // Available width for the scrollable region excludes the pinned columns.
+        let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
+        let avail = (avail_w - frozen_w).max(80.0);
+        // A range field asked for a column: scroll just far enough right to
+        // show it, then leave the selection-following below alone.
+        if let Some(rc) = v.reveal_col.take() {
+            if rc >= fc {
+                let col0 = v.col0;
+                v.col0 =
+                    scroll_col0_for_sel(|c| col_px(v.sheet().col_width(c)), col0, fc, rc, avail);
             }
-            // Available width for the scrollable region excludes the pinned columns.
-            let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
-            let avail = (avail_w - frozen_w).max(80.0);
-            // A range field asked for a column: scroll just far enough right to
-            // show it, then leave the selection-following below alone.
-            if let Some(rc) = v.reveal_col.take() {
-                if rc >= fc {
-                    let col0 = v.col0;
-                    v.col0 = scroll_col0_for_sel(
-                        |c| col_px(v.sheet().col_width(c)),
-                        col0,
-                        fc,
-                        rc,
-                        avail,
-                    );
-                }
-            }
-            // Only re-centre on the selection when it has actually moved; otherwise
-            // leave col0 alone so manual scrolling (arrows/wheel/thumb) sticks.
+        }
+        // Only re-centre on the selection when it has actually moved; otherwise
+        // leave col0 alone so manual scrolling (arrows/wheel/thumb) sticks.
+        'follow: {
             if v.sel == v.follow_sel {
-                return;
+                break 'follow;
             }
             v.follow_sel = v.sel;
             let sc = v.sel.1;
             if sc < fc {
-                return; // a frozen column is always visible
+                break 'follow; // a frozen column is always visible
             }
             let col0 = v.col0;
             v.col0 = scroll_col0_for_sel(|c| col_px(v.sheet().col_width(c)), col0, fc, sc, avail);
         }
+        // Both the renderer and the hit-test stop at `MAX_VISIBLE_COL`, so a
+        // `col0` past it is a grid that draws column IV and answers no clicks
+        // beyond it — and, because the wheel and the thumb move `col0` by one at
+        // a time from wherever it is, appears frozen. `reveal_col` is unbounded
+        // by design (a rule over a whole column is a normal thing to want), so
+        // the clamp belongs here rather than on the range field.
+        v.col0 = v.col0.min(MAX_VISIBLE_COL);
     }
 
     /// Scroll horizontally by `delta` columns (Shift+wheel), clamped to the extent.
@@ -4637,11 +4666,35 @@ impl Docxy {
             let s = v.active;
             let (r, c) = v.sel;
             let wb = &mut v.pkg.workbook;
-            match op {
-                StructOp::InsertRow => edit::insert_rows(wb, s, r, 1),
-                StructOp::DeleteRow => edit::delete_rows(wb, s, r, 1),
-                StructOp::InsertCol => edit::insert_cols(wb, s, c, 1),
-                StructOp::DeleteCol => edit::delete_cols(wb, s, c, 1),
+            let shift = match op {
+                StructOp::InsertRow => {
+                    edit::insert_rows(wb, s, r, 1);
+                    (true, r, 1i64)
+                }
+                StructOp::DeleteRow => {
+                    edit::delete_rows(wb, s, r, 1);
+                    (true, r, -1)
+                }
+                StructOp::InsertCol => {
+                    edit::insert_cols(wb, s, c, 1);
+                    (false, c, 1)
+                }
+                StructOp::DeleteCol => {
+                    edit::delete_cols(wb, s, c, 1);
+                    (false, c, -1)
+                }
+            };
+            // Charts the UI authored live outside the workbook until they're
+            // saved, so `structural_edit` never sees them. Their refs are
+            // written to the file all the same, and Excel re-reads them.
+            let name = v.pkg.workbook.sheets[s].name.clone();
+            let shift = gridcore::formula::EditShift {
+                rows: shift.0,
+                at: shift.1,
+                delta: shift.2,
+            };
+            for ch in v.charts.iter_mut().filter(|ch| ch.sheet == s) {
+                edit::shift_chart_refs(&mut ch.data, &name, &shift);
             }
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
@@ -5705,6 +5758,29 @@ impl Docxy {
                     ))
                     .child(heading("TYPE"))
                     .child(types)
+                    // The four buttons above are the only kinds we can WRITE.
+                    // A scatter/area/doughnut/radar chart round-trips as its
+                    // original part rather than being flattened into a column
+                    // chart on save — so edits here show on screen but don't
+                    // reach the file until a type is picked. Say so.
+                    .when(!gridcore::xlsx::chart_kind_is_writable(&data.kind), |d| {
+                        d.child(
+                            div()
+                                .px_1()
+                                .pb(px(2.))
+                                .text_size(px(10.))
+                                .text_color(pal.dim)
+                                .child(format!(
+                                    "This {}chart is kept as Excel wrote it. Edits below show \
+                                     here but are not saved until you pick a type above.",
+                                    if data.kind.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{} ", data.kind)
+                                    }
+                                )),
+                        )
+                    })
                     .child(heading("TITLE"))
                     .child(self.ref_field(
                         "chart-title",
@@ -14187,6 +14263,9 @@ fn label_lines(label: &str) -> Vec<String> {
     }
 }
 
+/// The last column the grid draws and hit-tests. Every clamp on `col0` has to
+/// agree with it: a scroll offset past this renders a window nothing can reach.
+const MAX_VISIBLE_COL: u32 = 255;
 const SHEET_ROW_H: f32 = 21.0;
 const SHEET_GUT: f32 = 46.0;
 
@@ -15013,9 +15092,9 @@ fn sheet_el(
     // Horizontal column window: frozen cols 0..fc are always drawn; the scrollable
     // window fills the REMAINING width from the scroll offset col0 (kept >= fc).
     // Column virtualization by offset — the counterpart to the row uniform_list.
-    let col0 = view.col0.max(fc).min(255);
+    let col0 = view.col0.max(fc).min(MAX_VISIBLE_COL);
     let avail = (grid_w - SHEET_GUT - frozen_w).max(80.0);
-    let cend = last_visible_col(|c| col_px(sh.col_width(c)), col0, avail, 255);
+    let cend = last_visible_col(|c| col_px(sh.col_width(c)), col0, avail, MAX_VISIBLE_COL);
     // Total rows to virtualize over: the used range plus generous headroom.
     let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
@@ -15145,7 +15224,7 @@ fn sheet_el(
     // The cards' boxes are only known here, so the fill handle's visibility is
     // the one overlay field the render pass can't fill in.
     let ov = GridOverlay {
-        handle_hidden: corner_under_chart,
+        handle_hidden: ov.handle_hidden || corner_under_chart,
         ..ov
     };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
