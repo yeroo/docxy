@@ -321,6 +321,29 @@ pub struct ChartSource {
     pub cat_col: u32,
 }
 
+/// A sheet name as a formula/`<c:f>` reference spells it. Anything that isn't a
+/// bare identifier has to be quoted — spaces, but also `-`, `(`, `.`, `&`, a
+/// leading digit — and an apostrophe inside the name is doubled. Excel reports a
+/// workbook whose chart refs get this wrong as needing repair, and drops the
+/// chart.
+pub fn quote_sheet_name(name: &str) -> String {
+    if name.is_empty() {
+        return String::new(); // no sheet part at all
+    }
+    let bare = !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        // A name shaped like a cell reference (`A1`, `XFD1048576`) must be
+        // quoted too, or `A1!$B$2` reads as a range.
+        && parse_cell_name(name).is_none();
+    if bare {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
+}
+
 impl ChartSource {
     /// The `Sheet1!$A$1:$D$5` form a chart's `<c:f>` refs use. `rows` narrows it
     /// to one column of the box (a series), leaving the header row out.
@@ -331,11 +354,7 @@ impl ChartSource {
         } else {
             r1
         };
-        let name = if self.sheet.contains(' ') {
-            format!("'{}'", self.sheet)
-        } else {
-            self.sheet.clone()
-        };
+        let name = quote_sheet_name(&self.sheet);
         format!(
             "{name}!${}${}:${}${}",
             col_name(c1),
@@ -349,11 +368,7 @@ impl ChartSource {
     /// which already excludes the header row.
     pub fn to_ref(&self) -> String {
         let (r1, c1, r2, c2) = self.range;
-        let name = if self.sheet.contains(' ') {
-            format!("'{}'", self.sheet)
-        } else {
-            self.sheet.clone()
-        };
+        let name = quote_sheet_name(&self.sheet);
         format!(
             "{name}!${}${}:${}${}",
             col_name(c1),
@@ -365,18 +380,23 @@ impl ChartSource {
 
     /// The single header cell above `col` — a series' name ref.
     pub fn header_ref(&self, col: u32) -> String {
-        let name = if self.sheet.contains(' ') {
-            format!("'{}'", self.sheet)
-        } else {
-            self.sheet.clone()
-        };
+        let name = quote_sheet_name(&self.sheet);
         format!("{name}!${}${}", col_name(col), self.range.0 + 1)
     }
 
     /// Parse a `Sheet1!$A$1:$D$5` ref (the sheet part optional).
     pub fn parse_f_ref(s: &str) -> Option<ChartSource> {
         let (sheet, cells) = match s.rsplit_once('!') {
-            Some((a, b)) => (a.trim_matches('\'').to_string(), b),
+            // The inverse of `quote_sheet_name`: unwrap the quotes and undo the
+            // apostrophe doubling, so a sheet called `Bob's data` survives a
+            // round trip instead of coming back as `Bob''s data`.
+            Some((a, b)) => {
+                let name = match a.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+                    Some(inner) => inner.replace("''", "'"),
+                    None => a.to_string(),
+                };
+                (name, b)
+            }
             None => (String::new(), s),
         };
         let range = parse_range_name(cells)?;

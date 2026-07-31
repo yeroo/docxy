@@ -2132,18 +2132,30 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
         // literals. The numbers are the same either way.
         let src = data.source.as_ref();
         // A series' own refs win; otherwise they are derived from the chart's
-        // box and the column this series reads.
-        let name_ref = s.name_ref.clone().or_else(|| Some(src?.header_ref(s.col?)));
+        // box and the column this series reads. NOT the name, though: a series
+        // that reads cells but was NAMED by hand has `name_ref: None` on
+        // purpose, and deriving its header cell would overwrite the typed name
+        // with whatever that cell says the next time Excel refreshes.
+        // `chart_from_range` sets `name_ref` itself, so nothing that wants a
+        // live name loses one.
+        let name_ref = s.name_ref.clone();
         let val_ref = s
             .values_ref
             .as_ref()
             .map(|v| v.to_ref())
             .or_else(|| Some(src?.f_ref(s.col?, s.col?, true)));
+        // Derive the category ref only from a box that HAS a label column to
+        // spare. Re-pointing one series of a chart that had no refs at all makes
+        // the box that series' single column, and `cat_col` is then the series'
+        // own numbers — `<c:cat>` would name them as the labels.
         let cat_ref = data
             .categories_ref
             .as_ref()
             .map(|v| v.to_ref())
-            .or_else(|| src.map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true)));
+            .or_else(|| {
+                src.filter(|sc| sc.range.1 != sc.range.3)
+                    .map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true))
+            });
         let name = match name_ref {
             Some(r) => format!(
                 "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",

@@ -1462,6 +1462,35 @@ fn col_at_x(
     None
 }
 
+/// What committing a series-NAME field should do with the text in it.
+#[derive(Debug, PartialEq, Eq)]
+enum NameCommit {
+    /// The text is still the name the field was seeded with — leave the series
+    /// exactly as it is.
+    Unchanged,
+    /// A reference: read the name out of those cells and keep the link.
+    Ref((u32, u32, u32, u32)),
+    /// Anything else is the name itself.
+    Literal,
+}
+
+/// A series-name field shows the name the series REPORTS, not the reference it
+/// may have come from, so "does this text name cells?" can only be asked of text
+/// the user actually changed. Otherwise focusing the field of a series called
+/// `Q1` (or `H1`, or `FY1` — quarter and half-year headers are the common case)
+/// and pressing Enter would read it as cell Q1: the name becomes that cell's
+/// contents, usually empty, and the series ends up bound to an unrelated cell.
+/// Re-committing a name that came from a reference would likewise sever it.
+fn series_name_commit(text: &str, shown: &str) -> NameCommit {
+    if text.trim() == shown.trim() {
+        return NameCommit::Unchanged;
+    }
+    match parse_ref_text(text) {
+        Some(range) => NameCommit::Ref(range),
+        None => NameCommit::Literal,
+    }
+}
+
 /// The cells a range field's text names, or `None` if it isn't a range. A
 /// `Sheet!` prefix is accepted and dropped — a chart plots the sheet it floats
 /// over, and pointing can't reach another one — and `$` anchors are ignored.
@@ -2206,12 +2235,13 @@ impl Docxy {
             if matches!(self.range_pick, Some((_, true))) {
                 return;
             }
-            // A click that didn't drag ends point mode, and then does what any
-            // click does — including dropping the chart selection, which is the
-            // only way out of the panel otherwise.
-            self.range_edit = None;
-            self.ref_msg = None;
-            self.range_pick = None;
+            // A plain click writes the clicked cell into the field and keeps it
+            // focused — Enter commits. Ending point mode here instead would make
+            // the interaction depend on whether the pointer happened to twitch
+            // between press and release: a one-pixel move inside the same cell
+            // goes through `sheet_drag_over` and picks, a perfectly still click
+            // would not. Escape is the way out of the field.
+            return self.range_pick_to(row, col, true, cx);
         }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
@@ -2302,6 +2332,13 @@ impl Docxy {
         self.chart_drag_end(cx); // commit a chart move, if any
         self.range_pick_end(cx); // replot a range picked off the grid
         self.formula_pick = None; // the reference stays; the drag is over
+        // A text drag inside a range field can be released anywhere too. Only
+        // the Chart panel had its own mouse-up, so a drag in one of the entry
+        // bars' fields left this armed and the next hover over that text kept
+        // extending the selection with no button down.
+        if let Some(f) = &mut self.range_edit {
+            f.dragging = false;
+        }
     }
 
     /// Drop everything keyed to the chart list: the selection itself, a drag in
@@ -2592,8 +2629,14 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let (name, name_ref) = match parse_ref_text(text) {
-            Some(range) => {
+        let shown = data
+            .series
+            .get(i)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let (name, name_ref) = match series_name_commit(text, &shown) {
+            NameCommit::Unchanged => return,
+            NameCommit::Ref(range) => {
                 let Some(v) = self.active_sheet() else { return };
                 let sh = v.sheet();
                 let label = gridcore::sheet::range_labels(sh, range)
@@ -2608,7 +2651,7 @@ impl Docxy {
                 (label, Some(src.to_ref()))
             }
             // Not a reference — Excel takes a typed name as the name.
-            None => (text.trim().to_string(), None),
+            NameCommit::Literal => (text.trim().to_string(), None),
         };
         let Some(s) = data.series.get_mut(i) else {
             return;
@@ -2928,7 +2971,16 @@ impl Docxy {
             return;
         }
         match key {
-            "escape" => self.range_edit = None,
+            "escape" => {
+                // Escape is the way out of point mode, so it has to take the
+                // last commit's message with it — otherwise an abandoned edit
+                // leaves its complaint standing under a field nobody is in.
+                self.range_edit = None;
+                self.range_pick = None;
+                if matches!(&self.ref_msg, Some((t, _, _)) if *t == f.target) {
+                    self.ref_msg = None;
+                }
+            }
             "enter" => {
                 self.range_edit = None;
                 return self.ref_commit(f.target, &f.buf, cx);
@@ -5072,7 +5124,9 @@ impl Docxy {
     /// Build a clustered column chart from the selected range (categories = first
     /// text column, one series per numeric column) and float it over the sheet.
     fn sheet_insert_chart(&mut self, kind: &str, cx: &mut Context<Self>) {
-        if let Some(v) = self.active_sheet_mut() {
+        // Plot first, so nothing below runs (and no undo entry is pushed) for a
+        // range that holds no numbers.
+        let Some((range, data)) = self.active_sheet().and_then(|v| {
             let range = if v.has_range() {
                 v.range()
             } else {
@@ -5080,21 +5134,27 @@ impl Docxy {
                 (0, 0, mr, mc)
             };
             let sh = v.sheet();
-            if let Some(data) = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind) {
-                let s = v.active;
-                // Anchor the saved chart just right of the selected range. The
-                // span is the card's size now, so pick one that reads well and
-                // let the user drag it from there.
-                let (r0, _, _, c1) = range;
-                let from = (r0, c1 + 2);
-                let to = (r0 + 10, c1 + 8);
-                v.charts.push(ChartView {
-                    sheet: s,
-                    from,
-                    to,
-                    data,
-                });
-            }
+            let data = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind)?;
+            Some((range, data))
+        }) else {
+            return;
+        };
+        // UI-authored charts live in the snapshot alongside the workbook, so
+        // without this Ctrl+Z would undo the edit BEFORE the insert and leave
+        // the chart standing.
+        self.sheet_snapshot();
+        if let Some(v) = self.active_sheet_mut() {
+            let s = v.active;
+            // Anchor the saved chart just right of the selected range. The span
+            // is the card's size now, so pick one that reads well and let the
+            // user drag it from there.
+            let (r0, _, _, c1) = range;
+            v.charts.push(ChartView {
+                sheet: s,
+                from: (r0, c1 + 2),
+                to: (r0 + 10, c1 + 8),
+                data,
+            });
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -15725,6 +15785,35 @@ mod grid_geom_tests {
         );
         // Past the last column there is no cell.
         assert_eq!(col_at_x(w, 100_000.0, 0, 0, 255), None);
+    }
+
+    #[test]
+    fn a_series_name_is_only_read_as_a_reference_when_it_was_changed() {
+        use super::{NameCommit, series_name_commit};
+        // The field is seeded with the name the series reports, so committing
+        // it untouched must change nothing — even when that name happens to
+        // read as a cell. `Q1`..`Q4` and `H1`/`H2` are the common headers.
+        assert_eq!(series_name_commit("Q1", "Q1"), NameCommit::Unchanged);
+        assert_eq!(series_name_commit("H1", "H1"), NameCommit::Unchanged);
+        assert_eq!(series_name_commit(" Qty ", "Qty"), NameCommit::Unchanged);
+        // A name that came from a cell is shown resolved; re-committing it must
+        // not sever the link either.
+        assert_eq!(
+            series_name_commit("Revenue", "Revenue"),
+            NameCommit::Unchanged
+        );
+        // Actually typing a reference points the name at those cells.
+        assert_eq!(
+            series_name_commit("B1", "Qty"),
+            NameCommit::Ref((0, 1, 0, 1))
+        );
+        assert_eq!(
+            series_name_commit("$D$7", "Qty"),
+            NameCommit::Ref((6, 3, 6, 3))
+        );
+        // Anything else is the name itself.
+        assert_eq!(series_name_commit("Revenue", "Qty"), NameCommit::Literal);
+        assert_eq!(series_name_commit("", "Qty"), NameCommit::Literal);
     }
 
     #[test]

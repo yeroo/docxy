@@ -389,7 +389,11 @@ fn parse_chart(xml: &str) -> ChartData {
                         }
                         _ => {}
                     }
-                } else if in_f {
+                // Only a <c:f> INSIDE a <c:ser> names data. `mode` alone isn't
+                // enough: a chart title and every axis title are <c:tx> too, and
+                // one linked to a cell would otherwise land on the last series'
+                // name and widen the chart's box to cover the title cell.
+                } else if in_f && ser_depth == 1 {
                     let raw = p.text().trim().to_string();
                     if let Some(src) = crate::sheet::ChartSource::parse_f_ref(&raw) {
                         // Each ref belongs to whatever block it sits in, so a
@@ -690,6 +694,135 @@ mod tests {
             ChartSource::parse_f_ref("Budget!$A$2:$A$5").unwrap().range,
             (1, 0, 4, 0)
         );
+    }
+
+    #[test]
+    fn sheet_names_needing_quotes_round_trip_through_a_chart_ref() {
+        use crate::sheet::{ChartSource, quote_sheet_name};
+        // Bare identifiers stay bare; everything else is quoted, and an
+        // apostrophe inside the name is doubled. Excel calls the file corrupt
+        // otherwise and drops the chart.
+        assert_eq!(quote_sheet_name("Sheet1"), "Sheet1");
+        assert_eq!(quote_sheet_name("My Sheet"), "'My Sheet'");
+        assert_eq!(quote_sheet_name("Q1-Actuals"), "'Q1-Actuals'");
+        assert_eq!(quote_sheet_name("Data (raw)"), "'Data (raw)'");
+        assert_eq!(quote_sheet_name("2026Budget"), "'2026Budget'");
+        assert_eq!(quote_sheet_name("Bob's data"), "'Bob''s data'");
+        // A name shaped like a cell reference needs quoting too.
+        assert_eq!(quote_sheet_name("A1"), "'A1'");
+        // No sheet part at all stays absent.
+        assert_eq!(quote_sheet_name(""), "");
+
+        for name in ["Sheet1", "My Sheet", "Q1-Actuals", "Bob's data", "A1"] {
+            let src = ChartSource {
+                sheet: name.into(),
+                range: (0, 1, 3, 1),
+                cat_col: 1,
+            };
+            let back = ChartSource::parse_f_ref(&src.to_ref())
+                .unwrap_or_else(|| panic!("{name}: {}", src.to_ref()));
+            assert_eq!(back.sheet, name, "{}", src.to_ref());
+            assert_eq!(back.range, src.range);
+        }
+    }
+
+    #[test]
+    fn a_hand_typed_series_name_is_written_as_text_not_as_a_ref() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // `name_ref: None` means the name was typed. Deriving the header cell
+        // for it would make Excel show whatever B1 says the next time it
+        // refreshes, and the typed name would survive only as a stale cache.
+        let cd = ChartData {
+            series: vec![ChartSeries {
+                name: "Revenue".into(),
+                values: vec![1.0, 2.0],
+                col: Some(1),
+                ..Default::default()
+            }],
+            categories: vec!["Jan".into(), "Feb".into()],
+            source: Some(ChartSource {
+                sheet: "Budget".into(),
+                range: (0, 0, 2, 1),
+                cat_col: 0,
+            }),
+            ..Default::default()
+        };
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(
+            out.contains("<c:tx><c:v>Revenue</c:v></c:tx>"),
+            "literal name: {out}"
+        );
+        assert!(
+            !out.contains("<c:f>Budget!$B$1</c:f>"),
+            "no derived name ref"
+        );
+        // Reading it back gives the same literal name and no link.
+        let again = parse_chart(&out);
+        assert_eq!(again.series[0].name, "Revenue");
+        assert_eq!(again.series[0].name_ref, None);
+    }
+
+    #[test]
+    fn a_one_column_source_does_not_name_its_own_numbers_as_the_categories() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // Re-pointing one series of a chart that had no refs at all makes the
+        // chart's box that series' single column, so its `cat_col` IS the
+        // numbers. A derived <c:cat> would tell Excel to label the bars with the
+        // values they plot.
+        let one_col = ChartSource {
+            sheet: "Budget".into(),
+            range: (1, 1, 3, 1),
+            cat_col: 1,
+        };
+        let cd = ChartData {
+            series: vec![ChartSeries {
+                name: "Qty".into(),
+                values: vec![1.0, 2.0, 3.0],
+                col: Some(1),
+                values_ref: Some(one_col.clone()),
+                ..Default::default()
+            }],
+            categories: vec!["a".into(), "b".into(), "c".into()],
+            source: Some(one_col),
+            ..Default::default()
+        };
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(
+            out.contains("<c:cat><c:strLit"),
+            "literal categories: {out}"
+        );
+        assert!(
+            !out.contains("<c:cat><c:strRef"),
+            "no fabricated category ref: {out}"
+        );
+        // The values ref is untouched by the guard.
+        assert!(out.contains("<c:f>Budget!$B$2:$B$4</c:f>"), "{out}");
+    }
+
+    #[test]
+    fn a_linked_chart_title_is_not_read_as_series_data() {
+        // A title (chart or axis) linked to a cell is a <c:tx> too, and axis
+        // titles come AFTER the series in the part. Attributing its <c:f> would
+        // rename the last series and stretch the chart's box over the title
+        // cell — a chart the user never touched, corrupted on the next save.
+        let xml = "<c:chartSpace><c:chart>\
+<c:title><c:tx><c:strRef><c:f>Budget!$H$20</c:f><c:strCache><c:pt idx=\"0\"><c:v>Spend</c:v></c:pt></c:strCache></c:strRef></c:tx></c:title>\
+<c:plotArea><c:barChart>\
+<c:ser><c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx=\"0\"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>\
+<c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt></c:strCache></c:strRef></c:cat>\
+<c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx=\"0\"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val>\
+</c:ser></c:barChart>\
+<c:valAx><c:title><c:tx><c:strRef><c:f>Budget!$H$21</c:f><c:strCache><c:pt idx=\"0\"><c:v>Units</c:v></c:pt></c:strCache></c:strRef></c:tx></c:title></c:valAx>\
+</c:plotArea></c:chart></c:chartSpace>";
+        let cd = parse_chart(xml);
+        assert_eq!(cd.series.len(), 1);
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Budget!$B$1"));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 2, 1))
+        );
+        // The box covers the data only — H20/H21 are nowhere near it.
+        assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 1)));
     }
 
     #[test]

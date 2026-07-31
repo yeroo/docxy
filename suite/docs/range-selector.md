@@ -23,6 +23,11 @@ starts pointing:
   dragging a new source range does in Excel. A plain click only writes the cell
   into the field — press Enter to commit it.
 - A pick **replaces** the field's whole buffer. Nothing is appended.
+- A click on the grid never *leaves* point mode — while a range field is
+  focused the grid points, full stop. Escape gives the field up. (Ending point
+  mode on a click instead would make the whole interaction depend on whether the
+  pointer twitched between press and release: a one-pixel move inside the cell
+  you pressed already goes through `sheet_drag_over` and picks.)
 
 Every field that names cells **washes and outlines** them while you type
 (`range_preview`) — a series' values and the category labels above all, since
@@ -66,7 +71,7 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 |--------|-------|-------------|
 | `ChartRange` | Chart panel | replots the chart from the box |
 | `ChartTitle` | Chart panel | plain text — **not** pointable |
-| `SeriesName(i)` | series card | a ref reads that cell and is kept live; anything else is a literal name |
+| `SeriesName(i)` | series card | a ref reads that cell and is kept live; anything else is a literal name — but only if you **changed** the text (`series_name_commit`) |
 | `SeriesValues(i)` | series card | re-reads **only** that series' numbers |
 | `Categories` | Chart panel | the category-axis labels |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
@@ -74,10 +79,11 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `Sort` | Sort bar | the rows to sort |
 | `TextToColumns` | Text to Columns bar | the cells to split |
 
-The four bars seed their field from the current selection when they open
-(`bar_target` → `bar_open`), so leaving the field alone does exactly what the
-bar did before it had one. Sort seeds from the *region it would find* — header
-already dropped — for the same reason. At apply time `bar_cells()` is the
+The four bars *display* the current selection in their field until you pin a
+range into it (`bar_target` → `bar_open` → `bar_seed`; see "The entry bars follow
+the selection until you pin them" below), so leaving the field alone does exactly
+what the bar did before it had one. Sort shows the *region it would find* —
+header already dropped — for the same reason. At apply time `bar_cells()` is the
 field's range when it names one, else the selection.
 
 A bar owns the keyboard while it is open, so `sheet_key` asks its range field
