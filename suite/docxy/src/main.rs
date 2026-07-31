@@ -797,8 +797,9 @@ struct Docxy {
     // The Chart panel field being typed into: which one, its buffer, and the
     // caret's char offset in it.
     range_edit: Option<RangeEdit>,
-    // What the last Chart-panel action said, shown under the range field.
-    chart_msg: Option<(bool, String)>,
+    // What the last commit said about a field, shown under it: which field, did
+    // it work, and the text.
+    ref_msg: Option<(RefTarget, bool, String)>,
     // A range being picked off the grid while a range field has the keyboard
     // (Excel's point mode): the anchor cell, and whether the pointer has moved
     // since the press — a press that never moves is a plain click, not a pick.
@@ -1189,6 +1190,15 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
         .into_any_element()
 }
 
+/// The cells a range field's text names, or `None` if it isn't a range. A
+/// `Sheet!` prefix is accepted and dropped — a chart plots the sheet it floats
+/// over, and pointing can't reach another one — and `$` anchors are ignored.
+fn parse_ref_text(text: &str) -> Option<(u32, u32, u32, u32)> {
+    let t = text.trim();
+    let cells = t.rsplit_once('!').map(|(_, r)| r).unwrap_or(t);
+    gridcore::sheet::parse_range_name(cells)
+}
+
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
 fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -1468,7 +1478,7 @@ impl Docxy {
             chart_sel: None,
             chart_drag: None,
             range_edit: None,
-            chart_msg: None,
+            ref_msg: None,
             range_pick: None,
             keytips: KeyTip::Off,
             context_menu: None,
@@ -1573,7 +1583,7 @@ impl Docxy {
             // click does — including dropping the chart selection, which is the
             // only way out of the panel otherwise.
             self.range_edit = None;
-            self.chart_msg = None;
+            self.ref_msg = None;
             self.range_pick = None;
         }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
@@ -1581,7 +1591,7 @@ impl Docxy {
         }
         self.chart_sel = None; // going back to the grid drops any chart selection
         self.range_edit = None;
-        self.chart_msg = None;
+        self.ref_msg = None;
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
@@ -1695,9 +1705,9 @@ impl Docxy {
     /// chart plots the sheet it floats over.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
-        let cells = text.trim().rsplit_once('!').map(|(_, r)| r).unwrap_or(text.trim());
-        let Some(range) = gridcore::sheet::parse_range_name(cells) else {
-            self.chart_msg = Some((false, format!("\"{}\" isn't a range like A1:D5", text.trim())));
+        let cells = text.trim();
+        let Some(range) = parse_ref_text(text) else {
+            self.ref_msg = Some((RefTarget::ChartRange, false, format!("\"{}\" isn't a range like A1:D5", text.trim())));
             cx.notify();
             return;
         };
@@ -1706,7 +1716,8 @@ impl Docxy {
             gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
         }) else {
             let (r1, c1, r2, c2) = range;
-            self.chart_msg = Some((
+            self.ref_msg = Some((
+                RefTarget::ChartRange,
                 false,
                 format!(
                     "{}:{} has no column of numbers under a header row",
@@ -1725,7 +1736,7 @@ impl Docxy {
         }
         let msg = format!("Plotting {} series over {} categories", data.series.len(), data.categories.len());
         self.set_status(format!("Chart plots {}", cells.to_uppercase()));
-        self.chart_msg = Some((true, msg));
+        self.ref_msg = Some((RefTarget::ChartRange, true, msg));
         self.chart_set_data(data, cx);
     }
 
@@ -1747,6 +1758,20 @@ impl Docxy {
         // palette default.
         s.color = if s.color == Some(rgb) { None } else { Some(rgb) };
         self.chart_set_data(data, cx);
+    }
+
+    /// Apply a field's text to whatever it edits. Every field commits through
+    /// here, so a new target means one arm rather than a new key handler.
+    fn ref_commit(&mut self, target: RefTarget, text: &str, cx: &mut Context<Self>) {
+        match target {
+            RefTarget::ChartRange => self.chart_apply_range(text, cx),
+            RefTarget::ChartTitle => {
+                if let Some(mut data) = self.chart_data() {
+                    data.title = text.trim().to_string();
+                    self.chart_set_data(data, cx);
+                }
+            }
+        }
     }
 
     /// Is a range field holding the keyboard? Then the grid is in point mode:
@@ -1830,15 +1855,7 @@ impl Docxy {
             "escape" => self.range_edit = None,
             "enter" => {
                 self.range_edit = None;
-                match f.target {
-                    RefTarget::ChartRange => return self.chart_apply_range(&f.buf, cx),
-                    RefTarget::ChartTitle => {
-                        if let Some(mut data) = self.chart_data() {
-                            data.title = f.buf.trim().to_string();
-                            return self.chart_set_data(data, cx);
-                        }
-                    }
-                }
+                return self.ref_commit(f.target, &f.buf, cx);
             }
             // A plain arrow past a selection lands on the end it points at.
             "left" => {
@@ -2009,9 +2026,7 @@ impl Docxy {
         if f.target != RefTarget::ChartRange {
             return None;
         }
-        let text = f.buf.trim();
-        let cells = text.rsplit_once('!').map(|(_, r)| r).unwrap_or(text);
-        gridcore::sheet::parse_range_name(cells)
+        parse_ref_text(&f.buf)
     }
 
     /// The box the in-progress fill drag would cover, for the preview outline.
@@ -3731,6 +3746,77 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// One text field, whatever it edits. While it holds the keyboard it shows
+    /// the live buffer split around a caret, each half a click-to-caret run
+    /// (the formula bar's trick); otherwise the committed value, or a hint when
+    /// that is empty. Under it sits whatever the last commit said about this
+    /// field, or `help` when there is nothing to report.
+    fn ref_field(&self, id: &'static str, target: RefTarget, value: String, hint: &'static str, help: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ent = cx.entity();
+        let editing = match &self.range_edit {
+            Some(f) if f.target == target => Some(f.clone()),
+            _ => None,
+        };
+        let shown = match &editing {
+            Some(_) => String::new(),
+            None if value.is_empty() => hint.to_string(),
+            None => value.clone(),
+        };
+        let idle_text = StyledText::new(SharedString::from(shown));
+        let seed = value.clone();
+        let msg = match &self.ref_msg {
+            Some((t, ok, m)) if *t == target => Some((*ok, m.clone())),
+            _ => None,
+        };
+        let boxed = div()
+            .id(id)
+            .h(px(24.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap(px(1.))
+            .rounded(px(4.))
+            .bg(hsla_u(0xffffff))
+            .border_1()
+            .border_color(if editing.is_some() { hsla_u(BRAND) } else { pal.border })
+            .cursor_text()
+            .text_size(px(12.))
+            .text_color(if editing.is_some() || !value.is_empty() { hsla_u(0x1a1a1a) } else { hsla_u(0x999999) })
+            .map(|d| match &editing {
+                Some(f) => d.child(ref_field_row(f, &ent)),
+                None => d.child(div().overflow_hidden().child(idle_text)),
+            })
+            // The click that FOCUSES a field selects all of it, so typing a new
+            // value replaces the old one instead of appending to it (the
+            // caret-at-click behaviour turned every retyped range into
+            // "A1:B5A1:D5"). Clicks once focused place the caret normally.
+            .when(editing.is_none(), |d| {
+                let ent_c = ent.clone();
+                d.on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+                    cx2.stop_propagation();
+                    let seed = seed.clone();
+                    ent_c.update(cx2, |this, cx2| {
+                        let n = seed.chars().count();
+                        this.range_edit = Some(RangeEdit { target, buf: seed, caret: n, anchor: 0, dragging: false });
+                        cx2.notify();
+                    });
+                })
+            });
+        v_flex()
+            .child(boxed)
+            .when(msg.is_some() || !help.is_empty(), |d| {
+                d.child(match msg {
+                    Some((ok, m)) => div()
+                        .pt(px(2.))
+                        .text_size(px(10.))
+                        .text_color(if ok { hsla_u(BRAND) } else { hsla_u(0xd0322b) })
+                        .child(SharedString::from(m)),
+                    None => div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child(help),
+                })
+            })
+            .into_any_element()
+    }
+
     /// The "Chart" side panel, shown while a chart is selected: what it plots,
     /// how it is drawn, its title, and a colour per series. Every control acts
     /// on the selection immediately.
@@ -3738,60 +3824,6 @@ impl Docxy {
         let Some(data) = self.chart_data() else { return div().into_any_element() };
         let ent = cx.entity();
         let heading = |t: &'static str| div().px_1().pt_2().pb(px(2.)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(pal.dim).child(t);
-
-        // A text field: while it has the keyboard it shows the live buffer split
-        // around a caret, each half a click-to-caret segment (the formula bar's
-        // trick); otherwise the committed value, or a hint when that is empty.
-        // Clicking an idle field focuses it with the caret under the pointer.
-        let field = |id: &'static str, target: RefTarget, value: String, hint: &'static str| {
-            let editing = match &self.range_edit {
-                Some(f) if f.target == target => Some(f.clone()),
-                _ => None,
-            };
-            let ent_f = ent.clone();
-            let seed = value.clone();
-            let shown = match &editing {
-                Some(_) => String::new(),
-                None if value.is_empty() => hint.to_string(),
-                None => value.clone(),
-            };
-            let idle_text = StyledText::new(SharedString::from(shown));
-            let seed_for_click = seed.clone();
-            div()
-                .id(id)
-                .h(px(24.))
-                .px_2()
-                .flex()
-                .items_center()
-                .gap(px(1.))
-                .rounded(px(4.))
-                .bg(hsla_u(0xffffff))
-                .border_1()
-                .border_color(if editing.is_some() { hsla_u(BRAND) } else { pal.border })
-                .cursor_text()
-                .text_size(px(12.))
-                .text_color(if editing.is_some() || !value.is_empty() { hsla_u(0x1a1a1a) } else { hsla_u(0x999999) })
-                .map(|d| match &editing {
-                    Some(f) => d.child(ref_field_row(f, &ent_f)),
-                    None => d.child(div().overflow_hidden().child(idle_text)),
-                })
-                // The click that FOCUSES a field selects all of it, so typing a
-                // new value replaces the old one instead of appending to it (the
-                // caret-at-click behaviour turned every retyped range into
-                // "A1:B5A1:D5"). Clicks once focused place the caret normally.
-                .when(editing.is_none(), |d| {
-                    let ent_c = ent_f.clone();
-                    d.on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
-                        cx2.stop_propagation();
-                        let seed = seed_for_click.clone();
-                        ent_c.update(cx2, |this, cx2| {
-                            let n = seed.chars().count();
-                            this.range_edit = Some(RangeEdit { target, buf: seed, caret: n, anchor: 0, dragging: false });
-                            cx2.notify();
-                        });
-                    })
-                })
-        };
 
         // Chart type: the four kinds we draw, current one filled in.
         let mut types = h_flex().gap(px(4.)).flex_wrap();
@@ -3904,7 +3936,7 @@ impl Docxy {
                                 ent_x.update(cx2, |this, cx2| {
                                     this.chart_sel = None;
                                     this.range_edit = None;
-                                    this.chart_msg = None;
+                                    this.ref_msg = None;
                                     this.range_pick = None;
                                     cx2.notify();
                                 });
@@ -3920,21 +3952,19 @@ impl Docxy {
                     .px_3()
                     .pb_2()
                     .child(heading("DATA RANGE"))
-                    .child(field("chart-range", RefTarget::ChartRange, range_shown, "e.g. A1:D5"))
-                    // What the last replot did — or why it couldn't, which the
-                    // status bar alone makes far too easy to miss.
-                    .child(match &self.chart_msg {
-                        Some((ok, msg)) => div()
-                            .pt(px(2.))
-                            .text_size(px(10.))
-                            .text_color(if *ok { hsla_u(BRAND) } else { hsla_u(0xd0322b) })
-                            .child(SharedString::from(msg.clone())),
-                        None => div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("Include the header row: it names the series. Enter to replot."),
-                    })
+                    .child(self.ref_field(
+                        "chart-range",
+                        RefTarget::ChartRange,
+                        range_shown,
+                        "e.g. A1:D5",
+                        "Include the header row: it names the series. Enter to replot.",
+                        pal,
+                        cx,
+                    ))
                     .child(heading("TYPE"))
                     .child(types)
                     .child(heading("TITLE"))
-                    .child(field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title"))
+                    .child(self.ref_field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title", "", pal, cx))
                     .child(heading("SERIES COLOURS"))
                     .child(colors),
             )
@@ -10541,7 +10571,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_px, last_visible_col, range_text, row_height_px, scroll_col0_for_sel};
+    use super::{col_px, last_visible_col, parse_ref_text, range_text, row_height_px, scroll_col0_for_sel};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -10592,6 +10622,28 @@ mod grid_geom_tests {
             let cend = last_visible_col(&w, col0, 500.0, 255);
             assert!(col0 <= sc && sc <= cend, "sc={sc} not in [{col0},{cend}]");
         }
+    }
+
+    #[test]
+    fn parse_ref_text_accepts_what_a_range_field_is_typed() {
+        // The plain forms, in any case, with or without surrounding space.
+        assert_eq!(parse_ref_text("A1:D5"), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("  a1:d5 "), Some((0, 0, 4, 3)));
+        // A single cell is a one-cell range.
+        assert_eq!(parse_ref_text("C3"), Some((2, 2, 2, 2)));
+        // $ anchors are accepted and ignored; a Sheet! prefix is dropped, since
+        // pointing can't reach another sheet.
+        assert_eq!(parse_ref_text("$A$1:$D$5"), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("Budget!A1:D5"), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("'My Sheet'!A1:D5"), Some((0, 0, 4, 3)));
+        // Corners in the other order still name the same box.
+        assert_eq!(parse_ref_text("D5:A1"), Some((0, 0, 4, 3)));
+        // Nothing else is a range — notably the concatenation a field used to
+        // produce when typing over an existing value appended instead.
+        assert_eq!(parse_ref_text("A1:B5A1:D5"), None);
+        assert_eq!(parse_ref_text(""), None);
+        assert_eq!(parse_ref_text("total"), None);
+        assert_eq!(parse_ref_text("A0"), None);
     }
 
     #[test]

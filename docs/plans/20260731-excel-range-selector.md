@@ -138,12 +138,13 @@ Dependencies identified:
 - [x] run `cargo test --manifest-path suite/Cargo.toml` - 11 passed
 
 ### Task 2: One reusable field renderer and commit dispatch
-- [ ] extract `ref_field(target, value, hint, pal, ent)` from the closure inside `chart_panel`, returning the focused (selectable runs + caret) or idle (select-all on focus click) form
-- [ ] extract `fn ref_commit(&mut self, target: RefTarget, text: &str, cx)` with one arm per target, replacing the `match f.which` inside the Enter handler
-- [ ] move the inline validity message (`chart_msg`) onto the field so any range target can report why its range was refused
-- [ ] rebuild the Chart panel's two fields on `ref_field` with no behaviour change
-- [ ] write tests for the commit dispatch on a non-UI seam (parse + route, not render)
-- [ ] run tests and screenshot the Chart panel to confirm it looks and behaves as before - must pass before task 3
+- [x] extract `ref_field(id, target, value, hint, help, pal, cx)` as a method on `Docxy` (it reads `range_edit`/`ref_msg` itself, which is cleaner than passing them), returning the focused (selectable runs + caret) or idle (select-all on focus click) form
+- [x] extract `fn ref_commit(&mut self, target: RefTarget, text: &str, cx)` with one arm per target, replacing the `match f.target` inside the Enter handler
+- [x] move the inline validity message onto the field: `chart_msg` became `ref_msg: Option<(RefTarget, bool, String)>`, so any field renders its own message and falls back to its `help` line
+- [x] rebuild the Chart panel's two fields on `ref_field` with no behaviour change
+- [x] write tests for the commit dispatch on a non-UI seam
+  - ➕ the seam turned out to be reference PARSING: extracted `parse_ref_text` (trim, drop a `Sheet!` prefix, `$` ignored) which both the field commit and the live outline now share, and which formula pointing will need in Task 7. `ref_commit` itself needs `&mut Docxy` + `Context`, so it can't be unit-tested.
+- [x] run tests and screenshot the Chart panel to confirm it looks and behaves as before - 12 passed, panel unchanged
 
 ### Task 3: Anchor a pick on the cell that was pressed
 - [ ] add `fn cell_at(&self, pos: Point<Pixels>) -> Option<(u32, u32)>`: columns from `col_px`/`col_width` (exact), rows from `ListState::bounds_for_item` (exact, unlike the overlay's uniform-row arithmetic)
