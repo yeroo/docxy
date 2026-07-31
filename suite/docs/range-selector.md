@@ -164,6 +164,12 @@ not just their fields). Two on screen would aim the first at cells pinned for
 the second — `sheet_key` routes to whichever opened first, while `bar_seed` and
 `bar_cells` read the slot the second one overwrote.
 
+⚠️ `bar_open` also clears `range_edit`/`range_pick` outright, not just a field
+belonging to a bar. A Chart panel field left focused keeps `range_field_active`
+true, so the first drag meant for the bar would be committed by `range_pick_end`
+→ `ref_commit` to the **chart** — replotting it — while the bar's own range
+stayed unpinned and its rule landed on the untouched selection.
+
 ## Pointing while typing a formula
 
 Formula pointing shares the pointing service but not the field: the cell edit
@@ -204,6 +210,13 @@ run carrying its reference index, so a caret standing inside a reference splits
 it without either half losing its colour, and clicking any run still places the
 caret. A buffer that isn't a formula gets no colouring: `A1` typed as text stays
 text.
+
+References nest — `=SUM(B2:B5)/B3` covers B3 twice — and the two sides then have
+to choose the same one. The text has no choice: a run belongs to the token it
+sits in, the inner one. So the grid asks `ref_index_at`, which picks the
+**smallest** covering reference (earliest index on a tie). Taking the first
+covering one instead left the second reference with no cell anywhere in its
+colour.
 
 ## Traps this rests on
 
@@ -290,8 +303,8 @@ cargo test -p gridcore                        # the chart model + xlsx round-tri
 
 Covered that way: `parse_ref_text`, `range_a1`, `sel_range`, `col_at_x`,
 `row_at_index`/`row_index_of`, `series_remove`/`series_move`, `ref_token_at`,
-`replace_ref`, `formula_ref_tokens`, `edit_runs`, `ref_color`, `sort_rows_from`,
-`bar_range_text`.
+`replace_ref`, `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
+`sort_rows_from`, `bar_range_text`.
 
 Everything else — input routing, point mode, the outlines — can only be checked
 by driving the real binary: launch `suite/target/debug/suite.exe`, assert the

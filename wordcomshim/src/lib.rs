@@ -1276,18 +1276,21 @@ mod win {
                             reg(|r| r.docs.get(doc).map(|d| d.name()).unwrap_or_default()).as_str(),
                         )),
                     ),
-                    3 | 29 => put(
-                        result,
-                        VARIANT::from(BSTR::from(
-                            reg(|r| {
-                                r.docs
-                                    .get(doc)
-                                    .and_then(|d| d.path.clone())
-                                    .unwrap_or_default()
-                            })
-                            .as_str(),
-                        )),
-                    ), // Path / FullName
+                    // Path is the CONTAINING FOLDER, FullName the whole path —
+                    // collapsing them made the idiomatic `doc.Path & "\" &
+                    // doc.Name` produce the filename twice.
+                    3 | 29 => {
+                        let full = reg(|r| r.docs.get(doc).and_then(|d| d.path.clone()))
+                            .unwrap_or_default();
+                        let out = if id == 3 {
+                            full.rsplit_once(['\\', '/'])
+                                .map(|(dir, _)| dir.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            full
+                        };
+                        put(result, VARIANT::from(BSTR::from(out.as_str())));
+                    }
                     113 | 65535 => {} // Activate / Select — no-op
                     6 => put_disp(result, Tables { doc }),
                     _ => return unhandled(id, wflags, params, result),

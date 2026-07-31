@@ -1697,6 +1697,27 @@ fn ref_color(i: usize) -> u32 {
     REF_COLORS[i % REF_COLORS.len()]
 }
 
+/// Which of a formula's references owns cell `(r, c)` for colouring: the
+/// SMALLEST one covering it, earliest index on a tie.
+///
+/// References nest — `=SUM(B2:B5)/B3` covers B3 twice. The text colours B3 by
+/// the token it sits in (the inner one), so the grid has to agree or the second
+/// reference would have no cell drawn in its colour at all.
+fn ref_index_at(refs: &[(u32, u32, u32, u32)], r: u32, c: u32) -> Option<usize> {
+    refs.iter()
+        .enumerate()
+        .filter(|(_, r0c0)| {
+            let (r0, c0, r1, c1) = **r0c0;
+            r >= r0 && r <= r1 && c >= c0 && c <= c1
+        })
+        .min_by_key(|(i, rng)| {
+            let (r0, c0, r1, c1) = **rng;
+            let cells = (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1);
+            (cells, *i)
+        })
+        .map(|(i, _)| i)
+}
+
 /// A range as the A1 text a field shows.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -2619,6 +2640,13 @@ impl Docxy {
         // Columns splitting the Sort bar's whole region, say. Only one at a
         // time, which is also what the keyboard already assumed.
         self.bar_close();
+        // `bar_close` only drops a field belonging to a bar. A Chart panel field
+        // left focused would keep `range_field_active` true, so the very first
+        // drag meant for this bar would be committed through `ref_commit` to the
+        // CHART — replotting it — while the bar's own range stayed unpinned and
+        // its rule landed on the untouched selection instead.
+        self.range_edit = None;
+        self.range_pick = None;
         self.bar_field = Some(target);
         self.ref_msg = None;
     }
@@ -14405,9 +14433,21 @@ fn sheet_row(
     // Merged regions: the top-left cell spans its columns' combined width; cells
     // it covers in the same row are skipped; cells under a vertical merge render
     // blank (content lives only in the top-left).
+    // The row is drawn in two segments — the frozen columns, then the scrolled
+    // window from `col0` — and `seg_start` marks the first column of each. A
+    // merge whose origin sits LEFT of a segment's start would otherwise have
+    // every one of its covered columns `continue`d away while the column header
+    // still drew them, shifting the rest of the row left by the merge's width;
+    // and `skip_to` set in the frozen band would eat the scrolled window's first
+    // columns. The clipped remainder is drawn at the segment start instead.
     let mut skip_to: i64 = -1;
-    for c in (0..fc).chain(col0..=cend) {
-        if (c as i64) <= skip_to {
+    let cols = (0..fc)
+        .map(|c| (c, c == 0))
+        .chain((col0..=cend).map(|c| (c, c == col0)));
+    for (c, seg_start) in cols {
+        if seg_start {
+            skip_to = -1;
+        } else if (c as i64) <= skip_to {
             continue;
         }
         let merge = sh
@@ -14416,10 +14456,12 @@ fn sheet_row(
             .find(|&&(mr1, mc1, mr2, mc2)| r >= mr1 && r <= mr2 && c >= mc1 && c <= mc2)
             .copied();
         let (cell_w, blank_covered) = match merge {
-            Some((mr1, mc1, _mr2, mc2)) if r == mr1 && c == mc1 => {
+            Some((mr1, mc1, _mr2, mc2)) if r == mr1 && (c == mc1 || seg_start) => {
                 skip_to = mc2 as i64; // widen; skip the rest of the span in this row
                 (
-                    (mc1..=mc2).map(|cc| col_px(sh.col_width(cc))).sum::<f32>(),
+                    (c.max(mc1)..=mc2)
+                        .map(|cc| col_px(sh.col_width(cc)))
+                        .sum::<f32>(),
                     false,
                 )
             }
@@ -14442,13 +14484,9 @@ fn sheet_row(
         let in_ref = ov
             .range_preview
             .is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
-        // Cells the formula being typed reads: the first reference covering
-        // this cell gives it its colour.
-        let formula_ref = ov
-            .formula_refs
-            .iter()
-            .position(|&(fr0, fc0, fr1, fc1)| r >= fr0 && r <= fr1 && c >= fc0 && c <= fc1)
-            .map(|i| (i, ov.formula_refs[i]));
+        // Cells the formula being typed reads: the innermost reference covering
+        // this cell gives it its colour, which is the one the TEXT draws too.
+        let formula_ref = ref_index_at(&ov.formula_refs, r, c).map(|i| (i, ov.formula_refs[i]));
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
@@ -14834,19 +14872,24 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
     // One element per point per series, every frame. A chart the UI authored is
     // capped at MAX_CHART_CELLS when it is pointed, but one read from a file can
     // cache as many points as Excel cared to write, and a card a few hundred
-    // pixels wide can't show them anyway.
+    // pixels wide can't show them anyway. BOTH axes need the cap: `parse_chart`
+    // pushes one `ChartSeries` per `<c:ser>` with no bound of its own, so
+    // capping only the points still leaves points × series elements per frame.
     const MAX_CARD_POINTS: usize = 512;
+    const MAX_CARD_SERIES: usize = 32;
     let ncat = data
         .categories
         .len()
         .max(
             data.series
                 .iter()
+                .take(MAX_CARD_SERIES)
                 .map(|s| s.values.len())
                 .max()
                 .unwrap_or(0),
         )
         .min(MAX_CARD_POINTS);
+    let nser = data.series.len().min(MAX_CARD_SERIES);
     // The title strip and the legend take fixed bites out of the card; the plot
     // area gets the rest, and the bars scale to it.
     let area_h = (h - 46.0).max(40.0);
@@ -14882,7 +14925,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                         )),
                 );
                 let mut bars = v_flex().flex_1().gap(px(1.));
-                for (si, s) in data.series.iter().enumerate() {
+                for (si, s) in data.series.iter().take(nser).enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let frac = (val.max(0.0) / maxv) as f32;
                     bars = bars.child(
@@ -14903,7 +14946,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut stack = div().relative().w(px(14.)).h(px(plot_h));
-                for (si, s) in data.series.iter().enumerate() {
+                for (si, s) in data.series.iter().take(nser).enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     stack = stack.child(
@@ -14990,7 +15033,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut cluster = h_flex().items_end().gap(px(1.));
-                for (si, s) in data.series.iter().enumerate() {
+                for (si, s) in data.series.iter().take(nser).enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     cluster = cluster.child(
@@ -15018,7 +15061,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 
     let legend: AnyElement = pie_legend.unwrap_or_else(|| {
         let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
-        for (si, s) in data.series.iter().enumerate() {
+        for (si, s) in data.series.iter().take(nser).enumerate() {
             legend = legend.child(
                 h_flex()
                     .items_center()
@@ -15434,10 +15477,20 @@ fn sheet_el(
     // just under the column header) — the layer clips, so a chart scrolled up
     // slides under the header instead of drawing over it.
     let row_y = |ar: u32| -> f32 {
-        if (ar as usize) < fr {
-            return ar as f32 * row_h; // pinned frozen row
+        // `scrolled_px` counts LIST items, and the list virtualizes over
+        // `visible` — hidden rows collapse out of it. Treating the raw sheet row
+        // as that index drifts one row height per hidden row above the anchor,
+        // so after an AutoFilter every card, note and dropdown slides down the
+        // sheet (far enough to leave the clipped chart layer entirely).
+        // A hidden anchor row lands on its insertion point, which is where the
+        // row it names would sit.
+        let vi = match visible.binary_search(&ar) {
+            Ok(i) | Err(i) => i,
+        };
+        if vi < fr {
+            return vi as f32 * row_h; // pinned frozen row
         }
-        fr as f32 * row_h + (ar - fr as u32) as f32 * row_h + scrolled_px
+        vi as f32 * row_h + scrolled_px
     };
     let loaded = sh.drawings.iter().filter_map(|d| match &d.kind {
         gridcore::sheet::DrawingKind::Chart(cd) => Some((d.from, d.to, cd)),
@@ -15874,14 +15927,43 @@ fn main() {
 mod grid_geom_tests {
     use super::{
         chart_range_of, col_at_x, col_px, edit_runs, fill_box, formula_ref_tokens,
-        last_visible_col, parse_ref_text, range_a1, range_text, ref_color, ref_token_at,
-        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, series_move, series_remove,
-        shift_col, shift_row,
+        last_visible_col, parse_ref_text, range_a1, range_text, ref_color, ref_index_at,
+        ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, series_move,
+        series_remove, shift_col, shift_row,
     };
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
         move |_c| w
+    }
+
+    /// The grid and the formula text must colour a cell by the SAME reference.
+    /// `=SUM(B2:B5)/B3` covers B3 twice; the text draws it as the second token,
+    /// so a grid that took the first covering ref would leave that reference
+    /// with no cell of its own colour anywhere.
+    #[test]
+    fn overlapping_refs_colour_by_the_innermost() {
+        // B2:B5 (rows 1..4, col 1) then B3 (row 2, col 1).
+        let refs = [(1, 1, 4, 1), (2, 1, 2, 1)];
+        assert_eq!(ref_index_at(&refs, 2, 1), Some(1)); // B3 → the inner ref
+        assert_eq!(ref_index_at(&refs, 1, 1), Some(0)); // B2 → only the outer
+        assert_eq!(ref_index_at(&refs, 4, 1), Some(0)); // B5 → only the outer
+        assert_eq!(ref_index_at(&refs, 0, 1), None); // B1 → neither
+        assert_eq!(ref_index_at(&refs, 2, 2), None); // C3 → neither
+        assert_eq!(ref_index_at(&[], 0, 0), None);
+        // Two identical refs: the earlier index wins, so the colour is stable.
+        assert_eq!(ref_index_at(&[(0, 0, 0, 0), (0, 0, 0, 0)], 0, 0), Some(0));
+    }
+
+    /// The text side of the same formula, so the two assertions sit together:
+    /// `edit_runs` gives B3 the second reference's colour.
+    #[test]
+    fn edit_runs_colours_a_nested_ref_by_its_own_token() {
+        let runs = edit_runs("=SUM(B2:B5)/B3", 0);
+        let b3 = runs.iter().find(|(_, s, _)| s == "B3").expect("B3 run");
+        assert_eq!(b3.2, Some(1));
+        let outer = runs.iter().find(|(_, s, _)| s == "B2:B5").expect("B2:B5");
+        assert_eq!(outer.2, Some(0));
     }
 
     #[test]

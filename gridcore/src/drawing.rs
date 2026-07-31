@@ -161,7 +161,14 @@ fn parse_anchor_cell(p: &mut XmlParser) -> (u32, u32) {
             _ => {}
         }
     }
-    (row, col)
+    // A crafted `<xdr:col>`/`<xdr:row>` parses as any u32, and consumers add to
+    // it to bound a card's span (`from.1 + 1`, `ac + 256`): near u32::MAX that
+    // panics a debug build and wraps a release one. `estimate_to` already
+    // guards its own arithmetic; clamping here covers every consumer at once.
+    (
+        row.min(crate::sheet::MAX_ROWS - 1),
+        col.min(crate::sheet::MAX_COLS - 1),
+    )
 }
 
 /// One drawing's new home: its anchor index in the part, and the `(row, col)`
@@ -532,6 +539,34 @@ mod tests {
             }
             _ => panic!("expected image"),
         }
+    }
+
+    /// A crafted anchor cell is clamped to the sheet's own limits. Consumers add
+    /// to it to bound a card's span (`from.1 + 1`, `ac + 256`), which near
+    /// u32::MAX panics a debug build and wraps a release one.
+    #[test]
+    fn anchor_cells_are_clamped_to_the_sheet() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>4294967295</xdr:col><xdr:row>4294967295</xdr:row></xdr:from>
+              <xdr:to><xdr:col>4294967295</xdr:col><xdr:row>4294967295</xdr:row></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let resolve = |rid: &str| {
+            (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()))
+        };
+        let get = |_: &str| None;
+        let ds = parse_drawings(xml, &resolve, &get);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(
+            ds[0].from,
+            (crate::sheet::MAX_ROWS - 1, crate::sheet::MAX_COLS - 1)
+        );
+        assert_eq!(ds[0].to, ds[0].from);
+        // The bound every consumer relies on: adding to the anchor can't overflow.
+        assert!(ds[0].from.1.checked_add(256).is_some());
+        assert!(ds[0].from.0.checked_add(1024).is_some());
     }
 
     /// Two anchors; the first holds a shape we don't model, so the picture's

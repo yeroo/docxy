@@ -357,6 +357,37 @@ mod win {
         unsafe { put(pvarresult, VARIANT::from(obj.into_dispatch())) };
     }
 
+    /// How many of `params`' arguments are positional. An indexed property put
+    /// (`ws.Cells(1, 1) = "x"`) carries the assigned value as a NAMED argument
+    /// (`DISPID_PROPERTYPUT`), so `cArgs` alone would read it as one index too
+    /// many — `ws.Range("A1") = "hi"` looks like `Range("A1", "hi")`.
+    ///
+    /// # Safety
+    /// `params` must be null or a valid `DISPPARAMS`.
+    unsafe fn n_pos_args(params: *const DISPPARAMS) -> u32 {
+        unsafe {
+            params
+                .as_ref()
+                .map_or(0, |dp| dp.cArgs.saturating_sub(dp.cNamedArgs))
+        }
+    }
+
+    /// The cell an indexed property put is assigning. COM puts the named
+    /// `DISPID_PROPERTYPUT` argument FIRST in `rgvarg`; an empty/omitted value
+    /// clears the cell, which is what Excel does.
+    ///
+    /// # Safety
+    /// `params` must be null or a valid `DISPPARAMS`.
+    unsafe fn put_cell(params: *const DISPPARAMS) -> Cell {
+        unsafe {
+            params
+                .as_ref()
+                .filter(|dp| dp.cArgs > 0 && dp.cNamedArgs > 0)
+                .and_then(|dp| variant_to_cell(&*dp.rgvarg))
+                .unwrap_or_default()
+        }
+    }
+
     /// Interpret a VARIANT the way Excel interprets a value assigned to a cell:
     /// `=…` is a formula, other strings are text, bools are booleans, numbers are
     /// numbers. `None` = empty/omitted (clear). App-specific (over gridcore).
@@ -471,7 +502,10 @@ mod win {
         S_OK
     }
     unsafe fn vt_app_name(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
-        unsafe { out_bstr(ret, "Docxy") }
+        // Same source as the IDispatch path: hardcoding it here left
+        // `XLCOMSHIM_APP_NAME` dead for exactly the early-bound clients that
+        // gate on the name.
+        unsafe { out_bstr(ret, &app_name()) }
     }
     unsafe fn vt_app_version(_t: &Application_Impl, ret: *mut BSTR) -> HRESULT {
         unsafe { out_bstr(ret, "16.0") }
@@ -1392,39 +1426,44 @@ mod win {
                         }
                     }
                     238 => {
-                        // Cells or Cells(row, col).
-                        if let (Some(rr), Some(cc)) = (arg_i32(params, 0), arg_i32(params, 1)) {
-                            let r = (rr.max(1) - 1) as u32;
-                            let c = (cc.max(1) - 1) as u32;
-                            put_obj(
-                                result,
-                                Range {
-                                    book,
-                                    sheet,
-                                    r1: r,
-                                    c1: c,
-                                    r2: r,
-                                    c2: c,
-                                },
-                            );
+                        // Cells or Cells(row, col). `ws.Cells(1, 1) = "x"` is a
+                        // PROPERTYPUT with a NULL `result`, so handing back a
+                        // Range object silently drops the write: assign into the
+                        // cells instead. (`write_fill` refuses the unbounded
+                        // whole-sheet form, so a bare `ws.Cells = "x"` is a
+                        // logged no-op rather than a million writes.)
+                        let np = n_pos_args(params);
+                        let (r1, c1, r2, c2) = match (np >= 2)
+                            .then(|| (arg_i32(params, 0), arg_i32(params, 1)))
+                            .and_then(|(a, b)| a.zip(b))
+                        {
+                            Some((rr, cc)) => {
+                                let r = (rr.max(1) - 1) as u32;
+                                let c = (cc.max(1) - 1) as u32;
+                                (r, c, r, c)
+                            }
+                            None => (0, 0, MAX_ROW, MAX_COL),
+                        };
+                        let rng = Range {
+                            book,
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        };
+                        if is_put(wflags) {
+                            rng.write_fill(put_cell(params));
                         } else {
-                            put_obj(
-                                result,
-                                Range {
-                                    book,
-                                    sheet,
-                                    r1: 0,
-                                    c1: 0,
-                                    r2: MAX_ROW,
-                                    c2: MAX_COL,
-                                },
-                            );
+                            put_obj(result, rng);
                         }
                     }
                     197 => {
                         // Range("A1"[, "B2"]) or Range(cell1, cell2).
+                        let np = n_pos_args(params);
                         let a = arg_string(params, 0).unwrap_or_default();
-                        let rect = if let Some(b) = arg_string(params, 1) {
+                        let cell2 = (np >= 2).then(|| arg_string(params, 1)).flatten();
+                        let rect = if let Some(b) = cell2 {
                             match (parse_cell_name(a.trim()), parse_cell_name(b.trim())) {
                                 (Some((r1, c1)), Some((r2, c2))) => {
                                     Some((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
@@ -1437,17 +1476,24 @@ mod win {
                             parse_cell_name(a.trim()).map(|(r, c)| (r, c, r, c))
                         };
                         match rect {
-                            Some((r1, c1, r2, c2)) => put_obj(
-                                result,
-                                Range {
+                            // `ws.Range("A1") = "x"` puts through here too, with
+                            // a NULL `result` — write rather than return an
+                            // object nobody receives.
+                            Some((r1, c1, r2, c2)) => {
+                                let rng = Range {
                                     book,
                                     sheet,
                                     r1,
                                     c1,
                                     r2,
                                     c2,
-                                },
-                            ),
+                                };
+                                if is_put(wflags) {
+                                    rng.write_fill(put_cell(params));
+                                } else {
+                                    put_obj(result, rng);
+                                }
+                            }
                             None => {
                                 log(&format!("Range: cannot parse '{a}'"));
                                 return Err(E_FAIL.into());
@@ -1673,12 +1719,34 @@ mod win {
                             }
                         }
                     }
-                    // Item / _Default(row, col) → sub-cell Range
+                    // Item / _Default(row, col) → sub-cell Range. A put
+                    // (`rng(1, 1) = "x"`) gets a NULL `result`, so it has to
+                    // write instead of returning the sub-range.
                     170 | 0 => {
-                        let rr = arg_i32(params, 0).unwrap_or(1).max(1) as u32 - 1;
-                        let cc = arg_i32(params, 1).unwrap_or(1).max(1) as u32 - 1;
+                        let np = n_pos_args(params);
+                        let idx = |i: u32| {
+                            if i < np {
+                                arg_i32(params, i).unwrap_or(1)
+                            } else {
+                                1
+                            }
+                        };
+                        let rr = idx(0).max(1) as u32 - 1;
+                        let cc = idx(1).max(1) as u32 - 1;
                         let r = r1 + rr;
                         let c = c1 + cc;
+                        let sub = Range {
+                            book,
+                            sheet,
+                            r1: r,
+                            c1: c,
+                            r2: r,
+                            c2: c,
+                        };
+                        if is_put(wflags) {
+                            sub.write_fill(put_cell(params));
+                            return Ok(());
+                        }
                         put_obj(
                             result,
                             Range {
@@ -1797,10 +1865,14 @@ mod win {
                     ),
                     257 => put(result, VARIANT::from((r1 + 1) as i32)),
                     240 => put(result, VARIANT::from((c1 + 1) as i32)),
-                    118 => put(
-                        result,
-                        VARIANT::from(((r2 - r1 + 1) * (c2 - c1 + 1)) as i32),
-                    ),
+                    // Count. `Worksheet.Cells`/`Rows`/`Columns` span the whole
+                    // sheet (2^34 cells), so the product must be computed wide:
+                    // in u32 it wraps to 0 in release and panics inside a vtable
+                    // frame in debug, breaking `ws.Cells(ws.Rows.Count, 1)`.
+                    118 => {
+                        let n = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
+                        put(result, VARIANT::from(n.min(i32::MAX as u64) as i32))
+                    }
                     111 => self.write_fill(Cell::default()),
                     235 | 564 => {} // Select / Merge — no-op in P1
                     // Offset(RowOffset, ColumnOffset) — shift the whole range.
