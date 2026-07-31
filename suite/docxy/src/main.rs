@@ -817,6 +817,11 @@ struct Docxy {
     ref_msg: Option<(RefTarget, bool, String)>,
     // The cell a left press landed on, so a drag-select starts there.
     drag_anchor: Option<(u32, u32)>,
+    // A reference being pointed at while a formula is being typed: the buffer
+    // and caret as they were when the press landed, plus the anchor cell. Each
+    // move re-splices from those, so a drag rewrites one reference rather than
+    // appending one per cell crossed.
+    formula_pick: Option<(String, usize, (u32, u32))>,
     // A range being picked off the grid while a range field has the keyboard
     // (Excel's point mode): the anchor cell, and whether the pointer has moved
     // since the press — a press that never moves is a plain click, not a pick.
@@ -1637,6 +1642,7 @@ impl Docxy {
             chart_drag: None,
             range_edit: None,
             ref_msg: None,
+            formula_pick: None,
             drag_anchor: None,
             range_pick: None,
             keytips: KeyTip::Off,
@@ -1733,6 +1739,11 @@ impl Docxy {
     /// Move the spreadsheet selection to a cell (from a grid click), collapsing
     /// the range and committing any in-progress edit first.
     fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        // Typing a formula: a click writes the cell in rather than committing
+        // the edit and moving away.
+        if self.formula_pick_active() {
+            return self.formula_pick_to(row, col, true, cx);
+        }
         if self.range_field_active() {
             // Mid-drag: the pick already has this cell, and its release applies.
             if matches!(self.range_pick, Some((_, true))) {
@@ -2037,7 +2048,13 @@ impl Docxy {
     /// crossed a boundary.
     fn grid_press(&mut self, pos: Point<Pixels>, _cx: &mut Context<Self>) {
         let Some(cell) = self.cell_at(pos) else { return };
-        if self.range_field_active() {
+        if self.formula_pick_active() {
+            // Anchor the reference on the pressed cell, with the buffer as it
+            // stands, so the drag rewrites from there.
+            if let Some(v) = self.active_sheet() {
+                self.formula_pick = Some((v.editing.clone().unwrap_or_default(), v.edit_caret, cell));
+            }
+        } else if self.range_field_active() {
             self.range_pick = Some((cell, false));
         } else {
             self.drag_anchor = Some(cell);
@@ -2079,6 +2096,36 @@ impl Docxy {
             }
         }
         None
+    }
+
+    /// Is a formula being typed? Then a click or drag on the grid writes its
+    /// cells into the formula instead of moving the selection.
+    fn formula_pick_active(&self) -> bool {
+        self.active_sheet().and_then(|v| v.editing.as_ref()).is_some_and(|b| b.starts_with('='))
+    }
+
+    /// Point at `(row, col)` while typing a formula. `start` plants the anchor;
+    /// otherwise the reference grows from wherever the anchor already is.
+    fn formula_pick_to(&mut self, row: u32, col: u32, start: bool, cx: &mut Context<Self>) {
+        let (buf, caret, anchor) = match self.formula_pick.clone() {
+            // The press already planted the anchor; a click on the same cell
+            // must not move it, or the reference would follow the pointer.
+            Some(p) if !start || p.2 == (row, col) => p,
+            _ => {
+                let Some(v) = self.active_sheet() else { return };
+                let base = (v.editing.clone().unwrap_or_default(), v.edit_caret, (row, col));
+                self.formula_pick = Some(base.clone());
+                base
+            }
+        };
+        // A one-cell pick reads as A1, not A1:A1, which is what Excel writes.
+        let text = if anchor == (row, col) { gridcore::sheet::cell_name(row, col) } else { range_text(anchor, (row, col)) };
+        let (next, next_caret) = replace_ref(&buf, caret, &text);
+        if let Some(v) = self.active_sheet_mut() {
+            v.editing = Some(next);
+            v.edit_caret = next_caret;
+        }
+        cx.notify();
     }
 
     /// Is a range field holding the keyboard? Then the grid is in point mode:
@@ -2377,6 +2424,9 @@ impl Docxy {
     /// virtualized list swallows child `on_mouse_down`, so the drag start is
     /// inferred from the first move rather than a press).
     fn sheet_drag_over(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.formula_pick_active() {
+            return self.formula_pick_to(row, col, false, cx);
+        }
         if self.range_field_active() {
             return self.range_pick_to(row, col, false, cx);
         }
@@ -2402,6 +2452,9 @@ impl Docxy {
 
     /// Extend the selection to a cell (Shift+click), keeping the anchor.
     fn extend_to(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
+        if self.formula_pick_active() {
+            return self.formula_pick_to(row, col, false, cx);
+        }
         if self.range_field_active() {
             return self.range_pick_to(row, col, false, cx);
         }
@@ -10835,6 +10888,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
                 this.sheet_fill_end(cx); // commit an auto-fill drag, if any
                 this.chart_drag_end(cx); // commit a chart move, if any
                 this.range_pick_end(cx); // replot a range picked off the grid
+                this.formula_pick = None; // the reference stays; the drag is over
             });
         })
         .child(bar)
@@ -11130,6 +11184,27 @@ mod grid_geom_tests {
         assert_eq!(buf, "=\"café\"&C3");
         // 10 CHARS, not the 11 bytes é costs — the caret is counted in chars.
         assert_eq!(caret, 10);
+    }
+
+    #[test]
+    fn pointing_at_cells_while_typing_a_formula() {
+        use super::{range_text, replace_ref};
+        // The decision the grid makes on each move: take the buffer and caret
+        // as they were when the press landed, and splice in the range the drag
+        // has reached so far.
+        let point = |buf: &str, caret: usize, anchor: (u32, u32), to: (u32, u32)| {
+            let text = if anchor == to { gridcore::sheet::cell_name(to.0, to.1) } else { range_text(anchor, to) };
+            replace_ref(buf, caret, &text)
+        };
+        // A click after "=SUM(" inserts one cell — A1, not A1:A1.
+        assert_eq!(point("=SUM(", 5, (0, 0), (0, 0)), ("=SUM(A1".to_string(), 7));
+        // Dragging on rewrites that same reference rather than appending.
+        assert_eq!(point("=SUM(", 5, (0, 0), (3, 0)), ("=SUM(A1:A4".to_string(), 10));
+        assert_eq!(point("=SUM(", 5, (0, 0), (3, 2)), ("=SUM(A1:C4".to_string(), 10));
+        // Standing on an existing reference replaces it, keeping the rest.
+        assert_eq!(point("=B2*C2", 3, (8, 3), (8, 3)), ("=D9*C2".to_string(), 3));
+        // Dragging backwards names the same box.
+        assert_eq!(point("=SUM(", 5, (3, 2), (0, 0)), ("=SUM(A1:C4".to_string(), 10));
     }
 
     #[test]

@@ -200,12 +200,14 @@ Dependencies identified:
 - ⚠️ `refs_in` keeps only same-sheet rectangles; whole-column (`A:C`), whole-row, 3D and structured references parse but aren't outlined.
 
 ### Task 8: Point mode while editing a formula
-- [ ] route grid clicks and drags to `replace_ref` when the active cell edit holds a formula, instead of committing the edit and moving the selection
-- [ ] keep pointing out of the way when the buffer is not a formula: a click still commits and moves, as it does today
-- [ ] leave the cell edit intact through the drag, so Enter/Escape still commit/cancel the formula
-- [ ] make the fx bar and the in-cell editor agree — both read the same buffer, so both must show the written reference
-- [ ] write tests for the decision (buffer + caret + picked range → new buffer + caret), covering "not a formula" and "replace the ref under the caret"
-- [ ] run tests, then screenshot typing `=SUM(` and dragging A2:A5 - must pass before task 9
+- [x] route grid clicks and drags to `replace_ref` when the active cell edit holds a formula, instead of committing the edit and moving the selection
+- [x] keep pointing out of the way when the buffer is not a formula: `formula_pick_active` requires a leading `=`, so ordinary editing is untouched
+- [x] leave the cell edit intact through the drag, so Enter/Escape still commit/cancel the formula
+  - each move re-splices from the buffer and caret AS THEY WERE at the press, so a drag rewrites one reference instead of appending one per cell crossed
+- [x] make the fx bar and the in-cell editor agree — both read the same buffer, verified on screen
+- [x] write tests for the decision (buffer + caret + picked range → new buffer + caret), covering insert-after-bracket, replace-under-caret, one cell as `A1` not `A1:A1`, and a backwards drag
+- [x] run tests (20 passed), then screenshot typing `=SUM(` and dragging B2:B5
+  - ⚠️ first attempt anchored on the first cell the pointer MOVED into (`=SUM(B3:B5` for a drag starting on row 2) — the same defect Task 3 fixed for the other paths. The press now plants the formula anchor through `cell_at` too. Verified: the drag writes `=SUM(B2:B5`, and committing gives 14.
 
 ### Task 9: Colour the ranges a formula mentions
 - [ ] thread `refs_in(buf)` for the live edit buffer into `GridOverlay` alongside the existing range preview
