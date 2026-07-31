@@ -214,10 +214,12 @@ Dependencies identified:
   - ➕ REPLACED Task 7's `refs_in` with `formula_ref_tokens`: the AST can say WHICH ranges a formula reads but not WHERE they sit in the text, and the text colouring needs spans. One scan now feeds both, so grid and text can't disagree. It skips function names, other sheets' cells and anything inside a string literal.
 - [x] give each ref an index-keyed colour from a small palette and draw its border with the per-cell edge technique (`deferred`, exact placement)
 - [x] tint the referenced cells lightly in the same colour, keeping the picked-range wash distinguishable
-- [ ] show the same colour on the reference inside the formula text (fx bar and in-cell), so text and grid agree
-  - ⚠️ DEFERRED. The spans are available (`formula_ref_tokens` returns them), but the fx bar and in-cell editor currently split their text at the caret only; colouring means splitting at token boundaries as well while keeping click-to-caret per run. Worth doing on its own rather than bolted onto this task.
+- [x] show the same colour on the reference inside the formula text (fx bar and in-cell), so text and grid agree
+  - ➕ one new pure function, `edit_runs(buf, caret)`: the text cut at the caret AND at every token boundary, each run carrying the reference index. Both editors render it — `fx_edit_row` as one click-to-caret `fx_segment` per run, `edit_caret_row` as plain runs — so a caret standing inside a reference splits it without either half losing its colour, and clicking any run still places the caret. Non-formula buffers get no colouring, so `A1` typed as text stays text.
+  - ⚠️ harness note: `SendKeys` is unusable against gpui — its `+`/`^`/`%` modifiers arrive as real shift presses and the shifted characters come out wrong (`=B2*C2+SUM(D2:D5` typed as `=B2*C2Sum9d2;d5`). The screenshot harness sends virtual-key down/up pairs via `SendInput` with shift held per `VkKeyScanW` instead.
 - [x] write tests for the colour assignment (stable per ref index, wraps past the palette length) and for the token scan
-- [x] run tests (21 passed), then screenshot `=B2*C2+SUM(D2:D5)` mid-edit - three ranges outlined in blue, terracotta and purple, each tinted to match
+  - ➕ plus `edit_runs`: the runs and their colour indices, a caret cutting a reference in two, char offsets past multibyte text, a non-formula buffer, an empty buffer, half-typed input
+- [x] run tests (22 passed), then screenshot `=B2*C2+SUM(D2:D5)` mid-edit - three ranges outlined in blue, terracotta and purple, each tinted to match; the fx bar and the in-cell editor now draw `B2`, `C2` and `D2:D5` in those same three colours, and clicking `C2` in the fx bar puts the caret between its two (still terracotta) halves
 
 ### Task 10: Retrofit the other range inputs
 - [ ] add `CondFormat`, `Validation`, `Sort` and `TextToColumns` targets, each seeded from the current selection when its bar opens

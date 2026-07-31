@@ -1154,33 +1154,64 @@ fn buf_delete(text: &mut String, caret: usize) {
     text.replace_range(start..end, "");
 }
 
+/// The runs an in-progress edit buffer is drawn in: the text split at the caret
+/// AND at the boundaries of every reference the formula mentions, each run
+/// carrying the index of the reference it belongs to (`None` for ordinary
+/// text). Splitting at the caret too keeps the caret bar exactly between two
+/// runs, and every run reports the char offset a click needs to place the
+/// caret. The reference index is the one `formula_refs` hands the grid, so the
+/// text and the outlines are coloured from the same numbering.
+///
+/// A buffer that isn't a formula gets no colouring — `A1` typed as text is text.
+fn edit_runs(buf: &str, caret_chars: usize) -> Vec<(usize, String, Option<usize>)> {
+    let caret = char_to_byte(buf, caret_chars);
+    let toks = if buf.starts_with('=') { formula_ref_tokens(buf) } else { Vec::new() };
+    let mut cuts = vec![0usize, caret, buf.len()];
+    cuts.extend(toks.iter().flat_map(|(s, _)| [s.start, s.end]));
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let color = toks.iter().position(|(s, _)| s.start <= a && b <= s.end);
+            (buf[..a].chars().count(), buf[a..b].to_string(), color)
+        })
+        .collect()
+}
+
 /// Render an in-progress edit buffer with a blinking-style caret bar at `caret`
-/// (a char index): the text before the caret, the caret, then the text after.
+/// (a char index), each reference the formula mentions in its own colour.
 /// Shared by the in-cell editor and the formula bar.
 fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> AnyElement {
-    let chars: Vec<char> = text.chars().collect();
-    let c = caret.min(chars.len());
-    let before: String = chars[..c].iter().collect();
-    let after: String = chars[c..].iter().collect();
-    h_flex()
-        .items_center()
-        .child(div().text_size(px(12.)).text_color(color).child(SharedString::from(before)))
-        .child(div().w(px(1.5)).h(px(13.)).bg(caret_color).flex_none())
-        .child(div().text_size(px(12.)).text_color(color).child(SharedString::from(after)))
-        .into_any_element()
+    let cc = caret.min(text.chars().count());
+    let bar = || div().w(px(1.5)).h(px(13.)).bg(caret_color).flex_none();
+    let mut row = h_flex().items_center();
+    let mut placed = false;
+    for (off, s, ci) in edit_runs(text, cc) {
+        if off == cc && !placed {
+            row = row.child(bar());
+            placed = true;
+        }
+        let c = ci.map(|i| hsla_u(ref_color(i))).unwrap_or(color);
+        row = row.child(div().text_size(px(12.)).text_color(c).child(SharedString::from(s)));
+    }
+    if !placed {
+        row = row.child(bar());
+    }
+    row.into_any_element()
 }
 
 /// One click-to-caret text segment for the formula bar: a StyledText whose
 /// TextLayout maps the click position to a char index (`base_off` is the char
-/// offset of this segment within the whole buffer). Used for the before/after
-/// halves around the caret so clicking places the caret under the pointer.
-fn fx_segment(s: String, base_off: usize, ent: Entity<Docxy>) -> AnyElement {
+/// offset of this segment within the whole buffer). One per run of
+/// `edit_runs`, so clicking any of them places the caret under the pointer.
+fn fx_segment(s: String, base_off: usize, color: Option<u32>, ent: Entity<Docxy>) -> AnyElement {
     let styled = StyledText::new(SharedString::from(s.clone()));
     let layout = styled.layout().clone();
     div()
         .child(styled)
         .text_size(px(12.))
-        .text_color(hsla_u(0x1a1a1a))
+        .text_color(hsla_u(color.unwrap_or(0x1a1a1a)))
         .cursor_text()
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
             let byte = layout.index_for_position(ev.position).unwrap_or_else(|e| e).min(s.len());
@@ -1195,21 +1226,25 @@ fn fx_segment(s: String, base_off: usize, ent: Entity<Docxy>) -> AnyElement {
         .into_any_element()
 }
 
-/// The formula bar's editing content: the text split before/after the caret
-/// (each a click-to-caret segment) with the caret bar between them.
+/// The formula bar's editing content: one click-to-caret segment per run of
+/// `edit_runs` — so each reference is drawn in its grid colour — with the caret
+/// bar sitting between the runs it splits.
 fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
-    let chars: Vec<char> = text.chars().collect();
-    let cc = caret.min(chars.len());
-    let before: String = chars[..cc].iter().collect();
-    let after: String = chars[cc..].iter().collect();
-    h_flex()
-        .flex_1()
-        .h_full()
-        .items_center()
-        .child(fx_segment(before, 0, ent.clone()))
-        .child(div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none())
-        .child(fx_segment(after, cc, ent.clone()))
-        .into_any_element()
+    let cc = caret.min(text.chars().count());
+    let bar = || div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none();
+    let mut row = h_flex().flex_1().h_full().items_center();
+    let mut placed = false;
+    for (off, s, ci) in edit_runs(text, cc) {
+        if off == cc && !placed {
+            row = row.child(bar());
+            placed = true;
+        }
+        row = row.child(fx_segment(s, off, ci.map(ref_color), ent.clone()));
+    }
+    if !placed {
+        row = row.child(bar());
+    }
+    row.into_any_element()
 }
 
 /// The column at `x` pixels from the grid's left edge: the gutter first, then
@@ -11087,7 +11122,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, formula_ref_tokens, ref_color, ref_token_at, replace_ref, scroll_col0_for_sel, series_move, series_remove};
+    use super::{col_at_x, col_px, edit_runs, last_visible_col, parse_ref_text, range_a1, range_text, row_height_px, formula_ref_tokens, ref_color, ref_token_at, replace_ref, scroll_col0_for_sel, series_move, series_remove};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -11295,6 +11330,37 @@ mod grid_geom_tests {
         assert_ne!(ref_color(0), ref_color(1));
         assert_eq!(ref_color(0), ref_color(6));
         assert_eq!(ref_color(2), ref_color(8));
+    }
+
+    #[test]
+    fn edit_runs_splits_at_the_caret_and_at_every_reference() {
+        // (text, colour index) — the offsets are checked separately below.
+        let runs = |b: &str, c: usize| edit_runs(b, c).into_iter().map(|(_, s, i)| (s, i)).collect::<Vec<_>>();
+        let plain = |s: &str| (s.to_string(), None);
+        let refd = |s: &str, i: usize| (s.to_string(), Some(i));
+
+        // Each reference is its own run, in the numbering the grid outlines use.
+        assert_eq!(runs("=B2*C2", 6), vec![plain("="), refd("B2", 0), plain("*"), refd("C2", 1)]);
+        assert_eq!(runs("=B2*C2+SUM(D2:D5)", 17), vec![plain("="), refd("B2", 0), plain("*"), refd("C2", 1), plain("+SUM("), refd("D2:D5", 2), plain(")")]);
+
+        // The caret cuts a run in two so the bar can sit between the halves —
+        // both halves keep the colour of the reference they came from.
+        assert_eq!(runs("=B2*C2", 2), vec![plain("="), refd("B", 0), refd("2", 0), plain("*"), refd("C2", 1)]);
+        // A caret already on a boundary adds no cut.
+        assert_eq!(runs("=B2*C2", 3), vec![plain("="), refd("B2", 0), plain("*"), refd("C2", 1)]);
+
+        // Not a formula: one run per side of the caret, uncoloured. `A1` here
+        // is text, not a reference.
+        assert_eq!(runs("A1 note", 3), vec![plain("A1 "), plain("note")]);
+        assert_eq!(runs("", 0), Vec::new());
+
+        // Offsets are char indices into the whole buffer, so a click in any run
+        // lands on the right caret position even past multibyte text.
+        assert_eq!(edit_runs("=\"é\"&C3", 7).iter().map(|(o, _, _)| *o).collect::<Vec<_>>(), vec![0, 5]);
+        assert_eq!(runs("=\"é\"&C3", 7), vec![plain("=\"é\"&"), refd("C3", 0)]);
+        // Half-typed input colours nothing and still splits at the caret.
+        assert_eq!(runs("=SUM(", 5), vec![plain("=SUM(")]);
+        assert_eq!(runs("=SUM(", 2), vec![plain("=S"), plain("UM(")]);
     }
 
     #[test]
