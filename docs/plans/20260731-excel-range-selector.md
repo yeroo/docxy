@@ -260,9 +260,15 @@ Dependencies identified:
   - ⚠️ the ROOT workspace still warns in `comshimcore`, `docxcore`, `ribbonspec`, `xlsxy`, `xlcomshim` and `wordcomshim` — all pre-existing and in crates this plan never touched, so left alone.
 
 ### Task 12: [Final] Update documentation
-- [ ] document the range selector in the suite's docs: how pointing works, which inputs accept it, and the reference syntax supported (same-sheet `A1:D5`)
-- [ ] update README.md if the feature list mentions charting or formula editing
-- [ ] record in the project knowledge doc the two traps this work depends on: the list swallowing mouse-down, and per-cell edge rendering being the only exact way to outline a range
+- [x] document the range selector in the suite's docs: how pointing works, which inputs accept it, and the reference syntax supported (same-sheet `A1:D5`)
+  - ➕ the suite had NO docs directory — new `suite/docs/range-selector.md`, the first one. Sections: pointing (press/drag/release, the frozen-rows `None`), typing in a field (the key table, the per-target message), a table of the nine `RefTarget`s and what each commit does, the syntax `parse_ref_text` accepts (with what it rejects), formula pointing (insert-vs-replace, function names, the trailing `:`), reference colours, the traps, and how to test.
+  - every function, key and behaviour named in it was re-read out of `main.rs` rather than taken from this plan's prose
+  - ➕ fixed a doc comment that had been duplicated onto one line above `range_a1`
+- [x] update README.md if the feature list mentions charting or formula editing
+  - ⚠️ NO change needed, and the condition is the reason. README's formula-editing and chart claims are all about the ratatui TUIs and the VS Code / JetBrains editors — none of which gained the range selector — and its "charts … preserved byte-for-byte" line still holds there, since a chart part is only regenerated when `ChartData::edited` is set and nothing outside the suite sets it. The GPUI desktop suite is not mentioned in README at all; advertising an unreleased app is a product call, not a documentation one.
+- [x] record in the project knowledge doc the two traps this work depends on: the list swallowing mouse-down, and per-cell edge rendering being the only exact way to outline a range
+  - both are in the new doc's "Traps this rests on" section, with the fix (`cell_at`/`grid_press`) and the failure mode (drift on content-tall rows) spelled out, plus the third structural one: the suite is a separate workspace, so a green suite build says nothing about `xlsxy`/`gridwasm`/the TUIs
+  - also written into the session-persistent suite knowledge doc, together with the `SendKeys`-vs-gpui harness note
 
 ## Technical Details
 

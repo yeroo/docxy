@@ -1,0 +1,199 @@
+# The range selector
+
+Every input in the suite that asks for cells is the same input. Focus it and it
+takes the keyboard; click or drag on the grid and it writes what you pointed at;
+the cells it names are washed and outlined while you work. This document
+describes that field, the inputs that use it, and the reference syntax it
+accepts.
+
+Implementation: `suite/docxy/src/main.rs` (`RefTarget`, `RangeEdit`, `ref_field`,
+`ref_commit`, `cell_at`, `formula_pick_to`, `formula_ref_tokens`, `edit_runs`).
+
+## Pointing
+
+A range field is *pointable* when its target names cells rather than text
+(`RefTarget::is_range`). While one is focused, the grid stops selecting and
+starts pointing:
+
+- **Press** plants the anchor on the cell under the pointer — the cell you
+  pressed on, not the first one you move into.
+- **Drag** grows the reference from that anchor; the field's text is rewritten
+  on every move, so a drag produces one reference, not one per cell crossed.
+- **Release** after a real drag commits the range straight away, the way
+  dragging a new source range does in Excel. A plain click only writes the cell
+  into the field — press Enter to commit it.
+- A pick **replaces** the field's whole buffer. Nothing is appended.
+
+The chart's own range and the entry bars also **wash** the cells they name while
+you type (`range_preview`), and a pointed range that is scrolled off-screen is
+revealed (`reveal_range`). A series or a title doesn't wash — it would only
+clutter the grid.
+
+⚠️ `cell_at` returns `None` on sheets with **frozen rows**: they render outside
+the virtualized list, so the list's measured bounds can't locate a press there.
+Those sheets fall back to the older behaviour — the drag anchors on the first
+cell the pointer moves into. Frozen columns are fine; column hit-testing is
+arithmetic over the same widths the renderer uses.
+
+## Typing in a field
+
+The field owns its own buffer — there is no `gpui-component` `InputState`
+anywhere in this app — and receives keys through `sheet_key` → `range_edit_key`:
+
+| Key | Does |
+|-----|------|
+| click an idle field | focus it and select all, so typing replaces the value |
+| click / drag inside the text | place the caret · select a run |
+| ← → Home End (+Shift) | move the caret · extend the selection |
+| Ctrl+A | select all |
+| Backspace · Delete | delete the selection, else one character |
+| Enter | commit through `ref_commit` |
+| Escape | abandon the edit, leaving the committed value |
+
+Under the field sits whatever the last commit said about it — `"Applies to
+D2:D5"`, or `"\"total\" isn't a range like A1:D5"` — falling back to the field's
+static help line when there's nothing to report (`ref_msg`, keyed by target so
+fields can't show each other's messages).
+
+## Which inputs accept a range
+
+One `RefTarget` variant per input, one `ref_commit` arm per variant:
+
+| Target | Where | Commit does |
+|--------|-------|-------------|
+| `ChartRange` | Chart panel | replots the chart from the box |
+| `ChartTitle` | Chart panel | plain text — **not** pointable |
+| `SeriesName(i)` | series card | a ref reads that cell and is kept live; anything else is a literal name |
+| `SeriesValues(i)` | series card | re-reads **only** that series' numbers |
+| `Categories` | Chart panel | the category-axis labels |
+| `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
+| `Validation` | Data Validation bar | the cells the list applies to |
+| `Sort` | Sort bar | the rows to sort |
+| `TextToColumns` | Text to Columns bar | the cells to split |
+
+The four bars seed their field from the current selection when they open
+(`bar_target` → `bar_open`), so leaving the field alone does exactly what the
+bar did before it had one. Sort seeds from the *region it would find* — header
+already dropped — for the same reason. At apply time `bar_cells()` is the
+field's range when it names one, else the selection.
+
+A bar owns the keyboard while it is open, so `sheet_key` asks its range field
+first (`RefTarget::is_bar`) — otherwise what you type lands in the bar's own
+buffer.
+
+Series can also be added, removed and reordered from the panel. The last series
+can't be removed (a chart with none is not renderable, and Excel won't let you
+get there either), and a series' colour lives on the series, so it travels
+through a reorder.
+
+## Reference syntax
+
+Same-sheet rectangles in A1 form. `parse_ref_text` accepts:
+
+- `A1:D5`, in any case, with surrounding space
+- `C3` — a single cell is a one-cell range
+- `$A$1:$D$5` — `$` anchors are accepted and ignored
+- `Budget!A1:D5`, `'My Sheet'!A1:D5` — the sheet prefix is dropped, since
+  pointing can't reach another sheet
+- `D5:A1` — corners in either order name the same box
+
+Anything else is rejected with a message quoting what was typed. Cross-sheet,
+multi-area, whole-column (`A:C`), whole-row, 3D and structured references still
+work **in formulas** — they just can't be built by pointing, and the outline
+skips them.
+
+## Pointing while typing a formula
+
+Formula pointing shares the pointing service but not the field: the cell edit
+already owns its buffer. It is active whenever the live edit buffer starts with
+`=` (`formula_pick_active`), so ordinary cell editing is untouched — click a
+cell while typing text and it still commits and moves, as before.
+
+With `=SUM(` typed and the caret at the end, clicking or dragging cells writes
+the reference in. Whether a pick **inserts** or **replaces** is `ref_token_at`:
+
+- after an operator, a comma or an open bracket → insert
+- inside or immediately after a reference → replace it
+- a token followed by `(` is a **function name**, not a reference: `LOG10(`
+  parses as column LOG row 10 otherwise, the same ambiguity Excel resolves this
+  way
+- a trailing `:` belongs to the reference under the caret, so pointing after a
+  half-typed `=SUM(D2:` completes it to `=SUM(D2:D5` instead of leaving
+  `=SUM(D2:D2:D5`
+
+Each move during a drag re-splices from the buffer and caret **as they were at
+the press**, so the drag rewrites one reference. The edit itself stays intact
+throughout, so Enter and Escape still commit and cancel the formula, and the fx
+bar and the in-cell editor read the same buffer.
+
+## Reference colours
+
+`formula_ref_tokens` scans the buffer once for every reference, returning where
+each sits in the text and which cells it names. That one scan feeds both the
+grid and the text, so they cannot disagree. It skips function names, other
+sheets' cells (this grid can't outline them) and anything inside a string
+literal.
+
+Each reference gets a colour by index from a six-entry palette (`ref_color`,
+wrapping past the end). On the grid its cells are outlined and lightly tinted in
+that colour — kept distinguishable from the picked-range wash. In the text,
+`edit_runs` splits the buffer at the caret *and* at every token boundary, each
+run carrying its reference index, so a caret standing inside a reference splits
+it without either half losing its colour, and clicking any run still places the
+caret. A buffer that isn't a formula gets no colouring: `A1` typed as text stays
+text.
+
+## Traps this rests on
+
+Two properties of the GPUI grid that this feature depends on. Both are easy to
+undo by accident.
+
+**The virtualized `list` swallows child `on_mouse_down`.** Cells only ever see
+`on_click` and `on_mouse_move`. That is why a press can't be handled by the cell
+it lands on, and why drags used to anchor on the first cell the pointer *moved
+into* — a papercut for selection, but a correctness bug for pointing. The fix is
+a grid-level `on_mouse_down` that hit-tests the position itself (`cell_at`, →
+`grid_press`): columns by summing `col_px(col_width(c))` from `col0`, rows from
+`ListState::bounds_for_item` + `viewport_bounds`. Don't move anchoring back into
+the cells; it will silently stop firing.
+
+**Per-cell edge rendering is the only exact way to outline a range.** The range
+outline, the fill handle and the formula ref outlines are drawn by the *edge
+cells themselves* — an absolutely-positioned child, `deferred` to escape the
+cell's overflow clip. The chart overlay's approach (reconstructing row positions
+from a uniform row height) drifts on rows whose height comes from their content,
+which is already visible on the sample sheet. Any new overlay that has to line
+up with cells must use the per-cell technique.
+
+A third, structural one: the suite is a **separate cargo workspace**. `gridcore`
+types are also built as literals by `xlsxy`, `gridwasm` and the TUIs in the root
+workspace, and only `cargo build --all-targets` at the root notices when a model
+change breaks them. A green suite build says nothing.
+
+## Testing
+
+gpui's headless harness can't compile this crate (see
+[`../docxy/tests/README.md`](../docxy/tests/README.md)), so anything worth
+testing is extracted as a free function and covered by plain `#[test]`s in
+`main.rs`:
+
+```sh
+cargo test --manifest-path suite/Cargo.toml   # the pure helpers
+cargo test -p gridcore                        # the chart model + xlsx round-trip
+```
+
+Covered that way: `parse_ref_text`, `range_a1`, `sel_range`, `col_at_x`,
+`row_at_index`/`row_index_of`, `series_remove`/`series_move`, `ref_token_at`,
+`replace_ref`, `formula_ref_tokens`, `edit_runs`, `ref_color`, `sort_rows_from`,
+`bar_range_text`.
+
+Everything else — input routing, point mode, the outlines — can only be checked
+by driving the real binary: launch `suite/target/debug/suite.exe`, assert the
+window owns the foreground **before sending any input** (without that guard a
+stray drag lands in whatever window you are actually working in), then drive
+Win32 mouse/keys and screenshot.
+
+⚠️ `SendKeys` is unusable against gpui: its `+`/`^`/`%` modifiers arrive as real
+shift presses and the shifted characters come out wrong (`=B2*C2+SUM(D2:D5`
+types as `=B2*C2Sum9d2;d5`). Send virtual-key down/up pairs via `SendInput`
+with shift held per `VkKeyScanW` instead.

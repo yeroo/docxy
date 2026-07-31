@@ -1470,7 +1470,7 @@ fn ref_color(i: usize) -> u32 {
     REF_COLORS[i % REF_COLORS.len()]
 }
 
-/// A range as the A1 text a field shows./// A range as the A1 text a field shows.
+/// A range as the A1 text a field shows.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
