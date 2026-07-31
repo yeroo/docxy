@@ -305,6 +305,14 @@ enum RefTarget {
     SeriesValues(usize),
     /// The cells holding the category labels.
     Categories,
+    /// The cells a conditional-formatting rule applies to.
+    CondFormat,
+    /// The cells a data-validation list applies to.
+    Validation,
+    /// The rows a sort runs over.
+    Sort,
+    /// The cells Text-to-Columns splits.
+    TextToColumns,
 }
 
 impl RefTarget {
@@ -312,6 +320,24 @@ impl RefTarget {
     /// mode while it has the keyboard.
     fn is_range(self) -> bool {
         !matches!(self, RefTarget::ChartTitle)
+    }
+
+    /// Does this field belong to one of the sheet entry bars? Those bars own
+    /// the keyboard while they are open, so their range field has to be asked
+    /// first — otherwise what you type lands in the bar's own buffer.
+    fn is_bar(self) -> bool {
+        matches!(self, RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort | RefTarget::TextToColumns)
+    }
+}
+
+/// The range field a sheet action opens, if that action has one.
+fn bar_target(act: SheetAct) -> Option<RefTarget> {
+    match act {
+        SheetAct::CondFormat => Some(RefTarget::CondFormat),
+        SheetAct::DataValidation => Some(RefTarget::Validation),
+        SheetAct::CustomSort => Some(RefTarget::Sort),
+        SheetAct::TextToColumns => Some(RefTarget::TextToColumns),
+        _ => None,
     }
 }
 
@@ -672,9 +698,7 @@ impl SheetView {
     }
     /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
     fn range(&self) -> (u32, u32, u32, u32) {
-        let (ar, ac) = self.sel;
-        let (br, bc) = self.anchor;
-        (ar.min(br), ac.min(bc), ar.max(br), ac.max(bc))
+        sel_range(self.sel, self.anchor)
     }
     /// Whether more than one cell is selected.
     fn has_range(&self) -> bool {
@@ -868,6 +892,9 @@ struct Docxy {
     sheet_sort_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
+    // The cells the open entry bar acts on, as its range field shows them.
+    // Seeded from the selection when the bar opens; None = no bar open.
+    bar_range: Option<String>,
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -1407,6 +1434,30 @@ fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
 }
 
+/// The rectangle a selection covers, whichever corner it was dragged from.
+fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
+    let ((ar, ac), (br, bc)) = (sel, anchor);
+    (ar.min(br), ac.min(bc), ar.max(br), ac.max(bc))
+}
+
+/// What a bar's range field makes of what was typed: the cells in normal A1
+/// form, or the complaint to show under the field.
+fn bar_range_text(text: &str) -> Result<String, String> {
+    match parse_ref_text(text) {
+        Some(r) => Ok(range_a1(r)),
+        None => Err(format!("\"{}\" isn't a range like A1:D5", text.trim())),
+    }
+}
+
+/// The rows a sort runs over: a field naming more than one row sorts exactly
+/// those, anything else falls back to the region found around the cursor.
+fn sort_rows_from(field: Option<(u32, u32, u32, u32)>, region: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match field {
+        Some((r0, _, r1, _)) if r1 > r0 => Some((r0, r1)),
+        _ => region,
+    }
+}
+
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
 fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
     use gridcore::sheet::cell_name;
@@ -1709,6 +1760,7 @@ impl Docxy {
             sheet_ttc_edit: None,
             sheet_sort_edit: None,
             sheet_rowh_edit: None,
+            bar_range: None,
         }
     }
 
@@ -1989,6 +2041,55 @@ impl Docxy {
             RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
             RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
             RefTarget::Categories => self.categories_apply(text, cx),
+            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort | RefTarget::TextToColumns => self.bar_range_apply(target, text, cx),
+        }
+    }
+
+    /// Re-point the open entry bar. The bar itself does nothing until its own
+    /// Enter — this only says which cells it will act on.
+    fn bar_range_apply(&mut self, target: RefTarget, text: &str, cx: &mut Context<Self>) {
+        match bar_range_text(text) {
+            Ok(a1) => {
+                self.ref_msg = Some((target, true, format!("Applies to {a1}")));
+                self.bar_range = Some(a1);
+            }
+            Err(m) => self.ref_msg = Some((target, false, m)),
+        }
+        cx.notify();
+    }
+
+    /// The cells the open bar acts on: its range field when that names one,
+    /// else the selection — which is what these bars always used.
+    fn bar_cells(&self) -> Option<(u32, u32, u32, u32)> {
+        self.bar_range
+            .as_deref()
+            .and_then(parse_ref_text)
+            .or_else(|| self.active_sheet().map(|v| v.range()))
+    }
+
+    /// Open a bar's range field on the selection, so it starts out saying what
+    /// the bar would have done anyway.
+    fn bar_open(&mut self, target: RefTarget) {
+        let seed = match target {
+            // A sort's box is the region it would find, header already dropped.
+            RefTarget::Sort => self.sheet_sort_bounds().and_then(|(top, bottom)| {
+                let max_c = self.active_sheet().map(|v| v.extent().1)?;
+                Some(range_a1((top, 0, bottom, max_c)))
+            }),
+            _ => None,
+        };
+        self.bar_range = Some(seed.or_else(|| self.active_sheet().map(|v| range_a1(v.range()))).unwrap_or_default());
+        self.ref_msg = None;
+    }
+
+    /// A bar closed: drop its range field along with it.
+    fn bar_close(&mut self) {
+        self.bar_range = None;
+        if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
+            self.range_edit = None;
+        }
+        if matches!(&self.ref_msg, Some((t, _, _)) if t.is_bar()) {
+            self.ref_msg = None;
         }
     }
 
@@ -2433,7 +2534,9 @@ impl Docxy {
     /// grid outlines them so you can see what you are pointing the chart at.
     fn range_preview(&self) -> Option<(u32, u32, u32, u32)> {
         let f = self.range_edit.as_ref()?;
-        if f.target != RefTarget::ChartRange {
+        // The chart's own box and the entry bars wash the cells they name; a
+        // series or a title would only clutter the grid.
+        if f.target != RefTarget::ChartRange && !f.target.is_bar() {
             return None;
         }
         parse_ref_text(&f.buf)
@@ -3016,8 +3119,12 @@ impl Docxy {
     fn sheet_cf_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_cf_edit.clone() else { return };
         match key {
-            "escape" => self.sheet_cf_edit = None,
+            "escape" => {
+                self.sheet_cf_edit = None;
+                self.bar_close();
+            }
             "enter" => {
+                let cells = self.bar_cells();
                 if buf.trim().eq_ignore_ascii_case("clear") {
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
@@ -3026,17 +3133,17 @@ impl Docxy {
                         v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
-                } else if let Some((op, val, val2)) = parse_cf_input(&buf) {
+                } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
                         let s = v.active;
-                        let (r0, c0, r1, c1) = v.range();
-                        v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, val2.as_deref(), cf_preset_dxf());
+                        v.pkg.add_conditional_format(s, cells, op, &val, val2.as_deref(), cf_preset_dxf());
                         v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
                 }
                 self.sheet_cf_edit = None;
+                self.bar_close();
             }
             "backspace" => {
                 buf.pop();
@@ -3104,18 +3211,23 @@ impl Docxy {
     fn sheet_ttc_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_ttc_edit.clone() else { return };
         match key {
-            "escape" => self.sheet_ttc_edit = None,
+            "escape" => {
+                self.sheet_ttc_edit = None;
+                self.bar_close();
+            }
             "enter" => {
                 let delim = parse_delim(&buf);
-                self.sheet_snapshot();
-                if let Some(v) = self.active_sheet_mut() {
-                    let s = v.active;
-                    let (r0, c0, r1, _) = v.range();
-                    gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
-                    v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                if let Some((r0, c0, r1, _)) = self.bar_cells() {
+                    self.sheet_snapshot();
+                    if let Some(v) = self.active_sheet_mut() {
+                        let s = v.active;
+                        gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
+                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                    }
+                    self.mark_sheet_dirty();
                 }
-                self.mark_sheet_dirty();
                 self.sheet_ttc_edit = None;
+                self.bar_close();
             }
             "backspace" => {
                 buf.pop();
@@ -3168,11 +3280,13 @@ impl Docxy {
         match key {
             "escape" => {
                 self.sheet_sort_edit = None;
+                self.bar_close();
                 cx.notify();
             }
             "enter" => {
                 self.sheet_sort_edit = None;
                 self.sheet_commit_sort(&buf, cx);
+                self.bar_close();
             }
             "backspace" => {
                 buf.pop();
@@ -3237,20 +3351,23 @@ impl Docxy {
     fn sheet_dv_edit_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_dv_edit.clone() else { return };
         match key {
-            "escape" => self.sheet_dv_edit = None,
+            "escape" => {
+                self.sheet_dv_edit = None;
+                self.bar_close();
+            }
             "enter" => {
-                let items: Vec<&str> = buf.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-                if !items.is_empty() {
+                let items: Vec<String> = buf.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if let Some(cells) = self.bar_cells().filter(|_| !items.is_empty()) {
                     let f1 = format!("\"{}\"", items.join(","));
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
                         let s = v.active;
-                        let (r0, c0, r1, c1) = v.range();
-                        v.pkg.add_data_validation(s, (r0, c0, r1, c1), "list", "", &f1, None);
+                        v.pkg.add_data_validation(s, cells, "list", "", &f1, None);
                     }
                     self.mark_sheet_dirty();
                 }
                 self.sheet_dv_edit = None;
+                self.bar_close();
             }
             "backspace" => {
                 buf.pop();
@@ -3598,7 +3715,8 @@ impl Docxy {
         let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
             return;
         };
-        let Some((start, bottom)) = self.sheet_sort_bounds() else {
+        let field = self.bar_range.as_deref().and_then(parse_ref_text);
+        let Some((start, bottom)) = sort_rows_from(field, self.sheet_sort_bounds()) else {
             return;
         };
         self.sheet_snapshot();
@@ -4476,6 +4594,11 @@ impl Docxy {
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // An action that opens a bar with a range field seeds that field from
+        // the selection first, so the bar starts on the cells it always used.
+        if let Some(target) = bar_target(act) {
+            self.bar_open(target);
+        }
         match act {
             SheetAct::Cut => self.sheet_copy(true, cx),
             SheetAct::Copy => self.sheet_copy(false, cx),
@@ -4559,6 +4682,11 @@ impl Docxy {
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
             return self.sheet_rename_key(ev, key, cx);
+        }
+        // A bar's range field is asked before the bar it sits in, or the bar's
+        // own buffer would eat what is typed into the field.
+        if !ctrl && matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
+            return self.range_edit_key(ev, ctrl, shift, key, cx);
         }
         // The comment entry bar swallows typing until Enter (commit) / Esc.
         if self.sheet_comment_edit.is_some() {
@@ -8407,17 +8535,14 @@ impl Docxy {
     /// The conditional-format entry bar: type a comparison like ">500" to apply
     /// the Light-Red highlight rule to the selection.
     fn sheet_cf_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        use gridcore::sheet::cell_name;
-        let range = self.active_sheet().map(|v| {
-            let (r0, c0, r1, c1) = v.range();
-            format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
-        }).unwrap_or_default();
         let ent = cx.entity();
         let (ent_ok, ent_cancel) = (ent.clone(), ent.clone());
         h_flex()
-            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Highlight {range} where value")))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Highlight"))
+            .child(div().w(px(110.)).child(self.bar_range_field("cf-range", RefTarget::CondFormat, pal, cx)))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("where value"))
             .child(
                 div().w(px(160.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
                     .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
@@ -8437,18 +8562,27 @@ impl Docxy {
             .child(div().id("cf-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
                 .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
                 .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                    ent_cancel.update(cx, |this, cx| { this.sheet_cf_edit = None; cx.notify(); });
+                    ent_cancel.update(cx, |this, cx| { this.sheet_cf_edit = None; this.bar_close(); cx.notify(); });
                 }))
             .into_any_element()
+    }
+
+    /// The range field an entry bar carries: the cells it will act on, pointable
+    /// at the grid like any other reference.
+    fn bar_range_field(&self, id: &'static str, target: RefTarget, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let value = self.bar_range.clone().unwrap_or_default();
+        self.ref_field(id, target, value, "A1:D5", "", pal, cx)
     }
 
     /// The Text-to-Columns delimiter bar.
     fn sheet_ttc_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let ent_cancel = cx.entity();
         h_flex()
-            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("Split selected column by delimiter:"))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Split"))
+            .child(div().w(px(110.)).child(self.bar_range_field("ttc-range", RefTarget::TextToColumns, pal, cx)))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("by delimiter:"))
             .child(
                 div().w(px(150.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
                     .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
@@ -8459,7 +8593,7 @@ impl Docxy {
             .child(div().id("ttc-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
                 .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
                 .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                    ent_cancel.update(cx, |this, cx| { this.sheet_ttc_edit = None; cx.notify(); });
+                    ent_cancel.update(cx, |this, cx| { this.sheet_ttc_edit = None; this.bar_close(); cx.notify(); });
                 }))
             .into_any_element()
     }
@@ -8494,9 +8628,11 @@ impl Docxy {
         let ent = cx.entity();
         let ent_cancel = ent.clone();
         h_flex()
-            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort the region by"))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort"))
+            .child(div().w(px(110.)).child(self.bar_range_field("sort-range", RefTarget::Sort, pal, cx)))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("by"))
             .child(
                 div().w(px(220.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
                     .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
@@ -8507,7 +8643,7 @@ impl Docxy {
             .child(div().id("sort-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
                 .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
                 .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                    ent_cancel.update(cx, |this, cx| { this.sheet_sort_edit = None; cx.notify(); });
+                    ent_cancel.update(cx, |this, cx| { this.sheet_sort_edit = None; this.bar_close(); cx.notify(); });
                 }))
             .into_any_element()
     }
@@ -8538,17 +8674,14 @@ impl Docxy {
     /// The data-validation entry bar: type comma-separated allowed values to make
     /// the selection a dropdown list.
     fn sheet_dv_edit_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        use gridcore::sheet::cell_name;
-        let range = self.active_sheet().map(|v| {
-            let (r0, c0, r1, c1) = v.range();
-            format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
-        }).unwrap_or_default();
         let ent = cx.entity();
         let ent_cancel = ent.clone();
         h_flex()
-            .w_full().h(px(30.)).items_center().gap_2().px_2()
+            .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child(format!("Dropdown list for {range} (comma-separated):")))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("Dropdown list for"))
+            .child(div().w(px(110.)).child(self.bar_range_field("dv-range", RefTarget::Validation, pal, cx)))
+            .child(div().text_size(px(12.)).text_color(pal.dim).child("(comma-separated):"))
             .child(
                 div().flex_1().h(px(22.)).px_2().flex().items_center().rounded_sm()
                     .bg(hsla_u(0xffffff)).border_1().border_color(hsla_u(BRAND))
@@ -8559,7 +8692,7 @@ impl Docxy {
             .child(div().id("dv-cancel").px_2().py(px(2.)).rounded_sm().cursor_pointer().text_size(px(12.))
                 .bg(pal.panel).text_color(pal.fg).border_1().border_color(pal.border).child("Cancel")
                 .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                    ent_cancel.update(cx, |this, cx| { this.sheet_dv_edit = None; cx.notify(); });
+                    ent_cancel.update(cx, |this, cx| { this.sheet_dv_edit = None; this.bar_close(); cx.notify(); });
                 }))
             .into_any_element()
     }
@@ -8568,6 +8701,7 @@ impl Docxy {
     fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
         let buf = self.sheet_cf_edit.clone().unwrap_or_default();
         let buf = if buf.trim().is_empty() { ">500".to_string() } else { buf };
+        let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
             self.sheet_snapshot();
             if let Some(v) = self.active_sheet_mut() {
@@ -8576,17 +8710,17 @@ impl Docxy {
                 v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
             }
             self.mark_sheet_dirty();
-        } else if let Some((op, val, val2)) = parse_cf_input(&buf) {
+        } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
             self.sheet_snapshot();
             if let Some(v) = self.active_sheet_mut() {
                 let s = v.active;
-                let (r0, c0, r1, c1) = v.range();
-                v.pkg.add_conditional_format(s, (r0, c0, r1, c1), op, &val, val2.as_deref(), cf_preset_dxf());
+                v.pkg.add_conditional_format(s, cells, op, &val, val2.as_deref(), cf_preset_dxf());
                 v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
             }
             self.mark_sheet_dirty();
         }
         self.sheet_cf_edit = None;
+        self.bar_close();
         cx.notify();
     }
 
@@ -11454,6 +11588,79 @@ mod grid_geom_tests {
         assert_eq!(range_text((4, 0), (0, 3)), "A1:D5");
         // A single cell picks itself.
         assert_eq!(range_text((2, 2), (2, 2)), "C3:C3");
+    }
+
+    #[test]
+    fn bar_target_routes_each_action_to_its_field() {
+        use super::{bar_target, RefTarget, SheetAct};
+        assert_eq!(bar_target(SheetAct::CondFormat), Some(RefTarget::CondFormat));
+        assert_eq!(bar_target(SheetAct::DataValidation), Some(RefTarget::Validation));
+        assert_eq!(bar_target(SheetAct::CustomSort), Some(RefTarget::Sort));
+        assert_eq!(bar_target(SheetAct::TextToColumns), Some(RefTarget::TextToColumns));
+        // The bars without a range field — and everything else — get none.
+        assert_eq!(bar_target(SheetAct::Filter), None);
+        assert_eq!(bar_target(SheetAct::RowHeight), None);
+        assert_eq!(bar_target(SheetAct::Bold), None);
+    }
+
+    #[test]
+    fn bar_fields_are_ranges_and_take_the_keyboard_first() {
+        use super::RefTarget;
+        for t in [RefTarget::CondFormat, RefTarget::Validation, RefTarget::Sort, RefTarget::TextToColumns] {
+            assert!(t.is_bar(), "{t:?} sits inside a bar, so it is asked before the bar's own buffer");
+            assert!(t.is_range(), "{t:?} points at cells");
+        }
+        // The Chart panel's fields are not in a bar and must not steal its keys.
+        for t in [RefTarget::ChartRange, RefTarget::ChartTitle, RefTarget::Categories, RefTarget::SeriesValues(0), RefTarget::SeriesName(1)] {
+            assert!(!t.is_bar(), "{t:?} is a panel field");
+        }
+    }
+
+    #[test]
+    fn a_bar_seeds_its_field_from_the_selection() {
+        use super::{range_a1, sel_range};
+        let seed = |sel, anchor| range_a1(sel_range(sel, anchor));
+        // A block selection, dragged from either corner.
+        assert_eq!(seed((1, 1), (4, 3)), "B2:D5");
+        assert_eq!(seed((4, 3), (1, 1)), "B2:D5");
+        assert_eq!(seed((4, 1), (1, 3)), "B2:D5");
+        // One cell seeds itself, and still parses back.
+        assert_eq!(seed((0, 0), (0, 0)), "A1:A1");
+        assert_eq!(parse_ref_text(&seed((0, 0), (0, 0))), Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn bar_range_text_normalises_or_explains_itself() {
+        use super::bar_range_text;
+        // What is typed comes back in the form the bar will act on.
+        assert_eq!(bar_range_text("b2:d5"), Ok("B2:D5".to_string()));
+        assert_eq!(bar_range_text("  B2:D5 "), Ok("B2:D5".to_string()));
+        // Anchors are accepted and ignored; a backwards range is ordered.
+        assert_eq!(bar_range_text("$D$5:$B$2"), Ok("B2:D5".to_string()));
+        // A `Sheet!` prefix is dropped — pointing can't leave this sheet.
+        assert_eq!(bar_range_text("Sheet1!B2:D5"), Ok("B2:D5".to_string()));
+        // A single cell is a range of one.
+        assert_eq!(bar_range_text("C3"), Ok("C3:C3".to_string()));
+        // Anything else is reported under the field, quoting what was typed.
+        assert_eq!(bar_range_text(" hello "), Err("\"hello\" isn't a range like A1:D5".to_string()));
+        assert!(bar_range_text("").is_err());
+        assert!(bar_range_text("A1:").is_err());
+    }
+
+    #[test]
+    fn sort_uses_the_field_only_when_it_names_rows() {
+        use super::sort_rows_from;
+        let region = Some((1, 8));
+        // An explicit multi-row range sorts exactly those rows.
+        assert_eq!(sort_rows_from(Some((3, 0, 6, 2)), region), Some((3, 6)));
+        // One row, or one cell, says nothing useful — keep the found region.
+        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), region), region);
+        assert_eq!(sort_rows_from(None, region), region);
+        // With no region either, there is nothing to sort.
+        assert_eq!(sort_rows_from(Some((3, 0, 3, 2)), None), None);
+        assert_eq!(sort_rows_from(None, None), None);
+        // A field range still wins when no region was found.
+        assert_eq!(sort_rows_from(Some((0, 0, 4, 1)), None), Some((0, 4)));
     }
 
     #[test]

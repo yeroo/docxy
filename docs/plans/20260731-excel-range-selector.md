@@ -222,11 +222,20 @@ Dependencies identified:
 - [x] run tests (22 passed), then screenshot `=B2*C2+SUM(D2:D5)` mid-edit - three ranges outlined in blue, terracotta and purple, each tinted to match; the fx bar and the in-cell editor now draw `B2`, `C2` and `D2:D5` in those same three colours, and clicking `C2` in the fx bar puts the caret between its two (still terracotta) halves
 
 ### Task 10: Retrofit the other range inputs
-- [ ] add `CondFormat`, `Validation`, `Sort` and `TextToColumns` targets, each seeded from the current selection when its bar opens
-- [ ] give those bars a `ref_field` for their range, so they can be pointed at cells instead of only using the selection
-- [ ] apply through `ref_commit`, keeping each bar's existing behaviour when the range is left alone
-- [ ] write tests for seeding (selection → field text) and for commit routing per target
-- [ ] run tests, then screenshot conditional formatting applied to a pointed range - must pass before task 11
+- [x] add `CondFormat`, `Validation`, `Sort` and `TextToColumns` targets, each seeded from the current selection when its bar opens
+  - ➕ one seam does the seeding: `bar_target(act)` says which field an action opens, so `run_sheet_act` seeds before the match rather than in four arms
+  - ➕ Sort seeds from the region it would find (`sheet_sort_bounds`, header already dropped), not the raw selection — otherwise leaving the field alone would change what Sort did
+- [x] give those bars a `ref_field` for their range, so they can be pointed at cells instead of only using the selection
+  - the bars grew from a fixed `h(30)` to `min_h(30)` so the field's own message ("Applies to D2:D5", or a complaint) has room
+  - ➕ `RefTarget::is_bar()` + one check at the top of `sheet_key`: a bar owns the keyboard while open, so its field has to be asked first or the bar's buffer eats what you type
+  - ➕ `range_preview` now washes a bar's range too, so the cells a rule will hit are visible while you point at them
+- [x] apply through `ref_commit`, keeping each bar's existing behaviour when the range is left alone
+  - `bar_cells()` = the field's range, else the selection; CF, validation and text-to-columns all read it
+  - Sort goes through `sort_rows_from`: a field naming more than one row sorts exactly those, anything else keeps the found region
+- [x] write tests for seeding (selection → field text) and for commit routing per target
+  - ➕ extracted `sel_range(sel, anchor)` out of `SheetView::range` so seeding is testable without a workbook
+- [x] run tests, then screenshot conditional formatting applied to a pointed range - must pass before task 11
+  - 27 passed. Verified on screen: with A1 selected, Home ▸ Conditional Formatting opens seeded `A1:A1`; dragging D2:D5 writes it into the field, says "Applies to D2:D5" and washes those cells; Apply highlights 2398 and 998 only, leaving A1 alone — the rule went to the pointed range, not the selection. The sort bar seeds `A2:D5` (the region, header dropped) from a cell inside the table, and the validation and text-to-columns bars show their seeded `B2:B2`.
 
 ### Task 11: Verify acceptance criteria
 - [ ] verify every requirement in Overview is implemented: shared field, series UI, formula pointing, retrofit
