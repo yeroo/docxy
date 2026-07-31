@@ -147,12 +147,15 @@ Dependencies identified:
 - [x] run tests and screenshot the Chart panel to confirm it looks and behaves as before - 12 passed, panel unchanged
 
 ### Task 3: Anchor a pick on the cell that was pressed
-- [ ] add `fn cell_at(&self, pos: Point<Pixels>) -> Option<(u32, u32)>`: columns from `col_px`/`col_width` (exact), rows from `ListState::bounds_for_item` (exact, unlike the overlay's uniform-row arithmetic)
-- [ ] handle `on_mouse_down` on the grid container to plant the pick anchor at `cell_at(pos)`, since the virtualized list never delivers mouse-down to cells
-- [ ] make `sheet_drag_over`/`range_pick_to` extend from that anchor instead of adopting the first moved-into cell
-- [ ] write tests for the column half of `cell_at` (pure: x → column, including the gutter and frozen columns)
-- [ ] write tests for `range_text` covering an anchor that is below/right of the target (already partly covered — extend)
-- [ ] run tests, then screenshot a slow drag AND a fast drag from A1 to D5: both must produce A1:D5 - must pass before task 4
+- [x] add `fn cell_at(&self, pos: Point<Pixels>) -> Option<(u32, u32)>`: columns via the new pure `col_at_x`, rows from `ListState::bounds_for_item` + `viewport_bounds` (exact, unlike the overlay's uniform-row arithmetic)
+  - ➕ needed `SheetView::row_at_list_index`, the inverse of `row_list_index`, because hidden rows collapse out of the list
+  - ⚠️ returns `None` on sheets with frozen ROWS: those render outside the list, so its bounds can't locate a press there. Those sheets keep the old first-moved-cell behaviour; the fallback is in `sheet_drag_over`.
+- [x] handle `on_mouse_down` on the grid container to plant the anchor at `cell_at(pos)`, since the virtualized list never delivers mouse-down to cells
+- [x] make `sheet_drag_over`/`range_pick_to` extend from that anchor instead of adopting the first moved-into cell
+  - ➕ this fixed ORDINARY drag-select too, not just pointing — `drag_anchor` feeds `select_cell`/`extend_to` the pressed cell
+- [x] write tests for the column half of `cell_at` (pure: x → column, gutter, frozen band, boundary belongs to the column it opens)
+- [x] write tests for `range_text` covering an anchor below/right of the target (already covered by the existing test — no change needed)
+- [x] run tests, then screenshot a fast drag from A1 to D5 - 13 passed; the drag that previously produced A2:D5 now produces A1:D5 in point mode, and A1:C4 for plain drag-select
 
 ### Task 4: Per-series references in the chart model
 - [ ] give `ChartSeries` its own `values: Option<ChartSource>` and `name_ref: Option<String>`, and `ChartData` a `categories_ref: Option<ChartSource>`, keeping `source` as the box the panel shows

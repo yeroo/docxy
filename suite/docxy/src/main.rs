@@ -681,6 +681,14 @@ impl SheetView {
         let fr = (sh.freeze.0 as usize).min(30);
         vis_before.saturating_sub(fr)
     }
+    /// The sheet row a list index refers to — the inverse of `row_list_index`,
+    /// which the list needs because hidden rows collapse out of it.
+    fn row_at_list_index(&self, ix: usize) -> Option<u32> {
+        let sh = self.sheet();
+        let fr = (sh.freeze.0 as usize).min(30);
+        (0..u32::MAX).filter(|&r| !sh.row_hidden(r)).nth(fr + ix)
+    }
+
     /// The used extent (max row, max col) over the active sheet's cells + merges.
     fn extent(&self) -> (u32, u32) {
         let sh = self.sheet();
@@ -800,6 +808,8 @@ struct Docxy {
     // What the last commit said about a field, shown under it: which field, did
     // it work, and the text.
     ref_msg: Option<(RefTarget, bool, String)>,
+    // The cell a left press landed on, so a drag-select starts there.
+    drag_anchor: Option<(u32, u32)>,
     // A range being picked off the grid while a range field has the keyboard
     // (Excel's point mode): the anchor cell, and whether the pointer has moved
     // since the press — a press that never moves is a plain click, not a pick.
@@ -1190,6 +1200,31 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
         .into_any_element()
 }
 
+/// The column at `x` pixels from the grid's left edge: the gutter first, then
+/// the frozen columns, then the scrolled window from `col0`. `None` when `x`
+/// lands in the gutter, which is a row header rather than a cell.
+fn col_at_x(col_w_px: impl Fn(u32) -> f32, x: f32, fc: u32, col0: u32, max_col: u32) -> Option<u32> {
+    if x < SHEET_GUT {
+        return None;
+    }
+    let mut at = SHEET_GUT;
+    for c in 0..fc {
+        let w = col_w_px(c);
+        if x < at + w {
+            return Some(c);
+        }
+        at += w;
+    }
+    for c in col0..=max_col {
+        let w = col_w_px(c);
+        if x < at + w {
+            return Some(c);
+        }
+        at += w;
+    }
+    None
+}
+
 /// The cells a range field's text names, or `None` if it isn't a range. A
 /// `Sheet!` prefix is accepted and dropped — a chart plots the sheet it floats
 /// over, and pointing can't reach another one — and `$` anchors are ignored.
@@ -1479,6 +1514,7 @@ impl Docxy {
             chart_drag: None,
             range_edit: None,
             ref_msg: None,
+            drag_anchor: None,
             range_pick: None,
             keytips: KeyTip::Off,
             context_menu: None,
@@ -1772,6 +1808,55 @@ impl Docxy {
                 }
             }
         }
+    }
+
+    /// A press landed on the grid: remember which cell, so the drag that may
+    /// follow extends from there rather than from wherever the pointer first
+    /// crossed a boundary.
+    fn grid_press(&mut self, pos: Point<Pixels>, _cx: &mut Context<Self>) {
+        let Some(cell) = self.cell_at(pos) else { return };
+        if self.range_field_active() {
+            self.range_pick = Some((cell, false));
+        } else {
+            self.drag_anchor = Some(cell);
+        }
+    }
+
+    /// The cell under a window position, or `None` when the pointer isn't over
+    /// one (the gutter, the header, past the last column). Rows come from the
+    /// list's own measured bounds rather than a uniform row height, so this is
+    /// exact on content-tall rows too; columns come from the same widths the
+    /// renderer uses.
+    ///
+    /// This exists because the virtualized list never delivers `on_mouse_down`
+    /// to a cell, so a press can only be located by hit-testing it.
+    fn cell_at(&self, pos: Point<Pixels>) -> Option<(u32, u32)> {
+        let v = self.active_sheet()?;
+        let sh = v.sheet();
+        // Frozen rows render outside the list, so the list's bounds can't locate
+        // a press in that band; leave those sheets on the old behaviour.
+        if sh.freeze.0 > 0 {
+            return None;
+        }
+        let list_bounds = v.vlist.viewport_bounds();
+        let (x, y) = (f32::from(pos.x - list_bounds.left()), pos.y);
+        if y < list_bounds.top() || y > list_bounds.bottom() {
+            return None;
+        }
+        let fc = sh.freeze.1.min(64);
+        let col = col_at_x(|c| col_px(sh.col_width(c)), x, fc, v.col0.max(fc).min(255), 255)?;
+        // Walk the rendered rows from the scroll position until one contains y.
+        let top = v.vlist.logical_scroll_top().item_ix;
+        for ix in top..top.saturating_add(200) {
+            let Some(b) = v.vlist.bounds_for_item(ix) else { break };
+            if y >= b.top() && y < b.bottom() {
+                return v.row_at_list_index(ix).map(|r| (r, col));
+            }
+            if b.top() > pos.y {
+                break;
+            }
+        }
+        None
     }
 
     /// Is a range field holding the keyboard? Then the grid is in point mode:
@@ -2076,7 +2161,13 @@ impl Docxy {
         }
         if !self.sheet_dragging {
             self.sheet_dragging = true;
-            self.select_cell(row, col, cx); // anchor + sel at the drag origin
+            // The press located the origin; fall back to this cell when it
+            // couldn't (frozen rows, or a press outside the grid).
+            let (ar, ac) = self.drag_anchor.unwrap_or((row, col));
+            self.select_cell(ar, ac, cx);
+            if (ar, ac) != (row, col) {
+                self.extend_to(row, col, cx);
+            }
         } else {
             // Only re-render when the target cell actually changed.
             if self.active_sheet().is_some_and(|v| v.sel != (row, col)) {
@@ -10410,6 +10501,16 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
         .relative()
         .overflow_hidden()
         .bg(hsla_u(0xffffff))
+        // A press anywhere in the grid plants the drag anchor. The virtualized
+        // list never gives a cell its own mouse-down, so without this the anchor
+        // could only be the first cell the pointer MOVED into — which is a cell
+        // late whenever the press is near an edge.
+        .on_mouse_down(MouseButton::Left, {
+            let ent_dn = ent.clone();
+            move |ev, _w, cx| {
+                ent_dn.update(cx, |this, cx| this.grid_press(ev.position, cx));
+            }
+        })
         // Column-resize drag: track the pointer and release anywhere in the grid.
         .on_mouse_move(move |ev, _w, cx| {
             let at = (f32::from(ev.position.x), f32::from(ev.position.y));
@@ -10426,6 +10527,7 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             ent_up.update(cx, |this, cx| {
                 this.col_resize_end(cx);
                 this.sheet_dragging = false; // end any drag-select
+                this.drag_anchor = None;
                 this.sheet_fill_end(cx); // commit an auto-fill drag, if any
                 this.chart_drag_end(cx); // commit a chart move, if any
                 this.range_pick_end(cx); // replot a range picked off the grid
@@ -10571,7 +10673,7 @@ fn main() {
 
 #[cfg(test)]
 mod grid_geom_tests {
-    use super::{col_px, last_visible_col, parse_ref_text, range_text, row_height_px, scroll_col0_for_sel};
+    use super::{col_at_x, col_px, last_visible_col, parse_ref_text, range_text, row_height_px, scroll_col0_for_sel};
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
@@ -10622,6 +10724,30 @@ mod grid_geom_tests {
             let cend = last_visible_col(&w, col0, 500.0, 255);
             assert!(col0 <= sc && sc <= cend, "sc={sc} not in [{col0},{cend}]");
         }
+    }
+
+    #[test]
+    fn col_at_x_locates_the_pressed_column() {
+        // 100px columns, no frozen ones, scrolled so column 5 is leftmost.
+        let w = |_c: u32| 100.0f32;
+        let g = super::SHEET_GUT;
+        // The gutter is a row header, not a cell.
+        assert_eq!(col_at_x(&w, 0.0, 0, 5, 255), None);
+        assert_eq!(col_at_x(&w, g - 1.0, 0, 5, 255), None);
+        // First pixel past the gutter is the leftmost scrolled column.
+        assert_eq!(col_at_x(&w, g, 0, 5, 255), Some(5));
+        assert_eq!(col_at_x(&w, g + 99.0, 0, 5, 255), Some(5));
+        // A boundary belongs to the column it opens — the off-by-one that made
+        // a press near an edge anchor a cell late.
+        assert_eq!(col_at_x(&w, g + 100.0, 0, 5, 255), Some(6));
+        assert_eq!(col_at_x(&w, g + 250.0, 0, 5, 255), Some(7));
+
+        // Frozen columns come first and are always at the left, whatever col0 is.
+        assert_eq!(col_at_x(&w, g, 2, 9, 255), Some(0));
+        assert_eq!(col_at_x(&w, g + 150.0, 2, 9, 255), Some(1));
+        assert_eq!(col_at_x(&w, g + 200.0, 2, 9, 255), Some(9), "past the frozen band comes col0");
+        // Past the last column there is no cell.
+        assert_eq!(col_at_x(&w, 100_000.0, 0, 0, 255), None);
     }
 
     #[test]
