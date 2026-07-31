@@ -1406,9 +1406,8 @@ mod tests {
         assert_eq!(pkg.sect_pr().matches("<w:titlePg").count(), 1);
         let first = pkg.create_hf(true, "first").expect("first header");
         assert!(pkg.sect_pr().contains("w:type=\"first\""));
-        assert_eq!(
-            crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some(),
-            true
+        assert!(
+            crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some()
         );
         pkg.set_title_pg(false);
         assert!(!pkg.has_title_pg() && !pkg.sect_pr().contains("titlePg"));

@@ -271,7 +271,7 @@ impl Spacing {
     /// The line-spacing multiple (e.g. 1.0, 1.5, 2.0) when `line_rule` is `auto`
     /// (or absent, which Word treats as `auto`). `None` for `exact`/`atLeast`.
     pub fn line_multiple(&self) -> Option<f32> {
-        let auto = self.line_rule.as_deref().map_or(true, |r| r == "auto");
+        let auto = self.line_rule.as_deref().is_none_or(|r| r == "auto");
         if !auto {
             return None;
         }

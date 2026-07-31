@@ -3666,7 +3666,13 @@ impl App {
             gridcore::sheet::chart_from_range(sh, &sh.name, (r1, c1, r2, c2), kind)
         };
         let Some(data) = data else {
-            self.status = Some("Insert chart: no numeric columns in the selection".into());
+            // `chart_from_range` refuses both a header-only selection and one
+            // with nothing numeric under the header; say which.
+            self.status = Some(if r2 <= r1 {
+                "Insert chart: select the data rows too, not just the header".into()
+            } else {
+                "Insert chart: no numeric columns in the selection".to_string()
+            });
             return;
         };
         let sheet = self.sheet;
@@ -4525,7 +4531,7 @@ fn draw(app: &mut App, f: &mut Frame) {
             if vr.len() >= cap {
                 break;
             }
-            if !(show_hidden || !sheet.row_hidden(row)) {
+            if !show_hidden && sheet.row_hidden(row) {
                 continue;
             }
             let h = row_line_count(sheet, styles, row, vis_cols, d1904);
@@ -5420,7 +5426,7 @@ fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
     let start = d
         .sel
         .saturating_sub(list_h - 1)
-        .min(rows.len().saturating_sub(list_h).max(0));
+        .min(rows.len().saturating_sub(list_h));
     for (i, (label, color, active)) in rows.iter().enumerate().skip(start).take(list_h) {
         let mut spans: Vec<RSpan> = vec![RSpan::raw(if *active { "● " } else { "  " }.to_string())];
         if let Some((r, g, b)) = color {

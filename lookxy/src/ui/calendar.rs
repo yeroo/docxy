@@ -562,6 +562,17 @@ fn to_local(iso_utc: &str) -> LocalDateTime {
     }
 }
 
+/// A `YYYY-MM-DD` date `days` from now, for tests that need an event the
+/// agenda will actually list. `agenda_window` is relative to `unix_now()`
+/// (−7/+30 days), so a hard-coded fixture date silently drops out of the
+/// window as the calendar moves past it and every test that reloads the
+/// agenda starts failing on a date rather than on a code change.
+#[cfg(test)]
+pub(crate) fn test_date_from_now(days: i64) -> String {
+    let (y, m, d) = date_of_utc(&unix_to_iso8601(unix_now() + days * 86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// The `(year, month, day)` in the leading `YYYY-MM-DD` of a stored UTC
 /// timestamp — used for all-day events, whose date is absolute (floating) and
 /// must NOT be shifted by `to_local`'s offset conversion.

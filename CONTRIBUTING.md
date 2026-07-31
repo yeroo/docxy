@@ -10,15 +10,35 @@ cargo build --release
 
 Produces `target/release/docxy`.
 
+### Two workspaces
+
+The repo holds **two** cargo workspaces: the root one, and `suite/` — the GPUI
+desktop app, kept separate because it pins `gpui` to a git revision through its
+own `Cargo.lock` and its own `[workspace.lints]`. They share the `*core` crates
+by path.
+
+That split is load-bearing: a change to a `gridcore` / `docxcore` public type can
+compile green in one workspace while breaking the other, because only the root
+one builds `xlsxy`, `gridwasm` and the TUIs against those types. **Build and test
+both** whenever you touch a core crate's public API. CI (`.github/workflows/ci.yml`)
+only covers the root workspace, so the suite's tests are on you.
+
 ## Testing
 
 ```
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+
+cargo test --manifest-path suite/Cargo.toml
+cargo clippy --manifest-path suite/Cargo.toml --all-targets -- -D warnings
 ```
 
-The workspace is five crates, layered bottom-up:
+The desktop suite's grid, its range-selector fields and the two GPUI traps they
+rest on are written up in
+[`suite/docs/range-selector.md`](suite/docs/range-selector.md).
+
+The root workspace is five crates, layered bottom-up:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
   DEFLATE, XML pull parser) shared by both document formats.

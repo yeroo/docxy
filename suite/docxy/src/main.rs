@@ -224,6 +224,10 @@ struct SheetView {
     /// on the selection when it differs from this, so manual scrolling (arrows /
     /// wheel / thumb) can move the view away without being snapped back.
     follow_sel: (u32, u32),
+    /// A column a range field asked to be brought into view, scrolled to on the
+    /// next render. Only the render pass knows how wide the grid is, so
+    /// `reveal_range` can't work out a rightwards scroll itself.
+    reveal_col: Option<u32>,
 }
 
 /// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
@@ -264,6 +268,9 @@ const PIVOT_AGGS: [(gridcore::frame::Agg, &str); 6] = [
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
 struct SheetSnapshot {
     wb: gridcore::sheet::Workbook,
+    /// UI-authored charts live outside the workbook, so undoing a chart move,
+    /// delete or re-point needs them snapshotted alongside it.
+    charts: Vec<ChartView>,
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
@@ -737,6 +744,7 @@ impl SheetView {
     /// Restore this view from an undo/redo snapshot, rebuilding the recalc engine.
     fn restore(&mut self, snap: SheetSnapshot) {
         self.pkg.workbook = snap.wb;
+        self.charts = snap.charts;
         self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
         self.active = snap
             .active
@@ -938,8 +946,12 @@ struct Docxy {
     sheet_sort_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
     sheet_rowh_edit: Option<String>,
-    // The cells the open entry bar acts on, as its range field shows them.
-    // Seeded from the selection when the bar opens; None = no bar open.
+    // Which entry bar's range field is on screen, if any. Its seed depends on
+    // the bar (a sort's is the region it would find, not the selection).
+    bar_field: Option<RefTarget>,
+    // A range the user PINNED into that field, by typing it or pointing at it.
+    // While this is None the bar keeps following the selection, which is what
+    // these bars did before they grew a range field.
     bar_range: Option<String>,
 }
 
@@ -1459,6 +1471,28 @@ fn parse_ref_text(text: &str) -> Option<(u32, u32, u32, u32)> {
     gridcore::sheet::parse_range_name(cells)
 }
 
+/// The most cells a chart reads from one field. It plots a point per cell AND
+/// renders an element per point, so an unbounded range — `A1:A1048576` parses
+/// perfectly well — would allocate a million strings and ask the renderer for a
+/// million divs, every frame, rather than draw anything anyone wanted.
+const MAX_CHART_CELLS: u64 = 4096;
+
+/// A chart field's range, or what to tell the user. `example` is the shape that
+/// field wants, for the "isn't a range" message.
+fn chart_range_of(text: &str, example: &str) -> Result<(u32, u32, u32, u32), String> {
+    let Some(range) = parse_ref_text(text) else {
+        return Err(format!("\"{}\" isn't a range like {example}", text.trim()));
+    };
+    let (r1, c1, r2, c2) = range;
+    let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+    if cells > MAX_CHART_CELLS {
+        return Err(format!(
+            "that range is {cells} cells; a chart plots at most {MAX_CHART_CELLS}"
+        ));
+    }
+    Ok(range)
+}
+
 /// Drop series `i`, unless it is the last one — a chart with no series has
 /// nothing to draw, and Excel won't let you get there either. Reports whether
 /// it removed one.
@@ -1509,6 +1543,13 @@ fn ref_token_at(buf: &str, caret_chars: usize) -> Option<std::ops::Range<usize>>
         .unwrap_or(caret);
     if buf[end..].starts_with('(') {
         return None; // a function name
+    }
+    if buf[..start].ends_with('!') {
+        // `Sheet2!A1` — the cell half of another sheet's reference. Replacing it
+        // would silently repoint that reference at THIS sheet's picked cell, so
+        // a pick inserts instead. (`formula_ref_tokens` skips these for the same
+        // reason: we can only outline the sheet we are looking at.)
+        return None;
     }
     let token = &buf[start..end];
     // `D2:` is half a range — typed, not finished. It counts as the reference
@@ -1750,6 +1791,7 @@ fn new_sheet_surface() -> Surface {
         vlist: ListState::new(0, ListAlignment::Top, px(400.)),
         col0: 0,
         follow_sel: (0, 0),
+        reveal_col: None,
     })
 }
 
@@ -1775,6 +1817,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     vlist: ListState::new(0, ListAlignment::Top, px(400.)),
                     col0: 0,
                     follow_sel: (0, 0),
+                    reveal_col: None,
                 };
                 (
                     Surface::Sheet(view),
@@ -2053,6 +2096,7 @@ impl Docxy {
             sheet_ttc_edit: None,
             sheet_sort_edit: None,
             sheet_rowh_edit: None,
+            bar_field: None,
             bar_range: None,
         }
     }
@@ -2243,6 +2287,35 @@ impl Docxy {
         }
     }
 
+    /// The left button came up: end every grid drag that could be in flight and
+    /// commit what it did. Every step takes its state, so this is idempotent and
+    /// can be called from wherever the release lands — the grid, the panel that
+    /// swallows the event, or the window root when the pointer left both. Left
+    /// only on the grid, a release over the ribbon would leave (say) `sheet_fill`
+    /// armed, and the NEXT drag anywhere would commit an auto-fill nobody asked
+    /// for.
+    fn grid_release(&mut self, cx: &mut Context<Self>) {
+        self.col_resize_end(cx);
+        self.sheet_dragging = false; // end any drag-select
+        self.drag_anchor = None;
+        self.sheet_fill_end(cx); // commit an auto-fill drag, if any
+        self.chart_drag_end(cx); // commit a chart move, if any
+        self.range_pick_end(cx); // replot a range picked off the grid
+        self.formula_pick = None; // the reference stays; the drag is over
+    }
+
+    /// Drop everything keyed to the chart list: the selection itself, a drag in
+    /// flight, the panel's focused field and its message. All of them are bare
+    /// indices into ONE sheet's charts, so they mean something else the moment
+    /// that list changes underneath them (a sheet switch, a tab switch, an undo).
+    fn chart_drop_selection(&mut self) {
+        self.chart_sel = None;
+        self.chart_drag = None;
+        self.range_edit = None;
+        self.ref_msg = None;
+        self.range_pick = None;
+    }
+
     /// Where the idx-th chart of the active sheet lives. The overlay lays the
     /// cards out in this order too: authored charts first, then the drawings.
     fn chart_locate(&self, idx: usize) -> Option<ChartRef> {
@@ -2310,14 +2383,13 @@ impl Docxy {
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
         let cells = text.trim();
-        let Some(range) = parse_ref_text(text) else {
-            self.ref_msg = Some((
-                RefTarget::ChartRange,
-                false,
-                format!("\"{}\" isn't a range like A1:D5", text.trim()),
-            ));
-            cx.notify();
-            return;
+        let range = match chart_range_of(text, "A1:D5") {
+            Ok(r) => r,
+            Err(m) => {
+                self.ref_msg = Some((RefTarget::ChartRange, false, m));
+                cx.notify();
+                return;
+            }
         };
         let Some(mut data) = self.active_sheet().and_then(|v| {
             let sh = v.sheet();
@@ -2416,35 +2488,55 @@ impl Docxy {
         cx.notify();
     }
 
-    /// The cells the open bar acts on: its range field when that names one,
-    /// else the selection — which is what these bars always used.
+    /// The cells the open bar acts on: the range pinned into its field, else
+    /// whatever the field is showing — which follows the selection, exactly as
+    /// these bars did before they had a field at all.
     fn bar_cells(&self) -> Option<(u32, u32, u32, u32)> {
         self.bar_range
             .as_deref()
             .and_then(parse_ref_text)
-            .or_else(|| self.active_sheet().map(|v| v.range()))
+            .or_else(|| self.bar_seed())
     }
 
-    /// Open a bar's range field on the selection, so it starts out saying what
-    /// the bar would have done anyway.
+    /// What an untouched range field shows: the live selection, or for a sort
+    /// the region it would find (header already dropped).
+    fn bar_seed(&self) -> Option<(u32, u32, u32, u32)> {
+        if self.bar_field == Some(RefTarget::Sort) {
+            if let Some((top, bottom)) = self.sheet_sort_bounds() {
+                if let Some(max_c) = self.active_sheet().map(|v| v.extent().1) {
+                    return Some((top, 0, bottom, max_c));
+                }
+            }
+        }
+        self.active_sheet().map(|v| v.range())
+    }
+
+    /// Open a bar's range field. It starts unpinned, so until the user types a
+    /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        let seed = match target {
-            // A sort's box is the region it would find, header already dropped.
-            RefTarget::Sort => self.sheet_sort_bounds().and_then(|(top, bottom)| {
-                let max_c = self.active_sheet().map(|v| v.extent().1)?;
-                Some(range_a1((top, 0, bottom, max_c)))
-            }),
-            _ => None,
-        };
-        self.bar_range = Some(
-            seed.or_else(|| self.active_sheet().map(|v| range_a1(v.range())))
-                .unwrap_or_default(),
-        );
+        self.bar_field = Some(target);
+        self.bar_range = None;
         self.ref_msg = None;
+    }
+
+    /// Commit whatever is typed in a focused bar range field, for the commit
+    /// paths that don't come through the field's own Enter (the Apply button).
+    fn bar_flush(&mut self, cx: &mut Context<Self>) {
+        let Some((target, buf)) = self
+            .range_edit
+            .as_ref()
+            .filter(|f| f.target.is_bar())
+            .map(|f| (f.target, f.buf.clone()))
+        else {
+            return;
+        };
+        self.range_edit = None;
+        self.ref_commit(target, &buf, cx);
     }
 
     /// A bar closed: drop its range field along with it.
     fn bar_close(&mut self) {
+        self.bar_field = None;
         self.bar_range = None;
         if matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
             self.range_edit = None;
@@ -2460,30 +2552,37 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let Some(range) = parse_ref_text(text) else {
-            self.ref_msg = Some((
-                RefTarget::SeriesValues(i),
-                false,
-                format!("\"{}\" isn't a range like B2:B5", text.trim()),
-            ));
-            cx.notify();
-            return;
+        let range = match chart_range_of(text, "B2:B5") {
+            Ok(r) => r,
+            Err(m) => {
+                self.ref_msg = Some((RefTarget::SeriesValues(i), false, m));
+                cx.notify();
+                return;
+            }
         };
         let Some(v) = self.active_sheet() else { return };
         let sh = v.sheet();
         let name = sh.name.clone();
         let values = gridcore::sheet::range_numbers(sh, range);
+        let src = gridcore::sheet::ChartSource {
+            sheet: name,
+            range,
+            cat_col: range.1,
+        };
         let Some(s) = data.series.get_mut(i) else {
             return;
         };
         let n = values.len();
         s.values = values;
         s.col = (range.1 == range.3).then_some(range.1);
-        s.values_ref = Some(gridcore::sheet::ChartSource {
-            sheet: name,
-            range,
-            cat_col: range.1,
-        });
+        s.values_ref = Some(src.clone());
+        // The chart's box is the union of what it reads, so the DATA RANGE the
+        // panel shows covers this series too — otherwise it only caught up after
+        // a save/reload, when `parse_chart` re-unions the refs.
+        match &mut data.source {
+            Some(box_) => box_.union(&src),
+            None => data.source = Some(src),
+        }
         self.ref_msg = Some((RefTarget::SeriesValues(i), true, format!("{n} points")));
         self.chart_set_data(data, cx);
     }
@@ -2562,6 +2661,9 @@ impl Docxy {
             return;
         }
         self.range_edit = None;
+        // `ref_msg` is keyed by series index, and every index past `i` just
+        // shifted — the old message would surface under a different series.
+        self.ref_msg = None;
         self.chart_set_data(data, cx);
     }
 
@@ -2574,6 +2676,7 @@ impl Docxy {
             return;
         }
         self.range_edit = None;
+        self.ref_msg = None; // same index-keying as `series_delete`
         self.chart_set_data(data, cx);
     }
 
@@ -2582,14 +2685,13 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let Some(range) = parse_ref_text(text) else {
-            self.ref_msg = Some((
-                RefTarget::Categories,
-                false,
-                format!("\"{}\" isn't a range like A2:A5", text.trim()),
-            ));
-            cx.notify();
-            return;
+        let range = match chart_range_of(text, "A2:A5") {
+            Ok(r) => r,
+            Err(m) => {
+                self.ref_msg = Some((RefTarget::Categories, false, m));
+                cx.notify();
+                return;
+            }
         };
         let Some(v) = self.active_sheet() else { return };
         let sh = v.sheet();
@@ -2664,7 +2766,14 @@ impl Docxy {
                 break;
             };
             if y >= b.top() && y < b.bottom() {
-                return v.row_at_list_index(ix).map(|r| (r, col));
+                // A merged region renders as ONE cell at its top-left, and every
+                // other path reports that cell. Pressing in the middle of the
+                // merge has to agree, or a drag started inside one covers a
+                // different range than the same drag started outside it.
+                return v.row_at_list_index(ix).map(|r| match sh.merge_at(r, col) {
+                    Some((mr, mc, _, _)) => (mr, mc),
+                    None => (r, col),
+                });
             }
             if b.top() > pos.y {
                 break;
@@ -2777,14 +2886,19 @@ impl Docxy {
         if after == before {
             return;
         }
-        let Some((r0, c0, r1, _)) = after else { return };
+        let Some((r0, c0, r1, c1)) = after else {
+            return;
+        };
         if let Some(v) = self.active_sheet_mut() {
             // Reveal the far end first, then the near one: a range that fits
             // ends up wholly in view, and one that doesn't shows its start.
             let (near, far) = (v.row_list_index(r0), v.row_list_index(r1));
             v.vlist.scroll_to_reveal_item(far);
             v.vlist.scroll_to_reveal_item(near);
+            // A range to the LEFT can be scrolled to here; one to the right
+            // needs the grid width, which only the render pass knows.
             v.col0 = v.col0.min(c0);
+            v.reveal_col = Some(c1);
         }
     }
 
@@ -3029,9 +3143,11 @@ impl Docxy {
     /// grid outlines them so you can see what you are pointing the chart at.
     fn range_preview(&self) -> Option<(u32, u32, u32, u32)> {
         let f = self.range_edit.as_ref()?;
-        // The chart's own box and the entry bars wash the cells they name; a
-        // series or a title would only clutter the grid.
-        if f.target != RefTarget::ChartRange && !f.target.is_bar() {
+        // Every field that names cells outlines them — a series' values and the
+        // category labels most of all, since that is where you most need to see
+        // what you picked. The title isn't a range, so its text never parses as
+        // one by accident.
+        if !f.target.is_range() {
             return None;
         }
         parse_ref_text(&f.buf)
@@ -3043,11 +3159,12 @@ impl Docxy {
     /// `sheet_el`. `handle_hidden` is filled in there, where the chart cards'
     /// boxes are known.
     fn grid_overlay(&self) -> GridOverlay {
-        let range_preview = self.range_preview();
         GridOverlay {
             fill_preview: self.sheet_fill_preview(),
-            range_preview,
-            picking: range_preview.is_some() || self.range_field_active(),
+            range_preview: self.range_preview(),
+            // `range_preview` is Some only for a field that `is_range`, which is
+            // exactly what `range_field_active` asks.
+            picking: self.range_field_active(),
             formula_refs: self.formula_refs(),
             handle_hidden: false,
         }
@@ -3068,11 +3185,15 @@ impl Docxy {
         let Some(f) = self.sheet_fill.take() else {
             return;
         };
-        if f.to == (f.src.2, f.src.3) {
-            return; // never dragged off the source
+        let (br0, bc0, br1, bc1) = fill_box(f.src, f.to);
+        // Dragged back onto the source, or up/left off it — either way the box
+        // is the source and `autofill` would write nothing. Bail before the
+        // snapshot, or an idle flick of the handle costs an undo step and marks
+        // a clean workbook dirty.
+        if (br0, bc0, br1, bc1) == f.src {
+            return;
         }
         self.sheet_snapshot();
-        let (br0, bc0, br1, bc1) = fill_box(f.src, f.to);
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             // Only now does anything move: the cells fill and the selection grows
@@ -3145,8 +3266,15 @@ impl Docxy {
             v.sel = (0, 0);
             v.anchor = (0, 0);
             v.editing = None;
-            cx.notify();
+        } else {
+            return;
         }
+        // Everything below points into the sheet we just left.
+        self.chart_drop_selection();
+        self.bar_close();
+        self.sheet_fill = None;
+        self.formula_pick = None;
+        cx.notify();
     }
 
     /// Adjust `col0` (horizontal scroll) so the selected column stays visible in
@@ -3160,6 +3288,23 @@ impl Docxy {
             if v.col0 < fc {
                 v.col0 = fc;
             }
+            // Available width for the scrollable region excludes the pinned columns.
+            let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
+            let avail = (avail_w - frozen_w).max(80.0);
+            // A range field asked for a column: scroll just far enough right to
+            // show it, then leave the selection-following below alone.
+            if let Some(rc) = v.reveal_col.take() {
+                if rc >= fc {
+                    let col0 = v.col0;
+                    v.col0 = scroll_col0_for_sel(
+                        |c| col_px(v.sheet().col_width(c)),
+                        col0,
+                        fc,
+                        rc,
+                        avail,
+                    );
+                }
+            }
             // Only re-centre on the selection when it has actually moved; otherwise
             // leave col0 alone so manual scrolling (arrows/wheel/thumb) sticks.
             if v.sel == v.follow_sel {
@@ -3170,9 +3315,6 @@ impl Docxy {
             if sc < fc {
                 return; // a frozen column is always visible
             }
-            // Available width for the scrollable region excludes the pinned columns.
-            let frozen_w: f32 = (0..fc).map(|c| col_px(v.sheet().col_width(c))).sum();
-            let avail = (avail_w - frozen_w).max(80.0);
             let col0 = v.col0;
             v.col0 = scroll_col0_for_sel(|c| col_px(v.sheet().col_width(c)), col0, fc, sc, avail);
         }
@@ -3358,6 +3500,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             v.undo.push(SheetSnapshot {
                 wb: v.pkg.workbook.clone(),
+                charts: v.charts.clone(),
                 active: v.active,
                 sel: v.sel,
                 anchor: v.anchor,
@@ -3375,6 +3518,7 @@ impl Docxy {
             if let Some(snap) = v.undo.pop() {
                 v.redo.push(SheetSnapshot {
                     wb: v.pkg.workbook.clone(),
+                    charts: v.charts.clone(),
                     active: v.active,
                     sel: v.sel,
                     anchor: v.anchor,
@@ -3384,6 +3528,9 @@ impl Docxy {
             }
         }
         if done {
+            // The chart list just changed under it, so an index into it means
+            // something else now.
+            self.chart_drop_selection();
             self.mark_sheet_dirty();
         }
         cx.notify();
@@ -3395,6 +3542,7 @@ impl Docxy {
             if let Some(snap) = v.redo.pop() {
                 v.undo.push(SheetSnapshot {
                     wb: v.pkg.workbook.clone(),
+                    charts: v.charts.clone(),
                     active: v.active,
                     sel: v.sel,
                     anchor: v.anchor,
@@ -3404,6 +3552,7 @@ impl Docxy {
             }
         }
         if done {
+            self.chart_drop_selection();
             self.mark_sheet_dirty();
         }
         cx.notify();
@@ -4345,6 +4494,8 @@ impl Docxy {
         let Some(keys) = gridcore::edit::parse_sort_spec(text) else {
             return;
         };
+        // Only a PINNED range overrides the region the sort would find on its
+        // own; the field showing that region is not the user choosing it.
         let field = self.bar_range.as_deref().and_then(parse_ref_text);
         let Some((start, bottom)) = sort_rows_from(field, self.sheet_sort_bounds()) else {
             return;
@@ -5047,29 +5198,18 @@ impl Docxy {
     /// the live buffer split around a caret, each half a click-to-caret run
     /// (the formula bar's trick); otherwise the committed value, or a hint when
     /// that is empty. Under it sits whatever the last commit said about this
-    /// field, or `help` when there is nothing to report.
+    /// field, or `help` when there is nothing to report. `id` is a `String` so
+    /// the per-series fields can build theirs from the series index.
     fn ref_field(
         &self,
-        id: &'static str,
+        id: impl Into<String>,
         target: RefTarget,
         value: String,
         hint: &'static str,
         help: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.ref_field_dyn(id.to_string(), target, value, hint, help, cx)
-    }
-
-    /// `ref_field` for the repeated ones, whose ids are built per series.
-    fn ref_field_dyn(
-        &self,
-        id: String,
-        target: RefTarget,
-        value: String,
-        hint: &'static str,
-        help: &'static str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+        let id: String = id.into();
         let pal = Pal::of(cx);
         let ent = cx.entity();
         let editing = match &self.range_edit {
@@ -5300,7 +5440,7 @@ impl Docxy {
                                     )),
                             ),
                     )
-                    .child(self.ref_field_dyn(
+                    .child(self.ref_field(
                         format!("series-name-{si}"),
                         RefTarget::SeriesName(si),
                         sr.name.clone(),
@@ -5315,7 +5455,7 @@ impl Docxy {
                             .text_color(pal.dim)
                             .child("VALUES"),
                     )
-                    .child(self.ref_field_dyn(
+                    .child(self.ref_field(
                         format!("series-vals-{si}"),
                         RefTarget::SeriesValues(si),
                         vals,
@@ -5355,10 +5495,13 @@ impl Docxy {
                 let ent_up = ent.clone();
                 move |_ev, _w, cx| {
                     cx.stop_propagation();
-                    ent_up.update(cx, |this, _| {
+                    ent_up.update(cx, |this, cx| {
                         if let Some(f) = &mut this.range_edit {
                             f.dragging = false;
                         }
+                        // The panel eats this event, so the root never sees it:
+                        // end a grid drag that was released over the panel here.
+                        this.grid_release(cx);
                     });
                 }
             })
@@ -5576,8 +5719,10 @@ impl Docxy {
             return self.sheet_rename_key(ev, key, cx);
         }
         // A bar's range field is asked before the bar it sits in, or the bar's
-        // own buffer would eat what is typed into the field.
-        if !ctrl && matches!(&self.range_edit, Some(f) if f.target.is_bar()) {
+        // own buffer would eat what is typed into the field. Ctrl chords stay
+        // with the sheet — except Ctrl+A, which the focused field reads as
+        // "select this text", not "select the used range".
+        if matches!(&self.range_edit, Some(f) if f.target.is_bar()) && (!ctrl || key == "a") {
             return self.range_edit_key(ev, ctrl, shift, key, cx);
         }
         // The comment entry bar swallows typing until Enter (commit) / Esc.
@@ -5618,6 +5763,12 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.
+        // Without this it falls through to the sheet's select-all below, and the
+        // field's own handler is dead code.
+        if ctrl && key == "a" && self.range_edit.is_some() {
+            return self.range_edit_key(ev, ctrl, shift, key, cx);
+        }
         if ctrl {
             match key {
                 "s" => self.save_active(window, cx),
@@ -5763,6 +5914,12 @@ impl Docxy {
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i < self.tabs.len() {
             self.active = i;
+            // Same reason as `select_sheet`: these all index the document we
+            // were just on.
+            self.chart_drop_selection();
+            self.bar_close();
+            self.sheet_fill = None;
+            self.formula_pick = None;
             self.persist();
             self.refocus(window, cx);
         }
@@ -11302,7 +11459,13 @@ impl Docxy {
         target: RefTarget,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let value = self.bar_range.clone().unwrap_or_default();
+        // Unpinned, it shows the selection live, so what the field says and what
+        // Apply will do can't drift apart.
+        let value = self
+            .bar_range
+            .clone()
+            .or_else(|| self.bar_seed().map(range_a1))
+            .unwrap_or_default();
         self.ref_field(id, target, value, "A1:D5", "", cx)
     }
 
@@ -11653,6 +11816,9 @@ impl Docxy {
         } else {
             buf
         };
+        // The Apply button doesn't go through the field's Enter, so a range
+        // typed but not yet committed would be silently ignored.
+        self.bar_flush(cx);
         let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
             self.sheet_snapshot();
@@ -13048,7 +13214,6 @@ impl Render for Docxy {
         let sidebar = t.sidebar;
         let tab_active = t.tab_active;
         let pal = Pal::of(cx);
-        let _hover = pal.hover;
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
@@ -13757,6 +13922,10 @@ impl Render for Docxy {
                 if this.ruler_drag.is_some() {
                     this.ruler_drag_end(cx);
                 }
+                // A grid drag released off the grid (over the ribbon, the sheet
+                // tabs, outside the window) ends here; idempotent, so the grid's
+                // own handler having run first costs nothing.
+                this.grid_release(cx);
                 if this.selecting {
                     this.selecting = false;
                     let has_sel = matches!(this.tabs.get(this.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
@@ -13878,11 +14047,6 @@ fn label_lines(label: &str) -> Vec<String> {
 
 const SHEET_ROW_H: f32 = 21.0;
 const SHEET_GUT: f32 = 46.0;
-/// A chart card's footprint (see `chart_card`): its width is fixed, its height
-/// varies a little with the legend, so this is a representative value used only
-/// to tell which cells a card covers.
-const CHART_CARD_W: f32 = 360.0;
-const CHART_CARD_H: f32 = 215.0;
 
 /// The frozen column-letter header row (with drag-to-resize handles). Rendered
 /// once above the virtualized rows so it stays put while they scroll vertically.
@@ -14215,8 +14379,16 @@ fn sheet_row(
                 if shift {
                     this.extend_to(r, c, cx)
                 } else {
+                    // While a formula is being typed, a click POINTS at this
+                    // cell — the selection never moves, so neither opening an
+                    // editor on it (which would replace the half-typed
+                    // formula with this cell's contents) nor following its
+                    // link is what was asked for.
+                    let pointing = this.formula_pick_active();
                     this.select_cell(r, c, cx);
-                    if dbl {
+                    if pointing {
+                        // the reference is written; nothing else to do
+                    } else if dbl {
                         // Double-click enters inline edit mode (Excel-style).
                         this.sheet_begin_edit(None, cx);
                     } else if has_link {
@@ -14778,38 +14950,44 @@ fn sheet_el(
     let cc_frozen = comment_cells.clone();
     let cc_list = comment_cells.clone();
     // A chart card floating over the selection's corner owns those pixels, so
-    // the fill handle (which paints above every cell) stands down there. The
-    // card's cell span is derived from its fixed size, which is enough to know
-    // whether it covers the corner.
+    // the fill handle (which paints above every cell) stands down there. A card
+    // is drawn at its anchor, `chart_span_px` wide and tall — the same size the
+    // overlay uses, so a resized card hides the handle over exactly the cells it
+    // actually covers.
     let corner_under_chart = {
-        let anchors = view
+        let (br, bc) = (r1, c1);
+        let boxes = view
             .charts
             .iter()
             .filter(|c| c.sheet == view.active)
-            .map(|cv| cv.from)
+            .map(|cv| (cv.from, cv.to))
             .chain(
                 sh.drawings
                     .iter()
                     .filter(|d| matches!(d.kind, gridcore::sheet::DrawingKind::Chart(_)))
-                    .map(|d| d.from),
+                    .map(|d| (d.from, d.to)),
             );
-        // Hidden rows/columns measure zero, so both walks are bounded by a cell
-        // count as well as by the card's extent.
-        anchors.into_iter().any(|(ar, ac)| {
+        boxes.into_iter().any(|(from, to)| {
+            let (ar, ac) = from;
+            if br < ar || bc < ac {
+                return false;
+            }
+            let (cw, ch) = chart_span_px(sh, from, to);
+            // Hidden rows/columns measure zero, so both walks are bounded by a
+            // cell count as well as by the card's extent.
             let mut w = 0.0f32;
             let mut cc = ac;
-            while w < CHART_CARD_W && cc < ac + 64 {
+            while w < cw && cc < ac + 256 {
                 w += col_px(sh.col_width(cc));
                 cc += 1;
             }
             let mut h = 0.0f32;
             let mut rr = ar;
-            while h < CHART_CARD_H && rr < ar + 64 {
+            while h < ch && rr < ar + 1024 {
                 h += row_height_px(sh.row_height(rr), SHEET_ROW_H) + 1.0;
                 rr += 1;
             }
-            let (br, bc) = (view.range().2, view.range().3);
-            br >= ar && br < rr && bc >= ac && bc < cc
+            br < rr && bc < cc
         })
     };
     // The cards' boxes are only known here, so the fill handle's visibility is
@@ -15285,15 +15463,7 @@ fn sheet_el(
             });
         })
         .on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
-            ent_up.update(cx, |this, cx| {
-                this.col_resize_end(cx);
-                this.sheet_dragging = false; // end any drag-select
-                this.drag_anchor = None;
-                this.sheet_fill_end(cx); // commit an auto-fill drag, if any
-                this.chart_drag_end(cx); // commit a chart move, if any
-                this.range_pick_end(cx); // replot a range picked off the grid
-                this.formula_pick = None; // the reference stays; the drag is over
-            });
+            ent_up.update(cx, |this, cx| this.grid_release(cx));
         })
         .child(bar)
         .child(grid_area)
@@ -15472,9 +15642,10 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        col_at_x, col_px, edit_runs, formula_ref_tokens, last_visible_col, parse_ref_text,
-        range_a1, range_text, ref_color, ref_token_at, replace_ref, row_height_px,
-        scroll_col0_for_sel, series_move, series_remove,
+        chart_range_of, col_at_x, col_px, edit_runs, fill_box, formula_ref_tokens,
+        last_visible_col, parse_ref_text, range_a1, range_text, ref_color, ref_token_at,
+        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, series_move, series_remove,
+        shift_col, shift_row,
     };
 
     // A uniform-width sheet: every column is `w` px.
@@ -15618,6 +15789,93 @@ mod grid_geom_tests {
         // Nor is anything that simply doesn't name cells.
         assert_eq!(ref_token_at("=total", 6), None);
         assert_eq!(ref_token_at("", 0), None);
+    }
+
+    #[test]
+    fn ref_token_at_will_not_repoint_another_sheets_reference() {
+        // `Sheet2!A1` — replacing the cell half would silently swing that
+        // reference onto THIS sheet's picked cell. A pick inserts instead.
+        assert_eq!(ref_token_at("=Sheet2!A1", 10), None);
+        assert_eq!(ref_token_at("=SUM(Sheet2!A1:A5)", 17), None);
+        // The local reference alongside one is still replaceable.
+        assert_eq!(ref_token_at("=Sheet2!A1+B2", 13), Some(11..13));
+    }
+
+    #[test]
+    fn chart_range_of_bounds_what_a_chart_will_read() {
+        // A range a chart can plot comes back parsed.
+        assert_eq!(chart_range_of("B2:B5", "B2:B5"), Ok((1, 1, 4, 1)));
+        assert_eq!(chart_range_of(" c3 ", "B2:B5"), Ok((2, 2, 2, 2)));
+        // Anything that isn't a range says so, quoting the field's own example.
+        assert_eq!(
+            chart_range_of("total", "A2:A5"),
+            Err("\"total\" isn't a range like A2:A5".to_string())
+        );
+        // A whole column parses fine and would allocate a million cells — the
+        // point of the cap is that the field declines instead of hanging.
+        let err = chart_range_of("A1:A1048576", "B2:B5").unwrap_err();
+        assert!(err.contains("1048576 cells"), "got {err:?}");
+        assert!(err.contains("at most 4096"), "got {err:?}");
+        // The cap is inclusive at the boundary.
+        assert!(chart_range_of("A1:A4096", "B2:B5").is_ok());
+        assert!(chart_range_of("A1:A4097", "B2:B5").is_err());
+    }
+
+    #[test]
+    fn fill_box_extends_along_whichever_axis_was_pulled_furthest() {
+        let src = (1, 1, 2, 2); // B2:C3
+        // Pulled down three rows: rows grow, columns don't.
+        assert_eq!(fill_box(src, (5, 2)), (1, 1, 5, 2));
+        // Pulled right three columns: columns grow, rows don't.
+        assert_eq!(fill_box(src, (2, 5)), (1, 1, 2, 5));
+        // Diagonal: the longer pull wins; an equal pull goes down (`dr >= dc`).
+        assert_eq!(fill_box(src, (6, 4)), (1, 1, 6, 2));
+        assert_eq!(fill_box(src, (4, 6)), (1, 1, 2, 6));
+        assert_eq!(fill_box(src, (4, 4)), (1, 1, 4, 2));
+        // Back onto the source, or up/left off it, is the source itself — which
+        // is how `sheet_fill_end` knows there is nothing to fill.
+        assert_eq!(fill_box(src, (2, 2)), src);
+        assert_eq!(fill_box(src, (0, 0)), src);
+        assert_eq!(fill_box(src, (1, 0)), src);
+    }
+
+    #[test]
+    fn resize_axis_splits_a_grip_drag_into_offset_and_growth() {
+        // The far edge (+1) grows in place: no offset, size follows the drag.
+        assert_eq!(resize_axis(1, 40.0, 200.0, 100.0), (0.0, 40.0));
+        assert_eq!(resize_axis(1, -40.0, 200.0, 100.0), (0.0, -40.0));
+        // The near edge (-1) moves the card as it shrinks it.
+        assert_eq!(resize_axis(-1, 40.0, 200.0, 100.0), (40.0, -40.0));
+        // Neither edge can shrink past the minimum.
+        assert_eq!(resize_axis(1, -500.0, 200.0, 100.0), (0.0, -100.0));
+        assert_eq!(resize_axis(-1, 500.0, 200.0, 100.0), (100.0, -100.0));
+        // A grip that isn't on this axis leaves it alone.
+        assert_eq!(resize_axis(0, 40.0, 200.0, 100.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn shift_col_and_row_land_on_the_nearest_boundary() {
+        // Default sheet: uniform columns and rows, so the arithmetic is checkable.
+        let sh = gridcore::sheet::Sheet::default();
+        let cw = col_px(sh.col_width(0));
+        let rh = row_height_px(sh.row_height(0), super::SHEET_ROW_H) + 1.0;
+        // Less than half a cell rounds back; more than half rounds on.
+        assert_eq!(shift_col(&sh, 4, cw * 0.4), 4);
+        assert_eq!(shift_col(&sh, 4, cw * 0.6), 5);
+        assert_eq!(shift_col(&sh, 4, cw * 2.6), 7);
+        // The same rule going backwards.
+        assert_eq!(shift_col(&sh, 4, -cw * 0.4), 4);
+        assert_eq!(shift_col(&sh, 4, -cw * 0.6), 3);
+        assert_eq!(shift_col(&sh, 4, -cw * 2.6), 1);
+        // Column 0 is the wall — a drag off the left edge stops there.
+        assert_eq!(shift_col(&sh, 1, -cw * 50.0), 0);
+        // Rows behave the same, over their own heights.
+        assert_eq!(shift_row(&sh, 10, rh * 0.6), 11);
+        assert_eq!(shift_row(&sh, 10, -rh * 3.6), 6);
+        assert_eq!(shift_row(&sh, 2, -rh * 50.0), 0);
+        // No movement is no movement.
+        assert_eq!(shift_col(&sh, 7, 0.0), 7);
+        assert_eq!(shift_row(&sh, 7, 0.0), 7);
     }
 
     #[test]

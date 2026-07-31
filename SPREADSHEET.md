@@ -24,8 +24,10 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   own cached values — a scoreboard, not a claim (§8).
 - Grid editing UX with Excel muscle memory: formula bar, A1 navigation, range
   selection, fill-down semantics, ref-translating copy/paste.
-- Lossless save: everything unmodeled (charts, pivots, conditional formatting,
-  print setup…) preserved byte-for-byte.
+- Lossless save: everything unmodeled (pivots, conditional formatting, print
+  setup…) preserved byte-for-byte. Charts are now modeled (§4a), so an *edited*
+  chart is regenerated and a moved/deleted drawing has its anchor rewritten;
+  untouched ones still round-trip verbatim.
 - Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`.
 
 **Non-goals (at least initially)**
@@ -103,8 +105,17 @@ worksheet XML sources.
 **On save:**
 - Regenerate only `<sheetData>` (and `<cols>`/`<dimension>` when touched) and
   **splice** it into the original worksheet XML — sheet-level features we don't
-  model (conditional formatting, data validation, drawings, sheet views) ride
+  model (conditional formatting, data validation, sheet views) ride
   along untouched. This is the spreadsheet analogue of docxy's `sectPr` splice.
+- Rewrite the drawing part's anchors in place (`drawing::rewrite_anchors`) so a
+  moved or deleted drawing persists. Every other byte of that part survives —
+  including whole anchors for shapes and text boxes we don't model, which is
+  what `Drawing::anchor_ix` (an index over ALL anchors, not just parsed ones)
+  exists to get right. A chart this session authored carries its own new part
+  and is marked `ANCHOR_AUTHORED`, so it never claims an index in the old one.
+- Regenerate a chart part only when its `ChartData::edited` is set; an untouched
+  chart's `xl/charts/chartN.xml` is copied verbatim, keeping the formatting the
+  model doesn't carry.
 - Append new strings to `sharedStrings.xml` (existing entries untouched, so
   unedited rich-text strings survive), update its counts.
 - Drop `xl/calcChain.xml` (its content-type override and relationship too) and
@@ -116,6 +127,33 @@ worksheet XML sources.
 
 **Fidelity gate:** load → save → reload is semantically identical; saved files
 open cleanly in Excel; a corpus round-trip test enforces it (§8).
+
+### 4a. Charts as a live, range-backed model
+
+Charts were "unmodeled, preserved"; they are now read and written as *ranges*
+rather than as frozen number caches, which is what lets an editor repoint one.
+
+- **Parsing** (`gridcore::drawing::parse_chart`): each `<c:ser>`'s `<c:f>`
+  becomes that series' `values_ref` / `name_ref`, `<c:cat>`'s becomes the
+  chart's `categories_ref`, and a fill directly on the series gives its `color`.
+  The union of those refs is the chart's own box, `ChartData::source`.
+- **`ChartSource`** carries `(sheet, range, cat_col)` and knows how to write
+  itself back as an absolute `Sheet1!$B$2:$B$5` (`f_ref` / `to_ref` /
+  `header_ref`) and how to read one back (`parse_f_ref`), plus `union`.
+- **Building one from cells** (`sheet::chart_from_range`): the header row names
+  each series, the first mostly-non-numeric column supplies the category labels,
+  and every mostly-numeric column becomes a series. `range_numbers` /
+  `range_labels` read the cells a field points at.
+- **Writing** (`xlsx::chart_space_xml`): an edited chart is written with live
+  `numRef` / `strRef` refs *and* their caches, so Excel treats it as a real
+  chart bound to the cells and updates it when they change.
+- **Anchors are editable**: `Sheet::drawing_part`, `Sheet::drawings_removed` and
+  `Drawing::anchor_ix` are what let a save move or delete one drawing without
+  touching the rest of the part (see the save bullets above).
+
+Both editors use this: xlsxy's Insert ▸ Chart and the desktop suite's Chart
+panel, whose range fields are documented in
+[`suite/docs/range-selector.md`](suite/docs/range-selector.md).
 
 ---
 

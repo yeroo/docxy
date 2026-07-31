@@ -535,12 +535,19 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    /// The date `blank_form` sits on. Relative to now, because a saved form
+    /// only lands in `App::agenda` if it falls inside `agenda_window`'s
+    /// −7/+30 days — a hard-coded date quietly stops being visible there.
+    fn form_day() -> String {
+        crate::ui::calendar::test_date_from_now(1)
+    }
+
     fn blank_form() -> EventForm {
         EventForm {
             editing_id: None,
             title: String::new(),
-            start: "2026-07-20 14:00".into(),
-            end: "2026-07-20 15:00".into(),
+            start: format!("{} 14:00", form_day()),
+            end: format!("{} 15:00", form_day()),
             all_day: false,
             repeat: None,
             interval: "1".into(),
@@ -579,7 +586,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Standup"));
-        assert!(text.contains("2026-07-20 14:00"));
+        assert!(text.contains(&format!("{} 14:00", form_day())));
         assert!(text.contains("Invalid start time"));
     }
 

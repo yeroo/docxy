@@ -265,7 +265,10 @@ Dependencies identified:
   - every function, key and behaviour named in it was re-read out of `main.rs` rather than taken from this plan's prose
   - ➕ fixed a doc comment that had been duplicated onto one line above `range_a1`
 - [x] update README.md if the feature list mentions charting or formula editing
-  - ⚠️ NO change needed, and the condition is the reason. README's formula-editing and chart claims are all about the ratatui TUIs and the VS Code / JetBrains editors — none of which gained the range selector — and its "charts … preserved byte-for-byte" line still holds there, since a chart part is only regenerated when `ChartData::edited` is set and nothing outside the suite sets it. The GPUI desktop suite is not mentioned in README at all; advertising an unreleased app is a product call, not a documentation one.
+  - ⚠️ first judged as "no change needed"; **that was wrong on two counts** and was corrected in the code-review pass:
+    - the "charts … preserved byte-for-byte" line no longer holds. `save_xlsx` now regenerates an edited chart's part AND rewrites the drawing part's anchors, and `xlsxy`'s own Insert ▸ Chart (a shipped, `cargo install`-ed app) went through `chart_from_range`, so it writes a **live** chart where it used to write frozen `numLit`/`strLit` caches. README and SPREADSHEET.md §1/§4 now state the exception, and SPREADSHEET.md gained §4a on the range-backed chart model.
+    - the suite is NOT unreleased — `.github/workflows/release.yml` builds `suite.exe` and attaches `packaging/inno/suite.iss` as one of three installers on every tag. Leaving it out of README may still be the right product call, but not for that reason.
+  - CONTRIBUTING.md also gained the two-workspace build/test rule (a `gridcore` API change compiles green in `suite/` while breaking the root workspace — exactly what commit `fba3534` had to fix) and a pointer to `suite/docs/range-selector.md`, which nothing linked to.
 - [x] record in the project knowledge doc the two traps this work depends on: the list swallowing mouse-down, and per-cell edge rendering being the only exact way to outline a range
   - both are in the new doc's "Traps this rests on" section, with the fix (`cell_at`/`grid_press`) and the failure mode (drift on content-tall rows) spelled out, plus the third structural one: the suite is a separate workspace, so a green suite build says nothing about `xlsxy`/`gridwasm`/the TUIs
   - also written into the session-persistent suite knowledge doc, together with the `SendKeys`-vs-gpui harness note
@@ -316,7 +319,10 @@ the sample sheet.
   values and category labels should all be live references, not literals.
 
 **External system updates**:
-- `xlsxy` (TUI) shares `gridcore`: after the per-series model change, decide whether
-  its chart insert should set per-series refs too, or keep deriving them.
+- ~~`xlsxy` (TUI) shares `gridcore`: after the per-series model change, decide whether
+  its chart insert should set per-series refs too, or keep deriving them.~~
+  **Resolved on this branch** (commit `fba3534`): `insert_chart` calls
+  `gridcore::sheet::chart_from_range`, so the TUI writes per-series refs and a live
+  chart, same as the suite.
 - The comshims (`xlcomshim`) expose gridcore workbooks over COM; per-series refs may
   be worth surfacing there if a client asks for chart data.

@@ -12,6 +12,7 @@
 //!     return-value convention,
 //!   * each parameter (and the return) ABI-equivalent in type, honoring the two
 //!     deliberate flattenings (enum -> I4, interface pointer -> IUnknown).
+//!
 //! That is thousands of assertions — one per parameter across ~940 methods —
 //! covering every corner of the surface.
 //!

@@ -22,6 +22,11 @@ pub use win::DISP_IFACES;
 
 #[cfg(windows)]
 mod win {
+    // The vtable-stub arities in the `include!`d gen_*.rs are Word's, not
+    // ours: `#[interface]` gives each expanded slot the real interface's
+    // parameter list, and several of Word's run well past clippy's
+    // 7-argument advice. There is nothing here to refactor.
+    #![allow(clippy::too_many_arguments)]
     #![allow(non_snake_case)]
 
     use std::cell::RefCell;

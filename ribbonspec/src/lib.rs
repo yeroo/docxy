@@ -6,7 +6,8 @@
 //! renderers consume the same value:
 //!   * the terminal apps (docxy/xlsxy/… TUIs) draw it with ratatui, and
 //!   * the desktop suite draws it with GPUI (Fluent-2 skin).
-//! so one ribbon/command definition drives both, and a change lands in both.
+//!
+//! So one ribbon/command definition drives both, and a change lands in both.
 //!
 //! What the model *does* encode is layout INTENT that a faithful ribbon needs but
 //! that is renderer-independent:

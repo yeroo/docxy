@@ -1505,9 +1505,13 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             }
         }
         if let Some(dpart) = sheet.drawing_part.as_deref() {
+            // Only drawings READ from this part have an index in it; one we
+            // authored (`add_chart`) carries its own part and would otherwise
+            // move a stranger's anchor at the index it borrowed.
             let moves: Vec<crate::drawing::AnchorMove> = sheet
                 .drawings
                 .iter()
+                .filter(|d| d.anchor_ix != crate::sheet::ANCHOR_AUTHORED)
                 .map(|d| (d.anchor_ix, d.from, d.to))
                 .collect();
             if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
@@ -2096,15 +2100,9 @@ pub(crate) fn esc_attr(s: &str) -> String {
 
 /// A self-contained `chartSpace` for a clustered column chart, with categories
 /// and per-series values cached as literals (`strLit`/`numLit`) so it renders
-/// without the source range.
-/// The chart part a `ChartData` serializes to — exposed to sibling modules so
-/// their tests can round-trip parse → write → parse.
-#[cfg(test)]
-pub(crate) fn chart_space_xml_for_test(data: &crate::sheet::ChartData) -> String {
-    chart_space_xml(data)
-}
-
-fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
+/// without the source range. `pub(crate)` so sibling modules' tests can
+/// round-trip parse → write → parse.
+pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
     let ncat = data.categories.len().max(
         data.series
             .iter()
@@ -2915,10 +2913,13 @@ impl SheetPackage {
             }
         }
 
+        // Its anchor lives in the part we just wrote, not in whatever drawing
+        // part the sheet was loaded with, so the save-side anchor rewrite has to
+        // leave it (and every index in the old part) alone.
         self.workbook.sheets[sheet]
             .drawings
             .push(crate::sheet::Drawing {
-                anchor_ix: 0,
+                anchor_ix: crate::sheet::ANCHOR_AUTHORED,
                 from,
                 to,
                 kind: crate::sheet::DrawingKind::Chart(data.clone()),
@@ -3813,6 +3814,62 @@ mod tests {
         );
         assert_eq!(reopened.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
         assert_eq!(reopened.series[0].values, vec![2.0, 5.0]);
+    }
+
+    #[test]
+    fn adding_a_chart_never_moves_an_anchor_in_the_loaded_drawing_part() {
+        use crate::sheet::{ChartData, ChartSeries, DrawingKind};
+        // A sheet whose drawing part holds ONE anchor we don't model (a shape).
+        // `parse_drawings` therefore yields no Drawing, but `drawing_part` is
+        // still set, so a save runs the anchor rewrite over it.
+        let mut pkg = new_xlsx();
+        let dpart = "xl/drawings/drawing1.xml";
+        let shape = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:sp/><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+        pkg.parts
+            .push((dpart.to_string(), shape.as_bytes().to_vec()));
+        pkg.workbook.sheets[0].drawing_part = Some(dpart.to_string());
+        assert!(
+            pkg.workbook.sheets[0].drawings.is_empty(),
+            "the shape is not modelled"
+        );
+
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into()],
+            series: vec![ChartSeries {
+                name: "East".into(),
+                values: vec![1.0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // The chart lands far from the shape, on a part of its own.
+        pkg.add_chart(0, (20, 5), (35, 12), &data);
+        let saved = save_xlsx(&pkg);
+        let re = load_xlsx(&saved).unwrap();
+        let out =
+            String::from_utf8(re.part(dpart).expect("the old drawing part").to_vec()).unwrap();
+        assert_eq!(
+            out, shape,
+            "the shape's anchor must come back byte for byte"
+        );
+
+        // And deleting the authored chart must not strike the shape's anchor either.
+        let mut deleted = pkg.clone();
+        let gone = deleted.workbook.sheets[0]
+            .drawings
+            .pop()
+            .expect("the chart we just added");
+        assert!(matches!(gone.kind, DrawingKind::Chart(_)));
+        deleted.workbook.sheets[0]
+            .drawings_removed
+            .push(gone.anchor_ix);
+        let re = load_xlsx(&save_xlsx(&deleted)).unwrap();
+        let out =
+            String::from_utf8(re.part(dpart).expect("the old drawing part").to_vec()).unwrap();
+        assert_eq!(out, shape, "the shape survives an authored chart's delete");
     }
 
     #[test]

@@ -24,10 +24,13 @@ starts pointing:
   into the field — press Enter to commit it.
 - A pick **replaces** the field's whole buffer. Nothing is appended.
 
-The chart's own range and the entry bars also **wash** the cells they name while
-you type (`range_preview`), and a pointed range that is scrolled off-screen is
-revealed (`reveal_range`). A series or a title doesn't wash — it would only
-clutter the grid.
+Every field that names cells **washes and outlines** them while you type
+(`range_preview`) — a series' values and the category labels above all, since
+that is where you most need to see what you picked. A pointed range that is
+scrolled off-screen is revealed (`reveal_range`), in either direction: leftwards
+directly, rightwards on the next render, which is the first point that knows how
+wide the grid is. The chart title isn't a range (`RefTarget::is_range`), so its
+text is never parsed as one.
 
 ⚠️ `cell_at` returns `None` on sheets with **frozen rows**: they render outside
 the virtualized list, so the list's measured bounds can't locate a press there.
@@ -45,7 +48,7 @@ anywhere in this app — and receives keys through `sheet_key` → `range_edit_k
 | click an idle field | focus it and select all, so typing replaces the value |
 | click / drag inside the text | place the caret · select a run |
 | ← → Home End (+Shift) | move the caret · extend the selection |
-| Ctrl+A | select all |
+| Ctrl+A | select all — the field takes this ahead of the sheet's select-all |
 | Backspace · Delete | delete the selection, else one character |
 | Enter | commit through `ref_commit` |
 | Escape | abandon the edit, leaving the committed value |
@@ -100,7 +103,30 @@ Same-sheet rectangles in A1 form. `parse_ref_text` accepts:
 Anything else is rejected with a message quoting what was typed. Cross-sheet,
 multi-area, whole-column (`A:C`), whole-row, 3D and structured references still
 work **in formulas** — they just can't be built by pointing, and the outline
-skips them.
+skips them. Pointing next to one *inserts* rather than replaces
+(`ref_token_at` declines a token preceded by `!`), so a click can never swing
+`=Sheet2!A1` onto this sheet's cell behind your back.
+
+A chart field additionally caps what it will read at `MAX_CHART_CELLS`
+(`chart_range_of`). `A1:A1048576` parses perfectly well and would ask the
+renderer for a million elements every frame, so the field declines it with a
+count instead of hanging the window. The entry bars have no such cap — a
+conditional format over a whole column is a normal thing to want.
+
+### The entry bars follow the selection until you pin them
+
+`bar_range` is `None` until you type a range into the field or point at one. Up
+to that moment the field *displays* the live selection (`bar_seed`) and the bar
+acts on it, which is exactly what Conditional Formatting, Data Validation,
+Custom Sort and Text-to-Columns did before they had a field at all. Seeding the
+field on open instead would freeze it: you would open the bar, drag out the
+cells you meant, and Apply would still use whatever was selected beforehand.
+
+A sort's seed is not the selection but the region it would find on its own
+(`sheet_sort_bounds`), and only a *pinned* range overrides that.
+
+The Apply button flushes the focused field first (`bar_flush`), so a range typed
+but not yet Entered still counts.
 
 ## Pointing while typing a formula
 
@@ -145,8 +171,8 @@ text.
 
 ## Traps this rests on
 
-Two properties of the GPUI grid that this feature depends on. Both are easy to
-undo by accident.
+Properties of the GPUI grid that this feature depends on. All are easy to undo
+by accident.
 
 **The virtualized `list` swallows child `on_mouse_down`.** Cells only ever see
 `on_click` and `on_mouse_move`. That is why a press can't be handled by the cell
@@ -165,7 +191,24 @@ from a uniform row height) drifts on rows whose height comes from their content,
 which is already visible on the sample sheet. Any new overlay that has to line
 up with cells must use the per-cell technique.
 
-A third, structural one: the suite is a **separate cargo workspace**. `gridcore`
+**A drag can be released anywhere, so it must be ended everywhere.**
+`sheet_dragging`, `drag_anchor`, `sheet_fill`, `chart_drag`, `formula_pick` and
+`range_pick` are all armed by the grid but the button can come up over the
+ribbon, over the Chart panel (which `stop_propagation`s mouse-up), or outside
+the window entirely. They are therefore ended by one idempotent `grid_release`,
+called from the grid, from the panel, and from the window root. Left on the grid
+alone, a release over the ribbon leaves `sheet_fill` armed and the *next* drag
+anywhere commits an auto-fill nobody asked for, undo entry and all.
+
+**Anything holding a chart index has to be dropped when the chart list moves.**
+`chart_sel`, `chart_drag`, `range_edit`, `ref_msg` and `range_pick` are bare
+indices into *one sheet's* charts, resolved lazily by `chart_locate`. A sheet
+switch, a tab switch or an undo re-points them at a different chart, so all of
+them go through `chart_drop_selection`. Without it, selecting a chart on Sheet1
+and clicking Sheet2's tab leaves the panel open and bound to Sheet2's chart 0 —
+and Delete removes *that* one.
+
+A structural one: the suite is a **separate cargo workspace**. `gridcore`
 types are also built as literals by `xlsxy`, `gridwasm` and the TUIs in the root
 workspace, and only `cargo build --all-targets` at the root notices when a model
 change breaks them. A green suite build says nothing.

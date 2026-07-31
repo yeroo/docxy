@@ -163,6 +163,10 @@ pub type AnchorMove = (usize, (u32, u32), (u32, u32));
 /// keyed by [`Drawing::anchor_ix`], which counts every anchor in the part
 /// (including the ones we don't model). A `oneCellAnchor` has no `<to>`; only
 /// its `<from>` moves, and its extent rides along.
+///
+/// An anchor we can't find the end of means our indices no longer line up with
+/// the part's, so the whole rewrite is abandoned and `xml` comes back unchanged
+/// — better a move that didn't persist than moves applied to the wrong artwork.
 pub fn rewrite_anchors(xml: &str, moves: &[AnchorMove], drop: &[usize]) -> String {
     if moves.is_empty() && drop.is_empty() {
         return xml.to_string();
@@ -174,7 +178,7 @@ pub fn rewrite_anchors(xml: &str, moves: &[AnchorMove], drop: &[usize]) -> Strin
         out.push_str(&rest[..cut]);
         rest = &rest[cut..];
         let Some(end) = find_close(rest, tag) else {
-            break;
+            return xml.to_string();
         };
         let (element, after) = rest.split_at(end);
         if !drop.contains(&ix) {
@@ -348,9 +352,10 @@ fn parse_chart(xml: &str) -> ChartData {
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
                     "srgbClr" if ser_depth == 1 && mode == 0 => {
-                        if let Some(rgb) = u32::from_str_radix(p.attr("val").trim(), 16)
-                            .ok()
-                            .filter(|_| p.attr("val").len() == 6)
+                        let val = p.attr("val");
+                        let val = val.trim();
+                        if let Some(rgb) =
+                            u32::from_str_radix(val, 16).ok().filter(|_| val.len() == 6)
                         {
                             if let Some(sr) = cd.series.last_mut() {
                                 sr.color.get_or_insert(rgb);
@@ -459,11 +464,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rewrite_anchors_moves_one_and_leaves_the_rest_alone() {
-        // Two anchors; the first holds a shape we don't model, so the picture's
-        // `anchor_ix` is 1 even though it is the only Drawing parsed.
-        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
+    /// Two anchors; the first holds a shape we don't model, so the picture's
+    /// `anchor_ix` is 1 even though it is the only Drawing parsed.
+    const TWO_ANCHORS: &str = r#"<xdr:wsDr xmlns:xdr="a" xmlns:r="b">
             <xdr:twoCellAnchor>
               <xdr:from><xdr:col>0</xdr:col><xdr:colOff>7</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>9</xdr:rowOff></xdr:from>
               <xdr:to><xdr:col>2</xdr:col><xdr:row>2</xdr:row></xdr:to>
@@ -475,11 +478,15 @@ mod tests {
               <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/></xdr:nvPicPr>
                 <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
             </xdr:twoCellAnchor></xdr:wsDr>"#;
-        let resolve = |rid: &str| {
-            (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()))
-        };
+
+    fn png_resolve(rid: &str) -> Option<(String, String)> {
+        (rid == "rId1").then(|| ("image/png".to_string(), "xl/media/image1.png".to_string()))
+    }
+
+    #[test]
+    fn rewrite_anchors_moves_the_indexed_anchor_and_nothing_else() {
         let get = |_: &str| None;
-        let ds = parse_drawings(xml, &resolve, &get);
+        let ds = parse_drawings(TWO_ANCHORS, &png_resolve, &get);
         assert_eq!(ds.len(), 1);
         assert_eq!(
             ds[0].anchor_ix, 1,
@@ -487,8 +494,8 @@ mod tests {
         );
 
         // Move it three rows down and one column right.
-        let out = rewrite_anchors(xml, &[(1, (5, 2), (13, 6))], &[]);
-        let moved = parse_drawings(&out, &resolve, &get);
+        let out = rewrite_anchors(TWO_ANCHORS, &[(1, (5, 2), (13, 6))], &[]);
+        let moved = parse_drawings(&out, &png_resolve, &get);
         assert_eq!(moved[0].from, (5, 2));
         assert_eq!(moved[0].to, (13, 6));
         // The untouched anchor and the offsets inside the moved one survive.
@@ -499,15 +506,64 @@ mod tests {
             out.contains("<xdr:colOff>0</xdr:colOff>"),
             "the moved anchor keeps its offsets"
         );
-        // Rewriting nothing is a byte-for-byte no-op.
-        assert_eq!(rewrite_anchors(xml, &[], &[]), xml);
+    }
 
-        // Dropping the picture's anchor leaves the shape's anchor behind.
-        let culled = rewrite_anchors(xml, &[], &[1]);
-        assert!(parse_drawings(&culled, &resolve, &get).is_empty());
-        assert!(culled.contains("<xdr:sp/>"));
+    #[test]
+    fn rewrite_anchors_with_nothing_to_do_is_byte_for_byte() {
+        assert_eq!(rewrite_anchors(TWO_ANCHORS, &[], &[]), TWO_ANCHORS);
+        // An index nobody claims leaves every anchor as it was.
+        assert_eq!(
+            rewrite_anchors(TWO_ANCHORS, &[(9, (1, 1), (2, 2))], &[]),
+            TWO_ANCHORS
+        );
+    }
+
+    #[test]
+    fn rewrite_anchors_drops_only_the_listed_anchor() {
+        let get = |_: &str| None;
+        let culled = rewrite_anchors(TWO_ANCHORS, &[], &[1]);
+        assert!(parse_drawings(&culled, &png_resolve, &get).is_empty());
+        assert!(culled.contains("<xdr:sp/>"), "the shape's anchor stays");
         assert!(!culled.contains("Logo"));
         assert_eq!(culled.matches("<xdr:twoCellAnchor>").count(), 1);
+    }
+
+    #[test]
+    fn rewrite_anchors_moves_a_one_cell_anchor_by_its_from_alone() {
+        // A `oneCellAnchor` has no `<to>` — its size is the `<xdr:ext>`, which
+        // must ride along untouched when the anchor moves.
+        let xml = r#"<xdr:wsDr xmlns:xdr="a">
+            <xdr:oneCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:ext cx="2857500" cy="1428750"/>
+              <xdr:sp/>
+            </xdr:oneCellAnchor></xdr:wsDr>"#;
+        let out = rewrite_anchors(xml, &[(0, (7, 3), (99, 99))], &[]);
+        assert!(
+            out.contains("<xdr:col>3</xdr:col>"),
+            "the from column moved"
+        );
+        assert!(out.contains("<xdr:row>7</xdr:row>"), "the from row moved");
+        assert!(
+            out.contains(r#"<xdr:ext cx="2857500" cy="1428750"/>"#),
+            "the extent is untouched"
+        );
+        assert!(
+            !out.contains("99"),
+            "there is no <to> to write the far corner into"
+        );
+    }
+
+    #[test]
+    fn rewrite_anchors_abandons_the_whole_rewrite_on_an_anchor_it_cannot_close() {
+        // No `</xdr:twoCellAnchor>`: past this point our anchor indices and the
+        // part's no longer agree, so nothing may be rewritten at all.
+        let xml = r#"<xdr:wsDr xmlns:xdr="a">
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from>
+            </xdr:wsDr>"#;
+        assert_eq!(rewrite_anchors(xml, &[(0, (5, 5), (9, 9))], &[]), xml);
+        assert_eq!(rewrite_anchors(xml, &[], &[0]), xml);
     }
 
     #[test]
@@ -568,7 +624,7 @@ mod tests {
         assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 3)));
 
         // Writing and re-reading keeps every one of them.
-        let again = parse_chart(&crate::xlsx::chart_space_xml_for_test(&cd));
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&cd));
         assert_eq!(
             again.series[0].values_ref.as_ref().map(|v| v.range),
             Some((1, 1, 2, 1))
@@ -600,7 +656,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let out = crate::xlsx::chart_space_xml_for_test(&derived);
+        let out = crate::xlsx::chart_space_xml(&derived);
         assert!(
             out.contains("<c:f>Budget!$B$2:$B$2</c:f>"),
             "derived value ref: {out}"

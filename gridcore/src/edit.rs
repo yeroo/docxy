@@ -344,6 +344,11 @@ pub fn autofill(
 ) -> usize {
     let (sr0, sc0, sr1, sc1) = src;
     let (tr, tc) = to;
+    // A denormalized source has no cells to read, and the pattern walk below
+    // divides by their count.
+    if sr0 > sr1 || sc0 > sc1 {
+        return 0;
+    }
     let dr = tr.saturating_sub(sr1);
     let dc = tc.saturating_sub(sc1);
     if dr == 0 && dc == 0 {
@@ -936,6 +941,74 @@ mod tests {
         eng.recalc_all(&mut w);
         assert_eq!(value_at(&w, "D2"), CellValue::Number(200.0));
         assert_eq!(value_at(&w, "D3"), CellValue::Number(420.0));
+    }
+
+    #[test]
+    fn autofill_right_rebases_columns_not_rows() {
+        // B1 = B2+B3, dragged RIGHT to D1: the refs must walk columns.
+        let mut w = wb(&[("B2", Cell::number(1.0)), ("B3", Cell::number(2.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("B2+B3".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 3)), 2);
+        let f = |c: u32| w.sheets[0].cell(0, c).and_then(|x| x.formula.clone());
+        assert_eq!(f(2).as_deref(), Some("C2+C3"));
+        assert_eq!(f(3).as_deref(), Some("D2+D3"));
+    }
+
+    #[test]
+    fn autofill_cycles_a_non_numeric_pattern() {
+        // "x","y" filled down five rows repeats the pair, rather than trying to
+        // read a series out of text.
+        let mut w = wb(&[("A1", Cell::text("x")), ("A2", Cell::text("y"))]);
+        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (6, 0)), 5);
+        let t = |r: u32| match w.sheets[0].cell(r, 0).map(|c| c.value.clone()) {
+            Some(CellValue::Text(s)) => s,
+            v => panic!("A{} not text: {v:?}", r + 1),
+        };
+        assert_eq!(
+            (t(2), t(3), t(4), t(5), t(6)),
+            ("x".into(), "y".into(), "x".into(), "y".into(), "x".into())
+        );
+    }
+
+    #[test]
+    fn autofill_leaves_a_verbatim_formula_cell_unrebased() {
+        // `f_attrs` means a shared formula / data table whose `<f>` we serialize
+        // verbatim — rewriting its refs would produce something the loader can't
+        // round-trip, so the copy keeps the source text exactly.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("A1*2".into()),
+                f_attrs: Some(" t=\"shared\" si=\"0\"".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (2, 1)), 2);
+        let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
+        assert_eq!(
+            f(1).as_deref(),
+            Some("A1*2"),
+            "verbatim formulas are copied, not shifted"
+        );
+        assert_eq!(f(2).as_deref(), Some("A1*2"));
+    }
+
+    #[test]
+    fn autofill_refuses_a_denormalized_source() {
+        // A backwards range has no cells to read, and the pattern walk divides
+        // by their count — this used to panic rather than decline.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        assert_eq!(autofill(&mut w, 0, (3, 0, 1, 0), (9, 0)), 0);
+        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 1), (0, 9)), 0);
     }
 
     #[test]

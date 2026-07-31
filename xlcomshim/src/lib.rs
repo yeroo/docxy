@@ -26,6 +26,11 @@ pub use win::DISP_IFACES;
 
 #[cfg(windows)]
 mod win {
+    // The vtable-stub arities in the `include!`d gen_*.rs are Excel's, not
+    // ours: `#[interface]` gives each expanded slot the real interface's
+    // parameter list, and several of Excel's run well past clippy's
+    // 7-argument advice. There is nothing here to refactor.
+    #![allow(clippy::too_many_arguments)]
     // COM interface methods are PascalCase by contract (they map to Excel's
     // typelib member names), so the generated interface traits opt out of the
     // snake_case lint.
@@ -59,11 +64,12 @@ mod win {
     /// — so it works on a machine with NO Excel (the VDI), not just this dev box.
     const DOCXY_LIBID: GUID = GUID::from_u128(0x7b3f9e21_4c1a_4e8b_a2d6_9f5c1e0b7a31);
 
-    /// The dispinterfaces we author + serve, as (name, Office source IID, our
-    /// docxy IID). The mktypelib bin copies each Office dispinterface (real memids
-    /// + invkinds) into our .tlb under OUR IID; the shim's `GetTypeInfo` returns
-    /// that IID's typeinfo, so a typeinfo-driven late-bound client (pywin32, VB6)
-    /// introspects each object correctly. Single source of truth for both.
+    /// The dispinterfaces we author and serve, as (name, Office source IID, our
+    /// docxy IID). The mktypelib bin copies each Office dispinterface (its real
+    /// memids and invkinds) into our .tlb under OUR IID; the shim's `GetTypeInfo`
+    /// returns that IID's typeinfo, so a typeinfo-driven late-bound client
+    /// (pywin32, VB6) introspects each object correctly. One source of truth for
+    /// both.
     // Names are prefixed `Docxy` so they never collide with the identically-named
     // dual `wanted` interfaces in the same typelib (a typelib requires unique type
     // names); the name is cosmetic for the dispatch path (clients read members).

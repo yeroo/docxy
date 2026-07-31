@@ -62,6 +62,10 @@ pub fn run(spec: &Spec) -> Result<()> {
 }
 
 /// Author the .tlb at `out`.
+///
+/// # Safety
+/// Drives the COM type-library APIs directly, so it must be called on a thread
+/// with COM initialized, and `out` must name a path this process may create.
 pub unsafe fn author(spec: &Spec, out: &str) -> Result<()> {
     unsafe {
         let src = load_office(spec)?;
@@ -246,6 +250,10 @@ unsafe fn copy_interface(
         let flags = TYPEFLAG_FOLEAUTOMATION.0 | TYPEFLAG_FDISPATCHABLE.0;
         cti.SetTypeFlags(flags as u32)?;
         let mut href = 0u32;
+        // `phreftype` is an OUT parameter that windows-rs types as `*const u32`;
+        // it is written through, so the binding must stay a `&mut` to a `mut`
+        // local. clippy only sees the `*const` and thinks the `mut` is spare.
+        #[allow(clippy::unnecessary_mut_passed)]
         cti.AddRefTypeInfo(idisp_ti, &mut href)?;
         cti.AddImplType(0, href)?;
 

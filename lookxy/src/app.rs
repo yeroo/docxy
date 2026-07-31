@@ -7003,12 +7003,17 @@ pub(crate) mod tests {
     fn editing_an_all_day_event_round_trips_the_same_boundaries() {
         let mut app = App::for_test_with_seeded_store();
         app.mode = crate::app::Mode::Calendar;
+        // `open_edit_event` looks the event up in `agenda`, whose window is
+        // relative to now — so the date has to be too, or this test starts
+        // failing on the calendar rather than on a regression.
+        let day = crate::ui::calendar::test_date_from_now(1);
+        let next = crate::ui::calendar::test_date_from_now(2);
         app.open_new_event();
         if let Some(f) = app.event_form.as_mut() {
             f.title = "Holiday".into();
             f.all_day = true;
-            f.start = "2026-07-20".into();
-            f.end = "2026-07-20".into(); // one-day all-day
+            f.start = day.clone();
+            f.end = day.clone(); // one-day all-day
         }
         app.save_event_form();
         let id = match app.test_cmd_rx.as_ref().unwrap().try_recv() {
@@ -7019,14 +7024,17 @@ pub(crate) mod tests {
         // Re-open it for editing and save it back without changing anything.
         app.selected_event = Some(id.clone());
         app.open_edit_event();
-        assert!(app.event_form.is_some());
+        assert!(
+            app.event_form.is_some(),
+            "the event must be in the agenda to be editable"
+        );
         app.save_event_form();
 
         // The stored boundaries must be unchanged: editing an all-day event
-        // must not grow or shift it.
+        // must not grow or shift it. The end is the EXCLUSIVE next midnight.
         let send = app.store.event_for_send(&id).unwrap().unwrap();
-        assert_eq!(send.start_utc, "2026-07-20T00:00:00Z");
-        assert_eq!(send.end_utc, "2026-07-21T00:00:00Z");
+        assert_eq!(send.start_utc, format!("{day}T00:00:00Z"));
+        assert_eq!(send.end_utc, format!("{next}T00:00:00Z"));
         assert!(send.is_all_day);
     }
 
@@ -7042,11 +7050,14 @@ pub(crate) mod tests {
     fn editing_a_local_not_yet_synced_event_enqueues_no_update_event() {
         let mut app = App::for_test_with_seeded_store();
         app.mode = crate::app::Mode::Calendar;
+        // Relative for the same reason as the all-day test above: the agenda
+        // window `open_edit_event` searches moves with the calendar.
+        let day = crate::ui::calendar::test_date_from_now(1);
         app.open_new_event();
         if let Some(f) = app.event_form.as_mut() {
             f.title = "Planning".into();
-            f.start = "2026-07-20 14:00".into();
-            f.end = "2026-07-20 15:00".into();
+            f.start = format!("{day} 14:00");
+            f.end = format!("{day} 15:00");
         }
         app.save_event_form();
 

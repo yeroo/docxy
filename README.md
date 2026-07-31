@@ -150,9 +150,14 @@ measures plus DAX-style row-context iterators like
 sources — `xlsxy data.csv` imports directly; `Ctrl-M` manages the model in
 the TUI and materializes reports, with definitions persisted in the file), and the
 same lossless
-round-trip guarantee: anything it doesn't model (charts, pivots, conditional
-formatting…) is preserved byte-for-byte. Formulas it can't evaluate yet keep
-Excel's cached results and are saved untouched.
+round-trip guarantee: anything it doesn't model (pivots, conditional
+formatting…) is preserved byte-for-byte. The one deliberate exception is a chart
+you *edit* — repoint its range, rename or reorder its series, recolour it — which
+is regenerated from the model, and a drawing you move or delete, whose anchor is
+rewritten in place. Charts and drawings you leave alone still round-trip verbatim.
+Inserting a chart from a selection writes a **live** chart: each series is bound
+to its own cells, so Excel updates it when the data changes. Formulas it can't
+evaluate yet keep Excel's cached results and are saved untouched.
 
 ```sh
 xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)

@@ -254,12 +254,18 @@ impl Sheet {
     }
 }
 
+/// [`Drawing::anchor_ix`] for a drawing this session authored: it has its own
+/// freshly written part, so it occupies no slot in [`Sheet::drawing_part`] and a
+/// save must not rewrite an anchor at its index there.
+pub const ANCHOR_AUTHORED: usize = usize::MAX;
+
 /// A floating drawing anchored over a cell rectangle (a picture or a chart).
 #[derive(Clone, Debug)]
 pub struct Drawing {
     /// This drawing's position among ALL anchors in its part — anchors we can't
     /// render (shapes, text boxes) are skipped here but still occupy a slot, so
-    /// a save needs this to rewrite the right element.
+    /// a save needs this to rewrite the right element. [`ANCHOR_AUTHORED`] for a
+    /// drawing that came from us rather than from the loaded part.
     pub anchor_ix: usize,
     /// Top-left anchor cell `(row, col)`, 0-based.
     pub from: (u32, u32),
