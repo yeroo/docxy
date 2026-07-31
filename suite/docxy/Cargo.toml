@@ -15,6 +15,9 @@ publish = false
 name = "suite"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 gpui.workspace = true
 gpui_platform.workspace = true

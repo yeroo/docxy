@@ -266,7 +266,7 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
     let mut rows: Vec<Vec<Option<Cell>>> = (r1..=r2)
         .map(|r| (0..=max_c).map(|c| s.cell(r, c).cloned()).collect())
         .collect();
-    let is_blank = |cell: &Option<Cell>| cell.as_ref().map_or(true, |c| c.is_blank());
+    let is_blank = |cell: &Option<Cell>| cell.as_ref().is_none_or(|c| c.is_blank());
     // Cross-type rank so values of different kinds order deterministically.
     let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
         Some(CellValue::Number(_)) => 0,
@@ -913,12 +913,12 @@ mod tests {
         let s = &w.sheets[0];
         assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(1.0)));
         assert_eq!(s.cell(2, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
-        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
+        assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
         // Descending: 3,2,1,blank (blank still last)
         sort_rows(&mut w, 0, 0, 3, &[(0, false)]);
         let s = &w.sheets[0];
         assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
-        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
+        assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
     }
 
     #[test]

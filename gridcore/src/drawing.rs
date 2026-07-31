@@ -153,13 +153,17 @@ fn parse_anchor_cell(p: &mut XmlParser) -> (u32, u32) {
     (row, col)
 }
 
+/// One drawing's new home: its anchor index in the part, and the `(row, col)`
+/// cells its `<from>` and `<to>` now sit on.
+pub type AnchorMove = (usize, (u32, u32), (u32, u32));
+
 /// Edit a drawing part in place: move the `<from>`/`<to>` cells of the anchors
 /// in `moves`, drop the anchor elements listed in `drop`, and leave everything
 /// else — other anchors, offsets, artwork — byte for byte as it was. Both are
 /// keyed by [`Drawing::anchor_ix`], which counts every anchor in the part
 /// (including the ones we don't model). A `oneCellAnchor` has no `<to>`; only
 /// its `<from>` moves, and its extent rides along.
-pub fn rewrite_anchors(xml: &str, moves: &[(usize, (u32, u32), (u32, u32))], drop: &[usize]) -> String {
+pub fn rewrite_anchors(xml: &str, moves: &[AnchorMove], drop: &[usize]) -> String {
     if moves.is_empty() && drop.is_empty() {
         return xml.to_string();
     }
@@ -256,7 +260,7 @@ fn set_cell_fields(block: &str, row: u32, col: u32) -> String {
             "row" => Some(row),
             _ => None,
         };
-        match value.and_then(|v| find_close(tail, name).map(|e| (v, e))) {
+        match value.zip(find_close(tail, name)) {
             Some((v, end)) => {
                 out.push_str(&format!("<{name}>{v}</{name}>"));
                 rest = &tail[end..];

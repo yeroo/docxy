@@ -1505,7 +1505,7 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             }
         }
         if let Some(dpart) = sheet.drawing_part.as_deref() {
-            let moves: Vec<(usize, (u32, u32), (u32, u32))> = sheet.drawings.iter().map(|d| (d.anchor_ix, d.from, d.to)).collect();
+            let moves: Vec<crate::drawing::AnchorMove> = sheet.drawings.iter().map(|d| (d.anchor_ix, d.from, d.to)).collect();
             if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
                 p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed).into_bytes();
@@ -2584,10 +2584,7 @@ impl SheetPackage {
                     .filter_map(|t| xml.find(t))
                     .min()
                     .or_else(|| xml.find("</worksheet>"));
-                match anchor {
-                    Some(pos) => xml.insert_str(pos, &block),
-                    None => {}
-                }
+                if let Some(pos) = anchor { xml.insert_str(pos, &block) }
             }
             p.1 = xml.into_bytes();
         }
@@ -3542,6 +3539,85 @@ mod tests {
         let bytes = save_xlsx(&pkg);
         let re = load_xlsx(&bytes).unwrap();
         assert!(re.workbook.sheets.iter().any(|s| s.name == "Budget"));
+    }
+
+    #[test]
+    fn edited_chart_series_refs_round_trip_through_save_and_load() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |range| ChartSource { sheet: "Sheet1".into(), range, cat_col: 0 };
+        let mut pkg = new_xlsx();
+        // Two series reading different columns, plus their own category labels.
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "column".into(),
+            categories: vec!["Laptop".into(), "Dock".into()],
+            series: vec![
+                ChartSeries {
+                    name: "Qty".into(),
+                    values: vec![2.0, 5.0],
+                    col: Some(1),
+                    values_ref: Some(src((1, 1, 2, 1))),
+                    name_ref: Some("Sheet1!$B$1".into()),
+                    ..Default::default()
+                },
+                ChartSeries {
+                    name: "Total".into(),
+                    values: vec![2398.0, 358.0],
+                    col: Some(3),
+                    values_ref: Some(src((1, 3, 2, 3))),
+                    name_ref: Some("Sheet1!$D$1".into()),
+                    ..Default::default()
+                },
+            ],
+            source: Some(src((0, 0, 2, 3))),
+            categories_ref: Some(src((1, 0, 2, 0))),
+            ..Default::default()
+        };
+        pkg.add_chart(0, (5, 0), (20, 8), &data);
+
+        // Save the package and read it back the way opening the file would.
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0].drawings.first().expect("chart drawing").kind {
+            DrawingKind::Chart(c) => c.clone(),
+            other => panic!("expected a chart drawing, got {other:?}"),
+        };
+        let got = chart(&re);
+        assert_eq!(got.series.len(), 2);
+        assert_eq!(got.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
+        assert_eq!(got.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
+        assert_eq!(got.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
+        assert_eq!(got.series[1].name_ref.as_deref(), Some("Sheet1!$D$1"));
+        assert_eq!(got.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        assert_eq!(got.series[1].values, vec![2398.0, 358.0]);
+        assert_eq!(got.categories, vec!["Laptop", "Dock"]);
+        // The loader knows which part to write an edit back into.
+        assert_eq!(got.part.as_deref(), Some("xl/charts/chart1.xml"));
+
+        // Now edit one series the way the panel does — re-point it at another
+        // column, rename it, and move the categories — and save again. Only an
+        // `edited` chart is regenerated, so this is the path that matters.
+        let mut edited = re;
+        let mut cd = got;
+        cd.series[1].values_ref = Some(src((1, 2, 2, 2)));
+        cd.series[1].values = vec![1199.0, 179.0];
+        cd.series[1].col = Some(2);
+        cd.series[1].name = "Unit price".into();
+        cd.series[1].name_ref = Some("Sheet1!$C$1".into());
+        cd.categories_ref = Some(src((1, 4, 2, 4)));
+        cd.edited = true;
+        edited.workbook.sheets[0].drawings[0].kind = DrawingKind::Chart(cd);
+
+        let reopened = chart(&load_xlsx(&save_xlsx(&edited)).unwrap());
+        // The edit survived the trip to disk…
+        assert_eq!(reopened.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 2, 2, 2)));
+        assert_eq!(reopened.series[1].name_ref.as_deref(), Some("Sheet1!$C$1"));
+        assert_eq!(reopened.series[1].name, "Unit price");
+        assert_eq!(reopened.series[1].values, vec![1199.0, 179.0]);
+        assert_eq!(reopened.categories_ref.as_ref().map(|v| v.range), Some((1, 4, 2, 4)));
+        // …and the series that was left alone came back untouched.
+        assert_eq!(reopened.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
+        assert_eq!(reopened.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
+        assert_eq!(reopened.series[0].values, vec![2.0, 5.0]);
     }
 
     #[test]

@@ -708,16 +708,13 @@ impl SheetView {
     /// rows, past the frozen ones) — for `ListState::scroll_to_reveal_item`.
     fn row_list_index(&self, row: u32) -> usize {
         let sh = self.sheet();
-        let vis_before = (0..row).filter(|&r| !sh.row_hidden(r)).count();
-        let fr = (sh.freeze.0 as usize).min(30);
-        vis_before.saturating_sub(fr)
+        row_index_of(|r| sh.row_hidden(r), (sh.freeze.0 as usize).min(30), row)
     }
     /// The sheet row a list index refers to — the inverse of `row_list_index`,
     /// which the list needs because hidden rows collapse out of it.
     fn row_at_list_index(&self, ix: usize) -> Option<u32> {
         let sh = self.sheet();
-        let fr = (sh.freeze.0 as usize).min(30);
-        (0..u32::MAX).filter(|&r| !sh.row_hidden(r)).nth(fr + ix)
+        row_at_index(|r| sh.row_hidden(r), (sh.freeze.0 as usize).min(30), ix)
     }
 
     /// The used extent (max row, max col) over the active sheet's cells + merges.
@@ -1056,6 +1053,26 @@ struct Pal {
     sel: Hsla,
 }
 
+impl Pal {
+    /// Read the palette off the active theme. The render pass builds one and
+    /// passes it down; a field deep in the tree can ask for its own instead of
+    /// having it threaded through every signature.
+    fn of(cx: &App) -> Pal {
+        let t = cx.theme();
+        let fg = t.foreground;
+        Pal {
+            fg,
+            dim: t.muted_foreground,
+            border: t.border,
+            panel: t.secondary,
+            // A theme-adaptive hover tint: a low-alpha wash of the foreground,
+            // clearly visible on both light and dark grounds.
+            hover: Hsla { a: 0.12, ..fg },
+            sel: t.selection,
+        }
+    }
+}
+
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
 const LINK: u32 = 0x2f6fdb;
 const FILE_FG: u32 = 0xffffff;
@@ -1274,6 +1291,18 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
     row.into_any_element()
 }
 
+/// The sheet row at list index `ix`, skipping hidden rows and the `frozen`
+/// ones that render outside the list. `None` past the last row.
+fn row_at_index(hidden: impl Fn(u32) -> bool, frozen: usize, ix: usize) -> Option<u32> {
+    (0..u32::MAX).filter(|&r| !hidden(r)).nth(frozen + ix)
+}
+
+/// The list index of `row` — the inverse of `row_at_index`, which the list
+/// needs because hidden rows collapse out of it.
+fn row_index_of(hidden: impl Fn(u32) -> bool, frozen: usize, row: u32) -> usize {
+    (0..row).filter(|&r| !hidden(r)).count().saturating_sub(frozen)
+}
+
 /// The column at `x` pixels from the grid's left edge: the gutter first, then
 /// the frozen columns, then the scrolled window from `col0`. `None` when `x`
 /// lands in the gutter, which is a row header rather than a cell.
@@ -1355,7 +1384,11 @@ fn ref_token_at(buf: &str, caret_chars: usize) -> Option<std::ops::Range<usize>>
         return None; // a function name
     }
     let token = &buf[start..end];
-    gridcore::sheet::parse_range_name(token).map(|_| start..end)
+    // `D2:` is half a range — typed, not finished. It counts as the reference
+    // under the caret, so a pick completes it instead of appending and leaving
+    // `=SUM(D2:D2:D5`.
+    let typed = token.strip_suffix(':').unwrap_or(token);
+    gridcore::sheet::parse_range_name(typed).map(|_| start..end)
 }
 
 /// Write `text` into a formula buffer at the caret: over the reference the
@@ -1374,6 +1407,14 @@ fn replace_ref(buf: &str, caret_chars: usize, text: &str) -> (String, usize) {
     (out, caret)
 }
 
+/// One reference inside a formula: the byte span it occupies in the text, and
+/// the cells `(r1, c1, r2, c2)` it names.
+type RefToken = (std::ops::Range<usize>, (u32, u32, u32, u32));
+
+/// What one of the small per-series buttons (move up/down, remove) does when
+/// it is clicked.
+type SeriesAction = Box<dyn Fn(&mut Docxy, &mut Context<Docxy>)>;
+
 /// Every cell reference in a formula, in the order it is written: where it sits
 /// in the text and which cells it names. One scan feeds both the outlines on the
 /// grid and the colouring of the text, so the two can't disagree.
@@ -1381,7 +1422,7 @@ fn replace_ref(buf: &str, caret_chars: usize, text: &str) -> (String, usize) {
 /// Skips what only looks like a reference: function names (`LOG10(`), the cell
 /// part of another sheet's ref (`Sheet2!A1`, which this grid can't outline), and
 /// anything inside a string literal.
-fn formula_ref_tokens(buf: &str) -> Vec<(std::ops::Range<usize>, (u32, u32, u32, u32))> {
+fn formula_ref_tokens(buf: &str) -> Vec<RefToken> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < buf.len() {
@@ -1411,10 +1452,11 @@ fn formula_ref_tokens(buf: &str) -> Vec<(std::ops::Range<usize>, (u32, u32, u32,
         }
         let is_call = buf[end..].starts_with('(');
         let qualified = buf[..start].ends_with('!');
-        if !is_call && !qualified {
-            if let Some(r) = gridcore::sheet::parse_range_name(&buf[start..end]) {
-                out.push((start..end, r));
-            }
+        if !is_call
+            && !qualified
+            && let Some(r) = gridcore::sheet::parse_range_name(&buf[start..end])
+        {
+            out.push((start..end, r));
         }
         i = end.max(start + 1);
     }
@@ -1602,7 +1644,7 @@ fn build_surface(kind: Kind, path: Option<&PathBuf>) -> (Surface, Vec<Comment>, 
     }
 }
 
-fn file_name(path: &PathBuf) -> String {
+fn file_name(path: &std::path::Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled.docx".into())
 }
 
@@ -2351,14 +2393,11 @@ impl Docxy {
         let Some(mut f) = self.range_edit.clone() else { return };
         let len = f.buf.chars().count();
         if ctrl {
-            match key {
-                "a" => {
-                    f.anchor = 0;
-                    f.caret = len;
-                    self.range_edit = Some(f);
-                    cx.notify();
-                }
-                _ => {}
+            if key == "a" {
+                f.anchor = 0;
+                f.caret = len;
+                self.range_edit = Some(f);
+                cx.notify();
             }
             return;
         }
@@ -2540,6 +2579,22 @@ impl Docxy {
             return None;
         }
         parse_ref_text(&f.buf)
+    }
+
+    /// Everything drawn over the grid that isn't the cells themselves: the fill
+    /// and range previews, point mode, and the formula's coloured references.
+    /// One bundle, so the render pass doesn't thread four more arguments through
+    /// `sheet_el`. `handle_hidden` is filled in there, where the chart cards'
+    /// boxes are known.
+    fn grid_overlay(&self) -> GridOverlay {
+        let range_preview = self.range_preview();
+        GridOverlay {
+            fill_preview: self.sheet_fill_preview(),
+            range_preview,
+            picking: range_preview.is_some() || self.range_field_active(),
+            formula_refs: self.formula_refs(),
+            handle_hidden: false,
+        }
     }
 
     /// The box the in-progress fill drag would cover, for the preview outline.
@@ -3194,7 +3249,7 @@ impl Docxy {
                 let keep: Vec<bool> = (start..=bottom)
                     .map(|r| {
                         let val = v.pkg.workbook.sheets[s].cell(r, sc).map(|c| c.value.clone());
-                        gridcore::filter::matches(val.as_ref(), &op, &operand)
+                        gridcore::filter::matches(val.as_ref(), op, &operand)
                     })
                     .collect();
                 for (i, r) in (start..=bottom).enumerate() {
@@ -4291,12 +4346,13 @@ impl Docxy {
     /// (the formula bar's trick); otherwise the committed value, or a hint when
     /// that is empty. Under it sits whatever the last commit said about this
     /// field, or `help` when there is nothing to report.
-    fn ref_field(&self, id: &'static str, target: RefTarget, value: String, hint: &'static str, help: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        self.ref_field_dyn(id.to_string(), target, value, hint, help, pal, cx)
+    fn ref_field(&self, id: &'static str, target: RefTarget, value: String, hint: &'static str, help: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        self.ref_field_dyn(id.to_string(), target, value, hint, help, cx)
     }
 
     /// `ref_field` for the repeated ones, whose ids are built per series.
-    fn ref_field_dyn(&self, id: String, target: RefTarget, value: String, hint: &'static str, help: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    fn ref_field_dyn(&self, id: String, target: RefTarget, value: String, hint: &'static str, help: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        let pal = Pal::of(cx);
         let ent = cx.entity();
         let editing = match &self.range_edit {
             Some(f) if f.target == target => Some(f.clone()),
@@ -4420,7 +4476,7 @@ impl Docxy {
                 );
             }
             // Reorder / remove, one small button each.
-            let btn = |id: String, glyph: &'static str, tip: &'static str, on: bool, f: Box<dyn Fn(&mut Docxy, &mut Context<Docxy>)>| {
+            let btn = |id: String, glyph: &'static str, tip: &'static str, on: bool, f: SeriesAction| {
                 let ent_b = ent.clone();
                 div()
                     .id(ElementId::Name(id.into()))
@@ -4461,9 +4517,9 @@ impl Docxy {
                                     .child(btn(format!("series-rm-{si}"), "\u{00d7}", "Remove series", n_series > 1, Box::new(move |t, cx2| t.series_delete(si, cx2)))),
                             ),
                     )
-                    .child(self.ref_field_dyn(format!("series-name-{si}"), RefTarget::SeriesName(si), sr.name.clone(), "e.g. B1 or a name", "", pal, cx))
+                    .child(self.ref_field_dyn(format!("series-name-{si}"), RefTarget::SeriesName(si), sr.name.clone(), "e.g. B1 or a name", "", cx))
                     .child(div().pt(px(2.)).text_size(px(10.)).text_color(pal.dim).child("VALUES"))
-                    .child(self.ref_field_dyn(format!("series-vals-{si}"), RefTarget::SeriesValues(si), vals, "e.g. B2:B5", "", pal, cx))
+                    .child(self.ref_field_dyn(format!("series-vals-{si}"), RefTarget::SeriesValues(si), vals, "e.g. B2:B5", "", cx))
                     .child(swatches),
             );
         }
@@ -4549,13 +4605,12 @@ impl Docxy {
                         range_shown,
                         "e.g. A1:D5",
                         "Include the header row: it names the series. Enter to replot.",
-                        pal,
                         cx,
                     ))
                     .child(heading("TYPE"))
                     .child(types)
                     .child(heading("TITLE"))
-                    .child(self.ref_field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title", "", pal, cx))
+                    .child(self.ref_field("chart-title", RefTarget::ChartTitle, data.title.clone(), "Chart title", "", cx))
                     .child(heading("SERIES"))
                     .child(series_list)
                     .child({
@@ -4584,7 +4639,6 @@ impl Docxy {
                         data.categories_ref.as_ref().map(|v| range_a1(v.range)).unwrap_or_default(),
                         "e.g. A2:A5",
                         "The cells labelling each point along the axis.",
-                        pal,
                         cx,
                     )),
             )
@@ -6379,7 +6433,7 @@ impl Docxy {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, b)| match b {
-                    Block::Paragraph(p) => p.props.heading_level.map(|lvl| (i, lvl as u8, p.plain_text())),
+                    Block::Paragraph(p) => p.props.heading_level.map(|lvl| (i, lvl, p.plain_text())),
                     _ => None,
                 })
                 .filter(|(_, _, t)| !t.trim().is_empty())
@@ -7346,7 +7400,7 @@ fn emit_run(
             *caret = None;
         }
         let seg: String = chars[a..b].iter().collect();
-        let selected = sel.map_or(false, |(s, e)| s < e && start + a >= s && start + b <= e);
+        let selected = sel.is_some_and(|(s, e)| s < e && start + a >= s && start + b <= e);
         emit_words(out, &seg, props, base, is_link, selected, click, start + a, pal);
     }
     if *caret == Some(end) {
@@ -7366,7 +7420,7 @@ fn emit_tab(out: &mut Vec<AnyElement>, idx: &mut usize, caret: &mut Option<usize
         out.push(caret_bar());
         *caret = None;
     }
-    let selected = sel.map_or(false, |(s, e)| s < e && s <= pos && pos < e);
+    let selected = sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
     let w = width.max(3.0);
     out.push(
         div()
@@ -8541,7 +8595,7 @@ impl Docxy {
             .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Highlight"))
-            .child(div().w(px(110.)).child(self.bar_range_field("cf-range", RefTarget::CondFormat, pal, cx)))
+            .child(div().w(px(110.)).child(self.bar_range_field("cf-range", RefTarget::CondFormat, cx)))
             .child(div().text_size(px(12.)).text_color(pal.dim).child("where value"))
             .child(
                 div().w(px(160.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
@@ -8569,9 +8623,9 @@ impl Docxy {
 
     /// The range field an entry bar carries: the cells it will act on, pointable
     /// at the grid like any other reference.
-    fn bar_range_field(&self, id: &'static str, target: RefTarget, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    fn bar_range_field(&self, id: &'static str, target: RefTarget, cx: &mut Context<Self>) -> AnyElement {
         let value = self.bar_range.clone().unwrap_or_default();
-        self.ref_field(id, target, value, "A1:D5", "", pal, cx)
+        self.ref_field(id, target, value, "A1:D5", "", cx)
     }
 
     /// The Text-to-Columns delimiter bar.
@@ -8581,7 +8635,7 @@ impl Docxy {
             .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Split"))
-            .child(div().w(px(110.)).child(self.bar_range_field("ttc-range", RefTarget::TextToColumns, pal, cx)))
+            .child(div().w(px(110.)).child(self.bar_range_field("ttc-range", RefTarget::TextToColumns, cx)))
             .child(div().text_size(px(12.)).text_color(pal.dim).child("by delimiter:"))
             .child(
                 div().w(px(150.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
@@ -8631,7 +8685,7 @@ impl Docxy {
             .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort"))
-            .child(div().w(px(110.)).child(self.bar_range_field("sort-range", RefTarget::Sort, pal, cx)))
+            .child(div().w(px(110.)).child(self.bar_range_field("sort-range", RefTarget::Sort, cx)))
             .child(div().text_size(px(12.)).text_color(pal.dim).child("by"))
             .child(
                 div().w(px(220.)).h(px(22.)).px_2().flex().items_center().rounded_sm()
@@ -8680,7 +8734,7 @@ impl Docxy {
             .w_full().min_h(px(30.)).py(px(3.)).items_center().gap_2().px_2()
             .bg(pal.panel).border_b_1().border_color(pal.border)
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Dropdown list for"))
-            .child(div().w(px(110.)).child(self.bar_range_field("dv-range", RefTarget::Validation, pal, cx)))
+            .child(div().w(px(110.)).child(self.bar_range_field("dv-range", RefTarget::Validation, cx)))
             .child(div().text_size(px(12.)).text_color(pal.dim).child("(comma-separated):"))
             .child(
                 div().flex_1().h(px(22.)).px_2().flex().items_center().rounded_sm()
@@ -9283,19 +9337,19 @@ impl Docxy {
         let rp = doc.map(|ed| ed.caret_props());
         let pp = doc.map(|ed| ed.caret_para_props());
         match act {
-            Bold => rp.map_or(false, |p| p.bold),
-            Italic => rp.map_or(false, |p| p.italic),
-            Underline => rp.map_or(false, |p| p.underline),
-            Strike => rp.map_or(false, |p| p.strike),
-            Super => rp.map_or(false, |p| p.vert_align == VertAlign::Superscript),
-            Sub => rp.map_or(false, |p| p.vert_align == VertAlign::Subscript),
-            AlignL => pp.map_or(false, |p| p.align == Align::Left),
-            AlignC => pp.map_or(false, |p| p.align == Align::Center),
-            AlignR => pp.map_or(false, |p| p.align == Align::Right),
-            AlignJ => pp.map_or(false, |p| p.align == Align::Justify),
-            Bullets => doc.map_or(false, |ed| ed.all_in_list(NUM_BULLET)),
-            Numbers => doc.map_or(false, |ed| ed.all_in_list(NUM_DECIMAL)),
-            ParaBorders => pp.map_or(false, |p| p.borders.bottom.is_some()),
+            Bold => rp.is_some_and(|p| p.bold),
+            Italic => rp.is_some_and(|p| p.italic),
+            Underline => rp.is_some_and(|p| p.underline),
+            Strike => rp.is_some_and(|p| p.strike),
+            Super => rp.is_some_and(|p| p.vert_align == VertAlign::Superscript),
+            Sub => rp.is_some_and(|p| p.vert_align == VertAlign::Subscript),
+            AlignL => pp.is_some_and(|p| p.align == Align::Left),
+            AlignC => pp.is_some_and(|p| p.align == Align::Center),
+            AlignR => pp.is_some_and(|p| p.align == Align::Right),
+            AlignJ => pp.is_some_and(|p| p.align == Align::Justify),
+            Bullets => doc.is_some_and(|ed| ed.all_in_list(NUM_BULLET)),
+            Numbers => doc.is_some_and(|ed| ed.all_in_list(NUM_DECIMAL)),
+            ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
             ToggleNav => self.show_nav,
@@ -9556,10 +9610,8 @@ impl Render for Docxy {
         let panel = t.secondary;
         let sidebar = t.sidebar;
         let tab_active = t.tab_active;
-        // A theme-adaptive hover tint: a low-alpha wash of the foreground, so it's
-        // clearly visible as a highlight on both light and dark grounds.
-        let hover = Hsla { a: 0.12, ..fg };
-        let pal = Pal { fg, dim, border, panel, hover, sel: t.selection };
+        let pal = Pal::of(cx);
+        let _hover = pal.hover;
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
@@ -9727,7 +9779,7 @@ impl Render for Docxy {
                             let (fr, ev) = if is_h { (h_first_ref, h_even_ref) } else { (f_first_ref, f_even_ref) };
                             if page1 == 1 && title_pg && fr {
                                 "first"
-                            } else if page1 % 2 == 0 && even_odd && ev {
+                            } else if page1.is_multiple_of(2) && even_odd && ev {
                                 "even"
                             } else {
                                 "default"
@@ -9847,7 +9899,7 @@ impl Render for Docxy {
                         v_flex().id("doc-scroll").track_scroll(&self.doc_scroll).flex_1().h_full().min_h(px(0.)).overflow_y_scroll().bg(bg).text_color(fg).px(px(48.)).py(px(28.)).gap_1().children(blocks).into_any_element()
                     }
                 }
-                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.sheet_fill_preview(), self.range_preview(), self.range_field_active(), self.formula_refs(), self.chart_ui(), cx).into_any_element(),
+                Surface::Sheet(v) => sheet_el(v, &cx.entity(), self.sheet_rename.clone(), self.sheet_comment_edit.is_some(), sheet_dv.clone(), self.sheet_dv_open, sheet_grid_w, self.grid_overlay(), self.chart_ui(), cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex().flex_1().bg(bg).items_center().justify_center().text_color(dim).child("No documents — File \u{203A} New").into_any_element(),
@@ -10615,7 +10667,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
-fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, fill_preview: Option<(u32, u32, u32, u32)>, range_preview: Option<(u32, u32, u32, u32)>, picking: bool, formula_refs: std::rc::Rc<Vec<(u32, u32, u32, u32)>>, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
+fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String)>, comment_editing: bool, dv_values: Option<Vec<String>>, dv_open: bool, grid_w: f32, ov: GridOverlay, chart_ui: ChartUi, cx: &mut Context<Docxy>) -> AnyElement {
     use gridcore::sheet::cell_name;
     let sh = view.sheet();
     let (sr, sc) = view.sel;
@@ -10730,13 +10782,9 @@ fn sheet_el(view: &SheetView, ent: &Entity<Docxy>, rename: Option<(usize, String
             br >= ar && br < rr && bc >= ac && bc < cc
         })
     };
-    let ov = GridOverlay {
-        fill_preview,
-        range_preview,
-        picking: range_preview.is_some() || picking,
-        formula_refs: formula_refs.clone(),
-        handle_hidden: corner_under_chart,
-    };
+    // The cards' boxes are only known here, so the fill handle's visibility is
+    // the one overlay field the render pass can't fill in.
+    let ov = GridOverlay { handle_hidden: corner_under_chart, ..ov };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new((0..total_rows as u32).filter(|r| !sh.row_hidden(*r)).collect());
@@ -11221,7 +11269,7 @@ fn main() {
         };
         let startup_files = cli_files.clone();
         cx.open_window(options, move |window, cx| {
-            let view = cx.new(|cx| Docxy::new(cx));
+            let view = cx.new(Docxy::new);
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
                 view.update(cx, move |this, cx| this.open_args(startup_files, cx));
@@ -11315,22 +11363,22 @@ mod grid_geom_tests {
         let w = |_c: u32| 100.0f32;
         let g = super::SHEET_GUT;
         // The gutter is a row header, not a cell.
-        assert_eq!(col_at_x(&w, 0.0, 0, 5, 255), None);
-        assert_eq!(col_at_x(&w, g - 1.0, 0, 5, 255), None);
+        assert_eq!(col_at_x(w, 0.0, 0, 5, 255), None);
+        assert_eq!(col_at_x(w, g - 1.0, 0, 5, 255), None);
         // First pixel past the gutter is the leftmost scrolled column.
-        assert_eq!(col_at_x(&w, g, 0, 5, 255), Some(5));
-        assert_eq!(col_at_x(&w, g + 99.0, 0, 5, 255), Some(5));
+        assert_eq!(col_at_x(w, g, 0, 5, 255), Some(5));
+        assert_eq!(col_at_x(w, g + 99.0, 0, 5, 255), Some(5));
         // A boundary belongs to the column it opens — the off-by-one that made
         // a press near an edge anchor a cell late.
-        assert_eq!(col_at_x(&w, g + 100.0, 0, 5, 255), Some(6));
-        assert_eq!(col_at_x(&w, g + 250.0, 0, 5, 255), Some(7));
+        assert_eq!(col_at_x(w, g + 100.0, 0, 5, 255), Some(6));
+        assert_eq!(col_at_x(w, g + 250.0, 0, 5, 255), Some(7));
 
         // Frozen columns come first and are always at the left, whatever col0 is.
-        assert_eq!(col_at_x(&w, g, 2, 9, 255), Some(0));
-        assert_eq!(col_at_x(&w, g + 150.0, 2, 9, 255), Some(1));
-        assert_eq!(col_at_x(&w, g + 200.0, 2, 9, 255), Some(9), "past the frozen band comes col0");
+        assert_eq!(col_at_x(w, g, 2, 9, 255), Some(0));
+        assert_eq!(col_at_x(w, g + 150.0, 2, 9, 255), Some(1));
+        assert_eq!(col_at_x(w, g + 200.0, 2, 9, 255), Some(9), "past the frozen band comes col0");
         // Past the last column there is no cell.
-        assert_eq!(col_at_x(&w, 100_000.0, 0, 0, 255), None);
+        assert_eq!(col_at_x(w, 100_000.0, 0, 0, 255), None);
     }
 
     #[test]
@@ -11454,6 +11502,55 @@ mod grid_geom_tests {
         // Half-typed formulas are the normal case mid-edit.
         assert!(ranges("=SUM(").is_empty());
         assert!(ranges("=1+2").is_empty());
+    }
+
+    #[test]
+    fn pointing_maps_rows_past_hidden_ones() {
+        use super::{row_at_index, row_index_of};
+        // Rows 2 and 3 hidden: the list holds 0,1,4,5,… so a press on the third
+        // rendered row is sheet row 4, not row 2.
+        let hidden = |r: u32| r == 2 || r == 3;
+        assert_eq!(row_at_index(hidden, 0, 0), Some(0));
+        assert_eq!(row_at_index(hidden, 0, 1), Some(1));
+        assert_eq!(row_at_index(hidden, 0, 2), Some(4));
+        assert_eq!(row_at_index(hidden, 0, 3), Some(5));
+        // Frozen rows render above the list, so the list starts past them.
+        assert_eq!(row_at_index(hidden, 2, 0), Some(4));
+        // Nothing hidden: the index is the row.
+        assert_eq!(row_at_index(|_| false, 0, 7), Some(7));
+
+        // The inverse agrees with it, so a pick and a scroll-to name the same row.
+        for ix in 0..4 {
+            let row = row_at_index(hidden, 0, ix).unwrap();
+            assert_eq!(row_index_of(hidden, 0, row), ix, "row {row} at index {ix}");
+        }
+        assert_eq!(row_index_of(hidden, 2, 4), 0);
+        // A hidden row has no index of its own; it reports the next one's place,
+        // which is where a reveal-scroll should land.
+        assert_eq!(row_index_of(hidden, 0, 2), 2);
+        assert_eq!(row_index_of(hidden, 0, 3), 2);
+    }
+
+    #[test]
+    fn a_formula_that_never_parses_still_edits() {
+        // Nothing here is a reference, and none of it parses; the scan and the
+        // run split must still return something sane rather than panic or
+        // colour the wrong text, or ordinary typing would break.
+        for broken in ["=SUM(((", "=+*/", "=)(", "=A", "=:", "=SUM(D2:", "="] {
+            let n = broken.chars().count();
+            let runs = edit_runs(broken, n);
+            assert_eq!(runs.iter().map(|(_, s, _)| s.as_str()).collect::<String>(), broken, "runs must rebuild {broken:?}");
+            for c in 0..=n {
+                let _ = edit_runs(broken, c);
+                let _ = ref_token_at(broken, c);
+                let _ = replace_ref(broken, c, "B2");
+            }
+        }
+        // A half-typed range colours nothing, since it isn't a range yet.
+        assert!(formula_ref_tokens("=SUM(D2:").is_empty());
+        // But pointing into it still works: the reference under the caret is
+        // replaced whole, not appended to.
+        assert_eq!(replace_ref("=SUM(D2:", 8, "D2:D5"), ("=SUM(D2:D5".to_string(), 10));
     }
 
     #[test]
