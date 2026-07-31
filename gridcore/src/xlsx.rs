@@ -2073,6 +2073,13 @@ pub(crate) fn esc_attr(s: &str) -> String {
 /// A self-contained `chartSpace` for a clustered column chart, with categories
 /// and per-series values cached as literals (`strLit`/`numLit`) so it renders
 /// without the source range.
+/// The chart part a `ChartData` serializes to — exposed to sibling modules so
+/// their tests can round-trip parse → write → parse.
+#[cfg(test)]
+pub(crate) fn chart_space_xml_for_test(data: &crate::sheet::ChartData) -> String {
+    chart_space_xml(data)
+}
+
 fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
     let ncat = data.categories.len().max(data.series.iter().map(|s| s.values.len()).max().unwrap_or(0));
     let cat_pts: String = (0..ncat)
@@ -2086,27 +2093,40 @@ fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
         // values, so Excel keeps it live; a snapshot writes the caches alone as
         // literals. The numbers are the same either way.
         let src = data.source.as_ref();
-        let name = match (src, s.col) {
-            (Some(sc), Some(col)) => format!(
+        // A series' own refs win; otherwise they are derived from the chart's
+        // box and the column this series reads.
+        let name_ref = s.name_ref.clone().or_else(|| Some(src?.header_ref(s.col?)));
+        let val_ref = s
+            .values_ref
+            .as_ref()
+            .map(|v| v.to_ref())
+            .or_else(|| Some(src?.f_ref(s.col?, s.col?, true)));
+        let cat_ref = data
+            .categories_ref
+            .as_ref()
+            .map(|v| v.to_ref())
+            .or_else(|| src.map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true)));
+        let name = match name_ref {
+            Some(r) => format!(
                 "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
-                esc_attr(&sc.header_ref(col)),
+                esc_attr(&r),
                 esc_attr(&s.name)
             ),
-            _ => format!("<c:tx><c:v>{}</c:v></c:tx>", esc_attr(&s.name)),
+            None => format!("<c:tx><c:v>{}</c:v></c:tx>", esc_attr(&s.name)),
         };
-        let cat = match src {
-            Some(sc) => format!(
+        let cat = match cat_ref {
+            Some(r) => format!(
                 "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strCache></c:strRef></c:cat>",
-                esc_attr(&sc.f_ref(sc.cat_col, sc.cat_col, true))
+                esc_attr(&r)
             ),
             None => format!("<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>"),
         };
-        let val = match (src, s.col) {
-            (Some(sc), Some(col)) => format!(
+        let val = match val_ref {
+            Some(r) => format!(
                 "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numCache></c:numRef></c:val>",
-                esc_attr(&sc.f_ref(col, col, true))
+                esc_attr(&r)
             ),
-            _ => format!("<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"),
+            None => format!("<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"),
         };
         let fill = match s.color {
             Some(rgb) => format!("<c:spPr><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></c:spPr>"),

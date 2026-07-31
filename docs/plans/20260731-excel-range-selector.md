@@ -158,12 +158,14 @@ Dependencies identified:
 - [x] run tests, then screenshot a fast drag from A1 to D5 - 13 passed; the drag that previously produced A2:D5 now produces A1:D5 in point mode, and A1:C4 for plain drag-select
 
 ### Task 4: Per-series references in the chart model
-- [ ] give `ChartSeries` its own `values: Option<ChartSource>` and `name_ref: Option<String>`, and `ChartData` a `categories_ref: Option<ChartSource>`, keeping `source` as the box the panel shows
-- [ ] fill them in `chart_from_range` (each numeric column becomes that series' values ref; the label column becomes `categories_ref`)
-- [ ] read them in `parse_chart`: the `<c:f>` inside each `<c:ser>`'s `<c:val>`/`<c:tx>` belongs to that series, the one in `<c:cat>` to the categories
-- [ ] write per-series refs in `chart_space_xml` from the series' own ranges, falling back to the current derived form when absent
-- [ ] write tests in `gridcore` for parse → model → serialize → parse round-tripping two series with different value ranges
-- [ ] run `cargo test -p gridcore`, then `cargo build --all-targets` at the root and the suite build (this task changes public types) - must pass before task 5
+- [x] give `ChartSeries` its own `values_ref: Option<ChartSource>` and `name_ref: Option<String>`, and `ChartData` a `categories_ref: Option<ChartSource>`, keeping `source` as the box the panel shows
+  - ⚠️ named `values_ref`, not `values`: `ChartSeries::values` is already the cached numbers
+  - ➕ added `ChartSource::to_ref()` — a per-series range names itself, unlike `f_ref` which derives a column out of the chart's box and skips a header row
+- [x] fill them in `chart_from_range` (each numeric column becomes that series' values ref; the label column becomes `categories_ref`)
+- [x] read them in `parse_chart`: the `<c:f>` inside each `<c:ser>`'s `<c:val>`/`<c:tx>` belongs to that series, the one in `<c:cat>` to the categories, and their union stays the chart's box
+- [x] write per-series refs in `chart_space_xml` from the series' own ranges, falling back to the derived form when absent
+- [x] write tests in `gridcore` for parse → model → serialize → parse round-tripping two series with different value ranges, plus the derived fallback
+- [x] run `cargo test -p gridcore` (273 passed), then `cargo build --all-targets` at the root and the suite build — both green (the fixtures broken by the last model change already use `..Default::default()`)
 
 ### Task 5: Series list in the Chart panel
 - [ ] render the series as a list: name, values range, colour swatch row, with the selected series highlighted

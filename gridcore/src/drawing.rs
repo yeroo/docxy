@@ -362,7 +362,25 @@ fn parse_chart(xml: &str) -> ChartData {
                         _ => {}
                     }
                 } else if in_f {
-                    if let Some(src) = crate::sheet::ChartSource::parse_f_ref(p.text().trim()) {
+                    let raw = p.text().trim().to_string();
+                    if let Some(src) = crate::sheet::ChartSource::parse_f_ref(&raw) {
+                        // Each ref belongs to whatever block it sits in, so a
+                        // series can later be re-pointed on its own; their union
+                        // is the chart's overall box.
+                        match mode {
+                            1 => {
+                                if let Some(sr) = cd.series.last_mut() {
+                                    sr.name_ref = Some(raw);
+                                }
+                            }
+                            2 => cd.categories_ref = Some(src.clone()),
+                            3 => {
+                                if let Some(sr) = cd.series.last_mut() {
+                                    sr.values_ref = Some(src.clone());
+                                }
+                            }
+                            _ => {}
+                        }
                         match &mut cd.source {
                             Some(cur) if cur.sheet == src.sheet => cur.union(&src),
                             Some(_) => {}
@@ -481,6 +499,52 @@ mod tests {
         let src = cd.source.expect("source range");
         assert_eq!(src.sheet, "Budget");
         assert_eq!(src.range, (0, 0, 2, 1));
+    }
+
+    #[test]
+    fn per_series_refs_survive_a_parse_write_parse_round_trip() {
+        use crate::sheet::{ChartSeries, ChartSource};
+        // Two series reading different columns, plus their own category ref.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt><c:pt idx="1"><c:v>Dock</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser>
+          <c:ser><c:idx val="1"/>
+            <c:tx><c:strRef><c:f>Budget!$D$1</c:f><c:strCache><c:pt idx="0"><c:v>Total</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt><c:pt idx="1"><c:v>Dock</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$D$2:$D$3</c:f><c:numCache><c:pt idx="0"><c:v>2398</c:v></c:pt><c:pt idx="1"><c:v>358</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.series.len(), 2);
+        // Each series kept its OWN values range, not the chart's overall box.
+        assert_eq!(cd.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
+        assert_eq!(cd.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Budget!$B$1"));
+        assert_eq!(cd.series[1].name_ref.as_deref(), Some("Budget!$D$1"));
+        assert_eq!(cd.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        // Their union is still the whole box the panel shows.
+        assert_eq!(cd.source.as_ref().map(|v| v.range), Some((0, 0, 2, 3)));
+
+        // Writing and re-reading keeps every one of them.
+        let again = parse_chart(&crate::xlsx::chart_space_xml_for_test(&cd));
+        assert_eq!(again.series[0].values_ref.as_ref().map(|v| v.range), Some((1, 1, 2, 1)));
+        assert_eq!(again.series[1].values_ref.as_ref().map(|v| v.range), Some((1, 3, 2, 3)));
+        assert_eq!(again.categories_ref.as_ref().map(|v| v.range), Some((1, 0, 2, 0)));
+        assert_eq!(again.series[1].name_ref.as_deref(), Some("Budget!$D$1"));
+        assert_eq!(again.series[1].values, vec![2398.0, 358.0]);
+
+        // A series with no ref of its own still falls back to the chart's box.
+        let derived = ChartData {
+            series: vec![ChartSeries { name: "Qty".into(), values: vec![1.0], col: Some(1), ..Default::default() }],
+            categories: vec!["Laptop".into()],
+            source: Some(ChartSource { sheet: "Budget".into(), range: (0, 0, 1, 1), cat_col: 0 }),
+            ..Default::default()
+        };
+        let out = crate::xlsx::chart_space_xml_for_test(&derived);
+        assert!(out.contains("<c:f>Budget!$B$2:$B$2</c:f>"), "derived value ref: {out}");
+        assert!(out.contains("<c:f>Budget!$A$2:$A$2</c:f>"), "derived category ref: {out}");
     }
 
     #[test]

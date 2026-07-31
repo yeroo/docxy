@@ -289,9 +289,12 @@ pub struct ChartData {
     pub categories: Vec<String>,
     pub series: Vec<ChartSeries>,
     /// The cells the chart plots, when it is range-backed rather than a frozen
-    /// snapshot. Read from the `<c:f>` refs on load; written back on save, so
-    /// Excel sees a live chart too.
+    /// snapshot — the whole box, header row and labels included. Read from the
+    /// `<c:f>` refs on load; written back on save, so Excel sees a live chart too.
     pub source: Option<ChartSource>,
+    /// The cells holding the category labels, when known. A series UI edits this
+    /// on its own, so it can't be derived from `source` alone.
+    pub categories_ref: Option<ChartSource>,
     /// The chart part this came from (`xl/charts/chartN.xml`), so an edit can be
     /// written back into it.
     pub part: Option<String>,
@@ -320,6 +323,14 @@ impl ChartSource {
         let top = if skip_header { r1.saturating_add(1).min(r2) } else { r1 };
         let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
         format!("{name}!${}${}:${}${}", col_name(c1), top + 1, col_name(c2), r2 + 1)
+    }
+
+    /// This source's own cells as an absolute ref — for a per-series range,
+    /// which already excludes the header row.
+    pub fn to_ref(&self) -> String {
+        let (r1, c1, r2, c2) = self.range;
+        let name = if self.sheet.contains(' ') { format!("'{}'", self.sheet) } else { self.sheet.clone() };
+        format!("{name}!${}${}:${}${}", col_name(c1), r1 + 1, col_name(c2), r2 + 1)
     }
 
     /// The single header cell above `col` — a series' name ref.
@@ -389,11 +400,14 @@ pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, 
     let cat_col = cat_col.unwrap_or(c0);
     let rows: Vec<u32> = (r0 + 1..=r1).collect();
     let title = text_of(r0, cat_col);
+    let src = |c1: u32, c2: u32| ChartSource { sheet: sheet_name.to_string(), range: (r0 + 1, c1, r1, c2), cat_col };
     let series = num_cols
         .iter()
         .map(|&c| ChartSeries {
             name: text_of(r0, c),
             col: Some(c),
+            values_ref: Some(src(c, c)),
+            name_ref: Some(ChartSource { sheet: sheet_name.to_string(), range, cat_col }.header_ref(c)),
             values: rows
                 .iter()
                 .map(|&r| match sheet.cell(r, c).map(|cl| &cl.value) {
@@ -410,6 +424,7 @@ pub fn chart_from_range(sheet: &Sheet, sheet_name: &str, range: (u32, u32, u32, 
         categories: rows.iter().map(|&r| text_of(r, cat_col)).collect(),
         series,
         source: Some(ChartSource { sheet: sheet_name.to_string(), range, cat_col }),
+        categories_ref: Some(src(cat_col, cat_col)),
         part: None,
         edited: true,
     })
@@ -425,6 +440,11 @@ pub struct ChartSeries {
     pub color: Option<u32>,
     /// The worksheet column this series reads, when the chart is range-backed.
     pub col: Option<u32>,
+    /// The cells this series' values come from. Set independently of the chart's
+    /// overall box, so one series can be re-pointed without touching the others.
+    pub values_ref: Option<ChartSource>,
+    /// The `<c:f>` ref naming this series (usually its header cell), verbatim.
+    pub name_ref: Option<String>,
 }
 
 /// One data-validation rule over a set of cell ranges.
