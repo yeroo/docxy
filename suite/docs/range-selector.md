@@ -73,7 +73,10 @@ anywhere in this app — and receives keys through `sheet_key` → `range_edit_k
 `Ctrl+A` is the *only* chord the field takes. Every other one falls through to
 the sheet even while a field is focused, so `Ctrl+C`/`X`/`V` copy, cut and paste
 **cells**, `Ctrl+Z`/`Y` undo the **sheet**, and `Ctrl+S` saves — selecting text
-in a field and pressing `Ctrl+C` copies the grid selection, not the text.
+in a field and pressing `Ctrl+C` copies the grid selection, not the text. For a
+field inside a bar that means routing *past* the bar as well (`to_bar` in
+`sheet_key`): the bar's own buffer takes plain typing, not chords, so a chord the
+field declined would otherwise be dropped there rather than reaching the sheet.
 
 Under the field sits whatever the last commit said about it — `"Applies to
 D2:D5"`, or `"\"total\" isn't a range like A1:D5"` — falling back to the field's
@@ -107,9 +110,18 @@ A bar owns the keyboard while it is open, so `sheet_key` asks its range field
 first (`RefTarget::is_bar`) — otherwise what you type lands in the bar's own
 buffer.
 
-All three refuse a slot whose cells are on **another sheet** (`ref_elsewhere`):
-the field shows a range with its sheet stripped, so committing one from the
-wrong sheet would silently move it here onto unrelated numbers.
+Every chart slot — `ChartRange` as much as `SeriesName`, `SeriesValues` and
+`Categories` — refuses cells that are on **another sheet** (`ref_elsewhere`): the
+field shows a range with its sheet stripped, so committing one from the wrong
+sheet would silently move it here onto unrelated numbers. `ChartRange` needs this
+most, since it is seeded from the box and re-points *every* series at once.
+
+Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
+combo plot area still round-trips verbatim, and only **picking a type**
+(`chart_set_kind`) says "author this one afresh". Growing the box as a slot moves
+only stretches it over the sheet it already names (`union_source`) —
+`ChartSource::union` keeps the receiver's sheet, so unioning across sheets would
+leave the box naming one and covering the other's cells.
 
 Series can also be added, removed and reordered from the panel. A reorder closes
 the gap behind the series rather than swapping it with its destination — the

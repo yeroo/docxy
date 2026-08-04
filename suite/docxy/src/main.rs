@@ -1555,6 +1555,23 @@ fn series_remove(list: &mut Vec<gridcore::sheet::ChartSeries>, i: usize) -> bool
     true
 }
 
+/// Grow a chart's box to also cover a slot just re-pointed at `src`.
+///
+/// `ChartSource::union` merges rectangles and keeps the receiver's sheet name,
+/// so unioning across sheets would leave the box naming one sheet and covering
+/// the other's cells — and `chart_space_xml` derives a ref-less series' and the
+/// categories' `<c:f>` from that box. A box on another sheet has nothing to say
+/// about these cells, so it is replaced rather than stretched.
+fn union_source(
+    box_: &mut Option<gridcore::sheet::ChartSource>,
+    src: gridcore::sheet::ChartSource,
+) {
+    match box_ {
+        Some(b) if b.sheet.eq_ignore_ascii_case(&src.sheet) => b.union(&src),
+        _ => *box_ = Some(src),
+    }
+}
+
 /// Move series `i` by `delta` places, clamped to the ends. Returns where it
 /// landed, or `None` if it couldn't move. Colours ride along, since they live
 /// on the series rather than on its position.
@@ -2574,6 +2591,14 @@ impl Docxy {
     /// chart plots the sheet it floats over.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
+        // The field shows the box with its sheet name STRIPPED, so a chart
+        // floating over one sheet but plotting another shows cells that mean
+        // something else here. Committing the seed text as-is would re-point it
+        // at the active sheet's numbers, exactly as the per-series slots refuse
+        // to.
+        if self.ref_block_elsewhere(RefTarget::ChartRange, old.source.as_ref(), cx) {
+            return;
+        }
         let cells = text.trim();
         let range = match chart_range_of(text, "A1:D5") {
             Ok(r) => r,
@@ -2603,6 +2628,11 @@ impl Docxy {
         // The new plot keeps the look of the old one.
         data.title = old.title.clone();
         data.part = old.part.clone();
+        // Re-pointing is not "author this one afresh" — only picking a type is
+        // (see `chart_set_kind`). `chart_from_range` always says `complex:
+        // false`, and taking that would let the writer regenerate a stacked or
+        // combo plot area as a plain clustered one.
+        data.complex = old.complex;
         for (i, s) in data.series.iter_mut().enumerate() {
             s.color = old.series.get(i).and_then(|o| o.color);
         }
@@ -2866,10 +2896,7 @@ impl Docxy {
         // The chart's box is the union of what it reads, so the DATA RANGE the
         // panel shows covers this series too — otherwise it only caught up after
         // a save/reload, when `parse_chart` re-unions the refs.
-        match &mut data.source {
-            Some(box_) => box_.union(&src),
-            None => data.source = Some(src),
-        }
+        union_source(&mut data.source, src);
         self.ref_msg = Some((RefTarget::SeriesValues(i), true, format!("{n} points")));
         self.chart_set_data(data, cx);
     }
@@ -3025,10 +3052,7 @@ impl Docxy {
         // The chart's box covers everything it reads, labels included — the same
         // reason `series_apply_values` unions, and the DATA RANGE the panel shows
         // is derived from it.
-        match &mut data.source {
-            Some(box_) => box_.union(&src),
-            None => data.source = Some(src),
-        }
+        union_source(&mut data.source, src);
         self.ref_msg = Some((
             RefTarget::Categories,
             true,
@@ -6182,19 +6206,25 @@ impl Docxy {
         // own buffer would eat what is typed into the field. Ctrl chords stay
         // with the sheet — except Ctrl+A, which the focused field reads as
         // "select this text", not "select the used range".
-        if matches!(&self.range_edit, Some(f) if f.target.is_bar()) && (!ctrl || key == "a") {
+        let bar_field = matches!(&self.range_edit, Some(f) if f.target.is_bar());
+        if bar_field && (!ctrl || key == "a") {
             return self.range_edit_key(ev, ctrl, shift, key, cx);
         }
+        // A chord the field just declined belongs to the SHEET. Letting it reach
+        // the bar handlers below instead would only get it dropped — the bar's
+        // own buffer takes plain typing, not chords — so `Ctrl+C`/`V`/`Z`/`S`
+        // would do nothing at all while a bar's range field had focus.
+        let to_bar = |open: bool| open && !bar_field;
         // The comment entry bar swallows typing until Enter (commit) / Esc.
         if self.sheet_comment_edit.is_some() {
             return self.sheet_comment_key(ev, key, cx);
         }
         // The conditional-format entry bar likewise swallows typing.
-        if self.sheet_cf_edit.is_some() {
+        if to_bar(self.sheet_cf_edit.is_some()) {
             return self.sheet_cf_key(ev, key, cx);
         }
         // The data-validation entry bar swallows typing too.
-        if self.sheet_dv_edit.is_some() {
+        if to_bar(self.sheet_dv_edit.is_some()) {
             return self.sheet_dv_edit_key(ev, key, cx);
         }
         // The AutoFilter criteria bar swallows typing too.
@@ -6202,11 +6232,11 @@ impl Docxy {
             return self.sheet_filter_key(ev, key, cx);
         }
         // The Text-to-Columns delimiter bar swallows typing too.
-        if self.sheet_ttc_edit.is_some() {
+        if to_bar(self.sheet_ttc_edit.is_some()) {
             return self.sheet_ttc_key(ev, key, cx);
         }
         // The multi-level sort spec bar swallows typing too.
-        if self.sheet_sort_edit.is_some() {
+        if to_bar(self.sheet_sort_edit.is_some()) {
             return self.sheet_sort_key(ev, key, cx);
         }
         // The row-height entry bar swallows typing too.
@@ -16294,6 +16324,34 @@ mod grid_geom_tests {
         // Anything else is the name itself.
         assert_eq!(series_name_commit("Revenue", "Qty"), NameCommit::Literal);
         assert_eq!(series_name_commit("", "Qty"), NameCommit::Literal);
+    }
+
+    #[test]
+    fn a_charts_box_only_grows_over_the_sheet_it_already_names() {
+        use gridcore::sheet::ChartSource;
+        let src = |sheet: &str, range| ChartSource {
+            sheet: sheet.into(),
+            range,
+            cat_col: 0,
+        };
+        // Same sheet: the box stretches to cover the newly pointed cells.
+        let mut b = Some(src("Data", (1, 1, 3, 1)));
+        super::union_source(&mut b, src("data", (0, 0, 5, 2)));
+        assert_eq!(b.as_ref().map(|s| (s.sheet.as_str(), s.range)), {
+            Some(("Data", (0, 0, 5, 2)))
+        });
+        // Another sheet: `union` keeps the RECEIVER's name, so stretching would
+        // leave the box saying "Data" over cells on "Report" — and
+        // `chart_space_xml` derives refs from that box. Replace it instead.
+        let mut b = Some(src("Data", (1, 1, 3, 1)));
+        super::union_source(&mut b, src("Report", (9, 9, 9, 9)));
+        assert_eq!(b.as_ref().map(|s| (s.sheet.as_str(), s.range)), {
+            Some(("Report", (9, 9, 9, 9)))
+        });
+        // No box yet: the pointed cells become it.
+        let mut b = None;
+        super::union_source(&mut b, src("Data", (0, 0, 1, 1)));
+        assert_eq!(b.map(|s| s.range), Some((0, 0, 1, 1)));
     }
 
     #[test]

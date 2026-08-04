@@ -5032,7 +5032,12 @@ fn draw_sheet_picker(app: &App, sel: usize, f: &mut Frame, grid: Rect) {
         .map(|s| s.name.as_str())
         .collect();
     let widest = names.iter().map(|n| n.chars().count()).max().unwrap_or(6);
-    let w = ((widest + 6) as u16).clamp(16, grid.width.saturating_sub(2));
+    // `.max().min()`, not `clamp`: on a terminal narrower than the minimum,
+    // `clamp`'s `min <= max` assert fires before the "too small to draw" guard
+    // below can decline.
+    let w = ((widest + 6) as u16)
+        .max(16)
+        .min(grid.width.saturating_sub(2));
     let h = (names.len() as u16 + 3).min(grid.height);
     if w < 12 || h < 4 {
         return;
@@ -5249,7 +5254,11 @@ fn draw_dv_picker(app: &App, p: &DvPicker, f: &mut Frame, grid: Rect) {
         .max()
         .unwrap_or(6)
         .max(8);
-    let w = ((widest + 4) as u16).clamp(10, grid.width.saturating_sub(2));
+    // See `draw_sheet_picker`: `clamp` asserts `min <= max`, and a narrow
+    // terminal leaves the available width below the 10 asked for here.
+    let w = ((widest + 4) as u16)
+        .max(10)
+        .min(grid.width.saturating_sub(2));
     let h = (p.values.len() as u16 + 2).min(grid.height.max(3));
     // Anchor under the cursor cell when it's on screen, else the grid's corner.
     let cell_x = app
@@ -5401,7 +5410,9 @@ fn draw_format_dialog(app: &App, d: &FormatDialog, f: &mut Frame, grid: Rect) {
     };
 
     let w = 42u16.min(grid.width.saturating_sub(2));
-    let h = ((rows.len() as u16) + 6).clamp(9, grid.height.min(22));
+    // See `draw_sheet_picker`: `clamp` asserts `min <= max`, and a terminal
+    // under 9 rows tall would trip it before the guard below returns.
+    let h = ((rows.len() as u16) + 6).max(9).min(grid.height.min(22));
     if w < 22 || h < 8 {
         return;
     }

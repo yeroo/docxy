@@ -1537,10 +1537,15 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             // never touched.
             if !(moves.is_empty() && sheet.drawings_removed.is_empty()) {
                 if let Some(p) = parts.iter_mut().find(|(n, _)| n == dpart) {
-                    if let Ok(xml) = std::str::from_utf8(&p.1) {
-                        p.1 = crate::drawing::rewrite_anchors(xml, &moves, &sheet.drawings_removed)
-                            .into_bytes();
-                    }
+                    // Lossy on purpose once there IS something to write: the
+                    // load path read this same part with `from_utf8_lossy`, so
+                    // the anchors and their indices came from the decoded text
+                    // either way. Bailing out here instead would drop the move
+                    // or the delete on the floor, silently — the chart the user
+                    // deleted would be back on the next open.
+                    let xml = String::from_utf8_lossy(&p.1);
+                    p.1 = crate::drawing::rewrite_anchors(&xml, &moves, &sheet.drawings_removed)
+                        .into_bytes();
                 }
             }
         }
@@ -2190,15 +2195,21 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             .map(|v| v.to_ref())
             .or_else(|| Some(src?.f_ref(s.col?, s.col?, true)));
         // Derive the category ref only from a box that HAS a label column to
-        // spare, and only when no series plots that column. `cat_col` comes from
-        // whichever ref was read first — for a chart whose categories are
-        // literals that is a series' own name or values column, and `<c:cat>`
-        // would then name the plotted numbers as their own labels.
-        let plots_col = |c: u32| {
+        // spare, and only when no series has already claimed that column.
+        // `cat_col` comes from whichever ref was read first — for a chart whose
+        // categories are `<c:strLit>` that is a series' own NAME or VALUES ref,
+        // and `<c:cat>` would then name cells the labels never came from: Excel
+        // refreshes from the ref it is given, so the user's typed labels would
+        // be replaced by whatever those cells hold.
+        let claimed_col = |c: u32| {
             data.series.iter().any(|s| {
                 s.col == Some(c)
                     || s.values_ref
                         .as_ref()
+                        .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
+                    || s.name_ref
+                        .as_deref()
+                        .and_then(crate::sheet::ChartSource::parse_f_ref)
                         .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
             })
         };
@@ -2207,7 +2218,7 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             .as_ref()
             .map(|v| v.to_ref())
             .or_else(|| {
-                src.filter(|sc| sc.range.1 != sc.range.3 && !plots_col(sc.cat_col))
+                src.filter(|sc| sc.range.1 != sc.range.3 && !claimed_col(sc.cat_col))
                     .map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true))
             });
         let name = match name_ref {

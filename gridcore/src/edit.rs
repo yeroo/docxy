@@ -801,6 +801,11 @@ pub fn shift_chart_refs(
         *slot = next;
         hit
     };
+    // Which sheet a ref-less series reads: `chart_space_xml` derives its cells
+    // from the chart's box, so that box decides whether its column is an index
+    // into the edited grid. (Shifting leaves the sheet name alone, so reading it
+    // after `shift_slot` is the same answer.)
+    let source_mine = cd.source.as_ref().is_some_and(&mine);
     let mut changed = shift_slot(&mut cd.source);
     changed |= shift_slot(&mut cd.categories_ref);
     for ser in &mut cd.series {
@@ -812,8 +817,15 @@ pub fn shift_chart_refs(
             // back exactly the dangling ref the drop above is for.
             ser.col = None;
         }
-        // The column a series plots is an index into the grid like any other.
-        if !shift.rows {
+        // The column a series plots is an index into the grid like any other —
+        // but only into the grid it actually reads. Shifting it for a column
+        // inserted on some OTHER sheet would leave `col` contradicting
+        // `values_ref`, and would mark a chart nobody touched for regeneration.
+        let col_mine = match ser.values_ref.as_ref() {
+            Some(v) => mine(v),
+            None => source_mine,
+        };
+        if !shift.rows && col_mine {
             if let Some(c) = ser.col {
                 let next = point(c, shift);
                 changed |= next != Some(c);
@@ -950,9 +962,21 @@ fn point(v: u32, shift: &EditShift) -> Option<u32> {
 /// A span through the shift (deletes clamp); None = span fully deleted.
 fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     let at = shift.at;
-    let lo = point(a.min(b), shift).unwrap_or(at);
+    // `point` says `None` for two different things. On a DELETE the coordinate
+    // is gone, and the span clamps to the edit point. On an INSERT it was pushed
+    // off the end of the sheet — it clamps to the last row/column instead, since
+    // collapsing to `at - 1` would silently truncate a sheet-wide
+    // `<col min="1" max="16384">`, or a chart ref reading a whole column, down
+    // to the few cells before the insert.
+    let last = (if shift.rows { MAX_ROWS } else { MAX_COLS }) - 1;
+    let lo = match point(a.min(b), shift) {
+        Some(l) => l,
+        None if shift.delta > 0 => last,
+        None => at,
+    };
     let hi = match point(a.max(b), shift) {
         Some(h) => h,
+        None if shift.delta > 0 => last,
         None => at.checked_sub(1)?,
     };
     (lo <= hi).then_some((lo, hi))
@@ -1623,6 +1647,45 @@ mod tests {
         let cd = chart_of(&w);
         assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 2)));
         assert!(!cd.edited);
+    }
+
+    #[test]
+    fn a_column_insert_elsewhere_leaves_a_charts_plotted_column_alone() {
+        // `ser.col` is an index into the grid the series READS. Shifting it for
+        // a column inserted on some other sheet leaves it contradicting
+        // `values_ref` — and `chart_space_xml` derives a ref-less series' cells
+        // from it — while also marking a chart nobody touched as edited.
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_cols(&mut w, 1, 0, 3); // three columns on the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].col, Some(1));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 1, 3, 1))
+        );
+        assert!(!cd.edited);
+    }
+
+    #[test]
+    fn an_insert_pushing_a_span_off_the_sheet_clamps_to_the_last_column() {
+        // `point` says None both for "deleted" and for "pushed past the last
+        // column". Reading the second as the first collapses the span to just
+        // before the edit — and Excel writes `<col min="1" max="16384"/>` for a
+        // sheet-wide width, so every column past the insert would revert.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 0,
+            max: crate::sheet::MAX_COLS - 1,
+            width: Some(20.0),
+            attrs: String::new(),
+        });
+        insert_cols(&mut w, 0, 3, 1);
+        let d = &w.sheets[0].col_defs[0];
+        assert_eq!((d.min, d.max), (0, crate::sheet::MAX_COLS - 1));
     }
 
     #[test]

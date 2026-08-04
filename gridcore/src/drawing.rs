@@ -355,9 +355,32 @@ fn estimate_to(from: (u32, u32), ext: (i64, i64)) -> (u32, u32) {
     )
 }
 
+/// How many cached points one chart part may hold, all its series and its
+/// categories together. `<c:pt idx="…">` is an untrusted attribute that sizes a
+/// `Vec`, and a per-series cap is no cap at all: `<c:ser>` may repeat freely, so
+/// a ~1 MB chart part of tiny stanzas each holding one `<c:pt idx="1048575"/>`
+/// would ask for tens of GB while merely opening the workbook. A full column's
+/// worth across the whole part is far more than any real chart caches.
+const MAX_CACHE_POINTS: usize = 1 << 20;
+
+/// Grow `v` so index `i` exists, spending the part's remaining point budget.
+/// `false` when the budget won't stretch that far, and the point is dropped.
+fn fit_cache<T: Clone + Default>(v: &mut Vec<T>, i: usize, budget: &mut usize) -> bool {
+    let Some(need) = (i + 1).checked_sub(v.len()) else {
+        return true;
+    };
+    if need > *budget {
+        return false;
+    }
+    *budget -= need;
+    v.resize(i + 1, T::default());
+    true
+}
+
 /// Parse the cached data of a chart part (`c:chartSpace`).
 fn parse_chart(xml: &str) -> ChartData {
     let mut cd = ChartData::default();
+    let mut budget = MAX_CACHE_POINTS;
     let mut p = XmlParser::new(xml);
     let mut in_title = false;
     let mut in_title_text = false;
@@ -370,6 +393,8 @@ fn parse_chart(xml: &str) -> ChartData {
     // series colour (a fill nested in the data points or the plot area is a
     // different thing).
     let mut in_f = false;
+    // Inside the open series' own `<c:spPr>` — see the `"spPr"` arm below.
+    let mut in_ser_fill = false;
     let mut ser_depth = 0i32;
     // Inside an axis (<c:catAx>/<c:valAx>/…). Every axis may carry a <c:title>
     // of its own, and its text is not the chart's.
@@ -448,6 +473,11 @@ fn parse_chart(xml: &str) -> ChartData {
                         ser_depth += 1;
                         ser_at = depth;
                     }
+                    // A `<c:spPr>` that is a DIRECT child of the open series.
+                    // Everything under it — `<a:solidFill>` for a bar's fill,
+                    // `<a:ln><a:solidFill>` for a line's stroke — is the series'
+                    // own colour.
+                    "spPr" if depth == ser_at + 1 => in_ser_fill = true,
                     "tx" if plotted => mode = 1,
                     "cat" if plotted => mode = 2,
                     "val" if plotted => mode = 3,
@@ -467,7 +497,13 @@ fn parse_chart(xml: &str) -> ChartData {
                     "v" => in_v = true,
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
-                    "srgbClr" if ser_depth == 1 && mode == 0 => {
+                    // The series' OWN fill, which is the one `chart_space_xml`
+                    // writes back. `<c:dPt>`, `<c:marker>`, `<c:dLbls>`,
+                    // `<c:trendline>` and `<c:errBars>` all carry `<c:spPr>` of
+                    // their own; taking a colour from one of those would render
+                    // the card wrong and then persist a single point's colour as
+                    // the whole series' fill on the next edit.
+                    "srgbClr" if in_ser_fill => {
                         let val = p.attr("val");
                         let val = val.trim();
                         if let Some(rgb) =
@@ -503,19 +539,17 @@ fn parse_chart(xml: &str) -> ChartData {
                         2 => {
                             if cd.series.len() <= 1 {
                                 let i = pt_idx.unwrap_or(cd.categories.len());
-                                if cd.categories.len() <= i {
-                                    cd.categories.resize(i + 1, String::new());
+                                if fit_cache(&mut cd.categories, i, &mut budget) {
+                                    cd.categories[i] = t.to_string();
                                 }
-                                cd.categories[i] = t.to_string();
                             }
                         }
                         3 => {
                             if let (Ok(x), Some(s)) = (t.parse::<f64>(), cd.series.last_mut()) {
                                 let i = pt_idx.unwrap_or(s.values.len());
-                                if s.values.len() <= i {
-                                    s.values.resize(i + 1, 0.0);
+                                if fit_cache(&mut s.values, i, &mut budget) {
+                                    s.values[i] = x;
                                 }
-                                s.values[i] = x;
                             }
                         }
                         _ => {}
@@ -596,9 +630,11 @@ fn parse_chart(xml: &str) -> ChartData {
                     "v" => in_v = false,
                     "f" => in_f = false,
                     "pt" => pt_idx = None,
+                    "spPr" if depth == ser_at + 1 => in_ser_fill = false,
                     "ser" => {
                         ser_depth -= 1;
                         ser_at = -1;
+                        in_ser_fill = false;
                     }
                     "tx" | "cat" | "val" => mode = 0,
                     "xVal" | "yVal" | "bubbleSize" => in_pts = false,
@@ -845,6 +881,54 @@ mod tests {
     }
 
     #[test]
+    fn a_data_points_fill_is_not_the_series_colour() {
+        // A `<c:dPt>` colours ONE bar. `chart_space_xml` writes `s.color` back
+        // as the whole series' fill, so taking it here would make the first
+        // subsequent edit persist one point's colour over the lot. Same for the
+        // marker, the labels, the trendline and the error bars.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:dPt><c:idx val="1"/><c:spPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></c:spPr></c:dPt>
+            <c:dLbls><c:spPr><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></c:spPr></c:dLbls>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert_eq!(parse_chart(xml).series[0].color, None);
+    }
+
+    #[test]
+    fn a_line_series_takes_its_colour_from_its_own_stroke() {
+        // A line's colour lives at `<c:spPr><a:ln><a:solidFill>`, one level
+        // deeper than a bar's fill — the series' own `<c:spPr>` is what makes it
+        // the series' colour, not the depth it sits at.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:lineChart>
+          <c:ser><c:idx val="0"/>
+            <c:spPr><a:ln w="28575"><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></a:ln></c:spPr>
+            <c:marker><c:spPr><a:solidFill><a:srgbClr val="ED7D31"/></a:solidFill></c:spPr></c:marker>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert_eq!(parse_chart(xml).series[0].color, Some(0x4472C4));
+    }
+
+    #[test]
+    fn a_charts_caches_cannot_outgrow_the_parts_point_budget() {
+        // `idx` is an untrusted attribute that sizes a Vec, and `<c:ser>` may
+        // repeat freely — so a per-series cap is none at all. A handful of tiny
+        // stanzas each claiming the last row must not allocate GBs.
+        let ser = format!(
+            r#"<c:ser><c:val><c:numRef><c:numCache><c:pt idx="{}"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#,
+            crate::sheet::MAX_ROWS - 1
+        );
+        let xml = format!(
+            r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart>{}</c:barChart></c:plotArea></c:chart></c:chartSpace>"#,
+            ser.repeat(8)
+        );
+        let cd = parse_chart(&xml);
+        let total: usize = cd.series.iter().map(|s| s.values.len()).sum();
+        assert_eq!(cd.series.len(), 8);
+        assert!(total <= MAX_CACHE_POINTS, "{total} points cached");
+    }
+
+    #[test]
     fn a_sparse_cache_keeps_its_points_where_excel_put_them() {
         // Excel omits the `<c:pt>` for a blank or non-numeric source cell, so a
         // cache is sparse. Appending in document order shifts everything after
@@ -975,6 +1059,34 @@ mod tests {
         assert!(
             out.contains("<c:f>Budget!$A$2:$A$2</c:f>"),
             "derived category ref: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_in_categories_are_not_given_a_reference_they_never_had() {
+        // Categories written as `<c:strLit>` came from nobody's cells.
+        // `source.cat_col` is then just whichever `<c:f>` was read first — here
+        // the series' NAME ref, in a column no series plots — so deriving
+        // `<c:cat><c:strRef>` from it would hand Excel a ref to refresh the
+        // user's typed labels away from.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Sheet1!$A$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strLit><c:ptCount val="2"/><c:pt idx="0"><c:v>North</c:v></c:pt><c:pt idx="1"><c:v>South</c:v></c:pt></c:strLit></c:cat>
+            <c:val><c:numRef><c:f>Sheet1!$C$2:$C$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.categories, vec!["North", "South"]);
+        assert_eq!(cd.categories_ref, None);
+        // The box spans A..C, and `cat_col` is A — the name cell's column.
+        assert_eq!(cd.source.as_ref().map(|s| (s.range, s.cat_col)), {
+            Some(((0, 0, 2, 2), 0))
+        });
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(out.contains("<c:cat><c:strLit>"), "kept literal: {out}");
+        assert!(
+            !out.contains("<c:f>Sheet1!$A$2:$A$3</c:f>"),
+            "invented a category ref: {out}"
         );
     }
 
