@@ -38,7 +38,7 @@ The desktop suite's grid, its range-selector fields and the two GPUI traps they
 rest on are written up in
 [`suite/docs/range-selector.md`](suite/docs/range-selector.md).
 
-The root workspace is five crates, layered bottom-up:
+The root workspace is twenty crates. Layered bottom-up, at its core:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
   DEFLATE, XML pull parser) shared by both document formats.
@@ -49,7 +49,16 @@ The root workspace is five crates, layered bottom-up:
 - **`docxy`** — the `.docx` terminal UI (ratatui), clipboard, image rendering.
 - **`xlsxy`** — the `.xlsx` terminal UI.
 
-The three `*core` crates must stay **dependency-free** (`std` only). Most logic
+The rest follow the same shape — a pure core plus its front end: `projcore` /
+`yppxy` / `mppread` (project schedules), `mailcore` / `lookxy` (mail and
+calendar), `editcore`, `ribboncore` / `ribbonspec` / `backstagecore` and
+`ctlcore` (shared UI and the agent control surface), `docxwasm` / `gridwasm`
+(the browser builds), and `comshimcore` / `xlcomshim` / `wordcomshim` (the COM
+shims). The desktop GPUI suite lives in its own workspace under `suite/`.
+
+The three `*core` crates above must stay **dependency-free** (`std` only), as
+must `projcore` and `editcore`; `mailcore` is the exception, since IMAP and a
+local mail store need HTTP/TLS and SQLite. Most logic
 lives there and is covered by fast, pure unit tests — please add tests there for
 behavior changes.
 

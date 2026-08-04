@@ -378,6 +378,8 @@ fn parse_chart(xml: &str) -> ChartData {
     // `<c:grouping val="…"/>`. Together they decide `cd.complex`.
     let mut groups = 0usize;
     let mut grouping = String::new();
+    // A `<c:f>` inside a series that `parse_f_ref` couldn't read.
+    let mut unparsed_ref = false;
     // Element depth, and the depth of the open `<c:ser>` (-1 outside one). What
     // a series PLOTS is named by its direct children; `<c:dLbls>`, `<c:errBars>`
     // and `<c:trendline>` sit at that same level with refs of their own, and
@@ -388,6 +390,11 @@ fn parse_chart(xml: &str) -> ChartData {
     // Inside the point arrays a scatter or bubble chart plots instead of
     // `<c:cat>`/`<c:val>`.
     let mut in_pts = false;
+    // The `idx` of the open `<c:pt>`. Excel writes SPARSE caches — a blank or
+    // non-numeric source cell simply has no `<c:pt>` — so appending in document
+    // order shifts everything after a gap one place left, and an edited chart
+    // would then write that shift back to disk.
+    let mut pt_idx: Option<usize> = None;
     loop {
         match p.next() {
             Event::Start => {
@@ -447,6 +454,16 @@ fn parse_chart(xml: &str) -> ChartData {
                     // A scatter's/bubble's points: plotted cells, but under
                     // names `mode` doesn't cover.
                     "xVal" | "yVal" | "bubbleSize" if plotted => in_pts = true,
+                    // Capped: `idx` is an untrusted attribute, and it sizes a
+                    // Vec. No cache can outgrow the sheet it reads.
+                    "pt" => {
+                        pt_idx = p
+                            .attr("idx")
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|&i| i < crate::sheet::MAX_ROWS as usize)
+                    }
                     "v" => in_v = true,
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
@@ -484,13 +501,21 @@ fn parse_chart(xml: &str) -> ChartData {
                         }
                         // Categories are shared across series; take the first set.
                         2 => {
-                            if cd.series.len() <= 1 && !t.is_empty() {
-                                cd.categories.push(t.to_string());
+                            if cd.series.len() <= 1 {
+                                let i = pt_idx.unwrap_or(cd.categories.len());
+                                if cd.categories.len() <= i {
+                                    cd.categories.resize(i + 1, String::new());
+                                }
+                                cd.categories[i] = t.to_string();
                             }
                         }
                         3 => {
                             if let (Ok(x), Some(s)) = (t.parse::<f64>(), cd.series.last_mut()) {
-                                s.values.push(x);
+                                let i = pt_idx.unwrap_or(s.values.len());
+                                if s.values.len() <= i {
+                                    s.values.resize(i + 1, 0.0);
+                                }
+                                s.values[i] = x;
                             }
                         }
                         _ => {}
@@ -548,6 +573,16 @@ fn parse_chart(xml: &str) -> ChartData {
                                 slot => *slot = Some(src),
                             }
                         }
+                    } else if mode != 0 {
+                        // A ref this model can't hold: a whole column
+                        // (`Sheet1!$B:$B`), a defined name, a multi-area ref.
+                        // The slot stays empty, and regenerating the part would
+                        // write the cached numbers back as `<c:numLit>` —
+                        // turning a live, sheet-linked series into frozen
+                        // literals. Keep the part verbatim instead; picking a
+                        // type in the panel is still the way to author it
+                        // afresh, exactly as for a stacked or combo chart.
+                        unparsed_ref = true;
                     }
                 } else if in_title_text {
                     cd.title.push_str(&decoded(p.text()));
@@ -560,6 +595,7 @@ fn parse_chart(xml: &str) -> ChartData {
                     "t" => in_title_text = false,
                     "v" => in_v = false,
                     "f" => in_f = false,
+                    "pt" => pt_idx = None,
                     "ser" => {
                         ser_depth -= 1;
                         ser_at = -1;
@@ -573,7 +609,17 @@ fn parse_chart(xml: &str) -> ChartData {
             Event::Eof => break,
         }
     }
-    cd.complex = groups > 1 || !matches!(grouping.as_str(), "" | "clustered" | "standard");
+    cd.complex =
+        groups > 1 || unparsed_ref || !matches!(grouping.as_str(), "" | "clustered" | "standard");
+    // `cat_col` is set by whichever `<c:f>` landed in the box FIRST, and inside
+    // a `<c:ser>` that is the series' NAME ref — its header cell, in the column
+    // it plots. Where the labels really live is `<c:cat>`, so say so whenever
+    // the chart told us.
+    if let (Some(src), Some(cats)) = (cd.source.as_mut(), cd.categories_ref.as_ref()) {
+        if src.sheet == cats.sheet {
+            src.cat_col = cats.range.1;
+        }
+    }
     cd
 }
 
@@ -796,6 +842,61 @@ mod tests {
         let src = cd.source.expect("source range");
         assert_eq!(src.sheet, "Budget");
         assert_eq!(src.range, (0, 0, 2, 1));
+    }
+
+    #[test]
+    fn a_sparse_cache_keeps_its_points_where_excel_put_them() {
+        // Excel omits the `<c:pt>` for a blank or non-numeric source cell, so a
+        // cache is sparse. Appending in document order shifts everything after
+        // the gap one place left — and an edited chart writes that shift back.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$5</c:f><c:strCache><c:ptCount val="4"/><c:pt idx="0"><c:v>Jan</c:v></c:pt><c:pt idx="3"><c:v>Apr</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$5</c:f><c:numCache><c:ptCount val="4"/><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="2"><c:v>30</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.series[0].values, vec![10.0, 0.0, 30.0]);
+        assert_eq!(cd.categories, vec!["Jan", "", "", "Apr"]);
+        // An `idx` past the sheet is not a point, and must not size a Vec.
+        let huge = xml.replace("idx=\"3\"", "idx=\"4294967295\"");
+        assert_eq!(parse_chart(&huge).categories, vec!["Jan", "Apr"]);
+    }
+
+    #[test]
+    fn a_ref_this_model_cant_hold_keeps_the_whole_part_verbatim() {
+        // A whole-column ref is a shape `parse_f_ref` declines, so the series
+        // would keep its cached numbers but lose its link — and regenerating
+        // the part would write those numbers back as `<c:numLit>`, freezing a
+        // live chart. `complex` is the existing "keep it as Excel wrote it"
+        // escape hatch.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:val><c:numRef><c:f>Budget!$B:$B</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.series[0].values, vec![2.0], "the cache still draws it");
+        assert_eq!(cd.series[0].values_ref, None);
+        assert!(cd.complex, "so the part is not regenerated");
+        assert!(!crate::xlsx::chart_is_writable(&cd));
+        // An ordinary ref leaves the chart writable.
+        let ok = xml.replace("$B:$B", "$B$2:$B$3");
+        assert!(!parse_chart(&ok).complex);
+    }
+
+    #[test]
+    fn the_source_box_takes_its_label_column_from_the_category_ref() {
+        // `cat_col` is set by whichever `<c:f>` landed in the box first, and
+        // inside a `<c:ser>` that is the NAME ref — column B here. The labels
+        // are in A, and `chart_space_xml` derives `<c:cat>` from `cat_col` when
+        // a chart has no category ref of its own.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt><c:pt idx="1"><c:v>Dock</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.source.expect("source").cat_col, 0, "column A, not B");
     }
 
     #[test]

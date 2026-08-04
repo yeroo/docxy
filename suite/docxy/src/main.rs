@@ -1435,9 +1435,13 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
 }
 
 /// The sheet row at list index `ix`, skipping hidden rows and the `frozen`
-/// ones that render outside the list. `None` past the last row.
+/// ones that render outside the list. `None` past the last row of the sheet —
+/// which is what bounds the scan: `0..u32::MAX` would take a minute to answer
+/// `None` for an index nothing can satisfy.
 fn row_at_index(hidden: impl Fn(u32) -> bool, frozen: usize, ix: usize) -> Option<u32> {
-    (0..u32::MAX).filter(|&r| !hidden(r)).nth(frozen + ix)
+    (0..gridcore::sheet::MAX_ROWS)
+        .filter(|&r| !hidden(r))
+        .nth(frozen + ix)
 }
 
 /// The list index of `row` — the inverse of `row_at_index`, which the list
@@ -1554,6 +1558,10 @@ fn series_remove(list: &mut Vec<gridcore::sheet::ChartSeries>, i: usize) -> bool
 /// Move series `i` by `delta` places, clamped to the ends. Returns where it
 /// landed, or `None` if it couldn't move. Colours ride along, since they live
 /// on the series rather than on its position.
+///
+/// The ones it moves past close up behind it, as a list reorder does — a swap
+/// would be the same thing for the ±1 the arrows send, but would silently
+/// scramble the order for anything wider.
 fn series_move(list: &mut [gridcore::sheet::ChartSeries], i: usize, delta: i32) -> Option<usize> {
     if i >= list.len() {
         return None;
@@ -1562,8 +1570,31 @@ fn series_move(list: &mut [gridcore::sheet::ChartSeries], i: usize, delta: i32) 
     if to == i {
         return None;
     }
-    list.swap(i, to);
+    if to > i {
+        list[i..=to].rotate_left(1);
+    } else {
+        list[to..=i].rotate_right(1);
+    }
     Some(to)
+}
+
+/// Whether byte `at` sits inside a `"…"` string literal or a `'…'` quoted sheet
+/// name — the two places in a formula where text may look like a reference and
+/// isn't. (A doubled quote escapes itself, and toggling twice lands on the same
+/// answer, so no special case is needed for it.)
+fn quoted_at(buf: &str, at: usize) -> bool {
+    let (mut dq, mut sq) = (false, false);
+    for (i, c) in buf.char_indices() {
+        if i >= at {
+            break;
+        }
+        match c {
+            '"' if !sq => dq = !dq,
+            '\'' if !dq => sq = !sq,
+            _ => {}
+        }
+    }
+    dq || sq
 }
 
 /// The byte range of the cell reference the caret sits in or immediately after,
@@ -1590,6 +1621,16 @@ fn ref_token_at(buf: &str, caret_chars: usize) -> Option<std::ops::Range<usize>>
         .unwrap_or(caret);
     if buf[end..].starts_with('(') {
         return None; // a function name
+    }
+    if buf[end..].starts_with('[') {
+        return None; // a structured reference's table name — `T1[Amount]`
+    }
+    if quoted_at(buf, start) {
+        // Inside `"…"` or `'…'`: a string literal's contents, or a quoted sheet
+        // name. `formula_ref_tokens` steps over both, and repointing either one
+        // rewrites text that never named a cell — `='Q1'!A1` would become
+        // `='D7'!A1`, naming a sheet that doesn't exist.
+        return None;
     }
     if buf[..start].ends_with('!') {
         // `Sheet2!A1` — the cell half of another sheet's reference. Replacing it
@@ -1691,9 +1732,14 @@ fn formula_ref_tokens(buf: &str) -> Vec<RefToken> {
         // `Q1`). Cell-shaped, so `parse_range_name` takes it and we'd outline
         // cell Q1 of the sheet in view while the real ref went uncoloured.
         let is_sheet_name = buf[end..].starts_with('!');
+        // A structured reference's table name — `T1[Amount]`. Short ones are
+        // cell-shaped; longer ones are only rejected by `parse_col`'s XFD bound,
+        // which is an accident rather than a check.
+        let is_table = buf[end..].starts_with('[');
         if !is_call
             && !qualified
             && !is_sheet_name
+            && !is_table
             && let Some(r) = gridcore::sheet::parse_range_name(&buf[start..end])
         {
             out.push((start..end, r));
@@ -1745,10 +1791,24 @@ fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
 
 /// What a bar's range field makes of what was typed: the cells in normal A1
 /// form, or the complaint to show under the field.
-fn bar_range_text(text: &str) -> Result<String, String> {
-    match parse_ref_text(text) {
+///
+/// A `Sheet!` prefix is only accepted when it names `sheet`. A chart can afford
+/// to drop one (it plots the sheet it floats over), but a rule, a split or a
+/// sort acts on the ACTIVE sheet: dropping `Sheet2!` there would silently apply
+/// it to this sheet's cells of the same name, and the message would agree.
+fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
+    let t = text.trim();
+    if let Some((prefix, _)) = t.rsplit_once('!') {
+        let named = prefix.trim().trim_matches('\'').replace("''", "'");
+        if !named.eq_ignore_ascii_case(sheet) {
+            return Err(format!(
+                "\"{named}\" is another sheet; this acts on {sheet}"
+            ));
+        }
+    }
+    match parse_ref_text(t) {
         Some(r) => Ok(range_a1(r)),
-        None => Err(format!("\"{}\" isn't a range like A1:D5", text.trim())),
+        None => Err(format!("\"{t}\" isn't a range like A1:D5")),
     }
 }
 
@@ -1765,11 +1825,10 @@ fn sort_rows_from(
 }
 
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
+/// A drag IS a selection, so it normalises and formats through the same two
+/// functions the selection does rather than repeating them.
 fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
-    use gridcore::sheet::cell_name;
-    let (r0, c0) = (anchor.0.min(to.0), anchor.1.min(to.1));
-    let (r1, c1) = (anchor.0.max(to.0), anchor.1.max(to.1));
-    format!("{}:{}", cell_name(r0, c0), cell_name(r1, c1))
+    range_a1(sel_range(to, anchor))
 }
 
 /// One run of a Chart-panel field's text (`base_off` is its char offset in the
@@ -2615,7 +2674,10 @@ impl Docxy {
     /// Re-point the open entry bar. The bar itself does nothing until its own
     /// Enter — this only says which cells it will act on.
     fn bar_range_apply(&mut self, target: RefTarget, text: &str, cx: &mut Context<Self>) {
-        match bar_range_text(text) {
+        let Some(sheet) = self.active_sheet().map(|v| v.sheet().name.clone()) else {
+            return;
+        };
+        match bar_range_text(text, &sheet) {
             Ok(a1) => {
                 self.ref_msg = Some((target, true, format!("Applies to {a1}")));
                 self.bar_range = Some(a1);
@@ -2719,12 +2781,51 @@ impl Docxy {
         self.find_open = false;
     }
 
+    /// The sheet a chart reference reads, when that is NOT the sheet on screen.
+    /// A chart floats over one sheet and may plot another; pointing and the
+    /// fields both speak the active sheet, and the fields show a range with its
+    /// sheet stripped — so committing one of those slots from the wrong sheet
+    /// would silently move it here, onto unrelated numbers.
+    fn ref_elsewhere(&self, src: Option<&gridcore::sheet::ChartSource>) -> Option<String> {
+        let here = self.active_sheet()?.sheet().name.clone();
+        let src = src?;
+        (!src.sheet.eq_ignore_ascii_case(&here)).then(|| src.sheet.clone())
+    }
+
+    /// Refuse a commit whose slot reads another sheet, saying which. `true` when
+    /// the caller should stop.
+    fn ref_block_elsewhere(
+        &mut self,
+        target: RefTarget,
+        src: Option<&gridcore::sheet::ChartSource>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(other) = self.ref_elsewhere(src) else {
+            return false;
+        };
+        self.ref_msg = Some((
+            target,
+            false,
+            format!("these cells are on {other}; open that sheet to re-point them"),
+        ));
+        cx.notify();
+        true
+    }
+
     /// Re-point one series at another range, re-reading just its numbers. The
     /// other series and the categories are left exactly as they were.
     fn series_apply_values(&mut self, i: usize, text: &str, cx: &mut Context<Self>) {
         let Some(mut data) = self.chart_data() else {
             return;
         };
+        let target = RefTarget::SeriesValues(i);
+        if self.ref_block_elsewhere(
+            target,
+            data.series.get(i).and_then(|s| s.values_ref.as_ref()),
+            cx,
+        ) {
+            return;
+        }
         let range = match chart_range_of(text, "B2:B5") {
             Ok(r) => r,
             Err(m) => {
@@ -2733,6 +2834,19 @@ impl Docxy {
                 return;
             }
         };
+        // A series plots ONE column. Excel splits a two-dimensional pick into a
+        // series per column and reads such a ref column-major, while
+        // `range_numbers` flattens row-major — so accepting one here would write
+        // a `<c:f>` whose own cache is in the wrong order.
+        if range.1 != range.3 {
+            self.ref_msg = Some((
+                RefTarget::SeriesValues(i),
+                false,
+                "a series plots one column — point at cells like B2:B5".into(),
+            ));
+            cx.notify();
+            return;
+        }
         let Some(v) = self.active_sheet() else { return };
         let sh = v.sheet();
         let name = sh.name.clone();
@@ -2747,7 +2861,7 @@ impl Docxy {
         };
         let n = values.len();
         s.values = values;
-        s.col = (range.1 == range.3).then_some(range.1);
+        s.col = Some(range.1);
         s.values_ref = Some(src.clone());
         // The chart's box is the union of what it reads, so the DATA RANGE the
         // panel shows covers this series too — otherwise it only caught up after
@@ -2770,6 +2884,14 @@ impl Docxy {
             .get(i)
             .map(|s| s.name.clone())
             .unwrap_or_default();
+        let held = data
+            .series
+            .get(i)
+            .and_then(|s| s.name_ref.as_deref())
+            .and_then(gridcore::sheet::ChartSource::parse_f_ref);
+        if self.ref_block_elsewhere(RefTarget::SeriesName(i), held.as_ref(), cx) {
+            return;
+        }
         let (name, name_ref) = match series_name_commit(text, &shown) {
             NameCommit::Unchanged => return,
             NameCommit::Ref(range) => {
@@ -2779,9 +2901,13 @@ impl Docxy {
                     .first()
                     .cloned()
                     .unwrap_or_default();
+                // A name is ONE cell — the label taken above is that cell's, and
+                // `chart_space_xml` caches a single point beside the ref. A
+                // wider pick would write a `<c:f>` its own cache contradicts.
+                let cell = (range.0, range.1, range.0, range.1);
                 let src = gridcore::sheet::ChartSource {
                     sheet: sh.name.clone(),
-                    range,
+                    range: cell,
                     cat_col: range.1,
                 };
                 (label, Some(src.to_ref()))
@@ -2804,6 +2930,18 @@ impl Docxy {
             return;
         };
         let n = data.series.len();
+        // A pie plots one series and `chart_space_xml` writes only the first —
+        // a second would be listed in the panel, pointed at cells, and then
+        // dropped on save without a word.
+        if data.kind == "pie" && n > 0 {
+            self.ref_msg = Some((
+                RefTarget::SeriesValues(n - 1),
+                false,
+                "A pie plots one series — switch to column, bar or line to add another".into(),
+            ));
+            cx.notify();
+            return;
+        }
         data.series.push(gridcore::sheet::ChartSeries {
             name: format!("Series {}", n + 1),
             values: vec![0.0; data.categories.len()],
@@ -2864,6 +3002,9 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
+        if self.ref_block_elsewhere(RefTarget::Categories, data.categories_ref.as_ref(), cx) {
+            return;
+        }
         let range = match chart_range_of(text, "A2:A5") {
             Ok(r) => r,
             Err(m) => {
@@ -2875,11 +3016,19 @@ impl Docxy {
         let Some(v) = self.active_sheet() else { return };
         let sh = v.sheet();
         data.categories = gridcore::sheet::range_labels(sh, range);
-        data.categories_ref = Some(gridcore::sheet::ChartSource {
+        let src = gridcore::sheet::ChartSource {
             sheet: sh.name.clone(),
             range,
             cat_col: range.1,
-        });
+        };
+        data.categories_ref = Some(src.clone());
+        // The chart's box covers everything it reads, labels included — the same
+        // reason `series_apply_values` unions, and the DATA RANGE the panel shows
+        // is derived from it.
+        match &mut data.source {
+            Some(box_) => box_.union(&src),
+            None => data.source = Some(src),
+        }
         self.ref_msg = Some((
             RefTarget::Categories,
             true,
@@ -3118,8 +3267,13 @@ impl Docxy {
                 }
             }
             "enter" => {
+                // The repaint is ours, not the commit's: several arms return
+                // early when nothing changed, and the field has just lost its
+                // focus ring and caret either way.
                 self.range_edit = None;
-                return self.ref_commit(f.target, &f.buf, cx);
+                self.ref_commit(f.target, &f.buf, cx);
+                cx.notify();
+                return;
             }
             // A plain arrow past a selection lands on the end it points at.
             "left" => {
@@ -5329,11 +5483,15 @@ impl Docxy {
             } else {
                 // Nothing selected: plot the used cells — but a big sheet has
                 // far more of those than a card can draw, and this path doesn't
-                // go through `chart_range_of`'s cap.
+                // go through `chart_range_of`'s cap. Columns are capped first,
+                // at a count a legend can still name; without that a sheet 4096
+                // columns wide leaves room for zero rows and the button does
+                // nothing at all.
+                const MAX_CHART_COLS: u32 = 64;
                 let (mr, mc) = v.extent();
-                let mc = mc.min(MAX_CHART_CELLS as u32 - 1);
+                let mc = mc.min(MAX_CHART_COLS - 1);
                 let cols = u64::from(mc) + 1;
-                let rows = (MAX_CHART_CELLS / cols).saturating_sub(1) as u32;
+                let rows = (MAX_CHART_CELLS / cols).saturating_sub(1).max(1) as u32;
                 (0, 0, mr.min(rows), mc)
             };
             let sh = v.sheet();
@@ -15989,7 +16147,7 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        chart_range_of, col_at_x, col_px, edit_runs, fill_box, formula_ref_tokens,
+        char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box, formula_ref_tokens,
         last_visible_col, parse_ref_text, range_a1, range_text, ref_color, ref_index_at,
         ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, series_move,
         series_remove, shift_col, shift_row,
@@ -16006,8 +16164,14 @@ mod grid_geom_tests {
     /// with no cell of its own colour anywhere.
     #[test]
     fn overlapping_refs_colour_by_the_innermost() {
+        // Taken from the real scan, not written out: hardcoding it here would
+        // let the two sides drift apart while both tests stayed green.
+        let refs: Vec<_> = formula_ref_tokens("=SUM(B2:B5)/B3")
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
         // B2:B5 (rows 1..4, col 1) then B3 (row 2, col 1).
-        let refs = [(1, 1, 4, 1), (2, 1, 2, 1)];
+        assert_eq!(refs, vec![(1, 1, 4, 1), (2, 1, 2, 1)]);
         assert_eq!(ref_index_at(&refs, 2, 1), Some(1)); // B3 → the inner ref
         assert_eq!(ref_index_at(&refs, 1, 1), Some(0)); // B2 → only the outer
         assert_eq!(ref_index_at(&refs, 4, 1), Some(0)); // B5 → only the outer
@@ -16211,6 +16375,64 @@ mod grid_geom_tests {
         assert_eq!(ref_token_at("=Q1!B2", 2), None, "caret inside Q1");
         assert_eq!(ref_token_at("=Q1!B2", 6), None, "the cell half, as above");
         assert_eq!(ref_token_at("=Q1!B2+C3", 9), Some(7..9), "the local one");
+        // The same name QUOTED. `formula_ref_tokens` steps over `'…'`, so this
+        // has to as well or a pick with the caret inside the quotes rewrites
+        // `='Q1'!A1` to `='D7'!A1` — a sheet that doesn't exist.
+        assert_eq!(ref_token_at("='Q1'!A1", 4), None, "caret after the name");
+        assert_eq!(ref_token_at("='Q1'!A1", 3), None, "caret inside it");
+        assert_eq!(ref_token_at("='Q1'!A1", 8), None, "the cell half");
+        assert_eq!(ref_token_at("='Bob''s data'!A1", 5), None);
+        assert_eq!(
+            ref_token_at("='Q1'!A1+C3", 11),
+            Some(9..11),
+            "the local one"
+        );
+        // A string literal's contents are text, not cells — `formula_ref_tokens`
+        // skips them too, and a pick inside one would edit the string.
+        assert_eq!(ref_token_at("=\"A1 here\"", 4), None);
+        assert_eq!(
+            ref_token_at("=\"A1\"&C3", 8),
+            Some(6..8),
+            "outside it again"
+        );
+        // A structured reference's table name is not a cell.
+        assert_eq!(ref_token_at("=SUM(T1[Amount])", 7), None);
+    }
+
+    #[test]
+    fn the_two_reference_scanners_agree_on_the_same_buffer() {
+        // `formula_ref_tokens` colours the text and the grid; `ref_token_at`
+        // decides what a pick replaces. They are separate scans of the same
+        // four rules (function name, `Sheet!`-qualified, quoted name, string),
+        // so drift between them shows up as a formula edited where nothing was
+        // outlined. Every span one reports, the other must claim from its end.
+        for buf in [
+            "=B2*C2",
+            "=SUM(D2:D5)+B3",
+            "=LOG10(A1)",
+            "=Sheet2!A1+B2",
+            "=Q1!B2+C3",
+            "='Q1'!A1+C3",
+            "=\"A1\"&C3",
+            "='Bob''s data'!A1+B2",
+            "=SUM(T1[Amount])+B2",
+        ] {
+            for (span, _) in formula_ref_tokens(buf) {
+                let caret = buf[..span.end].chars().count();
+                assert_eq!(
+                    ref_token_at(buf, caret),
+                    Some(span.clone()),
+                    "{buf:?} at {caret}"
+                );
+            }
+        }
+        // And where it reports nothing, a pick inserts rather than replaces.
+        for buf in ["='Q1'!A1", "=\"A1 is here\"", "=Sheet2!A1", "=Q1!A1"] {
+            assert!(formula_ref_tokens(buf).is_empty(), "{buf:?}");
+            for caret in 0..=buf.chars().count() {
+                assert_eq!(ref_token_at(buf, caret), None, "{buf:?} at {caret}");
+            }
+        }
     }
 
     #[test]
@@ -16373,8 +16595,12 @@ mod grid_geom_tests {
         assert_eq!(formula_ref_tokens("=SUM(D2:D5)")[0].0, 5..10);
         assert_eq!(formula_ref_tokens("=B2*C2")[1].0, 4..6);
         // Function names are not references, even when they read like cells.
-        assert!(ranges("=LOG10(A1)").len() == 1, "only A1 counts");
+        assert_eq!(ranges("=LOG10(A1)"), vec![(0, 0, 0, 0)], "only A1 counts");
         assert_eq!(ranges("=SUM(A1)"), vec![(0, 0, 0, 0)]);
+        // Nor is a table name in a structured reference, which is cell-shaped
+        // whenever it is short: `T1` would otherwise outline cell T1.
+        assert!(ranges("=SUM(T1[Amount])").is_empty());
+        assert_eq!(ranges("=SUM(T1[Amount])+B2"), vec![(1, 1, 1, 1)]);
         // Another sheet's cells can't be outlined here, so they're skipped.
         assert!(ranges("=Sheet2!A1").is_empty());
         assert_eq!(
@@ -16446,9 +16672,29 @@ mod grid_geom_tests {
                 "runs must rebuild {broken:?}"
             );
             for c in 0..=n {
-                let _ = edit_runs(broken, c);
-                let _ = ref_token_at(broken, c);
-                let _ = replace_ref(broken, c, "B2");
+                // The invariant holds at EVERY caret, not just the end: a run
+                // split that dropped or duplicated text would still rebuild the
+                // buffer at one position by luck.
+                assert_eq!(
+                    edit_runs(broken, c)
+                        .iter()
+                        .map(|(_, s, _)| s.as_str())
+                        .collect::<String>(),
+                    broken,
+                    "runs must rebuild {broken:?} at caret {c}"
+                );
+                // A pick writes its cell in and keeps everything it didn't
+                // stand on, wherever the caret is.
+                let (out, caret) = replace_ref(broken, c, "B2");
+                assert!(out.contains("B2"), "{broken:?} at {c} lost the pick");
+                let span = ref_token_at(broken, c)
+                    .unwrap_or_else(|| char_to_byte(broken, c)..char_to_byte(broken, c));
+                assert_eq!(
+                    out,
+                    format!("{}B2{}", &broken[..span.start], &broken[span.end..]),
+                    "{broken:?} at {c}"
+                );
+                assert!(caret <= out.chars().count(), "{broken:?} at {c}");
             }
         }
         // A half-typed range colours nothing, since it isn't a range yet.
@@ -16469,6 +16715,15 @@ mod grid_geom_tests {
         assert_ne!(ref_color(0), ref_color(1));
         assert_eq!(ref_color(0), ref_color(6));
         assert_eq!(ref_color(2), ref_color(8));
+        // Telling references apart IS the feature, so every colour in the
+        // palette has to differ from every other — a duplicated constant would
+        // draw two references identically and pass everything above.
+        let palette: Vec<u32> = (0..6).map(ref_color).collect();
+        for (i, a) in palette.iter().enumerate() {
+            for (j, b) in palette.iter().enumerate() {
+                assert!(i == j || a != b, "colours {i} and {j} are both {a:#08X}");
+            }
+        }
     }
 
     #[test]
@@ -16584,6 +16839,21 @@ mod grid_geom_tests {
         assert_eq!(
             list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["Qty", "Total", "Price"]
+        );
+        // Further than one place: the ones it passes close up behind it. A swap
+        // would give ["Price", "Total", "Qty"] here — the arrows only ever send
+        // ±1, where the two agree, so nothing else would notice.
+        let mut four = vec![named("A", 1), named("B", 2), named("C", 3), named("D", 4)];
+        assert_eq!(series_move(&mut four, 0, 3), Some(3));
+        assert_eq!(
+            four.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["B", "C", "D", "A"]
+        );
+        // And back again, clamped past the end.
+        assert_eq!(series_move(&mut four, 3, -9), Some(0));
+        assert_eq!(
+            four.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["A", "B", "C", "D"]
         );
     }
 
@@ -16722,14 +16992,16 @@ mod grid_geom_tests {
 
     #[test]
     fn bar_range_text_normalises_or_explains_itself() {
-        use super::bar_range_text;
+        let bar_range_text = |t: &str| super::bar_range_text(t, "Sheet1");
         // What is typed comes back in the form the bar will act on.
         assert_eq!(bar_range_text("b2:d5"), Ok("B2:D5".to_string()));
         assert_eq!(bar_range_text("  B2:D5 "), Ok("B2:D5".to_string()));
         // Anchors are accepted and ignored; a backwards range is ordered.
         assert_eq!(bar_range_text("$D$5:$B$2"), Ok("B2:D5".to_string()));
-        // A `Sheet!` prefix is dropped — pointing can't leave this sheet.
+        // This sheet's own name is dropped, however it is spelled.
         assert_eq!(bar_range_text("Sheet1!B2:D5"), Ok("B2:D5".to_string()));
+        assert_eq!(bar_range_text("sheet1!B2:D5"), Ok("B2:D5".to_string()));
+        assert_eq!(bar_range_text("'Sheet1'!B2:D5"), Ok("B2:D5".to_string()));
         // A single cell is a range of one.
         assert_eq!(bar_range_text("C3"), Ok("C3:C3".to_string()));
         // Anything else is reported under the field, quoting what was typed.
@@ -16739,6 +17011,23 @@ mod grid_geom_tests {
         );
         assert!(bar_range_text("").is_err());
         assert!(bar_range_text("A1:").is_err());
+    }
+
+    #[test]
+    fn a_bar_refuses_another_sheets_cells() {
+        // A rule, a split or a sort acts on the sheet in view. Dropping the
+        // prefix (which is right for a chart) would apply it to THIS sheet's
+        // B2:D5 and say "Applies to B2:D5" — right-looking, wrong cells.
+        assert_eq!(
+            super::bar_range_text("Sheet2!B2:D5", "Sheet1"),
+            Err("\"Sheet2\" is another sheet; this acts on Sheet1".to_string())
+        );
+        // Quoting doesn't get round it, doubled apostrophe and all.
+        assert!(super::bar_range_text("'Bob''s data'!A1:A9", "Sheet1").is_err());
+        assert_eq!(
+            super::bar_range_text("'Bob''s data'!A1:A9", "Bob's data"),
+            Ok("A1:A9".to_string())
+        );
     }
 
     #[test]

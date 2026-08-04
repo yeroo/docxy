@@ -2141,35 +2141,35 @@ pub fn chart_is_writable(cd: &crate::sheet::ChartData) -> bool {
     chart_kind_is_writable(&cd.kind) && !cd.complex
 }
 
-/// A self-contained `chartSpace` for a clustered column chart, with categories
-/// and per-series values cached as literals (`strLit`/`numLit`) so it renders
-/// without the source range. `pub(crate)` so sibling modules' tests can
-/// round-trip parse → write → parse.
+/// A self-contained `chartSpace` for the kinds `chart_kind_is_writable`
+/// accepts (bar, column, line, pie). Each series and the categories are written
+/// as a `strRef`/`numRef` naming the cells they read plus a cache of what those
+/// cells said, so the chart stays live in Excel; a series with no reference
+/// falls back to literals (`strLit`/`numLit`) and renders without a source
+/// range. `pub(crate)` so sibling modules' tests can round-trip parse → write →
+/// parse.
 pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
-    let ncat = data.categories.len().max(
-        data.series
-            .iter()
-            .map(|s| s.values.len())
-            .max()
-            .unwrap_or(0),
-    );
-    let cat_pts: String = (0..ncat)
-        .map(|i| {
-            format!(
-                "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
-                esc_attr(data.categories.get(i).map(|s| s.as_str()).unwrap_or(""))
-            )
-        })
+    // Each cache is sized from ITS OWN slot, never from a chart-wide maximum:
+    // series can be re-pointed one at a time, so a 3-cell `<c:f>` beside a
+    // 9-point cache is both invalid and self-contradicting — and `parse_chart`
+    // reads the cache, so the six padding zeros would come back as real points.
+    let ncat = data.categories.len();
+    let cat_pts: String = data
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", esc_attr(c)))
         .collect();
     let ser_xml = |si: usize, s: &crate::sheet::ChartSeries| -> String {
-        let val_pts: String = (0..ncat)
-            .map(|i| {
+        let nval = s.values.len();
+        let val_pts: String = s
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
                 // `<c:v>` is an xsd:double too — same `NaN`/`inf` hazard as a
                 // worksheet cell's `<v>`, and the same answer.
-                format!(
-                    "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
-                    num_repr(s.values.get(i).copied().unwrap_or(0.0))
-                )
+                format!("<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", num_repr(*v))
             })
             .collect();
         // A range-backed chart writes the cells it reads alongside the cached
@@ -2223,17 +2223,21 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
                 "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strCache></c:strRef></c:cat>",
                 esc_attr(&r)
             ),
+            // No reference AND no labels is not "labels that are all blank" —
+            // it is a chart Excel numbers 1, 2, 3 itself. Writing an empty
+            // `<c:strLit>` would blank the axis instead.
+            None if ncat == 0 => String::new(),
             None => {
                 format!("<c:cat><c:strLit><c:ptCount val=\"{ncat}\"/>{cat_pts}</c:strLit></c:cat>")
             }
         };
         let val = match val_ref {
             Some(r) => format!(
-                "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numCache></c:numRef></c:val>",
+                "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{nval}\"/>{val_pts}</c:numCache></c:numRef></c:val>",
                 esc_attr(&r)
             ),
             None => format!(
-                "<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{ncat}\"/>{val_pts}</c:numLit></c:val>"
+                "<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{nval}\"/>{val_pts}</c:numLit></c:val>"
             ),
         };
         let fill = match s.color {
@@ -4099,6 +4103,61 @@ mod tests {
         );
         assert_eq!(reopened.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
         assert_eq!(reopened.series[0].values, vec![2.0, 5.0]);
+    }
+
+    #[test]
+    fn a_re_pointed_series_caches_only_the_cells_its_own_ref_names() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |range| ChartSource {
+            sheet: "Sheet1".into(),
+            range,
+            cat_col: 0,
+        };
+        // Series are re-pointed ONE at a time, so their lengths diverge. A
+        // chart-wide point count would pad the short one with zeros and write
+        // that count beside its own three-cell `<c:f>` — a cache contradicting
+        // its ref, and six phantom bars when the file is read back.
+        let data = ChartData {
+            kind: "column".into(),
+            categories: vec!["Jan".into(), "Feb".into(), "Mar".into()],
+            series: vec![
+                ChartSeries {
+                    name: "Short".into(),
+                    values: vec![9.0, 8.0, 7.0],
+                    col: Some(1),
+                    values_ref: Some(src((1, 1, 3, 1))),
+                    ..Default::default()
+                },
+                ChartSeries {
+                    name: "Long".into(),
+                    values: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                    col: Some(2),
+                    values_ref: Some(src((1, 2, 5, 2))),
+                    ..Default::default()
+                },
+            ],
+            source: Some(src((0, 0, 5, 2))),
+            categories_ref: Some(src((1, 0, 3, 0))),
+            edited: true,
+            ..Default::default()
+        };
+        let xml = chart_space_xml(&data);
+        assert!(
+            xml.contains("<c:ptCount val=\"3\"/>") && xml.contains("<c:ptCount val=\"5\"/>"),
+            "each cache is sized from its own slot: {xml}"
+        );
+        // Read it back the way opening the file would.
+        let mut pkg = new_xlsx();
+        pkg.add_chart(0, (5, 0), (20, 8), &data);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        match &re.workbook.sheets[0].drawings[0].kind {
+            DrawingKind::Chart(c) => {
+                assert_eq!(c.series[0].values, vec![9.0, 8.0, 7.0], "no padding");
+                assert_eq!(c.series[1].values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+                assert_eq!(c.categories, vec!["Jan", "Feb", "Mar"]);
+            }
+            other => panic!("expected a chart, got {other:?}"),
+        }
     }
 
     #[test]

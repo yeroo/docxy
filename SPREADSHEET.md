@@ -146,7 +146,30 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   `range_labels` read the cells a field points at.
 - **Writing** (`xlsx::chart_space_xml`): an edited chart is written with live
   `numRef` / `strRef` refs *and* their caches, so Excel treats it as a real
-  chart bound to the cells and updates it when they change.
+  chart bound to the cells and updates it when they change. Each cache is sized
+  from its own slot — a series' point count is its own values' — because series
+  are re-pointed one at a time and a chart-wide count would pad the short ones
+  with zeros the next parse would read back as real points.
+- **Only what can be authored is regenerated** (`xlsx::chart_is_writable`):
+  `chart_kind_is_writable` accepts bar, column, line and pie, and
+  `ChartData::complex` (set by `parse_chart` when the plot area holds more than
+  one `*Chart` group, or a `<c:grouping>` that isn't `clustered`/`standard`)
+  vetoes the rest. A scatter, doughnut, radar, bubble, stacked or combo chart
+  round-trips **verbatim** even when marked edited — which is also why
+  `parse_chart` reads `<c:cat>`/`<c:val>` but not `<c:xVal>`/`<c:yVal>`. A
+  series `<c:f>` this model can't hold (a whole column, a defined name, a
+  multi-area ref) sets `complex` for the same reason: the slot stays empty, and
+  regenerating would write the cached numbers back as `<c:numLit>`, freezing a
+  live chart.
+- **Sparse caches**: Excel omits the `<c:pt>` for a blank or non-numeric source
+  cell, so the parse places each point at its `idx` rather than appending.
+  Appending would shift everything after a gap one place left, and an edited
+  chart would write that shift back.
+- **Structural edits follow the refs** (`edit::shift_chart_refs`, called from
+  `structural_edit`): inserting or deleting rows and columns re-bases every
+  `ChartSource` — a `home` flag distinguishes a chart's own sheet from a
+  sheet-qualified ref — and a series whose cells are wholly deleted loses its
+  ref rather than being left plotting a stranger's numbers.
 - **Anchors are editable**: `Sheet::drawing_part`, `Sheet::drawings_removed` and
   `Drawing::anchor_ix` are what let a save move or delete one drawing without
   touching the rest of the part (see the save bullets above).

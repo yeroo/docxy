@@ -70,6 +70,11 @@ anywhere in this app — and receives keys through `sheet_key` → `range_edit_k
 | Enter | commit through `ref_commit` |
 | Escape | abandon the edit, leaving the committed value |
 
+`Ctrl+A` is the *only* chord the field takes. Every other one falls through to
+the sheet even while a field is focused, so `Ctrl+C`/`X`/`V` copy, cut and paste
+**cells**, `Ctrl+Z`/`Y` undo the **sheet**, and `Ctrl+S` saves — selecting text
+in a field and pressing `Ctrl+C` copies the grid selection, not the text.
+
 Under the field sits whatever the last commit said about it — `"Applies to
 D2:D5"`, or `"\"total\" isn't a range like A1:D5"` — falling back to the field's
 static help line when there's nothing to report (`ref_msg`, keyed by target so
@@ -83,8 +88,8 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 |--------|-------|-------------|
 | `ChartRange` | Chart panel | replots the chart from the box |
 | `ChartTitle` | Chart panel | plain text — **not** pointable |
-| `SeriesName(i)` | series card | a ref reads that cell and is kept live; anything else is a literal name — but only if you **changed** the text (`series_name_commit`) |
-| `SeriesValues(i)` | series card | re-reads **only** that series' numbers |
+| `SeriesName(i)` | series card | a ref reads that **cell** — the top-left one, since the cache beside it holds a single point — and is kept live; anything else is a literal name, and only if you **changed** the text (`series_name_commit`) |
+| `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one column**: Excel splits a two-dimensional pick into a series per column and reads such a ref column-major, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
 | `Categories` | Chart panel | the category-axis labels |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
 | `Validation` | Data Validation bar | the cells the list applies to |
@@ -102,8 +107,16 @@ A bar owns the keyboard while it is open, so `sheet_key` asks its range field
 first (`RefTarget::is_bar`) — otherwise what you type lands in the bar's own
 buffer.
 
-Series can also be added, removed and reordered from the panel. The last series
-can't be removed (a chart with none is not renderable, and Excel won't let you
+All three refuse a slot whose cells are on **another sheet** (`ref_elsewhere`):
+the field shows a range with its sheet stripped, so committing one from the
+wrong sheet would silently move it here onto unrelated numbers.
+
+Series can also be added, removed and reordered from the panel. A reorder closes
+the gap behind the series rather than swapping it with its destination — the
+arrows only ever send ±1, where the two agree, but the helper is written for what
+it says. A pie takes one series and `chart_space_xml` writes only the first, so
+`+ Add series` refuses there rather than listing one the save would drop. The
+last series can't be removed (a chart with none is not renderable, and Excel won't let you
 get there either), and a series' colour lives on the series, so it travels
 through a reorder.
 
@@ -114,8 +127,11 @@ Same-sheet rectangles in A1 form. `parse_ref_text` accepts:
 - `A1:D5`, in any case, with surrounding space
 - `C3` — a single cell is a one-cell range
 - `$A$1:$D$5` — `$` anchors are accepted and ignored
-- `Budget!A1:D5`, `'My Sheet'!A1:D5` — the sheet prefix is dropped, since
-  pointing can't reach another sheet
+- `Budget!A1:D5`, `'My Sheet'!A1:D5` — a chart field drops the sheet prefix,
+  since a chart plots the sheet it floats over and pointing can't reach another
+  one. The four **bars** do not: a rule, a split or a sort acts on the sheet in
+  view, so `bar_range_text` rejects a prefix naming any other sheet rather than
+  applying it here under a message that looks right
 - `D5:A1` — corners in either order name the same box
 
 Anything else is rejected with a message quoting what was typed. Cross-sheet,
@@ -125,10 +141,13 @@ skips them. Pointing next to one *inserts* rather than replaces
 (`ref_token_at` declines a token preceded by `!`), so a click can never swing
 `=Sheet2!A1` onto this sheet's cell behind your back.
 
-`ref_token_at` is a *caret-local* scan and, unlike `formula_ref_tokens`, knows
-nothing about string literals: with the caret after `="A1`, pointing replaces
-the `A1` inside the string. Half-typed formulas are the common case here and a
-literal that looks like a reference is not, so the simpler scan wins.
+`ref_token_at` is a *caret-local* scan while `formula_ref_tokens` walks the
+whole buffer, but they apply the same four rules — a token followed by `(` is a
+function name, one followed by `[` is a table name, one touching a `!` is the
+wrong half of another sheet's reference, and anything inside `"…"` or `'…'` is
+text (`quoted_at`). A test drives both over one corpus and asserts they agree:
+every span the scan reports, the caret-local one claims from its end, and where
+it reports nothing a pick inserts rather than replaces.
 
 A chart field additionally caps what it will read at `MAX_CHART_CELLS`
 (`chart_range_of`). `A1:A1048576` parses perfectly well and would ask the

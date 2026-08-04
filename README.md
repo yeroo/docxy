@@ -152,9 +152,12 @@ the TUI and materializes reports, with definitions persisted in the file), and t
 same lossless
 round-trip guarantee: anything it doesn't model (pivots, conditional
 formatting…) is preserved byte-for-byte. The one deliberate exception is a chart
-you *edit* — repoint its range, rename or reorder its series, recolour it — which
-is regenerated from the model, and a drawing you move or delete, whose anchor is
-rewritten in place. Charts and drawings you leave alone still round-trip verbatim.
+you *edit* — repoint its range, rename or reorder its series, recolour it, in the
+desktop suite's Chart panel — which is regenerated from the model, and a drawing
+you move or delete, whose anchor is rewritten in place. Only column, bar, line
+and pie charts can be regenerated; a scatter, a doughnut or anything stacked or
+combined is kept verbatim and can't be repointed. Charts and drawings you leave
+alone still round-trip verbatim.
 Inserting a chart from a selection writes a **live** chart: each series is bound
 to its own cells, so Excel updates it when the data changes. Formulas it can't
 evaluate yet keep Excel's cached results and are saved untouched.
@@ -170,7 +173,8 @@ xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
 
 Type to replace, `F2` to edit, `=` starts a formula; copy/paste and
 fill-down translate relative references like Excel; insert/delete rows and
-columns rewrites every affected formula workbook-wide; find, Save As, and
+columns rewrites every affected formula workbook-wide — and every chart
+reference with them; find, Save As, and
 sheet add/rename/delete round out the basics; range selections show
 Sum/Average/Count in the status bar. Try it: `cargo run -p gridcore --example gen_sample_xlsx &&
 xlsxy assets/sample.xlsx`. The design and roadmap (conformance scoreboard,

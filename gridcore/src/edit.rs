@@ -255,16 +255,22 @@ pub fn parse_sort_spec(s: &str) -> Option<Vec<(u32, bool)>> {
 /// every key column regardless of direction; cross-type order is number < text
 /// < bool. The sort is stable, so rows equal on all keys keep their order.
 /// Returns the number of rows reordered.
+///
+/// `r2` is clamped to the last used row: `A1:A1048576` is the ordinary "the
+/// whole column" idiom, and materialising a million rows × every used column
+/// would exhaust memory long before it sorted anything. Rows past the used
+/// region are empty, so they sort last either way.
 pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32, bool)]) -> usize {
     use std::cmp::Ordering;
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
-    if keys.is_empty() || r2 <= r1 {
+    let (used_rows, cols) = s.used_size();
+    if cols == 0 || used_rows == 0 {
         return 0;
     }
-    let (_, cols) = s.used_size();
-    if cols == 0 {
+    let r2 = r2.min(used_rows - 1);
+    if keys.is_empty() || r2 <= r1 {
         return 0;
     }
     let max_c = cols - 1;
@@ -603,6 +609,9 @@ pub fn subtotal(
 /// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
 /// Numeric-looking parts become numbers. Rows without the delimiter are left
 /// alone. Returns how many rows were split.
+///
+/// `r2` is clamped to the last used row, so the `A1:A1048576` whole-column
+/// idiom walks the sheet rather than a million empty rows (see `sort_rows`).
 pub fn text_to_columns(
     wb: &mut Workbook,
     sheet: usize,
@@ -614,6 +623,11 @@ pub fn text_to_columns(
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
+    let used_rows = s.used_size().0;
+    if used_rows == 0 {
+        return 0;
+    }
+    let r2 = r2.min(used_rows - 1);
     let splits: Vec<(u32, Vec<String>)> = (r1..=r2)
         .filter_map(|r| {
             let cell = s.cell(r, col)?;
@@ -790,7 +804,14 @@ pub fn shift_chart_refs(
     let mut changed = shift_slot(&mut cd.source);
     changed |= shift_slot(&mut cd.categories_ref);
     for ser in &mut cd.series {
+        let had_values = ser.values_ref.is_some();
         changed |= shift_slot(&mut ser.values_ref);
+        if had_values && ser.values_ref.is_none() {
+            // `chart_space_xml` derives a ref-less series' cells from the
+            // chart's box and this column, so leaving `col` behind would put
+            // back exactly the dangling ref the drop above is for.
+            ser.col = None;
+        }
         // The column a series plots is an index into the grid like any other.
         if !shift.rows {
             if let Some(c) = ser.col {
@@ -1037,6 +1058,41 @@ mod tests {
         assert_eq!(col(3, 0), Some(CellValue::Text("B".into())));
         assert_eq!(col(3, 1), Some(CellValue::Number(20.0)));
         assert_eq!(col(4, 1), Some(CellValue::Number(10.0)));
+    }
+
+    #[test]
+    fn a_whole_column_sort_stops_at_the_last_used_row() {
+        // `A1:A1048576` is the ordinary "sort this column" idiom, and the range
+        // field passes it straight through. Materialising a million rows ×
+        // every used column would exhaust memory long before it sorted
+        // anything; the rows past the used region are empty either way.
+        let mut w = wb(&[
+            ("A1", Cell::text("Pear")),
+            ("A2", Cell::text("Apple")),
+            ("A3", Cell::text("Fig")),
+        ]);
+        let n = sort_rows(&mut w, 0, 0, crate::sheet::MAX_ROWS - 1, &[(0, true)]);
+        assert_eq!(n, 3, "the used rows, not a million");
+        let s = &w.sheets[0];
+        let col = |r: u32| s.cell(r, 0).map(|c| c.value.clone());
+        assert_eq!(col(0), Some(CellValue::Text("Apple".into())));
+        assert_eq!(col(1), Some(CellValue::Text("Fig".into())));
+        assert_eq!(col(2), Some(CellValue::Text("Pear".into())));
+        // An empty sheet has nothing to clamp against, and says so.
+        assert_eq!(sort_rows(&mut wb(&[]), 0, 0, 100, &[(0, true)]), 0);
+    }
+
+    #[test]
+    fn a_whole_column_text_to_columns_stops_at_the_last_used_row() {
+        let mut w = wb(&[("A1", Cell::text("a,b")), ("A2", Cell::text("c,d"))]);
+        let n = text_to_columns(&mut w, 0, 0, 0, crate::sheet::MAX_ROWS - 1, ',');
+        assert_eq!(n, 2);
+        let s = &w.sheets[0];
+        assert_eq!(
+            s.cell(0, 1).map(|c| c.value.clone()),
+            Some(CellValue::Text("b".into()))
+        );
+        assert_eq!(text_to_columns(&mut wb(&[]), 0, 0, 0, 100, ','), 0);
     }
 
     #[test]
@@ -1537,6 +1593,23 @@ mod tests {
         // The box shrank rather than vanishing: A and C are still in it.
         assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 1)));
         assert!(cd.edited);
+    }
+
+    #[test]
+    fn deleting_a_charts_rows_drops_the_column_the_writer_would_derive_from() {
+        // A ROW delete can empty a series' range too, and `col` isn't touched
+        // by a row shift — but `chart_space_xml` derives a ref-less series'
+        // cells from the chart's box and that column, putting the dangling ref
+        // straight back. The drop has to take `col` with it.
+        let mut w = chart_wb();
+        let rows = match chart_of(&w).series[0].values_ref {
+            Some(ref v) => (v.range.0, v.range.2),
+            None => panic!("the fixture's series should start with a ref"),
+        };
+        delete_rows(&mut w, 0, rows.0, rows.1 - rows.0 + 1);
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].values_ref, None);
+        assert_eq!(cd.series[0].col, None, "or the writer re-derives the ref");
     }
 
     #[test]

@@ -169,7 +169,7 @@ Dependencies identified:
 
 ### Task 5: Series list in the Chart panel
 - [x] render the series as a list: a card per series with its name, values range and colour swatch row
-  - ➕ `ref_field_dyn` alongside `ref_field`: repeated fields need ids built per series, not `&'static str`
+  - ➕ repeated fields need ids built per series, not `&'static str`. First done as a second `ref_field_dyn`; folded back into `ref_field(id: impl Into<String>, …)` before the branch settled, so only `ref_field` exists.
   - ➕ `range_a1` — a range as the text a field shows, tested to round-trip through `parse_ref_text`
 - [x] make each series' name and values editable through `ref_field` (`SeriesName(i)` / `SeriesValues(i)`)
   - a name field takes a ref OR literal text, as Excel's does: a ref reads the cell and keeps `name_ref`, anything else is the name
@@ -193,11 +193,12 @@ Dependencies identified:
 - [x] decide insert-vs-replace: after an operator, `(` or `,` insert; inside or right after a reference, replace it
   - ➕ a token followed by `(` is a function name, not a reference — `LOG10(` parses as column LOG row 10 otherwise, the same ambiguity Excel resolves this way
 - [x] add `refs_in(buf) -> Vec<(u32,u32,u32,u32)>` over `gridcore::formula::parse`, ignoring text that doesn't parse yet, and skipping other sheets' cells (this grid can't outline them)
+  - ⚠️ SUPERSEDED in Task 9: `refs_in` no longer exists. `formula_ref_tokens` replaced it because the AST gives ranges but not their SPANS in the text, and the colouring needs both. `gridcore/src/formula.rs` is untouched by this plan as a result.
 - [x] write tests for `ref_token_at` (caret inside/after a ref, at the buffer end, after an operator or bracket, function names, non-references)
-- [x] write tests for `replace_ref` (insert after `(`, replace an existing ref, caret lands after what was written, multibyte text before the caret) and for `refs_in` (nested calls, arithmetic, backwards ranges, half-typed input, other sheets)
+- [x] write tests for `replace_ref` (insert after `(`, replace an existing ref, caret lands after what was written, multibyte text before the caret) and for `formula_ref_tokens` (nested calls, arithmetic, backwards ranges, half-typed input, other sheets)
 - [x] run tests - 19 passed
   - ⚠️ the helpers are unused until Task 8 wires them, so this commit carries two dead-code warnings. The tests caught two off-by-ones in my own expectations, not in the code.
-- ⚠️ `refs_in` keeps only same-sheet rectangles; whole-column (`A:C`), whole-row, 3D and structured references parse but aren't outlined.
+- ⚠️ the scan keeps only same-sheet rectangles; whole-column (`A:C`), whole-row and 3D references parse but aren't outlined. A structured reference's table name (`T1[Amount]`) is cell-shaped when short, so both scanners skip a token followed by `[` — added in the code-review pass, with a test.
 
 ### Task 8: Point mode while editing a formula
 - [x] route grid clicks and drags to `replace_ref` when the active cell edit holds a formula, instead of committing the edit and moving the selection
@@ -225,6 +226,7 @@ Dependencies identified:
 - [x] add `CondFormat`, `Validation`, `Sort` and `TextToColumns` targets, each seeded from the current selection when its bar opens
   - ➕ one seam does the seeding: `bar_target(act)` says which field an action opens, so `run_sheet_act` seeds before the match rather than in four arms
   - ➕ Sort seeds from the region it would find (`sheet_sort_bounds`, header already dropped), not the raw selection — otherwise leaving the field alone would change what Sort did
+  - ⚠️ REDESIGNED in the code-review pass: a field is no longer seeded ONCE on open. `bar_open` leaves it unpinned and `bar_seed()` recomputes it every frame, so the bar keeps following the selection until the user types a range or points at one; only then does `bar_range` pin it. `bar_cells()` = pinned range, else seed.
 - [x] give those bars a `ref_field` for their range, so they can be pointed at cells instead of only using the selection
   - the bars grew from a fixed `h(30)` to `min_h(30)` so the field's own message ("Applies to D2:D5", or a complaint) has room
   - ➕ `RefTarget::is_bar()` + one check at the top of `sheet_key`: a bar owns the keyboard while open, so its field has to be asked first or the bar's buffer eats what you type
@@ -239,25 +241,52 @@ Dependencies identified:
 
 ### Task 11: Verify acceptance criteria
 - [x] verify every requirement in Overview is implemented: shared field, series UI, formula pointing, retrofit
-  - shared field: `RefTarget` (9 variants) + `RangeEdit` + `ref_field`/`ref_field_dyn` + `ref_commit`, one arm per target
+  - shared field: `RefTarget` (9 variants) + `RangeEdit` + `ref_field` + `ref_commit`, one arm per target
   - series UI: per-series name/values cards, `Categories`, add/remove/reorder, colours riding on the series
   - formula pointing: `formula_pick_active` → `grid_press`/`formula_pick_to` → `replace_ref`, with `formula_ref_tokens` + `edit_runs` colouring grid and text from ONE scan
   - retrofit: `CondFormat`/`Validation`/`Sort`/`TextToColumns` seeded by `bar_target`/`bar_open`, applied through `bar_cells`/`sort_rows_from`
 - [x] verify edge cases: an invalid range explains itself; a chart with one series can't lose it; pointing across a hidden row/column; a formula that never parses still edits normally
   - invalid range: every commit arm sets `ref_msg(target, false, …)` quoting what was typed — `chart_apply_range`, `series_apply_values`, `categories_apply`, `bar_range_apply` (`bar_range_text`)
   - last series: `series_remove` refuses at length 1 AND the per-series remove button is disabled when `n_series <= 1`
-  - hidden rows: `row_at_list_index`/`row_list_index` now delegate to pure `row_at_index`/`row_index_of`, tested to skip hidden rows in both directions and agree with each other. ⚠️ hidden COLUMNS aren't a case: this grid doesn't implement `col_hidden` yet, so it renders them and `col_at_x` agrees with what's drawn.
+  - hidden rows: `row_at_list_index`/`row_list_index` now delegate to pure `row_at_index`/`row_index_of`, tested to skip hidden rows in both directions and agree with each other. ⚠️ hidden COLUMNS aren't a case: `gridcore::sheet::col_hidden` exists, but this grid never consults it — it renders every column, so `col_at_x` agrees with what's drawn.
   - unparseable formula: covered by a new test over `=SUM(((`, `=+*/`, `=)(`, `=:`, `=` at every caret position
   - ➕ FOUND AND FIXED: with the caret after a half-typed `=SUM(D2:`, a pick INSERTED and left `=SUM(D2:D2:D5`. `ref_token_at` now treats a trailing `:` as part of the reference under the caret, so the pick completes it to `=SUM(D2:D5`.
 - [x] verify a chart whose series were edited round-trips: save, reopen from disk, series and category refs intact
   - new `edited_chart_series_refs_round_trip_through_save_and_load` in `gridcore::xlsx`: `add_chart` → `save_xlsx` → `load_xlsx` keeps both series' `values_ref`/`name_ref` and `categories_ref`; then re-points one series, sets `edited`, saves and reloads — the edit survives and the untouched series comes back identical
 - [x] run the full unit suite (`cargo test` at the root and `cargo test --manifest-path suite/Cargo.toml`)
-  - suite 29 passed; gridcore 275 + 1 + 4; root all green EXCEPT 3 pre-existing `lookxy` calendar-form failures (`event_form.is_some()`), which this branch cannot have caused: it touches no lookxy file and lookxy depends on none of the crates it changes
+  - suite 29 passed; gridcore 275 + 1 + 4; root all green EXCEPT 3 `lookxy` calendar-form failures (`event_form.is_some()`)
+  - ⚠️ CORRECTED LATER: those failures were real and are now fixed (commit `307cf53`, which does touch `lookxy/src/app.rs`, `ui/calendar.rs` and `ui/eventform.rs`). Their fixtures hard-coded dates that had fallen out of `agenda_window`'s −7/+30-day range, so the tests failed on the calendar rather than on a regression; they now build dates relative to `unix_now()`. The root workspace is fully green.
 - [x] run `cargo build --all-targets` at the root and the suite build - both green
 - [x] run `cargo clippy --all-targets` (root and suite) - all issues fixed
   - `gridcore` and the suite are now clean. The suite workspace had NO `[workspace.lints]` at all, so it was reporting 76 warnings — 47 of them the very `collapsible_if` the root workspace already records as an accepted style choice. It now carries the same lint table (plus `too_many_arguments`, since the two grid render entry points take a slice of view state each), and the real warnings are fixed: `map_or`→`is_some_and`/`is_none_or`, needless borrows, `RefToken`/`SeriesAction`/`AnchorMove` type aliases, `&PathBuf`→`&Path`, `Option::zip`.
-  - ➕ two arg lists shrank rather than being silenced: `Pal::of(cx)` reads the palette off the theme so `ref_field`/`ref_field_dyn`/`bar_range_field` no longer thread it, and `Docxy::grid_overlay()` bundles the four overlay params this plan had added to `sheet_el` (13 → 10).
+  - ➕ two arg lists shrank rather than being silenced: `Pal::of(cx)` reads the palette off the theme so `ref_field`/`bar_range_field` no longer thread it, and `Docxy::grid_overlay()` bundles the four overlay params this plan had added to `sheet_el` (13 → 10).
   - ⚠️ the ROOT workspace still warns in `comshimcore`, `docxcore`, `ribbonspec`, `xlsxy`, `xlcomshim` and `wordcomshim` — all pre-existing and in crates this plan never touched, so left alone.
+
+### ➕ Post-review scope (not planned, shipped anyway)
+
+Six `fix: address code review findings` commits and this review pass added work
+the tasks above never record. Kept here so the acceptance record matches what is
+on the branch:
+
+- **Only some charts can be authored back**: `chart_is_writable` /
+  `chart_kind_is_writable` / `ChartData::complex` — a scatter, doughnut, radar,
+  bubble, stacked or combo chart round-trips verbatim and cannot be repointed.
+  Per-series caches are sized from their own slot, and `parse_chart` places each
+  cached point at its `<c:pt idx>` (Excel's caches are sparse).
+- **Structural edits follow chart refs**: `edit::shift_chart_refs` from
+  `structural_edit`, with a `home` flag for a chart floating over one sheet and
+  plotting another; a series whose cells are wholly deleted loses its ref and
+  the `col` the writer would otherwise re-derive one from.
+- **Grid gesture teardown**: `drop_grid_state` / `grid_release` /
+  `chart_drop_selection`, and `typing_bars_close` so one focused field owns the
+  keyboard.
+- **Scrolling and hidden rows**: `MAX_VISIBLE_COL`, `reconcile_sheet_hscroll`,
+  `handle_hidden`, `reveal_range`, `ref_index_at`.
+- **Guards found in review**: unbounded whole-column ranges clamped in
+  `sort_rows` / `text_to_columns`; a bar's range field refuses another sheet's
+  name (a chart may drop the prefix, a rule may not); the Chart panel refuses a
+  slot whose cells are on another sheet; a series takes one column and a series
+  name one cell; `+ Add series` refuses on a pie, which writes only the first.
 
 ### Task 12: [Final] Update documentation
 - [x] document the range selector in the suite's docs: how pointing works, which inputs accept it, and the reference syntax supported (same-sheet `A1:D5`)
