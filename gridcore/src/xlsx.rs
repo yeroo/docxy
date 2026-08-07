@@ -1538,13 +1538,12 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
             }
         }
         if let Some(dpart) = sheet.drawing_part.as_deref() {
-            // Only drawings READ from this part have an index in it; one we
-            // authored (`add_chart`) carries its own part and would otherwise
-            // move a stranger's anchor at the index it borrowed.
+            // Every drawing here has a real index in this part, including one
+            // `add_chart` spliced in, so moving or deleting any of them
+            // addresses the element it actually wrote.
             let moves: Vec<crate::drawing::AnchorMove> = sheet
                 .drawings
                 .iter()
-                .filter(|d| d.anchor_ix != crate::sheet::ANCHOR_AUTHORED)
                 .map(|d| (d.anchor_ix, d.from, d.to))
                 .collect();
             // Nothing to write means the part is left EXACTLY as it came in.
@@ -2292,7 +2291,15 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
                 "<c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{nval}\"/>{val_pts}</c:numLit></c:val>"
             ),
         };
+        // Where a series' colour lives depends on what is drawn: a line takes
+        // it from its STROKE, everything else from its fill. Writing a fill for
+        // a line would leave the line itself in Excel's default palette and
+        // apply the colour to the shape instead — which is what the loader's
+        // own `a_line_series_takes_its_colour_from_its_own_stroke` describes.
         let fill = match s.color {
+            Some(rgb) if data.kind == "line" => format!(
+                "<c:spPr><a:ln><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></a:ln></c:spPr>"
+            ),
             Some(rgb) => format!(
                 "<c:spPr><a:solidFill><a:srgbClr val=\"{rgb:06X}\"/></a:solidFill></c:spPr>"
             ),
@@ -3129,6 +3136,13 @@ impl SheetPackage {
 <{px}clientData/></{px}twoCellAnchor>",
             id = shape_id
         );
+        // Where this anchor will land: it is spliced at the end, so it takes the
+        // next free index in whichever part hosts it. Knowing it is what lets a
+        // later move or delete address this drawing like any other.
+        let anchor_ix = host_xml
+            .as_deref()
+            .map(crate::drawing::count_anchors)
+            .unwrap_or(0);
         match host_xml {
             // Splice before the root's close tag, so the anchors already there
             // keep their indices (the save-side rewrite is keyed by them).
@@ -3253,17 +3267,20 @@ impl SheetPackage {
             }
         }
 
-        // We wrote this anchor's cells ourselves, and it sits after every anchor
-        // the part was loaded with, so it owns no index in the map the save-side
-        // rewrite works from — which must leave it (and every borrowed index)
-        // alone.
+        // The model records where the chart actually lives: the anchor's index in
+        // the host part, so moving or deleting it addresses the right element,
+        // and the part we just wrote, so an edit to it can be regenerated. A
+        // caller cloning another chart's data would otherwise leave `part`
+        // pointing at the ORIGINAL, and editing the copy would overwrite it.
+        let mut data = data.clone();
+        data.part = Some(chart_part.clone());
         self.workbook.sheets[sheet]
             .drawings
             .push(crate::sheet::Drawing {
-                anchor_ix: crate::sheet::ANCHOR_AUTHORED,
+                anchor_ix,
                 from,
                 to,
-                kind: crate::sheet::DrawingKind::Chart(data.clone()),
+                kind: crate::sheet::DrawingKind::Chart(data),
             });
     }
 
@@ -3824,6 +3841,120 @@ pub fn new_xlsx() -> SheetPackage {
 #[cfg(test)]
 mod tests {
 
+    /// A line series' colour lives on its stroke, not its fill. Writing it as a
+    /// fill leaves the line in Excel's default palette and tints the shape
+    /// instead — silent visual damage to a chart the user only renamed.
+    #[test]
+    fn an_edited_line_chart_keeps_its_colour_on_the_stroke() {
+        let series = |c: u32| crate::sheet::ChartSeries {
+            name: "s".into(),
+            values: vec![1.0, 2.0],
+            color: Some(c),
+            ..Default::default()
+        };
+        let line = crate::sheet::ChartData {
+            title: "T".into(),
+            kind: "line".into(),
+            categories: vec!["a".into(), "b".into()],
+            series: vec![series(0xC0705A)],
+            ..Default::default()
+        };
+        let out = chart_space_xml(&line);
+        assert!(
+            out.contains("<a:ln><a:solidFill><a:srgbClr val=\"C0705A\"/></a:solidFill></a:ln>"),
+            "a line's colour must be a stroke: {out}"
+        );
+
+        // Round-trips: the loader reads a line's colour from exactly there.
+        assert_eq!(
+            crate::drawing::parse_chart_for_test(&out).series[0].color,
+            Some(0xC0705A)
+        );
+
+        // A column keeps the plain fill, which is where Excel looks for it.
+        let col = crate::sheet::ChartData {
+            kind: "column".into(),
+            ..line.clone()
+        };
+        let out2 = chart_space_xml(&col);
+        assert!(
+            out2.contains(
+                "<c:spPr><a:solidFill><a:srgbClr val=\"C0705A\"/></a:solidFill></c:spPr>"
+            ),
+            "a column's colour is a fill: {out2}"
+        );
+        assert_eq!(
+            crate::drawing::parse_chart_for_test(&out2).series[0].color,
+            Some(0xC0705A)
+        );
+    }
+
+    /// An inserted chart must be addressable afterwards: its anchor has a real
+    /// index in the host part, and its `part` names the chart XML we wrote. The
+    /// first is what lets a delete remove it; the second is what lets an edit be
+    /// regenerated. Both were missing, and both failed silently.
+    #[test]
+    fn an_inserted_chart_can_be_edited_and_deleted_afterwards() {
+        let mut pkg = load_xlsx(&fixture()).expect("load");
+        let data = crate::sheet::ChartData {
+            title: "T".into(),
+            kind: "column".into(),
+            categories: vec!["a".into()],
+            series: vec![crate::sheet::ChartSeries {
+                name: "s".into(),
+                values: vec![1.0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        pkg.add_chart(0, (0, 0), (10, 5), &data);
+
+        let dw = pkg.workbook.sheets[0]
+            .drawings
+            .last()
+            .expect("the chart is in the model");
+        // It knows the part it was written to, so an edit reaches that part.
+        let part = match &dw.kind {
+            crate::sheet::DrawingKind::Chart(cd) => {
+                cd.part.clone().expect("the chart part is recorded")
+            }
+            _ => panic!("expected a chart"),
+        };
+        assert!(
+            pkg.part(&part).is_some(),
+            "the recorded part exists in the package"
+        );
+        // And it knows where its anchor sits, rather than a sentinel.
+        let dpart = pkg.workbook.sheets[0]
+            .drawing_part
+            .clone()
+            .expect("a host part");
+        let host = String::from_utf8_lossy(pkg.part(&dpart).unwrap()).into_owned();
+        assert_eq!(
+            dw.anchor_ix,
+            crate::drawing::count_anchors(&host) - 1,
+            "the anchor is the last one in the part"
+        );
+
+        // Deleting it must actually strike the anchor from the saved part.
+        let ix = dw.anchor_ix;
+        pkg.workbook.sheets[0].drawings.pop();
+        pkg.workbook.sheets[0].drawings_removed.push(ix);
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload after the delete");
+        let host2 = String::from_utf8_lossy(saved.part(&dpart).unwrap()).into_owned();
+        assert!(
+            !host2.contains("Chart 1"),
+            "the deleted chart's anchor is still in the part: {host2}"
+        );
+        assert!(
+            saved.workbook.sheets[0]
+                .drawings
+                .iter()
+                .all(|d| !matches!(d.kind, crate::sheet::DrawingKind::Chart(_))),
+            "the chart came back on reopen"
+        );
+    }
+
     /// XML 1.0 forbids most C0 control characters outright — no escape can
     /// represent them — so a saved part carrying one is not well-formed and
     /// Excel rejects the whole workbook. Reachable from `=CHAR(1)`, and our own
@@ -3837,7 +3968,10 @@ mod tests {
         // legal but XML normalizes it away unless it is written as an entity.
         pkg.workbook.sheets[0].set_cell(1, 0, crate::sheet::Cell::text("x\ty\nz\r!"));
         let bytes = save_xlsx(&pkg);
-        assert!(!bytes.windows(3).any(|w| w == [b'a', 0x01, b'b']), "the raw control byte reached the file");
+        assert!(
+            !bytes.windows(3).any(|w| w == [b'a', 0x01, b'b']),
+            "the raw control byte reached the file"
+        );
 
         // Reloading gives back everything XML can carry. (The zip's own headers
         // are binary, so the check has to be on the XML parts, not the archive.)
@@ -3884,11 +4018,20 @@ mod tests {
         ]);
 
         let pkg = load_xlsx(&raw).expect("the crafted workbook is well-formed and must load");
-        assert!(pkg.workbook.sheets[0].row_attrs.contains_key(&0), "the row attribute was preserved");
+        assert!(
+            pkg.workbook.sheets[0].row_attrs.contains_key(&0),
+            "the row attribute was preserved"
+        );
         let out = String::from_utf8_lossy(&save_xlsx(&pkg)).into_owned();
-        assert!(!out.contains("<injected/>"), "attacker markup became part of the worksheet: {out}");
+        assert!(
+            !out.contains("<injected/>"),
+            "attacker markup became part of the worksheet: {out}"
+        );
         // The value itself survives, escaped, so the file still round-trips.
-        assert!(out.contains("&quot;&gt;&lt;injected/&gt;"), "the raw value should be escaped, not dropped: {out}");
+        assert!(
+            out.contains("&quot;&gt;&lt;injected/&gt;"),
+            "the raw value should be escaped, not dropped: {out}"
+        );
     }
     use super::*;
 

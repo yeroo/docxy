@@ -222,6 +222,23 @@ pub fn rewrite_anchors(xml: &str, moves: &[AnchorMove], drop: &[usize]) -> Strin
     out
 }
 
+/// How many anchors a drawing part holds — the index the next one spliced in
+/// at the end will occupy. Counts every anchor, including the ones we can't
+/// render, exactly as [`parse_drawings`] numbers them.
+pub fn count_anchors(xml: &str) -> usize {
+    let mut n = 0;
+    let mut rest = xml;
+    while let Some((cut, tag)) = next_anchor(rest) {
+        rest = &rest[cut..];
+        let Some(end) = find_close(rest, tag) else {
+            break;
+        };
+        n += 1;
+        rest = &rest[end..];
+    }
+    n
+}
+
 /// The next anchor element start in `xml`: its offset and its full tag name.
 fn next_anchor(xml: &str) -> Option<(usize, &str)> {
     let mut at = 0usize;
@@ -378,6 +395,13 @@ fn fit_cache<T: Clone + Default>(v: &mut Vec<T>, i: usize, budget: &mut usize) -
 }
 
 /// Parse the cached data of a chart part (`c:chartSpace`).
+/// [`parse_chart`] for sibling modules' tests, so a writer can be checked
+/// against the reader that has to understand it.
+#[cfg(test)]
+pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
+    parse_chart(xml)
+}
+
 fn parse_chart(xml: &str) -> ChartData {
     let mut cd = ChartData::default();
     let mut budget = MAX_CACHE_POINTS;
