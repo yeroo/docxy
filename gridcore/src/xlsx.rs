@@ -982,7 +982,7 @@ fn parse_worksheet(
                             attrs.push(' ');
                             attrs.push_str(a.name);
                             attrs.push_str("=\"");
-                            attrs.push_str(a.value);
+                            attrs.push_str(&esc_raw_attr(a.value));
                             attrs.push('"');
                         }
                     }
@@ -1007,7 +1007,7 @@ fn parse_worksheet(
                             attrs.push(' ');
                             attrs.push_str(a.name);
                             attrs.push_str("=\"");
-                            attrs.push_str(a.value);
+                            attrs.push_str(&esc_raw_attr(a.value));
                             attrs.push('"');
                         }
                     }
@@ -1060,7 +1060,7 @@ fn parse_worksheet(
                         }
                         attrs.push_str(a.name);
                         attrs.push_str("=\"");
-                        attrs.push_str(a.value);
+                        attrs.push_str(&esc_raw_attr(a.value));
                         attrs.push('"');
                     }
                     sheet.protection = Some(attrs);
@@ -1316,7 +1316,7 @@ fn parse_cell_body(
                                     attrs.push(' ');
                                     attrs.push_str(a.name);
                                     attrs.push_str("=\"");
-                                    attrs.push_str(a.value);
+                                    attrs.push_str(&esc_raw_attr(a.value));
                                     attrs.push('"');
                                 }
                                 f_attrs = Some(attrs);
@@ -1438,6 +1438,19 @@ fn decode(raw: &str) -> String {
 // Save
 // ---------------------------------------------------------------------------
 
+/// Can this character appear in XML 1.0 at all? Most C0 controls cannot - not
+/// even as a numeric entity - so the only way to keep a part well-formed is to
+/// leave them out. `=CHAR(1)` reaches the model, and our own loader is lenient
+/// enough to read one straight back, so nothing else catches this.
+fn xml_writable(ch: char) -> bool {
+    match ch {
+        '\t' | '\n' | '\r' => true,
+        c if (c as u32) < 0x20 => false,
+        '\u{fffe}' | '\u{ffff}' => false,
+        _ => true,
+    }
+}
+
 pub(crate) fn esc_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1445,6 +1458,10 @@ pub(crate) fn esc_text(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            // A literal CR would be normalized to LF on the way back in, so it
+            // only survives as an entity.
+            '\r' => out.push_str("&#13;"),
+            c if !xml_writable(c) => {}
             _ => out.push(ch),
         }
     }
@@ -2121,6 +2138,30 @@ pub(crate) fn esc_attr(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            // Attribute-value normalization turns any literal whitespace into a
+            // space, so tabs and newlines have to go in as entities too.
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c if !xml_writable(c) => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape an attribute value we captured VERBATIM from the source file, for
+/// re-emission inside double quotes. Such a value is still encoded - it may
+/// legally contain `"` and `>` because it came from a single-quoted attribute -
+/// so `&` must be left exactly as it is or existing entities would be doubled.
+pub(crate) fn esc_raw_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c if !xml_writable(c) => {}
             _ => out.push(ch),
         }
     }
@@ -3782,6 +3823,73 @@ pub fn new_xlsx() -> SheetPackage {
 
 #[cfg(test)]
 mod tests {
+
+    /// XML 1.0 forbids most C0 control characters outright — no escape can
+    /// represent them — so a saved part carrying one is not well-formed and
+    /// Excel rejects the whole workbook. Reachable from `=CHAR(1)`, and our own
+    /// lenient loader reads it straight back, which is why round-trip tests
+    /// never noticed.
+    #[test]
+    fn control_characters_never_reach_the_saved_package() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("a\u{1}b"));
+        // A tab and a newline are legal and must survive; a carriage return is
+        // legal but XML normalizes it away unless it is written as an entity.
+        pkg.workbook.sheets[0].set_cell(1, 0, crate::sheet::Cell::text("x\ty\nz\r!"));
+        let bytes = save_xlsx(&pkg);
+        assert!(!bytes.windows(3).any(|w| w == [b'a', 0x01, b'b']), "the raw control byte reached the file");
+
+        // Reloading gives back everything XML can carry. (The zip's own headers
+        // are binary, so the check has to be on the XML parts, not the archive.)
+        let back = load_xlsx(&bytes).expect("reload");
+        for (name, part) in back.parts.iter() {
+            if name.ends_with(".xml") || name.ends_with(".rels") {
+                assert!(
+                    !part.iter().any(|&b| b < 0x20 && !matches!(b, 9 | 10 | 13)),
+                    "{name} carries a raw control byte, so the part is not well-formed"
+                );
+            }
+        }
+        assert_eq!(
+            back.workbook.sheets[0].cell(0, 0).map(|c| c.value.clone()),
+            Some(crate::sheet::CellValue::Text("ab".into())),
+            "the forbidden char is dropped, the rest is intact"
+        );
+        assert_eq!(
+            back.workbook.sheets[0].cell(1, 0).map(|c| c.value.clone()),
+            Some(crate::sheet::CellValue::Text("x\ty\nz\r!".into())),
+            "tab, newline and carriage return all survive"
+        );
+    }
+
+    /// Attribute values captured verbatim from the source file may legally hold
+    /// `"` and `>` — they can come from a single-quoted attribute. Re-emitting
+    /// them inside double quotes closes the element early and splices whatever
+    /// follows into the worksheet as markup.
+    #[test]
+    fn preserved_raw_attributes_cannot_inject_markup() {
+        // A well-formed worksheet whose row carries a single-quoted attribute
+        // containing a quote and a tag: legal input, hostile on re-emission.
+        let sheet1 = "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\" customFormat='x\"><injected/>'><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>";
+        let workbook = "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>";
+        let wb_rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
+        let root_rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>";
+        let content_types = "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/></Types>";
+        let raw = write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into()),
+        ]);
+
+        let pkg = load_xlsx(&raw).expect("the crafted workbook is well-formed and must load");
+        assert!(pkg.workbook.sheets[0].row_attrs.contains_key(&0), "the row attribute was preserved");
+        let out = String::from_utf8_lossy(&save_xlsx(&pkg)).into_owned();
+        assert!(!out.contains("<injected/>"), "attacker markup became part of the worksheet: {out}");
+        // The value itself survives, escaped, so the file still round-trips.
+        assert!(out.contains("&quot;&gt;&lt;injected/&gt;"), "the raw value should be escaped, not dropped: {out}");
+    }
     use super::*;
 
     #[test]
