@@ -339,11 +339,24 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 9: [Final] Update documentation
 
-- [ ] document the orientation: what it means, that it is derived from the refs
+- [x] document the orientation: what it means, that it is derived from the refs
       rather than stored, and how the loader infers it — wherever the suite's
-      chart behaviour is already described (`suite/docs/`)
-- [ ] note the ambiguous-case decisions from Task 4, so the next reader does
-      not rediscover them from the code
+      chart behaviour is already described (`suite/docs/`) — new
+      `suite/docs/chart-orientation.md`: both readings side by side, why
+      `col: None` for a row series, why saving needs no writer change and the
+      `<c:cat>` fallback must not run when `by_row`, the panel button (what
+      rides along a flip, what doesn't, and where undo comes from), and the
+      re-pointing shape check
+- [x] note the ambiguous-case decisions from Task 4, so the next reader does
+      not rediscover them from the code — "How the loader infers orientation"
+      lists all five (single cell, no readable ref, both-ways rectangle,
+      disagreeing series, no votes), the unanimity rule, and why the `cat_col`
+      fixup is skipped for a row chart
+- [x] ➕ linked from the three places chart behaviour is already described, and
+      fixed the one claim this plan made stale: `range-selector.md`'s
+      `SeriesValues(i)` row said a series reads "one column" full stop, which
+      is no longer true of a row chart. Also linked from `CONTRIBUTING.md` and
+      `SPREADSHEET.md`'s chart section
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 

@@ -36,7 +36,9 @@ cargo clippy --manifest-path suite/Cargo.toml --all-targets -- -D warnings
 
 The desktop suite's grid, its range-selector fields and the two GPUI traps they
 rest on are written up in
-[`suite/docs/range-selector.md`](suite/docs/range-selector.md).
+[`suite/docs/range-selector.md`](suite/docs/range-selector.md); how a chart
+reads its range — each column a series, or each row — is in
+[`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md).
 
 The root workspace is twenty crates. Layered bottom-up, at its core:
 

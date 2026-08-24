@@ -181,6 +181,15 @@ show and accept references the way Excel writes them — `=Budget!$A$1:$D$5`, wi
 the `$` anchors and the sheet qualifier — and a qualifier naming another sheet is
 resolved against the workbook, so a chart can plot a sheet it doesn't float over.
 
+Which way round a chart reads its range — each column a series (the default,
+and every chart written before the feature existed) or each row — is
+`ChartData::by_row`. Nothing in SpreadsheetML stores it, so the writer emits
+whatever rectangle each ref holds and the loader **infers** the flag back from
+their shape; the panel's `Switch Row/Column` button flips it by re-deriving the
+chart through `chart_from_range`. The inference's ambiguous cases and the
+`<c:cat>` fallback a row chart must not take are written up in
+[`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md).
+
 ---
 
 ## 5. The formula language

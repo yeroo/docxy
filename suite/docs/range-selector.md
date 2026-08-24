@@ -106,7 +106,7 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `ChartRange` | Chart panel | replots the chart from the box |
 | `ChartTitle` | Chart panel | plain text — **not** pointable |
 | `SeriesName(i)` | series card | the field **shows the reference** (`=Budget!$B$1:$B$1`), not the name it resolved to, as Excel's Series name box does (`series_name_shown`); a series with no ref shows its literal name. A ref reads that **cell** — the top-left one, since the cache beside it holds a single point, and the ref is narrowed to it before anything is read — and is kept live; anything else is a literal name, and only if you **changed** the text, measured against whichever of the two was displayed (`series_name_commit`) |
-| `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one column**: Excel splits a two-dimensional pick into a series per column and reads such a ref column-major, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
+| `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one line** — one column on a column-oriented chart, one row on a row-oriented one (`series_values_shape_err`; see [`chart-orientation.md`](chart-orientation.md)). Excel splits a two-dimensional pick into a series per line and reads such a ref the long way, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
 | `Categories` | Chart panel | the category-axis labels |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
 | `Validation` | Data Validation bar | the cells the list applies to |
@@ -154,6 +154,13 @@ it says. A pie takes one series and `chart_space_xml` writes only the first, so
 last series can't be removed (a chart with none is not renderable, and Excel won't let you
 get there either), and a series' colour lives on the series, so it travels
 through a reorder.
+
+Which way round the box is read — each column a series, or each row — is the
+chart's own `by_row`, flipped by the panel's `Switch Row/Column` button and
+inferred from the refs when a chart is loaded. It decides what the DATA RANGE
+field replots, what a series' values field will accept, and what the hints
+under both suggest; it is written up in
+[`chart-orientation.md`](chart-orientation.md).
 
 ## Reference syntax
 
