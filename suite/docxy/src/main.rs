@@ -1776,6 +1776,55 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
     }
 }
 
+/// Where the Chart panel's three range fields point their `e.g.` at, for a
+/// chart read this way round.
+///
+/// A row-oriented chart is the transpose of a column one, so every example has
+/// to be too: its series is a ROW (`B2:D2`), the cell naming that series is the
+/// one to its LEFT (`A2`), and its category labels lie along the row ABOVE
+/// (`B1:D1`). A fixed column-shaped hint is not merely unhelpful on a row chart
+/// — `series_values_shape_err` REFUSES the very range the values hint offers,
+/// which is the failure that function's own comment calls worse than not
+/// checking at all.
+///
+/// Cells are the 0-based offsets `ref_example` stamps a sheet name onto.
+fn chart_field_examples(by_row: bool) -> ChartFieldExamples {
+    if by_row {
+        ChartFieldExamples {
+            name: (1, 0, 1, 0),
+            values: (1, 1, 1, 3),
+            categories: (0, 1, 0, 3),
+        }
+    } else {
+        ChartFieldExamples {
+            name: (0, 1, 0, 1),
+            values: (1, 1, 4, 1),
+            categories: (1, 0, 4, 0),
+        }
+    }
+}
+
+/// The cell boxes [`chart_field_examples`] hands back, one per range field.
+struct ChartFieldExamples {
+    /// The single cell naming a series.
+    name: (u32, u32, u32, u32),
+    /// The line of cells one series plots.
+    values: (u32, u32, u32, u32),
+    /// The line of cells labelling the axis.
+    categories: (u32, u32, u32, u32),
+}
+
+/// What a chart's DATA RANGE box has to include for the chart to read it, said
+/// the way round THIS chart reads. The header row names the series of a column
+/// chart; the label column names the series of a row one.
+fn chart_range_help(by_row: bool) -> &'static str {
+    if by_row {
+        "Include the label column: it names the series. Enter to replot."
+    } else {
+        "Include the header row: it names the series. Enter to replot."
+    }
+}
+
 /// Re-point series `i` at `src`, plotting `values`. Reports how many points it
 /// took, or `None` when there is no series `i`.
 ///
@@ -3037,11 +3086,19 @@ impl Docxy {
             gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind, old.by_row)
         }) else {
             let (r1, c1, r2, c2) = range;
+            // Named the way round THIS chart reads: a row chart wants a row of
+            // numbers beside a label column, and telling its user to go and
+            // find a column would send them after the wrong shape.
+            let (line, edge) = if old.by_row {
+                ("row", "beside a label column")
+            } else {
+                ("column", "under a header row")
+            };
             self.ref_msg = Some((
                 RefTarget::ChartRange,
                 false,
                 format!(
-                    "{}:{} has no column of numbers under a header row",
+                    "{}:{} has no {line} of numbers {edge}",
                     gridcore::sheet::cell_name(r1, c1),
                     gridcore::sheet::cell_name(r2, c2)
                 ),
@@ -3077,33 +3134,77 @@ impl Docxy {
     }
 
     /// The selected chart re-derived from its own range the other way round, or
-    /// `None` when it can't be — which is also what greys the Switch
-    /// Row/Column button out, so the button is enabled exactly when clicking it
-    /// would do something.
+    /// WHY it can't be — which is both what greys the Switch Row/Column button
+    /// out and the note printed under it, so the button is enabled exactly when
+    /// clicking it would do something and the reason given is the real one. The
+    /// two used to be worked out separately, and the note then blamed the range
+    /// for a sheet name the workbook had lost.
     ///
     /// The box's sheet name is what gets resolved, not the sheet on screen; an
     /// EMPTY name is an unqualified box, which means the sheet on screen, so it
     /// is passed as `None` rather than looked up and missed.
-    fn chart_switched(&self) -> Option<gridcore::sheet::ChartData> {
-        let data = self.chart_data()?;
-        let sheet = data.source.as_ref()?.sheet.clone();
-        let v = self.active_sheet()?;
+    ///
+    /// The cell cap is `chart_ref_of`'s, for `chart_ref_of`'s reason and then
+    /// some: this range did not come from a field, it came from the FILE, so it
+    /// is the one chart range nothing has ever bounded — a `<c:f>` may legally
+    /// name `$A$1:$A$1048576`. Re-deriving that would walk a million cells and
+    /// build a series per row, and this runs on every frame the panel draws,
+    /// not once per click.
+    fn chart_switched(&self) -> Result<gridcore::sheet::ChartData, String> {
+        let Some(data) = self.chart_data() else {
+            return Err("No chart selected.".to_string());
+        };
+        let Some(src) = data.source.as_ref() else {
+            return Err(
+                "No data range to re-read \u{2014} this chart came with references the \
+                        model can't hold."
+                    .to_string(),
+            );
+        };
+        let (r1, c1, r2, c2) = src.range;
+        let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+        if cells > MAX_CHART_CELLS {
+            return Err(format!(
+                "Its range is {cells} cells; a chart plots at most {MAX_CHART_CELLS}."
+            ));
+        }
+        let sheet = src.sheet.clone();
+        let Some(v) = self.active_sheet() else {
+            return Err("No workbook open.".to_string());
+        };
         let named = (!sheet.is_empty()).then_some(sheet.as_str());
-        let si = sheet_index_of(&self.sheet_names(), named, v.active).ok()?;
-        chart_switch_row_column(&data, v.pkg.workbook.sheets.get(si)?)
+        let found = sheet_index_of(&self.sheet_names(), named, v.active)
+            .ok()
+            .and_then(|si| v.pkg.workbook.sheets.get(si));
+        let Some(sh) = found else {
+            return Err(format!(
+                "Its range names a sheet this workbook hasn't got ({sheet})."
+            ));
+        };
+        chart_switch_row_column(&data, sh).ok_or_else(|| {
+            format!(
+                "Its range has no {} of numbers to read the other way round.",
+                if data.by_row { "column" } else { "row" },
+            )
+        })
     }
 
     /// Excel's `Switch Row/Column`: read the chart's range the other way round,
     /// so each row becomes a series instead of each column.
     ///
+    /// `data` is the flip the panel ALREADY derived to decide whether to enable
+    /// the button, handed back rather than worked out a second time — the
+    /// button and the click then cannot disagree about what clicking does.
+    ///
     /// The undo snapshot is `chart_set_data`'s — it takes one before writing the
     /// chart back, and a flip always differs from what is there (the
     /// orientation, if nothing else), so its "committed nothing" early return
     /// can't swallow this.
-    fn chart_switch_orientation(&mut self, cx: &mut Context<Self>) {
-        let Some(data) = self.chart_switched() else {
-            return;
-        };
+    fn chart_switch_orientation(
+        &mut self,
+        data: gridcore::sheet::ChartData,
+        cx: &mut Context<Self>,
+    ) {
         self.set_status(format!(
             "Chart reads each {} as a series \u{2014} {} series over {} categories",
             if data.by_row { "row" } else { "column" },
@@ -3307,11 +3408,7 @@ impl Docxy {
         };
         // The example is the shape THIS chart wants, so the "that isn't a range"
         // message doesn't send a row chart's user off to point at a column.
-        let example = self.ref_example(if data.by_row {
-            (1, 1, 1, 3)
-        } else {
-            (1, 1, 4, 1)
-        });
+        let example = self.ref_example(chart_field_examples(data.by_row).values);
         let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
@@ -3470,7 +3567,9 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let example = self.ref_example((1, 0, 4, 0));
+        // The labels of a row chart run ALONG a row, so a column example here
+        // would send its user at the one shape the chart doesn't read.
+        let example = self.ref_example(chart_field_examples(data.by_row).categories);
         let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
@@ -6315,27 +6414,23 @@ impl Docxy {
         // dialog — here it sits under the type buttons, since both answer "what
         // does this range mean".
         //
-        // It is enabled exactly when clicking it would do something:
-        // `chart_switched` is the same call the click makes, so the button can
-        // never look live and then do nothing. When it isn't, the note under it
-        // says which of the two reasons it is, rather than leaving a dead
-        // button to be clicked at.
+        // It is enabled exactly when clicking it would do something: the flip
+        // derived here IS what the click commits, so the button can never look
+        // live and then do nothing, and it is derived once rather than once to
+        // light the button and again to act on it. When it can't be derived,
+        // `chart_switched` says why and that becomes the note under the greyed
+        // button, rather than leaving a dead button to be clicked at.
         let switched = self.chart_switched();
-        let can_switch = switched.is_some();
+        let can_switch = switched.is_ok();
         let switch_note = match &switched {
-            Some(_) => format!(
+            Ok(_) => format!(
                 "Each {} is a series; each {} a category.",
                 if data.by_row { "row" } else { "column" },
                 if data.by_row { "column" } else { "row" },
             ),
-            None if data.source.is_none() => "No data range to re-read \u{2014} this chart came \
-                 with references the model can't hold."
-                .to_string(),
-            None => format!(
-                "Its range has no {} of numbers to read the other way round.",
-                if data.by_row { "column" } else { "row" },
-            ),
+            Err(why) => why.clone(),
         };
+        let flip = switched.ok();
         let ent_sw = ent.clone();
         let switch = v_flex()
             .gap(px(2.))
@@ -6352,8 +6447,14 @@ impl Docxy {
                     .text_color(if can_switch { pal.fg } else { pal.dim })
                     .when(can_switch, |d| {
                         d.cursor_pointer().hover(|d| d.bg(pal.hover)).on_click(
+                            // Cloned per click rather than moved: an `on_click`
+                            // handler is a `Fn`, and this one outlives the
+                            // frame that derived the flip.
                             move |_ev, _w, cx2| {
-                                ent_sw.update(cx2, |this, cx2| this.chart_switch_orientation(cx2));
+                                let Some(flip) = flip.clone() else { return };
+                                ent_sw.update(cx2, |this, cx2| {
+                                    this.chart_switch_orientation(flip, cx2)
+                                });
                             },
                         )
                     })
@@ -6378,8 +6479,13 @@ impl Docxy {
         // Everything here is a field, so a series can be pointed at the grid.
         // The two hints are the same on every card and cost a walk of the
         // workbook's sheet names each, so they are spelled once for the lot.
-        let name_hint = format!("e.g. {} or a name", self.ref_example((0, 1, 0, 1)));
-        let vals_hint = format!("e.g. {}", self.ref_example((1, 1, 4, 1)));
+        // They follow the chart's orientation for the reason
+        // `chart_field_examples` gives: the values field REFUSES a column on a
+        // row chart, so a fixed column hint would offer a range of its own that
+        // it then rejects.
+        let ex = chart_field_examples(data.by_row);
+        let name_hint = format!("e.g. {} or a name", self.ref_example(ex.name));
+        let vals_hint = format!("e.g. {}", self.ref_example(ex.values));
         let mut series_list = v_flex().gap(px(6.));
         for (si, sr) in data.series.iter().enumerate() {
             let vals = sr
@@ -6593,7 +6699,7 @@ impl Docxy {
                         RefTarget::ChartRange,
                         range_shown,
                         format!("e.g. {}", self.ref_example((0, 0, 4, 3))),
-                        "Include the header row: it names the series. Enter to replot.",
+                        chart_range_help(data.by_row),
                         cx,
                     ))
                     .child(heading("TYPE"))
@@ -6665,7 +6771,7 @@ impl Docxy {
                                 .as_ref()
                                 .map(source_ref_text)
                                 .unwrap_or_default(),
-                            format!("e.g. {}", self.ref_example((1, 0, 4, 0))),
+                            format!("e.g. {}", self.ref_example(ex.categories)),
                             "The cells labelling each point along the axis.",
                             cx,
                         ),
@@ -17266,6 +17372,47 @@ mod grid_geom_tests {
         // refuse next time round.
         assert!(err(true, (1, 1, 4, 1)).unwrap().contains("B2:D2"));
         assert!(err(false, (1, 1, 1, 3)).unwrap().contains("B2:B5"));
+    }
+
+    /// The hints have to follow the orientation for the same reason the
+    /// messages do — and the values hint most of all, since it is the one the
+    /// guard above can REFUSE. An empty VALUES field on a row chart offering
+    /// `B2:B5` would be telling the user to type the one range it rejects.
+    #[test]
+    fn the_example_cells_each_chart_field_offers_follow_the_charts_orientation() {
+        use super::{chart_field_examples, series_values_shape_err as err};
+
+        let col = chart_field_examples(false);
+        let row = chart_field_examples(true);
+
+        // Whatever the values hint offers, the guard must accept.
+        assert_eq!(err(false, col.values), None, "column hint is refused");
+        assert_eq!(err(true, row.values), None, "row hint is refused");
+        // And each is the shape the OTHER orientation refuses, so they are
+        // genuinely transposed rather than accidentally both accepted.
+        assert!(err(true, col.values).is_some());
+        assert!(err(false, row.values).is_some());
+
+        // A series' name is one cell: the header above it by column, the label
+        // to its left by row.
+        assert_eq!(col.name, (0, 1, 0, 1));
+        assert_eq!(row.name, (1, 0, 1, 0));
+        // Categories run down a column one way round and along a row the other.
+        assert!(col.categories.0 != col.categories.2);
+        assert_eq!(col.categories.1, col.categories.3, "a column of labels");
+        assert_eq!(row.categories.0, row.categories.2, "a row of labels");
+        assert!(row.categories.1 != row.categories.3);
+    }
+
+    /// The DATA RANGE help names what the box must include, and that differs by
+    /// orientation: the header row names a column chart's series, the label
+    /// column a row chart's.
+    #[test]
+    fn the_data_range_help_names_the_line_that_holds_this_charts_series_names() {
+        use super::chart_range_help;
+        assert!(chart_range_help(false).contains("header row"));
+        assert!(chart_range_help(true).contains("label column"));
+        assert_ne!(chart_range_help(false), chart_range_help(true));
     }
 
     #[test]

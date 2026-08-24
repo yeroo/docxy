@@ -139,10 +139,16 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   The union of those refs is the chart's own box, `ChartData::source`.
 - **`ChartSource`** carries `(sheet, range, cat_col)` and knows how to write
   itself back as an absolute `Sheet1!$B$2:$B$5` (`f_ref` / `to_ref` /
-  `header_ref`) and how to read one back (`parse_f_ref`), plus `union`.
+  `header_ref`, and `label_ref` for the row reading below) and how to read one
+  back (`parse_f_ref`), plus `union`. `cat_col` means the label column only in
+  the column reading; on a row chart it holds the column the *series names* come
+  from, since labels in a row are not a column index.
 - **Building one from cells** (`sheet::chart_from_range`): the header row names
   each series, the first mostly-non-numeric column supplies the category labels,
-  and every mostly-numeric column becomes a series. `range_numbers` /
+  and every mostly-numeric column becomes a series. That is the **column**
+  reading (`by_row: false`); with `by_row: true` it is the transpose — the first
+  column names each series, one row of labels supplies the categories, and every
+  mostly-numeric row becomes a series (see §4a below). `range_numbers` /
   `range_labels` read the cells a field points at.
 - **Writing** (`xlsx::chart_space_xml`): an edited chart is written with live
   `numRef` / `strRef` refs *and* their caches, so Excel treats it as a real

@@ -91,7 +91,8 @@ answer the all-numeric table already gets in the column reading.
 `infer_by_row` (`gridcore/src/drawing.rs`) measures each series' `<c:val>` ref
 and counts votes: one row across several columns votes **row**, one column down
 several rows votes **column**. A row reading wins only if it is **unanimous** —
-`rows > 0 && cols == 0`.
+`rows > 0 && cols == 0`. Only when *nothing* had a shape of its own does the
+arrangement of the single-cell series get a say (see below).
 
 The ambiguous cases, decided explicitly so the next reader doesn't have to
 rediscover them:
@@ -99,6 +100,15 @@ rediscover them:
 - **A single cell** (`$B$2`) is one row and one column at once. It fits both
   readings, so it votes for neither. A 1×1 chart therefore comes back
   column-oriented, and a round-trip test pins exactly that.
+- **Several single cells stacked down one column** (`$B$2`, `$B$3`, `$B$4`) is
+  the one case that looks ambiguous cell by cell and isn't, so it is **not** a
+  default: it counts as row evidence. It is what a row chart over a range one
+  label column plus one numeric column wide comes to — every row series is one
+  cell — and the column reading cannot produce it, since that emits one series
+  *per column* and two series therefore never share a column. Reading them as
+  columns would fold N one-point series into one N-point series on the next
+  load. The mirror shape, single cells side by side **along** a row, is what a
+  column chart one data row deep comes to, so it stays column-oriented.
 - **A series with no readable ref** — `<c:numLit>` values, or a ref this model
   cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to measure, so
   no vote.

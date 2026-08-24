@@ -152,7 +152,8 @@ the TUI and materializes reports, with definitions persisted in the file), and t
 same lossless
 round-trip guarantee: anything it doesn't model (pivots, conditional
 formatting…) is preserved byte-for-byte. The one deliberate exception is a chart
-you *edit* — repoint its range, rename or reorder its series, recolour it, in the
+you *edit* — repoint its range, switch which way round it reads that range
+(Excel's *Switch Row/Column*), rename or reorder its series, recolour it, in the
 desktop suite's Chart panel — which is regenerated from the model, and a drawing
 you move or delete, whose anchor is rewritten in place. Only column, bar, line
 and pie charts can be regenerated; a scatter, a doughnut or anything stacked or

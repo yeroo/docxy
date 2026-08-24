@@ -331,7 +331,12 @@ pub struct ChartData {
 pub struct ChartSource {
     pub sheet: String,
     pub range: (u32, u32, u32, u32),
-    /// The column inside `range` holding the category labels.
+    /// The column inside `range` holding the category labels — when the chart
+    /// is read COLUMN-wise. A row-oriented chart ([`ChartData::by_row`]) takes
+    /// its labels from a row, which no column index can express, so this holds
+    /// the column its SERIES NAMES come from instead. The writer must therefore
+    /// derive a row chart's `<c:cat>` from `ChartData::categories_ref`, never
+    /// from here.
     pub cat_col: u32,
 }
 
@@ -721,7 +726,13 @@ pub struct ChartSeries {
     /// Explicit series colour (`0xRRGGBB`) from its `<c:spPr>` solid fill;
     /// `None` leaves it to the renderer's palette.
     pub color: Option<u32>,
-    /// The worksheet column this series reads, when the chart is range-backed.
+    /// The worksheet column this series reads, when the chart is range-backed
+    /// and read COLUMN-wise. Always `None` for a row-oriented series
+    /// ([`ChartData::by_row`]), which occupies every column of its ref rather
+    /// than one — `None` here means "no single column", not "not range-backed".
+    /// It feeds the writer's column-shaped fallback ref and `claimed_col`, so a
+    /// row series' left-hand column here would make both quietly wrong rather
+    /// than inapplicable.
     pub col: Option<u32>,
     /// The cells this series' values come from. Set independently of the chart's
     /// overall box, so one series can be re-pointed without touching the others.

@@ -413,7 +413,8 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 /// written before orientation existed is, and what the panel can always show:
 ///
 /// - **A single cell** (`$B$2`) is one row AND one column at once — it fits
-///   both readings, so it votes for neither.
+///   both readings, so it votes for neither. Several of them can still settle
+///   it between them; see below.
 /// - **A series with no readable ref**: `<c:numLit>` values, or a ref this
 ///   model cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to
 ///   measure, so no vote.
@@ -426,18 +427,37 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 ///
 /// With no votes at all — the chart has no series, or none with a ref — the
 /// answer is the same: column.
+///
+/// One shape LOOKS ambiguous cell by cell and isn't: several single-cell series
+/// STACKED DOWN ONE COLUMN (`$B$2`, `$B$3`, `$B$4`). That is what a row chart
+/// over a two-column range comes to — one label column and one numeric column,
+/// so every row series is one cell wide — and the column reading cannot produce
+/// it, since it emits one series PER COLUMN and two series therefore never
+/// share a column. Reading those as columns would fold N one-point series into
+/// one N-point series on the next load, so they are counted as row evidence.
+/// A single one on its own stays ambiguous (a 2x2 range), as does a row of them
+/// (a column chart over a range one data row deep).
 fn infer_by_row(cd: &ChartData) -> bool {
     let (mut rows, mut cols) = (0usize, 0usize);
+    // The single-cell series, in the order they appear.
+    let mut cells: Vec<(u32, u32)> = Vec::new();
     for s in &cd.series {
         let Some(v) = &s.values_ref else { continue };
         let (r1, c1, r2, c2) = v.range;
         match (r1 == r2, c1 == c2) {
+            (true, true) => cells.push((r1, c1)),
             (true, false) => rows += 1,
             (false, true) => cols += 1,
             _ => {}
         }
     }
-    rows > 0 && cols == 0
+    if rows > 0 || cols > 0 {
+        return rows > 0 && cols == 0;
+    }
+    // Nothing had a shape of its own. Stacked single cells are row evidence.
+    cells.len() > 1
+        && cells.iter().all(|c| c.1 == cells[0].1)
+        && cells.iter().any(|c| c.0 != cells[0].0)
 }
 
 fn parse_chart(xml: &str) -> ChartData {
@@ -1850,5 +1870,99 @@ mod tests {
         // on screen is unaffected; only re-deriving from the box would now
         // choose the column reading, which draws the same single bar.
         assert!(!again.by_row, "a one-cell series is evidence of neither");
+    }
+
+    /// The same one-cell series, but SEVERAL of them: a row chart over a range
+    /// one label column plus one numeric column wide. Cell by cell each series
+    /// is ambiguous; stacked down one column they are not, because the column
+    /// reading emits one series per column and so never repeats a column.
+    /// Losing this would fold three one-point series into one three-point
+    /// series on the next load.
+    #[test]
+    fn stacked_one_cell_series_are_read_as_rows_not_as_one_column() {
+        use crate::sheet::{Cell, Sheet, chart_from_range, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+
+        let by_row = chart_from_range(&sh, "Budget", (0, 0, 3, 1), "column", true).expect("rows");
+        assert_eq!(by_row.series.len(), 3);
+        // Every series really is one cell wide — this is the shape at issue.
+        let refs: Vec<String> = by_row
+            .series
+            .iter()
+            .map(|s| s.values_ref.as_ref().expect("ref").to_ref())
+            .collect();
+        assert_eq!(
+            refs,
+            vec!["Budget!$B$2:$B$2", "Budget!$B$3:$B$3", "Budget!$B$4:$B$4"]
+        );
+
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&by_row));
+        assert!(
+            again.by_row,
+            "three cells down one column read as three rows"
+        );
+        let names: Vec<&str> = again.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(again.categories, vec!["Qty"]);
+        assert_eq!(again.series[1].values, vec![4.0]);
+
+        // The transpose is the column chart over the same box, and it must not
+        // be dragged along: its ONE series spans several rows, which is a shape
+        // of its own and votes column outright.
+        let by_col = chart_from_range(&sh, "Budget", (0, 0, 3, 1), "column", false).expect("cols");
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&by_col));
+        assert!(!again.by_row);
+        assert_eq!(again.series.len(), 1);
+        assert_eq!(again.series[0].values, vec![2.0, 4.0, 6.0]);
+    }
+
+    /// The mirror shape: one-cell series side by side ALONG one row, which is
+    /// what a column chart over a range one data row deep comes to. The column
+    /// reading produces it, so it stays the default rather than becoming row
+    /// evidence.
+    #[test]
+    fn one_cell_series_along_a_row_stay_column_oriented() {
+        use crate::sheet::{Cell, Sheet, chart_from_range, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(2398.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let by_col = chart_from_range(&sh, "Budget", (0, 0, 1, 2), "column", false).expect("cols");
+        assert_eq!(by_col.series.len(), 2);
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&by_col));
+        assert!(
+            !again.by_row,
+            "two cells along one row are not row evidence"
+        );
+        let names: Vec<&str> = again.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Qty", "Total"]);
+        assert_eq!(again.categories, vec!["Laptop"]);
     }
 }
