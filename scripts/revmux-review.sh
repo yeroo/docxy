@@ -141,8 +141,14 @@ if [[ -n "${REVMUX_REVIEW_DRYRUN:-}" ]]; then
 fi
 
 # --no-tui because ralphex captures stdout; --markdown so report.md is written
-# in a form the evaluation phase can read directly.
-revmux --task "$task" --run "$run" --no-tui --markdown --workdir "$repo_root" >&2
+# in a form the evaluation phase can read directly. revmux's own progress goes
+# to stderr so it stays out of the findings ralphex reads.
+#
+# revmux exits NON-ZERO when it has findings, the way a linter does. Under
+# `set -e` that killed this script before it could hand the report over, so a
+# review that worked perfectly looked to ralphex like a crashed hook. The report
+# file existing is the real success signal — check that, not the exit code.
+revmux --task "$task" --run "$run" --no-tui --markdown --workdir "$repo_root" >&2 || true
 
 report="$round_dir/report.md"
 if [[ -f "$report" ]]; then
