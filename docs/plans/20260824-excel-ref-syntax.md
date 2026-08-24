@@ -286,21 +286,31 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 6: Data validation accepts a foreign sheet; sort and text-to-columns refuse one
 
-- [ ] `Validation`: allow a qualifier naming another sheet — a validation list
-      commonly lives on a lookup sheet — resolving through `ref_sheet_index` and
-      persisting the qualified ref
-- [ ] `Sort` and `TextToColumns`: keep the existing refusal at main.rs:1809-1830;
-      these act on the rows in front of you, so a foreign sheet is a mistake, not
-      a feature. Confirm the message still reads correctly now that the field
-      shows a qualifier by default (it must not refuse the field's *own* seeded
-      value)
-- [ ] `CondFormat`: decide and record which side it falls on — it applies a rule
-      to cells on one sheet, so it refuses, same as Sort. Note the reasoning in
-      the code comment
-- [ ] write tests per target: for each `RefTarget`, whether a foreign qualifier
-      resolves or is refused, and that a ref naming the *active* sheet is always
-      accepted (the regression risk introduced by Task 3's seeding)
-- [ ] run tests — must pass before Task 7
+- [x] `Validation`: allow a qualifier naming another sheet — resolving through
+      the new `bar_ref_text`, which answers with the sheet index the rule lands
+      on and the ref spelled the workbook's way, and persisting that qualified
+      ref in `bar_range`. The rule is written to that sheet via the new
+      `bar_sheet_index` (derived from `bar_range`, not stored beside it)
+      — ⚠️ deviation from the stated rationale: the Validation bar's range field
+      is the APPLIES-TO range, not the list source (the bar's own text is a
+      literal comma-separated list, `add_data_validation(…, "list", …)`). So what
+      a qualifier buys is building the rule where the boxes are while looking at
+      the sheet holding the list — the same cross-sheet case, from the other end.
+      A range-valued list source is separate work and stays out of scope
+- [x] `Sort` and `TextToColumns`: keep the existing refusal — `bar_ref_text`
+      routes them straight back through `bar_range_text`, message unchanged;
+      tested that a foreign sheet is refused even when it EXISTS (the objection
+      is where they act, not an unknown name), and `no_bar_refuses_its_own_seeded_value`
+      covers the seeding regression for all four bars on every sheet
+- [x] `CondFormat`: refuses, same as Sort — it paints the cells in front of you.
+      Recorded with the rest of the per-target reasoning in the doc comment on
+      `target_takes_foreign_sheet`
+- [x] write tests per target: `each_range_target_says_whether_it_reads_another_sheet`
+      pins the policy for all nine `RefTarget` variants; the bar tests cover a
+      foreign sheet resolved (Validation) and refused (the other three), an
+      unknown sheet, a name needing quotes, a non-range, and an active-sheet ref
+      accepted for every bar
+- [x] run tests — must pass before Task 7
 
 ### Task 7: The wash and the pointing agree about which sheet you're on
 

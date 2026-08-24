@@ -1958,6 +1958,73 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
     }
 }
 
+/// Does a range field for `target` read cells on a sheet other than the one in
+/// front of you, when its reference names one?
+///
+/// The split is about what the field FEEDS, not about the field:
+///
+/// - The chart targets resolve. A chart floats over one sheet and plots
+///   another's numbers all the time — that is the whole point of a `<c:f>`
+///   carrying a sheet name.
+/// - `Validation` resolves. A dropdown belongs wherever the cells being
+///   validated are, and those are commonly on a different sheet from the one
+///   the rule is built on (a lookup sheet holding the list, an entry sheet
+///   holding the boxes).
+/// - `CondFormat`, `Sort` and `TextToColumns` refuse. Each acts on the rows in
+///   front of you: a rule paints these cells, a sort reorders these rows, a
+///   split rewrites these columns. A qualifier naming elsewhere is a mistake,
+///   and the existing message says so rather than acting on the same-named
+///   cells here.
+/// - `ChartTitle` isn't a range at all, so nothing resolves; it answers `false`
+///   only because the question doesn't apply to it.
+fn target_takes_foreign_sheet(target: RefTarget) -> bool {
+    match target {
+        RefTarget::ChartRange
+        | RefTarget::SeriesName(_)
+        | RefTarget::SeriesValues(_)
+        | RefTarget::Categories
+        | RefTarget::Validation => true,
+        RefTarget::CondFormat
+        | RefTarget::Sort
+        | RefTarget::TextToColumns
+        | RefTarget::ChartTitle => false,
+    }
+}
+
+/// Which sheet an entry bar will act on and the text its field keeps, or the
+/// complaint to show under it. `names` are the workbook's sheets and `active`
+/// the one on screen, which is what an unqualified reference means.
+///
+/// A bar that refuses a foreign sheet (see `target_takes_foreign_sheet`) goes
+/// on answering through `bar_range_text`, message and all. One that resolves
+/// looks the name up and answers with the sheet ACTUALLY found, spelled the way
+/// the workbook spells it — so `budget!a1:a9` comes back `=Budget!$A$1:$A$9`
+/// and the field stops disagreeing with the tab it names.
+fn bar_ref_text(
+    text: &str,
+    target: RefTarget,
+    names: &[String],
+    active: usize,
+) -> Result<(usize, String), String> {
+    let here = names.get(active).map_or("", String::as_str);
+    if !target_takes_foreign_sheet(target) {
+        return bar_range_text(text, here).map(|a1| (active, a1));
+    }
+    let Some(r) = parse_ref_text(text) else {
+        // The same complaint the refusing bars give, so the two never read as
+        // different kinds of failure: the `=` the field seeds itself with is
+        // not part of what the user typed wrong.
+        let t = text.trim();
+        return Err(format!(
+            "\"{}\" isn't a range like {}",
+            t.strip_prefix('=').unwrap_or(t).trim(),
+            ref_a1(Some(here), (0, 0, 4, 3))
+        ));
+    };
+    let i = sheet_index_of(names, r.sheet.as_deref(), active)?;
+    Ok((i, ref_a1(names.get(i).map(String::as_str), r.range)))
+}
+
 /// The rows a sort runs over: a field naming more than one row sorts exactly
 /// those, anything else falls back to the region found around the cursor.
 fn sort_rows_from(
@@ -2840,13 +2907,15 @@ impl Docxy {
     /// Re-point the open entry bar. The bar itself does nothing until its own
     /// Enter — this only says which cells it will act on.
     fn bar_range_apply(&mut self, target: RefTarget, text: &str, cx: &mut Context<Self>) {
-        let Some(sheet) = self.active_sheet().map(|v| v.sheet().name.clone()) else {
+        let Some(active) = self.active_sheet().map(|v| v.active) else {
             return;
         };
-        match bar_range_text(text, &sheet) {
-            Ok(a1) => {
+        match bar_ref_text(text, target, &self.sheet_names(), active) {
+            Ok((_, a1)) => {
                 // The message reads as a sentence, so it drops the field's `=`
-                // and keeps the qualifier: "Applies to Sheet1!$B$2:$D$5".
+                // and keeps the qualifier: "Applies to Sheet1!$B$2:$D$5". The
+                // qualifier is the whole point when a bar resolved one — it is
+                // what says the rule is landing on the other sheet.
                 let said = a1.trim_start_matches('=').to_string();
                 self.ref_msg = Some((target, true, format!("Applies to {said}")));
                 self.bar_range = Some(a1);
@@ -2854,6 +2923,21 @@ impl Docxy {
             Err(m) => self.ref_msg = Some((target, false, m)),
         }
         cx.notify();
+    }
+
+    /// The sheet the open bar acts on: the one its pinned range names, else the
+    /// one on screen. Only the bars that resolve a foreign qualifier can differ
+    /// from `active` — the others refuse one, so their pinned range always
+    /// names this sheet.
+    ///
+    /// Derived from `bar_range` rather than stored beside it, so the two cannot
+    /// drift into naming one sheet and acting on another.
+    fn bar_sheet_index(&self) -> Option<usize> {
+        let active = self.active_sheet()?.active;
+        match self.bar_range.as_deref().and_then(parse_ref_text) {
+            Some(r) => sheet_index_of(&self.sheet_names(), r.sheet.as_deref(), active).ok(),
+            None => Some(active),
+        }
     }
 
     /// The cells the open bar acts on: the range pinned into its field, else
@@ -4637,11 +4721,16 @@ impl Docxy {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                if let Some(cells) = self.bar_cells().filter(|_| !items.is_empty()) {
+                // The rule lands on the sheet the field NAMES, which for a
+                // validation may not be the one on screen: the list is built
+                // where it is read, and the boxes reading it commonly sit on
+                // another sheet from the one it was typed on.
+                let sheet = self.bar_sheet_index();
+                if let Some((cells, s)) = self.bar_cells().zip(sheet).filter(|_| !items.is_empty())
+                {
                     let f1 = format!("\"{}\"", items.join(","));
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
-                        let s = v.active;
                         v.pkg.add_data_validation(s, cells, "list", "", &f1, None);
                     }
                     self.mark_sheet_dirty();
@@ -17633,6 +17722,136 @@ mod grid_geom_tests {
             super::bar_range_text("'Bob''s data'!A1:A9", "Bob's data"),
             Ok("='Bob''s data'!$A$1:$A$9".to_string())
         );
+    }
+
+    #[test]
+    fn each_range_target_says_whether_it_reads_another_sheet() {
+        use super::{RefTarget::*, target_takes_foreign_sheet as takes};
+        // A chart plots cells it doesn't float over, so every chart field
+        // resolves a qualifier.
+        assert!(takes(ChartRange));
+        assert!(takes(SeriesValues(0)));
+        assert!(takes(SeriesName(2)));
+        assert!(takes(Categories));
+        // A dropdown is read where the boxes are, which is commonly not the
+        // sheet the list was typed on.
+        assert!(takes(Validation));
+        // A rule, a sort and a split act on the rows in front of you.
+        assert!(!takes(CondFormat));
+        assert!(!takes(Sort));
+        assert!(!takes(TextToColumns));
+        // Not a range at all — the question doesn't apply.
+        assert!(!takes(ChartTitle));
+    }
+
+    #[test]
+    fn validation_takes_another_sheets_cells() {
+        use super::{RefTarget, bar_ref_text};
+        let wb: Vec<String> = ["Sheet1", "Lookup", "My Sheet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dv = |t: &str| bar_ref_text(t, RefTarget::Validation, &wb, 0);
+        // The sheet named is the sheet acted on, and the field answers with the
+        // index the rule will be written to.
+        assert_eq!(dv("Lookup!A1:A9"), Ok((1, "=Lookup!$A$1:$A$9".to_string())));
+        // However it was spelled, the answer spells it the workbook's way.
+        assert_eq!(dv("lookup!a1:a9"), Ok((1, "=Lookup!$A$1:$A$9".to_string())));
+        assert_eq!(
+            dv("='LOOKUP'!$A$1:$A$9"),
+            Ok((1, "=Lookup!$A$1:$A$9".to_string()))
+        );
+        // A name needing quotes keeps them, and still names its own sheet.
+        assert_eq!(
+            dv("'My Sheet'!C3"),
+            Ok((2, "='My Sheet'!$C$3:$C$3".to_string()))
+        );
+        // No qualifier is still the sheet in front of you.
+        assert_eq!(dv("B2:D5"), Ok((0, "=Sheet1!$B$2:$D$5".to_string())));
+        // And "in front of you" follows the active sheet, not the first one.
+        assert_eq!(
+            bar_ref_text("B2:D5", RefTarget::Validation, &wb, 2),
+            Ok((2, "='My Sheet'!$B$2:$D$5".to_string()))
+        );
+    }
+
+    #[test]
+    fn validation_refuses_a_sheet_the_workbook_hasnt_got() {
+        use super::{RefTarget, bar_ref_text};
+        let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
+        // Resolving is not the same as accepting anything: a name matching no
+        // tab is refused by name rather than quietly applied to this sheet.
+        assert_eq!(
+            bar_ref_text("Budget!A1:A9", RefTarget::Validation, &wb, 0),
+            Err("there's no sheet called \"Budget\"".to_string())
+        );
+        // What isn't a range at all reads the same as it does on the other
+        // bars, with the field's own `=` off the front of the complaint.
+        assert_eq!(
+            bar_ref_text(" hello ", RefTarget::Validation, &wb, 0),
+            Err("\"hello\" isn't a range like =Sheet1!$A$1:$D$5".to_string())
+        );
+        assert_eq!(
+            bar_ref_text("=Lookup!", RefTarget::Validation, &wb, 0),
+            Err("\"Lookup!\" isn't a range like =Sheet1!$A$1:$D$5".to_string())
+        );
+        assert!(bar_ref_text("", RefTarget::Validation, &wb, 0).is_err());
+    }
+
+    #[test]
+    fn a_rule_a_sort_and_a_split_still_refuse_another_sheet() {
+        use super::{RefTarget, bar_ref_text};
+        let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
+        for target in [
+            RefTarget::CondFormat,
+            RefTarget::Sort,
+            RefTarget::TextToColumns,
+        ] {
+            // Refused even though the sheet EXISTS — the objection is that
+            // these act on the rows in view, not that the name is unknown.
+            assert_eq!(
+                bar_ref_text("Lookup!A1:A9", target, &wb, 0),
+                Err("\"Lookup\" is another sheet; this acts on Sheet1".to_string()),
+                "{target:?} took a foreign sheet"
+            );
+            // A range on the sheet in front of you is what they want, and the
+            // index they answer with is always that sheet.
+            assert_eq!(
+                bar_ref_text("B2:D5", target, &wb, 0),
+                Ok((0, "=Sheet1!$B$2:$D$5".to_string()))
+            );
+            assert_eq!(
+                bar_ref_text("A1:A9", target, &wb, 1),
+                Ok((1, "=Lookup!$A$1:$A$9".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn no_bar_refuses_its_own_seeded_value() {
+        use super::{RefTarget, bar_ref_text, ref_a1};
+        // Every bar's field SEEDS itself qualified with the active sheet, so
+        // the regression to watch is a bar objecting to text it wrote: pressing
+        // Enter on an untouched field must pin exactly what it shows.
+        let wb: Vec<String> = ["Sheet1", "Lookup", "Bob's Data"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for target in [
+            RefTarget::CondFormat,
+            RefTarget::Validation,
+            RefTarget::Sort,
+            RefTarget::TextToColumns,
+        ] {
+            for active in 0..wb.len() {
+                let seed = ref_a1(Some(wb[active].as_str()), (1, 1, 4, 3));
+                assert_eq!(
+                    bar_ref_text(&seed, target, &wb, active),
+                    Ok((active, seed.clone())),
+                    "{target:?} refused its own seed {seed}"
+                );
+            }
+        }
     }
 
     #[test]
