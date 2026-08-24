@@ -336,20 +336,32 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify every requirement in the Overview is implemented: `=`, `$` anchors
+- [x] verify every requirement in the Overview is implemented: `=`, `$` anchors
       and sheet qualifier shown in all eight range fields; a typed qualifier is
-      resolved or refused, never ignored
-- [ ] verify the out-of-scope list is still out of scope — no Switch
-      Row/Column, no header restyle, no marching ants, no chart-source outlines
-- [ ] verify edge cases: sheet names needing quotes, an apostrophe in a name, a
+      resolved or refused, never ignored — the four chart fields render through
+      `source_ref_text`/`series_name_shown` (main.rs:6071, :6164, :6188, :6346)
+      and the four entry bars share one renderer seeding through `ref_a1`
+      (main.rs:12217); every commit path resolves via `sheet_index_of`, and the
+      `let cells = t.rsplit_once('!')…` line that dropped a qualifier is gone
+- [x] verify the out-of-scope list is still out of scope — no Switch
+      Row/Column, no header restyle, no marching ants, no chart-source outlines:
+      the whole plan's diff is `suite/docxy/src/main.rs` plus this file, and its
+      only added `ref_color`/`ref_index_at` mention is a test-module `use`
+- [x] verify edge cases: sheet names needing quotes, an apostrophe in a name, a
       one-cell range, a reversed range (`D5:A1`), an unknown sheet, and the
-      concatenation `A1:B5A1:D5`
-- [ ] run `cargo test --manifest-path suite/Cargo.toml` — all suite tests pass
-- [ ] run `cargo test -p gridcore` — all gridcore tests pass
-- [ ] run `cargo build --all-targets` at the repo root — the root workspace
-      (xlsxy, gridwasm, lookxy, TUI docxy) still builds
-- [ ] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
-      `cargo fmt --check` — all issues fixed
+      concatenation `A1:B5A1:D5` — each is pinned by a test:
+      `parse_ref_text_accepts_what_a_range_field_is_typed` (`'My Sheet'!`,
+      `'Bob''s Data'!A1`, `C3`, `D5:A1`),
+      `parse_ref_text_refuses_what_isnt_a_range` (`A1:B5A1:D5`, `""`, `total`,
+      `A0`, `Budget!`), `ref_a1_writes_the_form_excel_shows` (`$C$3:$C$3` and
+      the quoting), and `sheet_index_of_refuses_a_sheet_that_isnt_there`
+- [x] run `cargo test --manifest-path suite/Cargo.toml` — all suite tests pass
+      (60 passed, 0 failed)
+- [x] run `cargo test -p gridcore` — all gridcore tests pass (329 + 1 + 4)
+- [x] run `cargo build --all-targets` at the repo root — the root workspace
+      (xlsxy, gridwasm, lookxy, TUI docxy) still builds — clean
+- [x] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
+      `cargo fmt --check` — both clean, nothing to fix
 
 ### Task 9: [Final] Update documentation
 
