@@ -1515,6 +1515,21 @@ fn series_name_commit(text: &str, shown: &str) -> NameCommit {
     }
 }
 
+/// The name a typed literal gives a series, without the `=` the field seeds
+/// itself with.
+///
+/// A ref-backed series' NAME field shows `=Budget!$B$1:$B$1`, so editing that
+/// into a label in place — rather than retyping over the whole selection —
+/// leaves the `=` in front of it. Kept, it would be the series' name:
+/// `chart_space_xml` writes it straight into `<c:tx><c:v>`, and the file would
+/// carry a name Excel reads as a broken formula. Every other path off this
+/// field already drops that `=` (`parse_ref_text`, `not_a_range_msg`); this one
+/// is the last that didn't.
+fn literal_series_name(text: &str) -> String {
+    let t = text.trim();
+    t.strip_prefix('=').unwrap_or(t).trim().to_string()
+}
+
 /// A reference as a field holds it: the sheet it names, if it named one, and
 /// the cell box. `None` means the sheet in front of you — a bare `A1:D5`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3193,7 +3208,7 @@ impl Docxy {
                 (label, Some(src.to_ref()))
             }
             // Not a reference — Excel takes a typed name as the name.
-            NameCommit::Literal => (text.trim().to_string(), None),
+            NameCommit::Literal => (literal_series_name(text), None),
         };
         let Some(s) = data.series.get_mut(i) else {
             return;
@@ -12438,7 +12453,7 @@ impl Docxy {
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Sort"))
             .child(
                 div()
-                    .w(px(110.))
+                    .w(px(160.))
                     .child(self.bar_range_field("sort-range", RefTarget::Sort, cx)),
             )
             .child(div().text_size(px(12.)).text_color(pal.dim).child("by"))
@@ -16739,6 +16754,21 @@ mod grid_geom_tests {
         // Anything else is the name itself.
         assert_eq!(series_name_commit("Revenue", "Qty"), NameCommit::Literal);
         assert_eq!(series_name_commit("", "Qty"), NameCommit::Literal);
+    }
+
+    #[test]
+    fn a_typed_series_name_drops_the_fields_seeded_equals() {
+        use super::literal_series_name;
+        // The field seeds itself with `=Budget!$B$1:$B$1`, so a label edited in
+        // over the reference keeps that `=` unless it's taken off here — and the
+        // `=` would go into the file as part of the series' name.
+        assert_eq!(literal_series_name("=Total"), "Total");
+        assert_eq!(literal_series_name(" = My Label "), "My Label");
+        // A plain label is untouched, and one that only says `=` names nothing.
+        assert_eq!(literal_series_name("Revenue"), "Revenue");
+        assert_eq!(literal_series_name("="), "");
+        // Only the leading `=` goes; one inside the label is part of it.
+        assert_eq!(literal_series_name("Q1=Q2"), "Q1=Q2");
     }
 
     #[test]

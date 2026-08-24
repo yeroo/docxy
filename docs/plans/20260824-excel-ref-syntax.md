@@ -213,7 +213,7 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 - [x] the four entry bars (`CondFormat`, `Validation`, `Sort`, `TextToColumns`):
       seed and re-render their field through `ref_a1` with the active sheet's
       name; `bar_range_text` strips the seed's leading `=` before reading the
-      qualifier and answers in the same qualified form, and the three 110px
+      qualifier and answers in the same qualified form, and all four 110px
       field boxes grew to 160px to fit a sheet name
 - [x] update `range_text` (main.rs:1847) so the text written while dragging
       carries the active sheet's qualifier, matching what the field will hold
