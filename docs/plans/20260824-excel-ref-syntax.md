@@ -163,25 +163,25 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 1: Parse a reference into its sheet and its cells
 
-- [ ] add `struct RefText { sheet: Option<String>, range: (u32, u32, u32, u32) }`
+- [x] add `struct RefText { sheet: Option<String>, range: (u32, u32, u32, u32) }`
       near `parse_ref_text` in `suite/docxy/src/main.rs`, deriving
       `Clone, Debug, PartialEq, Eq`
-- [ ] change `parse_ref_text` (main.rs:1519) to return `Option<RefText>`: strip a
+- [x] change `parse_ref_text` (main.rs:1519) to return `Option<RefText>`: strip a
       leading `=`, split the sheet qualifier on the **last** `!`, unquote a
       `'...'`-wrapped name (turning a doubled `''` back into one `'`), and parse
       the remainder with `gridcore::sheet::parse_range_name` as today
-- [ ] rewrite the doc comment — it currently states the prefix is "accepted and
+- [x] rewrite the doc comment — it currently states the prefix is "accepted and
       dropped", which is the behaviour being removed
-- [ ] update the four callers to compile against the new type without changing
+- [x] update the four callers to compile against the new type without changing
       their behaviour yet (main.rs:1510, :1534, :1826, :3516) — resolution
       arrives in Task 4, so for now each takes `.range` and ignores `.sheet`
-- [ ] write tests: `=Budget!$A$1:$D$5`, `Budget!A1:D5`, `'My Sheet'!A1:D5`,
+- [x] write tests: `=Budget!$A$1:$D$5`, `Budget!A1:D5`, `'My Sheet'!A1:D5`,
       `'Bob''s Data'!A1`, and the bare forms `A1:D5` / `  a1:d5 ` / `C3` all
       parse, with `sheet` set only where one was written
-- [ ] write tests for the rejections that must survive: `A1:B5A1:D5` (the
+- [x] write tests for the rejections that must survive: `A1:B5A1:D5` (the
       concatenation a field used to produce), `""`, `total`, `A0`, and a lone
       `Budget!` with no cells
-- [ ] run `cargo test --manifest-path suite/Cargo.toml` and `cargo build --all-targets` — must pass before Task 2
+- [x] run `cargo test --manifest-path suite/Cargo.toml` and `cargo build --all-targets` — must pass before Task 2
 
 ### Task 2: Format a reference the way Excel writes it
 

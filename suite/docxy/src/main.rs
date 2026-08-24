@@ -1507,19 +1507,56 @@ fn series_name_commit(text: &str, shown: &str) -> NameCommit {
     if text.trim() == shown.trim() {
         return NameCommit::Unchanged;
     }
+    // Task 4 resolves the sheet a ref may name; for now only its cells matter.
     match parse_ref_text(text) {
-        Some(range) => NameCommit::Ref(range),
+        Some(r) => NameCommit::Ref(r.range),
         None => NameCommit::Literal,
     }
 }
 
-/// The cells a range field's text names, or `None` if it isn't a range. A
-/// `Sheet!` prefix is accepted and dropped — a chart plots the sheet it floats
-/// over, and pointing can't reach another one — and `$` anchors are ignored.
-fn parse_ref_text(text: &str) -> Option<(u32, u32, u32, u32)> {
+/// A reference as a field holds it: the sheet it names, if it named one, and
+/// the cell box. `None` means the sheet in front of you — a bare `A1:D5`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RefText {
+    sheet: Option<String>,
+    range: (u32, u32, u32, u32),
+}
+
+/// What a range field's text refers to, or `None` if it isn't a range.
+///
+/// Input is deliberately more permissive than what `ref_a1` writes back, as
+/// Excel's is: the leading `=` is optional, `$` anchors are optional and
+/// ignored, the `Sheet!` qualifier is optional, quoting is optional when the
+/// name doesn't need it, and either corner may come first (`D5:A1` names the
+/// same box as `A1:D5`).
+///
+/// A qualifier is KEPT, not dropped: whoever asked for `Budget!A1:D5` gets
+/// Budget's cells or a message saying there's no such sheet — never this
+/// sheet's cells of the same name. The split is on the LAST `!` because a
+/// quoted sheet name may contain one and the cells never can.
+fn parse_ref_text(text: &str) -> Option<RefText> {
     let t = text.trim();
-    let cells = t.rsplit_once('!').map(|(_, r)| r).unwrap_or(t);
-    gridcore::sheet::parse_range_name(cells)
+    let t = t.strip_prefix('=').unwrap_or(t).trim();
+    let (name, cells) = match t.rsplit_once('!') {
+        Some((p, r)) => (unquote_sheet_name(p), r),
+        None => (None, t),
+    };
+    Some(RefText {
+        sheet: name,
+        range: gridcore::sheet::parse_range_name(cells)?,
+    })
+}
+
+/// The sheet name a qualifier carries, undoing `quote_sheet_name`: a
+/// `'...'`-wrapped name loses its quotes and its doubled `''` become one `'`.
+/// An empty qualifier names no sheet, which reads as "the one in front of you".
+fn unquote_sheet_name(prefix: &str) -> Option<String> {
+    let p = prefix.trim();
+    let name = match p.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => p.to_string(),
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 /// The most cells a chart reads from one field. It plots a point per cell AND
@@ -1531,9 +1568,10 @@ const MAX_CHART_CELLS: u64 = 4096;
 /// A chart field's range, or what to tell the user. `example` is the shape that
 /// field wants, for the "isn't a range" message.
 fn chart_range_of(text: &str, example: &str) -> Result<(u32, u32, u32, u32), String> {
-    let Some(range) = parse_ref_text(text) else {
+    let Some(r) = parse_ref_text(text) else {
         return Err(format!("\"{}\" isn't a range like {example}", text.trim()));
     };
+    let range = r.range;
     let (r1, c1, r2, c2) = range;
     let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
     if cells > MAX_CHART_CELLS {
@@ -1824,7 +1862,7 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
         }
     }
     match parse_ref_text(t) {
-        Some(r) => Ok(range_a1(r)),
+        Some(r) => Ok(range_a1(r.range)),
         None => Err(format!("\"{t}\" isn't a range like A1:D5")),
     }
 }
@@ -2724,6 +2762,7 @@ impl Docxy {
         self.bar_range
             .as_deref()
             .and_then(parse_ref_text)
+            .map(|r| r.range)
             .or_else(|| self.bar_seed())
     }
 
@@ -3513,7 +3552,7 @@ impl Docxy {
         if !f.target.is_range() {
             return None;
         }
-        parse_ref_text(&f.buf)
+        parse_ref_text(&f.buf).map(|r| r.range)
     }
 
     /// Everything drawn over the grid that isn't the cells themselves: the fill
@@ -4892,7 +4931,11 @@ impl Docxy {
         };
         // Only a PINNED range overrides the region the sort would find on its
         // own; the field showing that region is not the user choosing it.
-        let field = self.bar_range.as_deref().and_then(parse_ref_text);
+        let field = self
+            .bar_range
+            .as_deref()
+            .and_then(parse_ref_text)
+            .map(|r| r.range);
         let Some((start, bottom)) = sort_rows_from(field, self.sheet_sort_bounds()) else {
             return;
         };
@@ -16177,10 +16220,10 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box, formula_ref_tokens,
-        last_visible_col, parse_ref_text, range_a1, range_text, ref_color, ref_index_at,
-        ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, series_move,
-        series_remove, shift_col, shift_row,
+        RefText, char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box,
+        formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_color,
+        ref_index_at, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        series_move, series_remove, shift_col, shift_row,
     };
 
     // A uniform-width sheet: every column is `w` px.
@@ -16356,24 +16399,74 @@ mod grid_geom_tests {
 
     #[test]
     fn parse_ref_text_accepts_what_a_range_field_is_typed() {
+        let bare = |r| {
+            Some(RefText {
+                sheet: None,
+                range: r,
+            })
+        };
+        let on = |n: &str, r| {
+            Some(RefText {
+                sheet: Some(n.into()),
+                range: r,
+            })
+        };
         // The plain forms, in any case, with or without surrounding space.
-        assert_eq!(parse_ref_text("A1:D5"), Some((0, 0, 4, 3)));
-        assert_eq!(parse_ref_text("  a1:d5 "), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("A1:D5"), bare((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("  a1:d5 "), bare((0, 0, 4, 3)));
         // A single cell is a one-cell range.
-        assert_eq!(parse_ref_text("C3"), Some((2, 2, 2, 2)));
-        // $ anchors are accepted and ignored; a Sheet! prefix is dropped, since
-        // pointing can't reach another sheet.
-        assert_eq!(parse_ref_text("$A$1:$D$5"), Some((0, 0, 4, 3)));
-        assert_eq!(parse_ref_text("Budget!A1:D5"), Some((0, 0, 4, 3)));
-        assert_eq!(parse_ref_text("'My Sheet'!A1:D5"), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("C3"), bare((2, 2, 2, 2)));
+        // $ anchors and a leading = are accepted and ignored.
+        assert_eq!(parse_ref_text("$A$1:$D$5"), bare((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("=$A$1:$D$5"), bare((0, 0, 4, 3)));
+        // A Sheet! qualifier is KEPT — the sheet it names is what gets read.
+        assert_eq!(parse_ref_text("Budget!A1:D5"), on("Budget", (0, 0, 4, 3)));
+        assert_eq!(
+            parse_ref_text("=Budget!$A$1:$D$5"),
+            on("Budget", (0, 0, 4, 3))
+        );
+        // A quoted name loses its quotes; a doubled '' is one apostrophe.
+        assert_eq!(
+            parse_ref_text("'My Sheet'!A1:D5"),
+            on("My Sheet", (0, 0, 4, 3))
+        );
+        assert_eq!(
+            parse_ref_text("'Bob''s Data'!A1"),
+            on("Bob's Data", (0, 0, 0, 0))
+        );
         // Corners in the other order still name the same box.
-        assert_eq!(parse_ref_text("D5:A1"), Some((0, 0, 4, 3)));
+        assert_eq!(parse_ref_text("D5:A1"), bare((0, 0, 4, 3)));
+    }
+
+    #[test]
+    fn parse_ref_text_refuses_what_isnt_a_range() {
         // Nothing else is a range — notably the concatenation a field used to
         // produce when typing over an existing value appended instead.
         assert_eq!(parse_ref_text("A1:B5A1:D5"), None);
         assert_eq!(parse_ref_text(""), None);
         assert_eq!(parse_ref_text("total"), None);
         assert_eq!(parse_ref_text("A0"), None);
+        // A qualifier with no cells after it names nothing to read.
+        assert_eq!(parse_ref_text("Budget!"), None);
+        assert_eq!(parse_ref_text("=Budget!"), None);
+        assert_eq!(parse_ref_text("'My Sheet'!total"), None);
+    }
+
+    #[test]
+    fn unquote_sheet_name_undoes_the_writers_quoting() {
+        assert_eq!(super::unquote_sheet_name("Budget"), Some("Budget".into()));
+        assert_eq!(super::unquote_sheet_name(" Budget "), Some("Budget".into()));
+        assert_eq!(
+            super::unquote_sheet_name("'My Sheet'"),
+            Some("My Sheet".into())
+        );
+        assert_eq!(
+            super::unquote_sheet_name("'Bob''s Data'"),
+            Some("Bob's Data".into())
+        );
+        // An empty qualifier names no sheet: `!A1` means the sheet in front of you.
+        assert_eq!(super::unquote_sheet_name(""), None);
+        assert_eq!(super::unquote_sheet_name("''"), None);
     }
 
     #[test]
@@ -16919,7 +17012,10 @@ mod grid_geom_tests {
     fn range_a1_round_trips_through_parse_ref_text() {
         // What a field shows for a range is what it parses back to.
         for range in [(0, 0, 4, 3), (1, 1, 1, 1), (9, 25, 20, 27)] {
-            assert_eq!(parse_ref_text(&range_a1(range)), Some(range));
+            assert_eq!(
+                parse_ref_text(&range_a1(range)),
+                Some(RefText { sheet: None, range })
+            );
         }
         assert_eq!(range_a1((1, 1, 4, 1)), "B2:B5");
     }
@@ -17045,7 +17141,13 @@ mod grid_geom_tests {
         assert_eq!(seed((4, 1), (1, 3)), "B2:D5");
         // One cell seeds itself, and still parses back.
         assert_eq!(seed((0, 0), (0, 0)), "A1:A1");
-        assert_eq!(parse_ref_text(&seed((0, 0), (0, 0))), Some((0, 0, 0, 0)));
+        assert_eq!(
+            parse_ref_text(&seed((0, 0), (0, 0))),
+            Some(RefText {
+                sheet: None,
+                range: (0, 0, 0, 0)
+            })
+        );
     }
 
     #[test]
