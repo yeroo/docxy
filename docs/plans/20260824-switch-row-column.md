@@ -119,7 +119,12 @@ None outside the repo. Both workspaces build clean at the branch head;
 - **CRITICAL: update this plan file when scope changes during implementation**
 - Run tests after each change
 - Maintain backward compatibility: a column-oriented chart must behave exactly
-  as it does today, byte-for-byte in what it writes.
+  as it does today, byte-for-byte in what it writes — with one carve-out, taken
+  knowingly: a BOOLEAN label now reads `TRUE`/`FALSE` rather than Rust's
+  `true`/`false`, because the column branch's private `text_of` was lifted into
+  the shared `cell_text` so one cell cannot read two ways. That is the spelling
+  Excel shows and the one the panel's fields already produced. Nothing else on
+  the column path moves.
 
 ### Build and test commands — read this before Task 1
 
@@ -269,7 +274,10 @@ pure logic, but constructing views or elements blows up the render macro, so
       re-derive from (an imported chart whose refs the model cannot hold), and
       say why in the panel rather than failing silently on click — the button is
       enabled on `chart_switched().is_some()`, the same call the click makes, and
-      the note under it names which of the two reasons it is
+      the note under it is that call's own error text, so it names the reason —
+      ⚠️ four of them by the end of the branch, not the two this box was
+      written against: the missing box, the cell cap, a sheet the workbook has
+      lost, and a range with no line of numbers the other way round
 - [x] write tests for the pure part: given a `ChartData` and its sheet, the
       flipped chart's series names, values and categories
 - [x] write a test that flipping twice returns the original chart
@@ -314,7 +322,9 @@ pure logic, but constructing views or elements blows up the render macro, so
       Overview table plus an all-numeric block, saved it with `save_xlsx`, and
       ran under a git worktree at `af22bcf` (the last commit before the plan)
       and at HEAD. Both files are byte-identical
-      (sha256 `dc56be5f…9366bf`, 25470 bytes), and the derived model
+      (sha256 `dc56be5f…9366bf`, 25470 bytes) — note the fixture holds no
+      boolean labels, which is the one carve-out above and the one way a column
+      chart's bytes CAN move — and the derived model
       (series names, `col`, values, every `values_ref`/`name_ref`,
       `categories`, `categories_ref`, `source`/`cat_col`) matches line for
       line. Loading that same file on both builds also parses identically. The
@@ -385,7 +395,9 @@ fallback is never needed.
 Every chart in every existing file is column-oriented, and Task 4's inference
 must default to that. Task 3's "column output unchanged" test and Task 5's
 column round-trip are the two guards on this; treat a failure in either as a
-blocker rather than an expectation to update.
+blocker rather than an expectation to update. The single deliberate exception is
+the boolean-label spelling noted under Constraints, pinned by
+`a_derived_label_reads_the_same_as_the_one_a_field_would_show`.
 
 ## Post-Completion
 

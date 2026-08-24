@@ -465,18 +465,31 @@ pub fn range_numbers(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<f64> {
         .collect()
 }
 
+/// One cell as a chart reads it: the text of a label, a series name or a
+/// category.
+///
+/// Every chart path goes through here so that one cell cannot read two ways.
+/// `format_with` is what makes a boolean Excel's `TRUE` rather than Rust's
+/// `true` and a number the General spelling of itself; the panel's fields reach
+/// the same answer through [`range_labels`], so naming a series by hand and
+/// deriving the same name from the range agree, and `Switch Row/Column` cannot
+/// silently respell one.
+fn cell_text(sheet: &Sheet, r: u32, c: u32) -> String {
+    match sheet.cell(r, c).map(|cl| &cl.value) {
+        Some(CellValue::Text(t)) => t.clone(),
+        Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => {
+            format_with(&Xf::default(), v, false)
+        }
+        _ => String::new(),
+    }
+}
+
 /// The text in a range, row-major — category labels, or a series name.
 pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
     let (r1, c1, r2, c2) = range;
     (r1..=r2)
         .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
-        .map(|(r, c)| match sheet.cell(r, c).map(|cl| &cl.value) {
-            Some(CellValue::Text(t)) => t.clone(),
-            Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => {
-                format_with(&Xf::default(), v, false)
-            }
-            _ => String::new(),
-        })
+        .map(|(r, c)| cell_text(sheet, r, c))
         .collect()
 }
 
@@ -505,9 +518,14 @@ pub fn chart_from_range(
     }
 }
 
-/// The column reading of a range: one series per numeric column. Kept exactly as
-/// it was before orientation existed, so a column chart still comes out
-/// byte-for-byte what it always did.
+/// The column reading of a range: one series per numeric column. Kept as it was
+/// before orientation existed, so a column chart still comes out byte-for-byte
+/// what it always did — with one carve-out. Its own `text_of` used to spell a
+/// boolean label Rust's way (`true`); lifting it into the shared [`cell_text`]
+/// gives it Excel's `TRUE`, the spelling every other chart path and the panel's
+/// own fields already used. Nothing else moved: numbers and errors render
+/// identically, and `text_of` never fed the numeric-vs-text classification
+/// below, which reads `sheet.cell` directly.
 fn chart_from_columns(
     sheet: &Sheet,
     sheet_name: &str,
@@ -518,17 +536,7 @@ fn chart_from_columns(
     if r1 <= r0 {
         return None; // header row only — nothing to plot
     }
-    let text_of = |r: u32, c: u32| -> String {
-        match sheet.cell(r, c).map(|cl| &cl.value) {
-            Some(CellValue::Text(t)) => t.clone(),
-            Some(CellValue::Number(n)) => {
-                format_with(&Xf::default(), &CellValue::Number(*n), false)
-            }
-            Some(CellValue::Bool(b)) => b.to_string(),
-            Some(CellValue::Error(e)) => e.clone(),
-            _ => String::new(),
-        }
-    };
+    let text_of = |r: u32, c: u32| cell_text(sheet, r, c);
     // A column is a series if it is mostly numbers; the first that isn't
     // supplies the category labels.
     let (mut cat_col, mut num_cols) = (None, Vec::new());
@@ -623,17 +631,7 @@ fn chart_from_rows(
     if c1 <= c0 {
         return None; // label column only — nothing to plot
     }
-    let text_of = |r: u32, c: u32| -> String {
-        match sheet.cell(r, c).map(|cl| &cl.value) {
-            Some(CellValue::Text(t)) => t.clone(),
-            Some(CellValue::Number(n)) => {
-                format_with(&Xf::default(), &CellValue::Number(*n), false)
-            }
-            Some(CellValue::Bool(b)) => b.to_string(),
-            Some(CellValue::Error(e)) => e.clone(),
-            _ => String::new(),
-        }
-    };
+    let text_of = |r: u32, c: u32| cell_text(sheet, r, c);
     // A row is a series if it is mostly numbers; the first that isn't supplies
     // the category labels.
     let (mut cat_row, mut num_rows) = (None, Vec::new());
@@ -1895,6 +1893,45 @@ mod tests {
         let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["Year", "Sales"]);
         assert_eq!(cd.categories, vec!["2024", "2025"]);
+    }
+
+    /// A cell must read the same however a chart path reaches it. Deriving a
+    /// name through `chart_from_range` and typing the same cell into the
+    /// panel's SERIES NAME field (which goes through `range_labels`) used to
+    /// disagree on a boolean — Rust's `true` against Excel's `TRUE` — so
+    /// `Switch Row/Column` respelled a name it had no business touching.
+    #[test]
+    fn a_derived_label_reads_the_same_as_the_one_a_field_would_show() {
+        let boolean = |b: bool| Cell {
+            value: CellValue::Bool(b),
+            ..Cell::default()
+        };
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Flag")),
+            ("B1", Cell::text("Qty")),
+            ("A2", boolean(true)),
+            ("B2", Cell::number(2.0)),
+            ("A3", boolean(false)),
+            ("B3", Cell::number(4.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // Column reading: the boolean cells are the category labels.
+        let by_col = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", false).expect("cols");
+        assert_eq!(by_col.categories, range_labels(&sh, (1, 0, 2, 0)));
+        assert_eq!(by_col.categories, vec!["TRUE", "FALSE"]);
+        // Row reading: the same cells name the series.
+        let by_row = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", true).expect("rows");
+        let names: Vec<String> = by_row.series.iter().map(|s| s.name.clone()).collect();
+        // Row 0 holds `Qty`, so it is the label row, not a series; the two
+        // boolean cells below it name the two series.
+        assert_eq!(names, range_labels(&sh, (1, 0, 2, 0)));
+        assert_eq!(names, vec!["TRUE", "FALSE"]);
     }
 
     #[test]

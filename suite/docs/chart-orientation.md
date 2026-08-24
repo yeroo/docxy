@@ -106,8 +106,15 @@ rediscover them:
   label column plus one numeric column wide comes to — every row series is one
   cell — and the column reading cannot produce it, since that emits one series
   *per column* and two series therefore never share a column. Reading them as
-  columns would fold N one-point series into one N-point series on the next
-  load. The mirror shape, single cells side by side **along** a row, is what a
+  columns costs the load nothing — `parse_chart` builds one series per
+  `<c:ser>` either way round — but it loses the orientation, so the chart comes
+  back column-oriented and committing DATA RANGE, which re-derives the box the
+  way the chart already reads it, folds the N one-point series into one
+  N-point series. The button is *not* that path: it inverts `by_row` instead of
+  keeping it, so on a wrongly-inferred chart the first press hands back the
+  reading the chart should have had, appearing to do nothing, and only a second
+  press folds.
+  The mirror shape, single cells side by side **along** a row, is what a
   column chart one data row deep comes to, so it stays column-oriented.
 - **A series with no readable ref** — `<c:numLit>` values, or a ref this model
   cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to measure, so
@@ -140,9 +147,18 @@ first ref gave it, which is the series-name column — exactly what
 its `source` box with the orientation flipped, through `chart_from_range`. It is
 enabled exactly when clicking it would do something: `chart_switched()` is the
 same call the click makes, so it can never look live and then do nothing. When
-it is greyed, the note under it says which of the two reasons it is — no
-`source` box to re-read (an imported chart whose refs the model can't hold), or
-a range with no line of numbers the other way round.
+it is greyed, the note under it is `chart_switched`'s own error text, so it
+always names the reason rather than a class of them. With a chart selected
+those are:
+
+- no `source` box to re-read (an imported chart whose refs the model can't
+  hold);
+- a box over the cell cap — this is the one chart range nothing has ever
+  bounded, because it came from the FILE rather than from a field, and a
+  `<c:f>` may legally name a whole column;
+- a box naming a sheet the workbook hasn't got (one the user has since
+  deleted or renamed);
+- a range with no line of numbers the other way round.
 
 Undo is `chart_set_data`'s existing snapshot. A flip always differs from what is
 there (the orientation, if nothing else), so that call's "committed nothing"
@@ -158,6 +174,18 @@ for "Qty". For the same reason hand edits to the plot do not survive a flip: the
 range is the source of truth again. Flipping twice therefore returns the chart
 the range describes, which **is** the original for a chart derived from its
 range and never hand-edited.
+
+A chart whose refs the model can only PARTLY hold is the one case where
+"re-derive from the box" quietly loses a series: `parse_chart` unions the refs it
+could read into `source` and marks the chart `complex` for the one it couldn't,
+so the box covers less than the chart plots. Flipping such a chart redraws it
+from that partial box, and the unreadable series is not in the picture any more.
+That is not the button's doing — committing DATA RANGE re-derives from the same
+partial box and drops it identically — and while `complex` stands the file is
+untouched, because `chart_is_writable` vetoes regenerating the part. Picking a
+type (`chart_set_kind`) is what clears `complex`, and that is the documented
+"author this one afresh" escape hatch: after it the incomplete plot is what gets
+written.
 
 **Re-pointing a series** (`SeriesValues(i)`) checks the shape the *chart* wants,
 not a constant: `series_values_shape_err` refuses `range.1 != range.3` on a

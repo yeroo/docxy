@@ -148,8 +148,10 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   and every mostly-numeric column becomes a series. That is the **column**
   reading (`by_row: false`); with `by_row: true` it is the transpose — the first
   column names each series, one row of labels supplies the categories, and every
-  mostly-numeric row becomes a series (see §4a below). `range_numbers` /
-  `range_labels` read the cells a field points at.
+  mostly-numeric row becomes a series (see *Chart orientation* at the end of
+  this section, and
+  [`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md)).
+  `range_numbers` / `range_labels` read the cells a field points at.
 - **Writing** (`xlsx::chart_space_xml`): an edited chart is written with live
   `numRef` / `strRef` refs *and* their caches, so Excel treats it as a real
   chart bound to the cells and updates it when they change. Each cache is sized
@@ -187,9 +189,9 @@ show and accept references the way Excel writes them — `=Budget!$A$1:$D$5`, wi
 the `$` anchors and the sheet qualifier — and a qualifier naming another sheet is
 resolved against the workbook, so a chart can plot a sheet it doesn't float over.
 
-Which way round a chart reads its range — each column a series (the default,
-and every chart written before the feature existed) or each row — is
-`ChartData::by_row`. Nothing in SpreadsheetML stores it, so the writer emits
+**Chart orientation.** Which way round a chart reads its range — each column a
+series (the default, and every chart written before the feature existed) or each
+row — is `ChartData::by_row`. Nothing in SpreadsheetML stores it, so the writer emits
 whatever rectangle each ref holds and the loader **infers** the flag back from
 their shape; the panel's `Switch Row/Column` button flips it by re-deriving the
 chart through `chart_from_range`. The inference's ambiguous cases and the

@@ -2244,9 +2244,11 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             .map(|v| v.to_ref())
             .or_else(|| {
                 // Both halves of the fallback ask a column question, and a row
-                // chart has no column answer. `cat_col` is a column index, so
-                // `f_ref` would hand Excel a column of NUMBERS as the category
-                // labels; and `claimed_col` ("has a series already taken this
+                // chart has no column answer. `cat_col` there is the column the
+                // SERIES NAMES come from (`ChartSource::cat_col`), so `f_ref`
+                // would hand Excel that column of names as the category labels
+                // — or, on an imported chart whose first parsed ref was a values
+                // ref, a column of plotted numbers; and `claimed_col` ("has a series already taken this
                 // column?") is meaningless when every series spans the whole
                 // width — it would answer yes for every column in the box, on
                 // a chart where that says nothing about the labels. So the

@@ -1776,6 +1776,29 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
     }
 }
 
+/// Why a picked range can't be the category labels, or `None` if it can.
+///
+/// `<c:cat>` holds ONE line of labels, and `range_labels` flattens whatever it
+/// is given row-major. A single line flattens the way Excel reads it whichever
+/// way it runs, so unlike [`series_values_shape_err`] this does not care which
+/// way round the chart is: only a genuine RECTANGLE is refused, because there
+/// the cache docxy writes beside the ref and the labels Excel derives from the
+/// ref itself are in different orders, and the two disagree the moment Excel
+/// refreshes.
+///
+/// The message still names the shape THIS chart wants, for
+/// `series_values_shape_err`'s reason: a column chart's labels run down a
+/// column, a row chart's along a row, and a hint pointing at the other one
+/// sends the user at a shape they did not ask about.
+fn categories_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<&'static str> {
+    let rect = range.0 != range.2 && range.1 != range.3;
+    rect.then_some(if by_row {
+        "category labels are one line — point at a row like B1:D1"
+    } else {
+        "category labels are one line — point at a column like A2:A5"
+    })
+}
+
 /// Where the Chart panel's three range fields point their `e.g.` at, for a
 /// chart read this way round.
 ///
@@ -3585,6 +3608,11 @@ impl Docxy {
                 return;
             }
         };
+        if let Some(m) = categories_shape_err(data.by_row, range) {
+            self.ref_msg = Some((RefTarget::Categories, false, m.into()));
+            cx.notify();
+            return;
+        }
         let Some(v) = self.active_sheet() else { return };
         // The resolved sheet: its labels, and its name on the ref written back.
         let Some((sh, src)) = ref_source(&v.pkg.workbook.sheets, si, range) else {
@@ -17379,6 +17407,32 @@ mod grid_geom_tests {
         // refuse next time round.
         assert!(err(true, (1, 1, 4, 1)).unwrap().contains("B2:D2"));
         assert!(err(false, (1, 1, 1, 3)).unwrap().contains("B2:B5"));
+    }
+
+    /// Categories are one line too, but for a DIFFERENT reason from the
+    /// values, so the guard is deliberately not the same shape: a line reads
+    /// row-major whichever way it runs, and only a rectangle makes the cache
+    /// docxy writes and the labels Excel derives from the ref disagree.
+    #[test]
+    fn the_category_labels_field_refuses_a_rectangle_in_either_orientation() {
+        use super::categories_shape_err as err;
+        // Either line goes through in either orientation — unlike the values
+        // guard, which refuses the line the chart doesn't read.
+        for by_row in [false, true] {
+            assert_eq!(err(by_row, (1, 0, 4, 0)), None, "a column of labels");
+            assert_eq!(err(by_row, (0, 1, 0, 3)), None, "a row of labels");
+            assert_eq!(err(by_row, (1, 0, 1, 0)), None, "one cell");
+        }
+        // A rectangle is refused both ways round, and the hint names the line
+        // THIS chart's labels run along.
+        assert_eq!(
+            err(false, (0, 1, 2, 3)),
+            Some("category labels are one line — point at a column like A2:A5")
+        );
+        assert_eq!(
+            err(true, (0, 1, 2, 3)),
+            Some("category labels are one line — point at a row like B1:D1")
+        );
     }
 
     /// The hints have to follow the orientation for the same reason the
