@@ -3211,6 +3211,13 @@ impl Docxy {
             data.series.len(),
             data.categories.len()
         ));
+        // A flip doesn't just reorder the series, it replaces them — three
+        // columns become two rows, and card 3 now means something else
+        // entirely. Both of these are keyed by bare series index, so an open
+        // field would commit its buffer onto whichever series inherited the
+        // number, the same hazard `series_delete` clears them for.
+        self.range_edit = None;
+        self.ref_msg = None;
         self.chart_set_data(data, cx);
     }
 
