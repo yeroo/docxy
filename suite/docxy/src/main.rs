@@ -1755,6 +1755,58 @@ fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
     }
 }
 
+/// Why a picked range can't be a series' values, or `None` if it can.
+///
+/// A series plots ONE line of cells. Excel splits a two-dimensional pick into a
+/// series per line and reads such a ref in that orientation's major order,
+/// while `range_numbers` flattens row-major — so accepting a rectangle here
+/// would write a `<c:f>` whose own cache is in the wrong order.
+///
+/// WHICH line is the chart's own reading of its range, not a constant: a
+/// column-oriented chart's series is a column (`B2:B5`), a row-oriented one's
+/// is a row (`B2:D2`). Checking for a column either way would refuse every
+/// range a row chart's series can legally hold, and the message has to name the
+/// shape THIS chart wants — sending the user to `B2:B5` on a row chart is worse
+/// than not checking, since the range it asks for would be refused again.
+fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<&'static str> {
+    if by_row {
+        (range.0 != range.2).then_some("a series plots one row — point at cells like B2:D2")
+    } else {
+        (range.1 != range.3).then_some("a series plots one column — point at cells like B2:B5")
+    }
+}
+
+/// Re-point series `i` at `src`, plotting `values`. Reports how many points it
+/// took, or `None` when there is no series `i`.
+///
+/// `col` is the column a series occupies, and only a column-oriented one
+/// occupies one: a row series spans every column of its ref. It feeds the
+/// writer's fallback ref (`src.f_ref(s.col?, s.col?, true)`) and `claimed_col`,
+/// both column-shaped questions, so a row series' left-hand column index there
+/// would make them quietly wrong rather than inapplicable — the same reason
+/// `chart_from_rows` leaves it `None`.
+///
+/// The chart's box is rebuilt because it is the union of what the chart reads,
+/// so the DATA RANGE the panel shows covers this series too — otherwise it only
+/// caught up after a save and reload, when `parse_chart` re-unions the refs.
+/// Rebuilt from every slot rather than grown, so it follows the references off
+/// a sheet instead of being stranded on one none of them read any more.
+fn series_set_values(
+    data: &mut gridcore::sheet::ChartData,
+    i: usize,
+    values: Vec<f64>,
+    src: gridcore::sheet::ChartSource,
+) -> Option<usize> {
+    let by_row = data.by_row;
+    let s = data.series.get_mut(i)?;
+    let n = values.len();
+    s.values = values;
+    s.col = (!by_row).then_some(src.range.1);
+    s.values_ref = Some(src);
+    rebuild_source(data);
+    Some(n)
+}
+
 /// Read a chart's range the other way round: what was a series becomes a
 /// category and back again, which is Excel's `Switch Row/Column`.
 ///
@@ -3253,7 +3305,13 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let example = self.ref_example((1, 1, 4, 1));
+        // The example is the shape THIS chart wants, so the "that isn't a range"
+        // message doesn't send a row chart's user off to point at a column.
+        let example = self.ref_example(if data.by_row {
+            (1, 1, 1, 3)
+        } else {
+            (1, 1, 4, 1)
+        });
         let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
@@ -3262,16 +3320,8 @@ impl Docxy {
                 return;
             }
         };
-        // A series plots ONE column. Excel splits a two-dimensional pick into a
-        // series per column and reads such a ref column-major, while
-        // `range_numbers` flattens row-major — so accepting one here would write
-        // a `<c:f>` whose own cache is in the wrong order.
-        if range.1 != range.3 {
-            self.ref_msg = Some((
-                RefTarget::SeriesValues(i),
-                false,
-                "a series plots one column — point at cells like B2:B5".into(),
-            ));
+        if let Some(m) = series_values_shape_err(data.by_row, range) {
+            self.ref_msg = Some((RefTarget::SeriesValues(i), false, m.into()));
             cx.notify();
             return;
         }
@@ -3283,19 +3333,9 @@ impl Docxy {
             return;
         };
         let values = gridcore::sheet::range_numbers(sh, range);
-        let Some(s) = data.series.get_mut(i) else {
+        let Some(n) = series_set_values(&mut data, i, values, src) else {
             return;
         };
-        let n = values.len();
-        s.values = values;
-        s.col = Some(range.1);
-        s.values_ref = Some(src);
-        // The chart's box is the union of what it reads, so the DATA RANGE the
-        // panel shows covers this series too — otherwise it only caught up after
-        // a save/reload, when `parse_chart` re-unions the refs. Rebuilt from
-        // every slot rather than grown, so it follows the references off a sheet
-        // instead of being stranded on one none of them read any more.
-        rebuild_source(&mut data);
         self.ref_msg = Some((RefTarget::SeriesValues(i), true, format!("{n} points")));
         self.chart_set_data(data, cx);
     }
@@ -17194,6 +17234,131 @@ mod grid_geom_tests {
                 .expect("row chart");
         flat.source = boxed((1, 0, 1, 3));
         assert!(super::chart_switch_row_column(&flat, &sh).is_none());
+    }
+
+    #[test]
+    fn the_shape_a_series_may_be_re_pointed_at_follows_the_charts_orientation() {
+        use super::series_values_shape_err as err;
+        // A column chart: one column is the only accepted shape. `B2:B5` and a
+        // single cell go through; anything wider is refused, and the message
+        // names the shape it wants.
+        assert_eq!(err(false, (1, 1, 4, 1)), None);
+        assert_eq!(err(false, (1, 1, 1, 1)), None);
+        assert_eq!(
+            err(false, (1, 1, 1, 3)),
+            Some("a series plots one column — point at cells like B2:B5")
+        );
+        assert!(err(false, (1, 1, 4, 3)).is_some());
+
+        // A row chart is the transpose: `B2:D2` goes through, and the column
+        // that a column chart wants is now the refused shape. The regression
+        // this task fixes — before it, EVERY row was refused, so a
+        // row-oriented series could not be re-pointed at all.
+        assert_eq!(err(true, (1, 1, 1, 3)), None);
+        assert_eq!(err(true, (1, 1, 1, 1)), None);
+        assert_eq!(
+            err(true, (1, 1, 4, 1)),
+            Some("a series plots one row — point at cells like B2:D2")
+        );
+        assert!(err(true, (1, 1, 4, 3)).is_some());
+
+        // The message must never send the user at the shape this chart would
+        // refuse next time round.
+        assert!(err(true, (1, 1, 4, 1)).unwrap().contains("B2:D2"));
+        assert!(err(false, (1, 1, 1, 3)).unwrap().contains("B2:B5"));
+    }
+
+    #[test]
+    fn re_pointing_a_row_series_moves_its_ref_and_grows_the_charts_box() {
+        use gridcore::sheet::ChartSource;
+        let sh = overview_sheet();
+        let mut row =
+            gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true)
+                .expect("row chart");
+        assert_eq!(row.source.as_ref().map(|s| s.range), Some((0, 0, 3, 3)));
+
+        // Re-point "Laptop" at the Keyboard row instead, the way the panel's
+        // VALUES field does once the guard has let the range through.
+        let range = (3, 1, 3, 3);
+        let src = ChartSource {
+            sheet: "Budget".into(),
+            range,
+            cat_col: range.1,
+        };
+        let values = gridcore::sheet::range_numbers(&sh, range);
+        let n = super::series_set_values(&mut row, 0, values, src).expect("series 0");
+        assert_eq!(n, 3);
+        assert_eq!(row.series[0].values, vec![6.0, 39.99, 239.94]);
+        assert_eq!(
+            row.series[0].values_ref.as_ref().map(|s| s.to_ref()),
+            Some("Budget!$B$4:$D$4".to_string())
+        );
+        // `col` names a column, and a row series occupies every column of its
+        // ref. Storing the left-hand one would arm the writer's fallback ref
+        // and `claimed_col` with an answer that reads the chart the wrong way
+        // round.
+        assert_eq!(row.series[0].col, None);
+        // `rebuild_source` unions rectangles, so it needs no orientation of its
+        // own — the box still covers everything the chart reads, header row and
+        // label column included.
+        assert_eq!(row.source.as_ref().map(|s| s.range), Some((0, 0, 3, 3)));
+        assert_eq!(
+            row.source.as_ref().map(|s| s.sheet.as_str()),
+            Some("Budget")
+        );
+
+        // Point it off the box, and the box grows to cover the new cells —
+        // otherwise DATA RANGE would go on naming a rectangle the chart no
+        // longer reads all of.
+        let range = (5, 1, 5, 4);
+        let src = ChartSource {
+            sheet: "Budget".into(),
+            range,
+            cat_col: range.1,
+        };
+        super::series_set_values(&mut row, 0, gridcore::sheet::range_numbers(&sh, range), src)
+            .expect("series 0");
+        assert_eq!(row.source.as_ref().map(|s| s.range), Some((0, 0, 5, 4)));
+        assert_eq!(row.series[0].col, None);
+    }
+
+    #[test]
+    fn re_pointing_a_column_series_still_records_the_column_it_took() {
+        use gridcore::sheet::ChartSource;
+        let sh = overview_sheet();
+        let mut col =
+            gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 2), "column", false)
+                .expect("column chart");
+        let range = (1, 3, 3, 3);
+        let src = ChartSource {
+            sheet: "Budget".into(),
+            range,
+            cat_col: range.1,
+        };
+        let n =
+            super::series_set_values(&mut col, 0, gridcore::sheet::range_numbers(&sh, range), src)
+                .expect("series 0");
+        assert_eq!(n, 3);
+        // Unchanged behaviour for a column chart: `col` is the column it plots,
+        // which the writer's fallback ref and `claimed_col` both read.
+        assert_eq!(col.series[0].col, Some(3));
+        assert_eq!(col.series[0].values, vec![2398.0, 998.0, 239.94]);
+        assert_eq!(col.source.as_ref().map(|s| s.range), Some((0, 0, 3, 3)));
+
+        // No series `i`: nothing to re-point, and nothing said about points.
+        assert_eq!(
+            super::series_set_values(
+                &mut col,
+                99,
+                vec![1.0],
+                ChartSource {
+                    sheet: "Budget".into(),
+                    range: (0, 0, 0, 0),
+                    cat_col: 0,
+                },
+            ),
+            None
+        );
     }
 
     #[test]

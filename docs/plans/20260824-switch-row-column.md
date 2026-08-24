@@ -277,19 +277,26 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 7: Re-pointing a series accepts a row when the chart is row-oriented
 
-- [ ] change `series_apply_values`' one-column guard in
+- [x] change `series_apply_values`' one-column guard in
       `suite/docxy/src/main.rs`: reject `range.1 != range.3` only when the chart
       is column-oriented, and reject `range.0 != range.2` when it is row-oriented
-- [ ] update the message to name the shape that target actually wants, so a
-      row-oriented chart does not tell the user to point at `B2:B5`
-- [ ] check `rebuild_source` still produces the right box for row series — it
+      — lifted into the pure free function `series_values_shape_err`
+- [x] update the message to name the shape that target actually wants, so a
+      row-oriented chart does not tell the user to point at `B2:B5` — a row
+      chart says "a series plots one row — point at cells like B2:D2", and the
+      `ref_example` seeding the "that isn't a range" message flips too
+- [x] check `rebuild_source` still produces the right box for row series — it
       unions rectangles, so it should need no change, but pin that with a test
-      rather than assuming
-- [ ] write tests for the guard in both orientations: the accepted shape and
+      rather than assuming — confirmed unchanged, pinned in
+      `re_pointing_a_row_series_moves_its_ref_and_grows_the_charts_box`
+- [x] write tests for the guard in both orientations: the accepted shape and
       the refused one, with the message asserted
-- [ ] write a test that re-pointing a row series updates its `values_ref` and
-      the chart's box
-- [ ] run tests — must pass before Task 8
+- [x] write a test that re-pointing a row series updates its `values_ref` and
+      the chart's box — ➕ the mutation moved into a pure `series_set_values`
+      so it could be tested at all; it also leaves `col: None` for a row
+      series, which the old inline code did not (it stored `range.1`, arming
+      the writer's fallback ref and `claimed_col` with a column-shaped answer)
+- [x] run tests — must pass before Task 8
 
 ### Task 8: Verify acceptance criteria
 
