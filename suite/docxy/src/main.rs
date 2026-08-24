@@ -1834,12 +1834,13 @@ fn ref_index_at(refs: &[(u32, u32, u32, u32)], r: u32, c: u32) -> Option<usize> 
 
 /// A range as BARE A1 text — `B2:B5`, no `=`, no anchors, no sheet.
 ///
-/// This is the form for the places that are already about the sheet in front of
-/// you and have no room to say so twice: the name box, and the readout while a
-/// drag is in progress. Every range FIELD shows `ref_a1` instead — the
-/// qualified, anchored form Excel writes — so a reference can be copied between
-/// the two apps. When in doubt it's `ref_a1`: this one names no sheet, so a
-/// field holding it would lose a qualifier the moment it was re-shown.
+/// This is the form for a reference written into a CELL, where naming the sheet
+/// in front of you is noise Excel doesn't write either: the formula-bar pick
+/// (`range_text`) and the readout while that drag is in progress. Every range
+/// FIELD shows `ref_a1` instead — the qualified, anchored form Excel's own
+/// dialogs show — so a reference can be copied between the two apps. When in
+/// doubt it's `ref_a1`: this one names no sheet, so a field holding it would
+/// lose a qualifier the moment it was re-shown.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
@@ -1853,8 +1854,6 @@ fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
 /// Data'`) is spelled here exactly as it is spelled in the saved `<c:f>`. The
 /// only difference between the two is the leading `=`, which the field shows
 /// and the XML doesn't. `parse_ref_text` reads back everything this writes.
-// Wired into every range field in Task 3; until then only the tests call it.
-#[allow(dead_code)]
 fn ref_a1(sheet: Option<&str>, range: (u32, u32, u32, u32)) -> String {
     let src = gridcore::sheet::ChartSource {
         sheet: sheet.unwrap_or_default().to_string(),
@@ -1862,6 +1861,31 @@ fn ref_a1(sheet: Option<&str>, range: (u32, u32, u32, u32)) -> String {
         cat_col: range.1,
     };
     format!("={}", src.to_ref())
+}
+
+/// A source the model holds, as the field showing it reads it. An empty sheet
+/// name is a source naming none — `ref_a1`'s `None` — which is what a chart
+/// authored before its refs carried a sheet still has.
+fn source_ref_text(src: &gridcore::sheet::ChartSource) -> String {
+    ref_a1(
+        Some(src.sheet.as_str()).filter(|n| !n.is_empty()),
+        src.range,
+    )
+}
+
+/// What a series' NAME field shows: the reference the name came from, in the
+/// same qualified form every other range field uses, or the literal name when
+/// it came from no reference. Excel's Series name box reads the same way — it
+/// holds `=Budget!$B$1` and shows the resolved `Q1` beside it, not in it.
+///
+/// `series_apply_name` measures "did you change it?" against THIS, not against
+/// the bare name: that question is only meaningful against the text the field
+/// actually displayed.
+fn series_name_shown(name: &str, name_ref: Option<&str>) -> String {
+    match name_ref.and_then(gridcore::sheet::ChartSource::parse_f_ref) {
+        Some(src) => source_ref_text(&src),
+        None => name.to_string(),
+    }
 }
 
 /// The rectangle a selection covers, whichever corner it was dragged from.
@@ -1873,23 +1897,33 @@ fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
 /// What a bar's range field makes of what was typed: the cells in normal A1
 /// form, or the complaint to show under the field.
 ///
-/// A `Sheet!` prefix is only accepted when it names `sheet`. A chart can afford
-/// to drop one (it plots the sheet it floats over), but a rule, a split or a
-/// sort acts on the ACTIVE sheet: dropping `Sheet2!` there would silently apply
-/// it to this sheet's cells of the same name, and the message would agree.
+/// A `Sheet!` prefix is only accepted when it names `sheet`. A chart resolves
+/// one (it can plot a sheet it doesn't float over), but a rule, a split or a
+/// sort acts on the ACTIVE sheet: taking `Sheet2!` there would apply it to this
+/// sheet's cells of the same name, and the message would agree.
 fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
     let t = text.trim();
+    // The field SEEDS itself with `=Sheet1!$A$1:$D$5`, so the `=` comes off
+    // before the qualifier is read — otherwise the bar refuses its own untouched
+    // text, complaining about a sheet called `=Sheet1`.
+    let t = t.strip_prefix('=').unwrap_or(t).trim();
     if let Some((prefix, _)) = t.rsplit_once('!') {
-        let named = prefix.trim().trim_matches('\'').replace("''", "'");
-        if !named.eq_ignore_ascii_case(sheet) {
-            return Err(format!(
-                "\"{named}\" is another sheet; this acts on {sheet}"
-            ));
+        if let Some(named) = unquote_sheet_name(prefix) {
+            if !named.eq_ignore_ascii_case(sheet) {
+                return Err(format!(
+                    "\"{named}\" is another sheet; this acts on {sheet}"
+                ));
+            }
         }
     }
     match parse_ref_text(t) {
-        Some(r) => Ok(range_a1(r.range)),
-        None => Err(format!("\"{t}\" isn't a range like A1:D5")),
+        // Back in the field's own form, qualified with the sheet just checked:
+        // what the bar echoes is what the bar would accept again.
+        Some(r) => Ok(ref_a1(Some(sheet), r.range)),
+        None => Err(format!(
+            "\"{t}\" isn't a range like {}",
+            ref_a1(Some(sheet), (0, 0, 4, 3))
+        )),
     }
 }
 
@@ -1910,6 +1944,17 @@ fn sort_rows_from(
 /// functions the selection does rather than repeating them.
 fn range_text(anchor: (u32, u32), to: (u32, u32)) -> String {
     range_a1(sel_range(to, anchor))
+}
+
+/// The text a drag writes into a range FIELD: the same rectangle `range_text`
+/// reports, qualified with the sheet it was picked from — the form the field
+/// keeps once the drag ends. The two have to agree, or the reference would
+/// appear to change the instant the mouse came up.
+///
+/// `range_text` stays bare because the OTHER thing a drag writes into is a
+/// cell's formula, where naming this very sheet is noise Excel doesn't write.
+fn ref_pick_text(sheet: &str, anchor: (u32, u32), to: (u32, u32)) -> String {
+    ref_a1(Some(sheet), sel_range(to, anchor))
 }
 
 /// One run of a Chart-panel field's text (`base_off` is its char offset in the
@@ -2651,20 +2696,19 @@ impl Docxy {
 
     /// Re-point the selected chart at another range, replotting its categories
     /// and series from those cells while keeping its type, title and colours.
-    /// A `Sheet!A1:D5` form is accepted too — the sheet part is ignored, since a
-    /// chart plots the sheet it floats over.
+    /// A `Sheet!A1:D5` form is accepted; Task 5 resolves the sheet it names,
+    /// until when the cells are read from the sheet in front of you.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
-        // The field shows the box with its sheet name STRIPPED, so a chart
-        // floating over one sheet but plotting another shows cells that mean
-        // something else here. Committing the seed text as-is would re-point it
-        // at the active sheet's numbers, exactly as the per-series slots refuse
-        // to.
+        // The field shows the box qualified, but the read below is still the
+        // ACTIVE sheet's, so a chart floating over one sheet and plotting
+        // another would be re-pointed here by committing its own seed text.
+        // Task 5 resolves the qualifier and this guard goes.
         if self.ref_block_elsewhere(RefTarget::ChartRange, old.source.as_ref(), cx) {
             return;
         }
         let cells = text.trim();
-        let range = match chart_range_of(text, "A1:D5") {
+        let range = match chart_range_of(text, "=Sheet1!$A$1:$D$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::ChartRange, false, m));
@@ -2773,7 +2817,10 @@ impl Docxy {
         };
         match bar_range_text(text, &sheet) {
             Ok(a1) => {
-                self.ref_msg = Some((target, true, format!("Applies to {a1}")));
+                // The message reads as a sentence, so it drops the field's `=`
+                // and keeps the qualifier: "Applies to Sheet1!$B$2:$D$5".
+                let said = a1.trim_start_matches('=').to_string();
+                self.ref_msg = Some((target, true, format!("Applies to {said}")));
                 self.bar_range = Some(a1);
             }
             Err(m) => self.ref_msg = Some((target, false, m)),
@@ -2877,10 +2924,10 @@ impl Docxy {
     }
 
     /// The sheet a chart reference reads, when that is NOT the sheet on screen.
-    /// A chart floats over one sheet and may plot another; pointing and the
-    /// fields both speak the active sheet, and the fields show a range with its
-    /// sheet stripped — so committing one of those slots from the wrong sheet
-    /// would silently move it here, onto unrelated numbers.
+    /// A chart floats over one sheet and may plot another; the fields now SHOW
+    /// which, but the commit paths still read the active sheet, so committing
+    /// one of those slots from the wrong sheet would move it here, onto
+    /// unrelated numbers. Task 5 resolves the qualifier and this guard goes.
     fn ref_elsewhere(&self, src: Option<&gridcore::sheet::ChartSource>) -> Option<String> {
         let here = self.active_sheet()?.sheet().name.clone();
         let src = src?;
@@ -2921,7 +2968,7 @@ impl Docxy {
         ) {
             return;
         }
-        let range = match chart_range_of(text, "B2:B5") {
+        let range = match chart_range_of(text, "=Sheet1!$B$2:$B$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::SeriesValues(i), false, m));
@@ -2974,7 +3021,7 @@ impl Docxy {
         let shown = data
             .series
             .get(i)
-            .map(|s| s.name.clone())
+            .map(|s| series_name_shown(&s.name, s.name_ref.as_deref()))
             .unwrap_or_default();
         let held = data
             .series
@@ -3097,7 +3144,7 @@ impl Docxy {
         if self.ref_block_elsewhere(RefTarget::Categories, data.categories_ref.as_ref(), cx) {
             return;
         }
-        let range = match chart_range_of(text, "A2:A5") {
+        let range = match chart_range_of(text, "=Sheet1!$A$2:$A$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::Categories, false, m));
@@ -3271,7 +3318,11 @@ impl Docxy {
                 (row, col)
             }
         };
-        let text = range_text(anchor, (row, col));
+        let sheet = self
+            .active_sheet()
+            .map(|v| v.sheet().name.clone())
+            .unwrap_or_default();
+        let text = ref_pick_text(&sheet, anchor, (row, col));
         if let Some(f) = &mut self.range_edit {
             f.caret = text.chars().count();
             f.anchor = f.caret;
@@ -5876,7 +5927,7 @@ impl Docxy {
             let vals = sr
                 .values_ref
                 .as_ref()
-                .map(|v| range_a1(v.range))
+                .map(source_ref_text)
                 .unwrap_or_default();
             let mut swatches = h_flex().gap(px(3.));
             for swatch in CHART_COLORS {
@@ -5969,8 +6020,8 @@ impl Docxy {
                     .child(self.ref_field(
                         format!("series-name-{si}"),
                         RefTarget::SeriesName(si),
-                        sr.name.clone(),
-                        "e.g. B1 or a name",
+                        series_name_shown(&sr.name, sr.name_ref.as_deref()),
+                        "e.g. =Sheet1!$B$1 or a name",
                         "",
                         cx,
                     ))
@@ -5985,7 +6036,7 @@ impl Docxy {
                         format!("series-vals-{si}"),
                         RefTarget::SeriesValues(si),
                         vals,
-                        "e.g. B2:B5",
+                        "e.g. =Sheet1!$B$2:$B$5",
                         "",
                         cx,
                     ))
@@ -5996,14 +6047,7 @@ impl Docxy {
         let range_shown = data
             .source
             .as_ref()
-            .map(|s| {
-                let (r1, c1, r2, c2) = s.range;
-                format!(
-                    "{}:{}",
-                    gridcore::sheet::cell_name(r1, c1),
-                    gridcore::sheet::cell_name(r2, c2)
-                )
-            })
+            .map(source_ref_text)
             .unwrap_or_default();
         v_flex()
             .id("chart-panel")
@@ -6090,7 +6134,7 @@ impl Docxy {
                         "chart-range",
                         RefTarget::ChartRange,
                         range_shown,
-                        "e.g. A1:D5",
+                        "e.g. =Sheet1!$A$1:$D$5",
                         "Include the header row: it names the series. Enter to replot.",
                         cx,
                     ))
@@ -6160,9 +6204,9 @@ impl Docxy {
                             RefTarget::Categories,
                             data.categories_ref
                                 .as_ref()
-                                .map(|v| range_a1(v.range))
+                                .map(source_ref_text)
                                 .unwrap_or_default(),
-                            "e.g. A2:A5",
+                            "e.g. =Sheet1!$A$2:$A$5",
                             "The cells labelling each point along the axis.",
                             cx,
                         ),
@@ -11931,7 +11975,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("Highlight"),
             )
-            .child(div().w(px(110.)).child(self.bar_range_field(
+            .child(div().w(px(160.)).child(self.bar_range_field(
                 "cf-range",
                 RefTarget::CondFormat,
                 cx,
@@ -12022,12 +12066,16 @@ impl Docxy {
     ) -> AnyElement {
         // Unpinned, it shows the selection live, so what the field says and what
         // Apply will do can't drift apart.
+        let sheet = self
+            .active_sheet()
+            .map(|v| v.sheet().name.clone())
+            .unwrap_or_default();
         let value = self
             .bar_range
             .clone()
-            .or_else(|| self.bar_seed().map(range_a1))
+            .or_else(|| self.bar_seed().map(|r| ref_a1(Some(&sheet), r)))
             .unwrap_or_default();
-        self.ref_field(id, target, value, "A1:D5", "", cx)
+        self.ref_field(id, target, value, "=Sheet1!$A$1:$D$5", "", cx)
     }
 
     /// The Text-to-Columns delimiter bar.
@@ -12044,7 +12092,7 @@ impl Docxy {
             .border_b_1()
             .border_color(pal.border)
             .child(div().text_size(px(12.)).text_color(pal.dim).child("Split"))
-            .child(div().w(px(110.)).child(self.bar_range_field(
+            .child(div().w(px(160.)).child(self.bar_range_field(
                 "ttc-range",
                 RefTarget::TextToColumns,
                 cx,
@@ -12314,7 +12362,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("Dropdown list for"),
             )
-            .child(div().w(px(110.)).child(self.bar_range_field(
+            .child(div().w(px(160.)).child(self.bar_range_field(
                 "dv-range",
                 RefTarget::Validation,
                 cx,
@@ -16248,8 +16296,9 @@ mod grid_geom_tests {
     use super::{
         RefText, char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box,
         formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_a1,
-        ref_color, ref_index_at, ref_token_at, replace_ref, resize_axis, row_height_px,
-        scroll_col0_for_sel, series_move, series_remove, shift_col, shift_row,
+        ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
+        row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
+        shift_col, shift_row, source_ref_text,
     };
 
     // A uniform-width sheet: every column is `w` px.
@@ -17164,6 +17213,89 @@ mod grid_geom_tests {
         assert_eq!(range_text((2, 2), (2, 2)), "C3:C3");
     }
 
+    /// A field's text and the drag that fills it have to name the same cells on
+    /// the same sheet, or the reference would seem to change when the mouse came
+    /// up and the field was re-rendered from the model.
+    #[test]
+    fn a_drag_into_a_field_writes_the_form_the_field_keeps() {
+        // The same rectangles `range_text` reports, qualified.
+        assert_eq!(ref_pick_text("Sheet1", (1, 1), (4, 1)), "=Sheet1!$B$2:$B$5");
+        assert_eq!(ref_pick_text("Sheet1", (4, 1), (1, 1)), "=Sheet1!$B$2:$B$5");
+        assert_eq!(ref_pick_text("Sheet1", (0, 0), (4, 3)), "=Sheet1!$A$1:$D$5");
+        // Mixed directions still order both axes; one cell picks itself.
+        assert_eq!(ref_pick_text("Sheet1", (4, 0), (0, 3)), "=Sheet1!$A$1:$D$5");
+        assert_eq!(ref_pick_text("Sheet1", (2, 2), (2, 2)), "=Sheet1!$C$3:$C$3");
+        // And it parses back to exactly the sheet and cells picked.
+        for (anchor, to) in [((1, 1), (4, 1)), ((4, 0), (0, 3)), ((2, 2), (2, 2))] {
+            let text = ref_pick_text("My Sheet", anchor, to);
+            assert_eq!(
+                parse_ref_text(&text),
+                Some(RefText {
+                    sheet: Some("My Sheet".to_string()),
+                    range: super::sel_range(to, anchor),
+                }),
+                "{text:?}"
+            );
+        }
+        // A drag into a CELL keeps the bare form — see `range_a1`.
+        assert_eq!(range_text((1, 1), (4, 1)), "B2:B5");
+    }
+
+    #[test]
+    fn a_field_shows_the_sheet_its_source_names() {
+        let src = |sheet: &str| gridcore::sheet::ChartSource {
+            sheet: sheet.to_string(),
+            range: (1, 1, 4, 1),
+            cat_col: 1,
+        };
+        // The chart's own sheet, another sheet, and one needing quotes.
+        assert_eq!(source_ref_text(&src("Sheet1")), "=Sheet1!$B$2:$B$5");
+        assert_eq!(source_ref_text(&src("Budget")), "=Budget!$B$2:$B$5");
+        assert_eq!(source_ref_text(&src("My Sheet")), "='My Sheet'!$B$2:$B$5");
+        // A source naming no sheet shows no qualifier rather than a bare `!`,
+        // which is not a reference either app would read.
+        assert_eq!(source_ref_text(&src("")), "=$B$2:$B$5");
+        // Whatever it shows, the field can read back.
+        for name in ["Sheet1", "Budget", "My Sheet", "Bob's Data"] {
+            assert_eq!(
+                parse_ref_text(&source_ref_text(&src(name))),
+                Some(RefText {
+                    sheet: Some(name.to_string()),
+                    range: (1, 1, 4, 1)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_series_name_field_shows_its_reference_or_the_literal_name() {
+        // Named from a header cell: the field holds the reference, the way
+        // Excel's Series name box does.
+        assert_eq!(
+            series_name_shown("Q1", Some("Budget!$B$1")),
+            "=Budget!$B$1:$B$1"
+        );
+        assert_eq!(
+            series_name_shown("Q1", Some("'My Sheet'!$B$1")),
+            "='My Sheet'!$B$1:$B$1"
+        );
+        // Typed in by hand: there is no reference to show, so the name stands.
+        assert_eq!(series_name_shown("Q1", None), "Q1");
+        assert_eq!(series_name_shown("Total sales", None), "Total sales");
+        // A ref the writer can't parse is not silently blanked — the name it
+        // resolved to is still what the series is called.
+        assert_eq!(series_name_shown("Q1", Some("total")), "Q1");
+        // Which is exactly what `series_apply_name` compares against, so a name
+        // shown as a reference and committed untouched changes nothing.
+        for (name, r) in [("Q1", Some("Budget!$B$1")), ("Q1", None)] {
+            let shown = series_name_shown(name, r);
+            assert!(matches!(
+                super::series_name_commit(&shown, &shown),
+                super::NameCommit::Unchanged
+            ));
+        }
+    }
+
     #[test]
     fn bar_target_routes_each_action_to_its_field() {
         use super::{RefTarget, SheetAct, bar_target};
@@ -17215,41 +17347,82 @@ mod grid_geom_tests {
 
     #[test]
     fn a_bar_seeds_its_field_from_the_selection() {
-        use super::{range_a1, sel_range};
-        let seed = |sel, anchor| range_a1(sel_range(sel, anchor));
+        use super::{ref_a1, sel_range};
+        // What `bar_range_field` builds: the selection, qualified with the sheet
+        // it was made on, so the field reads like the one in Excel.
+        let seed = |sel, anchor| ref_a1(Some("Sheet1"), sel_range(sel, anchor));
         // A block selection, dragged from either corner.
-        assert_eq!(seed((1, 1), (4, 3)), "B2:D5");
-        assert_eq!(seed((4, 3), (1, 1)), "B2:D5");
-        assert_eq!(seed((4, 1), (1, 3)), "B2:D5");
+        assert_eq!(seed((1, 1), (4, 3)), "=Sheet1!$B$2:$D$5");
+        assert_eq!(seed((4, 3), (1, 1)), "=Sheet1!$B$2:$D$5");
+        assert_eq!(seed((4, 1), (1, 3)), "=Sheet1!$B$2:$D$5");
         // One cell seeds itself, and still parses back.
-        assert_eq!(seed((0, 0), (0, 0)), "A1:A1");
+        assert_eq!(seed((0, 0), (0, 0)), "=Sheet1!$A$1:$A$1");
         assert_eq!(
             parse_ref_text(&seed((0, 0), (0, 0))),
             Some(RefText {
-                sheet: None,
+                sheet: Some("Sheet1".to_string()),
                 range: (0, 0, 0, 0)
             })
+        );
+        // And the bar accepts its own seed rather than reading the `=` as a
+        // sheet name — the regression the qualifier introduces.
+        assert_eq!(
+            super::bar_range_text(&seed((1, 1), (4, 3)), "Sheet1"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        // A name needing quotes survives the round trip too.
+        let quoted = ref_a1(Some("Bob's Data"), (1, 1, 4, 3));
+        assert_eq!(quoted, "='Bob''s Data'!$B$2:$D$5");
+        assert_eq!(
+            super::bar_range_text(&quoted, "Bob's Data"),
+            Ok(quoted.clone())
         );
     }
 
     #[test]
     fn bar_range_text_normalises_or_explains_itself() {
         let bar_range_text = |t: &str| super::bar_range_text(t, "Sheet1");
-        // What is typed comes back in the form the bar will act on.
-        assert_eq!(bar_range_text("b2:d5"), Ok("B2:D5".to_string()));
-        assert_eq!(bar_range_text("  B2:D5 "), Ok("B2:D5".to_string()));
+        // What is typed comes back in the form the field will hold: the way
+        // Excel writes it, qualified with the sheet the bar acts on.
+        assert_eq!(bar_range_text("b2:d5"), Ok("=Sheet1!$B$2:$D$5".to_string()));
+        assert_eq!(
+            bar_range_text("  B2:D5 "),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
         // Anchors are accepted and ignored; a backwards range is ordered.
-        assert_eq!(bar_range_text("$D$5:$B$2"), Ok("B2:D5".to_string()));
-        // This sheet's own name is dropped, however it is spelled.
-        assert_eq!(bar_range_text("Sheet1!B2:D5"), Ok("B2:D5".to_string()));
-        assert_eq!(bar_range_text("sheet1!B2:D5"), Ok("B2:D5".to_string()));
-        assert_eq!(bar_range_text("'Sheet1'!B2:D5"), Ok("B2:D5".to_string()));
+        assert_eq!(
+            bar_range_text("$D$5:$B$2"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        // This sheet's own name is kept, however it is spelled.
+        assert_eq!(
+            bar_range_text("Sheet1!B2:D5"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        assert_eq!(
+            bar_range_text("sheet1!B2:D5"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        assert_eq!(
+            bar_range_text("'Sheet1'!B2:D5"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        // The field's own `=` is not a sheet name.
+        assert_eq!(
+            bar_range_text("=Sheet1!$B$2:$D$5"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
+        assert_eq!(
+            bar_range_text("=B2:D5"),
+            Ok("=Sheet1!$B$2:$D$5".to_string())
+        );
         // A single cell is a range of one.
-        assert_eq!(bar_range_text("C3"), Ok("C3:C3".to_string()));
-        // Anything else is reported under the field, quoting what was typed.
+        assert_eq!(bar_range_text("C3"), Ok("=Sheet1!$C$3:$C$3".to_string()));
+        // Anything else is reported under the field, quoting what was typed and
+        // showing the shape the field wants.
         assert_eq!(
             bar_range_text(" hello "),
-            Err("\"hello\" isn't a range like A1:D5".to_string())
+            Err("\"hello\" isn't a range like =Sheet1!$A$1:$D$5".to_string())
         );
         assert!(bar_range_text("").is_err());
         assert!(bar_range_text("A1:").is_err());
@@ -17258,7 +17431,7 @@ mod grid_geom_tests {
     #[test]
     fn a_bar_refuses_another_sheets_cells() {
         // A rule, a split or a sort acts on the sheet in view. Dropping the
-        // prefix (which is right for a chart) would apply it to THIS sheet's
+        // prefix (which a chart resolves instead) would apply it to THIS sheet's
         // B2:D5 and say "Applies to B2:D5" — right-looking, wrong cells.
         assert_eq!(
             super::bar_range_text("Sheet2!B2:D5", "Sheet1"),
@@ -17268,7 +17441,7 @@ mod grid_geom_tests {
         assert!(super::bar_range_text("'Bob''s data'!A1:A9", "Sheet1").is_err());
         assert_eq!(
             super::bar_range_text("'Bob''s data'!A1:A9", "Bob's data"),
-            Ok("A1:A9".to_string())
+            Ok("='Bob''s data'!$A$1:$A$9".to_string())
         );
     }
 

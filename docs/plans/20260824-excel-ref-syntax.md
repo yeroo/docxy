@@ -200,25 +200,36 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 3: Every range field shows the Excel form
 
-- [ ] chart panel DATA RANGE: replace the hand-built `format!("{}:{}", …)` in
+- [x] chart panel DATA RANGE: replace the hand-built `format!("{}:{}", …)` in
       `range_shown` (main.rs, in the chart-panel renderer) with `ref_a1` over
-      `source.sheet` and `source.range`
-- [ ] series VALUES and NAME fields: render through `ref_a1` with the series'
-      `values_ref` / `name_ref` sheet
-- [ ] CATEGORY LABELS field: same, from `categories_ref`
-- [ ] the four entry bars (`CondFormat`, `Validation`, `Sort`, `TextToColumns`):
+      `source.sheet` and `source.range` — via the new `source_ref_text`, which
+      maps an empty sheet name to `ref_a1`'s `None`
+- [x] series VALUES and NAME fields: render through `ref_a1` with the series'
+      `values_ref` / `name_ref` sheet — NAME goes through the new
+      `series_name_shown`, and `series_apply_name` now measures "unchanged"
+      against that same text (the field shows the ref, the literal name only
+      when there is no ref)
+- [x] CATEGORY LABELS field: same, from `categories_ref`
+- [x] the four entry bars (`CondFormat`, `Validation`, `Sort`, `TextToColumns`):
       seed and re-render their field through `ref_a1` with the active sheet's
-      name
-- [ ] update `range_text` (main.rs:1847) so the text written while dragging
+      name; `bar_range_text` strips the seed's leading `=` before reading the
+      qualifier and answers in the same qualified form, and the three 110px
+      field boxes grew to 160px to fit a sheet name
+- [x] update `range_text` (main.rs:1847) so the text written while dragging
       carries the active sheet's qualifier, matching what the field will hold
-      when the drag ends
-- [ ] update the field placeholders (`"e.g. A1:D5"`, `"e.g. B2:B5"`,
+      when the drag ends — ⚠️ deviation: `range_text` is SHARED with
+      `formula_pick_to`, where a pick writes into a cell's formula and must stay
+      bare. So `range_text` is unchanged and a sibling `ref_pick_text(sheet,
+      anchor, to)` was added for the field path; `range_a1`'s doc records which
+      is which
+- [x] update the field placeholders (`"e.g. A1:D5"`, `"e.g. B2:B5"`,
       `"e.g. A2:A5"`) to the qualified form, so the hint matches what the field
-      produces
-- [ ] write tests for the seeding and drag helpers — a drag from an anchor
+      produces — and the matching `chart_range_of` examples, so the "isn't a
+      range" message quotes the same shape
+- [x] write tests for the seeding and drag helpers — a drag from an anchor
       renders `=Sheet1!$B$2:$B$5`, and that text parses back to the same sheet
       and range
-- [ ] run tests — must pass before Task 4
+- [x] run tests — must pass before Task 4
 
 ### Task 4: Resolve a named sheet to a sheet index
 
