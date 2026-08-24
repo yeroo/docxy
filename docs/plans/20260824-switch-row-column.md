@@ -174,16 +174,16 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 1: Give a chart an orientation
 
-- [ ] add `by_row: bool` to `ChartData` in `gridcore/src/sheet.rs` (`false` =
+- [x] add `by_row: bool` to `ChartData` in `gridcore/src/sheet.rs` (`false` =
       today's behaviour, series from columns), documenting that it is derived
       from the refs rather than stored in the file
-- [ ] confirm `Default` still yields the current behaviour, so every existing
+- [x] confirm `Default` still yields the current behaviour, so every existing
       struct literal and `..Default::default()` site is unchanged in meaning
-- [ ] build BOTH workspaces — `ChartData` literals exist in `xlsxy`,
+- [x] build BOTH workspaces — `ChartData` literals exist in `xlsxy`,
       `gridwasm`, `lookxy` and the TUI `docxy` as well as the suite
-- [ ] write a test that a defaulted `ChartData` is column-oriented, so a later
+- [x] write a test that a defaulted `ChartData` is column-oriented, so a later
       change of default is caught rather than silently flipping every chart
-- [ ] run tests in both workspaces — must pass before Task 2
+- [x] run tests in both workspaces — must pass before Task 2
 
 ### Task 2: Build a chart from rows
 

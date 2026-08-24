@@ -311,6 +311,17 @@ pub struct ChartData {
     /// of a combo onto one axis pair as bars. Those parts round-trip verbatim
     /// instead, the same escape hatch scatter and area use.
     pub complex: bool,
+    /// Which way round the chart reads its range: `false` (the default) is
+    /// Excel's column orientation — each column of `source` is a series, the
+    /// first text column supplies the category labels. `true` is the transpose:
+    /// each row is a series, the first text row supplies the categories.
+    ///
+    /// SpreadsheetML has no orientation element, so this is NOT stored in the
+    /// file: Excel infers it from the shape of the refs a chart holds (a
+    /// `<c:val>` spanning `$B$2:$B$5` is a column series, `$B$2:$D$2` a row
+    /// one), and so does the loader. The flag exists so the UI can show and
+    /// flip the choice, and so the chart can be re-derived from its range.
+    pub by_row: bool,
 }
 
 /// The worksheet range a chart plots: the sheet by name (as the `<c:f>` refs
@@ -559,6 +570,7 @@ pub fn chart_from_range(
         edited: true,
         // Authored here, so it is exactly what the writer emits.
         complex: false,
+        by_row: false,
     })
 }
 
@@ -1527,6 +1539,32 @@ mod tests {
         // Cells that were never set read as empty rather than panicking.
         assert_eq!(range_numbers(&sh, (10, 10, 10, 11)), vec![0.0, 0.0]);
         assert_eq!(range_labels(&sh, (10, 10, 10, 10)), vec![""]);
+    }
+
+    #[test]
+    fn a_chart_is_column_oriented_unless_told_otherwise() {
+        // Orientation is not stored in the file, so every chart that predates it
+        // — which is every chart in every existing workbook — must read as
+        // column-oriented. Flipping this default would silently transpose them
+        // all, so pin it here rather than trusting `bool::default()` to stay put.
+        assert!(!ChartData::default().by_row);
+
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // And a chart built from a range is column-oriented too.
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column").expect("chart");
+        assert!(!cd.by_row);
     }
 
     #[test]
