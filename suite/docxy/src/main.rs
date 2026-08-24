@@ -2037,6 +2037,22 @@ fn sort_rows_from(
     }
 }
 
+/// The cells a range field's text points at ON THE SHEET IN FRONT OF YOU, or
+/// `None` when it points somewhere else. `here` is the active sheet's name.
+///
+/// A reference naming another sheet gets no wash: washing this sheet's A1:D5
+/// for a ref that means Budget's A1:D5 would draw the very lie — same-named
+/// cells standing in for the ones actually read — that keeping the qualifier
+/// exists to remove. The field still holds the ref and the grid is still in
+/// point mode, so a drag can re-point it at cells you can see.
+fn preview_range(text: &str, here: &str) -> Option<(u32, u32, u32, u32)> {
+    let r = parse_ref_text(text)?;
+    match r.sheet {
+        Some(s) if !s.eq_ignore_ascii_case(here) => None,
+        _ => Some(r.range),
+    }
+}
+
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
 /// A drag IS a selection, so it normalises and formats through the same two
 /// functions the selection does rather than repeating them.
@@ -3695,6 +3711,7 @@ impl Docxy {
 
     /// The cells a focused range field refers to, live as it is typed — the
     /// grid outlines them so you can see what you are pointing the chart at.
+    /// Only ever cells on the sheet in front of you; see `preview_range`.
     fn range_preview(&self) -> Option<(u32, u32, u32, u32)> {
         let f = self.range_edit.as_ref()?;
         // Every field that names cells outlines them — a series' values and the
@@ -3704,7 +3721,8 @@ impl Docxy {
         if !f.target.is_range() {
             return None;
         }
-        parse_ref_text(&f.buf).map(|r| r.range)
+        let here = self.active_sheet().map_or("", |v| v.sheet().name.as_str());
+        preview_range(&f.buf, here)
     }
 
     /// Everything drawn over the grid that isn't the cells themselves: the fill
@@ -3716,8 +3734,10 @@ impl Docxy {
         GridOverlay {
             fill_preview: self.sheet_fill_preview(),
             range_preview: self.range_preview(),
-            // `range_preview` is Some only for a field that `is_range`, which is
-            // exactly what `range_field_active` asks.
+            // Point mode asks only whether a range field has focus — NOT
+            // whether it currently washes anything. A field holding another
+            // sheet's reference draws no wash (`preview_range`) and must still
+            // let you drag a new range out of the sheet you can see.
             picking: self.range_field_active(),
             formula_refs: self.formula_refs(),
             // In point mode a drag off the selection's corner means "sweep a
@@ -16416,8 +16436,8 @@ fn main() {
 mod grid_geom_tests {
     use super::{
         RefText, char_to_byte, chart_ref_of, col_at_x, col_px, edit_runs, fill_box,
-        formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_a1,
-        ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
+        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1, range_text,
+        ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
         row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
         sheet_index_of, shift_col, shift_row, source_ref_text,
     };
@@ -17518,6 +17538,60 @@ mod grid_geom_tests {
         }
         // A drag into a CELL keeps the bare form — see `range_a1`.
         assert_eq!(range_text((1, 1), (4, 1)), "B2:B5");
+    }
+
+    /// A pick REPLACES the field's text rather than editing it, so whatever
+    /// qualifier was in there — including another sheet's — gives way to the
+    /// sheet the cells were actually dragged out of.
+    #[test]
+    fn a_pick_names_the_sheet_it_was_picked_from() {
+        // The field held Budget's cells; the drag happened on Sheet1.
+        let before = "=Budget!$A$1:$D$5";
+        assert_eq!(
+            parse_ref_text(before).and_then(|r| r.sheet),
+            Some("Budget".to_string())
+        );
+        let after = ref_pick_text("Sheet1", (1, 1), (4, 1));
+        assert_eq!(after, "=Sheet1!$B$2:$B$5");
+        assert_eq!(
+            parse_ref_text(&after),
+            Some(RefText {
+                sheet: Some("Sheet1".to_string()),
+                range: (1, 1, 4, 1),
+            })
+        );
+        // And the wash follows it back onto the sheet you can see.
+        assert_eq!(preview_range(before, "Sheet1"), None);
+        assert_eq!(preview_range(&after, "Sheet1"), Some((1, 1, 4, 1)));
+    }
+
+    /// The wash may only cover cells the reference really reads. A ref naming
+    /// another sheet washes nothing here, however well its A1 half parses.
+    #[test]
+    fn the_wash_only_covers_the_sheet_in_front_of_you() {
+        // No qualifier means this sheet, whichever it is.
+        assert_eq!(preview_range("A1:D5", "Sheet1"), Some((0, 0, 4, 3)));
+        assert_eq!(preview_range("=$A$1:$D$5", "Budget"), Some((0, 0, 4, 3)));
+        // Naming this sheet is the same thing, in any case and quoted or not.
+        assert_eq!(
+            preview_range("=Sheet1!$A$1:$D$5", "Sheet1"),
+            Some((0, 0, 4, 3))
+        );
+        assert_eq!(preview_range("sheet1!a1:d5", "Sheet1"), Some((0, 0, 4, 3)));
+        assert_eq!(
+            preview_range("='My Sheet'!$C$3:$C$3", "My Sheet"),
+            Some((2, 2, 2, 2))
+        );
+        // Naming another sheet washes nothing — the whole point.
+        assert_eq!(preview_range("=Budget!$A$1:$D$5", "Sheet1"), None);
+        assert_eq!(preview_range("Budget!A1:D5", "Sheet1"), None);
+        assert_eq!(preview_range("='Bob''s Data'!$A$1", "Sheet1"), None);
+        // Even a sheet the workbook hasn't got: it isn't THIS one either.
+        assert_eq!(preview_range("=Nowhere!$A$1:$B$2", "Sheet1"), None);
+        // And text that isn't a range at all never washes.
+        assert_eq!(preview_range("total", "Sheet1"), None);
+        assert_eq!(preview_range("", "Sheet1"), None);
+        assert_eq!(preview_range("=Sheet1!", "Sheet1"), None);
     }
 
     #[test]

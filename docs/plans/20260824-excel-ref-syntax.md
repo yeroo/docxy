@@ -314,21 +314,25 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 7: The wash and the pointing agree about which sheet you're on
 
-- [ ] `range_preview` (main.rs:3507): return `None` when the parsed ref names a
+- [x] `range_preview` (main.rs:3507): return `None` when the parsed ref names a
       sheet other than the active one — drawing the wash over the visible sheet's
       A1:D5 for a ref that means Budget's A1:D5 is exactly the lie this plan
-      removes
-- [ ] `range_pick_end`: write the picked range through `ref_a1` with the active
+      removes — the decision itself is the new pure `preview_range(text, here)`,
+      compared case-insensitively as `sheet_index_of` compares
+- [x] `range_pick_end`: write the picked range through `ref_a1` with the active
       sheet's name, so a mouse pick replaces a foreign qualifier with the sheet
-      actually picked from
-- [ ] check `GridOverlay.picking` still behaves: a field holding a foreign ref
+      actually picked from — already so since Task 3: `range_pick_to` REPLACES
+      the buffer with `ref_pick_text(active_sheet, …)`, and `range_pick_end`
+      commits that text, so no change was needed beyond the test that pins it
+- [x] check `GridOverlay.picking` still behaves: a field holding a foreign ref
       has no wash, but the grid must still be in point mode so a drag can
-      re-point it
-- [ ] write tests for the preview decision as a pure function — same sheet →
+      re-point it — `picking` reads `range_field_active` (focus), never the
+      preview, so it does; the comment claiming the two coincide was corrected
+- [x] write tests for the preview decision as a pure function — same sheet →
       `Some(range)`, other sheet → `None`, no qualifier → `Some(range)`
-- [ ] write a test that a pick over an existing foreign ref yields text naming
+- [x] write a test that a pick over an existing foreign ref yields text naming
       the active sheet
-- [ ] run tests — must pass before Task 8
+- [x] run tests — must pass before Task 8
 
 ### Task 8: Verify acceptance criteria
 
