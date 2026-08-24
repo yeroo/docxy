@@ -233,21 +233,21 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 4: Resolve a named sheet to a sheet index
 
-- [ ] add `fn ref_sheet_index(&self, sheet: Option<&str>) -> Result<usize, String>`
+- [x] add `fn ref_sheet_index(&self, sheet: Option<&str>) -> Result<usize, String>`
       on `Docxy`: `None` resolves to the active sheet index; a name matches a
       workbook sheet case-insensitively (Excel is case-insensitive here) and
       returns its index
-- [ ] return `Err` naming the sheet that isn't there — the message goes straight
+- [x] return `Err` naming the sheet that isn't there — the message goes straight
       into `ref_msg`, so word it for the user, e.g.
       `there's no sheet called "Budget"`
-- [ ] write tests for the pure part: factor the lookup itself into a free
+- [x] write tests for the pure part: factor the lookup itself into a free
       function over a `&[String]` of sheet names so it is testable without
       building a view, and test exact match, case-insensitive match, a name with
       spaces, an unknown name, and `None`
-- [ ] write a test that a duplicate-cased name (`budget` and `Budget` both
+- [x] write a test that a duplicate-cased name (`budget` and `Budget` both
       present, which Excel forbids but a hand-built file can contain) resolves to
       the first rather than panicking
-- [ ] run tests — must pass before Task 5
+- [x] run tests — must pass before Task 5
 
 ### Task 5: Chart fields read from the sheet their reference names
 

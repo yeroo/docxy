@@ -1559,6 +1559,30 @@ fn unquote_sheet_name(prefix: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Which sheet a reference names, as an index into `names`, or what to tell the
+/// user. `None` — a bare `A1:D5` — is the sheet in front of you, `active`.
+///
+/// Matching is case-insensitive, because Excel's is: `budget!A1` finds the
+/// `Budget` sheet. A name matching nothing is REFUSED rather than falling back
+/// to `active`: silently redirecting a qualifier someone typed is the bug this
+/// reference syntax exists to remove.
+///
+/// Excel forbids two sheets whose names differ only in case, but a hand-built
+/// file can carry them; the first one wins, as it does everywhere else the app
+/// looks a sheet up by name.
+// Wired into the commit paths in the next task; until then only the tests
+// reach it.
+#[allow(dead_code)]
+fn sheet_index_of(names: &[String], sheet: Option<&str>, active: usize) -> Result<usize, String> {
+    let Some(want) = sheet else {
+        return Ok(active);
+    };
+    names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(want))
+        .ok_or_else(|| format!("there's no sheet called \"{want}\""))
+}
+
 /// The most cells a chart reads from one field. It plots a point per cell AND
 /// renders an element per point, so an unbounded range — `A1:A1048576` parses
 /// perfectly well — would allocate a million strings and ask the renderer for a
@@ -3970,6 +3994,28 @@ impl Docxy {
             Some(Surface::Sheet(v)) => Some(v),
             _ => None,
         }
+    }
+    /// The workbook sheet a range field's reference names, as an index into the
+    /// open workbook's sheets; `None` — an unqualified reference — is the sheet
+    /// on screen.
+    ///
+    /// The `Err` is worded for the user because that is where it goes: straight
+    /// into `ref_msg`, under the field that named a sheet the workbook hasn't
+    /// got.
+    // Wired into the chart and validation commit paths in the next task.
+    #[allow(dead_code)]
+    fn ref_sheet_index(&self, sheet: Option<&str>) -> Result<usize, String> {
+        let Some(v) = self.active_sheet() else {
+            return Err("there's no workbook open".to_string());
+        };
+        let names: Vec<String> = v
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        sheet_index_of(&names, sheet, v.active)
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         match self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
@@ -16298,8 +16344,83 @@ mod grid_geom_tests {
         formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_a1,
         ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
         row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
-        shift_col, shift_row, source_ref_text,
+        sheet_index_of, shift_col, shift_row, source_ref_text,
     };
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// A qualifier names a sheet by name, whatever case it was typed in; no
+    /// qualifier means the sheet in front of you, whichever that is.
+    #[test]
+    fn sheet_index_of_finds_the_sheet_a_ref_names() {
+        let wb = names(&["Sheet1", "Budget", "My Sheet"]);
+
+        // No qualifier: the active sheet, not sheet 0.
+        assert_eq!(sheet_index_of(&wb, None, 2), Ok(2));
+        assert_eq!(sheet_index_of(&wb, None, 0), Ok(0));
+
+        // Named, from a different active sheet each time.
+        assert_eq!(sheet_index_of(&wb, Some("Sheet1"), 1), Ok(0));
+        assert_eq!(sheet_index_of(&wb, Some("Budget"), 0), Ok(1));
+
+        // Excel matches sheet names case-insensitively.
+        assert_eq!(sheet_index_of(&wb, Some("budget"), 0), Ok(1));
+        assert_eq!(sheet_index_of(&wb, Some("BUDGET"), 0), Ok(1));
+
+        // A name with spaces is a name like any other — the quotes came off in
+        // `parse_ref_text`, so what arrives here is the bare name.
+        assert_eq!(sheet_index_of(&wb, Some("My Sheet"), 0), Ok(2));
+        assert_eq!(sheet_index_of(&wb, Some("my sheet"), 0), Ok(2));
+    }
+
+    /// A sheet that isn't there is refused BY NAME, never quietly swapped for
+    /// the one on screen — that silent redirect is the bug this syntax removes.
+    #[test]
+    fn sheet_index_of_refuses_a_sheet_that_isnt_there() {
+        let wb = names(&["Sheet1", "Budget"]);
+
+        assert_eq!(
+            sheet_index_of(&wb, Some("Forecast"), 0),
+            Err("there's no sheet called \"Forecast\"".to_string())
+        );
+        // Not the active sheet's index by another route.
+        assert!(sheet_index_of(&wb, Some("Forecast"), 1).is_err());
+        // A near miss is still a miss.
+        assert!(sheet_index_of(&wb, Some("Budgets"), 0).is_err());
+        // An empty workbook has nothing to name.
+        assert!(sheet_index_of(&[], Some("Sheet1"), 0).is_err());
+    }
+
+    /// Excel forbids two sheets whose names differ only in case, but a
+    /// hand-built file can carry them. The first wins; nothing panics.
+    #[test]
+    fn sheet_index_of_takes_the_first_of_two_names_differing_only_in_case() {
+        let wb = names(&["budget", "Budget"]);
+        assert_eq!(sheet_index_of(&wb, Some("Budget"), 1), Ok(0));
+        assert_eq!(sheet_index_of(&wb, Some("budget"), 1), Ok(0));
+        assert_eq!(sheet_index_of(&wb, Some("BUDGET"), 1), Ok(0));
+    }
+
+    /// The two halves compose: what `parse_ref_text` pulls out of a field is
+    /// exactly what the lookup takes.
+    #[test]
+    fn a_parsed_ref_resolves_to_the_sheet_it_named() {
+        let wb = names(&["Sheet1", "Budget", "Bob's Data"]);
+        let resolve = |text: &str, active: usize| {
+            let r = parse_ref_text(text).expect("parses");
+            sheet_index_of(&wb, r.sheet.as_deref(), active).map(|i| (i, r.range))
+        };
+
+        assert_eq!(resolve("=Budget!$A$1:$D$5", 0), Ok((1, (0, 0, 4, 3))));
+        assert_eq!(resolve("A1:D5", 2), Ok((2, (0, 0, 4, 3))));
+        assert_eq!(resolve("'Bob''s Data'!A1", 0), Ok((2, (0, 0, 0, 0))));
+        assert_eq!(
+            resolve("=Forecast!A1:D5", 0),
+            Err("there's no sheet called \"Forecast\"".to_string())
+        );
+    }
 
     // A uniform-width sheet: every column is `w` px.
     fn uniform(w: f32) -> impl Fn(u32) -> f32 {
