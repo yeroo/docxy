@@ -310,6 +310,13 @@ pub struct ChartData {
     /// silently turn a stacked chart into a clustered one, or fold every series
     /// of a combo onto one axis pair as bars. Those parts round-trip verbatim
     /// instead, the same escape hatch scatter and area use.
+    ///
+    /// A `<c:pieChart>` holding several `<c:ser>` is the third shape: the
+    /// schema permits it (Excel's own UI won't author one, but a third-party
+    /// writer can) and the writer emits only the first, so regenerating such a
+    /// part would drop the rest without a word. The panel's five doors to that
+    /// state all refuse it; this is the sixth, and it takes the same escape
+    /// hatch.
     pub complex: bool,
     /// Which way round the chart reads its range: `false` (the default) is
     /// Excel's column orientation — each column of `source` is a series, the

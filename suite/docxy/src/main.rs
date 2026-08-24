@@ -1776,27 +1776,84 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
     }
 }
 
+/// Why a plot can't be handed to a chart of this kind, or `None` if it can.
+///
+/// A pie plots ONE series: `chart_space_xml` writes only the first and the
+/// preview draws only the first, so a second would be listed in the panel,
+/// pointed at cells, coloured, and then dropped on save without a word.
+///
+/// There are five ways a pie can come to hold a second series through the
+/// panel. This is the question four of them ask; `series_add` asks the same
+/// question in its own words:
+///
+/// - `series_add` — the explicit "+ Series" button, which does NOT call this.
+///   It refuses at `n > 0` BEFORE pushing, which is this rule on the count the
+///   push would leave (`n + 1 > 1`), and keeps its own wording because "+
+///   Series" is about to add one rather than commit a plot. Equivalent today,
+///   but a kind rule changed here has to be changed there too.
+/// - `chart_apply_range` — a wider DATA RANGE. Every re-derivation keeps the
+///   chart's KIND and takes the series count from the cells.
+/// - `chart_switch_row_column` — a flip turns N categories into N one-point
+///   series, so it reaches the state in ONE click.
+/// - `chart_set_kind` — picking **Pie** on a chart that already has N series.
+///   This one does not re-derive: it keeps `data.series` and rewrites `kind`,
+///   which is why "guard every re-derivation" is not enough. It is also the
+///   widest door of the five, since it is what a user reaches by clicking the
+///   word *Pie*.
+/// - `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric
+///   columns, which `chart_from_range` reads as a series each.
+///
+/// Those are the five doors the PANEL has. A file can arrive already holding a
+/// multi-series `<c:pieChart>` — the schema allows it even though Excel's own
+/// UI won't author it — and `parse_chart` calls such a chart one this model
+/// cannot reproduce, so it round-trips as Excel wrote it rather than losing its
+/// extra series on the next edit.
+///
+/// Refusing (rather than silently keeping the first) is the same answer
+/// `series_add` has always given, and it is the one that cannot lose work the
+/// user can see in the panel.
+fn chart_kind_series_err(kind: &str, series: usize) -> Option<String> {
+    (kind == "pie" && series > 1).then(|| {
+        format!(
+            "A pie plots one series and this reads as {series} \u{2014} pick \
+             column, bar or line, or a range with one line of numbers"
+        )
+    })
+}
+
 /// Why a picked range can't be the category labels, or `None` if it can.
 ///
 /// `<c:cat>` holds ONE line of labels, and `range_labels` flattens whatever it
-/// is given row-major. A single line flattens the way Excel reads it whichever
-/// way it runs, so unlike [`series_values_shape_err`] this does not care which
-/// way round the chart is: only a genuine RECTANGLE is refused, because there
-/// the cache docxy writes beside the ref and the labels Excel derives from the
-/// ref itself are in different orders, and the two disagree the moment Excel
-/// refreshes.
+/// is given row-major, so a genuine RECTANGLE is refused for
+/// [`series_values_shape_err`]'s first reason: the cache docxy writes beside
+/// the ref and the labels Excel derives from the ref itself would be in
+/// different orders, and the two disagree the moment Excel refreshes.
 ///
-/// The message still names the shape THIS chart wants, for
-/// `series_values_shape_err`'s reason: a column chart's labels run down a
-/// column, a row chart's along a row, and a hint pointing at the other one
-/// sends the user at a shape they did not ask about.
+/// WHICH line is the chart's own reading of its range, exactly as it is for the
+/// values. Category labels name the POINTS of a series, and a series' points
+/// run down rows on a column chart and along columns on a row one, so the
+/// labels run the same way: down a column (`A2:A5`) or along a row (`B1:D1`).
+/// That is the shape both derivations write (`chart_from_columns` takes a label
+/// COLUMN, `chart_from_rows` a label ROW) and the shape `chart_field_examples`
+/// has always offered here, so this is the guard catching up with its own hint.
+///
+/// It is also what makes the shape of `<c:cat>` evidence `infer_by_row` can
+/// trust. There is no orientation element in SpreadsheetML, so a chart whose
+/// series are all single cells is read back through its categories: labels down
+/// a column are the column reading's, along a row the row reading's. Accepting
+/// either line on either orientation put those two rules in contradiction — a
+/// user could commit a row of labels onto a column chart, and the file would
+/// come back row-oriented, with the VALUES fields refusing the very refs the
+/// series hold and the next DATA RANGE commit folding N series into one. A
+/// SINGLE CELL is one row and one column at once, so it fits both readings and
+/// goes through either way round, which is what a row chart over a range two
+/// columns wide needs. See `suite/docs/chart-orientation.md`.
 fn categories_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<&'static str> {
-    let rect = range.0 != range.2 && range.1 != range.3;
-    rect.then_some(if by_row {
-        "category labels are one line — point at a row like B1:D1"
+    if by_row {
+        (range.0 != range.2).then_some("category labels are one row — point at cells like B1:D1")
     } else {
-        "category labels are one line — point at a column like A2:A5"
-    })
+        (range.1 != range.3).then_some("category labels are one column — point at cells like A2:A5")
+    }
 }
 
 /// Where the Chart panel's three range fields point their `e.g.` at, for a
@@ -3129,6 +3186,11 @@ impl Docxy {
             cx.notify();
             return;
         };
+        if let Some(m) = chart_kind_series_err(&old.kind, data.series.len()) {
+            self.ref_msg = Some((RefTarget::ChartRange, false, m));
+            cx.notify();
+            return;
+        }
         // The new plot keeps the look of the old one.
         data.title = old.title.clone();
         data.part = old.part.clone();
@@ -3204,12 +3266,32 @@ impl Docxy {
                 "Its range names a sheet this workbook hasn't got ({sheet})."
             ));
         };
-        chart_switch_row_column(&data, sh).ok_or_else(|| {
+        let out = chart_switch_row_column(&data, sh).ok_or_else(|| {
             format!(
                 "Its range has no {} of numbers to read the other way round.",
                 if data.by_row { "column" } else { "row" },
             )
-        })
+        })?;
+        // The flip keeps `kind`, and a pie read the other way round is usually
+        // one one-point series per category. Caught here rather than at the
+        // click so the button greys out with the reason under it, the way every
+        // other "can't switch this one" does.
+        //
+        // The rule is the shared one; the SENTENCE is not. Every other door
+        // asks about the plot the user is committing, so "this reads as N"
+        // names what they are about to get. Here N is the FLIP's count and the
+        // note sits under a button nobody pressed — the chart on screen still
+        // reads as one series over a range that already holds one line of
+        // numbers, so the shared wording would name a shape that is not the
+        // problem and offer a remedy already in place. The siblings in this
+        // slot are statements about the chart as it stands; so is this.
+        if chart_kind_series_err(&out.kind, out.series.len()).is_some() {
+            return Err(format!(
+                "Read the other way round its range is {} series, and a pie plots one.",
+                out.series.len(),
+            ));
+        }
+        Ok(out)
     }
 
     /// Excel's `Switch Row/Column`: read the chart's range the other way round,
@@ -3250,6 +3332,15 @@ impl Docxy {
             return;
         };
         if data.kind == kind && !data.complex {
+            return;
+        }
+        // Picking Pie does not re-derive — it keeps the series it finds — so it
+        // is the one door to a multi-series pie that "guard every re-derivation"
+        // misses, and the one that reaches it in a single click on a chart whose
+        // series the user has already pointed and coloured.
+        if let Some(m) = chart_kind_series_err(kind, data.series.len()) {
+            self.set_status(m);
+            cx.notify();
             return;
         }
         data.kind = kind.to_string();
@@ -6169,6 +6260,15 @@ impl Docxy {
         }) else {
             return;
         };
+        // Asked before the snapshot, for the same reason the plot is derived
+        // first: a range the chart can't hold pushes no undo entry. Insert ▸ Pie
+        // over several numeric columns reads as a series each, and the writer
+        // would keep only the first.
+        if let Some(m) = chart_kind_series_err(kind, data.series.len()) {
+            self.set_status(m);
+            cx.notify();
+            return;
+        }
         // UI-authored charts live in the snapshot alongside the workbook, so
         // without this Ctrl+Z would undo the edit BEFORE the insert and leave
         // the chart standing.
@@ -17377,6 +17477,77 @@ mod grid_geom_tests {
         assert!(super::chart_switch_row_column(&flat, &sh).is_none());
     }
 
+    /// `series_add` refuses a pie a second series because the writer would drop
+    /// it, with its own inline `n > 0` test. There are four other ways to reach
+    /// the same state — the DATA RANGE commit and the switch both re-derive
+    /// while keeping the old kind, and picking **Pie** or inserting one skip the
+    /// derivation question entirely — and those four ask `chart_kind_series_err`,
+    /// which is `series_add`'s rule stated on the count AFTER the push.
+    #[test]
+    fn a_pie_is_refused_a_re_derived_plot_with_more_than_one_series() {
+        use super::chart_kind_series_err as err;
+        assert!(err("pie", 1).is_none());
+        assert!(err("pie", 0).is_none());
+        assert!(err("pie", 2).is_some_and(|m| m.contains("A pie plots one series")));
+        // Every other kind plots as many as the cells give.
+        for k in ["column", "bar", "line"] {
+            assert_eq!(err(k, 5), None);
+        }
+
+        // The switch is the route that reaches it in one click: a pie over a
+        // label column plus one numeric column reads, the other way round, as
+        // one one-point series per row.
+        let mut sh = gridcore::sheet::Sheet {
+            name: "Budget".into(),
+            ..Default::default()
+        };
+        for (addr, cell) in [
+            ("A1", gridcore::sheet::Cell::text("Item")),
+            ("B1", gridcore::sheet::Cell::text("Qty")),
+            ("A2", gridcore::sheet::Cell::text("Laptop")),
+            ("B2", gridcore::sheet::Cell::number(2.0)),
+            ("A3", gridcore::sheet::Cell::text("Monitor")),
+            ("B3", gridcore::sheet::Cell::number(4.0)),
+            ("A4", gridcore::sheet::Cell::text("Keyboard")),
+            ("B4", gridcore::sheet::Cell::number(6.0)),
+        ] {
+            let (r, c) = gridcore::sheet::parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let pie = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 1), "pie", false)
+            .expect("pie");
+        assert_eq!(pie.series.len(), 1);
+        let flipped = super::chart_switch_row_column(&pie, &sh).expect("flip");
+        assert_eq!(flipped.kind, "pie");
+        assert_eq!(flipped.series.len(), 3);
+        assert!(err(&flipped.kind, flipped.series.len()).is_some());
+
+        // The doors that do NOT re-derive. `chart_set_kind` keeps the series it
+        // finds and rewrites the kind, so a column chart over a range with two
+        // numeric columns becomes a pie holding both — the widest route to the
+        // silent drop, since it is one click on the word "Pie".
+        for (addr, cell) in [
+            ("C1", gridcore::sheet::Cell::text("Price")),
+            ("C2", gridcore::sheet::Cell::number(900.0)),
+            ("C3", gridcore::sheet::Cell::number(150.0)),
+            ("C4", gridcore::sheet::Cell::number(40.0)),
+        ] {
+            let (r, c) = gridcore::sheet::parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cols = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 2), "column", false)
+            .expect("cols");
+        assert_eq!(cols.series.len(), 2);
+        // What `chart_set_kind("pie", …)` would be committing: the SAME series,
+        // under a kind that writes one.
+        assert!(err("pie", cols.series.len()).is_some());
+        // And what `sheet_insert_chart("pie", …)` derives over the same range.
+        let inserted = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 2), "pie", false)
+            .expect("pie");
+        assert_eq!(inserted.series.len(), 2);
+        assert!(err(&inserted.kind, inserted.series.len()).is_some());
+    }
+
     #[test]
     fn the_shape_a_series_may_be_re_pointed_at_follows_the_charts_orientation() {
         use super::series_values_shape_err as err;
@@ -17409,30 +17580,40 @@ mod grid_geom_tests {
         assert!(err(false, (1, 1, 1, 3)).unwrap().contains("B2:B5"));
     }
 
-    /// Categories are one line too, but for a DIFFERENT reason from the
-    /// values, so the guard is deliberately not the same shape: a line reads
-    /// row-major whichever way it runs, and only a rectangle makes the cache
-    /// docxy writes and the labels Excel derives from the ref disagree.
+    /// Categories are one line too, and the line follows the chart the way the
+    /// values' does: labels name a series' POINTS, which run down rows on a
+    /// column chart and along columns on a row one. Taking either line on
+    /// either orientation would let a user commit a shape `infer_by_row` reads
+    /// back as the OTHER orientation, so the file would return flipped.
     #[test]
-    fn the_category_labels_field_refuses_a_rectangle_in_either_orientation() {
+    fn the_category_labels_field_takes_the_line_this_chart_reads() {
         use super::categories_shape_err as err;
-        // Either line goes through in either orientation — unlike the values
-        // guard, which refuses the line the chart doesn't read.
+        // The line each reading's own derivation writes goes through.
+        assert_eq!(err(false, (1, 0, 4, 0)), None, "a column chart's labels");
+        assert_eq!(err(true, (0, 1, 0, 3)), None, "a row chart's labels");
+        // One cell is one row and one column at once, so it fits both — which
+        // is what a row chart over a two-column range has.
         for by_row in [false, true] {
-            assert_eq!(err(by_row, (1, 0, 4, 0)), None, "a column of labels");
-            assert_eq!(err(by_row, (0, 1, 0, 3)), None, "a row of labels");
             assert_eq!(err(by_row, (1, 0, 1, 0)), None, "one cell");
         }
-        // A rectangle is refused both ways round, and the hint names the line
-        // THIS chart's labels run along.
+        // The other reading's line is refused, and the message names the shape
+        // THIS chart wants rather than the one that was picked.
         assert_eq!(
-            err(false, (0, 1, 2, 3)),
-            Some("category labels are one line — point at a column like A2:A5")
+            err(false, (0, 1, 0, 3)),
+            Some("category labels are one column — point at cells like A2:A5")
         );
         assert_eq!(
-            err(true, (0, 1, 2, 3)),
-            Some("category labels are one line — point at a row like B1:D1")
+            err(true, (1, 0, 4, 0)),
+            Some("category labels are one row — point at cells like B1:D1")
         );
+        // A rectangle differs BOTH ways round, so the same check refuses it on
+        // either orientation — the order mismatch that first motivated it.
+        assert!(err(false, (0, 1, 2, 3)).is_some());
+        assert!(err(true, (0, 1, 2, 3)).is_some());
+        // The message must never send the user at the shape this chart would
+        // refuse next time round.
+        assert!(err(false, (0, 1, 0, 3)).unwrap().contains("A2:A5"));
+        assert!(err(true, (1, 0, 4, 0)).unwrap().contains("B1:D1"));
     }
 
     /// The hints have to follow the orientation for the same reason the

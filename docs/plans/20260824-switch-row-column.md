@@ -123,7 +123,33 @@ None outside the repo. Both workspaces build clean at the branch head;
   knowingly: a BOOLEAN label now reads `TRUE`/`FALSE` rather than Rust's
   `true`/`false`, because the column branch's private `text_of` was lifted into
   the shared `cell_text` so one cell cannot read two ways. That is the spelling
-  Excel shows and the one the panel's fields already produced. Nothing else on
+  Excel shows and the one the panel's fields already produced.
+  A SECOND carve-out was taken during implementation, in the round answering the
+  first review (`c138a7e`): a multi-level `<c:cat>` — Excel's
+  `<c:multiLvlStrRef>` — is now refused at import, so a **column-oriented**
+  chart with grouped category labels comes back `categories_ref = None`,
+  `complex = true`, a narrower `source` box and its part kept verbatim instead
+  of regenerated. The **element** is what refuses the ref, not the shape of its
+  `<c:f>`: the usual multi-level ref is a rectangle, but two levels over ONE
+  category name the line `$A$2:$B$2`, which nothing in the range tells from an
+  ordinary row of labels — so a multi-level ref naming a line is refused
+  alongside the rectangle. (A `<c:cat>` rectangle stays refused on its own
+  account whoever wrote it.) It is the import-side twin of the panel's new
+  `categories_shape_err`, and it is deliberate: regenerating such a chart would
+  write a one-level `<c:strRef>` naming every level's cells beside a one-level
+  cache. Pinned by `a_multi_level_category_ref_is_one_this_model_cannot_hold`
+  and `a_multi_level_category_over_one_category_is_refused_too`.
+  A THIRD carve-out was taken in the round answering the third review: a
+  `<c:pieChart>` holding more than one `<c:ser>` is marked `complex` at import
+  (`parse_chart`), so a **column-oriented** multi-series pie — pie is a writable
+  kind, and such a chart cleared all three of the older `complex` conditions —
+  now round-trips verbatim instead of being regenerated on edit.
+  `chart_space_xml`'s pie arm emits `series.first()` only, so regenerating one
+  dropped every series after the first without a word. The schema permits the
+  shape even though Excel's own UI won't author it, and no panel door builds one
+  (Task 10's `chart_kind_series_err` bullet), so it only ever arrives from a
+  foreign file. Pinned by
+  `a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it`. Nothing else on
   the column path moves.
 
 ### Build and test commands — read this before Task 1
@@ -334,9 +360,16 @@ pure logic, but constructing views or elements blows up the render macro, so
       (drawing.rs)
 - [x] verify the deferred items are still deferred: no header darkening, no
       marching ants, no resolved label lists, no chart source outlines — the
-      branch diff since the plan commit touches only the six expected files
-      (drawing.rs, sheet.rs, xlsx.rs, suite main.rs, xlsxy main.rs, this plan)
-      and contains no `ref_color` / `ref_index_at` / darkening / ants code
+      branch diff since the plan commit contains no `ref_color` /
+      `ref_index_at` / darkening / ants code anywhere (the only hits are this
+      plan's own sentence describing the check). `git diff --name-only edddfdb`
+      (the plan commit) returns thirteen paths: the five expected code files
+      (drawing.rs, sheet.rs, xlsx.rs, suite main.rs, xlsxy main.rs), this plan,
+      five documentation files (SPREADSHEET.md, README.md, CONTRIBUTING.md,
+      `suite/docs/chart-orientation.md`, `suite/docs/range-selector.md` —
+      Task 9's, added after this box was ticked), and
+      `scripts/revmux-review.{sh,cmd}`, unrelated review tooling that landed on
+      this branch in ece3b81 and touches nothing this plan owns
 - [x] run `cargo test --manifest-path suite/Cargo.toml` — all pass (70, up
       from 62 at the branch head)
 - [x] run `cargo test -p gridcore` — all pass (343 + 1 + 4, up from 329)
@@ -368,6 +401,75 @@ pure logic, but constructing views or elements blows up the render macro, so
       is no longer true of a row chart. Also linked from `CONTRIBUTING.md` and
       `SPREADSHEET.md`'s chart section
 
+### Task 10: Review rounds (added after Task 9)
+
+Work the review rounds turned up, recorded here because the checklist above was
+already complete when it landed.
+
+- [x] ➕ `parse_chart` refuses a multi-level `<c:cat>` (Excel's
+      `<c:multiLvlStrRef>`), calling it a ref this model cannot hold. The
+      ELEMENT is what refuses it, not the shape of its `<c:f>` — a multi-level
+      ref naming a LINE (two levels over one category, `$A$2:$B$2`) is refused
+      alongside the usual rectangle, since no shape test tells that line from an
+      ordinary row of labels. See the second carve-out under *Development
+      Approach* and `SPREADSHEET.md` §4a. Tests:
+      `a_multi_level_category_ref_is_one_this_model_cannot_hold`,
+      `a_multi_level_category_over_one_category_is_refused_too`
+- [x] ➕ the category-ref cache pairs FIRST-wins per index, matching the cached
+      name above it: last-wins handed every series the last series' `<c:f>`
+      beside the first series' `<c:strCache>` — a cache contradicting its own
+      ref
+- [x] ➕ `categories_shape_err` in the panel: the CATEGORY LABELS field refuses
+      a genuine rectangle, for the same order mismatch the loader now refuses.
+      Documented in `range-selector.md` and `chart-orientation.md`
+- [x] ➕ `chart_field_examples` / `chart_range_help`: every hint in the panel
+      flips with the chart, so no field offers an example the next commit would
+      refuse
+- [x] ➕ `infer_by_row` asks the CATEGORIES before the stacked-single-cell
+      rule. Re-pointing two column series at single cells one above the other
+      is reachable by hand (`series_values_shape_err` refuses only a
+      several-column ref), and that shape is otherwise read as row evidence, so
+      a column chart flipped itself on reload. Test:
+      `a_column_chart_re_pointed_at_stacked_cells_stays_a_column_chart`
+- [x] ➕ `chart_kind_series_err`: a pie is refused a plot with more than one
+      series at every door to that state, since `chart_space_xml` writes only a
+      pie's first series — `chart_switched` (so the button greys out with the
+      reason under it), `chart_apply_range`, `chart_set_kind` (picking **Pie**
+      on a chart that already has N series: it does NOT re-derive, so guarding
+      the re-derivations alone missed the widest door of the lot) and
+      `sheet_insert_chart` (Insert ▸ Pie over several numeric columns). Matches
+      `series_add`'s existing refusal, which applies the same rule in its own
+      words (`n > 0` before the push) rather than calling the helper. Test:
+      `a_pie_is_refused_a_re_derived_plot_with_more_than_one_series`
+- [x] ➕ the IMPORT side of the same rule: `parse_chart` marks a `<c:pieChart>`
+      holding more than one `<c:ser>` `complex`, so a foreign multi-series pie
+      is kept verbatim rather than regenerated one slice group short on the next
+      edit. This one MOVES a column-oriented chart — see the third carve-out
+      under *Development Approach* and *Backward compatibility*. Test:
+      `a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it`
+- [x] ➕ `categories_shape_err` follows the ORIENTATION, like
+      `series_values_shape_err`: one column on a column chart, one row on a row
+      one, a single cell either way, a rectangle never. It first refused only
+      the rectangle and took either line on either orientation, which
+      contradicted the tiebreak above — `infer_by_row` reads the orientation
+      back OUT of `<c:cat>`'s shape, so committing a row of labels onto a column
+      chart (or a column onto a row one) flipped the chart on reload, the mirror
+      of the hole the tiebreak was added to close. The panel's own hints
+      (`chart_field_examples`) already offered the orientation-matching shape,
+      so this is the guard catching up with its hint. Tests:
+      `the_category_labels_field_takes_the_line_this_chart_reads`,
+      `re_pointing_the_labels_the_way_the_chart_reads_keeps_its_orientation`
+- [x] ➕ narrowed two claims that overstated what the tiebreak covers: the
+      stacked-cell rule fires when `<c:cat>` is one cell OR ABSENT, and absent
+      is not only the genuine row case — `chart_from_columns` leaves
+      `categories_ref` `None` on an all-numeric range, so such a column chart
+      with every series re-pointed at a single cell is still a guess. Said so in
+      `infer_by_row` and `chart-orientation.md` rather than restructuring the
+      inference, since one series left with a multi-row ref settles it before
+      the tiebreak runs. Also dropped SPREADSHEET.md §4a's "unlike the three
+      above it can fire on a column-oriented chart" — all of them do (a
+      `<c:val>` of `Sheet1!$B:$B` most of all); the real contrast is the symptom
+
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 
 ## Technical Details
@@ -395,9 +497,19 @@ fallback is never needed.
 Every chart in every existing file is column-oriented, and Task 4's inference
 must default to that. Task 3's "column output unchanged" test and Task 5's
 column round-trip are the two guards on this; treat a failure in either as a
-blocker rather than an expectation to update. The single deliberate exception is
-the boolean-label spelling noted under Constraints, pinned by
-`a_derived_label_reads_the_same_as_the_one_a_field_would_show`.
+blocker rather than an expectation to update. There are three deliberate
+exceptions, all recorded in the last backward-compatibility bullet of
+*Development Approach*: the boolean-label spelling (`TRUE`/`FALSE` rather than
+`true`/`false`), pinned by
+`a_derived_label_reads_the_same_as_the_one_a_field_would_show`; the
+multi-level `<c:cat>` refusal at import, pinned by
+`a_multi_level_category_ref_is_one_this_model_cannot_hold` and
+`a_multi_level_category_over_one_category_is_refused_too`; and the multi-series
+`<c:pieChart>` ⇒ `complex` marking at import, pinned by
+`a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it`. All three keep a
+column-oriented chart's part VERBATIM rather than writing it differently, which
+is the direction a data-preservation fix may move in. Anything else that
+moves on the column path is a regression, not an exception to re-bless.
 
 ## Post-Completion
 

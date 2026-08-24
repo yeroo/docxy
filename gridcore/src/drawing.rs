@@ -409,15 +409,17 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 /// (`$B$2:$D$2`) is a row series; one column down several rows (`$B$2:$B$5`) is
 /// a column series.
 ///
-/// Every ambiguous case answers "column", because that is what every chart
-/// written before orientation existed is, and what the panel can always show:
+/// Ambiguity falls back to "column", because that is what every chart written
+/// before orientation existed is, and what the panel can always show. What
+/// counts as ambiguous:
 ///
 /// - **A single cell** (`$B$2`) is one row AND one column at once — it fits
 ///   both readings, so it votes for neither. Several of them can still settle
 ///   it between them; see below.
 /// - **A series with no readable ref**: `<c:numLit>` values, or a ref this
 ///   model cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to
-///   measure, so no vote.
+///   measure, so no vote — though such a chart's `<c:cat>` may still settle it
+///   below, since the categories are read whatever the series are made of.
 /// - **A rectangle** spanning both ways (`$B$2:$D$5`) is a shape neither
 ///   reading produces — a hand-authored or foreign chart. No vote.
 /// - **Series that disagree**: a row vote must be UNANIMOUS to win. A chart
@@ -426,14 +428,45 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 ///   `ChartSeries::col` and `ChartSource::cat_col` both assume it.
 ///
 /// With no votes at all — the chart has no series, or none with a ref — the
-/// answer is the same: column.
+/// CATEGORIES are asked next (see below), and only if they have no shape of
+/// their own is the answer column.
 ///
 /// One shape LOOKS ambiguous cell by cell and isn't: several single-cell series
 /// STACKED DOWN ONE COLUMN (`$B$2`, `$B$3`, `$B$4`). That is what a row chart
 /// over a two-column range comes to — one label column and one numeric column,
-/// so every row series is one cell wide — and the column reading cannot produce
-/// it, since it emits one series PER COLUMN and two series therefore never
-/// share a column. The LOAD itself survives the wrong answer — `parse_chart`
+/// so every row series is one cell wide — and the column DERIVATION cannot
+/// produce it, since it emits one series PER COLUMN and two series therefore
+/// never share a column. The model can still reach it another way: nothing stops
+/// a user re-pointing two column series at single cells one above the other,
+/// since `series_values_shape_err` only refuses a ref spanning several columns.
+/// So the categories are consulted first — a column of labels is the column
+/// reading's, a row of them the row reading's, and the panel's
+/// `categories_shape_err` refuses the other line on either orientation so that
+/// this stays true of anything docxy itself commits.
+///
+/// The stacked-cell rule therefore decides only when the categories offer
+/// nothing: one cell, or absent. Neither branch is a proof, and both are
+/// guesses the rule takes knowingly:
+///
+/// - ONE CELL is what the rule is FOR — a row chart's labels are one cell when
+///   its range is two columns wide — but it is not exclusive to that case. A
+///   COLUMN chart one data row deep has one-cell labels too (`chart_from_columns`
+///   over `Item|Qty|Price|Total` × one row gives `A2`), and `categories_shape_err`
+///   admits a single cell on either orientation, so re-pointing that chart's
+///   series down a column walks it into the stacked shape with its category
+///   unchanged.
+/// - ABSENT is the same story without the labels: `chart_from_columns` leaves
+///   `categories_ref` `None` whenever every column in the range is numeric
+///   (`Year | Sales`), so an all-numeric COLUMN chart whose every series has
+///   been re-pointed at a single cell lands here too.
+///
+/// Both residues are narrower than they sound — one series left with a multi-row
+/// ref votes column and the early return above settles it — and what
+/// `categories_shape_err` really closes is the multi-cell LINE, not the single
+/// cell: a chart docxy wrote can never come back with its labels running the
+/// other way, only with them saying nothing.
+///
+/// The LOAD itself survives the wrong answer — `parse_chart`
 /// builds one `ChartSeries` per `<c:ser>` and never folds — but the orientation
 /// does not: the panel comes back on the wrong reading, and committing DATA
 /// RANGE, which re-derives the box the way the chart already reads it, folds
@@ -462,7 +495,21 @@ fn infer_by_row(cd: &ChartData) -> bool {
     if rows > 0 || cols > 0 {
         return rows > 0 && cols == 0;
     }
-    // Nothing had a shape of its own. Stacked single cells are row evidence.
+    // Nothing had a shape of its own. The categories settle it if THEY have
+    // one: labels running down a column are the column reading's label column
+    // (a row chart's labels are its header ROW), and labels running along a row
+    // are the row reading's. The panel's `categories_shape_err` refuses the
+    // other line on either orientation, so a chart docxy wrote never contradicts
+    // itself here. A single-cell or absent `<c:cat>` says nothing.
+    if let Some(cat) = &cd.categories_ref {
+        let (r1, c1, r2, c2) = cat.range;
+        match (r1 == r2, c1 == c2) {
+            (false, true) => return false,
+            (true, false) => return true,
+            _ => {}
+        }
+    }
+    // Still nothing. Stacked single cells are row evidence.
     cells.len() > 1
         && cells.iter().all(|c| c.1 == cells[0].1)
         && cells.iter().any(|c| c.0 != cells[0].0)
@@ -495,6 +542,8 @@ fn parse_chart(xml: &str) -> ChartData {
     let mut grouping = String::new();
     // A `<c:f>` inside a series that `parse_f_ref` couldn't read.
     let mut unparsed_ref = false;
+    // Inside a `<c:cat><c:multiLvlStrRef>`.
+    let mut multi_lvl = false;
     // Element depth, and the depth of the open `<c:ser>` (-1 outside one). What
     // a series PLOTS is named by its direct children; `<c:dLbls>`, `<c:errBars>`
     // and `<c:trendline>` sit at that same level with refs of their own, and
@@ -570,6 +619,11 @@ fn parse_chart(xml: &str) -> ChartData {
                     "spPr" if depth == ser_at + 1 => in_ser_fill = true,
                     "tx" if plotted => mode = 1,
                     "cat" if plotted => mode = 2,
+                    // The ELEMENT is what says a category is multi-level, not
+                    // the shape of its `<c:f>`: one category over two levels
+                    // names a LINE (`Sales!$A$2:$B$2`), which no shape test can
+                    // tell from an ordinary row of labels.
+                    "multiLvlStrRef" if mode == 2 => multi_lvl = true,
                     "val" if plotted => mode = 3,
                     // A scatter's/bubble's points: plotted cells, but under
                     // names `mode` doesn't cover.
@@ -659,19 +713,30 @@ fn parse_chart(xml: &str) -> ChartData {
                 // name and widen the chart's box to cover the title cell.
                 } else if in_f && ser_depth == 1 {
                     let raw = decoded(p.text()).trim().to_string();
-                    // A `<c:cat>` ref spanning BOTH ways is Excel's MULTI-LEVEL
-                    // category (`<c:multiLvlStrRef>`, one `<c:lvl>` per level):
-                    // a rectangle where this model holds a single line of
-                    // labels. `parse_f_ref` takes any rectangle happily, and
-                    // regenerating the part would then write a one-level
-                    // `<c:strRef>` whose `<c:f>` names EVERY level's cells
-                    // beside a cache holding one level's labels — the ref and
-                    // its cache in different orders, which is exactly what the
-                    // panel's `categories_shape_err` refuses to let a user type.
-                    // Import is the other door into that state; shut it the same
-                    // way, by calling the ref one this model can't hold.
-                    let held = crate::sheet::ChartSource::parse_f_ref(&raw)
-                        .filter(|s| mode != 2 || s.range.0 == s.range.2 || s.range.1 == s.range.3);
+                    // Excel's MULTI-LEVEL category (`<c:multiLvlStrRef>`, one
+                    // `<c:lvl>` per level) names every level's cells in one
+                    // `<c:f>`, where this model holds a single line of labels.
+                    // `parse_f_ref` takes it happily, and regenerating the part
+                    // would then write a one-level `<c:strRef>` naming EVERY
+                    // level's cells beside a cache holding one level's labels —
+                    // the ref and its cache in different orders, which is
+                    // exactly what the panel's `categories_shape_err` refuses to
+                    // let a user type. Import is the other door into that state;
+                    // shut it the same way, by calling the ref one this model
+                    // can't hold.
+                    //
+                    // Keyed on the ELEMENT, not the range: the usual multi-level
+                    // `<c:f>` is a rectangle, but one category over two levels
+                    // is the line `Sales!$A$2:$B$2` and one level over several
+                    // categories is an ordinary line too. A shape test would
+                    // take the first and there is nothing in the range to tell
+                    // them apart. The rectangle stays refused on its own account
+                    // — a `<c:cat>` spanning both ways is a shape neither
+                    // reading produces however it was written.
+                    let held = crate::sheet::ChartSource::parse_f_ref(&raw).filter(|s| {
+                        mode != 2
+                            || (!multi_lvl && (s.range.0 == s.range.2 || s.range.1 == s.range.3))
+                    });
                     if let Some(src) = held {
                         // Each ref belongs to whatever block it sits in, so a
                         // series can later be re-pointed on its own; their union
@@ -722,7 +787,7 @@ fn parse_chart(xml: &str) -> ChartData {
                     } else if mode != 0 {
                         // A ref this model can't hold: a whole column
                         // (`Sheet1!$B:$B`), a defined name, a multi-area ref, or
-                        // the multi-level `<c:cat>` rectangle above.
+                        // the multi-level `<c:cat>` above.
                         // The slot stays empty, and regenerating the part would
                         // write the cached numbers back as `<c:numLit>` —
                         // turning a live, sheet-linked series into frozen
@@ -749,7 +814,11 @@ fn parse_chart(xml: &str) -> ChartData {
                         ser_at = -1;
                         in_ser_fill = false;
                     }
-                    "tx" | "cat" | "val" => mode = 0,
+                    "tx" | "val" => mode = 0,
+                    "cat" => {
+                        mode = 0;
+                        multi_lvl = false;
+                    }
                     "xVal" | "yVal" | "bubbleSize" => in_pts = false,
                     _ => {}
                 }
@@ -758,8 +827,19 @@ fn parse_chart(xml: &str) -> ChartData {
             Event::Eof => break,
         }
     }
-    cd.complex =
-        groups > 1 || unparsed_ref || !matches!(grouping.as_str(), "" | "clustered" | "standard");
+    // A pie with several `<c:ser>` is the shape the writer cannot reproduce
+    // without losing data: `chart_space_xml`'s pie arm emits `series.first()`
+    // only. Nothing docxy derives can reach it — four of the five panel doors
+    // ask `chart_kind_series_err` first, and `series_add` applies the same rule
+    // in its own words (`n > 0` before the push) — but a foreign file may
+    // already be there,
+    // so hold it back rather than let the next edit regenerate it one slice
+    // group short. Picking a type in the panel is still the way out, and that
+    // door is guarded too.
+    cd.complex = groups > 1
+        || unparsed_ref
+        || !matches!(grouping.as_str(), "" | "clustered" | "standard")
+        || (cd.kind == "pie" && cd.series.len() > 1);
     cd.by_row = infer_by_row(&cd);
     // `cat_col` is set by whichever `<c:f>` landed in the box FIRST, and inside
     // a `<c:ser>` that is the series' NAME ref — its header cell, in the column
@@ -1089,6 +1169,37 @@ mod tests {
         // An ordinary ref leaves the chart writable.
         let ok = xml.replace("$B:$B", "$B$2:$B$3");
         assert!(!parse_chart(&ok).complex);
+    }
+
+    #[test]
+    fn a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it() {
+        // The writer's pie arm emits `series.first()` only, so regenerating
+        // this part would drop the second series without a word. No panel door
+        // can build one — four ask `chart_kind_series_err`, and `series_add`
+        // asks the same question inline — but the schema permits it, so a
+        // foreign file can arrive already there.
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:pieChart>
+          <c:ser><c:idx val="0"/>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser>
+          <c:ser><c:idx val="1"/>
+            <c:val><c:numRef><c:f>Budget!$C$2:$C$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.kind, "pie");
+        assert_eq!(cd.series.len(), 2, "both are loaded and both are drawn");
+        assert!(cd.complex, "so the part is not regenerated");
+        assert!(!crate::xlsx::chart_is_writable(&cd));
+        // One series is the ordinary pie, and stays editable.
+        let one = xml.replace(
+            r#"<c:ser><c:idx val="1"/>
+            <c:val><c:numRef><c:f>Budget!$C$2:$C$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser>"#,
+            "",
+        );
+        let cd = parse_chart(&one);
+        assert_eq!(cd.series.len(), 1);
+        assert!(!cd.complex);
     }
 
     #[test]
@@ -1673,9 +1784,11 @@ mod tests {
         assert_eq!(cd.source.as_ref().map(|s| s.cat_col), Some(0));
     }
 
-    /// Excel groups category labels by writing `<c:multiLvlStrRef>` with a
-    /// RECTANGULAR `<c:f>` and one `<c:lvl>` per level. This model holds a
-    /// single line of labels, so that ref is one it cannot hold: taking it
+    /// Excel groups category labels by writing `<c:multiLvlStrRef>` with one
+    /// `<c:lvl>` per level and an `<c:f>` naming every level's cells — usually
+    /// a rectangle, which is the shape this covers; the line case is the test
+    /// below. This model holds a single line of labels, so that ref is one it
+    /// cannot hold: taking it
     /// would let the writer regenerate a one-level `<c:strRef>` naming every
     /// level's cells beside a one-level cache — the ref-vs-cache contradiction
     /// the panel's own `categories_shape_err` refuses. It must instead mark the
@@ -1702,6 +1815,42 @@ mod tests {
         // The innermost level is the one the card shows; the outer level does
         // NOT overwrite it by restarting `idx` at 0.
         assert_eq!(cd.categories, vec!["Jan", "Feb", "Mar"]);
+    }
+
+    /// Two levels over ONE category name a line (`Sales!$A$2:$B$2`), not a
+    /// rectangle, so the shape of the `<c:f>` cannot be what decides: this is
+    /// indistinguishable from an ordinary row of labels by range alone. The
+    /// `<c:multiLvlStrRef>` element is what says so.
+    #[test]
+    fn a_multi_level_category_over_one_category_is_refused_too() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:cat><c:multiLvlStrRef><c:f>Sales!$A$2:$B$2</c:f><c:multiLvlStrCache><c:ptCount val="1"/>
+              <c:lvl><c:pt idx="0"><c:v>Jan</c:v></c:pt></c:lvl>
+              <c:lvl><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:lvl>
+            </c:multiLvlStrCache></c:multiLvlStrRef></c:cat>
+            <c:val><c:numRef><c:f>Sales!$C$2:$C$2</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert!(cd.complex, "the part is kept exactly as Excel wrote it");
+        assert!(
+            cd.categories_ref.is_none(),
+            "and the line is not the label ref"
+        );
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((1, 2, 1, 2)));
+        // An ordinary one-level `<c:strRef>` over the same line is held, so it
+        // really is the element and not the range doing the work.
+        let plain = xml
+            .replace("multiLvlStrRef", "strRef")
+            .replace("multiLvlStrCache", "strCache")
+            .replace("<c:lvl>", "")
+            .replace("</c:lvl>", "");
+        let cd = parse_chart(&plain);
+        assert!(!cd.complex);
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.range),
+            Some((1, 0, 1, 1))
+        );
     }
 
     /// Every shape that fits both readings, or neither, answers "column" — the
@@ -1994,6 +2143,137 @@ mod tests {
         assert!(!again.by_row);
         assert_eq!(again.series.len(), 1);
         assert_eq!(again.series[0].values, vec![2.0, 4.0, 6.0]);
+    }
+
+    /// The stacked-cell rule must not fire on a COLUMN chart whose series were
+    /// re-pointed at single cells by hand. `series_values_shape_err` refuses
+    /// only a ref spanning several columns, so a one-cell `<c:val>` commits, and
+    /// two of them one above the other are the same cell-by-cell shape the row
+    /// case produces. The categories tell the two apart: a column chart's labels
+    /// run DOWN a column, and that is a shape the row reading never writes.
+    #[test]
+    fn a_column_chart_re_pointed_at_stacked_cells_stays_a_column_chart() {
+        use crate::sheet::{Cell, Sheet, chart_from_range, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Unit price")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(900.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(150.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(40.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+
+        let mut cd = chart_from_range(&sh, "Budget", (0, 0, 3, 2), "column", false).expect("cols");
+        assert_eq!(cd.series.len(), 2);
+        // What the panel does when a user types `B2` into one VALUES field and
+        // `B3` into the other: both pass the shape guard, and both come out of
+        // `to_ref` as one-cell refs stacked down column B.
+        for (i, r) in [1u32, 2].into_iter().enumerate() {
+            let vr = cd.series[i].values_ref.as_mut().expect("ref");
+            vr.range = (r, 1, r, 1);
+            cd.series[i].values = crate::sheet::range_numbers(&sh, (r, 1, r, 1));
+        }
+        let refs: Vec<String> = cd
+            .series
+            .iter()
+            .map(|s| s.values_ref.as_ref().expect("ref").to_ref())
+            .collect();
+        assert_eq!(refs, vec!["Budget!$B$2:$B$2", "Budget!$B$3:$B$3"]);
+
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&cd));
+        // Pinned so `!again.by_row` cannot pass on a parse that produced
+        // nothing: with no series at all the categories are never reached and
+        // the fall-through answers column for the wrong reason.
+        assert_eq!(again.series.len(), 2);
+        assert!(
+            !again.by_row,
+            "the labels down A2:A4 are a column chart's, whatever the values' shape"
+        );
+    }
+
+    /// The categories are trusted BECAUSE the panel refuses to point them the
+    /// other way round (`categories_shape_err`). These pin the two shapes it
+    /// does accept — the line each reading's own derivation writes, and a single
+    /// cell — reading back as the orientation they were written on, so
+    /// re-pointing the labels can never flip a chart on reload.
+    #[test]
+    fn re_pointing_the_labels_the_way_the_chart_reads_keeps_its_orientation() {
+        use crate::sheet::{Cell, Sheet, chart_from_range, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("D1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(900.0)),
+            ("D2", Cell::number(1800.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(150.0)),
+            ("D3", Cell::number(600.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(40.0)),
+            ("D4", Cell::number(240.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+
+        // A COLUMN chart one data row deep: three series, each one cell, side
+        // by side along row 2. Its labels are the one cell A2, and the only
+        // other shape the panel takes here is a COLUMN — which is what it
+        // already has, so nothing a user can commit turns them into a row.
+        let cols = chart_from_range(&sh, "Budget", (0, 0, 1, 3), "column", false).expect("cols");
+        assert_eq!(cols.series.len(), 3);
+        assert_eq!(
+            cols.categories_ref.as_ref().expect("cat").range,
+            (1, 0, 1, 0)
+        );
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&cols));
+        assert_eq!(again.series.len(), 3);
+        assert!(
+            !again.by_row,
+            "three cells along a row are a column chart's"
+        );
+
+        // A ROW chart over a range two columns wide: three series, each one
+        // cell, stacked down column B. Its labels are the one cell B1, and
+        // widening them stays a ROW (`B1:D1`) — never the column that would
+        // read back as the other orientation.
+        let mut rows = chart_from_range(&sh, "Budget", (0, 0, 3, 1), "column", true).expect("rows");
+        assert_eq!(rows.series.len(), 3);
+        assert_eq!(
+            rows.categories_ref.as_ref().expect("cat").range,
+            (0, 1, 0, 1)
+        );
+        let cat = rows.categories_ref.as_mut().expect("cat");
+        cat.range = (0, 1, 0, 3);
+        rows.categories = crate::sheet::range_labels(&sh, (0, 1, 0, 3));
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&rows));
+        assert_eq!(again.series.len(), 3);
+        assert!(
+            again.by_row,
+            "a row of labels is the row reading's, and the stacked cells agree"
+        );
     }
 
     /// The mirror shape: one-cell series side by side ALONG one row, which is

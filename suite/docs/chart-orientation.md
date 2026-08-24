@@ -21,6 +21,7 @@ Implementation: `ChartData::by_row` and `chart_from_range` /
 `chart_space_xml` (`gridcore/src/xlsx.rs`), `infer_by_row` and `parse_chart`
 (`gridcore/src/drawing.rs`), and in the panel `chart_switch_row_column`,
 `chart_switched`, `chart_switch_orientation`, `series_values_shape_err`,
+`categories_shape_err`, `chart_kind_series_err`, `chart_field_examples`,
 `series_set_values` (`suite/docxy/src/main.rs`).
 
 ## What each orientation means
@@ -104,13 +105,31 @@ rediscover them:
   the one case that looks ambiguous cell by cell and isn't, so it is **not** a
   default: it counts as row evidence. It is what a row chart over a range one
   label column plus one numeric column wide comes to — every row series is one
-  cell — and the column reading cannot produce it, since that emits one series
-  *per column* and two series therefore never share a column. Reading them as
-  columns costs the load nothing — `parse_chart` builds one series per
-  `<c:ser>` either way round — but it loses the orientation, so the chart comes
-  back column-oriented and committing DATA RANGE, which re-derives the box the
-  way the chart already reads it, folds the N one-point series into one
-  N-point series. The button is *not* that path: it inverts `by_row` instead of
+  cell — and the column *derivation* cannot produce it, since that emits one
+  series *per column* and two series therefore never share a column. The model
+  can still be walked into the shape by hand, though: `series_values_shape_err`
+  refuses only a ref spanning several columns, so a user may point two column
+  series at single cells one above the other. That is why the **categories are
+  asked first**: labels running down a column are the column reading's, labels
+  along a row are the row reading's, and `categories_shape_err` refuses the
+  other line on either orientation, so nothing the panel commits can contradict
+  what the loader reads back out of it.
+  The stacked-cell rule then decides only when the categories are **one cell or
+  absent**. *One cell* is the genuine row case, whose labels *are* one cell when
+  its range is two columns wide. *Absent* is not: `chart_from_columns` leaves
+  `categories_ref` `None` whenever every column in the range is numeric
+  (`Year | Sales`), so an all-numeric **column** chart whose every series has
+  been re-pointed at a single cell still lands on the stacked-cell rule and is
+  still read as a row. The residue is narrow — one series left with a multi-row
+  ref votes column and the unanimity check settles it before the tiebreak runs —
+  but the rule is a guess there, not a proof.
+  Either way, the LOAD survives the wrong answer — `parse_chart` builds one
+  series per `<c:ser>` whichever way round it reads — but the orientation does
+  not: the panel comes back on the wrong reading, and committing DATA RANGE,
+  which re-derives the box the way the chart already reads it, folds the N
+  one-point series into one N-point series. That is the cost the rule is
+  weighed against, and why stacked cells count as row evidence despite the
+  residue. The button is *not* that path: it inverts `by_row` instead of
   keeping it, so on a wrongly-inferred chart the first press hands back the
   reading the chart should have had, appearing to do nothing, and only a second
   press folds.
@@ -124,8 +143,10 @@ rediscover them:
 - **Series that disagree** — a chart this model cannot re-derive either way
   round. Column wins, being the safer of the two to hand the user, since
   `ChartSeries::col` and `ChartSource::cat_col` both assume it.
-- **No votes at all** — no series, or none with a ref. Column, for the same
-  reason.
+- **No votes at all** — no series, or none with a ref. The **categories** are
+  asked next: a column of labels is the column reading's, a row of them the row
+  reading's, and only a `<c:cat>` with no line shape of its own (one cell, or
+  absent) leaves the answer column.
 
 The default in every ambiguous case is column-oriented, which is what **every**
 chart written before this feature is. That is the backward-compatibility
@@ -158,7 +179,9 @@ those are:
   `<c:f>` may legally name a whole column;
 - a box naming a sheet the workbook hasn't got (one the user has since
   deleted or renamed);
-- a range with no line of numbers the other way round.
+- a range with no line of numbers the other way round;
+- a **pie** whose flipped range would read as more than one series, which is
+  the usual case — see below.
 
 Undo is `chart_set_data`'s existing snapshot. A flip always differs from what is
 there (the orientation, if nothing else), so that call's "committed nothing"
@@ -194,6 +217,65 @@ shape — a row chart says "a series plots one row — point at cells like B2:D2
 because sending the user to `B2:B5` on a row chart is worse than not checking at
 all, the range it asks for being one that would be refused again. The example
 seeding the "that isn't a range" message flips with it.
+
+**Re-pointing the categories** (`Categories`) follows the orientation for the
+same reason the values do, plus one of its own. `<c:cat>` holds one LINE of
+labels, and those labels name a series' POINTS — which run down rows on a column
+chart and along columns on a row one — so `categories_shape_err` takes one
+column (`A2:A5`) one way round and one row (`B1:D1`) the other, which is exactly
+the shape each derivation writes. A single CELL is one row and one column at
+once and goes through either way, which is what a row chart two columns wide
+has. A rectangle differs both ways, so the same check refuses it on either
+orientation, for the order mismatch that first motivated it: `range_labels`
+flattens row-major while Excel derives its own list from the ref.
+
+The reason of its own is the paragraph above: `infer_by_row` reads a chart's
+orientation back OUT of the shape of its `<c:cat>` when no series has a shape.
+Accepting either line on either orientation would put the panel and the loader
+in contradiction — commit a row of labels onto a column chart and the file comes
+back row-oriented, the VALUES fields refusing the very refs the series hold and
+the next DATA RANGE commit folding N series into one.
+
+`parse_chart` shuts the import door on the remaining shape — Excel's multi-level
+`<c:multiLvlStrRef>` — by calling such a ref one this model cannot hold, so a
+chart docxy derives never arrives in a state the field would refuse; see
+[`SPREADSHEET.md`](../../SPREADSHEET.md) §4a. (A hand-authored file whose series
+shapes decide the orientation *and* whose `<c:cat>` runs the other way is not
+reachable through the panel and can still land there. Its label field then
+refuses its own ref — the same asymmetry `series_values_shape_err` has always
+had for a foreign chart mixing the two series shapes.)
+
+**No pie the panel builds holds more than one series**, because
+`chart_space_xml` writes only the first and the preview draws only the first, so
+a second would be listed in the panel, pointed at cells, coloured, and then
+dropped on save without a word. `chart_kind_series_err` is the rule all five
+doors to that state apply:
+
+- `series_add` — the "+ Series" button, which has always refused. It is the one
+  door that does not call the helper: it tests `n > 0` before pushing, which is
+  the same rule on the count the push would leave, and keeps its own wording
+  because it is about to add a series rather than commit a whole plot.
+- **Switching** a pie — the flip usually reads N categories as N one-point
+  series. Asked of the DERIVED plot, so the button greys out with the reason
+  under it rather than failing at the click. Its note is worded for that door —
+  the count belongs to the flip, not to the chart on screen.
+- `chart_apply_range` — a wide DATA RANGE on a pie is the same hole by another
+  door.
+- `chart_set_kind` — picking **Pie** on a chart that already has N series. This
+  one does not re-derive; it keeps the series and rewrites the kind, which is
+  why guarding the re-derivations alone left it open. It is also the widest
+  door, being what a user reaches by clicking the word *Pie*.
+- `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric columns.
+
+(A file that arrives already holding a multi-series `<c:pieChart>` is not
+reachable through the panel — the schema permits one even though Excel's own UI
+will not author it. `parse_chart` marks such a chart `complex`, so it round-trips
+as Excel wrote it instead of losing its extra series on the next edit, the same
+escape hatch a stacked or combo plot area takes.)
+
+All five refuse rather than silently keeping the first, which is the answer
+`series_add` has always given and the only one that cannot lose work the panel
+is already showing.
 
 `rebuild_source` needs no orientation of its own: it unions rectangles, so a row
 series' ref grows the box the same way a column's does. A test pins that rather
