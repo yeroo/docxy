@@ -191,10 +191,13 @@ Budget's cells or a message saying there is no such sheet — never this sheet's
 cells of the same name. (The old behaviour was the opposite: the prefix was
 parsed off and discarded, so typing `Budget!A1:D5` while looking at Sheet2
 silently plotted Sheet2's `A1:D5`.) Resolution is `sheet_index_of`, matching
-**case-insensitively** because Excel does; `None` means the sheet in front of
-you. Two sheets differing only in case — which Excel forbids but a hand-built
-file can carry — resolve to the first, as every other by-name lookup in the app
-does.
+**case-insensitively for ASCII names** because Excel does; `None` means the
+sheet in front of you. The fold is `eq_ignore_ascii_case`, so a name outside
+ASCII matches only at its own case: `бюджет!A1` does not find `Бюджет`. That is
+the convention every by-name lookup in the app shares, and changing it here
+alone would let resolution and the wash disagree about one reference. Two
+sheets differing only in case — which Excel forbids but a hand-built file can
+carry — resolve to the first, as every other by-name lookup does.
 
 Whether a foreign sheet is resolved or refused is per target
 (`target_takes_foreign_sheet`), and turns on what the field *feeds*, not on the

@@ -1584,10 +1584,17 @@ fn unquote_sheet_name(prefix: &str) -> Option<String> {
 /// Which sheet a reference names, as an index into `names`, or what to tell the
 /// user. `None` — a bare `A1:D5` — is the sheet in front of you, `active`.
 ///
-/// Matching is case-insensitive, because Excel's is: `budget!A1` finds the
-/// `Budget` sheet. A name matching nothing is REFUSED rather than falling back
-/// to `active`: silently redirecting a qualifier someone typed is the bug this
-/// reference syntax exists to remove.
+/// Matching is case-insensitive for ASCII names, because Excel's is:
+/// `budget!A1` finds the `Budget` sheet. The fold is `eq_ignore_ascii_case`, so
+/// a name outside ASCII matches only at its own case — `бюджет!A1` does NOT
+/// find `Бюджет`. That is the settled convention everywhere this app looks a
+/// sheet up by name (`preview_range`, and the rename uniqueness check), and
+/// folding here alone would let resolution and the wash disagree about the same
+/// reference — so the limit is stated rather than fixed in one place.
+///
+/// A name matching nothing is REFUSED rather than falling back to `active`:
+/// silently redirecting a qualifier someone typed is the bug this reference
+/// syntax exists to remove.
 ///
 /// Excel forbids two sheets whose names differ only in case, but a hand-built
 /// file can carry them; the first one wins, as it does everywhere else the app
@@ -1686,7 +1693,7 @@ fn ref_source(
     ))
 }
 
-/// Grow a chart's box to also cover a slot just re-pointed at `src`.
+/// Rebuild a chart's box from the references its slots hold right now.
 ///
 /// `ChartSource::union` merges rectangles and keeps the receiver's sheet name,
 /// so unioning across sheets would leave the box naming one sheet and covering
@@ -1694,18 +1701,57 @@ fn ref_source(
 /// categories' `<c:f>` from that box. Replacing it is no better: the box would
 /// then describe the one slot just re-pointed rather than the chart, and the
 /// DATA RANGE field showing it would offer to replot the whole chart from a
-/// single foreign column. A slot on another sheet leaves the box alone — which
-/// is also how the loader resolves the same clash (`parse_chart` in
-/// `gridcore/src/drawing.rs` keeps the box it already has), so a chart reads
-/// the same before and after a save.
-fn union_source(
-    box_: &mut Option<gridcore::sheet::ChartSource>,
-    src: gridcore::sheet::ChartSource,
-) {
-    match box_ {
-        Some(b) if b.sheet.eq_ignore_ascii_case(&src.sheet) => b.union(&src),
-        Some(_) => {}
-        slot => *slot = Some(src),
+/// single foreign column. So a reference naming another sheet than the box
+/// leaves the box alone, exactly as the loader resolves the same clash
+/// (`parse_chart` in `gridcore/src/drawing.rs`).
+///
+/// The fold starts EMPTY, not from the box already there, and walks the slots in
+/// the order the writer emits them — each series' name cell, the categories,
+/// then its values. Growing the existing box instead strands it: once every slot
+/// has moved to another sheet, nothing matches it any more, so it would go on
+/// naming a sheet no slot reads. The panel seeds DATA RANGE from that box, and
+/// Enter there replots the whole chart from the cells the user moved away from,
+/// with no undo snapshot. Rebuilding converges the moment the references do,
+/// which is what actually makes a chart read the same before and after a save —
+/// the loader unions from scratch too, so anything less diverges from it.
+///
+/// The name cell is folded in because the loader folds it in (`<c:tx>` carries
+/// mode 1): leaving it out would drop the header row from the box, shrinking
+/// the DATA RANGE the panel shows from `A1:D5` to `A2:D5` the first time a
+/// series was re-pointed.
+///
+/// A chart with no parsable reference anywhere keeps the box it had — there is
+/// nothing to rebuild it from, and dropping it would blank DATA RANGE.
+fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
+    use gridcore::sheet::ChartSource;
+    fn fold(box_: &mut Option<ChartSource>, src: ChartSource) {
+        match box_ {
+            Some(b) if b.sheet.eq_ignore_ascii_case(&src.sheet) => b.union(&src),
+            Some(_) => {}
+            slot => *slot = Some(src),
+        }
+    }
+    let mut built = None;
+    for s in &data.series {
+        if let Some(src) = s.name_ref.as_deref().and_then(ChartSource::parse_f_ref) {
+            fold(&mut built, src);
+        }
+        if let Some(src) = data.categories_ref.clone() {
+            fold(&mut built, src);
+        }
+        if let Some(src) = s.values_ref.clone() {
+            fold(&mut built, src);
+        }
+    }
+    // Categories can outlive every series ref — a chart whose series are all
+    // literal still has labels to cover.
+    if built.is_none() {
+        if let Some(src) = data.categories_ref.clone() {
+            fold(&mut built, src);
+        }
+    }
+    if built.is_some() {
+        data.source = built;
     }
 }
 
@@ -1993,8 +2039,9 @@ fn sel_range(sel: (u32, u32), anchor: (u32, u32)) -> (u32, u32, u32, u32) {
     (ar.min(br), ac.min(bc), ar.max(br), ac.max(bc))
 }
 
-/// What a bar's range field makes of what was typed: the cells in normal A1
-/// form, or the complaint to show under the field.
+/// What a bar's range field makes of what was typed: the cells as `ref_a1`
+/// spells them — qualified with `sheet` and anchored — or the complaint to show
+/// under the field. What the bar echoes is what the bar would accept again.
 ///
 /// A `Sheet!` prefix is only accepted when it names `sheet`. A chart resolves
 /// one (it can plot a sheet it doesn't float over), but a rule, a split or a
@@ -3158,11 +3205,13 @@ impl Docxy {
         let n = values.len();
         s.values = values;
         s.col = Some(range.1);
-        s.values_ref = Some(src.clone());
+        s.values_ref = Some(src);
         // The chart's box is the union of what it reads, so the DATA RANGE the
         // panel shows covers this series too — otherwise it only caught up after
-        // a save/reload, when `parse_chart` re-unions the refs.
-        union_source(&mut data.source, src);
+        // a save/reload, when `parse_chart` re-unions the refs. Rebuilt from
+        // every slot rather than grown, so it follows the references off a sheet
+        // instead of being stranded on one none of them read any more.
+        rebuild_source(&mut data);
         self.ref_msg = Some((RefTarget::SeriesValues(i), true, format!("{n} points")));
         self.chart_set_data(data, cx);
     }
@@ -3312,11 +3361,11 @@ impl Docxy {
             return;
         };
         data.categories = gridcore::sheet::range_labels(sh, range);
-        data.categories_ref = Some(src.clone());
+        data.categories_ref = Some(src);
         // The chart's box covers everything it reads, labels included — the same
-        // reason `series_apply_values` unions, and the DATA RANGE the panel shows
-        // is derived from it.
-        union_source(&mut data.source, src);
+        // reason `series_apply_values` rebuilds, and the DATA RANGE the panel
+        // shows is derived from it.
+        rebuild_source(&mut data);
         self.ref_msg = Some((
             RefTarget::Categories,
             true,
@@ -16772,35 +16821,96 @@ mod grid_geom_tests {
     }
 
     #[test]
-    fn a_charts_box_only_grows_over_the_sheet_it_already_names() {
-        use gridcore::sheet::ChartSource;
+    fn a_charts_box_is_rebuilt_from_the_references_its_slots_hold() {
+        use gridcore::sheet::{ChartData, ChartSeries, ChartSource};
         let src = |sheet: &str, range| ChartSource {
             sheet: sheet.into(),
             range,
             cat_col: 0,
         };
-        // Same sheet: the box stretches to cover the newly pointed cells.
-        let mut b = Some(src("Data", (1, 1, 3, 1)));
-        super::union_source(&mut b, src("data", (0, 0, 5, 2)));
-        assert_eq!(b.as_ref().map(|s| (s.sheet.as_str(), s.range)), {
-            Some(("Data", (0, 0, 5, 2)))
-        });
-        // Another sheet: `union` keeps the RECEIVER's name, so stretching would
-        // leave the box saying "Data" over cells on "Report" — and
-        // `chart_space_xml` derives refs from that box. Replacing it would be
-        // just as wrong the other way: the box would describe one re-pointed
-        // slot instead of the chart, and the DATA RANGE field showing it would
-        // offer to replot everything from that one foreign column. It stands,
-        // as it does when the loader meets the same clash.
-        let mut b = Some(src("Data", (1, 1, 3, 1)));
-        super::union_source(&mut b, src("Report", (9, 9, 9, 9)));
-        assert_eq!(b.as_ref().map(|s| (s.sheet.as_str(), s.range)), {
-            Some(("Data", (1, 1, 3, 1)))
-        });
-        // No box yet: the pointed cells become it.
-        let mut b = None;
-        super::union_source(&mut b, src("Data", (0, 0, 1, 1)));
-        assert_eq!(b.map(|s| s.range), Some((0, 0, 1, 1)));
+        // A two-series chart over `Data!A1:C5`: a header cell naming each
+        // series, a label column, and a numeric column each.
+        let chart = |ser: Vec<ChartSeries>, cats: Option<ChartSource>, box_| ChartData {
+            series: ser,
+            categories_ref: cats,
+            source: box_,
+            ..ChartData::default()
+        };
+        let ser = |name_ref: Option<&str>, vals: Option<ChartSource>| ChartSeries {
+            name_ref: name_ref.map(str::to_string),
+            values_ref: vals,
+            ..ChartSeries::default()
+        };
+
+        // Every slot on one sheet: the box is their union, and it reaches row 1
+        // because the name cells are folded in — the loader folds `<c:tx>` too,
+        // and leaving it out would shrink DATA RANGE to `A2:C5`.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Data!$C$1"), Some(src("Data", (1, 2, 4, 2)))),
+            ],
+            Some(src("Data", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 2)))
+        );
+
+        // The finding this test exists for: once EVERY slot has moved to
+        // another sheet, the box follows. Growing the old box instead left it
+        // naming "Data" — a sheet nothing read any more — and the panel seeded
+        // DATA RANGE from it, so Enter there replotted the chart from the cells
+        // the user had just moved away from.
+        let mut d = chart(
+            vec![
+                ser(Some("Budget!$B$1"), Some(src("Budget", (1, 1, 4, 1)))),
+                ser(Some("Budget!$C$1"), Some(src("Budget", (1, 2, 4, 2)))),
+            ],
+            Some(src("Budget", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Budget", (0, 0, 4, 2))),
+            "the box follows the references off the sheet once none of them read it"
+        );
+
+        // Still mixed: `union` keeps the RECEIVER's name, so stretching would
+        // leave the box saying "Data" over cells on "Budget" — and
+        // `chart_space_xml` derives refs from that box. The first slot in
+        // writing order wins and the foreign one is skipped, as it is in the
+        // loader when it meets the same clash.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Budget!$C$1"), Some(src("Budget", (9, 9, 9, 9)))),
+            ],
+            Some(src("Data", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 1))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 1)))
+        );
+
+        // A chart whose series are all literal still has labels to cover.
+        let mut d = chart(vec![ser(None, None)], Some(src("Data", (1, 0, 4, 0))), None);
+        super::rebuild_source(&mut d);
+        assert_eq!(d.source.map(|s| s.range), Some((1, 0, 4, 0)));
+
+        // Nothing parsable anywhere: the box it had stands, since there is
+        // nothing to rebuild it from and blanking it would empty DATA RANGE.
+        let mut d = chart(vec![ser(None, None)], None, Some(src("Data", (0, 0, 4, 2))));
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 2)))
+        );
     }
 
     #[test]
@@ -17782,13 +17892,28 @@ mod grid_geom_tests {
         assert_eq!(series_name_shown("Q1", Some("total")), "Q1");
         // Which is exactly what `series_apply_name` compares against, so a name
         // shown as a reference and committed untouched changes nothing.
-        for (name, r) in [("Q1", Some("Budget!$B$1")), ("Q1", None)] {
-            let shown = series_name_shown(name, r);
-            assert!(matches!(
-                super::series_name_commit(&shown, &shown),
-                super::NameCommit::Unchanged
-            ));
-        }
+        let shown = series_name_shown("Q1", Some("Budget!$B$1"));
+        assert!(matches!(
+            super::series_name_commit(&shown, &shown),
+            super::NameCommit::Unchanged
+        ));
+        // And THIS is what pins the coupling: the panel has to render
+        // `series_name_shown`, not the bare `sr.name`. Were it to drift back,
+        // an untouched ref-backed field would hand `series_name_commit` the
+        // literal `Q1` against the shown reference — they differ, `Q1` parses
+        // as a cell, and the series would be rebound to cell Q1's usually-empty
+        // contents. That is the exact failure `series_name_commit`'s doc
+        // comment exists to warn about, so assert across the two sides rather
+        // than comparing one value with itself, which no implementation of
+        // `series_name_shown` could ever fail.
+        assert!(
+            matches!(
+                super::series_name_commit("Q1", &shown),
+                super::NameCommit::Ref(_)
+            ),
+            "the literal name held against its own shown reference must read as \
+             a reference — nothing else catches the panel rendering `sr.name`"
+        );
     }
 
     #[test]
