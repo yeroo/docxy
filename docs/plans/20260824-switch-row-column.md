@@ -210,22 +210,22 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 3: Write a row-oriented chart to OOXML
 
-- [ ] verify (with a test, not by reading) that `chart_space_xml` already emits
+- [x] verify (with a test, not by reading) that `chart_space_xml` already emits
       correct `<c:val>`/`<c:tx>` refs for row series via
       `ChartSource::to_ref` — the expectation is that it does, and the test
       pins it so a later refactor of the ref path cannot regress it silently
-- [ ] fix `<c:cat>` derivation for row orientation: `cat_col` names a column and
+- [x] fix `<c:cat>` derivation for row orientation: `cat_col` names a column and
       cannot express a label row, so decide and implement — either a row
       analogue alongside it, or deriving `<c:cat>` only from
       `categories_ref` when `by_row` — and record the reasoning in a comment
-- [ ] review `claimed_col` (xlsx.rs:2245-2258) under row orientation: it asks
+- [x] review `claimed_col` (xlsx.rs:2245-2258) under row orientation: it asks
       whether any series occupies a column, which is the wrong question when
       series are rows. Make it answer the right one or not run
-- [ ] write a test asserting the exact `<c:f>` strings a row-oriented chart
+- [x] write a test asserting the exact `<c:f>` strings a row-oriented chart
       writes, for values, name and categories
-- [ ] write a test that a column-oriented chart's output is UNCHANGED by this
+- [x] write a test that a column-oriented chart's output is UNCHANGED by this
       task — the regression that matters most
-- [ ] run tests — must pass before Task 4
+- [x] run tests — must pass before Task 4
 
 ### Task 4: Infer orientation when loading a chart
 

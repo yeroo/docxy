@@ -2234,30 +2234,48 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             .as_ref()
             .map(|v| v.to_ref())
             .or_else(|| Some(src?.f_ref(s.col?, s.col?, true)));
-        // Derive the category ref only from a box that HAS a label column to
-        // spare, and only when no series has already claimed that column.
-        // `cat_col` comes from whichever ref was read first — for a chart whose
-        // categories are `<c:strLit>` that is a series' own NAME or VALUES ref,
-        // and `<c:cat>` would then name cells the labels never came from: Excel
-        // refreshes from the ref it is given, so the user's typed labels would
-        // be replaced by whatever those cells hold.
-        let claimed_col = |c: u32| {
-            data.series.iter().any(|s| {
-                s.col == Some(c)
-                    || s.values_ref
-                        .as_ref()
-                        .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
-                    || s.name_ref
-                        .as_deref()
-                        .and_then(crate::sheet::ChartSource::parse_f_ref)
-                        .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
-            })
-        };
+        // The categories' own ref wins in either orientation — `to_ref` writes
+        // whatever rectangle it is given, so a label ROW comes out as
+        // `$B$1:$D$1` with no help from here. Everything below it is the
+        // COLUMN-shaped fallback for a chart that carries no `categories_ref`.
         let cat_ref = data
             .categories_ref
             .as_ref()
             .map(|v| v.to_ref())
             .or_else(|| {
+                // Both halves of the fallback ask a column question, and a row
+                // chart has no column answer. `cat_col` is a column index, so
+                // `f_ref` would hand Excel a column of NUMBERS as the category
+                // labels; and `claimed_col` ("has a series already taken this
+                // column?") is meaningless when every series spans the whole
+                // width — it would answer yes for every column in the box, on
+                // a chart where that says nothing about the labels. So the
+                // fallback does not run: a row chart with no `categories_ref`
+                // writes its labels as literals, the same answer the
+                // all-numeric table gets.
+                if data.by_row {
+                    return None;
+                }
+                // Derive the category ref only from a box that HAS a label
+                // column to spare, and only when no series has already claimed
+                // that column. `cat_col` comes from whichever ref was read
+                // first — for a chart whose categories are `<c:strLit>` that is
+                // a series' own NAME or VALUES ref, and `<c:cat>` would then
+                // name cells the labels never came from: Excel refreshes from
+                // the ref it is given, so the user's typed labels would be
+                // replaced by whatever those cells hold.
+                let claimed_col = |c: u32| {
+                    data.series.iter().any(|s| {
+                        s.col == Some(c)
+                            || s.values_ref
+                                .as_ref()
+                                .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
+                            || s.name_ref
+                                .as_deref()
+                                .and_then(crate::sheet::ChartSource::parse_f_ref)
+                                .is_some_and(|v| v.range.1 <= c && c <= v.range.3)
+                    })
+                };
                 src.filter(|sc| sc.range.1 != sc.range.3 && !claimed_col(sc.cat_col))
                     .map(|sc| sc.f_ref(sc.cat_col, sc.cat_col, true))
             });
@@ -6160,5 +6178,198 @@ mod tests {
             ..Default::default()
         });
         assert!(!xml.contains("NaN") && !xml.contains("inf"), "{xml}");
+    }
+
+    /// Exactly what the writer emitted for the Overview's `A1:D4` table read
+    /// by column, at the commit before orientation reached the writer —
+    /// dumped from that build and diffed against this one, not hand-written.
+    const COLUMN_GOLDEN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Item</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title><c:autoTitleDeleted val=\"0\"/><c:plotArea><c:layout/><c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/><c:ser><c:idx val=\"0\"/><c:order val=\"0\"/><c:tx><c:strRef><c:f>Data!$B$1</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f><c:strCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt><c:pt idx=\"1\"><c:v>Monitor</c:v></c:pt><c:pt idx=\"2\"><c:v>Keyboard</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>2</c:v></c:pt><c:pt idx=\"1\"><c:v>4</c:v></c:pt><c:pt idx=\"2\"><c:v>6</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:ser><c:idx val=\"1\"/><c:order val=\"1\"/><c:tx><c:strRef><c:f>Data!$C$1</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>Unit price</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f><c:strCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt><c:pt idx=\"1\"><c:v>Monitor</c:v></c:pt><c:pt idx=\"2\"><c:v>Keyboard</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$C$2:$C$4</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>1199</c:v></c:pt><c:pt idx=\"1\"><c:v>249.5</c:v></c:pt><c:pt idx=\"2\"><c:v>39.99</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:ser><c:idx val=\"2\"/><c:order val=\"2\"/><c:tx><c:strRef><c:f>Data!$D$1</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>Total</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f><c:strCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt><c:pt idx=\"1\"><c:v>Monitor</c:v></c:pt><c:pt idx=\"2\"><c:v>Keyboard</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$D$2:$D$4</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>2398</c:v></c:pt><c:pt idx=\"1\"><c:v>998</c:v></c:pt><c:pt idx=\"2\"><c:v>239.94</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:axId val=\"111111111\"/><c:axId val=\"222222222\"/></c:barChart><c:catAx><c:axId val=\"111111111\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"222222222\"/></c:catAx><c:valAx><c:axId val=\"222222222\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"111111111\"/></c:valAx></c:plotArea><c:legend><c:legendPos val=\"b\"/><c:overlay val=\"0\"/></c:legend><c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>";
+
+    /// The Overview's worked example, as a sheet: `A1:D4`, one product per row.
+    fn overview_table() -> crate::sheet::Sheet {
+        use crate::sheet::{Cell, Sheet, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Unit price")),
+            ("D1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("D2", Cell::number(2398.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(249.5)),
+            ("D3", Cell::number(998.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(39.99)),
+            ("D4", Cell::number(239.94)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        sh
+    }
+
+    /// Every `<c:f>` a chart writes, in document order, tagged with the slot it
+    /// sits in — the three ref slots a series has.
+    fn f_refs(xml: &str) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        let mut slot = "";
+        let mut rest = xml;
+        while let Some(i) = rest.find('<') {
+            rest = &rest[i..];
+            for (tag, name) in [("<c:tx>", "tx"), ("<c:cat>", "cat"), ("<c:val>", "val")] {
+                if rest.starts_with(tag) {
+                    slot = name;
+                }
+            }
+            if let Some(body) = rest.strip_prefix("<c:f>") {
+                let end = body.find("</c:f>").expect("closed <c:f>");
+                out.push((slot, body[..end].to_string()));
+            }
+            rest = &rest[1..];
+        }
+        out
+    }
+
+    #[test]
+    fn a_row_oriented_chart_writes_row_shaped_refs() {
+        // The whole of orientation lives in these strings: SpreadsheetML has no
+        // element saying "by row", so a chart is row-oriented exactly when its
+        // `<c:val>` spans one row and its `<c:cat>` names the header row.
+        // `to_ref` writes whatever rectangle it is handed, so values and names
+        // needed no writer change — this pins that, so a later refactor of the
+        // ref path cannot quietly turn them back into columns.
+        let sh = overview_table();
+        let cd = crate::sheet::chart_from_range(&sh, "Data", (0, 0, 3, 3), "column", true)
+            .expect("chart");
+        let xml = chart_space_xml(&cd);
+        assert_eq!(
+            f_refs(&xml),
+            vec![
+                ("tx", "Data!$A$2".to_string()),
+                ("cat", "Data!$B$1:$D$1".to_string()),
+                ("val", "Data!$B$2:$D$2".to_string()),
+                ("tx", "Data!$A$3".to_string()),
+                ("cat", "Data!$B$1:$D$1".to_string()),
+                ("val", "Data!$B$3:$D$3".to_string()),
+                ("tx", "Data!$A$4".to_string()),
+                ("cat", "Data!$B$1:$D$1".to_string()),
+                ("val", "Data!$B$4:$D$4".to_string()),
+            ],
+            "{xml}"
+        );
+        // The caches beside those refs say what the refs say.
+        assert!(
+            xml.contains("<c:pt idx=\"0\"><c:v>Laptop</c:v></c:pt>")
+                && xml.contains("<c:pt idx=\"0\"><c:v>Qty</c:v></c:pt>")
+                && xml.contains("<c:pt idx=\"2\"><c:v>2398</c:v></c:pt>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn a_column_oriented_chart_writes_exactly_what_it_wrote_before_orientation() {
+        // The regression that matters most: every chart in every existing file
+        // is column-oriented, so the row work must not move a byte of what a
+        // column chart emits. If this fails the answer is to fix the writer,
+        // not to re-bless the string.
+        let sh = overview_table();
+        let cd = crate::sheet::chart_from_range(&sh, "Data", (0, 0, 3, 3), "column", false)
+            .expect("chart");
+        assert_eq!(chart_space_xml(&cd), COLUMN_GOLDEN);
+    }
+
+    #[test]
+    fn a_row_chart_with_no_category_ref_writes_literal_labels_not_a_column_of_names() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // A row chart whose series were named by hand carries no `name_ref`, so
+        // nothing claims column A — the column fallback would have found
+        // `cat_col` free and handed Excel `Data!$A$2:$A$3`, a column of series
+        // NAMES, as the category labels. `by_row` turns that fallback off and
+        // the labels go out as literals instead.
+        let row = |r| ChartSource {
+            sheet: "Data".into(),
+            range: (r, 1, r, 3),
+            cat_col: 0,
+        };
+        let cd = ChartData {
+            kind: "column".into(),
+            categories: vec!["Qty".into(), "Unit price".into(), "Total".into()],
+            series: vec![
+                ChartSeries {
+                    name: "Laptop".into(),
+                    values: vec![2.0, 1199.0, 2398.0],
+                    col: None,
+                    values_ref: Some(row(1)),
+                    ..Default::default()
+                },
+                ChartSeries {
+                    name: "Monitor".into(),
+                    values: vec![4.0, 249.5, 998.0],
+                    col: None,
+                    values_ref: Some(row(2)),
+                    ..Default::default()
+                },
+            ],
+            source: Some(ChartSource {
+                sheet: "Data".into(),
+                range: (0, 0, 2, 3),
+                cat_col: 0,
+            }),
+            categories_ref: None,
+            edited: true,
+            by_row: true,
+            ..Default::default()
+        };
+        let xml = chart_space_xml(&cd);
+        assert!(xml.contains("<c:cat><c:strLit"), "{xml}");
+        assert!(!xml.contains("$A$2:$A$3"), "column fallback fired: {xml}");
+        // Only the values are refs; `<c:tx>` is a literal `<c:v>`, since these
+        // series carry no `name_ref`.
+        assert_eq!(
+            f_refs(&xml),
+            vec![
+                ("val", "Data!$B$2:$D$2".to_string()),
+                ("val", "Data!$B$3:$D$3".to_string()),
+            ],
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn the_column_fallback_still_derives_a_category_ref_when_it_should() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // The other side of the guard: a COLUMN chart with no `categories_ref`
+        // and an unclaimed label column still derives one, exactly as before.
+        let cd = ChartData {
+            kind: "column".into(),
+            categories: vec!["a".into(), "b".into(), "c".into()],
+            series: vec![ChartSeries {
+                name: "S".into(),
+                values: vec![1.0, 2.0, 3.0],
+                col: Some(1),
+                ..Default::default()
+            }],
+            source: Some(ChartSource {
+                sheet: "Data".into(),
+                range: (0, 0, 3, 1),
+                cat_col: 0,
+            }),
+            categories_ref: None,
+            edited: true,
+            ..Default::default()
+        };
+        let xml = chart_space_xml(&cd);
+        assert!(
+            xml.contains("<c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f>"),
+            "{xml}"
+        );
     }
 }
