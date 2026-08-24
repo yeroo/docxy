@@ -9,4 +9,9 @@ if not exist "%BASHEXE%" (
     echo error: Git bash not found; revmux review hook cannot run 1>&2
     exit /b 1
 )
+rem Invoking bash.exe directly does NOT bring Git's coreutils along: the script
+rem would find git and revmux on the system PATH but die on `date: command not
+rem found`. Put the directory holding bash.exe on PATH so its siblings resolve.
+for %%I in ("%BASHEXE%") do set "BASHDIR=%%~dpI"
+set "PATH=%BASHDIR%;%PATH%"
 "%BASHEXE%" "%~dp0revmux-review.sh" %*
